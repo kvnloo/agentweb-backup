@@ -15,5 +15,10 @@ export const internalMcpServers: Record<string, McpServerConfig> = {
     env: {
       GITHUB_PERSONAL_ACCESS_TOKEN: "{{github_access_token}}"
     }
+  } as any,
+  "playwright": {
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@playwright/mcp"]
   } as any
 };

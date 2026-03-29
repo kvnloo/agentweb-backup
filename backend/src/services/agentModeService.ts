@@ -2332,7 +2332,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'fathom_get_transcript',
 
     // Coding Agent (sub-agent for code editing tasks)
-    'coding_agent'
+    'coding_agent',
+
+    // Browser Agent (sub-agent for web browsing tasks)
+    'browser_agent'
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -2344,6 +2347,20 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
   private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
+
+  // Playwright MCP tools that exist in the toolRegistry (for browser_agent and cookie tools)
+  // but should NOT be exposed directly to Emma's LLM. The browser_agent sub-agent uses them internally.
+  private static readonly HIDDEN_TOOLS = new Set([
+    'browser_navigate', 'browser_snapshot', 'browser_take_screenshot',
+    'browser_click', 'browser_type', 'browser_fill_form',
+    'browser_press_key', 'browser_run_code', 'browser_wait_for',
+    'browser_close', 'browser_tabs', 'browser_hover',
+    'browser_handle_dialog', 'browser_evaluate', 'browser_drag',
+    'browser_resize', 'browser_console_messages',
+    'browser_network_requests', 'browser_file_upload',
+    'browser_navigate_back', 'browser_select_option',
+    'browser_install',
+  ]);
 
   /**
    * Get tools that are not associated with any published skill.
@@ -2661,9 +2678,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
       // 2. Apply skill-based filtering if a skill filter is provided.
       // Pre-skills sessions pass undefined to get all tools for backward compatibility.
+      // Also exclude HIDDEN_TOOLS (Playwright MCP tools used internally by browser_agent).
       const contextAwareTools = precomputedAllowedSkillToolNames
-        ? allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name))
-        : allInternalTools;
+        ? allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name) && !AgentModeService.HIDDEN_TOOLS.has(tool.name))
+        : allInternalTools.filter(tool => !AgentModeService.HIDDEN_TOOLS.has(tool.name));
 
       // 3. Map back to wire-format definitions for the LLM
       const definitions = contextAwareTools.map(t => t.definition);

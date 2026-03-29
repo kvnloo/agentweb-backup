@@ -78,6 +78,15 @@ describe('AgentModeService - createHtmlTemplate', () => {
   let mockGetSetting: jest.Mock;
   let mockSetSetting: jest.Mock;
 
+  // Skip MCP initialization — this test doesn't need MCP servers
+  beforeAll(() => {
+    (AgentModeService as any).mcpInitialized = true;
+  });
+
+  afterAll(() => {
+    (AgentModeService as any).mcpInitialized = false;
+  });
+
   beforeEach(async () => {
     jest.clearAllMocks();
 

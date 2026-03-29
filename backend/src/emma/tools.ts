@@ -4688,6 +4688,57 @@ emmaToolRegistry.register({
   }
 });
 
+// ─── Browser Agent tool (sub-agent for web browsing tasks) ──────────────────
+emmaToolRegistry.register({
+  name: 'browser_agent',
+  definition: {
+    name: 'browser_agent',
+    description: 'Delegate a web browsing task to a specialized browser agent. The browser agent navigates websites, clicks elements, fills forms, extracts data, and completes web-based tasks autonomously. Use this for ANY task that requires interacting with a website (browsing, searching, filling forms, extracting data, etc.). Provide a clear task description including the target URL if known and what to accomplish. The agent returns a structured result with extracted data and a summary of actions taken. IMPORTANT: After browser_agent returns, trust its result — do NOT attempt to verify by calling browser tools yourself.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_description: {
+          type: 'string',
+          description: 'Detailed description of the browser task. Include: target URL (if known), what to do on the page, what data to extract, and any login credentials if needed.'
+        }
+      },
+      required: ['task_description']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!args.task_description) {
+      return { success: false, error: 'task_description is required. Describe what you want the browser to do.' };
+    }
+
+    const { runBrowserAgent } = await import('../services/browserAgentService');
+
+    const executeTool = context?.service
+      ? async (toolName: string, toolArgs: any) => {
+          return context.service.executeTool(
+            context.llmModel || 'anthropic.claude-sonnet-4-6',
+            toolName,
+            toolArgs,
+            context.userId,
+            context.sessionId
+          );
+        }
+      : undefined;
+
+    if (!executeTool) {
+      return { success: false, error: 'Browser tools are not available. Please try again later.' };
+    }
+
+    const result = await runBrowserAgent(args.task_description, {
+      userId: context?.userId,
+      sessionId: context?.sessionId || '',
+      socketEmit: context?.socketEmit,
+      executeTool,
+    });
+
+    return result;
+  }
+});
+
 // --- User Skill Creation ---
 emmaToolRegistry.register({
   name: 'create_skill',
