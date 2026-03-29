@@ -35,6 +35,19 @@ export async function getNotionCredentialsForEnv(env: 'development' | 'productio
 
 const NOTION_API_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
+const NOTION_MAX_RICH_TEXT_LENGTH = 2000;
+
+/** Split text into multiple rich_text elements, each within Notion's 2000-char limit */
+function toRichTextArray(text: string): Array<{ type: 'text'; text: { content: string } }> {
+  if (text.length <= NOTION_MAX_RICH_TEXT_LENGTH) {
+    return [{ type: 'text', text: { content: text } }];
+  }
+  const elements: Array<{ type: 'text'; text: { content: string } }> = [];
+  for (let i = 0; i < text.length; i += NOTION_MAX_RICH_TEXT_LENGTH) {
+    elements.push({ type: 'text', text: { content: text.slice(i, i + NOTION_MAX_RICH_TEXT_LENGTH) } });
+  }
+  return elements;
+}
 
 async function notionFetch(path: string, options: RequestInit = {}): Promise<any> {
   const { apiToken } = await getNotionCredentials();
@@ -153,7 +166,7 @@ export async function updateBlock(blockId: string, newText: string): Promise<any
     method: 'PATCH',
     body: JSON.stringify({
       [type]: {
-        rich_text: [{ type: 'text', text: { content: newText } }],
+        rich_text: toRichTextArray(newText),
       },
     }),
   });
@@ -161,32 +174,33 @@ export async function updateBlock(blockId: string, newText: string): Promise<any
 
 export async function appendBlocks(parentId: string, blocks: Array<{ type: string; text: string }>): Promise<any> {
   const children = blocks.map(b => {
+    const richText = toRichTextArray(b.text);
     if (b.type === 'heading_2') {
       return {
         object: 'block',
         type: 'heading_2',
-        heading_2: { rich_text: [{ type: 'text', text: { content: b.text } }] },
+        heading_2: { rich_text: richText },
       };
     }
     if (b.type === 'heading_3') {
       return {
         object: 'block',
         type: 'heading_3',
-        heading_3: { rich_text: [{ type: 'text', text: { content: b.text } }] },
+        heading_3: { rich_text: richText },
       };
     }
     if (b.type === 'bulleted_list_item') {
       return {
         object: 'block',
         type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ type: 'text', text: { content: b.text } }] },
+        bulleted_list_item: { rich_text: richText },
       };
     }
     // Default to paragraph
     return {
       object: 'block',
       type: 'paragraph',
-      paragraph: { rich_text: [{ type: 'text', text: { content: b.text } }] },
+      paragraph: { rich_text: richText },
     };
   });
 
