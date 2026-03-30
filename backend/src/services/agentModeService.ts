@@ -6345,6 +6345,41 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  /**
+   * Helper function to extract text preview from emailContent field.
+   * The emailContent can be either a string (legacy) or an object with html/text properties.
+   */
+  private getEmailContentPreview(emailContent: any, maxLength: number): string | undefined {
+    if (!emailContent) {
+      return undefined;
+    }
+
+    let textContent: string;
+
+    // Handle object format (new format with html/text properties)
+    if (typeof emailContent === 'object' && !Array.isArray(emailContent)) {
+      // Prefer html over text, but use whichever is available
+      textContent = emailContent.html || emailContent.text || '';
+    }
+    // Handle string format (legacy format)
+    else if (typeof emailContent === 'string') {
+      textContent = emailContent;
+    }
+    else {
+      return undefined;
+    }
+
+    // Strip HTML tags and truncate
+    const plainText = textContent.replace(/<[^>]*>/g, '').trim();
+    if (plainText.length === 0) {
+      return undefined;
+    }
+
+    return plainText.length > maxLength
+      ? plainText.substring(0, maxLength) + '...'
+      : plainText;
+  }
+
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -6416,9 +6451,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate email content for preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 150) + '...'
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 150)
         })),
         listName: list.name
       };
@@ -7059,9 +7092,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate HTML email content to text preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 200) + (eng.emailContent.length > 200 ? '...' : '')
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 200)
         })),
         leadName: `${lead.firstName || ''} ${lead.lastName || ''}`.trim()
       };
