@@ -1,6 +1,6 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
-import { accountMemoryDb } from '../services/db';
+import { accountMemoryDb, userDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
 
 // Register browser cookie persistence tools
@@ -5211,6 +5211,133 @@ emmaToolRegistry.register({
       steps: plan.steps.length,
       visibility: plan.visibility,
       message: `Work plan "${plan.title}" saved successfully. It is currently private. The user can submit it for platform review from Settings > Work Plans.`
+    };
+  }
+});
+
+// --- Report product issues tool ---
+
+emmaToolRegistry.register({
+  name: 'report_product_issues',
+  definition: {
+    name: 'report_product_issues',
+    description: 'Report one or more product issues or bugs. Creates tracked items in the engineering sprint board and notifies the oncall team. Use this when users encounter errors, unexpected behavior, or want to request fixes. Batch multiple issues into a single call when possible.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        issues: {
+          type: 'array',
+          description: 'Array of issues to report',
+          items: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Short title for the issue (e.g., "Login page crashes on mobile")'
+              },
+              description: {
+                type: 'string',
+                description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior'
+              },
+              priority: {
+                type: 'string',
+                enum: ['High', 'Medium', 'Low'],
+                description: 'Priority level. Default: Medium'
+              },
+              pageUrl: {
+                type: 'string',
+                description: 'URL of the page where the issue occurred (optional)'
+              }
+            },
+            required: ['title', 'description']
+          },
+          minItems: 1
+        }
+      },
+      required: ['issues']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    // Lazy imports to avoid pulling in heavy dependencies at module load time
+    const { createOncallItem } = await import('../services/notionService');
+    const { emailService } = await import('../services/emailService');
+    const { resendService } = await import('../services/resendService');
+
+    const userId = context?.userId;
+    if (!userId) {
+      throw new Error('Authentication required to report issues');
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
+
+    for (const issue of args.issues) {
+      try {
+        const issueContext: Record<string, any> = {
+          'User Email': user.email,
+          'User ID': userId,
+          'Page URL': issue.pageUrl || 'N/A',
+          'Session ID': context?.sessionId || 'N/A',
+        };
+
+        const result = await createOncallItem({
+          title: issue.title,
+          description: issue.description,
+          additionalTags: ['Customer Reported'],
+          context: issueContext,
+        });
+
+        // Send slim oncall alert email with the Notion URL (skips duplicate Notion creation)
+        await emailService.sendOncallAlert(
+          `Customer Report: ${issue.title}`,
+          issue.description,
+          issueContext,
+          result.notionUrl
+        );
+
+        // Send support email to founders (reuses Get Support pattern)
+        await resendService.sendEmail({
+          from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
+          to: 'founders@agentweb.pro',
+          subject: `Product Issue from ${user.email}: ${issue.title}`,
+          html: `
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
+              </div>
+              <div style="margin: 8px 0;"><strong>From:</strong> ${user.displayName || user.email} (${user.email})</div>
+              <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
+              <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
+              <div style="margin: 8px 0;"><strong>Notion:</strong> <a href="${result.notionUrl}">${result.notionUrl}</a></div>
+              <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
+                <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
+                <div>${issue.description.replace(/\n/g, '<br>')}</div>
+              </div>
+            </div>
+          `,
+          replyTo: user.email,
+        });
+
+        results.push({ title: issue.title, success: true, notionUrl: result.notionUrl });
+      } catch (err: any) {
+        results.push({ title: issue.title, success: false, error: err.message });
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    const failCount = results.filter(r => !r.success).length;
+    const summary = failCount === 0
+      ? `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.`
+      : `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
+
+    return {
+      success: failCount === 0,
+      message: summary,
+      results,
     };
   }
 });
