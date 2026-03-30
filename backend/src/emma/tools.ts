@@ -279,10 +279,10 @@ emmaToolRegistry.register({
 // --- Tools from marketingTools.ts ---
 emmaToolRegistry.register({
   name: "call_meta_marketing_api",
-    definition: {
-      name: "call_meta_marketing_api",
-      description:
-        `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
+  definition: {
+    name: "call_meta_marketing_api",
+    description:
+      `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
 
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
@@ -343,121 +343,121 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_SALES     → OFFSITE_CONVERSIONS, VALUE
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
   OUTCOME_APP_PROMOTION → APP_INSTALLS`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          entity_type: {
-            type: "string",
-            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE", "DATASET"],
-            description: "The Meta Ads entity to operate on."
-          },
-          action: {
-            type: "string",
-            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
-            description: "The operation to perform. Must be valid for the chosen entity_type."
-          },
-          account_id: {
-            type: "string",
-            description: "Ad Account ID (without 'act_' prefix). Must be obtained from list_connected_accounts(platform='meta')."
-          },
-          campaign_id: {
-            type: "string",
-            description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter)."
-          },
-          ad_set_id: {
-            type: "string",
-            description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter)."
-          },
-          ad_id: {
-            type: "string",
-            description: "Ad ID. Required for: AD UPDATE/DELETE."
-          },
-          params: {
-            type: "object",
-            description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
-            properties: {
-              // --- Common ---
-              name:   { type: "string", description: "Entity name." },
-              status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
-
-              // --- Campaign ---
-              objective:                  { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
-              special_ad_categories:      { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
-              advantage_campaign_budget:  { type: "boolean", description: "Enable Advantage Campaign Budget." },
-              budget_amount:              { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
-
-              // --- Ad Set ---
-              optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
-              billing_event:     { type: "string", description: "Billing event (must be compatible with optimization_goal)." },
-              daily_budget:      { type: "number", description: "Daily budget in dollars. Min $1, max $5,000." },
-              lifetime_budget:   { type: "number", description: "Lifetime budget in dollars. Min $1, max $50,000. Requires end_time." },
-              bid_strategy:      { type: "string", enum: ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"], description: "Bid strategy." },
-              bid_amount:        { type: "number", description: "Bid amount in dollars. Required for BID_CAP and COST_CAP strategies." },
-              targeting: {
-                type: "object",
-                description: "Targeting specification. geo_locations is required. targeting_automation.advantage_audience (0 or 1) is auto-injected as 0 if omitted — pass explicitly to override. Example: { geo_locations: { countries: ['US'] }, targeting_automation: { advantage_audience: 0 } }"
-              },
-              start_time:       { type: "string", description: "ISO 8601 start datetime." },
-              end_time:         { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
-              promoted_object:  { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
-
-              // --- Creative ---
-              page_id:              { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
-              image_hash:           { type: "string", description: "Image hash from UPLOAD_IMAGE." },
-              image_url:            { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
-              video_id:             { type: "string", description: "Video ID from UPLOAD_VIDEO." },
-              video_url:            { type: "string", description: "Video URL (for UPLOAD_VIDEO action)." },
-              carousel_cards: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    image_hash: { type: "string" }, video_id: { type: "string" },
-                    title: { type: "string" }, description: { type: "string" }, link_url: { type: "string" }
-                  }
-                },
-                description: "Carousel card array for multi-card creatives."
-              },
-              body:                 { type: "string", description: "Ad body / primary text." },
-              title:                { type: "string", description: "Ad headline." },
-              link_url:             { type: "string", description: "Destination URL." },
-              call_to_action_type:  { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
-              creative_id:          { type: "string", description: "Creative ID for AD CREATE." },
-
-              // --- Custom Audience ---
-              subtype:              { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
-              description:          { type: "string", description: "Audience description." },
-              customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
-              lookalike_spec:       { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
-              id:                   { type: "string", description: "Audience ID for UPLOAD_USERS." },
-              schema:               { type: "array", items: { type: "string" }, description: "PII field types for UPLOAD_USERS (e.g., ['EMAIL', 'FN', 'LN'])." },
-              payload:              { type: "string", description: "User data as JSON array-of-arrays for UPLOAD_USERS." },
-
-              // --- Targeting Search ---
-              q:    { type: "string", description: "Search query for targeting search." },
-              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
-
-              // --- Dataset ---
-              dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
-            }
-          }
+    inputSchema: {
+      type: "object",
+      properties: {
+        entity_type: {
+          type: "string",
+          enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE", "DATASET"],
+          description: "The Meta Ads entity to operate on."
         },
-        required: ["entity_type", "action", "account_id"]
-      }
-    },
-    execute: async (args, context) => {
-      return await agentModeService.callMetaMarketingApi(
-        context?.userId,
-        args.entity_type,
-        args.action,
-        args.account_id,
-        args.campaign_id,
-        args.ad_set_id,
-        args.ad_id,
-        args.params,
-      );
+        action: {
+          type: "string",
+          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          description: "The operation to perform. Must be valid for the chosen entity_type."
+        },
+        account_id: {
+          type: "string",
+          description: "Ad Account ID (without 'act_' prefix). Must be obtained from list_connected_accounts(platform='meta')."
+        },
+        campaign_id: {
+          type: "string",
+          description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter)."
+        },
+        ad_set_id: {
+          type: "string",
+          description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter)."
+        },
+        ad_id: {
+          type: "string",
+          description: "Ad ID. Required for: AD UPDATE/DELETE."
+        },
+        params: {
+          type: "object",
+          description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
+          properties: {
+            // --- Common ---
+            name: { type: "string", description: "Entity name." },
+            status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
+
+            // --- Campaign ---
+            objective: { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+            special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
+            advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
+            budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
+
+            // --- Ad Set ---
+            optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
+            billing_event: { type: "string", description: "Billing event (must be compatible with optimization_goal)." },
+            daily_budget: { type: "number", description: "Daily budget in dollars. Min $1, max $5,000." },
+            lifetime_budget: { type: "number", description: "Lifetime budget in dollars. Min $1, max $50,000. Requires end_time." },
+            bid_strategy: { type: "string", enum: ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"], description: "Bid strategy." },
+            bid_amount: { type: "number", description: "Bid amount in dollars. Required for BID_CAP and COST_CAP strategies." },
+            targeting: {
+              type: "object",
+              description: "Targeting specification. geo_locations is required. targeting_automation.advantage_audience (0 or 1) is auto-injected as 0 if omitted — pass explicitly to override. Example: { geo_locations: { countries: ['US'] }, targeting_automation: { advantage_audience: 0 } }"
+            },
+            start_time: { type: "string", description: "ISO 8601 start datetime." },
+            end_time: { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
+            promoted_object: { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
+
+            // --- Creative ---
+            page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
+            image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
+            image_url: { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
+            video_id: { type: "string", description: "Video ID from UPLOAD_VIDEO." },
+            video_url: { type: "string", description: "Video URL (for UPLOAD_VIDEO action)." },
+            carousel_cards: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  image_hash: { type: "string" }, video_id: { type: "string" },
+                  title: { type: "string" }, description: { type: "string" }, link_url: { type: "string" }
+                }
+              },
+              description: "Carousel card array for multi-card creatives."
+            },
+            body: { type: "string", description: "Ad body / primary text." },
+            title: { type: "string", description: "Ad headline." },
+            link_url: { type: "string", description: "Destination URL." },
+            call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
+            creative_id: { type: "string", description: "Creative ID for AD CREATE." },
+
+            // --- Custom Audience ---
+            subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
+            description: { type: "string", description: "Audience description." },
+            customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
+            lookalike_spec: { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
+            id: { type: "string", description: "Audience ID for UPLOAD_USERS." },
+            schema: { type: "array", items: { type: "string" }, description: "PII field types for UPLOAD_USERS (e.g., ['EMAIL', 'FN', 'LN'])." },
+            payload: { type: "string", description: "User data as JSON array-of-arrays for UPLOAD_USERS." },
+
+            // --- Targeting Search ---
+            q: { type: "string", description: "Search query for targeting search." },
+            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
+
+            // --- Dataset ---
+            dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
+          }
+        }
+      },
+      required: ["entity_type", "action", "account_id"]
     }
-  });
+  },
+  execute: async (args, context) => {
+    return await agentModeService.callMetaMarketingApi(
+      context?.userId,
+      args.entity_type,
+      args.action,
+      args.account_id,
+      args.campaign_id,
+      args.ad_set_id,
+      args.ad_id,
+      args.params,
+    );
+  }
+});
 
 emmaToolRegistry.register({
   name: "call_meta_ads_insights_api",
@@ -615,31 +615,371 @@ emmaToolRegistry.register({
   }
 });
 
+// --- LinkedIn Ads Tools ---
+emmaToolRegistry.register({
+  name: 'call_linkedin_marketing_api',
+  definition: {
+    name: 'call_linkedin_marketing_api',
+    description: `Manage LinkedIn Ads entities via the Marketing Developer Platform API. Requires account_id from list_connected_accounts(platform='linkedin_ads').
+
+ACTION MATRIX (entity_type → supported actions):
+  AD_ACCOUNT      → LIST
+  CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
+  CAMPAIGN        → LIST, CREATE, UPDATE
+  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC
+  POST            → CREATE
+  TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
+  MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
+  INMAIL          → CREATE_CONTENT, SEND_TEST
+  CONVERSATION_AD → CREATE, CREATE_CONTENT, SET_FIRST_CONTENT
+
+ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
+
+⚠️ AD FORMAT FLOWS — STRICTLY FOLLOW THESE, NO DEVIATION:
+
+  SINGLE IMAGE AD (campaign type: SPONSORED_UPDATES):
+    Ask first: "Show on company page or dark post only?"
+    Company page (FLOW A): MEDIA/UPLOAD_IMAGE → POST/CREATE (feed_distribution=MAIN_FEED, image_urn) → CREATIVE/CREATE (post_urn)
+    Dark post  (FLOW B): MEDIA/UPLOAD_IMAGE → CREATIVE/CREATE_INLINE (image_urn, commentary, campaign_id)
+
+  CAROUSEL AD (Requires Campaign format: CAROUSEL) — ALWAYS FLOW B, NO EXCEPTIONS. NEVER use POST/CREATE + CREATIVE/CREATE for carousel (causes LinkedIn type conflict):
+    MEDIA/UPLOAD_IMAGE (×N, one per card) → CREATIVE/CREATE_INLINE (carousel_cards, commentary, campaign_id)
+    carousel_cards format: array of { image_urn, title, landing_page }
+    LinkedIn does NOT support carousel as an organic company page post.
+
+  VIDEO AD (campaign type: SPONSORED_UPDATES, Requires Campaign format: SINGLE_VIDEO) — NEVER ask user for file size:
+    Ask first: "Show on company page or dark post only?"
+    Company page (FLOW A): MEDIA/UPLOAD_VIDEO (video_url) → POST/CREATE (feed_distribution=MAIN_FEED, video_urn) → CREATIVE/CREATE (post_urn)
+    Dark post  (FLOW B): MEDIA/UPLOAD_VIDEO (video_url) → CREATIVE/CREATE_INLINE (video_urn, commentary, campaign_id)
+    MEDIA/UPLOAD_VIDEO auto-downloads the video, measures its size, handles multipart upload, and returns video_urn.
+
+  ARTICLE AD (campaign type: SPONSORED_UPDATES):
+    POST/CREATE (article_url, article_title, article_description, optional thumbnail_urn) → CREATIVE/CREATE (post_urn)
+    No media upload needed — LinkedIn fetches the article preview automatically.
+
+  DOCUMENT AD (campaign type: SPONSORED_UPDATES):
+    MEDIA/UPLOAD_DOCUMENT (document_url) → POST/CREATE (document_urn, title) → CREATIVE/CREATE_INLINE (commentary, campaign_id) OR CREATIVE/CREATE (post_urn)
+
+  TEXT AD (campaign type: TEXT_AD):
+    CREATIVE/CREATE (headline, description, landing_page, optional image_urn, campaign_id)
+    No post creation needed — text ads are self-contained in the creative.
+
+  MESSAGE AD (InMail, campaign type: SPONSORED_INMAILS):
+    INMAIL/CREATE_CONTENT → CREATIVE/CREATE (inmail_content_urn, campaign_id)
+    Optionally send a test: INMAIL/SEND_TEST (inmail_content_urn, recipient_email)
+    sender is auto-resolved from the connected account — do NOT ask the user for it.
+
+  CONVERSATION AD (branching message, campaign type: SPONSORED_INMAILS):
+    CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
+    Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
+
+  JOBS AD (campaign type: SPONSORED_UPDATES, format: JOB_POSTING — uses DYNAMIC campaign):
+    CREATIVE/CREATE_DYNAMIC (format=JOBS, headline, button_label, campaign_id)
+    Campaign must use type=DYNAMIC. objective should be JOB_APPLICANTS.
+
+  SPOTLIGHT AD (campaign type: DYNAMIC):
+    ⚠️ logo_urn is REQUIRED for SPOTLIGHT — LinkedIn mandates it if the company page has no logo. Upload first with MEDIA/UPLOAD_IMAGE.
+    MEDIA/UPLOAD_IMAGE (logo image) → CREATIVE/CREATE_DYNAMIC (format=SPOTLIGHT, headline, call_to_action, landing_page, logo_urn, optional description/background_image_urn, campaign_id)
+
+  FOLLOWER AD (campaign type: DYNAMIC):
+    CREATIVE/CREATE_DYNAMIC (format=FOLLOW_COMPANY, headline, optional description/call_to_action, campaign_id)
+    Uses LinkedIn pre-approved headline/CTA templates to match member profile.
+
+  EVENT AD (campaign type: SPONSORED_UPDATES):
+    POST/CREATE (event_urn from an existing LinkedIn Event) → CREATIVE/CREATE (post_urn, optional pre_event_registration_image)
+    Or just CREATIVE/CREATE (post_urn=event_post_urn) if the event post already exists.
+
+  VAST TAG VIDEO AD (third-party video, campaign type: SPONSORED_UPDATES):
+    CREATIVE/CREATE (vast_tag_url, campaign_id) — no upload needed; video served by Innovid or approved vendor.
+
+REQUIRED PARAMS PER ENTITY + ACTION:
+  CAMPAIGN_GROUP CREATE: name, status (ACTIVE|DRAFT only — LinkedIn does NOT allow PAUSED on creation; if user wants paused, create as ACTIVE then UPDATE to PAUSED), run_schedule_start (epoch ms — ask the user when the campaign group should start), totalBudget.amount + totalBudget.currencyCode
+  CAMPAIGN CREATE: ⚠️ ALWAYS ask before creating: "What type of ads will run in this campaign?" Then set type accordingly:
+    type: SPONSORED_UPDATES (image, video, carousel, article, document, event, VAST) | TEXT_AD | SPONSORED_INMAILS (message/conversation) | DYNAMIC (jobs, spotlight, follower)
+    format: ⚠️ REQUIRED for DYNAMIC, VIDEO, and CAROUSEL ads.
+      - If type=DYNAMIC: format=JOBS|SPOTLIGHT|FOLLOW_COMPANY
+      - If type=SPONSORED_UPDATES for video ads: format=SINGLE_VIDEO
+      - If type=SPONSORED_UPDATES for carousel ads: format=CAROUSEL
+      - If type=SPONSORED_UPDATES for event ads: format=SPONSORED_UPDATE_EVENT
+      - For single image / article / document: omit format (defaults to STANDARD_UPDATE).
+    Campaign type is immutable after creation.
+    Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS|JOB_APPLICANTS), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
+    targeting_include format: array of { "facet_urn": "urn:li:adTargetingFacet:locations", "values": ["urn:li:geo:103644278"] }
+    ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
+  CAMPAIGN UPDATE: campaign_id + fields to update
+  CREATIVE LIST: params.campaign_id required
+  CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads).
+  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards.
+  CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
+  TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
+    Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
+  TARGETING ESTIMATE_REACH: targeting_criteria (object)
+  MEDIA UPLOAD_IMAGE: image_url (public URL). Returns image_urn.
+  MEDIA UPLOAD_VIDEO: video_url (public URL). Auto-downloads, measures size, handles multipart upload. Returns video_urn. NEVER ask the user for file size.
+  MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
+  INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender auto-resolved — do NOT pass it)
+  INMAIL SEND_TEST: inmail_content_urn, recipient_email
+  CONVERSATION_AD CREATE: name
+  CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
+  CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
+
+POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
+
+BUDGET FORMAT: decimal string e.g. "10.00" = $10.00 (NOT micro-currency)
+SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type: {
+          type: 'string',
+          enum: ['AD_ACCOUNT', 'CAMPAIGN_GROUP', 'CAMPAIGN', 'CREATIVE', 'POST', 'TARGETING', 'MEDIA', 'INMAIL', 'CONVERSATION_AD'],
+          description: 'The LinkedIn Ads entity to operate on.'
+        },
+        action: {
+          type: 'string',
+          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
+          description: 'The operation to perform. Must be valid for the chosen entity_type.'
+        },
+        account_id: {
+          type: 'string',
+          description: "LinkedIn Ads account ID. Obtain from list_connected_accounts(platform='linkedin_ads')."
+        },
+        params: {
+          type: 'object',
+          description: 'Action-specific parameters. See tool description for required fields per entity + action.',
+          properties: {
+            // Campaign Group / Campaign common
+            name: { type: 'string', description: 'Entity name.' },
+            status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
+            campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
+            campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
+            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE.' },
+            // Campaign
+            objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS, JOB_APPLICANTS).' },
+            costType: { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },
+            unitCost: { type: 'object', description: '{ amount: "10.00", currencyCode: "USD" }' },
+            totalBudget: { type: 'object', description: '{ amount: "1000.00", currencyCode: "USD" }' },
+            dailyBudget: { type: 'object', description: '{ amount: "50.00", currencyCode: "USD" }' },
+            runSchedule: { type: 'object', description: '{ start: <epoch_ms>, end?: <epoch_ms> }' },
+            targeting_include: {
+              type: 'array',
+              description: 'CAMPAIGN CREATE targeting (include). Each item: { facet_urn: string, values: string[] }. Use TARGETING SEARCH first to get value URNs.',
+              items: {
+                type: 'object',
+                properties: {
+                  facet_urn: { type: 'string' },
+                  values: { type: 'array', items: { type: 'string' } }
+                }
+              }
+            },
+            targeting_exclude: {
+              type: 'array',
+              description: 'CAMPAIGN CREATE targeting (exclude). Same format as targeting_include.',
+              items: {
+                type: 'object',
+                properties: {
+                  facet_urn: { type: 'string' },
+                  values: { type: 'array', items: { type: 'string' } }
+                }
+              }
+            },
+            // Creative
+            type: { type: 'string', enum: ['TEXT_AD', 'SPONSORED_UPDATES', 'SPONSORED_INMAILS', 'DYNAMIC'], description: 'Campaign/creative type.' },
+            format: { type: 'string', description: 'Campaign or creative format. DYNAMIC campaigns: JOBS|SPOTLIGHT|FOLLOW_COMPANY. Event campaigns: SPONSORED_UPDATE_EVENT.' },
+            reference: { type: 'string', description: 'Post URN for SPONSORED_UPDATES creatives.' },
+            // Creative — text ad
+            headline: { type: 'string', description: 'Text ad headline. Required for CREATIVE/CREATE text ads.' },
+            description: { type: 'string', description: 'Text ad description.' },
+            landing_page: { type: 'string', description: 'Landing page URL for text ads.' },
+            // Creative — VAST Tag Video Ad
+            vast_tag_url: { type: 'string', description: 'VAST tag URL for third-party video ads (e.g. from Innovid). Required for CREATIVE/CREATE VAST video.' },
+            // Creative — Event Ad
+            pre_event_registration_image: { type: 'string', description: 'Image URN for pre-event registration. Optional for event ad creatives.' },
+            // Creative — Dynamic Ad (Jobs / Spotlight / Follower)
+            button_label: { type: 'string', description: 'CTA button text for Jobs dynamic ads (CREATIVE/CREATE_DYNAMIC format=JOBS).' },
+            call_to_action: { type: 'string', description: 'CTA text for Spotlight/Follower dynamic ads.' },
+            background_image_urn: { type: 'string', description: 'Background image URN for Spotlight dynamic ads.' },
+            logo_urn: { type: 'string', description: 'Logo image URN for Spotlight dynamic ads.' },
+            // Post
+            commentary: { type: 'string', description: 'Post text content.' },
+            visibility: { type: 'string', enum: ['PUBLIC', 'CONNECTIONS', 'LOGGED_IN'], description: 'Post visibility.' },
+            feed_distribution: { type: 'string', enum: ['NONE', 'MAIN_FEED'], description: 'NONE = dark post (ad only, not shown on company page). MAIN_FEED = visible on company page AND runs as sponsored ad.' },
+            // Post — Article Ad
+            article_url: { type: 'string', description: 'URL of the article to feature. Required for POST/CREATE article ads.' },
+            article_title: { type: 'string', description: 'Article title override for article ads.' },
+            article_description: { type: 'string', description: 'Article description override for article ads.' },
+            thumbnail_urn: { type: 'string', description: 'Image URN to use as article thumbnail. Optional — LinkedIn auto-fetches if omitted.' },
+            // Targeting search
+            facet: { type: 'string', description: 'Targeting facet URN (e.g. urn:li:adTargetingFacet:locations).' },
+            query: { type: 'string', description: 'Search query for TARGETING SEARCH.' },
+            // Post media
+            image_url: { type: 'string', description: 'Public URL of the image to upload. Required for MEDIA/UPLOAD_IMAGE.' },
+            image_urn: { type: 'string', description: 'Image URN returned by MEDIA/UPLOAD_IMAGE. Use in CREATIVE/CREATE_INLINE or POST/CREATE.' },
+            carousel_cards: {
+              type: 'array',
+              description: 'Carousel ad cards. Each: { image_urn, title, landing_page }.',
+              items: {
+                type: 'object',
+                properties: {
+                  image_urn: { type: 'string' },
+                  title: { type: 'string' },
+                  landing_page: { type: 'string' },
+                }
+              }
+            },
+            // Media upload — video
+            video_url: { type: 'string', description: 'Public URL of the video file. Required for MEDIA/UPLOAD_VIDEO. File size is auto-detected — do NOT ask the user.' },
+            video_urn: { type: 'string', description: 'Video URN returned by MEDIA/UPLOAD_VIDEO. Use in CREATIVE/CREATE_INLINE.' },
+            file_size: { type: 'number', description: 'Video file size in bytes. Required for MEDIA/INIT_VIDEO_UPLOAD only (legacy — prefer UPLOAD_VIDEO instead).' },
+            // Media upload — document
+            document_url: { type: 'string', description: 'Public URL of the document (PDF, PPT, DOC). Required for MEDIA/UPLOAD_DOCUMENT.' },
+            document_urn: { type: 'string', description: 'Document URN returned by MEDIA/UPLOAD_DOCUMENT. Use in POST/CREATE for document ads.' },
+            // InMail / Message Ad
+            subject: { type: 'string', description: 'InMail subject line.' },
+            htmlBody: { type: 'string', description: 'InMail body content (HTML allowed).' },
+            callToActionText: { type: 'string', description: 'CTA button text (max 20 characters).' },
+            callToActionLandingPageUrl: { type: 'string', description: 'URL the CTA button links to.' },
+            salutationText: { type: 'string', description: 'Optional salutation (e.g. "Hi %FIRSTNAME%,").' },
+            senderName: { type: 'string', description: 'Optional display name for the sender.' },
+            senderTitle: { type: 'string', description: 'Optional job title of the sender.' },
+            senderCompany: { type: 'string', description: 'Optional company name of the sender.' },
+            inmail_content_urn: { type: 'string', description: 'InMail content URN (INMAIL/CREATE_CONTENT result). Use in CREATIVE/CREATE.' },
+            recipient_email: { type: 'string', description: 'Email address to send test InMail to. Required for INMAIL/SEND_TEST.' },
+            // Conversation Ad
+            conversation_ad_urn: { type: 'string', description: 'Conversation Ad URN from CONVERSATION_AD/CREATE. Used in CREATE_CONTENT and SET_FIRST_CONTENT.' },
+            body: { type: 'string', description: 'Message body text for CONVERSATION_AD/CREATE_CONTENT.' },
+            footer: { type: 'string', description: 'Optional footer text for conversation ad messages.' },
+            buttons: {
+              type: 'array',
+              description: 'CTA buttons for CONVERSATION_AD/CREATE_CONTENT. Each: { text, action: OPEN_URL|SEND_MESSAGE, url? }.',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string' },
+                  action: { type: 'string', enum: ['OPEN_URL', 'SEND_MESSAGE'] },
+                  url: { type: 'string' },
+                }
+              }
+            },
+            first_content_urn: { type: 'string', description: 'First message node URN. Required for CONVERSATION_AD/SET_FIRST_CONTENT.' },
+          }
+        }
+      },
+      required: ['entity_type', 'action', 'account_id']
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.callLinkedInMarketingApi(
+      context?.userId,
+      args.entity_type,
+      args.action,
+      args.account_id,
+      args.params,
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'call_linkedin_ads_insights_api',
+  definition: {
+    name: 'call_linkedin_ads_insights_api',
+    description: `Fetch LinkedIn Ads performance analytics (impressions, clicks, spend, conversions, etc.).
+Analytics are synchronous — results return immediately, no polling needed.
+
+PIVOT OPTIONS (what dimension to group by):
+  CAMPAIGN, CAMPAIGN_GROUP, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
+  MEMBER_INDUSTRY, MEMBER_SENIORITY, MEMBER_JOB_FUNCTION, MEMBER_COUNTRY_V2,
+  MEMBER_REGION_V2, PLACEMENT_NAME, IMPRESSION_DEVICE_TYPE
+
+TIME_GRANULARITY: ALL (totals only), DAILY, MONTHLY, YEARLY
+
+COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, videoViews,
+  videoCompletions, leadGenerationMailContactInfoShares, oneClickLeads`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: "LinkedIn Ads account ID from list_connected_accounts(platform='linkedin_ads')."
+        },
+        pivot: {
+          type: 'string',
+          description: 'Dimension to group results by (e.g. CAMPAIGN, CREATIVE, MEMBER_COUNTRY_V2).'
+        },
+        dateRange: {
+          type: 'object',
+          description: 'Date range. { start: { year, month, day }, end: { year, month, day } }',
+          properties: {
+            start: { type: 'object', properties: { year: { type: 'number' }, month: { type: 'number' }, day: { type: 'number' } }, required: ['year', 'month', 'day'] },
+            end: { type: 'object', properties: { year: { type: 'number' }, month: { type: 'number' }, day: { type: 'number' } }, required: ['year', 'month', 'day'] }
+          },
+          required: ['start', 'end']
+        },
+        timeGranularity: {
+          type: 'string',
+          enum: ['ALL', 'DAILY', 'MONTHLY', 'YEARLY'],
+          description: 'Time aggregation. Default: ALL (totals only).'
+        },
+        fields: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Metrics to return. Common: impressions, clicks, costInLocalCurrency, totalEngagements.'
+        },
+        campaigns: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of campaign URNs to filter by.'
+        },
+        creatives: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of creative URNs to filter by.'
+        }
+      },
+      required: ['account_id', 'pivot', 'dateRange']
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.callLinkedInAdsInsightsApi(
+      context?.userId,
+      args.account_id,
+      {
+        pivot: args.pivot,
+        dateRange: args.dateRange,
+        timeGranularity: args.timeGranularity,
+        fields: args.fields,
+        campaigns: args.campaigns,
+        creatives: args.creatives,
+      }
+    );
+  }
+});
+
 emmaToolRegistry.register({
   name: 'get_post_analytics',
   definition: {
     name: 'get_post_analytics',
     description: 'Get detailed analytics for specific posts from a connected social media account. Returns engagement metrics including likes, comments, shares, impressions, and clicks.',
     inputSchema: {
-            type: 'object',
-            properties: {
-              account_id: { 
-                type: 'string', 
-                description: 'The connected account ID (must belong to the authenticated user)' 
-              },
-              post_ids: { 
-                type: 'array', 
-                items: { type: 'string' },
-                description: 'Array of post IDs to fetch analytics for (e.g., LinkedIn URNs like "urn:li:share:123")'
-              }
-            },
-            required: ['account_id', 'post_ids']
-          }
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The connected account ID (must belong to the authenticated user)'
         },
-    execute: async (args, context) => {
-      return await agentModeService.getPostAnalytics(context?.userId, args.account_id, args.post_ids);
+        post_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of post IDs to fetch analytics for (e.g., LinkedIn URNs like "urn:li:share:123")'
+        }
+      },
+      required: ['account_id', 'post_ids']
     }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.getPostAnalytics(context?.userId, args.account_id, args.post_ids);
   }
+}
 );
 
 emmaToolRegistry.register({
@@ -859,11 +1199,11 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     return await agentModeService.performDeepResearchTool(
-      args.topic, 
-      args.prompt, 
-      args.tone || 'professional', 
-      args.depth || 'detailed', 
-      args.focus_areas, 
+      args.topic,
+      args.prompt,
+      args.tone || 'professional',
+      args.depth || 'detailed',
+      args.focus_areas,
       context?.userId
     );
   }
@@ -1223,14 +1563,14 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.createBlogArticle(
-      args.title_draft, 
-      args.content_draft, 
-      args.length || 'medium', 
-      args.researchContext || '', 
-      args.requirements || '', 
-      context?.userId, 
-      context?.sessionId, 
-      args.style || 'default', 
+      args.title_draft,
+      args.content_draft,
+      args.length || 'medium',
+      args.researchContext || '',
+      args.requirements || '',
+      context?.userId,
+      context?.sessionId,
+      args.style || 'default',
       args.deep_research || false
     );
   }
@@ -1355,8 +1695,8 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.repairBlogArticle(
-      args.article_url, 
-      context?.userId, 
+      args.article_url,
+      context?.userId,
       context?.sessionId
     );
   }
@@ -1562,11 +1902,11 @@ emmaToolRegistry.register({
   definition: {
     name: 'list_gtm_plans',
     description: 'List all Go-To-Market (GTM) plans for the current user. Returns a list of plans with their IDs, titles, descriptions, phase counts, and creation dates.',
-    inputSchema: { 
+    inputSchema: {
       type: 'object',
       properties: {
       },
-      required: [] 
+      required: []
     }
   },
   execute: async (args: any, context?: any) => {
@@ -1581,7 +1921,7 @@ emmaToolRegistry.register({
     description: 'Read a specific GTM plan by its plan ID. Returns the complete plan details including all phases and work items with their statuses, durations, and completion times.',
     inputSchema: {
       type: 'object',
-      properties: { 
+      properties: {
         plan_id: {
           type: 'string',
           description: 'The unique identifier (planId) of the GTM plan to read'
@@ -2120,10 +2460,10 @@ emmaToolRegistry.register({
   definition: {
     name: 'get_lead_lists',
     description: 'Get all lead lists for the current user. Returns a list of lead lists with their IDs, names, descriptions, lead counts, and creation dates.',
-    inputSchema: { 
-      type: 'object', 
+    inputSchema: {
+      type: 'object',
       properties: {
-      } 
+      }
     }
   },
   execute: async (args: any, context?: any) => {
@@ -2835,12 +3175,12 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.loadConnectedAccountPosts(
-      context?.userId, 
-      args.account_id, 
+      context?.userId,
+      args.account_id,
       {
         limit: args.limit,
         include_metrics: args.include_metrics
-       }
+      }
     );
   }
 });
@@ -2852,11 +3192,11 @@ emmaToolRegistry.register({
     description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement).',
     inputSchema: {
       type: 'object',
-      properties: { 
+      properties: {
         account_id: {
           type: 'string',
           description: 'The unique identifier (id) of the connected account to load metrics for'
-        } 
+        }
       },
       required: ['account_id']
     }
@@ -3004,29 +3344,29 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        template_id: { 
-          type: 'string', 
+        template_id: {
+          type: 'string',
           description: 'The template ID obtained from list_task_templates. Do not guess or fabricate template IDs.'
         },
-        parameters_json: { 
-          type: 'string', 
-          description: 'JSON string containing parameter values where keys are parameter names and values are the actual values. Example: {"site_url": "example.com", "business_area": "e-commerce"}' 
+        parameters_json: {
+          type: 'string',
+          description: 'JSON string containing parameter values where keys are parameter names and values are the actual values. Example: {"site_url": "example.com", "business_area": "e-commerce"}'
         },
-        attach_previous_task_results: { 
-          type: 'boolean', 
-          default: true, 
-          description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.', 
+        attach_previous_task_results: {
+          type: 'boolean',
+          default: true,
+          description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
         },
-        attached_file_urls: { 
+        attached_file_urls: {
           type: 'array',
           items: { type: 'string' },
           description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
-          default: [] 
+          default: []
         },
-        async: { 
+        async: {
           type: 'boolean',
           description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
-          default: false 
+          default: false
         }
       },
       required: ['template_id', 'parameters_json']
@@ -3035,7 +3375,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     let parameters = args.parameters_json;
     if (typeof parameters === 'string') {
-      try { parameters = JSON.parse(args.parameters_json); } catch (e) {}
+      try { parameters = JSON.parse(args.parameters_json); } catch (e) { }
     }
     return await agentModeService.createTaskFromTemplate(
       args.template_id,
@@ -4640,14 +4980,14 @@ emmaToolRegistry.register({
     const { runCodingAgent } = await import('../services/codingAgentService');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
-          return context.service.executeTool(
-            context.llmModel || 'anthropic.claude-sonnet-4-6',
-            toolName,
-            toolArgs,
-            context.userId,
-            context.sessionId
-          );
-        }
+        return context.service.executeTool(
+          context.llmModel || 'anthropic.claude-sonnet-4-6',
+          toolName,
+          toolArgs,
+          context.userId,
+          context.sessionId
+        );
+      }
       : undefined;
 
     // Use a draft branch for staging — derive from session ID

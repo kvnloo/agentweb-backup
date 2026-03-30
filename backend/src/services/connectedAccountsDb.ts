@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -129,7 +129,14 @@ export interface FathomConfig {
   token_expires_at: number;
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig; // | TwitterConfig
+export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
+  account_type: 'ad_account';
+  currency: string;
+  status: string;
+  scopes?: string[];
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig; // | TwitterConfig
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data

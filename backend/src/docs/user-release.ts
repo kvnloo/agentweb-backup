@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-30',
     changes: [
+      'Improvement: Mark Work Item as Done (GTM Tracker)',
+      '- Added a one-click "Mark as Done" button per work item in the GTM Tracker page',
+      '- Button appears on pending, in-progress, and pending-review items — not on already-completed or skipped items',
+      '- Available in both the customer portal and the admin portal',
       'Admin: Configurable Coding Agent LLM Model (Partner Portal)',
       '- Admins can now select which Claude model the coding agent uses for landing page edits in the Agent Mode settings tab',
       '- Default model is now Claude Sonnet 4.6 for better cost efficiency',
@@ -20,6 +24,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed a bug where viewing lead details in the CRM or asking Emma for lead information would fail with an error when the lead had email engagement history',
       '- The issue occurred because email content is stored as an object with html/text fields, but the code was treating it as a plain string',
       '- Engagement history now loads correctly and displays email previews properly',
+      'Fix: LinkedIn Scheduled Outreach Context Overload',
+      '- Fixed a bug where daily LinkedIn outreach schedules would accumulate too many tokens over time, causing the agent to produce empty responses or fall back to generic connection messages',
+      '- The pending invitations list and search results were returning full profile data unnecessarily, inflating context to 600k-700k tokens per session',
+      '- Both results are now trimmed to only the fields needed for deduplication and personalization',
     ],
   },
   {
