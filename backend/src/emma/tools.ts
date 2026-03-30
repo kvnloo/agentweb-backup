@@ -2,9 +2,6 @@ import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb, userDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
-import { createOncallItem } from '../services/notionService';
-import { emailService } from '../services/emailService';
-import { resendService } from '../services/resendService';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -5261,6 +5258,11 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // Lazy imports to avoid pulling in heavy dependencies at module load time
+    const { createOncallItem } = await import('../services/notionService');
+    const { emailService } = await import('../services/emailService');
+    const { resendService } = await import('../services/resendService');
+
     const userId = context?.userId;
     if (!userId) {
       throw new Error('Authentication required to report issues');
