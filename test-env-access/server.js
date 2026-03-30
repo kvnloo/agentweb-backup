@@ -359,6 +359,135 @@ let currentActivity = "idle"; // "idle" | "processing: <prompt snippet>" | "wait
 let lastPromptTime = null;
 let lastResponseTime = null;
 
+// ---------------------------------------------------------------------------
+// Fetch attachments from Notion page (images, files, PDFs, videos)
+// ---------------------------------------------------------------------------
+const ATTACHMENTS_DIR = "/home/ec2-user/agentweb/.notion-attachments";
+
+async function fetchNotionAttachments(notionPageId) {
+  try {
+    const notionToken = fs.readFileSync("/home/ec2-user/agentweb/.notion-token", "utf-8").trim();
+    if (!notionToken) return [];
+
+    // Fetch page properties for file-type properties
+    const pageRes = await fetch(`https://api.notion.com/v1/pages/${notionPageId}`, {
+      headers: {
+        Authorization: `Bearer ${notionToken}`,
+        "Notion-Version": "2022-06-28",
+      },
+    });
+    const pageJson = await pageRes.json();
+
+    // Fetch page blocks for inline images/files
+    const blocksRes = await fetch(
+      `https://api.notion.com/v1/blocks/${notionPageId}/children?page_size=100`,
+      {
+        headers: {
+          Authorization: `Bearer ${notionToken}`,
+          "Notion-Version": "2022-06-28",
+        },
+      }
+    );
+    const blocksJson = await blocksRes.json();
+
+    // Fetch page comments for comment-level attachments (screenshots pasted in comments)
+    const commentsRes = await fetch(
+      `https://api.notion.com/v1/comments?block_id=${notionPageId}&page_size=100`,
+      {
+        headers: {
+          Authorization: `Bearer ${notionToken}`,
+          "Notion-Version": "2022-06-28",
+        },
+      }
+    );
+    const commentsJson = await commentsRes.json();
+
+    const attachments = [];
+
+    // Extract from page-level file properties
+    if (pageJson.properties) {
+      for (const [, prop] of Object.entries(pageJson.properties)) {
+        if (prop.type === "files" && Array.isArray(prop.files)) {
+          for (const f of prop.files) {
+            const url = f.type === "file" ? f.file?.url : f.external?.url;
+            if (url) attachments.push({ url, name: f.name || "attachment" });
+          }
+        }
+      }
+    }
+
+    // Extract from block-level images, files, PDFs, videos
+    for (const block of blocksJson.results || []) {
+      if (!["image", "file", "pdf", "video"].includes(block.type)) continue;
+      const content = block[block.type];
+      if (!content) continue;
+      const url = content.type === "file" ? content.file?.url : content.external?.url;
+      if (!url) continue;
+      let name;
+      if (content.caption?.length > 0) {
+        name = content.caption.map((c) => c.plain_text).join("");
+      } else if (content.name) {
+        name = content.name;
+      } else {
+        name = url.split("/").pop().split("?")[0];
+      }
+      attachments.push({ url, name: name || "attachment" });
+    }
+
+    // Extract from comment attachments (screenshots pasted in Notion comments)
+    for (const comment of commentsJson.results || []) {
+      if (!comment.attachments?.length) continue;
+      const commentId = comment.id.split("-").pop(); // short suffix for uniqueness
+      for (let i = 0; i < comment.attachments.length; i++) {
+        const att = comment.attachments[i];
+        const url = att.file?.url;
+        if (!url) continue;
+        const rawName = url.split("/").pop().split("?")[0] || "attachment";
+        // Prefix with comment ID suffix to avoid name collisions across comments
+        const name = `${commentId}-${rawName}`;
+        attachments.push({ url, name });
+      }
+    }
+
+    console.log(`[relay] Notion attachments found: ${attachments.length} (blocks: ${blocksJson.results?.length || 0}, comments with attachments: ${(commentsJson.results || []).filter(c => c.attachments?.length).length})`);
+    return attachments;
+  } catch (err) {
+    console.error("[relay] Error fetching Notion attachments:", err);
+    return [];
+  }
+}
+
+async function downloadAttachments(attachments) {
+  fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+  const existing = new Set(fs.readdirSync(ATTACHMENTS_DIR));
+  const downloaded = [];
+
+  for (const { url, name } of attachments) {
+    // Sanitize filename
+    const safeName = name.replace(/\//g, "").replace(/[^\x20-\x7E]/g, "") || `attachment_${Date.now()}`;
+    if (existing.has(safeName)) {
+      // Already downloaded in a prior prompt — skip
+      continue;
+    }
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.error(`[relay] Failed to download ${safeName}: ${res.status}`);
+        continue;
+      }
+      const dest = path.join(ATTACHMENTS_DIR, safeName);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(dest, buffer);
+      downloaded.push(dest);
+      console.log(`[relay] Downloaded attachment: ${safeName}`);
+    } catch (err) {
+      console.error(`[relay] Error downloading ${safeName}:`, err);
+    }
+  }
+
+  return downloaded;
+}
+
 async function processQueue() {
   if (processing || promptQueue.length === 0) return;
   processing = true;
@@ -370,7 +499,16 @@ async function processQueue() {
     lastPromptTime = new Date();
 
     try {
-      const output = await runClaude(prompt);
+      // Fetch and download any attachments from the Notion page
+      const attachments = await fetchNotionAttachments(notionPageId);
+      const downloadedPaths = await downloadAttachments(attachments);
+
+      let enrichedPrompt = prompt;
+      if (downloadedPaths.length > 0) {
+        enrichedPrompt += `\n\nIMPORTANT: The following screenshot/image attachments from the Notion page have been downloaded. You MUST use the Read tool to view each image file BEFORE starting any work — these contain critical visual context for the task:\n${downloadedPaths.map((p) => `- ${p}`).join("\n")}`;
+      }
+
+      const output = await runClaude(enrichedPrompt);
       lastResponseTime = new Date();
 
       // Check for retry directive: [RELAY_RETRY_AFTER:<seconds>]
@@ -499,7 +637,7 @@ function runClaude(prompt) {
     const escaped = prompt.replace(/'/g, "'\\''");
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model opus --permission-mode auto --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model sonnet --permission-mode auto --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
