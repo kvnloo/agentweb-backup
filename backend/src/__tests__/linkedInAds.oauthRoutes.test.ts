@@ -61,7 +61,7 @@ const app = express();
 app.use(express.json());
 app.use('/', router);
 
-const makeState = (userId: string, expiresIn = '15m') =>
+const makeState = (userId: string, expiresIn: jwt.SignOptions['expiresIn'] = '15m') =>
   jwt.sign({ userId, nonce: 'abc123' }, JWT_SECRET, { expiresIn });
 
 beforeEach(() => {

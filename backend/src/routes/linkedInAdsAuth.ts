@@ -178,7 +178,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     // Fetch the authenticated person's LinkedIn member ID (r_basicprofile scope)
     let personUrn: string | undefined;
     try {
-      const meResp = await axios.get('https://api.linkedin.com/v2/me', {
+      const meResp = await axios.get<{ id?: string }>('https://api.linkedin.com/v2/me', {
         headers: { Authorization: `Bearer ${access_token}` },
       });
       const memberId = meResp.data?.id;
@@ -208,8 +208,6 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       scopes: config.scopes,
       personUrn,
     }, adAccountRefs);
-
-    console.log("adAccounts", adAccounts);
 
     res.json({ success: true, adAccounts, tokenSessionId });
   } catch (error: any) {

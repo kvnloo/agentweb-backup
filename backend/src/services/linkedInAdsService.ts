@@ -470,6 +470,8 @@ export async function createCreative(
     return { success: false, error: 'Carousel ads must use CREATIVE/CREATE_INLINE, not CREATIVE/CREATE. Use createCreativeInline instead.' };
   }
 
+  if (!params.campaign_id) return { success: false, error: 'CREATIVE CREATE requires campaign_id' };
+
   let body: Record<string, any> = {
     campaign: params.campaign_id.startsWith('urn:') ? params.campaign_id : `urn:li:sponsoredCampaign:${params.campaign_id}`,
     intendedStatus: params.status || 'ACTIVE',
