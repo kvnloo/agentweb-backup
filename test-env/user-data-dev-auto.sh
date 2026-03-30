@@ -448,7 +448,7 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
-RAW=$(claude --model sonnet --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
+RAW=$(claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
