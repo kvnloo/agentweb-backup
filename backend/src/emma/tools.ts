@@ -4878,41 +4878,52 @@ emmaToolRegistry.register({
   }
 });
 
-// --- Report product issue tool ---
+// --- Report product issues tool ---
 
 emmaToolRegistry.register({
-  name: 'report_product_issue',
+  name: 'report_product_issues',
   definition: {
-    name: 'report_product_issue',
-    description: 'Report a product issue or bug. Creates a tracked item in the engineering sprint board and notifies the oncall team. Use this when users encounter errors, unexpected behavior, or want to request a fix.',
+    name: 'report_product_issues',
+    description: 'Report one or more product issues or bugs. Creates tracked items in the engineering sprint board and notifies the oncall team. Use this when users encounter errors, unexpected behavior, or want to request fixes. Batch multiple issues into a single call when possible.',
     inputSchema: {
       type: 'object',
       properties: {
-        title: {
-          type: 'string',
-          description: 'Short title for the issue (e.g., "Login page crashes on mobile")'
-        },
-        description: {
-          type: 'string',
-          description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior'
-        },
-        priority: {
-          type: 'string',
-          enum: ['High', 'Medium', 'Low'],
-          description: 'Priority level. Default: Medium'
-        },
-        pageUrl: {
-          type: 'string',
-          description: 'URL of the page where the issue occurred (optional)'
+        issues: {
+          type: 'array',
+          description: 'Array of issues to report',
+          items: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Short title for the issue (e.g., "Login page crashes on mobile")'
+              },
+              description: {
+                type: 'string',
+                description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior'
+              },
+              priority: {
+                type: 'string',
+                enum: ['High', 'Medium', 'Low'],
+                description: 'Priority level. Default: Medium'
+              },
+              pageUrl: {
+                type: 'string',
+                description: 'URL of the page where the issue occurred (optional)'
+              }
+            },
+            required: ['title', 'description']
+          },
+          minItems: 1
         }
       },
-      required: ['title', 'description']
+      required: ['issues']
     }
   },
   execute: async (args: any, context: any) => {
     const userId = context?.userId;
     if (!userId) {
-      throw new Error('Authentication required to report an issue');
+      throw new Error('Authentication required to report issues');
     }
 
     const user = await userDb.getUserById(userId);
@@ -4920,55 +4931,71 @@ emmaToolRegistry.register({
       throw new Error('User not found');
     }
 
-    const issueContext: Record<string, any> = {
-      'User Email': user.email,
-      'User ID': userId,
-      'Page URL': args.pageUrl || 'N/A',
-      'Session ID': context?.sessionId || 'N/A',
-    };
+    const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
 
-    const result = await createOncallItem({
-      title: args.title,
-      description: args.description,
-      additionalTags: ['Customer Reported'],
-      context: issueContext,
-    });
+    for (const issue of args.issues) {
+      try {
+        const issueContext: Record<string, any> = {
+          'User Email': user.email,
+          'User ID': userId,
+          'Page URL': issue.pageUrl || 'N/A',
+          'Session ID': context?.sessionId || 'N/A',
+        };
 
-    // Send slim oncall alert email with the Notion URL (skips duplicate Notion creation)
-    await emailService.sendOncallAlert(
-      `Customer Report: ${args.title}`,
-      args.description,
-      issueContext,
-      result.notionUrl
-    );
+        const result = await createOncallItem({
+          title: issue.title,
+          description: issue.description,
+          additionalTags: ['Customer Reported'],
+          context: issueContext,
+        });
 
-    // Send support email to founders (reuses Get Support pattern)
-    await resendService.sendEmail({
-      from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-      to: 'founders@agentweb.pro',
-      subject: `Product Issue from ${user.email}: ${args.title}`,
-      html: `
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
-            <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
-          </div>
-          <div style="margin: 8px 0;"><strong>From:</strong> ${user.displayName || user.email} (${user.email})</div>
-          <div style="margin: 8px 0;"><strong>Priority:</strong> ${args.priority || 'Medium'}</div>
-          <div style="margin: 8px 0;"><strong>Page URL:</strong> ${args.pageUrl || 'N/A'}</div>
-          <div style="margin: 8px 0;"><strong>Notion:</strong> <a href="${result.notionUrl}">${result.notionUrl}</a></div>
-          <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
-            <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
-            <div>${args.description.replace(/\n/g, '<br>')}</div>
-          </div>
-        </div>
-      `,
-      replyTo: user.email,
-    });
+        // Send slim oncall alert email with the Notion URL (skips duplicate Notion creation)
+        await emailService.sendOncallAlert(
+          `Customer Report: ${issue.title}`,
+          issue.description,
+          issueContext,
+          result.notionUrl
+        );
+
+        // Send support email to founders (reuses Get Support pattern)
+        await resendService.sendEmail({
+          from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
+          to: 'founders@agentweb.pro',
+          subject: `Product Issue from ${user.email}: ${issue.title}`,
+          html: `
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
+              </div>
+              <div style="margin: 8px 0;"><strong>From:</strong> ${user.displayName || user.email} (${user.email})</div>
+              <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
+              <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
+              <div style="margin: 8px 0;"><strong>Notion:</strong> <a href="${result.notionUrl}">${result.notionUrl}</a></div>
+              <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
+                <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
+                <div>${issue.description.replace(/\n/g, '<br>')}</div>
+              </div>
+            </div>
+          `,
+          replyTo: user.email,
+        });
+
+        results.push({ title: issue.title, success: true, notionUrl: result.notionUrl });
+      } catch (err: any) {
+        results.push({ title: issue.title, success: false, error: err.message });
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    const failCount = results.filter(r => !r.success).length;
+    const summary = failCount === 0
+      ? `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.`
+      : `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
 
     return {
-      success: true,
-      message: `Issue "${args.title}" has been reported and tracked. The engineering team has been notified.`,
-      notionUrl: result.notionUrl,
+      success: failCount === 0,
+      message: summary,
+      results,
     };
   }
 });

@@ -1,4 +1,4 @@
-// Unit tests for report_product_issue tool
+// Unit tests for report_product_issues tool
 
 // Mock dependencies BEFORE any imports
 jest.mock('../../services/notionService', () => ({
@@ -69,14 +69,14 @@ const mockCreateOncallItem = createOncallItem as jest.MockedFunction<typeof crea
 const mockGetUserById = userDb.getUserById as jest.MockedFunction<typeof userDb.getUserById>;
 const mockResendSendEmail = resendService.sendEmail as jest.MockedFunction<typeof resendService.sendEmail>;
 
-describe('report_product_issue tool', () => {
+describe('report_product_issues tool', () => {
   let toolExecute: (args: any, context: any) => Promise<any>;
 
   beforeAll(async () => {
-    // Load tools (registers report_product_issue)
+    // Load tools (registers report_product_issues)
     await import('../../emma/tools');
 
-    const tool = emmaToolRegistry.getTool('report_product_issue');
+    const tool = emmaToolRegistry.getTool('report_product_issues');
     expect(tool).toBeDefined();
     toolExecute = tool!.execute;
   });
@@ -98,7 +98,7 @@ describe('report_product_issue tool', () => {
 
   it('should throw if no userId in context', async () => {
     await expect(toolExecute(
-      { title: 'Bug', description: 'It broke' },
+      { issues: [{ title: 'Bug', description: 'It broke' }] },
       {}
     )).rejects.toThrow('Authentication required');
   });
@@ -107,19 +107,20 @@ describe('report_product_issue tool', () => {
     mockGetUserById.mockResolvedValueOnce(null as any);
 
     await expect(toolExecute(
-      { title: 'Bug', description: 'It broke' },
+      { issues: [{ title: 'Bug', description: 'It broke' }] },
       { userId: 'unknown-user' }
     )).rejects.toThrow('User not found');
   });
 
-  it('should create Notion item with Oncall and Customer Reported tags', async () => {
+  it('should create Notion item with Oncall and Customer Reported tags for a single issue', async () => {
     const result = await toolExecute(
-      { title: 'Login fails', description: 'Cannot log in on mobile', priority: 'High', pageUrl: 'https://app.example.com/login' },
+      { issues: [{ title: 'Login fails', description: 'Cannot log in on mobile', priority: 'High', pageUrl: 'https://app.example.com/login' }] },
       { userId: 'user-123', sessionId: 'sess-456' }
     );
 
     expect(result.success).toBe(true);
-    expect(result.notionUrl).toBe('https://notion.so/notionpageid');
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].notionUrl).toBe('https://notion.so/notionpageid');
 
     expect(mockCreateOncallItem).toHaveBeenCalledWith({
       title: 'Login fails',
@@ -134,9 +135,52 @@ describe('report_product_issue tool', () => {
     });
   });
 
+  it('should process multiple issues in one call', async () => {
+    mockCreateOncallItem
+      .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })
+      .mockResolvedValueOnce({ pageId: 'p2', notionUrl: 'https://notion.so/p2' });
+
+    const result = await toolExecute(
+      { issues: [
+        { title: 'Bug 1', description: 'First issue' },
+        { title: 'Bug 2', description: 'Second issue', pageUrl: 'https://app.example.com/page2' },
+      ] },
+      { userId: 'user-123' }
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.results).toHaveLength(2);
+    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, notionUrl: 'https://notion.so/p1' });
+    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, notionUrl: 'https://notion.so/p2' });
+    expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
+    expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(2);
+    expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
+  });
+
+  it('should handle partial failures gracefully', async () => {
+    mockCreateOncallItem
+      .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })
+      .mockRejectedValueOnce(new Error('Notion API error'));
+
+    const result = await toolExecute(
+      { issues: [
+        { title: 'Good issue', description: 'This works' },
+        { title: 'Bad issue', description: 'This fails' },
+      ] },
+      { userId: 'user-123' }
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.results).toHaveLength(2);
+    expect(result.results[0].success).toBe(true);
+    expect(result.results[1].success).toBe(false);
+    expect(result.results[1].error).toBe('Notion API error');
+    expect(result.message).toContain('1 of 2');
+  });
+
   it('should send oncall alert email with Notion URL (no duplicate creation)', async () => {
     await toolExecute(
-      { title: 'Bug', description: 'Desc' },
+      { issues: [{ title: 'Bug', description: 'Desc' }] },
       { userId: 'user-123' }
     );
 
@@ -150,7 +194,7 @@ describe('report_product_issue tool', () => {
 
   it('should send support email to founders', async () => {
     await toolExecute(
-      { title: 'Bug', description: 'Desc', pageUrl: 'https://app.example.com/page' },
+      { issues: [{ title: 'Bug', description: 'Desc', pageUrl: 'https://app.example.com/page' }] },
       { userId: 'user-123' }
     );
 
@@ -165,7 +209,7 @@ describe('report_product_issue tool', () => {
 
   it('should handle missing pageUrl and sessionId gracefully', async () => {
     await toolExecute(
-      { title: 'Bug', description: 'Desc' },
+      { issues: [{ title: 'Bug', description: 'Desc' }] },
       { userId: 'user-123' }
     );
 
