@@ -9,6 +9,7 @@ import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
+import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
@@ -3253,6 +3254,11 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
         console.error("Error sending notifications:", notificationError);
         // Don't fail the request if notifications fail
       }
+    }
+
+    // Notify Slack thread if work item was just marked completed
+    if (status === "completed" && originalItem.status !== "completed") {
+      notifySlackWorkItemCompleted(updatedWorkItem).catch(() => {});
     }
 
     return res.json({
