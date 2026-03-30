@@ -16,6 +16,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Default model is now Claude Sonnet 4.6 for better cost efficiency',
       '- Claude Opus 4.6 is available as an option for more complex coding tasks that require advanced reasoning',
       '- The selected model is stored in the database and persists across sessions',
+      'Fix: CRM Engagement History Loading',
+      '- Fixed a bug where viewing lead details in the CRM or asking Emma for lead information would fail with an error when the lead had email engagement history',
+      '- The issue occurred because email content is stored as an object with html/text fields, but the code was treating it as a plain string',
+      '- Engagement history now loads correctly and displays email previews properly',
     ],
   },
   {
