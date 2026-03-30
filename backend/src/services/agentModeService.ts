@@ -18701,6 +18701,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
             keywords, url: search_url, title, company, cursor
           });
+          // Trim search results to essential fields to prevent context window bloat.
+          // Full profiles (skills, education, photos, etc.) are not needed for outreach decisions.
+          if (searchResult?.items && Array.isArray(searchResult.items)) {
+            const trimmedItems = searchResult.items.map((item: any) => {
+              const trimmed: any = {
+                provider_id: item.provider_id,
+                public_identifier: item.public_identifier,
+                first_name: item.first_name,
+                last_name: item.last_name,
+                headline: item.headline,
+                location: item.location,
+                network_distance: item.network_distance,
+                public_profile_url: item.public_profile_url,
+                is_open_profile: item.is_open_profile,
+              };
+              // Keep only current work experience for personalization context
+              if (item.work_experience?.length) {
+                const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+                if (current) trimmed.current_role = { position: current.position, company: current.company };
+              }
+              // Keep summary but truncate to 200 chars to avoid long bios inflating context
+              if (item.summary) trimmed.summary = item.summary.slice(0, 200);
+              return trimmed;
+            });
+            return { success: true, data: { ...searchResult, items: trimmedItems } };
+          }
           return { success: true, data: searchResult };
         }
 
@@ -18721,6 +18747,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-sent-invitations': {
           const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          // Trim each invitation to only the fields needed for deduplication.
+          // This list grows ~10 entries/day and can reach 200+ entries with full profile data,
+          // causing severe context window bloat in long-running scheduled sessions.
+          if (invitationsResult?.items && Array.isArray(invitationsResult.items)) {
+            const trimmedItems = invitationsResult.items.map((item: any) => ({
+              id: item.id,                                    // needed for cancel-invitation
+              invited_user_id: item.invited_user_id,         // provider_id for deduplication
+              invited_user_public_id: item.invited_user_public_id, // LinkedIn vanity id
+              invited_user: item.invited_user,               // name for reference
+            }));
+            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
+          }
           return { success: true, data: invitationsResult };
         }
 
