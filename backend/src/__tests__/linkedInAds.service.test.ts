@@ -109,8 +109,10 @@ describe('listCampaignGroups', () => {
 });
 
 describe('createCampaignGroup', () => {
+  const RUN_START = 1700000000000;
+
   it('makes POST with account URN and name', async () => {
-    await svc.createCampaignGroup(ACCESS_TOKEN, ACCOUNT_ID, { name: 'My Group', status: 'ACTIVE' });
+    await svc.createCampaignGroup(ACCESS_TOKEN, ACCOUNT_ID, { name: 'My Group', status: 'ACTIVE', run_schedule_start: RUN_START });
     expect(mockAxiosFn).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'POST',
@@ -129,6 +131,7 @@ describe('createCampaignGroup', () => {
       name: 'G',
       total_budget_amount: 1000,
       total_budget_currency: 'USD',
+      run_schedule_start: RUN_START,
     });
     expect(mockAxiosFn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -137,6 +140,11 @@ describe('createCampaignGroup', () => {
         }),
       })
     );
+  });
+
+  it('throws when run_schedule_start is missing', async () => {
+    await expect(svc.createCampaignGroup(ACCESS_TOKEN, ACCOUNT_ID, { name: 'G' }))
+      .rejects.toThrow('run_schedule_start is required');
   });
 });
 
@@ -200,11 +208,12 @@ describe('createCreative', () => {
     await svc.createCreative(ACCESS_TOKEN, {
       campaign_id: 'camp-1',
       post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
     });
     expect(mockAxiosFn).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'POST',
-        url: expect.stringContaining('/rest/creatives'),
+        url: expect.stringContaining(`/rest/adAccounts/${ACCOUNT_ID}/creatives`),
         data: expect.objectContaining({
           campaign: 'urn:li:sponsoredCampaign:camp-1',
           content: { reference: 'urn:li:share:999' },
@@ -219,6 +228,7 @@ describe('createCreative', () => {
       headline: 'Click Here',
       description: 'Ad copy',
       landing_page: 'https://example.com',
+      ad_account_id: ACCOUNT_ID,
     });
     const call = mockAxiosFn.mock.calls[0][0];
     expect(call.data.content.textAd).toMatchObject({
@@ -229,9 +239,142 @@ describe('createCreative', () => {
   });
 
   it('returns error when no creative type provided', async () => {
-    const result = await svc.createCreative(ACCESS_TOKEN, { campaign_id: 'camp-1' });
+    const result = await svc.createCreative(ACCESS_TOKEN, { campaign_id: 'camp-1', ad_account_id: ACCOUNT_ID });
     expect(result.success).toBe(false);
     expect(result.error).toContain('CREATIVE CREATE requires');
+  });
+
+  it('returns error when ad_account_id is missing', async () => {
+    const result = await svc.createCreative(ACCESS_TOKEN, { campaign_id: 'camp-1', post_urn: 'urn:li:share:999' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('ad_account_id');
+  });
+});
+
+describe('createCreativeInline', () => {
+  it('posts to creatives?action=createInline endpoint', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      commentary: 'Check this out',
+    });
+    expect(mockAxiosFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: expect.stringContaining(`/rest/adAccounts/${ACCOUNT_ID}/creatives?action=createInline`),
+        data: expect.objectContaining({
+          creative: expect.objectContaining({
+            campaign: 'urn:li:sponsoredCampaign:camp-1',
+            intendedStatus: 'ACTIVE',
+          }),
+        }),
+      })
+    );
+  });
+
+  it('includes image content when image_urn provided', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      title: 'My Ad',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.inlineContent.post.content).toMatchObject({
+      media: { id: 'urn:li:image:img-1', title: 'My Ad' },
+    });
+  });
+
+  it('returns error when ad_account_id missing', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, { campaign_id: 'camp-1', author_urn: 'urn:li:organization:org-1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('ad_account_id');
+  });
+
+  it('returns error when campaign_id missing', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, { ad_account_id: ACCOUNT_ID, author_urn: 'urn:li:organization:org-1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('campaign_id');
+  });
+
+  it('returns error when author_urn missing', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, { ad_account_id: ACCOUNT_ID, campaign_id: 'camp-1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('author_urn');
+  });
+});
+
+describe('createInMailContent', () => {
+  const validParams = {
+    ad_account_id: ACCOUNT_ID,
+    name: 'Test InMail',
+    sender: 'urn:li:person:abc123',
+    subject: 'Hello from LinkedIn',
+    htmlBody: '<p>Check us out</p>',
+    callToActionText: 'Learn More',
+    callToActionLandingPageUrl: 'https://example.com',
+  };
+
+  it('posts to /rest/inMailContents with correct body', async () => {
+    await svc.createInMailContent(ACCESS_TOKEN, validParams);
+    expect(mockAxiosFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: expect.stringContaining('/rest/inMailContents'),
+        data: expect.objectContaining({
+          account: `urn:li:sponsoredAccount:${ACCOUNT_ID}`,
+          sender: 'urn:li:person:abc123',
+          subject: 'Hello from LinkedIn',
+          htmlBody: '<p>Check us out</p>',
+          subContent: {
+            regular: {
+              callToActionText: 'Learn More',
+              callToActionLandingPageUrl: 'https://example.com',
+            },
+          },
+        }),
+      })
+    );
+  });
+
+  it('returns error when sender missing', async () => {
+    const result = await svc.createInMailContent(ACCESS_TOKEN, { ...validParams, sender: '' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('sender');
+  });
+
+  it('returns error when subject missing', async () => {
+    const result = await svc.createInMailContent(ACCESS_TOKEN, { ...validParams, subject: '' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('subject');
+  });
+
+  it('returns error when htmlBody missing', async () => {
+    const result = await svc.createInMailContent(ACCESS_TOKEN, { ...validParams, htmlBody: '' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('htmlBody');
+  });
+});
+
+describe('sendTestInMail', () => {
+  it('posts to inMailContents action=sendTestInMail', async () => {
+    const inMailUrn = 'urn:li:inMailContent:123';
+    await svc.sendTestInMail(ACCESS_TOKEN, inMailUrn, 'test@example.com');
+    expect(mockAxiosFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: expect.stringContaining('action=sendTestInMail'),
+        data: expect.objectContaining({ recipient: 'test@example.com' }),
+      })
+    );
+  });
+
+  it('encodes the inMailContent URN in the URL', async () => {
+    await svc.sendTestInMail(ACCESS_TOKEN, 'urn:li:inMailContent:456', 'a@b.com');
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.url).toContain(encodeURIComponent('urn:li:inMailContent:456'));
   });
 });
 

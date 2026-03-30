@@ -61,9 +61,11 @@ interface TokenSession {
     refresh_token?: string;
     expires_in: number;
     scopes: string[];
+    personUrn?: string;
   };
   userId: string;
   expires: number;
+  adAccountRefs: { [accountId: string]: string }; // accountId → organization URN (reference field)
 }
 
 const tokenSessions = new Map<string, TokenSession>();
@@ -75,20 +77,24 @@ setInterval(() => {
   }
 }, SESSION_CLEANUP_INTERVAL_MS);
 
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens']): string => {
+const storeTokenSession = (
+  userId: string,
+  tokens: TokenSession['tokens'],
+  adAccountRefs: TokenSession['adAccountRefs']
+): string => {
   const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
+  tokenSessions.set(sessionId, { tokens, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS, adAccountRefs });
   return sessionId;
 };
 
-const retrieveTokenSession = (sessionId: string, userId: string): TokenSession['tokens'] | null => {
+const retrieveTokenSession = (sessionId: string, userId: string): TokenSession | null => {
   const session = tokenSessions.get(sessionId);
   if (!session || session.userId !== userId || Date.now() > session.expires) {
     tokenSessions.delete(sessionId);
     return null;
   }
   tokenSessions.delete(sessionId); // one-time use
-  return session.tokens;
+  return session;
 };
 
 // ── Routes ───────────────────────────────────────────────────────────────────
@@ -169,9 +175,30 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       expires_in: number;
     };
 
+    // Fetch the authenticated person's LinkedIn member ID (r_basicprofile scope)
+    let personUrn: string | undefined;
+    try {
+      const meResp = await axios.get('https://api.linkedin.com/v2/me', {
+        headers: { Authorization: `Bearer ${access_token}` },
+      });
+      const memberId = meResp.data?.id;
+      if (memberId) personUrn = `urn:li:person:${memberId}`;
+    } catch (e) {
+      console.warn('[LinkedIn Ads OAuth] Could not fetch /v2/me (person URN):', e);
+    }
+
     // Fetch the user's ad accounts so they can pick one
     const accountsResult = await listAdAccounts(access_token);
-    const adAccounts = accountsResult.data?.elements || [];
+    const adAccounts = (accountsResult.data?.elements || []).map((acc: any) => ({
+      ...acc,
+      id: String(acc.id), // LinkedIn returns numeric IDs; normalize to string for frontend
+    }));
+
+    // Build accountId → organization URN map from the reference field on each ad account
+    const adAccountRefs: { [accountId: string]: string } = {};
+    for (const acc of adAccounts) {
+      if (acc.reference) adAccountRefs[String(acc.id)] = acc.reference;
+    }
 
     // Store tokens server-side, return session ID
     const tokenSessionId = storeTokenSession(userId, {
@@ -179,7 +206,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       refresh_token,
       expires_in,
       scopes: config.scopes,
-    });
+      personUrn,
+    }, adAccountRefs);
+
+    console.log("adAccounts", adAccounts);
 
     res.json({ success: true, adAccounts, tokenSessionId });
   } catch (error: any) {
@@ -202,10 +232,13 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId or adAccountId' });
   }
 
-  const tokens = retrieveTokenSession(tokenSessionId, userId);
-  if (!tokens) {
+  const session = retrieveTokenSession(tokenSessionId, userId);
+  if (!session) {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }
+
+  const { tokens } = session;
+  const organizationUrn = session.adAccountRefs?.[String(adAccountId)];
 
   try {
     const account = await createAccount(userId, 'linkedin_ads', {
@@ -219,6 +252,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         refresh_token: tokens.refresh_token,
         token_expires_at: Date.now() + tokens.expires_in * 1000,
         scopes: tokens.scopes,
+        ...(organizationUrn && { organization_urn: organizationUrn }),
+        ...(tokens.personUrn && { person_urn: tokens.personUrn }),
       },
     });
 

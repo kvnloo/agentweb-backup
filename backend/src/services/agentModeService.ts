@@ -133,15 +133,15 @@ export class AgentModeService {
     toolNames: string[];
     category?: string;
   }> = [
-    {
-      name: 'Meeting Intelligence',
-      description:
-        'Access meeting recordings, transcripts, and action items from Fathom. ' +
-        'Requires a connected Fathom account (Settings → Connected Accounts).',
-      toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
-      category: 'tool_bundle',
-    },
-  ];
+      {
+        name: 'Meeting Intelligence',
+        description:
+          'Access meeting recordings, transcripts, and action items from Fathom. ' +
+          'Requires a connected Fathom account (Settings → Connected Accounts).',
+        toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        category: 'tool_bundle',
+      },
+    ];
 
   /**
    * Ensure all built-in skills exist in the database.
@@ -1780,6 +1780,7 @@ export class AgentModeService {
 - **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
 - **Web Search**: Use 'search_web' proactively to gather information from the internet before asking users for clarification
 - **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
+- **Exception — Ad creation with landing page**: When creating LinkedIn or Meta ads and the user has already provided a landing page URL, do NOT web search for company information. Use the provided URL and inputs directly. Only search if no landing page is given and you need context about the company.
 - **When to search**: Before asking users for more details, search for market data, industry trends, competitor information, or other information available on the internet
 - **Search first, ask second**: Use web search to gather background information and context from the internet before requesting additional details from users
 - **Search topics include**: Market trends, industry benchmarks, competitor analysis, news, regulatory information, technology updates, or any information from the internet that would help provide better recommendations
@@ -18487,11 +18488,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   // --- LinkedIn Ads ---
 
-  /**
-   * Retrieve a valid LinkedIn Ads access token for the given user + ad account.
-   * Refreshes via refresh_token if the token is within 5 minutes of expiry and updates the DB.
-   */
-  private async getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string }> {
+  private async getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(userId);
     if (!user) throw new Error('User not found');
@@ -18526,7 +18523,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const bufferMs = 5 * 60 * 1000;
 
     if (cfg.token_expires_at && cfg.token_expires_at > now + bufferMs) {
-      return { accountId: selected.account_id, accessToken: cfg.access_token };
+      return { accountId: selected.account_id, accessToken: cfg.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
     }
 
     // Token expired or expiring soon — refresh it
@@ -18550,7 +18547,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       token_expires_at: Date.now() + newTokens.expires_in * 1000,
     });
 
-    return { accountId: selected.account_id, accessToken: newTokens.access_token };
+    return { accountId: selected.account_id, accessToken: newTokens.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
   }
 
   /**
@@ -18558,14 +18555,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   public async callLinkedInMarketingApi(
     userId: string,
-    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA',
+    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL',
     action: string,
     account_id: string,
     params: any = {}
   ): Promise<any> {
     console.log(`AgentMode: callLinkedInMarketingApi -> ${entity_type} / ${action}`);
 
-    const { accountId, accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+    const { accountId, accessToken, organizationUrn, personUrn } = await this.getLinkedInAdsCredentials(userId, account_id);
 
     switch (entity_type) {
       case 'AD_ACCOUNT': {
@@ -18583,11 +18580,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'CREATE') {
           const result = await linkedInAdsService.createCampaignGroup(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create campaign group');
           return { success: true, message: 'Campaign group created', campaignGroup: result.data };
         }
         if (action === 'UPDATE') {
           if (!params.campaign_group_id) throw new Error('UPDATE requires campaign_group_id');
           const result = await linkedInAdsService.updateCampaignGroup(accessToken, accountId, params.campaign_group_id, params);
+          if (!result.success) throw new Error(result.error || 'Failed to update campaign group');
           return { success: true, message: 'Campaign group updated', result: result.data };
         }
         throw new Error(`Unknown action "${action}" for CAMPAIGN_GROUP`);
@@ -18600,11 +18599,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'CREATE') {
           const result = await linkedInAdsService.createCampaign(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create campaign');
           return { success: true, message: 'Campaign created', campaign: result.data };
         }
         if (action === 'UPDATE') {
           if (!params.campaign_id) throw new Error('UPDATE requires campaign_id');
           const result = await linkedInAdsService.updateCampaign(accessToken, accountId, params.campaign_id, params);
+          if (!result.success) throw new Error(result.error || 'Failed to update campaign');
           return { success: true, message: 'Campaign updated', result: result.data };
         }
         throw new Error(`Unknown action "${action}" for CAMPAIGN`);
@@ -18612,23 +18613,42 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CREATIVE': {
         if (action === 'LIST') {
-          if (!params.campaign_id) throw new Error('LIST creatives requires campaign_id');
-          const result = await linkedInAdsService.listCreatives(accessToken, params.campaign_id);
+          if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
+          const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
           return { success: true, creatives: result.data?.elements || [] };
         }
         if (action === 'CREATE') {
-          if (!params.campaign_id) throw new Error('CREATE creative requires campaign_id');
-          const result = await linkedInAdsService.createCreative(accessToken, params);
+          if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
+          const result = await linkedInAdsService.createCreative(accessToken, { ...params, ad_account_id: accountId });
+          if (!result.success) throw new Error(result.error || 'Failed to create creative');
           return { success: true, message: 'Creative created', creative: result.data };
+        }
+        if (action === 'CREATE_INLINE') {
+          if (!params.campaign_id) throw new Error('CREATE_INLINE requires campaign_id');
+          if (!organizationUrn) throw new Error('Could not determine organization URN. Please reconnect your LinkedIn Ads account.');
+          const result = await linkedInAdsService.createCreativeInline(accessToken, {
+            ...params,
+            ad_account_id: accountId,
+            author_urn: organizationUrn,
+          });
+          if (!result.success) throw new Error(result.error || 'Failed to create inline creative');
+          return { success: true, message: 'Creative and post created in one step', creative: result.data };
         }
         throw new Error(`Unknown action "${action}" for CREATIVE`);
       }
 
       case 'POST': {
         if (action === 'CREATE') {
-          if (!params.author_urn) throw new Error('CREATE post requires author_urn (person or organization URN)');
-          const result = await linkedInAdsService.createPost(accessToken, params);
-          return { success: true, message: 'Dark post created', post: result.data };
+          const feedDistribution = params.feed_distribution || 'NONE';
+          if (!organizationUrn) throw new Error('Could not determine author_urn. Please reconnect your LinkedIn Ads account.');
+          const postParams = { ...params, author_urn: organizationUrn, ad_account_id: accountId };
+          // MAIN_FEED requires w_organization_social scope — reconnect LinkedIn Ads account if 403
+          const result = await linkedInAdsService.createPost(accessToken, postParams);
+          if (!result.success) throw new Error(result.error || 'Failed to create post');
+          const postUrn = result.data?.id;
+          const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
+          const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
+          return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
         }
         throw new Error(`Unknown action "${action}" for POST`);
       }
@@ -18639,7 +18659,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, facets: result.data?.elements || [] };
         }
         if (action === 'SEARCH') {
-          if (!params.facet || !params.query) throw new Error('SEARCH requires facet and query');
+          if (!params.facet) throw new Error('SEARCH requires facet');
           const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
           return { success: true, entities: result.data?.elements || [] };
         }
@@ -18652,14 +18672,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       case 'MEDIA': {
+        if (action === 'UPLOAD_IMAGE') {
+          if (!params.image_url) throw new Error('UPLOAD_IMAGE requires image_url (a public URL to the image)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          // Step 1: initialize upload to get signed URL + image URN
+          const initResult = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize image upload');
+          const uploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
+          const imageUrn: string = initResult.data?.value?.image || initResult.data?.image;
+          if (!uploadUrl || !imageUrn) throw new Error('LinkedIn did not return uploadUrl or image URN');
+          // Step 2: download the image and PUT to LinkedIn's signed URL
+          const axios = require('axios');
+          const imageResp = await axios.get(params.image_url, { responseType: 'arraybuffer' });
+          const contentType = imageResp.headers['content-type'] || 'image/jpeg';
+          await linkedInAdsService.uploadImageBinary(uploadUrl, Buffer.from(imageResp.data), contentType);
+          return { success: true, image_urn: imageUrn, message: 'Image uploaded to LinkedIn. Use image_urn in CREATIVE/CREATE_INLINE.' };
+        }
         if (action === 'INIT_IMAGE_UPLOAD') {
-          if (!params.author_urn) throw new Error('INIT_IMAGE_UPLOAD requires author_urn');
-          const result = await linkedInAdsService.initializeImageUpload(accessToken, params.author_urn);
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const result = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
           return { success: true, uploadInstructions: result.data };
         }
         if (action === 'INIT_VIDEO_UPLOAD') {
-          if (!params.author_urn || !params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires author_urn and file_size');
-          const result = await linkedInAdsService.initializeVideoUpload(accessToken, params.author_urn, params.file_size);
+          if (!params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires file_size');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const result = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, params.file_size);
           return { success: true, uploadInstructions: result.data };
         }
         if (action === 'FINALIZE_VIDEO') {
@@ -18668,6 +18705,26 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, result: result.data };
         }
         throw new Error(`Unknown action "${action}" for MEDIA`);
+      }
+
+      case 'INMAIL': {
+        if (action === 'CREATE_CONTENT') {
+          // Use person URN from connected account (captured at OAuth time). If missing, user needs to reconnect.
+          const sender = params.sender || personUrn;
+          if (!sender) throw new Error('Could not determine sender person URN. Please reconnect your LinkedIn Ads account to capture your person URN.');
+          const result = await linkedInAdsService.createInMailContent(accessToken, { ...params, sender, ad_account_id: accountId });
+          if (!result.success) throw new Error(result.error || 'Failed to create InMail content');
+          const inmailUrn = result.data?.id;
+          return { success: true, message: 'InMail content created. Use inmail_content_urn in CREATIVE/CREATE.', inmail_content_urn: inmailUrn, data: result.data };
+        }
+        if (action === 'SEND_TEST') {
+          if (!params.inmail_content_urn) throw new Error('SEND_TEST requires inmail_content_urn');
+          if (!params.recipient_email) throw new Error('SEND_TEST requires recipient_email');
+          const result = await linkedInAdsService.sendTestInMail(accessToken, params.inmail_content_urn, params.recipient_email);
+          if (!result.success) throw new Error(result.error || 'Failed to send test InMail');
+          return { success: true, message: 'Test InMail sent successfully', data: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for INMAIL`);
       }
 
       default:

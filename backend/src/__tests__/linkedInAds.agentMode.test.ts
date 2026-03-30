@@ -19,15 +19,19 @@ jest.mock('../services/linkedInAdsService', () => ({
   createCampaign: jest.fn(),
   updateCampaign: jest.fn(),
   createCreative: jest.fn(),
+  createCreativeInline: jest.fn(),
   listCreatives: jest.fn(),
   createPost: jest.fn(),
   listTargetingFacets: jest.fn(),
   searchTargetingEntities: jest.fn(),
   getAudienceCount: jest.fn(),
   initializeImageUpload: jest.fn(),
+  uploadImageBinary: jest.fn(),
   initializeVideoUpload: jest.fn(),
   finalizeVideoUpload: jest.fn(),
   getAdAnalytics: jest.fn(),
+  createInMailContent: jest.fn(),
+  sendTestInMail: jest.fn(),
 }));
 
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
@@ -53,6 +57,9 @@ const ACCOUNT_ID = 'urn:li:sponsoredAccount:987654321';
 const NUMERIC_ACCOUNT_ID = '987654321';
 const ACCESS_TOKEN = 'li-access-token';
 
+const ORG_URN = 'urn:li:organization:test-org';
+const PERSON_URN = 'urn:li:person:test-person';
+
 const makeUser = (overrides: any = {}) => ({
   id: USER_ID,
   connected_accounts: [
@@ -67,6 +74,8 @@ const makeUser = (overrides: any = {}) => ({
         token_expires_at: Date.now() + 60 * 60 * 1000, // 1 hour from now
         currency: 'USD',
         status: 'ACTIVE',
+        organization_urn: ORG_URN,
+        person_urn: PERSON_URN,
       },
     },
   ],
@@ -91,10 +100,14 @@ beforeEach(() => {
   (linkedInAdsService.listTargetingFacets as jest.Mock).mockResolvedValue({ success: true, data: { elements: [] } });
   (linkedInAdsService.searchTargetingEntities as jest.Mock).mockResolvedValue({ success: true, data: { elements: [] } });
   (linkedInAdsService.getAudienceCount as jest.Mock).mockResolvedValue({ success: true, data: { count: 50000 } });
-  (linkedInAdsService.initializeImageUpload as jest.Mock).mockResolvedValue({ success: true, data: { uploadUrl: 'https://upload.example.com' } });
+  (linkedInAdsService.initializeImageUpload as jest.Mock).mockResolvedValue({ success: true, data: { value: { uploadUrl: 'https://upload.example.com', image: 'urn:li:image:img-1' } } });
+  (linkedInAdsService.uploadImageBinary as jest.Mock).mockResolvedValue(undefined);
   (linkedInAdsService.initializeVideoUpload as jest.Mock).mockResolvedValue({ success: true, data: { uploadToken: 'tok' } });
   (linkedInAdsService.finalizeVideoUpload as jest.Mock).mockResolvedValue({ success: true, data: {} });
   (linkedInAdsService.getAdAnalytics as jest.Mock).mockResolvedValue({ success: true, data: { elements: [{ impressions: 1000 }] } });
+  (linkedInAdsService.createCreativeInline as jest.Mock).mockResolvedValue({ success: true, data: { id: 'cr-inline-1' } });
+  (linkedInAdsService.createInMailContent as jest.Mock).mockResolvedValue({ success: true, data: { id: 'urn:li:inMailContent:123' } });
+  (linkedInAdsService.sendTestInMail as jest.Mock).mockResolvedValue({ success: true, data: {} });
 
   service = new AgentModeService();
 });
@@ -271,9 +284,9 @@ describe('callLinkedInMarketingApi — CREATIVE', () => {
     ).rejects.toThrow('campaign_id');
   });
 
-  it('LIST calls listCreatives with campaign_id', async () => {
+  it('LIST calls listCreatives with accountId and campaign_id', async () => {
     await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'LIST', ACCOUNT_ID, { campaign_id: 'camp-1' });
-    expect(linkedInAdsService.listCreatives).toHaveBeenCalledWith(ACCESS_TOKEN, 'camp-1');
+    expect(linkedInAdsService.listCreatives).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1');
   });
 
   it('CREATE calls createCreative passing full params', async () => {
@@ -286,23 +299,70 @@ describe('callLinkedInMarketingApi — CREATIVE', () => {
       expect.objectContaining({ campaign_id: 'camp-1', post_urn: 'urn:li:share:999' })
     );
   });
+
+  it('CREATE_INLINE calls createCreativeInline with organizationUrn as author_urn', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE_INLINE', ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      commentary: 'Ad copy',
+    });
+    expect(linkedInAdsService.createCreativeInline).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      expect.objectContaining({
+        campaign_id: 'camp-1',
+        ad_account_id: ACCOUNT_ID,
+        author_urn: ORG_URN,
+      })
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('CREATE_INLINE throws when campaign_id missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE_INLINE', ACCOUNT_ID, {})
+    ).rejects.toThrow('campaign_id');
+  });
+
+  it('CREATE_INLINE throws when organization URN not in account config', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: USER_ID,
+      connected_accounts: [{
+        platform: 'linkedin_ads',
+        account_id: ACCOUNT_ID,
+        account_name: 'Test',
+        config: { account_type: 'ad_account', access_token: ACCESS_TOKEN, token_expires_at: Date.now() + 3600000 },
+      }],
+    });
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE_INLINE', ACCOUNT_ID, { campaign_id: 'camp-1' })
+    ).rejects.toThrow('organization URN');
+  });
 });
 
 // ── callLinkedInMarketingApi — POST ──────────────────────────────────────────
 
 describe('callLinkedInMarketingApi — POST', () => {
-  it('CREATE calls createPost', async () => {
-    await service.callLinkedInMarketingApi(USER_ID, 'POST', 'CREATE', ACCOUNT_ID, {
-      author_urn: 'urn:li:person:abc',
+  it('CREATE calls createPost with organizationUrn as author_urn', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'POST', 'CREATE', ACCOUNT_ID, {
       commentary: 'Hello',
     });
     expect(linkedInAdsService.createPost).toHaveBeenCalledWith(
       ACCESS_TOKEN,
-      expect.objectContaining({ author_urn: 'urn:li:person:abc' })
+      expect.objectContaining({ author_urn: ORG_URN, ad_account_id: ACCOUNT_ID })
     );
+    expect(result.success).toBe(true);
+    expect(result.post_urn).toBe('post-1');
   });
 
-  it('CREATE throws when author_urn missing', async () => {
+  it('CREATE throws when organization URN not in account config', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: USER_ID,
+      connected_accounts: [{
+        platform: 'linkedin_ads',
+        account_id: ACCOUNT_ID,
+        account_name: 'Test',
+        config: { account_type: 'ad_account', access_token: ACCESS_TOKEN, token_expires_at: Date.now() + 3600000 },
+      }],
+    });
     await expect(
       service.callLinkedInMarketingApi(USER_ID, 'POST', 'CREATE', ACCOUNT_ID, { commentary: 'Hi' })
     ).rejects.toThrow('author_urn');
@@ -328,10 +388,10 @@ describe('callLinkedInMarketingApi — TARGETING', () => {
     );
   });
 
-  it('SEARCH throws when facet or query missing', async () => {
+  it('SEARCH throws when facet is missing', async () => {
     await expect(
-      service.callLinkedInMarketingApi(USER_ID, 'TARGETING', 'SEARCH', ACCOUNT_ID, { facet: 'urn:...' })
-    ).rejects.toThrow('facet and query');
+      service.callLinkedInMarketingApi(USER_ID, 'TARGETING', 'SEARCH', ACCOUNT_ID, {})
+    ).rejects.toThrow('facet');
   });
 
   it('ESTIMATE_REACH calls getAudienceCount', async () => {
@@ -354,19 +414,58 @@ describe('callLinkedInMarketingApi — TARGETING', () => {
 // ── callLinkedInMarketingApi — MEDIA ─────────────────────────────────────────
 
 describe('callLinkedInMarketingApi — MEDIA', () => {
-  it('INIT_IMAGE_UPLOAD calls initializeImageUpload', async () => {
-    await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'INIT_IMAGE_UPLOAD', ACCOUNT_ID, {
-      author_urn: 'urn:li:person:abc',
-    });
-    expect(linkedInAdsService.initializeImageUpload).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:person:abc');
+  it('INIT_IMAGE_UPLOAD calls initializeImageUpload with organizationUrn', async () => {
+    await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'INIT_IMAGE_UPLOAD', ACCOUNT_ID, {});
+    expect(linkedInAdsService.initializeImageUpload).toHaveBeenCalledWith(ACCESS_TOKEN, ORG_URN);
   });
 
-  it('INIT_VIDEO_UPLOAD calls initializeVideoUpload', async () => {
+  it('INIT_IMAGE_UPLOAD falls back to account URN when no organizationUrn', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: USER_ID,
+      connected_accounts: [{
+        platform: 'linkedin_ads',
+        account_id: ACCOUNT_ID,
+        account_name: 'Test',
+        config: { account_type: 'ad_account', access_token: ACCESS_TOKEN, token_expires_at: Date.now() + 3600000 },
+      }],
+    });
+    await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'INIT_IMAGE_UPLOAD', ACCOUNT_ID, {});
+    expect(linkedInAdsService.initializeImageUpload).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      `urn:li:sponsoredAccount:${ACCOUNT_ID}`
+    );
+  });
+
+  it('UPLOAD_IMAGE downloads and uploads image, returns image_urn', async () => {
+    const mockAxios = require('axios');
+    mockAxios.get = jest.fn().mockResolvedValue({
+      data: Buffer.from('image-bytes'),
+      headers: { 'content-type': 'image/png' },
+    });
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, {
+      image_url: 'https://example.com/image.png',
+    });
+    expect(linkedInAdsService.initializeImageUpload).toHaveBeenCalledWith(ACCESS_TOKEN, ORG_URN);
+    expect(linkedInAdsService.uploadImageBinary).toHaveBeenCalledWith(
+      'https://upload.example.com',
+      expect.any(Buffer),
+      'image/png'
+    );
+    expect(result.success).toBe(true);
+    expect(result.image_urn).toBe('urn:li:image:img-1');
+  });
+
+  it('UPLOAD_IMAGE throws when image_url missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, {})
+    ).rejects.toThrow('image_url');
+  });
+
+  it('INIT_VIDEO_UPLOAD calls initializeVideoUpload with organizationUrn', async () => {
     await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'INIT_VIDEO_UPLOAD', ACCOUNT_ID, {
-      author_urn: 'urn:li:person:abc',
       file_size: 10485760,
     });
-    expect(linkedInAdsService.initializeVideoUpload).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:person:abc', 10485760);
+    expect(linkedInAdsService.initializeVideoUpload).toHaveBeenCalledWith(ACCESS_TOKEN, ORG_URN, 10485760);
   });
 
   it('FINALIZE_VIDEO calls finalizeVideoUpload', async () => {
@@ -374,12 +473,6 @@ describe('callLinkedInMarketingApi — MEDIA', () => {
       video_urn: 'urn:li:video:123',
     });
     expect(linkedInAdsService.finalizeVideoUpload).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:video:123');
-  });
-
-  it('INIT_IMAGE_UPLOAD throws when author_urn missing', async () => {
-    await expect(
-      service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'INIT_IMAGE_UPLOAD', ACCOUNT_ID, {})
-    ).rejects.toThrow('author_urn');
   });
 });
 
@@ -390,6 +483,89 @@ describe('callLinkedInMarketingApi — invalid entity_type', () => {
     await expect(
       (service as any).callLinkedInMarketingApi(USER_ID, 'UNKNOWN_ENTITY', 'LIST', ACCOUNT_ID)
     ).rejects.toThrow('Invalid entity_type');
+  });
+});
+
+// ── callLinkedInMarketingApi — INMAIL ─────────────────────────────────────────
+
+describe('callLinkedInMarketingApi — INMAIL', () => {
+  it('CREATE_CONTENT calls createInMailContent with personUrn as sender', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'CREATE_CONTENT', ACCOUNT_ID, {
+      name: 'Test InMail',
+      subject: 'Hello',
+      htmlBody: '<p>Hi</p>',
+      callToActionText: 'Learn More',
+      callToActionLandingPageUrl: 'https://example.com',
+    });
+    expect(linkedInAdsService.createInMailContent).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      expect.objectContaining({
+        sender: PERSON_URN,
+        ad_account_id: ACCOUNT_ID,
+        subject: 'Hello',
+      })
+    );
+    expect(result.success).toBe(true);
+    expect(result.inmail_content_urn).toBe('urn:li:inMailContent:123');
+  });
+
+  it('CREATE_CONTENT throws when no sender and no person_urn in config', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: USER_ID,
+      connected_accounts: [{
+        platform: 'linkedin_ads',
+        account_id: ACCOUNT_ID,
+        account_name: 'Test',
+        config: { account_type: 'ad_account', access_token: ACCESS_TOKEN, token_expires_at: Date.now() + 3600000 },
+      }],
+    });
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'CREATE_CONTENT', ACCOUNT_ID, {
+        name: 'Test', subject: 'Hi', htmlBody: '<p>Hi</p>', callToActionText: 'CTA', callToActionLandingPageUrl: 'https://example.com',
+      })
+    ).rejects.toThrow('sender');
+  });
+
+  it('CREATE_CONTENT accepts explicit sender param overriding person_urn', async () => {
+    await service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'CREATE_CONTENT', ACCOUNT_ID, {
+      sender: 'urn:li:person:custom-sender',
+      name: 'Test', subject: 'Hi', htmlBody: '<p>Hi</p>', callToActionText: 'CTA', callToActionLandingPageUrl: 'https://example.com',
+    });
+    expect(linkedInAdsService.createInMailContent).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      expect.objectContaining({ sender: 'urn:li:person:custom-sender' })
+    );
+  });
+
+  it('SEND_TEST calls sendTestInMail', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'SEND_TEST', ACCOUNT_ID, {
+      inmail_content_urn: 'urn:li:inMailContent:123',
+      recipient_email: 'test@example.com',
+    });
+    expect(linkedInAdsService.sendTestInMail).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      'urn:li:inMailContent:123',
+      'test@example.com'
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('SEND_TEST throws when inmail_content_urn missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'SEND_TEST', ACCOUNT_ID, { recipient_email: 'a@b.com' })
+    ).rejects.toThrow('inmail_content_urn');
+  });
+
+  it('SEND_TEST throws when recipient_email missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'SEND_TEST', ACCOUNT_ID, { inmail_content_urn: 'urn:li:inMailContent:123' })
+    ).rejects.toThrow('recipient_email');
+  });
+
+  it('throws on unknown INMAIL action', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'INMAIL', 'UNKNOWN_ACTION', ACCOUNT_ID, {})
+    ).rejects.toThrow('INMAIL');
   });
 });
 

@@ -109,6 +109,8 @@ export const INTEGRATION_CONFIG = {
       'r_ads',
       'rw_ads',
       'r_ads_reporting',
+      'r_organization_social',
+      'w_organization_social'
     ],
     authorizationUrl: 'https://www.linkedin.com/oauth/v2/authorization',
     tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken',

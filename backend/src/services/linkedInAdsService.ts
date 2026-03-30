@@ -42,12 +42,30 @@ async function makeRequest(
 
   try {
     const response = await axios(config);
-    return { success: true, data: response.data, status: response.status };
+    // LinkedIn POST endpoints return the created resource URN in x-restli-id header (body is empty)
+    const resourceId = response.headers?.['x-restli-id'];
+    const data = response.data && Object.keys(response.data).length > 0
+      ? response.data
+      : resourceId ? { id: resourceId } : response.data;
+    return { success: true, data, status: response.status };
   } catch (err: any) {
     const status = err.response?.status;
-    const message = err.response?.data?.message || err.response?.data?.serviceErrorCode || err.message;
-    console.error(`LinkedIn Ads API error [${method} ${path}]:`, status, message);
-    return { success: false, error: message, status };
+    const errData = err.response?.data;
+    const message = errData?.message || errData?.serviceErrorCode || err.message;
+    const details = errData?.errorDetails;
+    // errorDetails can be an array, a nested object with inputErrors, or a plain object
+    const detailsArr: any[] = Array.isArray(details)
+      ? details
+      : details?.inputErrors
+        ? details.inputErrors
+        : details
+          ? [details]
+          : [];
+    const fullError = detailsArr.length > 0
+      ? `${message}\n${detailsArr.map((d: any) => `ERROR :: ${d.inputPath ?? d.input ?? ''} :: ${d.description ?? d.message ?? JSON.stringify(d)}`).join('\n')}`
+      : message;
+    console.error(`LinkedIn Ads API error [${method} ${path}]:`, status, fullError, errData ? JSON.stringify(errData) : '');
+    return { success: false, error: fullError, status };
   }
 }
 
@@ -109,28 +127,32 @@ export async function createCampaignGroup(
   adAccountId: string,
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
+  // LinkedIn does not allow creating a campaign group with PAUSED status — must be ACTIVE or DRAFT
+  const status = params.status === 'PAUSED' ? 'ACTIVE' : (params.status || 'ACTIVE');
+
   const body: Record<string, any> = {
     account: `urn:li:sponsoredAccount:${adAccountId}`,
     name: params.name,
-    status: params.status || 'ACTIVE',
+    status,
   };
 
-  if (params.total_budget_amount) {
-    body.totalBudget = {
-      amount: String(params.total_budget_amount),
-      currencyCode: params.total_budget_currency || 'USD',
-    };
-  }
+  // totalBudget: accept nested object or flat params
+  const totalBudget = params.totalBudget || (params.total_budget_amount ? { amount: params.total_budget_amount, currencyCode: params.total_budget_currency || 'USD' } : undefined);
+  if (totalBudget) body.totalBudget = { amount: String(totalBudget.amount), currencyCode: totalBudget.currencyCode || 'USD' };
 
-  if (params.run_schedule_start) {
-    body.runSchedule = { start: params.run_schedule_start };
-    if (params.run_schedule_end) body.runSchedule.end = params.run_schedule_end;
-  }
+  // runSchedule.start is required by LinkedIn API
+  const scheduleStart = params.runSchedule?.start || params.run_schedule_start;
+  if (!scheduleStart) throw new Error('run_schedule_start is required for campaign group creation (epoch ms). Ask the user when the campaign group should start.');
+  body.runSchedule = { start: scheduleStart };
+  const scheduleEnd = params.runSchedule?.end || params.run_schedule_end;
+  if (scheduleEnd) body.runSchedule.end = scheduleEnd;
 
-  if (params.objective_type) body.objectiveType = params.objective_type;
+  const objectiveType = params.objectiveType || params.objective_type;
+  if (objectiveType) body.objectiveType = objectiveType;
 
   return makeRequest('POST', `/rest/adAccounts/${adAccountId}/adCampaignGroups`, accessToken, body);
 }
+
 
 export async function updateCampaignGroup(
   accessToken: string,
@@ -167,15 +189,86 @@ export async function listCampaigns(
   adAccountId: string,
   params: Record<string, any> = {}
 ): Promise<LinkedInAdsApiResult> {
-  let search = `(status:(values:List(${params.status || 'ACTIVE,PAUSED,DRAFT,ARCHIVED'})))`;
+  // LinkedIn REST API does not support combining campaignGroup + status in a single search expression.
+  // When filtering by campaign group, use it as the sole search filter.
+  // When filtering by status only, use the status filter.
+  let path: string;
   if (params.campaign_group_id) {
-    search = `(campaignGroup:(values:List(urn:li:sponsoredCampaignGroup:${params.campaign_group_id})),${search.slice(1)}`;
+    path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(campaignGroup:(values:List(urn:li:sponsoredCampaignGroup:${params.campaign_group_id})))`;
+  } else {
+    const statuses = params.status || 'ACTIVE,PAUSED,DRAFT,ARCHIVED';
+    path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(status:(values:List(${statuses})))`;
   }
-  return makeRequest(
-    'GET',
-    `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=${search}`,
-    accessToken
-  );
+  return makeRequest('GET', path, accessToken);
+}
+
+/**
+ * Build LinkedIn targetingCriteria from a simple flat array format that is easy for the
+ * model to generate without needing URN strings as JSON keys.
+ *
+ * Input (simple flat format Emma passes):
+ *   targeting_include: [
+ *     { facet_urn: "urn:li:adTargetingFacet:locations", values: ["urn:li:geo:103644278"] },
+ *     { facet_urn: "urn:li:adTargetingFacet:titles",    values: ["urn:li:title:100"] }
+ *   ]
+ *   targeting_exclude: [
+ *     { facet_urn: "urn:li:adTargetingFacet:seniorities", values: ["urn:li:seniority:1"] }
+ *   ]
+ *
+ * Output (LinkedIn API format):
+ *   { "include": { "and": [ { "or": { "urn:...": ["urn:..."] } } ] },
+ *     "exclude": { "or": { "urn:...": ["urn:..."] } } }
+ */
+function buildTargetingCriteria(
+  include: Array<{ facet_urn: string; values: string[] }>,
+  exclude?: Array<{ facet_urn: string; values: string[] }>
+): any {
+  const tc: any = {
+    include: {
+      and: include.map(({ facet_urn, values }) => ({
+        or: { [facet_urn]: values },
+      })),
+    },
+  };
+  if (exclude && exclude.length > 0) {
+    const excludeMap: Record<string, string[]> = {};
+    for (const { facet_urn, values } of exclude) {
+      excludeMap[facet_urn] = values;
+    }
+    tc.exclude = { or: excludeMap };
+  }
+  return tc;
+}
+
+/**
+ * Normalize a raw targetingCriteria object (may have or-clauses as arrays instead of maps).
+ */
+function normalizeOrClause(or: any): Record<string, any> {
+  if (Array.isArray(or)) {
+    return Object.assign({}, ...or);
+  }
+  return or;
+}
+
+function normalizeTargetingCriteria(tc: any): any {
+  if (!tc) return tc;
+  const result: any = {};
+  if (tc.include) {
+    result.include = {};
+    if (Array.isArray(tc.include.and)) {
+      result.include.and = tc.include.and.map((clause: any) =>
+        clause.or ? { or: normalizeOrClause(clause.or) } : clause
+      );
+    } else {
+      result.include = tc.include;
+    }
+  }
+  if (tc.exclude) {
+    result.exclude = tc.exclude.or
+      ? { or: normalizeOrClause(tc.exclude.or) }
+      : tc.exclude;
+  }
+  return result;
 }
 
 export async function createCampaign(
@@ -183,15 +276,20 @@ export async function createCampaign(
   adAccountId: string,
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
+  // Accept both camelCase (schema-style) and snake_case (legacy) param formats
+  const costType = params.costType || params.cost_type || 'CPC';
+  const unitCostAmount = params.unitCost?.amount || params.unit_cost_amount || '2.00';
+  const unitCostCurrency = params.unitCost?.currencyCode || params.unit_cost_currency || 'USD';
+
   const body: Record<string, any> = {
     account: `urn:li:sponsoredAccount:${adAccountId}`,
     name: params.name,
     status: params.status || 'DRAFT',
     type: params.type || 'SPONSORED_UPDATES',
-    costType: params.cost_type || 'CPC',
+    costType,
     unitCost: {
-      amount: String(params.unit_cost_amount || '2.00'),
-      currencyCode: params.unit_cost_currency || 'USD',
+      amount: String(unitCostAmount),
+      currencyCode: unitCostCurrency,
     },
     locale: {
       country: params.locale_country || 'US',
@@ -199,35 +297,43 @@ export async function createCampaign(
     },
     offsiteDeliveryEnabled: params.offsite_delivery_enabled ?? false,
     audienceExpansionEnabled: params.audience_expansion_enabled ?? false,
-    creativeSelection: params.creative_selection || 'OPTIMIZED',
+    creativeSelection: params.creative_selection || (params.type === 'SPONSORED_INMAILS' ? 'ROUND_ROBIN' : 'OPTIMIZED'),
   };
 
-  if (params.campaign_group_id) {
-    body.campaignGroup = `urn:li:sponsoredCampaignGroup:${params.campaign_group_id}`;
-  }
+  // campaignGroup: accept full URN or numeric ID
+  const campaignGroupUrn = params.campaignGroup?.startsWith('urn:') ? params.campaignGroup
+    : (params.campaign_group_id ? `urn:li:sponsoredCampaignGroup:${params.campaign_group_id}` : undefined);
+  if (campaignGroupUrn) body.campaignGroup = campaignGroupUrn;
 
-  if (params.objective_type) body.objectiveType = params.objective_type;
+  const objectiveType = params.objectiveType || params.objective_type;
+  if (objectiveType) body.objectiveType = objectiveType;
   if (params.format) body.format = params.format;
 
-  if (params.daily_budget_amount) {
-    body.dailyBudget = {
-      amount: String(params.daily_budget_amount),
-      currencyCode: params.daily_budget_currency || 'USD',
-    };
-  }
-  if (params.total_budget_amount) {
-    body.totalBudget = {
-      amount: String(params.total_budget_amount),
-      currencyCode: params.total_budget_currency || 'USD',
-    };
+  // dailyBudget: accept nested object or flat params
+  const dailyBudget = params.dailyBudget || (params.daily_budget_amount ? { amount: params.daily_budget_amount, currencyCode: params.daily_budget_currency || 'USD' } : undefined);
+  if (dailyBudget) body.dailyBudget = { amount: String(dailyBudget.amount), currencyCode: dailyBudget.currencyCode || 'USD' };
+
+  // totalBudget: accept nested object or flat params
+  const totalBudget = params.totalBudget || (params.total_budget_amount ? { amount: params.total_budget_amount, currencyCode: params.total_budget_currency || 'USD' } : undefined);
+  if (totalBudget) body.totalBudget = { amount: String(totalBudget.amount), currencyCode: totalBudget.currencyCode || 'USD' };
+
+  // runSchedule: required by LinkedIn — default to now if not provided
+  const scheduleStart = params.runSchedule?.start || params.run_schedule_start || Date.now();
+  body.runSchedule = { start: scheduleStart };
+  const scheduleEnd = params.runSchedule?.end || params.run_schedule_end;
+  if (scheduleEnd) body.runSchedule.end = scheduleEnd;
+
+  // targetingCriteria: prefer simple flat format (targeting_include/targeting_exclude arrays),
+  // fall back to raw object (targetingCriteria / targeting_criteria) with normalization
+  if (params.targeting_include && Array.isArray(params.targeting_include)) {
+    body.targetingCriteria = buildTargetingCriteria(params.targeting_include, params.targeting_exclude);
+  } else {
+    const targetingCriteria = params.targetingCriteria || params.targeting_criteria;
+    if (targetingCriteria) body.targetingCriteria = normalizeTargetingCriteria(targetingCriteria);
   }
 
-  if (params.run_schedule_start) {
-    body.runSchedule = { start: params.run_schedule_start };
-    if (params.run_schedule_end) body.runSchedule.end = params.run_schedule_end;
-  }
-
-  if (params.targeting_criteria) body.targetingCriteria = params.targeting_criteria;
+  // politicalIntent: required in LinkedIn API v202603+
+  body.politicalIntent = params.politicalIntent || 'NOT_POLITICAL';
 
   return makeRequest('POST', `/rest/adAccounts/${adAccountId}/adCampaigns`, accessToken, body);
 }
@@ -281,21 +387,31 @@ export async function createPost(
   accessToken: string,
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
+  // feed_distribution=NONE → dark post (ad only, never on company page)
+  // feed_distribution=MAIN_FEED → post appears on company page AND runs as sponsored ad
+  const feedDistribution = params.feed_distribution || 'NONE';
+  const isDarkPost = feedDistribution === 'NONE';
+
   const body: Record<string, any> = {
     author: params.author_urn,
-    commentary: params.text || '',
-    visibility: 'PUBLIC',
+    commentary: params.text || params.commentary || '',
+    visibility: params.visibility || 'PUBLIC',
     distribution: {
-      feedDistribution: 'NONE',
+      feedDistribution,
       thirdPartyDistributionChannels: [],
     },
     lifecycleState: 'PUBLISHED',
     isReshareDisabledByAuthor: true,
-    adContext: {
+  };
+
+  // adContext is only for dark posts (DSC). LinkedIn rejects adContext on MAIN_FEED posts.
+  // MAIN_FEED posts are organic — they get sponsored by referencing the post URN in a creative.
+  if (isDarkPost && params.ad_account_id) {
+    body.adContext = {
       dscAdAccount: `urn:li:sponsoredAccount:${params.ad_account_id}`,
       dscStatus: 'ACTIVE',
-    },
-  };
+    };
+  }
 
   if (params.image_urn) {
     body.content = {
@@ -320,9 +436,8 @@ export async function createPost(
         })),
       },
     };
-    if (params.content_landing_page) {
-      body.contentLandingPage = params.content_landing_page;
-    }
+    // LinkedIn requires contentLandingPage for carousel posts — default to first card's landing page
+    body.contentLandingPage = params.content_landing_page || params.carousel_cards[0]?.landing_page;
   }
 
   return makeRequest('POST', '/rest/posts', accessToken, body);
@@ -332,12 +447,17 @@ export async function createPost(
 
 export async function listCreatives(
   accessToken: string,
+  adAccountId: string,
   campaignId: string
 ): Promise<LinkedInAdsApiResult> {
+  const rawId = campaignId.startsWith('urn:li:sponsoredCampaign:') ? campaignId : `urn:li:sponsoredCampaign:${campaignId}`;
+  const campaignUrn = encodeURIComponent(rawId);
   return makeRequest(
     'GET',
-    `/rest/creatives?q=criteria&criteria.campaign=urn:li:sponsoredCampaign:${campaignId}`,
-    accessToken
+    `/rest/adAccounts/${adAccountId}/creatives?q=criteria&campaigns=List(${campaignUrn})`,
+    accessToken,
+    undefined,
+    { 'X-RestLi-Method': 'FINDER' }
   );
 }
 
@@ -345,14 +465,19 @@ export async function createCreative(
   accessToken: string,
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
+  // Carousel must use createCreativeInline — referencing a carousel post URN causes a LinkedIn type conflict
+  if (params.carousel_cards) {
+    return { success: false, error: 'Carousel ads must use CREATIVE/CREATE_INLINE, not CREATIVE/CREATE. Use createCreativeInline instead.' };
+  }
+
   let body: Record<string, any> = {
-    campaign: `urn:li:sponsoredCampaign:${params.campaign_id}`,
+    campaign: params.campaign_id.startsWith('urn:') ? params.campaign_id : `urn:li:sponsoredCampaign:${params.campaign_id}`,
     intendedStatus: params.status || 'ACTIVE',
   };
 
-  if (params.post_urn) {
-    // Sponsored content creative (image, video, carousel)
-    body.content = { reference: params.post_urn };
+  if (params.reference || params.post_urn) {
+    // Sponsored content creative (image, video only — not carousel)
+    body.content = { reference: params.reference || params.post_urn };
   } else if (params.headline) {
     // Text ad creative (no post needed)
     body.content = {
@@ -370,7 +495,69 @@ export async function createCreative(
     return { success: false, error: 'CREATIVE CREATE requires either post_urn, headline (text ad), or inmail_content_urn' };
   }
 
-  return makeRequest('POST', '/rest/creatives', accessToken, body);
+  const adAccountId = params.ad_account_id;
+  if (!adAccountId) return { success: false, error: 'CREATIVE CREATE requires ad_account_id' };
+  return makeRequest('POST', `/rest/adAccounts/${adAccountId}/creatives`, accessToken, body);
+}
+
+/**
+ * Create a creative and its post in a single API call using the createInline action.
+ * This is the recommended approach — avoids the separate POST/CREATE + CREATIVE/CREATE steps
+ * and ensures the post URN is correctly wired as the creative reference.
+ */
+export async function createCreativeInline(
+  accessToken: string,
+  params: Record<string, any>
+): Promise<LinkedInAdsApiResult> {
+  const adAccountId = params.ad_account_id;
+  if (!adAccountId) return { success: false, error: 'CREATIVE CREATE_INLINE requires ad_account_id' };
+  if (!params.campaign_id) return { success: false, error: 'CREATIVE CREATE_INLINE requires campaign_id' };
+  if (!params.author_urn) return { success: false, error: 'CREATIVE CREATE_INLINE requires author_urn (organization URN)' };
+
+  const post: Record<string, any> = {
+    adContext: {
+      dscAdAccount: `urn:li:sponsoredAccount:${adAccountId}`,
+      dscStatus: 'ACTIVE',
+    },
+    author: params.author_urn,
+    commentary: params.commentary || params.text || '',
+    visibility: params.visibility || 'PUBLIC',
+    distribution: {
+      feedDistribution: 'NONE',
+      thirdPartyDistributionChannels: [],
+    },
+    lifecycleState: 'PUBLISHED',
+    isReshareDisabledByAuthor: true,
+  };
+
+  if (params.image_urn) {
+    post.content = { media: { id: params.image_urn, title: params.title || '' } };
+  } else if (params.video_urn) {
+    post.content = { media: { id: params.video_urn, title: params.title || '' } };
+  } else if (params.carousel_cards && Array.isArray(params.carousel_cards)) {
+    post.content = {
+      carousel: {
+        cards: params.carousel_cards.map((card: any) => ({
+          media: { id: card.image_urn, title: card.title || '' },
+          landingPage: card.landing_page,
+        })),
+      },
+    };
+    // LinkedIn requires contentLandingPage for carousel posts — default to first card's landing page
+    post.contentLandingPage = params.content_landing_page || params.carousel_cards[0]?.landing_page;
+  }
+
+  const campaignUrn = params.campaign_id.startsWith('urn:') ? params.campaign_id : `urn:li:sponsoredCampaign:${params.campaign_id}`;
+
+  const body = {
+    creative: {
+      inlineContent: { post },
+      campaign: campaignUrn,
+      intendedStatus: params.status || 'ACTIVE',
+    },
+  };
+
+  return makeRequest('POST', `/rest/adAccounts/${adAccountId}/creatives?action=createInline`, accessToken, body);
 }
 
 // ─── Image upload ─────────────────────────────────────────────────────────────
@@ -443,14 +630,29 @@ export async function searchTargetingEntities(
     return { success: false, error: 'TARGETING SEARCH requires facet_urn' };
   }
 
-  const encodedFacet = encodeURIComponent(params.facet_urn);
+  // Normalize common facet URN aliases
+  const FACET_ALIASES: Record<string, string> = {
+    'urn:li:adTargetingFacet:jobTitles': 'urn:li:adTargetingFacet:titles',
+  };
+  const facetUrn = FACET_ALIASES[params.facet_urn] || params.facet_urn;
+  const encodedFacet = encodeURIComponent(facetUrn);
   let path: string;
 
-  if (params.query) {
+  // These facets have predefined values and do not support q=typeahead
+  const TYPEAHEAD_UNSUPPORTED_FACETS = [
+    'urn:li:adTargetingFacet:staffCountRanges',
+    'urn:li:adTargetingFacet:seniorities',
+    'urn:li:adTargetingFacet:industries',
+    'urn:li:adTargetingFacet:functions',
+  ];
+
+  const supportsTypeahead = !TYPEAHEAD_UNSUPPORTED_FACETS.includes(params.facet_urn);
+
+  if (params.query && supportsTypeahead) {
     // Typeahead search within a facet
     path = `/rest/adTargetingEntities?q=typeahead&facet=${encodedFacet}&query=${encodeURIComponent(params.query)}&queryVersion=QUERY_USES_URNS`;
   } else {
-    // List all entities for a facet
+    // List all entities for a facet (also used for facets that don't support typeahead)
     path = `/rest/adTargetingEntities?q=adTargetingFacet&facet=${encodedFacet}&queryVersion=QUERY_USES_URNS`;
   }
 
@@ -531,4 +733,76 @@ export async function getAdAnalytics(
   }
 
   return makeRequest('GET', `/rest/adAnalytics?${params.toString()}`, accessToken);
+}
+
+// ─── InMail (Message Ad) ──────────────────────────────────────────────────────
+
+/**
+ * Create InMail content for a Message Ad.
+ * POST /rest/inMailContents
+ *
+ * @param sender  - Person URN (urn:li:person:ID) or organization URN acting as sender
+ * @param subject - InMail subject line
+ * @param htmlBody - InMail body (HTML allowed)
+ * @param callToActionText - CTA button text (max 20 chars)
+ * @param callToActionLandingPageUrl - URL the CTA button links to
+ */
+export async function createInMailContent(
+  accessToken: string,
+  params: {
+    ad_account_id: string;
+    name: string;
+    sender: string;
+    subject: string;
+    htmlBody: string;
+    callToActionText: string;
+    callToActionLandingPageUrl: string;
+    salutationText?: string;
+    senderName?: string;
+    senderTitle?: string;
+    senderCompany?: string;
+  }
+): Promise<LinkedInAdsApiResult> {
+  if (!params.ad_account_id) return { success: false, error: 'createInMailContent requires ad_account_id' };
+  if (!params.sender) return { success: false, error: 'createInMailContent requires sender (person URN: urn:li:person:ID)' };
+  if (!params.subject) return { success: false, error: 'createInMailContent requires subject' };
+  if (!params.htmlBody) return { success: false, error: 'createInMailContent requires htmlBody' };
+  if (!params.callToActionText) return { success: false, error: 'createInMailContent requires callToActionText (max 20 chars)' };
+  if (!params.callToActionLandingPageUrl) return { success: false, error: 'createInMailContent requires callToActionLandingPageUrl' };
+
+  const body: Record<string, any> = {
+    account: `urn:li:sponsoredAccount:${params.ad_account_id}`,
+    name: params.name,
+    sender: params.sender,
+    subject: params.subject,
+    htmlBody: params.htmlBody,
+    subContent: {
+      regular: {
+        callToActionText: params.callToActionText,
+        callToActionLandingPageUrl: params.callToActionLandingPageUrl,
+      },
+    },
+  };
+
+  if (params.salutationText) body.salutationText = params.salutationText;
+  if (params.senderName) body.senderName = params.senderName;
+  if (params.senderTitle) body.senderTitle = params.senderTitle;
+  if (params.senderCompany) body.senderCompany = params.senderCompany;
+
+  return makeRequest('POST', '/rest/inMailContents', accessToken, body);
+}
+
+/**
+ * Send a test InMail to verify the message ad content before launching.
+ * POST /rest/inMailContents/{inMailContentUrn}?action=sendTestInMail
+ */
+export async function sendTestInMail(
+  accessToken: string,
+  inMailContentUrn: string,
+  recipientEmail: string
+): Promise<LinkedInAdsApiResult> {
+  const encodedUrn = encodeURIComponent(inMailContentUrn);
+  return makeRequest('POST', `/rest/inMailContents/${encodedUrn}?action=sendTestInMail`, accessToken, {
+    recipient: recipientEmail,
+  });
 }
