@@ -103,6 +103,8 @@ export default function WorkPlans() {
   const [autocomplete, setAutocomplete] = useState(false);
   const [requireLogin, setRequireLogin] = useState(false);
   const [visibility, setVisibility] = useState("system");
+  const [defaultModel, setDefaultModel] = useState("");
+  const [supportedModels, setSupportedModels] = useState<string[]>([]);
 
   // Reject dialog
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
@@ -135,6 +137,19 @@ export default function WorkPlans() {
     }
   }, [token]);
 
+  const fetchSupportedModels = useCallback(async () => {
+    try {
+      const res = await axios.get(buildApiUrl("/api/agent-mode/public/llm-models"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (Array.isArray(res.data) && res.data.length > 0) {
+        setSupportedModels(res.data);
+      }
+    } catch {
+      // Non-critical — model dropdown will be empty
+    }
+  }, [token]);
+
   const fetchAvailableFunctionCalls = useCallback(async () => {
     try {
       const res = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
@@ -152,7 +167,7 @@ export default function WorkPlans() {
     }
   }, [token]);
 
-  useEffect(() => { fetchPlans(); fetchAvailableFunctionCalls(); }, [fetchPlans, fetchAvailableFunctionCalls]);
+  useEffect(() => { fetchPlans(); fetchAvailableFunctionCalls(); fetchSupportedModels(); }, [fetchPlans, fetchAvailableFunctionCalls, fetchSupportedModels]);
 
   const openCreateDialog = () => {
     setEditingPlan(null);
@@ -164,6 +179,7 @@ export default function WorkPlans() {
     setAutocomplete(false);
     setRequireLogin(false);
     setVisibility("system");
+    setDefaultModel("");
     setDialogOpen(true);
   };
 
@@ -177,6 +193,7 @@ export default function WorkPlans() {
     setAutocomplete(plan.autocomplete || false);
     setRequireLogin(plan.requireLogin || false);
     setVisibility(plan.visibility);
+    setDefaultModel(plan.defaultModel || "");
     setDialogOpen(true);
   };
 
@@ -197,6 +214,7 @@ export default function WorkPlans() {
         title, description, welcomeMessage,
         steps: validSteps.map((s, i) => ({ ...s, stepCount: i + 1 })),
         showInAgentMode, autocomplete, requireLogin, visibility,
+        ...(defaultModel && { defaultModel }),
       };
       if (editingPlan) {
         await axios.put(buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`), body, {
@@ -401,6 +419,7 @@ export default function WorkPlans() {
               <TableCell>Title</TableCell>
               <TableCell>Steps</TableCell>
               <TableCell>Visibility</TableCell>
+              <TableCell>Model</TableCell>
               <TableCell>Agent Mode</TableCell>
               <TableCell>Owner</TableCell>
               <TableCell align="right">Actions</TableCell>
@@ -409,7 +428,7 @@ export default function WorkPlans() {
           <TableBody>
             {plans.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} align="center" sx={{ py: 4 }}>
+                <TableCell colSpan={8} align="center" sx={{ py: 4 }}>
                   <Typography color="text.secondary">No work plans yet. Create one to get started.</Typography>
                 </TableCell>
               </TableRow>
@@ -433,6 +452,11 @@ export default function WorkPlans() {
                     <TableCell>{plan.steps?.length || 0}</TableCell>
                     <TableCell>
                       <Chip label={plan.visibility} size="small" color={visibilityColor(plan.visibility) as any} />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="caption" color={plan.defaultModel ? "inherit" : "text.disabled"} sx={{ fontFamily: "monospace" }}>
+                        {plan.defaultModel || "default"}
+                      </Typography>
                     </TableCell>
                     <TableCell>
                       <Tooltip title={plan.showInAgentMode ? "Visible in Agent Mode" : "Hidden from Agent Mode"}>
@@ -460,7 +484,7 @@ export default function WorkPlans() {
                     </TableCell>
                   </TableRow>
                   <TableRow key={`${plan.planId}-expand`}>
-                    <TableCell colSpan={7} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
+                    <TableCell colSpan={8} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
                       <Collapse in={expandedId === plan.planId}>
                         <Box sx={{ p: 2, bgcolor: "grey.50" }}>
                           {plan.welcomeMessage && (
@@ -518,6 +542,15 @@ export default function WorkPlans() {
                   <MenuItem value="system">System</MenuItem>
                   <MenuItem value="public">Public</MenuItem>
                   <MenuItem value="private">Private</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 220 }}>
+                <InputLabel>Default Model (Optional)</InputLabel>
+                <Select value={defaultModel} label="Default Model (Optional)" onChange={(e) => setDefaultModel(e.target.value)}>
+                  <MenuItem value=""><em>Use Agent Mode Default</em></MenuItem>
+                  {supportedModels.map((m) => (
+                    <MenuItem key={m} value={m}>{m}</MenuItem>
+                  ))}
                 </Select>
               </FormControl>
               <FormControlLabel control={<Switch checked={showInAgentMode} onChange={(e) => setShowInAgentMode(e.target.checked)} />} label="Show in Agent Mode" />
