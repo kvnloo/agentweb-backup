@@ -18701,6 +18701,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
             keywords, url: search_url, title, company, cursor
           });
+          // Trim to essential fields only — full profiles (skills, education, photos, etc.)
+          // inflate context by 10x and degrade LLM output quality in long sessions.
+          if (Array.isArray(searchResult?.items)) {
+            const trimmedItems = searchResult.items.map((item: any) => {
+              const trimmed: any = {
+                provider_id: item.provider_id,
+                public_identifier: item.public_identifier,
+                first_name: item.first_name,
+                last_name: item.last_name,
+                headline: item.headline,
+                location: item.location,
+                network_distance: item.network_distance,
+                public_profile_url: item.public_profile_url,
+                is_open_profile: item.is_open_profile,
+              };
+              if (item.work_experience?.length) {
+                const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+                if (current) trimmed.current_role = { position: current.position, company: current.company };
+              }
+              if (item.summary) trimmed.summary = item.summary.slice(0, 200);
+              return trimmed;
+            });
+            return { success: true, data: { ...searchResult, items: trimmedItems } };
+          }
           return { success: true, data: searchResult };
         }
 
@@ -18721,6 +18745,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-sent-invitations': {
           const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
+          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
+          if (Array.isArray(invitationsResult?.items)) {
+            const trimmedItems = invitationsResult.items.map((item: any) => ({
+              id: item.id,
+              invited_user_id: item.invited_user_id,
+              invited_user_public_id: item.invited_user_public_id,
+              invited_user: item.invited_user,
+            }));
+            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
+          }
           return { success: true, data: invitationsResult };
         }
 
