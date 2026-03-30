@@ -18811,7 +18811,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   public async callLinkedInMarketingApi(
     userId: string,
-    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL',
+    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
     action: string,
     account_id: string,
     params: any = {}
@@ -18890,6 +18890,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!result.success) throw new Error(result.error || 'Failed to create inline creative');
           return { success: true, message: 'Creative and post created in one step', creative: result.data };
         }
+        if (action === 'CREATE_DYNAMIC') {
+          // Dynamic Ads: Jobs, Spotlight, Follower — campaign type must be DYNAMIC
+          if (!params.campaign_id) throw new Error('CREATE_DYNAMIC requires campaign_id');
+          if (!params.format) throw new Error('CREATE_DYNAMIC requires format (JOBS|SPOTLIGHT|FOLLOW_COMPANY)');
+          const result = await linkedInAdsService.createDynamicCreative(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
+          return { success: true, message: 'Dynamic creative created', creative: result.data };
+        }
         throw new Error(`Unknown action "${action}" for CREATIVE`);
       }
 
@@ -18928,6 +18936,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       case 'MEDIA': {
+        // Helper: if the URL is an S3 URL from our bucket, presign it before downloading.
+        // This handles the case where the user uploads a file to the chat (stored in S3)
+        // and Emma receives the S3 URL — direct S3 access requires a presigned URL.
+        const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
+        const resolveDownloadUrl = (url: string): string => {
+          if (isS3Url(url)) {
+            const presigned = presignS3Url(url);
+            return presigned || url;
+          }
+          return url;
+        };
+
         if (action === 'UPLOAD_IMAGE') {
           if (!params.image_url) throw new Error('UPLOAD_IMAGE requires image_url (a public URL to the image)');
           const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
@@ -18937,12 +18957,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const uploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
           const imageUrn: string = initResult.data?.value?.image || initResult.data?.image;
           if (!uploadUrl || !imageUrn) throw new Error('LinkedIn did not return uploadUrl or image URN');
-          // Step 2: download the image and PUT to LinkedIn's signed URL
+          // Step 2: download the image (presign if S3 URL) and PUT to LinkedIn's signed URL
           const axios = require('axios');
-          const imageResp = await axios.get(params.image_url, { responseType: 'arraybuffer' });
+          const imageResp = await axios.get(resolveDownloadUrl(params.image_url), { responseType: 'arraybuffer' });
           const contentType = imageResp.headers['content-type'] || 'image/jpeg';
           await linkedInAdsService.uploadImageBinary(uploadUrl, Buffer.from(imageResp.data), contentType);
           return { success: true, image_urn: imageUrn, message: 'Image uploaded to LinkedIn. Use image_urn in CREATIVE/CREATE_INLINE.' };
+        }
+        if (action === 'UPLOAD_VIDEO') {
+          // Convenience action: download video from URL, auto-detect size, handle full upload flow.
+          // Emma never asks the user for file_size — it's derived from the downloaded buffer.
+          if (!params.video_url) throw new Error('UPLOAD_VIDEO requires video_url (a public URL to the video file)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const axios = require('axios');
+          // Step 1: download video (presign if S3 URL — handles user-uploaded files from chat)
+          const videoResp = await axios.get(resolveDownloadUrl(params.video_url), { responseType: 'arraybuffer' });
+          const videoBuffer = Buffer.from(videoResp.data);
+          const fileSizeBytes = videoBuffer.length;
+          // Step 2: initialize upload — fileSizeBytes auto-calculated from buffer
+          const initResult = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, fileSizeBytes);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize video upload');
+          const uploadInstructions: any[] = initResult.data?.value?.uploadInstructions || [];
+          const videoUrn: string = initResult.data?.value?.video || initResult.data?.video;
+          const uploadToken: string = initResult.data?.value?.uploadToken || '';
+          if (!videoUrn) throw new Error('LinkedIn did not return video URN');
+          // Step 3: upload each part, collect ETag from each response (required for finalize)
+          const uploadedPartIds: string[] = [];
+          for (const instruction of uploadInstructions) {
+            const partStart: number = instruction.firstByte ?? 0;
+            const partEnd: number = instruction.lastByte ?? fileSizeBytes - 1;
+            const partBuffer = videoBuffer.slice(partStart, partEnd + 1);
+            const etag = await linkedInAdsService.uploadVideoPart(instruction.uploadUrl, partBuffer);
+            uploadedPartIds.push(etag);
+          }
+          // Step 4: finalize — pass uploadToken and ETags from part uploads
+          const finalizeResult = await linkedInAdsService.finalizeVideoUpload(accessToken, videoUrn, uploadToken, uploadedPartIds);
+          if (!finalizeResult.success) throw new Error(finalizeResult.error || 'Failed to finalize video upload');
+          return { success: true, video_urn: videoUrn, message: 'Video uploaded to LinkedIn. Use video_urn in CREATIVE/CREATE_INLINE.' };
+        }
+        if (action === 'UPLOAD_DOCUMENT') {
+          // Convenience action: download document from URL and upload to LinkedIn.
+          if (!params.document_url) throw new Error('UPLOAD_DOCUMENT requires document_url (a public URL to the document, e.g. PDF)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const axios = require('axios');
+          // Step 1: download document (presign if S3 URL — handles user-uploaded files from chat)
+          const docResp = await axios.get(resolveDownloadUrl(params.document_url), { responseType: 'arraybuffer' });
+          const docBuffer = Buffer.from(docResp.data);
+          const contentType = docResp.headers['content-type'] || 'application/pdf';
+          // Step 2: initialize upload
+          const initResult = await linkedInAdsService.initializeDocumentUpload(accessToken, ownerUrn);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize document upload');
+          const docUploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
+          const documentUrn: string = initResult.data?.value?.document || initResult.data?.document;
+          if (!docUploadUrl || !documentUrn) throw new Error('LinkedIn did not return uploadUrl or document URN');
+          // Step 3: upload binary
+          await linkedInAdsService.uploadDocumentBinary(docUploadUrl, docBuffer, contentType);
+          return { success: true, document_urn: documentUrn, message: 'Document uploaded to LinkedIn. Use document_urn in POST/CREATE.' };
         }
         if (action === 'INIT_IMAGE_UPLOAD') {
           const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
@@ -18981,6 +19051,33 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, message: 'Test InMail sent successfully', data: result.data };
         }
         throw new Error(`Unknown action "${action}" for INMAIL`);
+      }
+
+      case 'CONVERSATION_AD': {
+        if (action === 'CREATE') {
+          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
+          const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
+          const conversationAdUrn = result.data?.id;
+          return { success: true, message: 'Conversation ad created. Add message nodes with CONVERSATION_AD/CREATE_CONTENT, then set the first node with CONVERSATION_AD/SET_FIRST_CONTENT.', conversation_ad_urn: conversationAdUrn, data: result.data };
+        }
+        if (action === 'CREATE_CONTENT') {
+          if (!params.conversation_ad_urn) throw new Error('CONVERSATION_AD CREATE_CONTENT requires conversation_ad_urn');
+          if (!params.body) throw new Error('CONVERSATION_AD CREATE_CONTENT requires body (message text)');
+          if (!params.buttons || !Array.isArray(params.buttons) || params.buttons.length === 0) throw new Error('CONVERSATION_AD CREATE_CONTENT requires buttons array');
+          const result = await linkedInAdsService.createConversationAdContent(accessToken, params.conversation_ad_urn, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create conversation ad content');
+          const contentUrn = result.data?.id;
+          return { success: true, message: 'Message node added to conversation ad', content_urn: contentUrn, data: result.data };
+        }
+        if (action === 'SET_FIRST_CONTENT') {
+          if (!params.conversation_ad_urn) throw new Error('SET_FIRST_CONTENT requires conversation_ad_urn');
+          if (!params.first_content_urn) throw new Error('SET_FIRST_CONTENT requires first_content_urn');
+          const result = await linkedInAdsService.setConversationAdFirstContent(accessToken, params.conversation_ad_urn, params.first_content_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to set first content');
+          return { success: true, message: 'First message node set. Conversation ad is ready. Create a CREATIVE with inmail_content_urn = conversation_ad_urn.' };
+        }
+        throw new Error(`Unknown action "${action}" for CONVERSATION_AD`);
       }
 
       default:

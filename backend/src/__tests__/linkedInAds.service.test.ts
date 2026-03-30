@@ -190,6 +190,12 @@ describe('createCampaign', () => {
       })
     );
   });
+
+  it('returns error when creating a DYNAMIC campaign without a format', async () => {
+    const result = await svc.createCampaign(ACCESS_TOKEN, ACCOUNT_ID, { name: 'Camp Dyn', type: 'DYNAMIC' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('format is required when campaign type is DYNAMIC');
+  });
 });
 
 describe('updateCampaign', () => {
@@ -415,6 +421,274 @@ describe('searchTargetingEntities', () => {
     const result = await svc.searchTargetingEntities(ACCESS_TOKEN, { query: 'test' });
     expect(result.success).toBe(false);
     expect(result.error).toContain('facet_urn');
+  });
+});
+
+describe('createPost — article and document support', () => {
+  it('creates post with article content', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:post:art-1' }, status: 201 });
+    const result = await svc.createPost(ACCESS_TOKEN, {
+      author_urn: 'urn:li:organization:123',
+      article_url: 'https://example.com/blog/post',
+      article_title: 'My Article',
+      article_description: 'An interesting read',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.article.source).toBe('https://example.com/blog/post');
+    expect(body.content.article.title).toBe('My Article');
+    expect(result.success).toBe(true);
+  });
+
+  it('creates post with document content', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:post:doc-1' }, status: 201 });
+    await svc.createPost(ACCESS_TOKEN, {
+      author_urn: 'urn:li:organization:123',
+      document_urn: 'urn:li:document:doc-1',
+      title: 'Our Brochure',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.media.id).toBe('urn:li:document:doc-1');
+    expect(body.content.media.title).toBe('Our Brochure');
+  });
+
+  it('includes thumbnail in article content when thumbnail_urn provided', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:post:art-2' }, status: 201 });
+    await svc.createPost(ACCESS_TOKEN, {
+      author_urn: 'urn:li:organization:123',
+      article_url: 'https://example.com/article',
+      thumbnail_urn: 'urn:li:image:thumb-1',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.article.thumbnail).toBe('urn:li:image:thumb-1');
+  });
+});
+
+describe('createCreative — VAST tag video and event ad', () => {
+  it('creates VAST tag video creative', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:sponsoredCreative:vast-1' }, status: 201 });
+    const result = await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      ad_account_id: ACCOUNT_ID,
+      vast_tag_url: 'https://innovid.com/vast/my-ad.xml',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.thirdPartyVastTagVideoAd.vastTagUrl).toBe('https://innovid.com/vast/my-ad.xml');
+    expect(result.success).toBe(true);
+  });
+
+  it('creates event ad creative with pre_event_registration_image', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:sponsoredCreative:evt-1' }, status: 201 });
+    await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      ad_account_id: ACCOUNT_ID,
+      post_urn: 'urn:li:ugcPost:event-123',
+      pre_event_registration_image: 'urn:li:image:img-2',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.reference).toBe('urn:li:ugcPost:event-123');
+    expect(body.content.preEventRegistrationImage).toBe('urn:li:image:img-2');
+  });
+});
+
+describe('uploadVideoPart', () => {
+  it('PUTs buffer to uploadUrl and returns ETag from response header', async () => {
+    const axiosMock = jest.requireMock('axios');
+    axiosMock.default.put = jest.fn().mockResolvedValue({ headers: { etag: 'etag-part-1' }, data: {} });
+    const buf = Buffer.from('video-chunk');
+    const etag = await svc.uploadVideoPart('https://video-upload.example.com', buf);
+    expect(axiosMock.default.put).toHaveBeenCalledWith(
+      'https://video-upload.example.com',
+      buf,
+      { headers: { 'Content-Type': 'application/octet-stream' } }
+    );
+    expect(etag).toBe('etag-part-1');
+  });
+
+  it('returns empty string when ETag header is absent', async () => {
+    const axiosMock = jest.requireMock('axios');
+    axiosMock.default.put = jest.fn().mockResolvedValue({ headers: {}, data: {} });
+    const etag = await svc.uploadVideoPart('https://video-upload.example.com', Buffer.from('x'));
+    expect(etag).toBe('');
+  });
+});
+
+describe('initializeDocumentUpload', () => {
+  it('POSTs to /rest/documents?action=initializeUpload with ownerUrn', async () => {
+    mockAxiosFn.mockResolvedValue({ data: { value: { uploadUrl: 'https://doc-upload.example.com', document: 'urn:li:document:doc-1' } }, status: 200 });
+    const result = await svc.initializeDocumentUpload(ACCESS_TOKEN, 'urn:li:organization:123');
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.url).toContain('/rest/documents?action=initializeUpload');
+    expect(call.data.initializeUploadRequest.owner).toBe('urn:li:organization:123');
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('uploadDocumentBinary', () => {
+  it('PUTs buffer to uploadUrl with correct content type', async () => {
+    const axiosMock = jest.requireMock('axios');
+    const buf = Buffer.from('pdf-bytes');
+    await svc.uploadDocumentBinary('https://doc-upload.example.com', buf, 'application/pdf');
+    expect(axiosMock.default.put).toHaveBeenCalledWith(
+      'https://doc-upload.example.com',
+      buf,
+      { headers: { 'Content-Type': 'application/pdf' } }
+    );
+  });
+
+  it('defaults content type to application/pdf', async () => {
+    const axiosMock = jest.requireMock('axios');
+    await svc.uploadDocumentBinary('https://doc-upload.example.com', Buffer.from('data'));
+    expect(axiosMock.default.put).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Buffer),
+      { headers: { 'Content-Type': 'application/pdf' } }
+    );
+  });
+});
+
+describe('createDynamicCreative', () => {
+  it('creates JOBS dynamic creative', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:sponsoredCreative:dyn-1' }, status: 201 });
+    const result = await svc.createDynamicCreative(ACCESS_TOKEN, ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      format: 'JOBS',
+      headline: 'We are hiring!',
+      button_label: 'Apply Now',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.jobs.headline).toBe('We are hiring!');
+    expect(body.content.jobs.buttonLabel).toBe('Apply Now');
+    expect(result.success).toBe(true);
+  });
+
+  it('creates SPOTLIGHT dynamic creative', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:sponsoredCreative:dyn-2' }, status: 201 });
+    await svc.createDynamicCreative(ACCESS_TOKEN, ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      format: 'SPOTLIGHT',
+      headline: 'See our work',
+      call_to_action: 'Visit Now',
+      landing_page: 'https://example.com',
+      description: 'Award-winning agency',
+      logo_urn: 'urn:li:image:logo-1',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.spotlight.headline).toBe('See our work');
+    expect(body.content.spotlight.callToAction).toBe('Visit Now');
+    expect(body.content.spotlight.landingPage).toBe('https://example.com');
+    expect(body.content.spotlight.description).toBe('Award-winning agency');
+    expect(body.content.spotlight.logo).toBe('urn:li:image:logo-1');
+  });
+
+  it('returns error if SPOTLIGHT dynamic creative is missing logo_urn', async () => {
+    const result = await svc.createDynamicCreative(ACCESS_TOKEN, ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      format: 'SPOTLIGHT',
+      headline: 'See our work',
+      call_to_action: 'Visit Now',
+      landing_page: 'https://example.com',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('require logo_urn');
+  });
+
+  it('creates FOLLOW_COMPANY dynamic creative', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:sponsoredCreative:dyn-3' }, status: 201 });
+    await svc.createDynamicCreative(ACCESS_TOKEN, ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      format: 'FOLLOW_COMPANY',
+      headline: 'Follow us for updates',
+    });
+    const body = mockAxiosFn.mock.calls[0][0].data;
+    expect(body.content.follow.headline).toBe('Follow us for updates');
+  });
+
+  it('returns error for unknown format', async () => {
+    const result = await svc.createDynamicCreative(ACCESS_TOKEN, ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      format: 'UNKNOWN_FORMAT',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Unknown dynamic ad format');
+  });
+
+  it('returns error when campaign_id missing', async () => {
+    const result = await svc.createDynamicCreative(ACCESS_TOKEN, ACCOUNT_ID, { format: 'JOBS' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('campaign_id');
+  });
+});
+
+describe('createConversationAd', () => {
+  it('POSTs to /rest/conversationAds with parentAccount', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
+    const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { name: 'My Conversation Ad' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.url).toContain('/rest/conversationAds');
+    expect(call.data.parentAccount).toBe(`urn:li:sponsoredAccount:${ACCOUNT_ID}`);
+    expect(call.data.name).toBe('My Conversation Ad');
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error when name missing', async () => {
+    const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, {});
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('name');
+  });
+});
+
+describe('createConversationAdContent', () => {
+  it('POSTs message node with buttons to conversation ad', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAdContent:cc-1' }, status: 201 });
+    const result = await svc.createConversationAdContent(
+      ACCESS_TOKEN,
+      'urn:li:conversationAd:ca-1',
+      {
+        body: 'Hello! Interested in learning more?',
+        buttons: [
+          { text: 'Yes, tell me more', action: 'SEND_MESSAGE' },
+          { text: 'Visit our site', action: 'OPEN_URL', url: 'https://example.com' },
+        ],
+      }
+    );
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.url).toContain('conversationAds');
+    expect(call.url).toContain('sponsoredMessageContents');
+    expect(call.data.body).toBe('Hello! Interested in learning more?');
+    expect(call.data.buttons).toHaveLength(2);
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error when body missing', async () => {
+    const result = await svc.createConversationAdContent(ACCESS_TOKEN, 'urn:li:conversationAd:ca-1', {
+      buttons: [{ text: 'OK', action: 'OPEN_URL' }],
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('body');
+  });
+
+  it('returns error when buttons missing', async () => {
+    const result = await svc.createConversationAdContent(ACCESS_TOKEN, 'urn:li:conversationAd:ca-1', {
+      body: 'Hello',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('buttons');
+  });
+});
+
+describe('setConversationAdFirstContent', () => {
+  it('PATCHes conversation ad to set firstContent', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: {}, status: 204 });
+    const result = await svc.setConversationAdFirstContent(
+      ACCESS_TOKEN,
+      'urn:li:conversationAd:ca-1',
+      'urn:li:conversationAdContent:cc-1'
+    );
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.url).toContain('conversationAds');
+    expect(call.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
+    expect(call.data.patch.$set.firstContent).toBe('urn:li:conversationAdContent:cc-1');
+    expect(result.success).toBe(true);
   });
 });
 

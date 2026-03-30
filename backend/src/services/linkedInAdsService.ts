@@ -53,17 +53,23 @@ async function makeRequest(
     const errData = err.response?.data;
     const message = errData?.message || errData?.serviceErrorCode || err.message;
     const details = errData?.errorDetails;
-    // errorDetails can be an array, a nested object with inputErrors, or a plain object
-    const detailsArr: any[] = Array.isArray(details)
-      ? details
-      : details?.inputErrors
-        ? details.inputErrors
-        : details
-          ? [details]
-          : [];
-    const fullError = detailsArr.length > 0
-      ? `${message}\n${detailsArr.map((d: any) => `ERROR :: ${d.inputPath ?? d.input ?? ''} :: ${d.description ?? d.message ?? JSON.stringify(d)}`).join('\n')}`
-      : message;
+
+    // errorDetails.inputErrors: validation errors with input.inputPath.fieldPath
+    const inputErrors: any[] = details?.inputErrors ?? (Array.isArray(details) ? details : []);
+    // errorDetails.conditionalInputErrors: cross-field conflicts (e.g. carousel vs video type)
+    const conditionalErrors: any[] = details?.conditionalInputErrors ?? [];
+
+    const formatError = (d: any): string => {
+      const fieldPath = d.input?.inputPath?.fieldPath ?? d.inputPath?.fieldPath ?? d.inputPath ?? '';
+      const desc = d.description ?? d.message ?? JSON.stringify(d);
+      return fieldPath ? `  - ${fieldPath}: ${desc}` : `  - ${desc}`;
+    };
+
+    const allErrors = [
+      ...inputErrors.map(formatError),
+      ...conditionalErrors.map(formatError),
+    ];
+    const fullError = allErrors.length > 0 ? `${message}\n${allErrors.join('\n')}` : message;
     console.error(`LinkedIn Ads API error [${method} ${path}]:`, status, fullError, errData ? JSON.stringify(errData) : '');
     return { success: false, error: fullError, status };
   }
@@ -281,11 +287,18 @@ export async function createCampaign(
   const unitCostAmount = params.unitCost?.amount || params.unit_cost_amount || '2.00';
   const unitCostCurrency = params.unitCost?.currencyCode || params.unit_cost_currency || 'USD';
 
+  const campaignType = params.type || 'SPONSORED_UPDATES';
+
+  // LinkedIn requires format when type=DYNAMIC (e.g. SPOTLIGHT, JOBS, FOLLOW_COMPANY)
+  if (campaignType === 'DYNAMIC' && !params.format) {
+    return { success: false, error: 'format is required when campaign type is DYNAMIC. Use SPOTLIGHT, JOBS, or FOLLOW_COMPANY.' };
+  }
+
   const body: Record<string, any> = {
     account: `urn:li:sponsoredAccount:${adAccountId}`,
     name: params.name,
     status: params.status || 'DRAFT',
-    type: params.type || 'SPONSORED_UPDATES',
+    type: campaignType,
     costType,
     unitCost: {
       amount: String(unitCostAmount),
@@ -297,7 +310,7 @@ export async function createCampaign(
     },
     offsiteDeliveryEnabled: params.offsite_delivery_enabled ?? false,
     audienceExpansionEnabled: params.audience_expansion_enabled ?? false,
-    creativeSelection: params.creative_selection || (params.type === 'SPONSORED_INMAILS' ? 'ROUND_ROBIN' : 'OPTIMIZED'),
+    creativeSelection: params.creative_selection || (campaignType === 'SPONSORED_INMAILS' ? 'ROUND_ROBIN' : 'OPTIMIZED'),
   };
 
   // campaignGroup: accept full URN or numeric ID
@@ -427,6 +440,24 @@ export async function createPost(
         title: params.title || '',
       },
     };
+  } else if (params.document_urn) {
+    // Document Ads: reference the uploaded document URN
+    body.content = {
+      media: {
+        id: params.document_urn,
+        title: params.title || '',
+      },
+    };
+  } else if (params.article_url) {
+    // Article Ads: link to an external article
+    body.content = {
+      article: {
+        source: params.article_url,
+        title: params.article_title || '',
+        description: params.article_description || '',
+        ...(params.thumbnail_urn ? { thumbnail: params.thumbnail_urn } : {}),
+      },
+    };
   } else if (params.carousel_cards && Array.isArray(params.carousel_cards)) {
     body.content = {
       carousel: {
@@ -477,9 +508,20 @@ export async function createCreative(
     intendedStatus: params.status || 'ACTIVE',
   };
 
-  if (params.reference || params.post_urn) {
-    // Sponsored content creative (image, video only — not carousel)
+  if (params.vast_tag_url) {
+    // VAST Tag Video Ad — third-party video served via VAST tag URL (e.g. Innovid)
+    body.content = {
+      thirdPartyVastTagVideoAd: {
+        vastTagUrl: params.vast_tag_url,
+      },
+    };
+  } else if (params.reference || params.post_urn) {
+    // Sponsored content creative (image, video, article, document, event post URN)
     body.content = { reference: params.reference || params.post_urn };
+    // Event Ads: optional pre-event registration image
+    if (params.pre_event_registration_image) {
+      body.content.preEventRegistrationImage = params.pre_event_registration_image;
+    }
   } else if (params.headline) {
     // Text ad creative (no post needed)
     body.content = {
@@ -494,7 +536,7 @@ export async function createCreative(
     // Message ad / conversation ad creative
     body.content = { reference: params.inmail_content_urn };
   } else {
-    return { success: false, error: 'CREATIVE CREATE requires either post_urn, headline (text ad), or inmail_content_urn' };
+    return { success: false, error: 'CREATIVE CREATE requires either post_urn, vast_tag_url, headline (text ad), or inmail_content_urn' };
   }
 
   const adAccountId = params.ad_account_id;
@@ -609,13 +651,22 @@ export async function initializeVideoUpload(
 
 /**
  * Step 3: Finalize video upload after all parts are uploaded.
+ * uploadToken is returned by initializeVideoUpload (may be empty string).
+ * uploadedPartIds are the ETag values returned by each uploadVideoPart call.
  */
 export async function finalizeVideoUpload(
   accessToken: string,
-  videoUrn: string
+  videoUrn: string,
+  uploadToken: string = '',
+  uploadedPartIds: string[] = []
 ): Promise<LinkedInAdsApiResult> {
-  const encodedUrn = encodeURIComponent(videoUrn);
-  return makeRequest('POST', `/rest/videos/${encodedUrn}?action=finalizeUpload`, accessToken, {});
+  return makeRequest('POST', '/rest/videos?action=finalizeUpload', accessToken, {
+    finalizeUploadRequest: {
+      video: videoUrn,
+      uploadToken,
+      uploadedPartIds,
+    },
+  });
 }
 
 // ─── Targeting ────────────────────────────────────────────────────────────────
@@ -807,4 +858,190 @@ export async function sendTestInMail(
   return makeRequest('POST', `/rest/inMailContents/${encodedUrn}?action=sendTestInMail`, accessToken, {
     recipient: recipientEmail,
   });
+}
+
+// ─── Video upload (multipart) ─────────────────────────────────────────────────
+
+/**
+ * Step 2: PUT one video part to the signed uploadUrl.
+ * LinkedIn returns per-part upload URLs from initializeVideoUpload.
+ * No Authorization header needed for PUT.
+ * Returns the ETag from the response header — required for finalizeVideoUpload.
+ */
+export async function uploadVideoPart(uploadUrl: string, buffer: Buffer): Promise<string> {
+  const response = await axios.put(uploadUrl, buffer, {
+    headers: { 'Content-Type': 'application/octet-stream' },
+  });
+  // LinkedIn returns the part ID as an ETag header — must be passed to finalizeUpload
+  return response.headers?.['etag'] || response.headers?.['ETag'] || '';
+}
+
+// ─── Document upload ──────────────────────────────────────────────────────────
+
+/**
+ * Step 1: Initialize document upload.
+ * POST /rest/documents?action=initializeUpload
+ * Returns uploadUrl and document URN.
+ */
+export async function initializeDocumentUpload(
+  accessToken: string,
+  ownerUrn: string
+): Promise<LinkedInAdsApiResult> {
+  return makeRequest('POST', '/rest/documents?action=initializeUpload', accessToken, {
+    initializeUploadRequest: { owner: ownerUrn },
+  });
+}
+
+/**
+ * Step 2: PUT binary document data to the signed uploadUrl.
+ * No Authorization header needed for the PUT.
+ */
+export async function uploadDocumentBinary(uploadUrl: string, buffer: Buffer, contentType = 'application/pdf'): Promise<void> {
+  await axios.put(uploadUrl, buffer, {
+    headers: { 'Content-Type': contentType },
+  });
+}
+
+// ─── Dynamic Ads (Jobs / Spotlight / Follower) ────────────────────────────────
+
+/**
+ * Create a Dynamic Ad creative (Jobs, Spotlight, or Follower).
+ * Campaign must have type=DYNAMIC and matching format.
+ *
+ * format=JOBS:          content.jobs   → { headline, buttonLabel } (preApproved template or custom text)
+ * format=SPOTLIGHT:     content.spotlight → { headline, callToAction, landingPage, description?, backgroundImage?, logo? }
+ * format=FOLLOW_COMPANY: content.follow → { headline, description?, callToAction? } (pre-approved templates only)
+ */
+export async function createDynamicCreative(
+  accessToken: string,
+  adAccountId: string,
+  params: Record<string, any>
+): Promise<LinkedInAdsApiResult> {
+  if (!adAccountId) return { success: false, error: 'createDynamicCreative requires ad_account_id' };
+  if (!params.campaign_id) return { success: false, error: 'createDynamicCreative requires campaign_id' };
+  if (!params.format) return { success: false, error: 'createDynamicCreative requires format (JOBS|SPOTLIGHT|FOLLOW_COMPANY)' };
+
+  const campaignUrn = params.campaign_id.startsWith('urn:') ? params.campaign_id : `urn:li:sponsoredCampaign:${params.campaign_id}`;
+
+  const body: Record<string, any> = {
+    campaign: campaignUrn,
+    intendedStatus: params.status || 'ACTIVE',
+  };
+
+  const fmt = params.format.toUpperCase();
+  if (fmt === 'JOBS') {
+    body.content = {
+      jobs: {
+        headline: params.headline,
+        buttonLabel: params.button_label || params.buttonLabel,
+      },
+    };
+  } else if (fmt === 'SPOTLIGHT') {
+    // LinkedIn requires logo if the company page doesn't have a profile logo.
+    // Use MEDIA/UPLOAD_IMAGE to upload a logo image first and pass the resulting image URN as logo_urn.
+    if (!params.logo_urn) {
+      return {
+        success: false,
+        error: 'SPOTLIGHT dynamic ads require logo_urn. Upload a logo first using MEDIA/UPLOAD_IMAGE and pass the returned image_urn as logo_urn.',
+      };
+    }
+    body.content = {
+      spotlight: {
+        headline: params.headline,
+        callToAction: params.call_to_action || params.callToAction,
+        landingPage: params.landing_page || params.landingPage,
+        logo: params.logo_urn,
+        ...(params.description ? { description: params.description } : {}),
+        ...(params.background_image_urn ? { backgroundImage: params.background_image_urn } : {}),
+      },
+    };
+  } else if (fmt === 'FOLLOW_COMPANY') {
+    body.content = {
+      follow: {
+        headline: params.headline,
+        ...(params.description ? { description: params.description } : {}),
+        ...(params.call_to_action || params.callToAction ? { callToAction: params.call_to_action || params.callToAction } : {}),
+      },
+    };
+  } else {
+    return { success: false, error: `Unknown dynamic ad format "${params.format}". Use JOBS, SPOTLIGHT, or FOLLOW_COMPANY.` };
+  }
+
+  return makeRequest('POST', `/rest/adAccounts/${adAccountId}/creatives`, accessToken, body);
+}
+
+// ─── Conversation Ads ──────────────────────────────────────────────────────────
+
+/**
+ * Create a Conversation Ad container.
+ * POST /rest/conversationAds
+ * After creation, add message nodes via createConversationAdContent,
+ * then set the first node via setConversationAdFirstContent.
+ */
+export async function createConversationAd(
+  accessToken: string,
+  adAccountId: string,
+  params: Record<string, any>
+): Promise<LinkedInAdsApiResult> {
+  if (!adAccountId) return { success: false, error: 'createConversationAd requires ad_account_id' };
+  if (!params.name) return { success: false, error: 'createConversationAd requires name' };
+
+  const body: Record<string, any> = {
+    parentAccount: `urn:li:sponsoredAccount:${adAccountId}`,
+    name: params.name,
+  };
+
+  return makeRequest('POST', '/rest/conversationAds', accessToken, body);
+}
+
+/**
+ * Add a message node to a Conversation Ad.
+ * POST /rest/conversationAds/{conversationAdUrn}/sponsoredMessageContents
+ *
+ * Each node has a body text and up to 5 CTA buttons.
+ * buttons format: [{ text, action: 'OPEN_URL'|'SEND_MESSAGE', url? }]
+ */
+export async function createConversationAdContent(
+  accessToken: string,
+  conversationAdUrn: string,
+  params: Record<string, any>
+): Promise<LinkedInAdsApiResult> {
+  if (!conversationAdUrn) return { success: false, error: 'createConversationAdContent requires conversation_ad_urn' };
+  if (!params.body) return { success: false, error: 'createConversationAdContent requires body (message text)' };
+  if (!params.buttons || !Array.isArray(params.buttons) || params.buttons.length === 0) {
+    return { success: false, error: 'createConversationAdContent requires buttons array (1–5 buttons)' };
+  }
+
+  const encodedUrn = encodeURIComponent(conversationAdUrn);
+  const body: Record<string, any> = {
+    body: params.body,
+    ...(params.subject ? { subject: params.subject } : {}),
+    ...(params.footer ? { footer: params.footer } : {}),
+    buttons: params.buttons.map((btn: any) => ({
+      text: btn.text,
+      action: btn.action || 'OPEN_URL',
+      ...(btn.url ? { landingPage: btn.url } : {}),
+    })),
+  };
+
+  return makeRequest('POST', `/rest/conversationAds/${encodedUrn}/sponsoredMessageContents`, accessToken, body);
+}
+
+/**
+ * Set the first message node in a Conversation Ad (required before launching).
+ * PATCH /rest/conversationAds/{conversationAdUrn}
+ */
+export async function setConversationAdFirstContent(
+  accessToken: string,
+  conversationAdUrn: string,
+  firstContentUrn: string
+): Promise<LinkedInAdsApiResult> {
+  const encodedUrn = encodeURIComponent(conversationAdUrn);
+  return makeRequest(
+    'POST',
+    `/rest/conversationAds/${encodedUrn}`,
+    accessToken,
+    { patch: { $set: { firstContent: firstContentUrn } } },
+    { 'X-RestLi-Method': 'PARTIAL_UPDATE' }
+  );
 }

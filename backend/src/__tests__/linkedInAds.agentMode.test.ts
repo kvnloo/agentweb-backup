@@ -20,6 +20,7 @@ jest.mock('../services/linkedInAdsService', () => ({
   updateCampaign: jest.fn(),
   createCreative: jest.fn(),
   createCreativeInline: jest.fn(),
+  createDynamicCreative: jest.fn(),
   listCreatives: jest.fn(),
   createPost: jest.fn(),
   listTargetingFacets: jest.fn(),
@@ -28,10 +29,16 @@ jest.mock('../services/linkedInAdsService', () => ({
   initializeImageUpload: jest.fn(),
   uploadImageBinary: jest.fn(),
   initializeVideoUpload: jest.fn(),
+  uploadVideoPart: jest.fn(),
   finalizeVideoUpload: jest.fn(),
+  initializeDocumentUpload: jest.fn(),
+  uploadDocumentBinary: jest.fn(),
   getAdAnalytics: jest.fn(),
   createInMailContent: jest.fn(),
   sendTestInMail: jest.fn(),
+  createConversationAd: jest.fn(),
+  createConversationAdContent: jest.fn(),
+  setConversationAdFirstContent: jest.fn(),
 }));
 
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
@@ -106,8 +113,17 @@ beforeEach(() => {
   (linkedInAdsService.finalizeVideoUpload as jest.Mock).mockResolvedValue({ success: true, data: {} });
   (linkedInAdsService.getAdAnalytics as jest.Mock).mockResolvedValue({ success: true, data: { elements: [{ impressions: 1000 }] } });
   (linkedInAdsService.createCreativeInline as jest.Mock).mockResolvedValue({ success: true, data: { id: 'cr-inline-1' } });
+  (linkedInAdsService.createDynamicCreative as jest.Mock).mockResolvedValue({ success: true, data: { id: 'cr-dynamic-1' } });
   (linkedInAdsService.createInMailContent as jest.Mock).mockResolvedValue({ success: true, data: { id: 'urn:li:inMailContent:123' } });
   (linkedInAdsService.sendTestInMail as jest.Mock).mockResolvedValue({ success: true, data: {} });
+  (linkedInAdsService.initializeVideoUpload as jest.Mock).mockResolvedValue({ success: true, data: { value: { uploadInstructions: [{ uploadUrl: 'https://video-upload.example.com', firstByte: 0, lastByte: 99 }], video: 'urn:li:video:vid-1' } } });
+  (linkedInAdsService.uploadVideoPart as jest.Mock).mockResolvedValue('etag-part-1');
+  (linkedInAdsService.finalizeVideoUpload as jest.Mock).mockResolvedValue({ success: true, data: {} });
+  (linkedInAdsService.initializeDocumentUpload as jest.Mock).mockResolvedValue({ success: true, data: { value: { uploadUrl: 'https://doc-upload.example.com', document: 'urn:li:document:doc-1' } } });
+  (linkedInAdsService.uploadDocumentBinary as jest.Mock).mockResolvedValue(undefined);
+  (linkedInAdsService.createConversationAd as jest.Mock).mockResolvedValue({ success: true, data: { id: 'urn:li:conversationAd:ca-1' } });
+  (linkedInAdsService.createConversationAdContent as jest.Mock).mockResolvedValue({ success: true, data: { id: 'urn:li:conversationAdContent:cc-1' } });
+  (linkedInAdsService.setConversationAdFirstContent as jest.Mock).mockResolvedValue({ success: true, data: {} });
 
   service = new AgentModeService();
 });
@@ -472,6 +488,7 @@ describe('callLinkedInMarketingApi — MEDIA', () => {
     await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'FINALIZE_VIDEO', ACCOUNT_ID, {
       video_urn: 'urn:li:video:123',
     });
+    // Legacy FINALIZE_VIDEO passes video_urn only; uploadToken and uploadedPartIds use defaults
     expect(linkedInAdsService.finalizeVideoUpload).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:video:123');
   });
 });
@@ -615,5 +632,175 @@ describe('callLinkedInAdsInsightsApi', () => {
   it('returns analytics from service', async () => {
     const result = await service.callLinkedInAdsInsightsApi(USER_ID, ACCOUNT_ID, { pivot: 'CAMPAIGN', dateRange });
     expect(result.analytics).toEqual([{ impressions: 1000 }]);
+  });
+});
+
+// ── callLinkedInMarketingApi — MEDIA/UPLOAD_VIDEO ────────────────────────────
+
+describe('callLinkedInMarketingApi — MEDIA/UPLOAD_VIDEO', () => {
+  beforeEach(() => {
+    const mockAxios = require('axios');
+    mockAxios.get = jest.fn().mockResolvedValue({
+      data: Buffer.alloc(100, 'x'),
+      headers: { 'content-type': 'video/mp4' },
+    });
+  });
+
+  it('UPLOAD_VIDEO auto-downloads, inits upload, uploads parts, finalizes, returns video_urn', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_VIDEO', ACCOUNT_ID, {
+      video_url: 'https://example.com/video.mp4',
+    });
+    expect(linkedInAdsService.initializeVideoUpload).toHaveBeenCalledWith(ACCESS_TOKEN, ORG_URN, 100);
+    expect(linkedInAdsService.uploadVideoPart).toHaveBeenCalledWith(
+      'https://video-upload.example.com',
+      expect.any(Buffer)
+    );
+    expect(linkedInAdsService.finalizeVideoUpload).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:video:vid-1', '', ['etag-part-1']);
+    expect(result.success).toBe(true);
+    expect(result.video_urn).toBe('urn:li:video:vid-1');
+  });
+
+  it('UPLOAD_VIDEO throws when video_url missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_VIDEO', ACCOUNT_ID, {})
+    ).rejects.toThrow('video_url');
+  });
+});
+
+// ── callLinkedInMarketingApi — MEDIA/UPLOAD_DOCUMENT ────────────────────────
+
+describe('callLinkedInMarketingApi — MEDIA/UPLOAD_DOCUMENT', () => {
+  beforeEach(() => {
+    const mockAxios = require('axios');
+    mockAxios.get = jest.fn().mockResolvedValue({
+      data: Buffer.alloc(200, 'y'),
+      headers: { 'content-type': 'application/pdf' },
+    });
+  });
+
+  it('UPLOAD_DOCUMENT auto-downloads, inits upload, uploads binary, returns document_urn', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_DOCUMENT', ACCOUNT_ID, {
+      document_url: 'https://example.com/brochure.pdf',
+    });
+    expect(linkedInAdsService.initializeDocumentUpload).toHaveBeenCalledWith(ACCESS_TOKEN, ORG_URN);
+    expect(linkedInAdsService.uploadDocumentBinary).toHaveBeenCalledWith(
+      'https://doc-upload.example.com',
+      expect.any(Buffer),
+      'application/pdf'
+    );
+    expect(result.success).toBe(true);
+    expect(result.document_urn).toBe('urn:li:document:doc-1');
+  });
+
+  it('UPLOAD_DOCUMENT throws when document_url missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_DOCUMENT', ACCOUNT_ID, {})
+    ).rejects.toThrow('document_url');
+  });
+});
+
+// ── callLinkedInMarketingApi — CREATIVE/CREATE_DYNAMIC ───────────────────────
+
+describe('callLinkedInMarketingApi — CREATIVE/CREATE_DYNAMIC', () => {
+  it('CREATE_DYNAMIC calls createDynamicCreative with correct params', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE_DYNAMIC', ACCOUNT_ID, {
+      campaign_id: 'camp-1',
+      format: 'SPOTLIGHT',
+      headline: 'Check us out',
+      call_to_action: 'Learn More',
+      landing_page: 'https://example.com',
+    });
+    expect(linkedInAdsService.createDynamicCreative).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      ACCOUNT_ID,
+      expect.objectContaining({ campaign_id: 'camp-1', format: 'SPOTLIGHT' })
+    );
+    expect(result.success).toBe(true);
+    expect(result.creative).toBeDefined();
+  });
+
+  it('CREATE_DYNAMIC throws when campaign_id missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE_DYNAMIC', ACCOUNT_ID, { format: 'JOBS' })
+    ).rejects.toThrow('campaign_id');
+  });
+
+  it('CREATE_DYNAMIC throws when format missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE_DYNAMIC', ACCOUNT_ID, { campaign_id: 'camp-1' })
+    ).rejects.toThrow('format');
+  });
+});
+
+// ── callLinkedInMarketingApi — CONVERSATION_AD ───────────────────────────────
+
+describe('callLinkedInMarketingApi — CONVERSATION_AD', () => {
+  it('CREATE creates conversation ad and returns urn', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'CREATE', ACCOUNT_ID, {
+      name: 'My Conversation Ad',
+    });
+    expect(linkedInAdsService.createConversationAd).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      ACCOUNT_ID,
+      expect.objectContaining({ name: 'My Conversation Ad' })
+    );
+    expect(result.success).toBe(true);
+    expect(result.conversation_ad_urn).toBe('urn:li:conversationAd:ca-1');
+  });
+
+  it('CREATE throws when name missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'CREATE', ACCOUNT_ID, {})
+    ).rejects.toThrow('name');
+  });
+
+  it('CREATE_CONTENT adds message node and returns content_urn', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'CREATE_CONTENT', ACCOUNT_ID, {
+      conversation_ad_urn: 'urn:li:conversationAd:ca-1',
+      body: 'Hello! How can we help?',
+      buttons: [{ text: 'Learn More', action: 'OPEN_URL', url: 'https://example.com' }],
+    });
+    expect(linkedInAdsService.createConversationAdContent).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      'urn:li:conversationAd:ca-1',
+      expect.objectContaining({ body: 'Hello! How can we help?' })
+    );
+    expect(result.success).toBe(true);
+    expect(result.content_urn).toBe('urn:li:conversationAdContent:cc-1');
+  });
+
+  it('CREATE_CONTENT throws when conversation_ad_urn missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'CREATE_CONTENT', ACCOUNT_ID, {
+        body: 'Hi', buttons: [{ text: 'OK', action: 'OPEN_URL' }],
+      })
+    ).rejects.toThrow('conversation_ad_urn');
+  });
+
+  it('SET_FIRST_CONTENT sets first content node', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'SET_FIRST_CONTENT', ACCOUNT_ID, {
+      conversation_ad_urn: 'urn:li:conversationAd:ca-1',
+      first_content_urn: 'urn:li:conversationAdContent:cc-1',
+    });
+    expect(linkedInAdsService.setConversationAdFirstContent).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      'urn:li:conversationAd:ca-1',
+      'urn:li:conversationAdContent:cc-1'
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('SET_FIRST_CONTENT throws when first_content_urn missing', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'SET_FIRST_CONTENT', ACCOUNT_ID, {
+        conversation_ad_urn: 'urn:li:conversationAd:ca-1',
+      })
+    ).rejects.toThrow('first_content_urn');
+  });
+
+  it('throws on unknown CONVERSATION_AD action', async () => {
+    await expect(
+      (service as any).callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'UNKNOWN', ACCOUNT_ID, {})
+    ).rejects.toThrow('CONVERSATION_AD');
   });
 });

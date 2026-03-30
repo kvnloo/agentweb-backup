@@ -620,61 +620,107 @@ emmaToolRegistry.register({
     description: `Manage LinkedIn Ads entities via the Marketing Developer Platform API. Requires account_id from list_connected_accounts(platform='linkedin_ads').
 
 ACTION MATRIX (entity_type → supported actions):
-  AD_ACCOUNT     → LIST
-  CAMPAIGN_GROUP → LIST, CREATE, UPDATE
-  CAMPAIGN       → LIST, CREATE, UPDATE
-  CREATIVE       → LIST, CREATE, CREATE_INLINE
-  POST           → CREATE
-  TARGETING      → LIST_FACETS, SEARCH, ESTIMATE_REACH
-  MEDIA          → UPLOAD_IMAGE, INIT_VIDEO_UPLOAD, FINALIZE_VIDEO
-  INMAIL         → CREATE_CONTENT, SEND_TEST
+  AD_ACCOUNT      → LIST
+  CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
+  CAMPAIGN        → LIST, CREATE, UPDATE
+  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC
+  POST            → CREATE
+  TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
+  MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
+  INMAIL          → CREATE_CONTENT, SEND_TEST
+  CONVERSATION_AD → CREATE, CREATE_CONTENT, SET_FIRST_CONTENT
 
 ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
 
-⚠️ IMAGE/VIDEO/CAROUSEL AD FLOWS — STRICTLY FOLLOW THESE, NO DEVIATION:
+⚠️ AD FORMAT FLOWS — STRICTLY FOLLOW THESE, NO DEVIATION:
 
-  SINGLE IMAGE AD:
+  SINGLE IMAGE AD (campaign type: SPONSORED_UPDATES):
     Ask first: "Show on company page or dark post only?"
     Company page (FLOW A): MEDIA/UPLOAD_IMAGE → POST/CREATE (feed_distribution=MAIN_FEED, image_urn) → CREATIVE/CREATE (post_urn)
     Dark post  (FLOW B): MEDIA/UPLOAD_IMAGE → CREATIVE/CREATE_INLINE (image_urn, commentary, campaign_id)
 
-  CAROUSEL AD — ALWAYS FLOW B, NO EXCEPTIONS. NEVER use POST/CREATE + CREATIVE/CREATE for carousel (causes LinkedIn type conflict):
+  CAROUSEL AD (Requires Campaign format: CAROUSEL) — ALWAYS FLOW B, NO EXCEPTIONS. NEVER use POST/CREATE + CREATIVE/CREATE for carousel (causes LinkedIn type conflict):
     MEDIA/UPLOAD_IMAGE (×N, one per card) → CREATIVE/CREATE_INLINE (carousel_cards, commentary, campaign_id)
     carousel_cards format: array of { image_urn, title, landing_page }
     LinkedIn does NOT support carousel as an organic company page post.
 
-  VIDEO AD — ALWAYS FLOW B:
-    MEDIA/INIT_VIDEO_UPLOAD → MEDIA/FINALIZE_VIDEO → CREATIVE/CREATE_INLINE (video_urn, commentary, campaign_id)
+  VIDEO AD (campaign type: SPONSORED_UPDATES, Requires Campaign format: SINGLE_VIDEO) — NEVER ask user for file size:
+    Ask first: "Show on company page or dark post only?"
+    Company page (FLOW A): MEDIA/UPLOAD_VIDEO (video_url) → POST/CREATE (feed_distribution=MAIN_FEED, video_urn) → CREATIVE/CREATE (post_urn)
+    Dark post  (FLOW B): MEDIA/UPLOAD_VIDEO (video_url) → CREATIVE/CREATE_INLINE (video_urn, commentary, campaign_id)
+    MEDIA/UPLOAD_VIDEO auto-downloads the video, measures its size, handles multipart upload, and returns video_urn.
 
-  MESSAGE AD (InMail / Conversation Ad):
-    Campaign type must be SPONSORED_INMAILS.
-    FLOW: INMAIL/CREATE_CONTENT → CREATIVE/CREATE (inmail_content_urn, campaign_id)
+  ARTICLE AD (campaign type: SPONSORED_UPDATES):
+    POST/CREATE (article_url, article_title, article_description, optional thumbnail_urn) → CREATIVE/CREATE (post_urn)
+    No media upload needed — LinkedIn fetches the article preview automatically.
+
+  DOCUMENT AD (campaign type: SPONSORED_UPDATES):
+    MEDIA/UPLOAD_DOCUMENT (document_url) → POST/CREATE (document_urn, title) → CREATIVE/CREATE_INLINE (commentary, campaign_id) OR CREATIVE/CREATE (post_urn)
+
+  TEXT AD (campaign type: TEXT_AD):
+    CREATIVE/CREATE (headline, description, landing_page, optional image_urn, campaign_id)
+    No post creation needed — text ads are self-contained in the creative.
+
+  MESSAGE AD (InMail, campaign type: SPONSORED_INMAILS):
+    INMAIL/CREATE_CONTENT → CREATIVE/CREATE (inmail_content_urn, campaign_id)
     Optionally send a test: INMAIL/SEND_TEST (inmail_content_urn, recipient_email)
-    sender is auto-resolved from the connected account (captured at OAuth time) — do NOT ask the user for it.
+    sender is auto-resolved from the connected account — do NOT ask the user for it.
+
+  CONVERSATION AD (branching message, campaign type: SPONSORED_INMAILS):
+    CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
+    Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
+
+  JOBS AD (campaign type: SPONSORED_UPDATES, format: JOB_POSTING — uses DYNAMIC campaign):
+    CREATIVE/CREATE_DYNAMIC (format=JOBS, headline, button_label, campaign_id)
+    Campaign must use type=DYNAMIC. objective should be JOB_APPLICANTS.
+
+  SPOTLIGHT AD (campaign type: DYNAMIC):
+    ⚠️ logo_urn is REQUIRED for SPOTLIGHT — LinkedIn mandates it if the company page has no logo. Upload first with MEDIA/UPLOAD_IMAGE.
+    MEDIA/UPLOAD_IMAGE (logo image) → CREATIVE/CREATE_DYNAMIC (format=SPOTLIGHT, headline, call_to_action, landing_page, logo_urn, optional description/background_image_urn, campaign_id)
+
+  FOLLOWER AD (campaign type: DYNAMIC):
+    CREATIVE/CREATE_DYNAMIC (format=FOLLOW_COMPANY, headline, optional description/call_to_action, campaign_id)
+    Uses LinkedIn pre-approved headline/CTA templates to match member profile.
+
+  EVENT AD (campaign type: SPONSORED_UPDATES):
+    POST/CREATE (event_urn from an existing LinkedIn Event) → CREATIVE/CREATE (post_urn, optional pre_event_registration_image)
+    Or just CREATIVE/CREATE (post_urn=event_post_urn) if the event post already exists.
+
+  VAST TAG VIDEO AD (third-party video, campaign type: SPONSORED_UPDATES):
+    CREATIVE/CREATE (vast_tag_url, campaign_id) — no upload needed; video served by Innovid or approved vendor.
 
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN_GROUP CREATE: name, status (ACTIVE|DRAFT only — LinkedIn does NOT allow PAUSED on creation; if user wants paused, create as ACTIVE then UPDATE to PAUSED), run_schedule_start (epoch ms — ask the user when the campaign group should start), totalBudget.amount + totalBudget.currencyCode
-  CAMPAIGN CREATE: ⚠️ ALWAYS ask before creating: "What type of ads will run in this campaign — Image/Video/Carousel, Text Ad, or Message Ad?" Then set type accordingly:
-    type: SPONSORED_UPDATES (image, video, carousel) | TEXT_AD (text ads) | SPONSORED_INMAILS (message/conversation ads)
+  CAMPAIGN CREATE: ⚠️ ALWAYS ask before creating: "What type of ads will run in this campaign?" Then set type accordingly:
+    type: SPONSORED_UPDATES (image, video, carousel, article, document, event, VAST) | TEXT_AD | SPONSORED_INMAILS (message/conversation) | DYNAMIC (jobs, spotlight, follower)
+    format: ⚠️ REQUIRED for DYNAMIC, VIDEO, and CAROUSEL ads.
+      - If type=DYNAMIC: format=JOBS|SPOTLIGHT|FOLLOW_COMPANY
+      - If type=SPONSORED_UPDATES for video ads: format=SINGLE_VIDEO
+      - If type=SPONSORED_UPDATES for carousel ads: format=CAROUSEL
+      - If type=SPONSORED_UPDATES for event ads: format=SPONSORED_UPDATE_EVENT
+      - For single image / article / document: omit format (defaults to STANDARD_UPDATE).
     Campaign type is immutable after creation.
-    Other required fields: name, status, campaignGroup (full URN e.g. urn:li:sponsoredCampaignGroup:ID), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS|JOB_APPLICANTS), costType (CPM|CPC|CPV), unitCost (object), targeting_include (array, required)
+    Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS|JOB_APPLICANTS), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
     targeting_include format: array of { "facet_urn": "urn:li:adTargetingFacet:locations", "values": ["urn:li:geo:103644278"] }
-    targeting_exclude format: same as targeting_include (optional)
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
   CAMPAIGN UPDATE: campaign_id + fields to update
   CREATIVE LIST: params.campaign_id required
-  CREATIVE CREATE: campaign_id + post_urn (reference) for sponsored content. For text ads: headline, description, landing_page.
-  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR carousel_cards.
-  TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (search string)
-    Common facet URNs: locations, titles (job titles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
-    NOTE: staffCountRanges, seniorities, industries, functions do NOT support keyword search — omit query and the API returns all predefined values.
-    NOTE: For job titles use facet "urn:li:adTargetingFacet:titles" (NOT jobTitles)
+  CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads).
+  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards.
+  CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
+  TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
+    Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
   TARGETING ESTIMATE_REACH: targeting_criteria (object)
-  MEDIA UPLOAD_IMAGE: image_url (public URL) — downloads the image and uploads it to LinkedIn in one step. Returns image_urn.
-  MEDIA INIT_VIDEO_UPLOAD: file_size (bytes)
-  MEDIA FINALIZE_VIDEO: video_urn
-  INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender is auto-resolved from connected account — do NOT pass it)
+  MEDIA UPLOAD_IMAGE: image_url (public URL). Returns image_urn.
+  MEDIA UPLOAD_VIDEO: video_url (public URL). Auto-downloads, measures size, handles multipart upload. Returns video_urn. NEVER ask the user for file size.
+  MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
+  INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender auto-resolved — do NOT pass it)
   INMAIL SEND_TEST: inmail_content_urn, recipient_email
+  CONVERSATION_AD CREATE: name
+  CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
+  CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
+
+POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
 
 BUDGET FORMAT: decimal string e.g. "10.00" = $10.00 (NOT micro-currency)
 SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
@@ -683,12 +729,12 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
       properties: {
         entity_type: {
           type: 'string',
-          enum: ['AD_ACCOUNT', 'CAMPAIGN_GROUP', 'CAMPAIGN', 'CREATIVE', 'POST', 'TARGETING', 'MEDIA', 'INMAIL'],
+          enum: ['AD_ACCOUNT', 'CAMPAIGN_GROUP', 'CAMPAIGN', 'CREATIVE', 'POST', 'TARGETING', 'MEDIA', 'INMAIL', 'CONVERSATION_AD'],
           description: 'The LinkedIn Ads entity to operate on.'
         },
         action: {
           type: 'string',
-          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST'],
+          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
           description: 'The operation to perform. Must be valid for the chosen entity_type.'
         },
         account_id: {
@@ -735,13 +781,31 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
               }
             },
             // Creative
-            type: { type: 'string', enum: ['TEXT_AD', 'SPONSORED_UPDATES', 'SPONSORED_INMAILS'], description: 'Creative type.' },
+            type: { type: 'string', enum: ['TEXT_AD', 'SPONSORED_UPDATES', 'SPONSORED_INMAILS', 'DYNAMIC'], description: 'Campaign/creative type.' },
+            format: { type: 'string', description: 'Campaign or creative format. DYNAMIC campaigns: JOBS|SPOTLIGHT|FOLLOW_COMPANY. Event campaigns: SPONSORED_UPDATE_EVENT.' },
             reference: { type: 'string', description: 'Post URN for SPONSORED_UPDATES creatives.' },
+            // Creative — text ad
+            headline: { type: 'string', description: 'Text ad headline. Required for CREATIVE/CREATE text ads.' },
+            description: { type: 'string', description: 'Text ad description.' },
+            landing_page: { type: 'string', description: 'Landing page URL for text ads.' },
+            // Creative — VAST Tag Video Ad
+            vast_tag_url: { type: 'string', description: 'VAST tag URL for third-party video ads (e.g. from Innovid). Required for CREATIVE/CREATE VAST video.' },
+            // Creative — Event Ad
+            pre_event_registration_image: { type: 'string', description: 'Image URN for pre-event registration. Optional for event ad creatives.' },
+            // Creative — Dynamic Ad (Jobs / Spotlight / Follower)
+            button_label: { type: 'string', description: 'CTA button text for Jobs dynamic ads (CREATIVE/CREATE_DYNAMIC format=JOBS).' },
+            call_to_action: { type: 'string', description: 'CTA text for Spotlight/Follower dynamic ads.' },
+            background_image_urn: { type: 'string', description: 'Background image URN for Spotlight dynamic ads.' },
+            logo_urn: { type: 'string', description: 'Logo image URN for Spotlight dynamic ads.' },
             // Post
-
             commentary: { type: 'string', description: 'Post text content.' },
             visibility: { type: 'string', enum: ['PUBLIC', 'CONNECTIONS', 'LOGGED_IN'], description: 'Post visibility.' },
             feed_distribution: { type: 'string', enum: ['NONE', 'MAIN_FEED'], description: 'NONE = dark post (ad only, not shown on company page). MAIN_FEED = visible on company page AND runs as sponsored ad.' },
+            // Post — Article Ad
+            article_url: { type: 'string', description: 'URL of the article to feature. Required for POST/CREATE article ads.' },
+            article_title: { type: 'string', description: 'Article title override for article ads.' },
+            article_description: { type: 'string', description: 'Article description override for article ads.' },
+            thumbnail_urn: { type: 'string', description: 'Image URN to use as article thumbnail. Optional — LinkedIn auto-fetches if omitted.' },
             // Targeting search
             facet: { type: 'string', description: 'Targeting facet URN (e.g. urn:li:adTargetingFacet:locations).' },
             query: { type: 'string', description: 'Search query for TARGETING SEARCH.' },
@@ -760,11 +824,14 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
                 }
               }
             },
-            // Media upload
-            file_size: { type: 'number', description: 'Video file size in bytes. Required for INIT_VIDEO_UPLOAD.' },
-            video_urn: { type: 'string', description: 'Video URN. Required for FINALIZE_VIDEO.' },
+            // Media upload — video
+            video_url: { type: 'string', description: 'Public URL of the video file. Required for MEDIA/UPLOAD_VIDEO. File size is auto-detected — do NOT ask the user.' },
+            video_urn: { type: 'string', description: 'Video URN returned by MEDIA/UPLOAD_VIDEO. Use in CREATIVE/CREATE_INLINE.' },
+            file_size: { type: 'number', description: 'Video file size in bytes. Required for MEDIA/INIT_VIDEO_UPLOAD only (legacy — prefer UPLOAD_VIDEO instead).' },
+            // Media upload — document
+            document_url: { type: 'string', description: 'Public URL of the document (PDF, PPT, DOC). Required for MEDIA/UPLOAD_DOCUMENT.' },
+            document_urn: { type: 'string', description: 'Document URN returned by MEDIA/UPLOAD_DOCUMENT. Use in POST/CREATE for document ads.' },
             // InMail / Message Ad
-            sender: { type: 'string', description: 'LinkedIn Person URN of the message sender (urn:li:person:ID). Ask the user for their Member ID.' },
             subject: { type: 'string', description: 'InMail subject line.' },
             htmlBody: { type: 'string', description: 'InMail body content (HTML allowed).' },
             callToActionText: { type: 'string', description: 'CTA button text (max 20 characters).' },
@@ -773,8 +840,25 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             senderName: { type: 'string', description: 'Optional display name for the sender.' },
             senderTitle: { type: 'string', description: 'Optional job title of the sender.' },
             senderCompany: { type: 'string', description: 'Optional company name of the sender.' },
-            inmail_content_urn: { type: 'string', description: 'InMail content URN returned by INMAIL/CREATE_CONTENT. Use in CREATIVE/CREATE and INMAIL/SEND_TEST.' },
+            inmail_content_urn: { type: 'string', description: 'InMail content URN (INMAIL/CREATE_CONTENT result). Use in CREATIVE/CREATE.' },
             recipient_email: { type: 'string', description: 'Email address to send test InMail to. Required for INMAIL/SEND_TEST.' },
+            // Conversation Ad
+            conversation_ad_urn: { type: 'string', description: 'Conversation Ad URN from CONVERSATION_AD/CREATE. Used in CREATE_CONTENT and SET_FIRST_CONTENT.' },
+            body: { type: 'string', description: 'Message body text for CONVERSATION_AD/CREATE_CONTENT.' },
+            footer: { type: 'string', description: 'Optional footer text for conversation ad messages.' },
+            buttons: {
+              type: 'array',
+              description: 'CTA buttons for CONVERSATION_AD/CREATE_CONTENT. Each: { text, action: OPEN_URL|SEND_MESSAGE, url? }.',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string' },
+                  action: { type: 'string', enum: ['OPEN_URL', 'SEND_MESSAGE'] },
+                  url: { type: 'string' },
+                }
+              }
+            },
+            first_content_urn: { type: 'string', description: 'First message node URN. Required for CONVERSATION_AD/SET_FIRST_CONTENT.' },
           }
         }
       },
