@@ -6347,6 +6347,41 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  /**
+   * Helper function to extract text preview from emailContent field.
+   * The emailContent can be either a string (legacy) or an object with html/text properties.
+   */
+  private getEmailContentPreview(emailContent: any, maxLength: number): string | undefined {
+    if (!emailContent) {
+      return undefined;
+    }
+
+    let textContent: string;
+
+    // Handle object format (new format with html/text properties)
+    if (typeof emailContent === 'object' && !Array.isArray(emailContent)) {
+      // Prefer html over text, but use whichever is available
+      textContent = emailContent.html || emailContent.text || '';
+    }
+    // Handle string format (legacy format)
+    else if (typeof emailContent === 'string') {
+      textContent = emailContent;
+    }
+    else {
+      return undefined;
+    }
+
+    // Strip HTML tags and truncate
+    const plainText = textContent.replace(/<[^>]*>/g, '').trim();
+    if (plainText.length === 0) {
+      return undefined;
+    }
+
+    return plainText.length > maxLength
+      ? plainText.substring(0, maxLength) + '...'
+      : plainText;
+  }
+
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -6418,9 +6453,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate email content for preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 150) + '...'
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 150)
         })),
         listName: list.name
       };
@@ -7061,9 +7094,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate HTML email content to text preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 200) + (eng.emailContent.length > 200 ? '...' : '')
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 200)
         })),
         leadName: `${lead.firstName || ''} ${lead.lastName || ''}`.trim()
       };
@@ -18672,6 +18703,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
             keywords, url: search_url, title, company, cursor
           });
+          // Trim to essential fields only — full profiles (skills, education, photos, etc.)
+          // inflate context by 10x and degrade LLM output quality in long sessions.
+          if (Array.isArray(searchResult?.items)) {
+            const trimmedItems = searchResult.items.map((item: any) => {
+              const trimmed: any = {
+                provider_id: item.provider_id,
+                public_identifier: item.public_identifier,
+                first_name: item.first_name,
+                last_name: item.last_name,
+                headline: item.headline,
+                location: item.location,
+                network_distance: item.network_distance,
+                public_profile_url: item.public_profile_url,
+                is_open_profile: item.is_open_profile,
+              };
+              if (item.work_experience?.length) {
+                const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+                if (current) trimmed.current_role = { position: current.position, company: current.company };
+              }
+              if (item.summary) trimmed.summary = item.summary.slice(0, 200);
+              return trimmed;
+            });
+            return { success: true, data: { ...searchResult, items: trimmedItems } };
+          }
           return { success: true, data: searchResult };
         }
 
@@ -18692,6 +18747,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-sent-invitations': {
           const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
+          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
+          if (Array.isArray(invitationsResult?.items)) {
+            const trimmedItems = invitationsResult.items.map((item: any) => ({
+              id: item.id,
+              invited_user_id: item.invited_user_id,
+              invited_user_public_id: item.invited_user_public_id,
+              invited_user: item.invited_user,
+            }));
+            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
+          }
           return { success: true, data: invitationsResult };
         }
 
