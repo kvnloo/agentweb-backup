@@ -1,5 +1,7 @@
 import express from "express";
 import request from "supertest";
+import fs from "fs";
+import { extractTemplateOutline } from "../services/v0Service";
 
 // Mock aws-sdk
 jest.mock("aws-sdk", () => {
@@ -44,9 +46,16 @@ jest.mock("../middleware/auth", () => ({
 
 // Mock db service
 const mockGetUserById = jest.fn();
+const mockGetLeadListById = jest.fn();
+const mockUpdateLeadList = jest.fn();
+
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: mockGetUserById,
+  },
+  crmDb: {
+    getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
+    updateLeadList: (...args: any[]) => mockUpdateLeadList(...args),
   },
 }));
 
@@ -66,8 +75,13 @@ jest.mock("../services/v0Service", () => ({
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
   buildBrandEnrichedPrompt: jest.fn(),
+  extractTemplateOutline: jest.fn(),
   BrandContext: {},
 }));
+
+jest.mock("fs");
+const mockedFs = fs as jest.Mocked<typeof fs>;
+const mockedExtractOutline = extractTemplateOutline as jest.MockedFunction<typeof extractTemplateOutline>;
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
 
@@ -191,6 +205,71 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(brandCtx.brandPersonality).toBe("Bold");
     expect(brandCtx.targetAudience).toBe("Startups");
     expect(brandCtx.logoUrl).toBe("https://example.com/logo.png");
+  });
+
+  it("SUCCESS: template_name provided → loads and extracts template from disk", async () => {
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.readFileSync.mockReturnValue("<html>Full Template</html>");
+    mockedExtractOutline.mockReturnValue("Condensed Outline");
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ 
+        prompt: "Create a B2B page", 
+        template_name: "event-marketing" 
+      });
+
+    expect(res.status).toBe(201);
+    
+    // Check that fs was called correctly
+    expect(mockedFs.existsSync).toHaveBeenCalledWith(expect.stringContaining("event-marketing.html"));
+    expect(mockedFs.readFileSync).toHaveBeenCalledWith(expect.stringContaining("event-marketing.html"), "utf-8");
+    
+    // Check that extractTemplateOutline was called
+    expect(mockedExtractOutline).toHaveBeenCalledWith("<html>Full Template</html>");
+
+    // Verify generateLandingPage received the condensed HTML (6th arg)
+    const callArgs = mockGenerateLandingPage.mock.calls[0];
+    expect(callArgs[5]).toBe("Condensed Outline"); 
+  });
+
+  it("SUCCESS: pulls market strategy and passes to generation", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "test-user-id",
+      marketStrategy: {
+        businessOverview: "Enterprise AI Agents",
+        icp: [{ title: "CTO", description: "Decision maker" }],
+        competitors: [{ name: "LegacyCo", description: "Old tool" }]
+      }
+    });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    const brandCtx = mockGenerateLandingPage.mock.calls[0][3];
+    expect(brandCtx.businessOverview).toBe("Enterprise AI Agents");
+    expect(brandCtx.icp[0].title).toBe("CTO");
+    expect(brandCtx.competitors[0].name).toBe("LegacyCo");
+  });
+
+  it("SUCCESS: auto-enables public access on lead list if disabled", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValueOnce({ id: "list-123", publicAccessEnabled: false });
+    mockUpdateLeadList.mockResolvedValueOnce({});
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-123" });
+
+    // Verify crmDb.updateLeadList was called to enable public access
+    expect(mockUpdateLeadList).toHaveBeenCalledWith("list-123", { publicAccessEnabled: true });
+    
+    // Verify generation service was called with the lead_list_id
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
 });
 
