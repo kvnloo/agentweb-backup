@@ -1200,6 +1200,87 @@ export async function deleteSlackMessage(
  * Download a file from Slack using the bot token for auth
  * Returns the file content as a Buffer
  */
+export interface SlackMessage {
+  ts: string;
+  user: string;
+  displayName: string;
+  text: string;
+  threadTs?: string;
+  replyCount?: number;
+}
+
+/**
+ * Fetch messages from a Slack channel, with user display names resolved.
+ * Supports count-based limit and/or Unix timestamp bounds (oldest/latest).
+ */
+export async function getRecentChannelMessages(
+  channelId: string,
+  oldest?: string,
+  latest?: string
+): Promise<SlackMessage[]> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const result = await slackClient.conversations.history({
+    channel: channelId,
+    ...(oldest ? { oldest } : {}),
+    ...(latest ? { latest } : {}),
+  });
+
+  const messages = result.messages ?? [];
+
+  // Resolve display names for unique user IDs only (avoids N+1 API calls)
+  const uniqueUserIds = [...new Set(messages.map((m) => m.user).filter((id): id is string => !!id))];
+  const nameEntries = await Promise.all(
+    uniqueUserIds.map(async (id) => {
+      try {
+        return [id, await getSlackUserDisplayName(id)] as const;
+      } catch {
+        return [id, id] as const;
+      }
+    })
+  );
+  const displayNameMap = new Map(nameEntries);
+
+  return messages.map((msg) => {
+    const userId = msg.user ?? msg.bot_id ?? 'unknown';
+    return {
+      ts: msg.ts ?? '',
+      user: userId,
+      displayName: msg.user ? (displayNameMap.get(msg.user) ?? userId) : userId,
+      text: msg.text ?? '',
+      threadTs: msg.thread_ts,
+      replyCount: msg.reply_count,
+    } as SlackMessage;
+  });
+}
+
+/**
+ * Post a message to a Slack channel (or reply to a thread).
+ * Returns the message timestamp which can be used as a thread anchor.
+ */
+export async function postSlackMessage(
+  channelId: string,
+  text: string,
+  threadTs?: string
+): Promise<{ ts: string; channel: string }> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const result = await slackClient.chat.postMessage({
+    channel: channelId,
+    text,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+  });
+
+  return {
+    ts: result.ts ?? '',
+    channel: result.channel ?? channelId,
+  };
+}
+
 export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   if (!process.env.SLACK_BOT_TOKEN) {
     throw new Error('SLACK_BOT_TOKEN not set');

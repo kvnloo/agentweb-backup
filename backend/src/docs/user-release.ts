@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-30',
     changes: [
+      'Admin: Slack Message Tools for Emma',
+      '- Emma can now list Slack channels, read recent messages from any channel, and send messages or thread replies',
+      '- Filter messages by time window using since_hours (e.g. last 24 hours) or explicit Unix timestamps',
+      '- Use this to ask Emma to review client messages in a channel and draft or send replies on your behalf',
+      '- These tools are admin-only',
+    ],
+  },
+  {
+    date: '2026-03-30',
+    changes: [
       'Improvement: Mark Work Item as Done (GTM Tracker)',
       '- Added a one-click "Mark as Done" button per work item in the GTM Tracker page',
       '- Button appears on pending, in-progress, and pending-review items — not on already-completed or skipped items',
