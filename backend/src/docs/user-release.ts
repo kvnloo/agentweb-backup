@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-30',
+    changes: [
+      'Admin: Configurable Coding Agent LLM Model (Partner Portal)',
+      '- Admins can now select which Claude model the coding agent uses for landing page edits in the Agent Mode settings tab',
+      '- Default model is now Claude Sonnet 4.6 for better cost efficiency',
+      '- Claude Opus 4.6 is available as an option for more complex coding tasks that require advanced reasoning',
+      '- The selected model is stored in the database and persists across sessions',
+    ],
+  },
+  {
     date: '2026-03-29',
     changes: [
       'Improvement: Richer Chat History Data for Emma',
