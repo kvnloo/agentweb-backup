@@ -516,8 +516,15 @@ export async function reconcileAllStripeUsers(): Promise<{
     {},
   );
 
-  for (const user of users) {
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
     summary.checked++;
+
+    // Rate limit: pause 100ms every 10 users to stay well under Stripe's 100 req/s limit
+    if (i > 0 && i % 10 === 0) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
     try {
       // Fetch active/trialing subscriptions from Stripe
       const subscriptions = await stripe.subscriptions.list({
@@ -528,7 +535,7 @@ export async function reconcileAllStripeUsers(): Promise<{
 
       // Find the most relevant subscription: active > trialing > past_due > canceled
       const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2, canceled: 3 };
-      const sorted = subscriptions.data.sort(
+      const sorted = [...subscriptions.data].sort(
         (a, b) => (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
       );
       const sub = sorted[0]; // best subscription, or undefined
