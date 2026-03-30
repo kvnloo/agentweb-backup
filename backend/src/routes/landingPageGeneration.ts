@@ -1,4 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
+import fs from "fs";
+import path from "path";
 import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, crmDb } from "../services/db";
@@ -14,6 +16,7 @@ import {
   getPreviewDeploymentUrl,
   triggerVercelDeployment,
   resolveVercelProjectId,
+  extractTemplateOutline,
 } from "../services/v0Service";
 
 const router = Router();
@@ -22,6 +25,13 @@ const router = Router();
 // Constants
 // ---------------------------------------------------------------------------
 const MAX_INPUT_LENGTH = 10_000;
+
+const TEMPLATE_FILE_MAP: Record<string, string> = {
+  "event-marketing": "event-marketing.html",
+  "case-study": "case-study-lead-magnet.html",
+  "b2b-ad": "ad-campaign-optimized.html",
+  "advertorial": "advertorial.html",
+};
 
 // Expensive operations (v0 generation, deploy, iterate) — costs real credits
 const GENERATION_RATE_LIMIT_MAX = 10;
@@ -175,7 +185,22 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { prompt, name, lead_list_id, template_html } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_name } = req.body;
+    let template_html: string | undefined = rawTemplateHtml;
+
+    // If template_name provided (user picked a preset), load + condense from disk
+    if (template_name && !template_html) {
+      const filename = TEMPLATE_FILE_MAP[template_name];
+      if (filename) {
+        const templatePath = path.join(__dirname, "..", "templates", filename);
+        if (fs.existsSync(templatePath)) {
+          const fullHtml = fs.readFileSync(templatePath, "utf-8");
+          template_html = extractTemplateOutline(fullHtml);
+          console.log(`[LP GENERATION] Loaded template "${template_name}" (${template_html?.length} chars condensed)`);
+        }
+      }
+    }
+
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "prompt is required and must be a string" });
     }

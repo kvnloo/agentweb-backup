@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{page_title}}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Space+Mono:wght@700&display=swap" rel="stylesheet">
+    <style>
+        /* ============================================================
+           B2B EVENT MARKETING TEMPLATE (PREMIUM)
+           ============================================================ */
+
+        :root {
+            --color-primary: #6366F1;
+            --color-primary-dark: #4F46E5;
+            --color-primary-light: #EEF2FF;
+            --color-accent: #F43F5E;
+            --color-text-primary: #0F172A;
+            --color-text-secondary: #475569;
+            --color-text-muted: #94A3B8;
+            --color-bg-white: #ffffff;
+            --color-bg-light: #F8FAFC;
+            --color-dark-bg: #0F172A;
+            --color-border: #E2E8F0;
+            --font-main: 'Outfit', sans-serif;
+            --font-mono: 'Space Mono', monospace;
+            --radius-md: 12px;
+            --radius-lg: 24px;
+            --radius-full: 9999px;
+            --shadow-premium: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.2);
+        }
+
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body { font-family: var(--font-main); line-height: 1.6; color: var(--color-text-primary); background: var(--color-bg-white); background-image: radial-gradient(var(--color-border) 1px, transparent 1px); background-size: 40px 40px; -webkit-font-smoothing: antialiased; overflow-x: hidden; width: 100%; position: relative; }
+        
+        /* Background Glows */
+        .glow-orb { position: absolute; width: 800px; height: 800px; background: radial-gradient(circle, rgba(99, 102, 241, 0.05) 0%, transparent 70%); border-radius: 50%; z-index: -1; filter: blur(80px); pointer-events: none; }
+        .orb-1 { top: -200px; right: -200px; }
+        .orb-2 { top: 40%; left: -300px; background: radial-gradient(circle, rgba(244, 63, 94, 0.03) 0%, transparent 70%); }
+        .orb-3 { bottom: 10%; right: -100px; background: radial-gradient(circle, rgba(99, 102, 241, 0.05) 0%, transparent 70%); }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; width: 100%; box-sizing: border-box; position: relative; z-index: 10; }
+        .section { padding: 120px 0; position: relative; overflow: hidden; }
+        .text-center { text-align: center; }
+
+        h1, h2, h3, h4 { font-weight: 800; letter-spacing: -0.04em; line-height: 1.1; overflow-wrap: break-word; word-break: break-word; }
+        h1 { font-size: clamp(40px, 10vw, 84px); margin-bottom: 24px; color: var(--color-text-primary); }
+        h2 { font-size: clamp(32px, 6vw, 56px); margin-bottom: 48px; }
+        p { font-size: clamp(16px, 2vw, 22px); color: var(--color-text-secondary); margin-bottom: 32px; font-weight: 500; overflow-wrap: break-word; }
+
+        .label { font-family: var(--font-mono); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.15em; color: var(--color-primary); margin-bottom: 20px; display: block; }
+
+        .btn { display: inline-flex; align-items: center; justify-content: center; padding: 18px 44px; font-size: 18px; font-weight: 700; border-radius: var(--radius-full); text-decoration: none; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); cursor: pointer; border: none; }
+        .btn-primary { background: var(--color-primary); color: #fff; box-shadow: 0 10px 15px -3px rgba(99, 102, 241, 0.3); }
+        .btn-primary:hover { background: var(--color-primary-dark); transform: translateY(-3px); box-shadow: 0 20px 25px -5px rgba(99, 102, 241, 0.4); }
+
+        /* Header & Navigation */
+        header { padding: 0; background: rgba(255, 255, 255, 0.92); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 1000; border-bottom: 1px solid var(--color-border); }
+        .nav-container { display: flex; justify-content: space-between; align-items: center; height: 80px; }
+        .logo { font-size: 24px; font-weight: 900; letter-spacing: -0.04em; color: var(--color-text-primary); text-decoration: none; }
+        .nav-links { display: flex; gap: 32px; align-items: center; }
+        .nav-links a { font-size: 15px; font-weight: 600; color: var(--color-text-secondary); text-decoration: none; transition: color 0.2s; }
+        .nav-links a:hover { color: var(--color-primary); }
+        .nav-cta { font-size: 14px; font-weight: 700; color: #fff; background: var(--color-primary); padding: 10px 20px; border-radius: 100px; text-decoration: none; transition: all 0.2s; }
+
+        /* Hero Enhancement */
+        .hero { padding: 140px 0 100px; background: radial-gradient(circle at 100% 0%, rgba(99, 102, 241, 0.05) 0%, transparent 50%), radial-gradient(circle at 0% 100%, rgba(244, 63, 94, 0.03) 0%, transparent 50%); position: relative; }
+        .event-meta { display: flex; justify-content: center; gap: 48px; margin: 48px 0; font-family: var(--font-mono); }
+        .meta-item strong { display: block; font-size: 24px; color: var(--color-text-primary); letter-spacing: -0.02em; }
+        .meta-item small { color: var(--color-text-muted); font-size: 12px; letter-spacing: 0.1em; }
+
+        /* Why Attend Cards */
+        .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 32px; margin-top: 64px; }
+        .feature-card { padding: 48px; background: #fff; border: 1px solid var(--color-border); border-radius: var(--radius-lg); transition: all 0.4s cubic-bezier(0.165, 0.84, 0.44, 1); }
+        .feature-card:hover { transform: translateY(-10px); border-color: var(--color-primary-light); box-shadow: var(--shadow-xl); }
+        .feature-icon { font-size: 40px; margin-bottom: 24px; }
+
+        /* Speaker Grid */
+        .speakers-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 48px; margin-top: 64px; }
+        .speaker-card { text-align: center; transition: transform 0.3s cubic-bezier(0.165, 0.84, 0.44, 1); }
+        .speaker-card:hover { transform: translateY(-10px); }
+        .speaker-img { width: 200px; height: 200px; border-radius: 50%; background: #E2E8F0; margin: 0 auto 24px; position: relative; padding: 6px; border: 2px solid var(--color-border); transition: all 0.4s ease; overflow: hidden; }
+        .speaker-card:hover .speaker-img { border-color: var(--color-primary); box-shadow: 0 0 30px rgba(99, 102, 241, 0.3); }
+
+        /* Agenda */
+        .agenda-container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: var(--radius-lg); border: 1px solid var(--color-border); overflow: hidden; box-shadow: var(--shadow-premium); }
+        .agenda-row { display: grid; grid-template-columns: 180px 1fr; border-bottom: 1px solid var(--color-border); transition: background 0.3s ease; }
+        .agenda-row:hover { background: rgba(99, 102, 241, 0.03); }
+        .agenda-row:last-child { border-bottom: none; }
+        .agenda-time { padding: 32px; background: var(--color-bg-light); font-family: var(--font-mono); font-weight: 700; color: var(--color-primary); font-size: 15px; border-right: 1px solid var(--color-border); }
+        .agenda-info { padding: 32px; }
+        .agenda-info h3 { font-size: 20px; margin-bottom: 8px; }
+        .agenda-info p { font-size: 15px; margin-bottom: 0; color: var(--color-text-secondary); }
+
+        /* Register Area */
+        .register-area { background: var(--color-dark-bg); color: #fff; border-radius: var(--radius-lg); padding: 80px 48px; margin-top: 80px; overflow: hidden; position: relative; }
+        .register-area::before { content: ''; position: absolute; top: -50%; right: -20%; width: 60%; height: 200%; background: radial-gradient(circle, rgba(99, 102, 241, 0.1), transparent); transform: rotate(-45deg); }
+        .register-area h2 { color: #fff; }
+        .register-area p { color: #94A3B8; }
+        .register-features { display: flex; justify-content: center; gap: 32px; flex-wrap: wrap; margin-top: 48px; }
+        .reg-feature { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; color: #E2E8F0; }
+
+        footer { padding: 100px 0 60px; border-top: 1px solid var(--color-border); background: var(--color-dark-bg); color: #94A3B8; text-align: left; }
+        .footer-grid { display: grid; grid-template-columns: 2fr repeat(3, 1fr); gap: 48px; margin-bottom: 64px; }
+        .footer-brand p { font-size: 14px; margin-top: 16px; color: #64748B; max-width: 280px; }
+        .footer-heading { color: #fff; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 24px; }
+        .footer-links-list { list-style: none; }
+        .footer-links-list li { margin-bottom: 12px; }
+        .footer-links-list a { color: #64748B; text-decoration: none; font-size: 15px; transition: color 0.2s; }
+        .footer-links-list a:hover { color: #fff; }
+        .footer-bottom { border-top: 1px solid #1E293B; padding-top: 32px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: #475569; }
+
+        .reveal { opacity: 0; transform: translateY(30px); transition: all 1s cubic-bezier(0.16, 1, 0.3, 1); }
+        .reveal.active { opacity: 1; transform: translateY(0); }
+
+        @media (max-width: 768px) {
+            .section { padding: 80px 0; }
+            .event-meta { flex-direction: column; gap: 24px; align-items: center; }
+            .agenda-row { grid-template-columns: 1fr; }
+            .agenda-time { border-right: none; border-bottom: 1px solid var(--color-border); padding: 16px 24px; }
+            .register-area { padding: 48px 24px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+    <div class="glow-orb orb-3"></div>
+
+    <header>
+        <div class="container nav-container">
+            <a href="#" class="logo">{{company_name}}</a>
+            <div class="nav-links">
+                <a href="#about">About</a>
+                <a href="#speakers">Speakers</a>
+                <a href="#agenda">Agenda</a>
+                <a href="{{cta_primary_url}}" class="nav-cta">Register Now</a>
+            </div>
+        </div>
+    </header>
+
+    <section class="section hero text-center">
+        <div class="container">
+            <div class="reveal">
+                <span class="label">{{hero_tiny_label}}</span>
+                <h1>{{hero_headline}}</h1>
+                <p style="max-width: 800px; margin: 0 auto;">{{hero_subheadline}}</p>
+                
+                <div class="event-meta">
+                    <div class="meta-item">
+                        <strong>{{event_date}}</strong>
+                        <small>DATE</small>
+                    </div>
+                    <div class="meta-item">
+                        <strong>{{event_location}}</strong>
+                        <small>LOCATION</small>
+                    </div>
+                    <div class="meta-item">
+                        <strong>{{event_time}}</strong>
+                        <small>TIME</small>
+                    </div>
+                </div>
+
+                <div style="margin-top: 48px;">
+                    <a href="#register" class="btn btn-primary" style="padding: 22px 60px; font-size: 20px;">{{cta_primary_text}}</a>
+                    <p style="font-size: 14px; color: var(--color-text-muted); margin-top: 20px; font-weight: 600;">{{hero_note}}</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" style="background: var(--color-bg-light);">
+        <div class="container">
+            <div class="text-center reveal">
+                <span class="label">The Value</span>
+                <h2>{{value_props_headline}}</h2>
+                <p style="max-width: 700px; margin: 0 auto;">{{value_props_subheadline}}</p>
+            </div>
+            <div class="card-grid">
+                <div class="feature-card reveal">
+                    <div class="feature-icon">{{value_props_1_icon}}</div>
+                    <h3>{{value_props_1_title}}</h3>
+                    <p style="font-size: 16px;">{{value_props_1_description}}</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">{{value_props_2_icon}}</div>
+                    <h3>{{value_props_2_title}}</h3>
+                    <p style="font-size: 16px;">{{value_props_2_description}}</p>
+                </div>
+                <div class="feature-card reveal">
+                    <div class="feature-icon">{{value_props_n_icon}}</div>
+                    <h3>{{value_props_n_title}}</h3>
+                    <p style="font-size: 16px;">{{value_props_n_description}}</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section">
+        <div class="container">
+            <div class="text-center reveal">
+                <span class="label">The Lineup</span>
+                <h2>{{speakers_headline}}</h2>
+            </div>
+            <div class="speakers-grid">
+                <div class="speaker-card reveal">
+                    <div class="speaker-img">
+                        <div style="width: 100%; height: 100%; border-radius: 50%; background: #f1f5f9; display: flex; align-items: center; justify-content: center; font-size: 60px;">👤</div>
+                    </div>
+                    <h3 style="margin-bottom: 8px;">{{speakers_1_name}}</h3>
+                    <span style="font-weight: 700; color: var(--color-primary); font-size: 14px; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">{{speakers_1_title}}</span>
+                    <p style="font-size: 15px; color: var(--color-text-muted);">{{speakers_1_company}}</p>
+                </div>
+                <div class="speaker-card reveal">
+                    <div class="speaker-img">
+                        <div style="width: 100%; height: 100%; border-radius: 50%; background: #f1f5f9; display: flex; align-items: center; justify-content: center; font-size: 60px;">👤</div>
+                    </div>
+                    <h3 style="margin-bottom: 8px;">{{speakers_2_name}}</h3>
+                    <span style="font-weight: 700; color: var(--color-primary); font-size: 14px; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">{{speakers_2_title}}</span>
+                    <p style="font-size: 15px; color: var(--color-text-muted);">{{speakers_2_company}}</p>
+                </div>
+                <div class="speaker-card reveal">
+                    <div class="speaker-img">
+                        <div style="width: 100%; height: 100%; border-radius: 50%; background: #f1f5f9; display: flex; align-items: center; justify-content: center; font-size: 60px;">👤</div>
+                    </div>
+                    <h3 style="margin-bottom: 8px;">{{speakers_n_name}}</h3>
+                    <span style="font-weight: 700; color: var(--color-primary); font-size: 14px; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">{{speakers_n_title}}</span>
+                    <p style="font-size: 15px; color: var(--color-text-muted);">{{speakers_n_company}}</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="agenda" style="background: var(--color-bg-light);">
+        <div class="container">
+            <div class="text-center reveal">
+                <span class="label">The Schedule</span>
+                <h2>{{agenda_headline}}</h2>
+            </div>
+            <div class="agenda-container reveal">
+                <div class="agenda-row">
+                    <div class="agenda-time">{{agenda_1_time}}</div>
+                    <div class="agenda-info">
+                        <h3>{{agenda_1_title}}</h3>
+                        <p>{{agenda_1_description}}</p>
+                    </div>
+                </div>
+                <div class="agenda-row">
+                    <div class="agenda-time">{{agenda_2_time}}</div>
+                    <div class="agenda-info">
+                        <h3>{{agenda_2_title}}</h3>
+                        <p>{{agenda_2_description}}</p>
+                    </div>
+                </div>
+                <div class="agenda-row">
+                    <div class="agenda-time">{{agenda_n_time}}</div>
+                    <div class="agenda-info">
+                        <h3>{{agenda_n_title}}</h3>
+                        <p>{{agenda_n_description}}</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section">
+        <div class="container">
+            <div class="register-area reveal text-center" id="register">
+                <h2>{{final_cta_headline}}</h2>
+                <p style="max-width: 600px; margin: 0 auto 48px;">{{final_cta_subheadline}}</p>
+                <a href="{{cta_primary_url}}" class="btn btn-primary" style="background: #fff; color: var(--color-primary-dark); padding: 22px 80px;">{{cta_primary_text}}</a>
+                
+                <div class="register-features">
+                    <div class="reg-feature"><span>✨</span> {{cta_feature_1}}</div>
+                    <div class="reg-feature"><span>🛡️</span> {{cta_feature_2}}</div>
+                    <div class="reg-feature"><span>🤝</span> {{cta_feature_n}}</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-brand">
+                    <div class="logo" style="color: #fff;">{{company_name}}</div>
+                    <p>{{hero_subheadline}}</p>
+                </div>
+                <div class="footer-section">
+                    <h4 class="footer-heading">Event</h4>
+                    <ul class="footer-links-list">
+                        <li><a href="#about">About</a></li>
+                        <li><a href="#speakers">Speakers</a></li>
+                        <li><a href="#agenda">Schedule</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4 class="footer-heading">Company</h4>
+                    <ul class="footer-links-list">
+                        <li><a href="#">About Us</a></li>
+                        <li><a href="#">Newsroom</a></li>
+                        <li><a href="#">Careers</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4 class="footer-heading">Resources</h4>
+                    <ul class="footer-links-list">
+                        <li><a href="#">Press Kit</a></li>
+                        <li><a href="#">Travel Info</a></li>
+                        <li><a href="#">Contact Support</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; {{current_year}} {{company_name}}. All rights reserved.</p>
+                <div style="display: flex; gap: 24px;">
+                    <a href="#" style="color: #475569; text-decoration: none;">Privacy</a>
+                    <a href="#" style="color: #475569; text-decoration: none;">Terms</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function reveal() {
+            const reveals = document.querySelectorAll('.reveal');
+            for (let i = 0; i < reveals.length; i++) {
+                const windowHeight = window.innerHeight;
+                const elementTop = reveals[i].getBoundingClientRect().top;
+                const elementVisible = 100;
+                if (elementTop < windowHeight - elementVisible) {
+                    reveals[i].classList.add('active');
+                }
+            }
+        }
+        window.addEventListener('scroll', reveal);
+        reveal();
+    </script>
+</body>
+</html>

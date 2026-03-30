@@ -140,7 +140,7 @@ export interface BrandContext {
  * Sends section structure, CSS variables, and key patterns to v0 as inspiration
  * without overwhelming its prompt limits.
  */
-function extractTemplateOutline(fullHtml: string): string {
+export function extractTemplateOutline(fullHtml: string): string {
   const sections: string[] = [];
 
   // Extract CSS variables block (design tokens)
