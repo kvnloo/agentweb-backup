@@ -24,6 +24,10 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
+
+// Max tool result content size for persistence. DynamoDB items are limited to 400KB;
+// MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
+const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
@@ -84,6 +88,19 @@ interface LLMCallOptions {
   response_format?: { type: 'text' | 'json_object' } | null;
 }
 
+// Diagnosis agent configuration
+const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
+const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Context passed to the diagnosis agent when the main agent fails
+export interface DiagnosisContext {
+  errorType: 'transient' | 'context_limit' | 'content_filter' | 'rate_limit' | 'unknown';
+  errorMessage: string;
+  userMessage: string;
+  workPlanSummary: string | null;
+  failedFunctions: Record<string, number> | null;
+}
+
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -101,6 +118,7 @@ export class AgentModeService {
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
+  private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -470,6 +488,24 @@ export class AgentModeService {
     return this.getDefaultModel();
   }
 
+  async getCodingAgentDefaultModel(): Promise<string> {
+    const fallbackModel = 'anthropic.claude-sonnet-4-6';
+    try {
+      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting coding agent default model setting:', error);
+    }
+    // Fall back to Sonnet 4.6
+    return fallbackModel;
+  }
+
   async getBackupModel(primaryModel: string): Promise<string | null> {
     try {
       const setting = await settingsService.getSetting('agent_mode_backup_model');
@@ -596,7 +632,7 @@ export class AgentModeService {
               tools: params.tools.map((tool: any) => ({
                 toolSpec: {
                   name: tool.function.name,
-                  description: tool.function.description || '',
+                  description: tool.function.description || tool.function.name,
                   inputSchema: { json: tool.function.parameters },
                 }
               }))
@@ -1002,8 +1038,12 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
-    isCancelled?: () => boolean
+    isCancelled?: () => boolean,
+    excludeTools?: string[]
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
+    // Hoisted so the catch block can extract partial usage from messages accumulated before an error
+    let _messages: any[] | null = null;
+    let _initialMessageCount = 0;
     try {
       // Track backup model usage
       const originalLlmModel = llmModel;
@@ -1099,6 +1139,8 @@ export class AgentModeService {
 
       // Remember initial message count to slice response messages later
       let initialMessageCount = messages.length;
+      _messages = messages;
+      _initialMessageCount = initialMessageCount;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 20; // Prevent infinite loops
@@ -1200,6 +1242,12 @@ export class AgentModeService {
 
           const skillFilter = isLegacySession ? undefined : allowedToolNames;
           filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+
+          // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
+          if (excludeTools?.length && filteredToolsCache) {
+            const excludeSet = new Set(excludeTools);
+            filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
+          }
         }
 
         // Trim large old tool results to prevent context window overflow
@@ -1463,11 +1511,14 @@ export class AgentModeService {
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
+              ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+              : toolContent;
             (messages as any[]).push({
               tool_call_id: toolCall.id,
               role: 'tool',
               name: toolCall.function.name,
-              content: toolContent,
+              content: truncatedToolContent,
               metadata: { timestamp: new Date().toISOString() }
             });
           } else {
@@ -1611,6 +1662,12 @@ export class AgentModeService {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }
 
+      // Extract partial usage from any response messages accumulated before the error.
+      // This ensures token costs are tracked even when generation fails mid-stream.
+      const partialResponseMessages = _messages
+        ? _messages.slice(_initialMessageCount).filter((msg: any) => msg.role !== 'user' && msg.usage)
+        : [];
+
       // Preserve original error details for upstream error classification (e.g. isContextLimitError)
       // while still providing a user-friendly message
       const wrappedError: any = new Error(userMessage);
@@ -1618,6 +1675,9 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      if (partialResponseMessages.length > 0) {
+        wrappedError.partialUsageMessages = partialResponseMessages;
+      }
       throw wrappedError;
     }
   }
@@ -1879,6 +1939,12 @@ You can create and manage multi-step work plans using these tools:
 - **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes. **IMPORTANT**: If a step has requiredFunctionCalls defined, you MUST have called those functions before marking it as completed, or you'll get an error.
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
+
+## Skill Creation
+You can create custom skills for users using:
+- **create_skill**: Create a new skill bundle with a name, description, list of tool names, and optional system prompt. The skill starts as private to the user. They can later submit it for platform review via Settings > Skills.
+
+When a user asks to create a skill, identify the relevant tools from your available tools and create the skill with appropriate toolNames. For example, a "LinkedIn Post Creator from Latest News" skill might use tools like bravesearch_brave_news_search, create_social_media_posts, read_brand_guidelines, etc.
 
 ## GTM Plan Capabilities
 You can read and create Go-To-Market (GTM) plans using these tools:
@@ -2191,7 +2257,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      const publishedSkills = await skillService.getPublishedSkills();
+      const publishedSkills = await skillService.getSkillsAvailableToUser(userId);
 
       if (!publishedSkills.length)
         return { message: "No skills available in the library." };
@@ -2261,6 +2327,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+    'save_work_plan',
+
+    // Skill Creation (users can define custom skill bundles)
+    'create_skill',
 
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
@@ -2318,7 +2388,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
         name: tool.name,
-        description: tool.definition?.function?.description || ''
+        description: tool.definition?.function?.description || tool.name
       }));
   }
 
@@ -2418,23 +2488,24 @@ When a user requests client onboarding or says "onboard new client" or similar:
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getPublishedSkills(),
+      userId ? skillService.getSkillsAvailableToUser(userId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
-    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId))
+    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
+      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
         description: s.description,
         installed: installedIds.has(s.skillId),
-        toolNames: s.toolNames || []
+        toolNames: s.toolNames || [],
+        visibility: s.visibility || 'public',
       }));
 
     // Add virtual other_skills entry if allowed and there are unassociated tools
@@ -2476,7 +2547,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getPublishedSkills(),
+        skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
@@ -2495,12 +2566,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         }
       }
 
-      // Filter valid IDs: exists in published skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill)
-      const validSkillIds = skillIds.filter(id =>
-        (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || publishedSkills.some(s => s.skillId === id)) &&
-        (id === ADMIN_SKILL_VIRTUAL_ID || isWildcard || allowedSkillSet.has(id))
-      );
+      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
+      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill)
+      const validSkillIds = skillIds.filter(id => {
+        const skill = publishedSkills.find(s => s.skillId === id);
+        const isOwnSkill = skill && skill.ownerId === userId;
+        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || skill) &&
+          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
+      });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
 
@@ -2653,6 +2726,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
+    console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -2797,6 +2871,81 @@ When a user requests client onboarding or says "onboard new client" or similar:
         message: actualResult.message,
         file_url: actualResult.file_url,
         file_name: actualResult.file_name,
+      };
+    }
+
+    // For HTML creation, preserve the S3 URL so frontend can open artifact panel
+    if (toolName === 'create_html_from_template') {
+      console.log('[DEBUG] extractMinimalToolResult hit for create_html_from_template');
+      console.log('[DEBUG] result type:', typeof result, 'keys:', Object.keys(result || {}));
+      console.log('[DEBUG] result.s3_url:', result?.s3_url);
+      console.log('[DEBUG] result.content type:', typeof result?.content);
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+          console.log('[DEBUG] parsed content, actualResult keys:', Object.keys(actualResult));
+          console.log('[DEBUG] actualResult.s3_url:', actualResult.s3_url);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse create_html_from_template result.content as JSON:`, e);
+        }
+      }
+      const extracted = {
+        success: actualResult.success,
+        message: actualResult.message,
+        s3_url: actualResult.s3_url,
+        filename: actualResult.filename,
+        template_name: actualResult.template_name,
+      };
+      console.log('[DEBUG] returning extracted:', JSON.stringify(extracted));
+      return extracted;
+    }
+
+    // For HTML file creation, preserve the S3 URL so frontend can open artifact panel
+    if (toolName === 'create_html_file') {
+      console.log('[DEBUG] extractMinimalToolResult hit for create_html_file');
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse create_html_file result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        s3_url: actualResult.s3_url,
+        filename: actualResult.filename,
+        title: actualResult.title,
+      };
+    }
+
+    // For coding_agent, preserve the full response so Emma can relay PR/preview info
+    if (toolName === 'coding_agent') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse coding_agent result.content as JSON:`, e);
+        }
+      }
+      console.log(`[CODING_AGENT] Result:`, JSON.stringify({
+        success: actualResult.success,
+        message: actualResult.message,
+        iterations: actualResult.iterations,
+        branch: actualResult.branch,
+        previewUrl: actualResult.previewUrl,
+        error: actualResult.error,
+      }));
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        iterations: actualResult.iterations,
+        branch: actualResult.branch,
+        previewUrl: actualResult.previewUrl,
+        error: actualResult.error,
       };
     }
 
@@ -4444,7 +4593,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Read current user's brand guidelines
   public async readBrandGuidelines(userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -4455,7 +4604,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      const brand = user.brandGuidelines;
+      // If user belongs to an org, read from org data instead
+      let brand = user.brandGuidelines;
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org && org.brandGuidelines) {
+          brand = org.brandGuidelines;
+        }
+      }
       if (!brand) {
         return {
           success: true,
@@ -4578,7 +4734,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Read current user's market strategy
   public async readMarketStrategy(userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -4589,7 +4745,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      const marketStrategy = user.marketStrategy;
+      // If user belongs to an org, read from org data instead
+      let marketStrategy = user.marketStrategy;
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org && org.marketStrategy) {
+          marketStrategy = org.marketStrategy;
+        }
+      }
       if (!marketStrategy) {
         return {
           success: true,
@@ -4634,7 +4797,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Update user's market strategy
   public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -4644,8 +4807,26 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      // Get existing market strategy
-      const existingMarketStrategy = user.marketStrategy;
+      // Check org membership - only owners can update, members are rejected
+      const isOrgOwner = user.orgId && user.orgRole === 'owner';
+      const isOrgMember = user.orgId && user.orgRole !== 'owner';
+
+      if (isOrgMember) {
+        return {
+          success: false,
+          message: 'Only the org owner can update market strategy',
+          error: 'Permission denied'
+        };
+      }
+
+      // Get existing market strategy from org (if owner) or personal
+      let existingMarketStrategy: any;
+      if (isOrgOwner) {
+        const org = await orgDb.getOrgById(user.orgId!);
+        existingMarketStrategy = org?.marketStrategy;
+      } else {
+        existingMarketStrategy = user.marketStrategy;
+      }
 
       // Extract market strategy fields from updateData
       const { businessOverview, competitors, icp, ...otherFields } = updateData;
@@ -4699,10 +4880,12 @@ When a user requests client onboarding or says "onboard new client" or similar:
         updatedAt: new Date().toISOString()
       };
 
-      // Update user record with market strategy data
-      await userDb.updateUser(userId, {
-        marketStrategy: marketStrategyData
-      });
+      // Update org-level or personal market strategy
+      if (isOrgOwner) {
+        await orgDb.updateOrg(user.orgId!, { marketStrategy: marketStrategyData });
+      } else {
+        await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
+      }
 
       // Track what was updated vs added
       const updatedEntries: string[] = [];
@@ -7528,7 +7711,7 @@ Format the response as JSON with this structure:
   // Update user's brand guidelines (supports both brandData and attachments)
   public async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -7538,8 +7721,26 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Get existing brand guidelines
-      let existingBrand = user.brandGuidelines;
+      // Check org membership - only owners can update, members are rejected
+      const isOrgOwner = user.orgId && user.orgRole === 'owner';
+      const isOrgMember = user.orgId && user.orgRole !== 'owner';
+
+      if (isOrgMember) {
+        return {
+          success: false,
+          message: 'Only the org owner can update brand guidelines',
+          error: 'Permission denied'
+        };
+      }
+
+      // Get existing brand guidelines from org (if owner) or personal
+      let existingBrand: any;
+      if (isOrgOwner) {
+        const org = await orgDb.getOrgById(user.orgId!);
+        existingBrand = org?.brandGuidelines;
+      } else {
+        existingBrand = user.brandGuidelines;
+      }
 
       // If no existing brand guidelines, create a new structure
       if (!existingBrand) {
@@ -7565,10 +7766,12 @@ Format the response as JSON with this structure:
           updatedAt: new Date().toISOString(),
         };
 
-        // Update the user with initial brand guidelines
-        await userDb.updateUser(userId, {
-          brandGuidelines: initialBrandGuidelines
-        });
+        // Update org or user with initial brand guidelines
+        if (isOrgOwner) {
+          await orgDb.updateOrg(user.orgId!, { brandGuidelines: initialBrandGuidelines });
+        } else {
+          await userDb.updateUser(userId, { brandGuidelines: initialBrandGuidelines });
+        }
 
         // Use the initial structure as the base for updates
         existingBrand = initialBrandGuidelines;
@@ -7667,15 +7870,19 @@ Format the response as JSON with this structure:
         }
       }
 
-      // Update the user's brand guidelines
-      await userDb.updateUser(userId, {
-        brandGuidelines: {
-          ...existingBrand,
-          brandData: updatedBrandData,
-          attachments: updatedAttachments,
-          updatedAt: new Date().toISOString()
-        }
-      });
+      // Update org-level or personal brand guidelines
+      const updatedGuidelines = {
+        ...existingBrand,
+        brandData: updatedBrandData,
+        attachments: updatedAttachments,
+        updatedAt: new Date().toISOString()
+      };
+
+      if (isOrgOwner) {
+        await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedGuidelines });
+      } else {
+        await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
+      }
 
       const updatedFields = [];
       if (brandData) updatedFields.push(...Object.keys(brandData));
@@ -8886,6 +9093,55 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('AgentMode: Failed to generate session title:', error);
       return 'Marketing Task';
+    }
+  }
+
+  /**
+   * Diagnosis agent: when the main agent fails, this makes a lightweight LLM call
+   * to produce a context-aware error message instead of the generic fallback.
+   * Returns null if diagnosis fails (caller should use the generic message).
+   */
+  async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
+    try {
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+
+      const parts: string[] = [
+        `Error type: ${context.errorType}`,
+        `Error: ${context.errorMessage.slice(0, 200)}`,
+        `User's request: ${context.userMessage.slice(0, 300)}`,
+      ];
+      if (context.workPlanSummary) {
+        parts.push(`Work plan status:\n${context.workPlanSummary}`);
+      } else {
+        parts.push('No work plan.');
+      }
+      if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
+        parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
+      }
+
+      const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: parts.join('\n\n') },
+      ], {
+        max_completion_tokens: 200,
+        temperature: 0.3,
+      });
+
+      const timeoutPromise = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), DIAGNOSIS_TIMEOUT_MS)
+      );
+
+      const response = await Promise.race([llmPromise, timeoutPromise]);
+      if (!response) {
+        console.warn('AgentMode: Diagnosis agent timed out');
+        return null;
+      }
+
+      const message = (response as any).choices?.[0]?.message?.content?.trim();
+      return message || null;
+    } catch (error) {
+      console.error('AgentMode: Diagnostic message generation failed:', error);
+      return null;
     }
   }
 
@@ -18086,10 +18342,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           post_url: result.postUrl
         };
       } catch (error: any) {
-        // Handle specific error messages
+        // Handle specific error messages — pass through detailed permission errors as-is
         let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (message.includes('access token expired') && !message.includes('Permission denied')) {
+          message = 'Account token expired. Please reconnect the account in Settings → Connected Accounts.';
         }
 
         return {
@@ -18212,10 +18468,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           post_url: result.postUrl
         };
       } catch (error: any) {
-        // Handle specific error messages
+        // Handle specific error messages — pass through detailed permission errors as-is
         let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (message.includes('access token expired') && !message.includes('Permission denied')) {
+          message = 'Account token expired. Please reconnect the account in Settings → Connected Accounts.';
         }
 
         return {

@@ -1,0 +1,638 @@
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Container,
+  Typography,
+  Button,
+  Box,
+  Paper,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  IconButton,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  TextField,
+  FormControlLabel,
+  Switch,
+  Tooltip,
+  Alert,
+  CircularProgress,
+  Chip,
+  Stack,
+  Collapse,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
+  Autocomplete,
+} from "@mui/material";
+import {
+  Edit as EditIcon,
+  Add as AddIcon,
+  Delete as DeleteIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+  Close as CloseIcon,
+  Visibility as VisibilityIcon,
+  VisibilityOff as VisibilityOffIcon,
+} from "@mui/icons-material";
+import axios from "axios";
+import { useAuth } from "../contexts/AuthContext";
+import { buildApiUrl } from "../config";
+
+interface WorkPlanStep {
+  stepCount: number;
+  title: string;
+  description?: string;
+  requiredFunctionCalls?: string[];
+}
+
+interface WorkPlan {
+  planId: string;
+  title: string;
+  description?: string;
+  welcomeMessage?: string;
+  steps: WorkPlanStep[];
+  visibility: string;
+  isBuiltIn: boolean;
+  ownerId?: string;
+  showInAgentMode?: boolean;
+  autocomplete?: boolean;
+  requireLogin?: boolean;
+  showLoginSignup?: string;
+  defaultModel?: string;
+  reviewFeedback?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const visibilityColor = (v: string) => {
+  switch (v) {
+    case "system": return "primary";
+    case "public": return "success";
+    case "private": return "default";
+    case "pending_review": return "warning";
+    default: return "default";
+  }
+};
+
+export default function WorkPlans() {
+  const { token } = useAuth();
+  const [plans, setPlans] = useState<WorkPlan[]>([]);
+  const [pendingPlans, setPendingPlans] = useState<WorkPlan[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  // Dialog state
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingPlan, setEditingPlan] = useState<WorkPlan | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  // Form state
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [welcomeMessage, setWelcomeMessage] = useState("");
+  const [steps, setSteps] = useState<WorkPlanStep[]>([{ stepCount: 1, title: "" }]);
+  const [showInAgentMode, setShowInAgentMode] = useState(true);
+  const [autocomplete, setAutocomplete] = useState(false);
+  const [requireLogin, setRequireLogin] = useState(false);
+  const [visibility, setVisibility] = useState("system");
+
+  // Reject dialog
+  const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
+  const [rejectTarget, setRejectTarget] = useState<WorkPlan | null>(null);
+  const [rejectFeedback, setRejectFeedback] = useState("");
+
+  // Expanded rows
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedPendingId, setExpandedPendingId] = useState<string | null>(null);
+
+  // Delete confirmation
+  const [deleteTarget, setDeleteTarget] = useState<WorkPlan | null>(null);
+
+  // Available function calls for autocomplete
+  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<string[]>([]);
+
+  const fetchPlans = useCallback(async () => {
+    try {
+      const res = await axios.get(buildApiUrl("/api/admin/work-plans"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const all = res.data || [];
+      // Separate pending from rest
+      setPendingPlans(all.filter((p: WorkPlan) => p.visibility === "pending_review"));
+      setPlans(all.filter((p: WorkPlan) => p.visibility !== "pending_review"));
+    } catch (err) {
+      setError("Failed to load work plans");
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
+
+  const fetchAvailableFunctionCalls = useCallback(async () => {
+    try {
+      const res = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.data?.functionCalls) {
+        const workPlanFunctions = ["create_work_plan", "modify_work_plan", "set_work_plan_status"];
+        const names = res.data.functionCalls
+          .filter((fc: { name: string }) => !workPlanFunctions.includes(fc.name))
+          .map((fc: { name: string }) => fc.name);
+        setAvailableFunctionCalls(names);
+      }
+    } catch {
+      // Non-critical — autocomplete just won't have suggestions
+    }
+  }, [token]);
+
+  useEffect(() => { fetchPlans(); fetchAvailableFunctionCalls(); }, [fetchPlans, fetchAvailableFunctionCalls]);
+
+  const openCreateDialog = () => {
+    setEditingPlan(null);
+    setTitle("");
+    setDescription("");
+    setWelcomeMessage("");
+    setSteps([{ stepCount: 1, title: "" }]);
+    setShowInAgentMode(true);
+    setAutocomplete(false);
+    setRequireLogin(false);
+    setVisibility("system");
+    setDialogOpen(true);
+  };
+
+  const openEditDialog = (plan: WorkPlan) => {
+    setEditingPlan(plan);
+    setTitle(plan.title);
+    setDescription(plan.description || "");
+    setWelcomeMessage(plan.welcomeMessage || "");
+    setSteps(plan.steps.length > 0 ? plan.steps : [{ stepCount: 1, title: "" }]);
+    setShowInAgentMode(plan.showInAgentMode !== false);
+    setAutocomplete(plan.autocomplete || false);
+    setRequireLogin(plan.requireLogin || false);
+    setVisibility(plan.visibility);
+    setDialogOpen(true);
+  };
+
+  const handleSave = async () => {
+    if (!title.trim()) {
+      setError("Title is required");
+      return;
+    }
+    const validSteps = steps.filter(s => s.title.trim());
+    if (validSteps.length === 0) {
+      setError("At least one step with a title is required");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const body = {
+        title, description, welcomeMessage,
+        steps: validSteps.map((s, i) => ({ ...s, stepCount: i + 1 })),
+        showInAgentMode, autocomplete, requireLogin, visibility,
+      };
+      if (editingPlan) {
+        await axios.put(buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`), body, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSuccess("Work plan updated");
+      } else {
+        await axios.post(buildApiUrl("/api/admin/work-plans"), body, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSuccess("Work plan created");
+      }
+      setDialogOpen(false);
+      fetchPlans();
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to save work plan");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    try {
+      await axios.delete(buildApiUrl(`/api/admin/work-plans/${deleteTarget.planId}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess("Work plan deleted");
+      setDeleteTarget(null);
+      fetchPlans();
+    } catch (err) {
+      setError("Failed to delete work plan");
+    }
+  };
+
+  const handleApprove = async (planId: string) => {
+    try {
+      await axios.post(buildApiUrl(`/api/admin/work-plans/${planId}/approve`), {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess("Work plan approved!");
+      fetchPlans();
+    } catch (err) {
+      setError("Failed to approve work plan");
+    }
+  };
+
+  const handleReject = async () => {
+    if (!rejectTarget || !rejectFeedback.trim()) return;
+    try {
+      await axios.post(buildApiUrl(`/api/admin/work-plans/${rejectTarget.planId}/reject`), {
+        feedback: rejectFeedback,
+      }, { headers: { Authorization: `Bearer ${token}` } });
+      setSuccess("Work plan rejected");
+      setRejectDialogOpen(false);
+      setRejectTarget(null);
+      setRejectFeedback("");
+      fetchPlans();
+    } catch (err) {
+      setError("Failed to reject work plan");
+    }
+  };
+
+  const addStep = () => {
+    setSteps([...steps, { stepCount: steps.length + 1, title: "" }]);
+  };
+
+  const removeStep = (index: number) => {
+    if (steps.length <= 1) return;
+    setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
+  };
+
+  const updateStep = (index: number, field: string, value: string | string[]) => {
+    const updated = [...steps];
+    updated[index] = { ...updated[index], [field]: value };
+    setSteps(updated);
+  };
+
+  const toggleVisibility = async (plan: WorkPlan) => {
+    try {
+      await axios.put(buildApiUrl(`/api/admin/work-plans/${plan.planId}`), {
+        showInAgentMode: !plan.showInAgentMode,
+      }, { headers: { Authorization: `Bearer ${token}` } });
+      fetchPlans();
+    } catch (err) {
+      setError("Failed to update visibility");
+    }
+  };
+
+  if (loading) {
+    return (
+      <Container maxWidth="lg" sx={{ mt: 4, textAlign: "center" }}>
+        <CircularProgress />
+      </Container>
+    );
+  }
+
+  return (
+    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+      {error && <Alert severity="error" onClose={() => setError("")} sx={{ mb: 2 }}>{error}</Alert>}
+      {success && <Alert severity="success" onClose={() => setSuccess("")} sx={{ mb: 2 }}>{success}</Alert>}
+
+      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 3 }}>
+        <Box>
+          <Typography variant="h4" gutterBottom>Work Plans</Typography>
+          <Typography variant="body2" color="text.secondary">
+            Manage predefined work plans and review user-submitted plans.
+          </Typography>
+        </Box>
+        <Button variant="contained" startIcon={<AddIcon />} onClick={openCreateDialog}>
+          Create Work Plan
+        </Button>
+      </Box>
+
+      {/* Review Queue */}
+      {pendingPlans.length > 0 && (
+        <Paper variant="outlined" sx={{ p: 2, mb: 3, borderColor: "warning.main", bgcolor: "warning.light", opacity: 0.9 }}>
+          <Typography variant="h6" sx={{ mb: 1 }}>
+            Pending Review ({pendingPlans.length})
+          </Typography>
+          <Stack spacing={1}>
+            {pendingPlans.map((plan) => (
+              <Box key={plan.planId} sx={{ bgcolor: "background.paper", borderRadius: 1, overflow: "hidden" }}>
+                <Box
+                  sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", p: 1, cursor: "pointer" }}
+                  onClick={() => setExpandedPendingId(expandedPendingId === plan.planId ? null : plan.planId)}
+                >
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <IconButton size="small">
+                      {expandedPendingId === plan.planId ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
+                    </IconButton>
+                    <Box>
+                      <strong>{plan.title}</strong>
+                      <Typography variant="body2" color="text.secondary" component="span" sx={{ ml: 1 }}>
+                        — {plan.steps?.length || 0} steps
+                      </Typography>
+                      {plan.ownerId && (
+                        <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+                          (by {plan.ownerId})
+                        </Typography>
+                      )}
+                    </Box>
+                  </Box>
+                  <Stack direction="row" spacing={1}>
+                    <Button variant="contained" color="success" size="small" onClick={(e) => { e.stopPropagation(); handleApprove(plan.planId); }}>
+                      Approve
+                    </Button>
+                    <Button variant="outlined" color="error" size="small" onClick={(e) => { e.stopPropagation(); setRejectTarget(plan); setRejectDialogOpen(true); }}>
+                      Reject
+                    </Button>
+                  </Stack>
+                </Box>
+                <Collapse in={expandedPendingId === plan.planId}>
+                  <Box sx={{ px: 2, pb: 2, pt: 1, borderTop: "1px solid", borderColor: "divider" }}>
+                    {plan.description && (
+                      <Typography variant="body2" sx={{ mb: 1 }}>
+                        <strong>Description:</strong> {plan.description}
+                      </Typography>
+                    )}
+                    {plan.welcomeMessage && (
+                      <Typography variant="body2" sx={{ mb: 1 }}>
+                        <strong>Welcome:</strong> {plan.welcomeMessage}
+                      </Typography>
+                    )}
+                    <Typography variant="body2" sx={{ mb: 1 }}>
+                      <strong>Settings:</strong>{" "}
+                      {plan.autocomplete && <Chip label="Autocomplete" size="small" sx={{ mr: 0.5 }} />}
+                      {plan.requireLogin && <Chip label="Login Required" size="small" sx={{ mr: 0.5 }} />}
+                      {plan.defaultModel && <Chip label={`Model: ${plan.defaultModel}`} size="small" sx={{ mr: 0.5 }} />}
+                      {!plan.autocomplete && !plan.requireLogin && !plan.defaultModel && <span>None</span>}
+                    </Typography>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}><strong>Steps:</strong></Typography>
+                    {plan.steps?.map((step, i) => (
+                      <Box key={i} sx={{ ml: 2, mb: 0.5 }}>
+                        <Typography variant="body2">
+                          {step.stepCount}. <strong>{step.title}</strong>
+                          {step.description && <span> — {step.description}</span>}
+                        </Typography>
+                        {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                          <Box sx={{ ml: 2 }}>
+                            {step.requiredFunctionCalls.map((fc, j) => (
+                              <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
+                            ))}
+                          </Box>
+                        )}
+                      </Box>
+                    ))}
+                  </Box>
+                </Collapse>
+              </Box>
+            ))}
+          </Stack>
+        </Paper>
+      )}
+
+      {/* Work Plans Table */}
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead>
+            <TableRow>
+              <TableCell width={40} />
+              <TableCell>Title</TableCell>
+              <TableCell>Steps</TableCell>
+              <TableCell>Visibility</TableCell>
+              <TableCell>Agent Mode</TableCell>
+              <TableCell>Owner</TableCell>
+              <TableCell align="right">Actions</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {plans.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={7} align="center" sx={{ py: 4 }}>
+                  <Typography color="text.secondary">No work plans yet. Create one to get started.</Typography>
+                </TableCell>
+              </TableRow>
+            ) : (
+              plans.map((plan) => (
+                <React.Fragment key={plan.planId}>
+                  <TableRow hover sx={{ cursor: "pointer" }} onClick={() => setExpandedId(expandedId === plan.planId ? null : plan.planId)}>
+                    <TableCell>
+                      <IconButton size="small">
+                        {expandedId === plan.planId ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                      </IconButton>
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2" fontWeight="medium">{plan.title}</Typography>
+                      {plan.description && (
+                        <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                          {plan.description.length > 80 ? plan.description.substring(0, 80) + "..." : plan.description}
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>{plan.steps?.length || 0}</TableCell>
+                    <TableCell>
+                      <Chip label={plan.visibility} size="small" color={visibilityColor(plan.visibility) as any} />
+                    </TableCell>
+                    <TableCell>
+                      <Tooltip title={plan.showInAgentMode ? "Visible in Agent Mode" : "Hidden from Agent Mode"}>
+                        <IconButton size="small" onClick={(e) => { e.stopPropagation(); toggleVisibility(plan); }}>
+                          {plan.showInAgentMode ? <VisibilityIcon color="success" /> : <VisibilityOffIcon color="disabled" />}
+                        </IconButton>
+                      </Tooltip>
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="caption" color="text.secondary">
+                        {plan.isBuiltIn ? "System" : plan.ownerId ? plan.ownerId.substring(0, 8) + "..." : "—"}
+                      </Typography>
+                    </TableCell>
+                    <TableCell align="right">
+                      <Tooltip title="Edit">
+                        <IconButton size="small" onClick={(e) => { e.stopPropagation(); openEditDialog(plan); }}>
+                          <EditIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                      <Tooltip title="Delete">
+                        <IconButton size="small" onClick={(e) => { e.stopPropagation(); setDeleteTarget(plan); }} color="error">
+                          <DeleteIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                  <TableRow key={`${plan.planId}-expand`}>
+                    <TableCell colSpan={7} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
+                      <Collapse in={expandedId === plan.planId}>
+                        <Box sx={{ p: 2, bgcolor: "grey.50" }}>
+                          {plan.welcomeMessage && (
+                            <Typography variant="body2" sx={{ mb: 1 }}>
+                              <strong>Welcome:</strong> {plan.welcomeMessage}
+                            </Typography>
+                          )}
+                          <Typography variant="body2" sx={{ mb: 1 }}>
+                            <strong>Settings:</strong>{" "}
+                            {plan.autocomplete && <Chip label="Autocomplete" size="small" sx={{ mr: 0.5 }} />}
+                            {plan.requireLogin && <Chip label="Login Required" size="small" sx={{ mr: 0.5 }} />}
+                            {plan.defaultModel && <Chip label={`Model: ${plan.defaultModel}`} size="small" sx={{ mr: 0.5 }} />}
+                            {!plan.autocomplete && !plan.requireLogin && !plan.defaultModel && <span>None</span>}
+                          </Typography>
+                          <Typography variant="body2" sx={{ mb: 0.5 }}><strong>Steps:</strong></Typography>
+                          {plan.steps?.map((step, i) => (
+                            <Box key={i} sx={{ ml: 2, mb: 0.5 }}>
+                              <Typography variant="body2">
+                                {step.stepCount}. <strong>{step.title}</strong>
+                                {step.description && <span> — {step.description}</span>}
+                              </Typography>
+                              {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                                <Box sx={{ ml: 2 }}>
+                                  {step.requiredFunctionCalls.map((fc, j) => (
+                                    <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
+                                  ))}
+                                </Box>
+                              )}
+                            </Box>
+                          ))}
+                        </Box>
+                      </Collapse>
+                    </TableCell>
+                  </TableRow>
+                </React.Fragment>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </TableContainer>
+
+      {/* Create/Edit Dialog */}
+      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>{editingPlan ? "Edit Work Plan" : "Create Work Plan"}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Title" value={title} onChange={(e) => setTitle(e.target.value)} fullWidth required />
+            <TextField label="Description" value={description} onChange={(e) => setDescription(e.target.value)} fullWidth multiline rows={2} />
+            <TextField label="Welcome Message" value={welcomeMessage} onChange={(e) => setWelcomeMessage(e.target.value)} fullWidth multiline rows={2} helperText="Greeting shown when the plan starts. Supports HTML." />
+
+            <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+              <FormControl size="small" sx={{ minWidth: 150 }}>
+                <InputLabel>Visibility</InputLabel>
+                <Select value={visibility} label="Visibility" onChange={(e) => setVisibility(e.target.value)}>
+                  <MenuItem value="system">System</MenuItem>
+                  <MenuItem value="public">Public</MenuItem>
+                  <MenuItem value="private">Private</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControlLabel control={<Switch checked={showInAgentMode} onChange={(e) => setShowInAgentMode(e.target.checked)} />} label="Show in Agent Mode" />
+              <FormControlLabel control={<Switch checked={autocomplete} onChange={(e) => setAutocomplete(e.target.checked)} />} label="Autocomplete" />
+              <FormControlLabel control={<Switch checked={requireLogin} onChange={(e) => setRequireLogin(e.target.checked)} />} label="Require Login" />
+            </Box>
+
+            <Box>
+              <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
+                <Typography variant="subtitle2">Steps</Typography>
+                <Button size="small" startIcon={<AddIcon />} onClick={addStep}>Add Step</Button>
+              </Box>
+              {steps.map((step, i) => (
+                <Box key={i} sx={{ display: "flex", gap: 1, mb: 1, alignItems: "flex-start" }}>
+                  <Chip label={i + 1} size="small" sx={{ mt: 1 }} />
+                  <Box sx={{ flex: 1 }}>
+                    <TextField
+                      value={step.title}
+                      onChange={(e) => updateStep(i, "title", e.target.value)}
+                      placeholder={`Step ${i + 1} title`}
+                      size="small"
+                      fullWidth
+                      sx={{ mb: 0.5 }}
+                    />
+                    <TextField
+                      value={step.description || ""}
+                      onChange={(e) => updateStep(i, "description", e.target.value)}
+                      placeholder="Description (optional)"
+                      size="small"
+                      fullWidth
+                      sx={{ mb: 0.5 }}
+                    />
+                    <Autocomplete
+                      multiple
+                      freeSolo
+                      size="small"
+                      options={availableFunctionCalls}
+                      value={step.requiredFunctionCalls || []}
+                      onChange={(_e, newValue) => {
+                        updateStep(i, "requiredFunctionCalls", newValue as string[]);
+                      }}
+                      renderTags={(value, getTagProps) =>
+                        value.map((option, index) => {
+                          const { key, ...rest } = getTagProps({ index });
+                          return (
+                            <Chip
+                              key={key}
+                              label={option}
+                              size="small"
+                              variant="outlined"
+                              sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}
+                              {...rest}
+                            />
+                          );
+                        })
+                      }
+                      renderInput={(params) => (
+                        <TextField
+                          {...params}
+                          placeholder={step.requiredFunctionCalls?.length ? "" : "Select required function calls..."}
+                          helperText="Functions that must be called to complete this step"
+                        />
+                      )}
+                    />
+                  </Box>
+                  {steps.length > 1 && (
+                    <IconButton size="small" onClick={() => removeStep(i)} sx={{ mt: 0.5 }}>
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  )}
+                </Box>
+              ))}
+            </Box>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
+          <Button onClick={handleSave} variant="contained" disabled={saving}>
+            {saving ? <CircularProgress size={20} /> : editingPlan ? "Update" : "Create"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Reject Dialog */}
+      <Dialog open={rejectDialogOpen} onClose={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }} maxWidth="sm" fullWidth>
+        <DialogTitle>Reject Work Plan: {rejectTarget?.title}</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth multiline rows={3}
+            label="Feedback (required)"
+            placeholder="Explain why this was rejected..."
+            value={rejectFeedback}
+            onChange={(e) => setRejectFeedback(e.target.value)}
+            sx={{ mt: 1 }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }}>Cancel</Button>
+          <Button onClick={handleReject} variant="contained" color="error" disabled={!rejectFeedback.trim()}>Reject</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Delete Confirmation */}
+      <Dialog open={!!deleteTarget} onClose={() => setDeleteTarget(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>Delete Work Plan</DialogTitle>
+        <DialogContent>
+          <Typography>
+            Are you sure you want to delete "{deleteTarget?.title}"? This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteTarget(null)}>Cancel</Button>
+          <Button onClick={handleDelete} variant="contained" color="error">Delete</Button>
+        </DialogActions>
+      </Dialog>
+    </Container>
+  );
+}

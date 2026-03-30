@@ -55,6 +55,7 @@ export interface Skill {
   isBuiltIn?: boolean;
   ownerId?: string;
   visibility?: SkillVisibility;
+  reviewFeedback?: string;
 }
 
 export class SkillService {
@@ -179,6 +180,22 @@ export class SkillService {
       console.error("Error getting published skills:", error);
       throw error;
     }
+  }
+
+  /**
+   * Get all skills available to a specific user: published skills + their own private skills.
+   * User-created private skills are immediately usable by their owner without admin approval.
+   */
+  async getSkillsAvailableToUser(userId: string): Promise<Skill[]> {
+    const [publishedSkills, userSkills] = await Promise.all([
+      this.getPublishedSkills(),
+      this.getSkillsByOwner(userId),
+    ]);
+
+    // Merge: start with published, add user's private skills that aren't already published
+    const publishedIds = new Set(publishedSkills.map(s => s.skillId));
+    const privateUserSkills = userSkills.filter(s => !publishedIds.has(s.skillId));
+    return [...publishedSkills, ...privateUserSkills];
   }
 
 
@@ -312,6 +329,94 @@ export class SkillService {
       console.error("Error getting sync status:", error);
       throw error;
     }
+  }
+
+  async getSkillsByOwner(ownerId: string): Promise<Skill[]> {
+    const params = {
+      TableName: this.tableName,
+      IndexName: 'OwnerIndex',
+      KeyConditionExpression: 'ownerId = :ownerId',
+      ExpressionAttributeValues: { ':ownerId': ownerId },
+    };
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return (result.Items || []).map(item => this.normalizeSkill(item));
+    } catch (error: any) {
+      // Fallback to scan if GSI doesn't exist yet
+      if (error.code === 'ValidationException' && error.message?.includes('specified index')) {
+        console.warn(`OwnerIndex not found on ${this.tableName}, falling back to scan`);
+        const scanResult = await dynamodb.scan({
+          TableName: this.tableName,
+          FilterExpression: 'ownerId = :ownerId',
+          ExpressionAttributeValues: { ':ownerId': ownerId },
+        }).promise();
+        return (scanResult.Items || []).map(item => this.normalizeSkill(item));
+      }
+      console.error(`Error getting skills for owner ${ownerId}:`, error);
+      throw error;
+    }
+  }
+
+  async getSkillsByVisibility(visibility: SkillVisibility): Promise<Skill[]> {
+    const params = {
+      TableName: this.tableName,
+      IndexName: 'VisibilityIndex',
+      KeyConditionExpression: 'visibility = :visibility',
+      ExpressionAttributeValues: { ':visibility': visibility },
+    };
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return (result.Items || []).map(item => this.normalizeSkill(item));
+    } catch (error: any) {
+      // Fallback to scan if GSI doesn't exist yet
+      if (error.code === 'ValidationException' && error.message?.includes('specified index')) {
+        console.warn(`VisibilityIndex not found on ${this.tableName}, falling back to scan`);
+        const scanResult = await dynamodb.scan({
+          TableName: this.tableName,
+          FilterExpression: 'visibility = :visibility',
+          ExpressionAttributeValues: { ':visibility': visibility },
+        }).promise();
+        return (scanResult.Items || []).map(item => this.normalizeSkill(item));
+      }
+      console.error(`Error getting skills by visibility ${visibility}:`, error);
+      throw error;
+    }
+  }
+
+  async submitForReview(skillId: string, ownerId: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.ownerId !== ownerId) throw new Error('Not authorized');
+    if (skill.visibility !== 'private') throw new Error('Only private skills can be submitted for review');
+
+    skill.visibility = 'pending_review';
+    skill.reviewFeedback = undefined;
+    await this.updateSkill(skill);
+    return skill;
+  }
+
+  async approveSkill(skillId: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
+
+    skill.visibility = 'public';
+    skill.isPublished = true;
+    await this.updateSkill(skill);
+    return skill;
+  }
+
+  async rejectSkill(skillId: string, feedback: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
+
+    skill.visibility = 'private';
+    skill.reviewFeedback = feedback;
+    await this.updateSkill(skill);
+    return skill;
   }
 
   async deleteSkill(skillId: string): Promise<void> {

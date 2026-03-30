@@ -1321,10 +1321,32 @@ const createSkillsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-Skills`,
     AttributeDefinitions: [
-      { AttributeName: 'skillId', AttributeType: 'S' }
+      { AttributeName: 'skillId', AttributeType: 'S' },
+      { AttributeName: 'ownerId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'visibility', AttributeType: 'S' },
+      { AttributeName: 'updatedAt', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'skillId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'OwnerIndex',
+        KeySchema: [
+          { AttributeName: 'ownerId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      },
+      {
+        IndexName: 'VisibilityIndex',
+        KeySchema: [
+          { AttributeName: 'visibility', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      }
     ],
     BillingMode: 'PAY_PER_REQUEST'
   };
@@ -1385,6 +1407,53 @@ const createSkillAssignmentsTable = async () => {
         Projection: {
           ProjectionType: 'ALL'
         }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Work Plans table
+const createWorkPlansTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-WorkPlans`,
+    AttributeDefinitions: [
+      { AttributeName: 'planId', AttributeType: 'S' },
+      { AttributeName: 'ownerId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'visibility', AttributeType: 'S' },
+      { AttributeName: 'updatedAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'planId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'OwnerIndex',
+        KeySchema: [
+          { AttributeName: 'ownerId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      },
+      {
+        IndexName: 'VisibilityIndex',
+        KeySchema: [
+          { AttributeName: 'visibility', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
       }
     ],
     BillingMode: 'PAY_PER_REQUEST'
@@ -1688,6 +1757,7 @@ const main = async () => {
     await createConnectedAccountPostsTable();
     await createSkillsTable();
     await createSkillAssignmentsTable();
+    await createWorkPlansTable();
     await createAgentApiKeysTable();
     await createMcpOAuthClientsTable();
     await createMcpOAuthCodesTable();
@@ -1696,6 +1766,8 @@ const main = async () => {
     await createAccountMemoryTable();
     await createSocialEngagementTrackingTable();
     await createBrowserCookiesTable();
+    await createOrganizationsTable();
+    await createScheduleTemplatesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -1747,7 +1819,96 @@ const createLandingPagesTable = async () => {
   }
 };
 
+// Create Organizations table (for org profile sharing)
+const createOrganizationsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Organizations`,
+    AttributeDefinitions: [
+      { AttributeName: 'orgId', AttributeType: 'S' },
+      { AttributeName: 'ownerUserId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'orgId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'OwnerUserIdIndex',
+        KeySchema: [
+          { AttributeName: 'ownerUserId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5,
+        },
+      },
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5,
+    },
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Schedule Templates table (shared scheduled chat blueprints)
+const createScheduleTemplatesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+    AttributeDefinitions: [
+      { AttributeName: 'templateId', AttributeType: 'S' },
+      { AttributeName: 'createdBy', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'visibility', AttributeType: 'S' },
+      { AttributeName: 'category', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'templateId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'CreatedByIndex',
+        KeySchema: [
+          { AttributeName: 'createdBy', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'VisibilityCategoryIndex',
+        KeySchema: [
+          { AttributeName: 'visibility', KeyType: 'HASH' },
+          { AttributeName: 'category', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Run if this script is called directly
 if (require.main === module) {
   main();
-} 
+}

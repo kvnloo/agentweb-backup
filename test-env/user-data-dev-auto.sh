@@ -303,13 +303,15 @@ ATTACHMENTS_DIR="$APP_DIR/.notion-attachments"
 mkdir -p "$ATTACHMENTS_DIR"
 chown ec2-user:ec2-user "$ATTACHMENTS_DIR"
 
-ATTACHMENT_LIST=""
-while IFS=$'\t' read -r url name; do
-  [[ -z "$url" ]] && continue
+# Helper function to download an attachment
+download_attachment() {
+  local url="$1" name="$2"
+  [[ -z "$url" ]] && return
+  local decoded_name
   decoded_name=$(printf '%b' "${name//%/\\x}")
   decoded_name=$(echo "$decoded_name" | tr -d '/' | tr -cd '[:print:]')
   [[ -z "$decoded_name" ]] && decoded_name="attachment_$(date +%s%N)"
-  dest="$ATTACHMENTS_DIR/$decoded_name"
+  local dest="$ATTACHMENTS_DIR/$decoded_name"
   echo "Downloading attachment: $decoded_name"
   if curl -sL -o "$dest" "$url"; then
     chown ec2-user:ec2-user "$dest"
@@ -318,6 +320,27 @@ while IFS=$'\t' read -r url name; do
   else
     echo "WARNING: Failed to download $url"
   fi
+}
+
+ATTACHMENT_LIST=""
+
+# Extract attachments from page-level file properties (Files & media properties)
+while IFS=$'\t' read -r url name; do
+  download_attachment "$url" "$name"
+done < <(echo "$PAGE_JSON" | jq -r '
+  .properties | to_entries[] |
+  select(.value.type == "files") |
+  .value.files[] |
+  (if .type == "file" then .file.url
+   elif .type == "external" then .external.url
+   else empty end) as $url |
+  .name as $name |
+  "\($url)\t\($name)"
+')
+
+# Extract attachments from block-level images, files, PDFs, and videos
+while IFS=$'\t' read -r url name; do
+  download_attachment "$url" "$name"
 done < <(echo "$BLOCKS_JSON" | jq -r '
   .results[] |
   select(.type == "image" or .type == "file" or .type == "pdf" or .type == "video") |
@@ -343,7 +366,7 @@ fi
 if [[ -n "$ATTACHMENT_LIST" ]]; then
   CLAUDE_PROMPT="${CLAUDE_PROMPT}
 
-The following attachments from the Notion page have been downloaded to the EC2 instance. Read/view them as needed:
+IMPORTANT: The following screenshot/image attachments from the Notion page have been downloaded to the EC2 instance. You MUST use the Read tool to view each image file BEFORE starting any work — these contain critical visual context for the task:
 ${ATTACHMENT_LIST}"
 fi
 
@@ -425,7 +448,7 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
-RAW=$(claude --model opus --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
+RAW=$(claude --model sonnet --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)

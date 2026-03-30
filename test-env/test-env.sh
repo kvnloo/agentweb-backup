@@ -900,7 +900,7 @@ cmd_claude() {
     # Run Claude Code with a prompt (non-interactive, streams output back)
     ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
-        "source ~/.bashrc && cd /home/ec2-user/agentweb && claude --model opus --permission-mode auto -p $(printf '%q' "$message")"
+        "source ~/.bashrc && cd /home/ec2-user/agentweb && claude --model sonnet --permission-mode auto -p $(printf '%q' "$message")"
   else
     # Interactive Claude Code session
     ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

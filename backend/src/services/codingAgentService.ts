@@ -10,6 +10,7 @@
 import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
+import { agentModeService } from './agentModeService';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -29,50 +30,40 @@ interface SearchReplaceEdit {
   replace: string;
 }
 
+interface LineNumberEdit {
+  start_line: number;
+  end_line: number;
+  new_content: string;
+  expected_content?: string;
+}
+
 interface ApplyResult {
   result: string;
   appliedCount: number;
   errors: string[];
 }
 
-const DEFAULT_MAX_ITERATIONS = 30;
-const CODING_AGENT_MODEL = 'us.anthropic.claude-opus-4-6-v1';
+const DEFAULT_MAX_ITERATIONS = 50;
+const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if settings fetch fails
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 const MAX_RETRIES = 2;
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
-const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editing landing page code. You have direct access to files in a GitHub repository connected to Vercel. You also have browser tools to verify your changes visually.
+const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing page code in a GitHub repository connected to Vercel. Your edits go to a draft branch, creating a Vercel preview deployment for user review.
 
-## Staging Workflow
-Your edits go to a draft branch (not main). This creates a Vercel preview deployment so the user can review before going live. The user will publish to production separately when satisfied.
+## Principles
+- Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
+- For files over 5KB, use search_in_file to locate code before reading. Use read_file with line ranges, not whole files.
+- Prefer line_edits (from line numbers in search/read output) over search/replace.
+- Do NOT check_deployment after every edit. Make ALL your edits first, then check_deployment ONCE at the end. If the build fails, fix it. If still failing after 2 attempts, revert_file.
+- Only browse_page to verify when visual correctness matters for the task.
+- Do not make changes the user did not ask for.
+- Before your first edit, note the current commit SHA (via list_commits) so you can revert if needed.
+- When done, check_deployment once, then call report_to_user with a summary and the preview URL.
 
-## Rules
-1. ALWAYS read a file before editing it. Understand the code first.
-2. Make small, incremental edits. Each edit_file call should have 1-5 search/replace blocks.
-3. The "search" string must match the existing code EXACTLY (including whitespace and indentation).
-4. After making edits, use check_deployment to verify the preview build succeeds.
-5. If the build fails, read the error, fix it, and check again.
-6. After deployment succeeds, use browse_page to verify the changes look correct on the preview site.
-7. When finished, call report_to_user with a summary of all changes made. Include the preview URL so the user can review.
-8. Do NOT make changes the user did not ask for. Stay focused on the task.
-9. For large changes, break them into multiple edit_file calls.
-10. NEVER attempt to rewrite an entire file or replace more than a small section at once. Only make targeted edits to specific sections. If a file is too large to edit safely, report the limitation to the user.
-11. For large files (>20KB), read the file to understand structure, then make focused edits to only the specific lines that need changing. Do NOT restructure or reorganize code beyond what was requested.
-12. BEFORE making any edits, use list_commits to record the current commit SHA. This is your safety bookmark.
-13. If your edits break the build and you cannot fix them within 2 attempts, use revert_file to restore the file to the pre-edit commit SHA. Do NOT keep trying broken fixes.
-
-## Workflow
-1. list_files to see the project structure
-2. list_commits (optionally filtered by the file you plan to edit) to record the current commit SHA as a rollback point
-3. read_file to understand the current code
-4. edit_file with precise search/replace diffs
-5. check_deployment to verify the preview build
-6. If build fails: read error → fix → check again. If still failing after 2 fix attempts, revert_file to the pre-edit commit SHA.
-7. browse_page to verify changes visually on the preview deployment
-8. If something looks wrong: fix → redeploy → verify again. If unable to fix, revert_file.
-9. report_to_user when done (include the preview URL and verification results)`;
+Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -158,6 +149,52 @@ export function applySearchReplace(content: string, edits: SearchReplaceEdit[]):
   return { result, appliedCount, errors };
 }
 
+// ─── Line-Number Edit Engine ─────────────────────────────────────────────────
+
+export function applyLineNumberEdit(content: string, edits: LineNumberEdit[]): ApplyResult {
+  const lines = content.split('\n');
+  let appliedCount = 0;
+  const errors: string[] = [];
+
+  // Sort edits by start_line descending so later edits don't shift earlier line numbers
+  const sortedEdits = [...edits].sort((a, b) => b.start_line - a.start_line);
+
+  for (let i = 0; i < sortedEdits.length; i++) {
+    const edit = sortedEdits[i];
+
+    if (edit.start_line < 1 || edit.end_line > lines.length) {
+      errors.push(`Edit ${i + 1}: line range ${edit.start_line}-${edit.end_line} is out of range (file has ${lines.length} lines).`);
+      continue;
+    }
+
+    if (edit.start_line > edit.end_line) {
+      errors.push(`Edit ${i + 1}: start_line (${edit.start_line}) > end_line (${edit.end_line}).`);
+      continue;
+    }
+
+    // Validate expected_content if provided (rough match — trim + compare)
+    if (edit.expected_content !== undefined) {
+      const actualLines = lines.slice(edit.start_line - 1, edit.end_line);
+      const actual = actualLines.join('\n').trim();
+      const expected = edit.expected_content.trim();
+      if (actual !== expected) {
+        errors.push(
+          `Edit ${i + 1}: expected content at lines ${edit.start_line}-${edit.end_line} does not match. ` +
+          `Expected: "${expected.substring(0, 80)}..." Got: "${actual.substring(0, 80)}..."`
+        );
+        continue;
+      }
+    }
+
+    // Apply the replacement
+    const newLines = edit.new_content === '' ? [] : edit.new_content.split('\n');
+    lines.splice(edit.start_line - 1, edit.end_line - edit.start_line + 1, ...newLines);
+    appliedCount++;
+  }
+
+  return { result: lines.join('\n'), appliedCount, errors };
+}
+
 // ─── Tool Definitions (Anthropic native format) ─────────────────────────────
 
 function getToolDefinitions(): Anthropic.Tool[] {
@@ -172,14 +209,40 @@ function getToolDefinitions(): Anthropic.Tool[] {
       }
     },
     {
+      name: 'search_in_file',
+      description: 'Search for a pattern in a file. Returns matching lines with line numbers and 3 lines of surrounding context. Use this BEFORE read_file on large files to find the exact lines you need to edit.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Path to the file to search in'
+          },
+          pattern: {
+            type: 'string',
+            description: 'Search pattern (case-insensitive substring match)'
+          }
+        },
+        required: ['file_path', 'pattern']
+      }
+    },
+    {
       name: 'read_file',
-      description: 'Read the contents of a file from the repository.',
+      description: 'Read the contents of a file from the repository. Returns content with line numbers prepended. For large files, use start_line and end_line to read only a specific section.',
       input_schema: {
         type: 'object' as const,
         properties: {
           file_path: {
             type: 'string',
             description: 'Path to the file (e.g., "app/page.tsx", "app/globals.css")'
+          },
+          start_line: {
+            type: 'number',
+            description: 'First line to read (1-indexed). If omitted, reads from the beginning.'
+          },
+          end_line: {
+            type: 'number',
+            description: 'Last line to read (1-indexed, inclusive). If omitted, reads to the end.'
           }
         },
         required: ['file_path']
@@ -187,13 +250,39 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'edit_file',
-      description: 'Edit a file using search-and-replace diffs. Each edit specifies an exact string to find and its replacement. The search string must match the existing code exactly (including whitespace). Use read_file first to see the current content.',
+      description: 'Edit a file. Supports two modes:\n1. Line-number edits (preferred): provide "line_edits" array with {start_line, end_line, new_content}. Line numbers come from read_file or search_in_file.\n2. Search/replace edits (fallback): provide "edits" array with {search, replace}. The search string must match exactly once.\nUse line_edits when you have line numbers. Use edits as a fallback for small, unambiguous changes.',
       input_schema: {
         type: 'object' as const,
         properties: {
           file_path: {
             type: 'string',
             description: 'Path to the file to edit'
+          },
+          line_edits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                start_line: {
+                  type: 'number',
+                  description: 'First line to replace (1-indexed, from read_file or search_in_file output)'
+                },
+                end_line: {
+                  type: 'number',
+                  description: 'Last line to replace (1-indexed, inclusive)'
+                },
+                new_content: {
+                  type: 'string',
+                  description: 'Replacement content (can be empty string to delete lines)'
+                },
+                expected_content: {
+                  type: 'string',
+                  description: 'Optional: expected content at those lines (safety check). Edit is rejected if it does not match.'
+                }
+              },
+              required: ['start_line', 'end_line', 'new_content']
+            },
+            description: 'Array of line-number-based edits. Preferred over search/replace edits.'
           },
           edits: {
             type: 'array',
@@ -211,14 +300,14 @@ function getToolDefinitions(): Anthropic.Tool[] {
               },
               required: ['search', 'replace']
             },
-            description: 'Array of search/replace edits to apply sequentially'
+            description: 'Array of search/replace edits (fallback mode). Use line_edits instead when possible.'
           },
           commit_message: {
             type: 'string',
             description: 'Git commit message describing the changes'
           }
         },
-        required: ['file_path', 'edits']
+        required: ['file_path']
       }
     },
     {
@@ -343,6 +432,58 @@ async function executeTool(
       return files.map((f: any) => `${f.path} (${f.size} bytes)`).join('\n') || 'No files found.';
     }
 
+    case 'search_in_file': {
+      if (!args.file_path || !args.pattern) {
+        return 'Error: file_path and pattern are required.';
+      }
+      const data = await mcpFetch({
+        method: 'GET',
+        path: `${basePath}/file-content`,
+        queryParams: { path: args.file_path, ...branchQuery },
+        context: { userId: context.userId }
+      });
+      const content = data.content || '';
+      const lines = content.split('\n');
+      const pattern = args.pattern.toLowerCase();
+      const contextLines = 3;
+      const maxOutputChars = 5000;
+
+      // Find matching line indices
+      const matchIndices: number[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].toLowerCase().includes(pattern)) {
+          matchIndices.push(i);
+        }
+      }
+
+      if (matchIndices.length === 0) {
+        return `No matches found for "${args.pattern}" in ${args.file_path}.`;
+      }
+
+      // Build output with context, merging overlapping ranges
+      let output = `Found ${matchIndices.length} match(es) for "${args.pattern}" in ${args.file_path} (${lines.length} lines total):\n\n`;
+      const shown = new Set<number>();
+
+      for (const idx of matchIndices) {
+        const start = Math.max(0, idx - contextLines);
+        const end = Math.min(lines.length - 1, idx + contextLines);
+        for (let i = start; i <= end; i++) {
+          if (!shown.has(i)) {
+            const marker = i === idx ? '>>>' : '   ';
+            output += `${marker} ${i + 1}: ${lines[i]}\n`;
+            shown.add(i);
+          }
+        }
+        output += '---\n';
+        if (output.length > maxOutputChars) {
+          output += `\n... [truncated, ${matchIndices.length - matchIndices.indexOf(idx) - 1} more matches]`;
+          break;
+        }
+      }
+
+      return output;
+    }
+
     case 'read_file': {
       const data = await mcpFetch({
         method: 'GET',
@@ -350,12 +491,33 @@ async function executeTool(
         queryParams: { path: args.file_path, ...branchQuery },
         context: { userId: context.userId }
       });
-      return data.content || '';
+      const content = data.content || '';
+      const lines = content.split('\n');
+
+      // Apply line range if specified
+      const startLine = args.start_line ? Math.max(1, args.start_line) : 1;
+      const endLine = args.end_line ? Math.min(lines.length, args.end_line) : lines.length;
+
+      // Prepend line numbers
+      const numberedLines = lines
+        .slice(startLine - 1, endLine)
+        .map((line: string, i: number) => `${startLine + i}: ${line}`);
+
+      let result = numberedLines.join('\n');
+      if (args.start_line || args.end_line) {
+        result = `[Lines ${startLine}-${endLine} of ${lines.length}]\n${result}`;
+      } else {
+        result = `[${lines.length} lines total]\n${result}`;
+      }
+      return result;
     }
 
     case 'edit_file': {
-      if (!args.edits || !Array.isArray(args.edits) || args.edits.length === 0) {
-        return 'Error: edits array is required and must not be empty.';
+      const hasLineEdits = args.line_edits && Array.isArray(args.line_edits) && args.line_edits.length > 0;
+      const hasSearchReplace = args.edits && Array.isArray(args.edits) && args.edits.length > 0;
+
+      if (!hasLineEdits && !hasSearchReplace) {
+        return 'Error: either line_edits or edits array is required and must not be empty.';
       }
 
       // Step 1: Read current file content (from draft branch if applicable)
@@ -367,9 +529,26 @@ async function executeTool(
       });
 
       const currentContent = fileData.content || '';
+      let newContent: string;
+      let appliedCount: number;
+      let errors: string[];
+      let totalEdits: number;
 
-      // Step 2: Apply search/replace diffs
-      const { result: newContent, appliedCount, errors } = applySearchReplace(currentContent, args.edits);
+      if (hasLineEdits) {
+        // Line-number-based editing (preferred)
+        const editResult = applyLineNumberEdit(currentContent, args.line_edits);
+        newContent = editResult.result;
+        appliedCount = editResult.appliedCount;
+        errors = editResult.errors;
+        totalEdits = args.line_edits.length;
+      } else {
+        // Search/replace editing (fallback)
+        const editResult = applySearchReplace(currentContent, args.edits);
+        newContent = editResult.result;
+        appliedCount = editResult.appliedCount;
+        errors = editResult.errors;
+        totalEdits = args.edits.length;
+      }
 
       if (appliedCount === 0) {
         return `Failed to apply edits. Errors:\n${errors.join('\n')}`;
@@ -388,7 +567,7 @@ async function executeTool(
         context: { userId: context.userId }
       });
 
-      let response = `Applied ${appliedCount}/${args.edits.length} edits to ${args.file_path}.`;
+      let response = `Applied ${appliedCount}/${totalEdits} edits to ${args.file_path}.`;
       if (writeResult.is_staging) {
         response += ` Changes pushed to draft branch ${branch}. A preview deployment is being created.`;
       } else if (writeResult.deployed_url) {
@@ -584,15 +763,27 @@ export function _setBedrockClientForTest(client: AnthropicBedrock | null): void 
 
 /**
  * Call the Anthropic Messages API with retry logic for transient errors.
+ * Maps model IDs to inference profile ARNs when needed.
  */
 async function callWithRetry(
   client: AnthropicBedrock,
   params: Anthropic.MessageCreateParamsNonStreaming
 ): Promise<Anthropic.Message> {
+  // Map model IDs to inference profile ARNs for models that require them
+  const inferenceProfileMap: Record<string, string> = {
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
+    'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+  };
+
+  // Use inference profile ARN if available, otherwise use model ID as-is
+  const actualModel = inferenceProfileMap[params.model] || params.model;
+  const updatedParams = { ...params, model: actualModel };
+
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      return await client.messages.create(params);
+      return await client.messages.create(updatedParams);
     } catch (error) {
       if (error instanceof Anthropic.APIError && (error.status === 429 || (error.status && error.status >= 500))) {
         lastError = error;
@@ -606,12 +797,96 @@ async function callWithRetry(
   throw lastError!;
 }
 
+// ─── Failure Summary ─────────────────────────────────────────────────────────
+
+/**
+ * Extract a structured summary from the agent's message history
+ * so the parent agent knows what happened when max iterations is hit.
+ */
+function extractFailureSummary(
+  messages: Anthropic.MessageParam[],
+  maxIterations: number
+): { message: string; previewUrl?: string } {
+  const toolsCalled: string[] = [];
+  const filesEdited: string[] = [];
+  let previewUrl: string | undefined;
+  let lastAgentText = '';
+
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'tool_use') {
+          toolsCalled.push(block.name);
+          const input = block.input as any;
+          if (block.name === 'edit_file' && input?.file_path) {
+            if (!filesEdited.includes(input.file_path)) {
+              filesEdited.push(input.file_path);
+            }
+          }
+          if (block.name === 'browse_page' && input?.url) {
+            previewUrl = input.url;
+          }
+        }
+        if (block.type === 'text' && 'text' in block) {
+          lastAgentText = block.text;
+        }
+      }
+    }
+    // Check tool results for preview URLs
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (typeof block === 'object' && 'type' in block && block.type === 'tool_result') {
+          const content = (block as any).content;
+          if (typeof content === 'string') {
+            const urlMatch = content.match(/https:\/\/[^\s"]+\.vercel\.app[^\s"]*/);
+            if (urlMatch) previewUrl = urlMatch[0];
+          }
+        }
+      }
+    }
+  }
+
+  const parts: string[] = [
+    `Coding agent hit the iteration limit (${maxIterations}).`,
+  ];
+
+  if (filesEdited.length > 0) {
+    parts.push(`Files edited: ${filesEdited.join(', ')}.`);
+  } else {
+    parts.push('No files were edited.');
+  }
+
+  if (previewUrl) {
+    parts.push(`Preview: ${previewUrl}`);
+  }
+
+  // Summarize tool call pattern
+  if (toolsCalled.length > 0) {
+    const counts: Record<string, number> = {};
+    for (const t of toolsCalled) counts[t] = (counts[t] || 0) + 1;
+    const summary = Object.entries(counts)
+      .map(([name, count]) => count > 1 ? `${name} x${count}` : name)
+      .join(', ');
+    parts.push(`Activity: ${summary}.`);
+  }
+
+  if (lastAgentText) {
+    const truncated = lastAgentText.length > 200
+      ? lastAgentText.substring(0, 200) + '...'
+      : lastAgentText;
+    parts.push(`Last agent note: "${truncated}"`);
+  }
+
+  return { message: parts.join(' '), previewUrl };
+}
+
 // ─── Main Agent Loop ────────────────────────────────────────────────────────
 
 async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
-  maxIterations: number
+  maxIterations: number,
+  model: string
 ): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
   const client = getBedrockClient();
@@ -643,7 +918,7 @@ async function runCodingAgentInternal(
 
       // Call Anthropic Messages API
       const response = await callWithRetry(client, {
-        model: CODING_AGENT_MODEL,
+        model,
         max_tokens: 16384,
         system: CODING_AGENT_SYSTEM_PROMPT,
         tools,
@@ -714,11 +989,14 @@ async function runCodingAgentInternal(
       messages.push({ role: 'user', content: toolResults });
     }
 
-    // Max iterations reached
+    // Max iterations reached — extract useful context for the parent agent
+    const summary = extractFailureSummary(messages, maxIterations);
     return {
       success: false,
-      message: `Coding agent reached maximum iterations (${maxIterations}). The task may be partially complete. Check the deployment for any changes that were made.`,
-      iterations: iteration
+      message: summary.message,
+      iterations: iteration,
+      previewUrl: summary.previewUrl,
+      branch: context.draftBranch,
     };
 
   } catch (error) {
@@ -740,6 +1018,15 @@ export async function runCodingAgent(
   maxIterations: number = DEFAULT_MAX_ITERATIONS
 ): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
+  // Fetch the coding agent model from settings (defaults to Sonnet 4.6)
+  let model: string;
+  try {
+    model = await agentModeService.getCodingAgentDefaultModel();
+  } catch (error) {
+    console.error('Error fetching coding agent model from settings, using fallback:', error);
+    model = DEFAULT_CODING_AGENT_MODEL;
+  }
+
   const timeoutPromise = new Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }>((resolve) => {
     setTimeout(() => {
       resolve({
@@ -751,7 +1038,7 @@ export async function runCodingAgent(
   });
 
   return Promise.race([
-    runCodingAgentInternal(taskDescription, context, maxIterations),
+    runCodingAgentInternal(taskDescription, context, maxIterations, model),
     timeoutPromise
   ]);
 }

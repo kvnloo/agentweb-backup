@@ -1,4 +1,4 @@
-import { applySearchReplace, runCodingAgent, CodingAgentContext, _setBedrockClientForTest } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest } from '../services/codingAgentService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
@@ -136,7 +136,7 @@ describe('runCodingAgent', () => {
 
   // --- FAIL CASES ---
 
-  test('returns partial result when max iterations reached', async () => {
+  test('returns structured failure info when max iterations reached', async () => {
     // LLM always returns a tool call, never terminates
     mockCreate.mockResolvedValue({
       content: [
@@ -146,11 +146,77 @@ describe('runCodingAgent', () => {
     });
     mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 1000 }] });
 
-    const result = await runCodingAgent('edit the page', mockContext, 3); // max 3 iterations
+    const result = await runCodingAgent('edit the page', mockContext, 3);
 
     expect(result.success).toBe(false);
-    expect(result.message).toContain('maximum');
+    expect(result.message).toContain('iteration limit');
+    expect(result.message).toContain('list_files');
+    expect(result.message).toContain('No files were edited');
     expect(result.iterations).toBe(3);
+  });
+
+  test('max iterations failure includes files edited and preview URL', async () => {
+    // Iteration 1: read_file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { file_path: 'app/page.tsx' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch.mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' });
+
+    // Iteration 2: edit_file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'edit_file', input: {
+          file_path: 'app/page.tsx',
+          edits: [{ search: '<h1>Old</h1>', replace: '<h1>New</h1>' }]
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file reads content, then writes
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' })
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/commit/abc' });
+
+    // Iteration 3: check_deployment (last iteration)
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_3', name: 'check_deployment', input: {} }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch.mockResolvedValueOnce({
+      status: 'READY',
+      url: 'https://test-abc.vercel.app',
+      preview_url: 'https://test-abc.vercel.app'
+    });
+
+    const result = await runCodingAgent('change heading', mockContext, 3);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('app/page.tsx');
+    expect(result.message).toContain('vercel.app');
+    expect(result.message).toContain('edit_file');
+    expect(result.previewUrl).toContain('vercel.app');
+  });
+
+  test('max iterations failure includes last agent reasoning', async () => {
+    mockCreate.mockResolvedValue({
+      content: [
+        { type: 'text', text: 'I am trying to fix the CSS import path that is causing the build error.' },
+        { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { file_path: 'app/globals.css' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch.mockResolvedValue({ content: 'body { margin: 0; }' });
+
+    const result = await runCodingAgent('fix css', mockContext, 2);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Last agent note');
+    expect(result.message).toContain('CSS import');
   });
 
   test('handles LLM call errors gracefully', async () => {
@@ -525,5 +591,268 @@ describe('runCodingAgent', () => {
       method: 'GET',
       path: expect.stringContaining('/files')
     }));
+  });
+
+  // --- search_in_file tool tests ---
+
+  test('search_in_file returns matching lines with line numbers and context', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'search_in_file', input: { file_path: 'app/page.tsx', pattern: 'className' } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Found matches.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // mcpFetch returns file content
+    mockedMcpFetch.mockResolvedValueOnce({
+      content: 'line1\nline2\nline3 className="hero"\nline4\nline5\nline6 className="footer"\nline7'
+    });
+
+    const result = await runCodingAgent('search for className', mockContext);
+
+    expect(result.success).toBe(true);
+    // Verify mcpFetch was called with file-content endpoint
+    expect(mockedMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'GET',
+      path: expect.stringContaining('/file-content'),
+      queryParams: expect.objectContaining({ path: 'app/page.tsx' })
+    }));
+  });
+
+  test('search_in_file returns "no matches" when pattern not found', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'search_in_file', input: { file_path: 'app/page.tsx', pattern: 'nonexistent' } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'No matches found.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({
+      content: 'line1\nline2\nline3'
+    });
+
+    const result = await runCodingAgent('search for nonexistent', mockContext);
+    expect(result.success).toBe(true);
+  });
+
+  // --- read_file with line range tests ---
+
+  test('read_file with start_line and end_line returns only that range with line numbers', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { file_path: 'app/page.tsx', start_line: 2, end_line: 4 } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Read lines 2-4.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({
+      content: 'line1\nline2\nline3\nline4\nline5'
+    });
+
+    const result = await runCodingAgent('read lines 2-4', mockContext);
+    expect(result.success).toBe(true);
+  });
+
+  test('read_file without line range returns full content with line numbers', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { file_path: 'app/page.tsx' } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Read full file.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({
+      content: 'alpha\nbeta\ngamma'
+    });
+
+    const result = await runCodingAgent('read the file', mockContext);
+    expect(result.success).toBe(true);
+  });
+
+  // --- edit_file with line numbers tests ---
+
+  test('edit_file with line_edits uses line-number-based replacement', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+            file_path: 'app/page.tsx',
+            line_edits: [{ start_line: 2, end_line: 3, new_content: '  return "universe";\n' }],
+            commit_message: 'Update return value'
+          }}
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Applied line edit.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // GET file content
+    mockedMcpFetch.mockResolvedValueOnce({
+      content: 'function hello() {\n  return "world";\n}'
+    });
+    // PUT github-edit
+    mockedMcpFetch.mockResolvedValueOnce({
+      success: true,
+      commit_url: 'https://github.com/test/repo/commit/abc',
+    });
+
+    const result = await runCodingAgent('edit with line numbers', mockContext);
+    expect(result.success).toBe(true);
+
+    // Verify the PUT was called with the line-edited content
+    const putCall = mockedMcpFetch.mock.calls.find(call => call[0]?.method === 'PUT');
+    expect(putCall).toBeDefined();
+    expect((putCall![0] as any).body.content).toContain('universe');
+    expect((putCall![0] as any).body.content).not.toContain('"world"');
+  });
+
+  test('edit_file with search/replace still works (backward compat)', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+            file_path: 'app/page.tsx',
+            edits: [{ search: '<h1>Old</h1>', replace: '<h1>New</h1>' }],
+            commit_message: 'Update heading'
+          }}
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' });
+    mockedMcpFetch.mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/xyz' });
+
+    const result = await runCodingAgent('edit with search/replace', mockContext);
+    expect(result.success).toBe(true);
+  });
+});
+
+// ─── applyLineNumberEdit tests ──────────────────────────────────────────────
+
+describe('applyLineNumberEdit', () => {
+  test('replaces a single line range correctly', () => {
+    const content = 'line1\nline2\nline3\nline4\nline5';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 2, end_line: 3, new_content: 'replaced2\nreplaced3' }
+    ]);
+    expect(result.errors).toHaveLength(0);
+    expect(result.appliedCount).toBe(1);
+    expect(result.result).toBe('line1\nreplaced2\nreplaced3\nline4\nline5');
+  });
+
+  test('replaces multiple non-overlapping ranges', () => {
+    const content = 'a\nb\nc\nd\ne';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 1, end_line: 1, new_content: 'A' },
+      { start_line: 5, end_line: 5, new_content: 'E' }
+    ]);
+    expect(result.errors).toHaveLength(0);
+    expect(result.appliedCount).toBe(2);
+    expect(result.result).toBe('A\nb\nc\nd\nE');
+  });
+
+  test('inserts content (more lines than replaced)', () => {
+    const content = 'a\nb\nc';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 2, end_line: 2, new_content: 'x\ny\nz' }
+    ]);
+    expect(result.appliedCount).toBe(1);
+    expect(result.result).toBe('a\nx\ny\nz\nc');
+  });
+
+  test('deletes lines (empty new_content)', () => {
+    const content = 'a\nb\nc\nd';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 2, end_line: 3, new_content: '' }
+    ]);
+    expect(result.appliedCount).toBe(1);
+    expect(result.result).toBe('a\nd');
+  });
+
+  test('returns error for out-of-bounds line numbers', () => {
+    const content = 'a\nb\nc';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 0, end_line: 1, new_content: 'x' }
+    ]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('out of range');
+    expect(result.appliedCount).toBe(0);
+  });
+
+  test('returns error when end_line exceeds file length', () => {
+    const content = 'a\nb\nc';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 2, end_line: 10, new_content: 'x' }
+    ]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('out of range');
+  });
+
+  test('returns error when start_line > end_line', () => {
+    const content = 'a\nb\nc';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 3, end_line: 1, new_content: 'x' }
+    ]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.appliedCount).toBe(0);
+  });
+
+  test('validates expected_content when provided', () => {
+    const content = 'line1\nline2\nline3';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 2, end_line: 2, new_content: 'replaced', expected_content: 'line2' }
+    ]);
+    expect(result.errors).toHaveLength(0);
+    expect(result.appliedCount).toBe(1);
+    expect(result.result).toBe('line1\nreplaced\nline3');
+  });
+
+  test('rejects edit when expected_content does not match', () => {
+    const content = 'line1\nline2\nline3';
+    const result = applyLineNumberEdit(content, [
+      { start_line: 2, end_line: 2, new_content: 'replaced', expected_content: 'wrong content' }
+    ]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('does not match');
+    expect(result.appliedCount).toBe(0);
+    expect(result.result).toBe(content); // unchanged
   });
 });

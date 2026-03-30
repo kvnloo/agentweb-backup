@@ -65,6 +65,7 @@ jest.mock("../services/v0Service", () => ({
   buildBrandEnrichedPrompt: jest.fn(),
   getDeploymentStatus: jest.fn(),
   getPreviewDeploymentUrl: (...args: any[]) => mockGetPreviewDeploymentUrl(...args),
+  resolveVercelProjectId: jest.fn().mockImplementation((page: any) => Promise.resolve(page.vercelProjectId || null)),
   BrandContext: {},
 }));
 
@@ -201,6 +202,35 @@ describe("PUT /github-edit with draft branch", () => {
       expect.any(Object)
     );
   });
+
+  it("SUCCESS: retries getFileSha when branch was just created (eventual consistency)", async () => {
+    // Branch doesn't exist → create it from main
+    mockedAxios.get.mockRejectedValueOnce({ response: { status: 404 } }); // branch check → 404
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "main-sha-456" } })); // get main HEAD
+    mockedAxios.post.mockResolvedValueOnce(axiosRes({})); // create branch ref
+    // First getFileSha → 404 (eventual consistency delay)
+    mockedAxios.get.mockRejectedValueOnce({ response: { status: 404 } });
+    // Retry getFileSha → success
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ sha: "file-sha-retry" }));
+    mockedAxios.put.mockResolvedValueOnce(axiosRes({ commit: { html_url: "https://github.com/commit/retry" } }));
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-123/github-edit")
+      .send({
+        file_path: "app/page.tsx",
+        content: "retried content",
+        branch: "draft/session-retry123",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_staging).toBe(true);
+    // Verify the PUT included the SHA from the retry
+    expect(mockedAxios.put).toHaveBeenCalledWith(
+      expect.stringContaining("/contents/app/page.tsx"),
+      expect.objectContaining({ sha: "file-sha-retry" }),
+      expect.any(Object)
+    );
+  }, 10000);
 
   it("SUCCESS: reuses existing branch", async () => {
     // Branch already exists
@@ -472,9 +502,9 @@ describe("GET /preview-url", () => {
     expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith("prj_test123", "draft/session-12345678");
   });
 
-  it("SUCCESS: returns pending when no deployment yet", async () => {
+  it("SUCCESS: returns not_found when no deployment exists for the branch", async () => {
     mockGetPreviewDeploymentUrl.mockResolvedValueOnce({
-      buildStatus: "pending",
+      buildStatus: "not_found",
       previewUrl: undefined,
     });
 
@@ -482,6 +512,6 @@ describe("GET /preview-url", () => {
       .get("/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/session-12345678");
 
     expect(res.status).toBe(200);
-    expect(res.body.buildStatus).toBe("pending");
+    expect(res.body.buildStatus).toBe("not_found");
   });
 });

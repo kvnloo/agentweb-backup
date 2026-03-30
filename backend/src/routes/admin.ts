@@ -9,6 +9,7 @@ import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
+import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
@@ -16,6 +17,7 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 
@@ -3254,6 +3256,11 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       }
     }
 
+    // Notify Slack thread if work item was just marked completed
+    if (status === "completed" && originalItem.status !== "completed") {
+      notifySlackWorkItemCompleted(updatedWorkItem).catch(() => {});
+    }
+
     return res.json({
       success: true,
       data: result.Attributes,
@@ -3926,13 +3933,15 @@ router.get("/subscription-types", async (req, res) => {
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+    const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
       subscriptionTypes = [{
         name: "Basic",
         allowedPages: allAvailablePages, // All available pages (expanded)
-        allowedSkills: allAvailableSkills // All available skills (expanded)
+        allowedSkills: allAvailableSkills, // All available skills (expanded)
+        allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
       }];
     }
 
@@ -3959,10 +3968,18 @@ router.get("/subscription-types", async (req, res) => {
         normalizedSkills = allAvailableSkills;
       }
 
+      // Handle allowedConnectedAccounts — default to all if missing or "*"
+      let normalizedConnectedAccounts = type.allowedConnectedAccounts || allAvailableConnectedAccounts;
+      if (normalizedConnectedAccounts.includes('*')) {
+        normalizedConnectedAccounts = allAvailableConnectedAccounts;
+      }
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
-        allowedSkills: normalizedSkills
+        allowedSkills: normalizedSkills,
+        allowedConnectedAccounts: normalizedConnectedAccounts,
+        ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
       };
     }));
 
@@ -3986,6 +4003,7 @@ router.post("/subscription-types", async (req, res) => {
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+    const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4018,10 +4036,25 @@ router.post("/subscription-types", async (req, res) => {
         normalizedSkills = allAvailableSkills;
       }
 
+      // Handle allowedConnectedAccounts — default to all if missing or "*"
+      let normalizedConnectedAccounts = Array.isArray(type.allowedConnectedAccounts)
+        ? type.allowedConnectedAccounts
+        : allAvailableConnectedAccounts;
+      if (normalizedConnectedAccounts.includes('*')) {
+        normalizedConnectedAccounts = allAvailableConnectedAccounts;
+      }
+
+      // Parse monthlyTokenAllowance (preserve null for unlimited)
+      const parsedAllowance = type.monthlyTokenAllowance != null
+        ? Number(type.monthlyTokenAllowance)
+        : null;
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
-        allowedSkills: normalizedSkills
+        allowedSkills: normalizedSkills,
+        allowedConnectedAccounts: normalizedConnectedAccounts,
+        ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
       };
     }));
 
@@ -4222,6 +4255,43 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
   } catch (error) {
     console.error("Error updating user subscription type:", error);
     res.status(500).json({ message: "Error updating subscription type" });
+  }
+});
+
+// Grant token bonus to a user
+router.post("/users/:userId/token-bonus", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { bonusTokens } = req.body;
+
+    if (typeof bonusTokens !== "number" || bonusTokens <= 0) {
+      return res.status(400).json({ message: "bonusTokens must be a positive number" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await grantTokenBonus(userId, bonusTokens);
+    const updatedUser = await userDb.getUserById(userId);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error granting token bonus:", error);
+    res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Get token usage for a specific user
+router.get("/users/:userId/token-usage", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const usage = await getUserTokenUsage(userId);
+    const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
+    res.json({ ...usage, allowance, effectiveAllowance });
+  } catch (error) {
+    console.error("Error getting user token usage:", error);
+    res.status(500).json({ message: "Error getting token usage" });
   }
 });
 

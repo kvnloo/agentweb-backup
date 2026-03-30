@@ -28,9 +28,10 @@ import WorkflowDetails from './pages/WorkflowDetails';
 import WorkflowRun from './pages/WorkflowRun';
 import WorkflowExecutionDetails from './pages/WorkflowExecutionDetails';
 import Release from './pages/Release';
-import Guide from './pages/Guide';
 import Templates from './pages/Templates';
 import Skills from './pages/Skills';
+import WorkPlans from './pages/WorkPlans';
+import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
@@ -60,7 +61,6 @@ export default function App() {
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route path="release" element={<Release />} />
-                    <Route path="guide" element={<Guide />} />
                     <Route path="api" element={<Api />} />
                     <Route path="execution/:executionId/token/:token" element={<SharedExecution />} />
                     <Route
@@ -84,6 +84,22 @@ export default function App() {
                       element={
                         <PartnerRoute>
                           <Skills />
+                        </PartnerRoute>
+                      }
+                    />
+                    <Route
+                      path="work-plans"
+                      element={
+                        <PartnerRoute>
+                          <WorkPlans />
+                        </PartnerRoute>
+                      }
+                    />
+                    <Route
+                      path="schedule-templates"
+                      element={
+                        <PartnerRoute>
+                          <ScheduleTemplates />
                         </PartnerRoute>
                       }
                     />

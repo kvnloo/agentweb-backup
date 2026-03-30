@@ -2,21 +2,24 @@ import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
-import { scheduleDb, userDb, taskDb } from '../services/db';
+import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
+import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
+import { isContextLimitError, isSessionLimitError, isTransientLLMError } from '../utils/agentModeErrors';
+import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+import { checkTokenUsage } from '../services/tokenUsageService';
 import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
@@ -31,6 +34,49 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
   if (share.expiresAt) return new Date(share.expiresAt);
   if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
   return new Date(0); // No dates at all — treat as expired
+}
+
+/** Classify an error for the diagnosis agent. */
+function classifyErrorType(error: unknown): DiagnosisContext['errorType'] {
+  if (isContextLimitError(error)) return 'context_limit';
+  if (error instanceof Error) {
+    if (error.message.includes('content policies') || error.message.includes('content_filter')) return 'content_filter';
+    if (error.message.includes('high demand') || (error as any)?.status === 429) return 'rate_limit';
+    if (isTransientLLMError(error)) return 'transient';
+  }
+  return 'unknown';
+}
+
+/** Build a compact work plan summary string for the diagnosis agent. */
+function buildWorkPlanSummary(session: any): string | null {
+  if (!session?.workPlan?.steps?.length) return null;
+  return session.workPlan.steps
+    .map((s: any) => `Step ${s.stepCount}: ${s.title} [${s.status}]`)
+    .join('\n');
+}
+
+/**
+ * Invoke the diagnosis agent to produce a context-aware error message.
+ * Returns null if diagnosis fails — caller should fall back to the generic message.
+ */
+async function getDiagnosticErrorMessage(
+  error: unknown,
+  sessionId: string,
+  userMessage: string
+): Promise<string | null> {
+  try {
+    const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    const context: DiagnosisContext = {
+      errorType: classifyErrorType(error),
+      errorMessage: error instanceof Error ? error.message : String(error),
+      userMessage: userMessage || '',
+      workPlanSummary: buildWorkPlanSummary(session),
+      failedFunctions: session?.failedFunctions || null,
+    };
+    return await agentModeService.generateDiagnosticMessage(context);
+  } catch {
+    return null;
+  }
 }
 
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
@@ -1052,6 +1098,16 @@ export async function runScheduledChat(
 
     // Save error to session record if session was created
     if (sessionId) {
+      // Persist partial token usage from messages accumulated before the error
+      if ((error as any)?.partialUsageMessages?.length) {
+        try {
+          await chatbotDb.addMessagesToSession(sessionId, (error as any).partialUsageMessages);
+          console.log(`Scheduled chat: Persisted partial usage from ${(error as any).partialUsageMessages.length} messages for failed session ${sessionId}`);
+        } catch (usageErr) {
+          console.error('Failed to persist partial usage for scheduled chat:', usageErr);
+        }
+      }
+
       try {
         await chatbotDb.updateSessionError(
           sessionId,
@@ -1384,6 +1440,21 @@ export async function generateSessionResponse(
     }
   }
 
+  // Compute tools to exclude based on page context (e.g. get_visual_context only on visual pages)
+  let excludeTools: string[] | undefined;
+  if (session.portalType === 'emma-sidebar') {
+    // Only include get_visual_context on pages where seeing the rendered UI is useful
+    const visualPages = new Set(['brand-guidelines', 'social-posts', 'images', 'videos', 'email-templates', 'newsletter', 'blog']);
+    const urlPath = (pageContext?.currentUrl || '').replace(/^\//, '');
+    const page = urlPath.split('/')[0].split('?')[0];
+    if (!visualPages.has(page)) {
+      excludeTools = ['get_visual_context'];
+    }
+  } else {
+    // Non-sidebar sessions (agent mode, scheduled chats) never need visual context
+    excludeTools = ['get_visual_context'];
+  }
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -1394,7 +1465,8 @@ export async function generateSessionResponse(
       llmModel,
       sessionId,
       mockMode: false,
-      isInteractiveShare: isInteractiveShare || false
+      isInteractiveShare: isInteractiveShare || false,
+      excludeTools
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -1438,7 +1510,7 @@ export async function generateSessionResponse(
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
   // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = [];
   try {
     skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
   } catch (error) {
@@ -1638,7 +1710,7 @@ export const agentModeController = {
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = [];
       try {
         skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {
@@ -1707,6 +1779,15 @@ export const agentModeController = {
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });
+      }
+
+      // Check token usage limits
+      const usageStatus = await checkTokenUsage(user.userId);
+      if (!usageStatus.allowed) {
+        return res.status(429).json({
+          error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+          tokenUsage: usageStatus,
+        });
       }
 
       // Get session
@@ -1798,16 +1879,36 @@ export const agentModeController = {
         progressStore.delete(sessionId);
       }
 
+      // Persist partial token usage from messages accumulated before the error.
+      // This ensures we track costs even when generation fails mid-stream.
+      if (sessionId && (error as any)?.partialUsageMessages?.length) {
+        try {
+          await chatbotDb.addMessagesToSession(sessionId, (error as any).partialUsageMessages);
+          console.log(`AgentMode: Persisted partial usage from ${(error as any).partialUsageMessages.length} messages for failed session ${sessionId}`);
+        } catch (usageErr) {
+          console.error('AgentMode: Failed to persist partial usage on error:', usageErr);
+        }
+      }
+
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
+      // Use the diagnosis agent for a context-aware message when possible.
+      let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
+        // Skip diagnosis for errors that already have specific handling below (context limit, etc.)
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          const userMessage = req.body?.userMessage || '';
+          diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+        }
+
         const errorAssistantMessage: ChatMessage = {
           role: 'assistant',
-          content: 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
             isErrorMessage: true,
+            ...(diagnosticContent ? { isDiagnosticMessage: true } : {}),
           },
         };
         await chatbotDb.addMessageToSession(sessionId, errorAssistantMessage).catch(err => {
@@ -1946,7 +2047,10 @@ export const agentModeController = {
         }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
-      res.status(500).json({ error: 'Failed to generate response' });
+      res.status(500).json({
+        error: 'Failed to generate response',
+        ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
+      });
     }
   },
 
@@ -2357,14 +2461,22 @@ export const agentModeController = {
 
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
+      // Use the diagnosis agent for a context-aware message when possible.
+      let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          const userMessage = req.body?.userMessage || '';
+          diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+        }
+
         const errorAssistantMessage: ChatMessage = {
           role: 'assistant',
-          content: 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
             isErrorMessage: true,
+            ...(diagnosticContent ? { isDiagnosticMessage: true } : {}),
           },
         };
         await chatbotDb.addMessageToSession(shareId, errorAssistantMessage).catch(err => {
@@ -2505,7 +2617,10 @@ export const agentModeController = {
         }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
-      res.status(500).json({ error: 'Failed to generate response' });
+      res.status(500).json({
+        error: 'Failed to generate response',
+        ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
+      });
     }
   },
 
@@ -2933,6 +3048,83 @@ export const agentModeController = {
     }
   },
 
+  // Email report to lead (public with conversable token)
+  async emailReportToLead(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { email, reportUrl, conversableToken } = req.body;
+
+      if (!email || typeof email !== 'string' || !email.trim()) {
+        return res.status(400).json({ error: 'email is required' });
+      }
+      if (!reportUrl || typeof reportUrl !== 'string') {
+        return res.status(400).json({ error: 'reportUrl is required' });
+      }
+      if (!conversableToken) {
+        return res.status(401).json({ error: 'conversableToken is required' });
+      }
+
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversableToken) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
+      // Build email HTML
+      const emailHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+            <p style="color: #666; margin: 5px 0;">Your AI-Powered Report</p>
+          </div>
+
+          <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+            <h2 style="color: #1B2549; margin-top: 0;">Your Report is Ready!</h2>
+            <p style="color: #333; line-height: 1.6;">
+              Your personalized AI analysis has been completed. Click below to view your full report.
+            </p>
+
+            <div style="text-align: center; margin: 20px 0;">
+              <a href="${reportUrl}"
+                 style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">
+                View Your Report
+              </a>
+            </div>
+
+            <p style="color: #333; line-height: 1.6; margin-top: 20px;">
+              Want Emma to help you act on these insights?
+              <a href="https://app.agentweb.pro/register" style="color: #643B7E; text-decoration: none;">Create your free account</a>
+              and she'll walk you through fixing each issue step by step.
+            </p>
+          </div>
+
+          <div style="text-align: center; color: #666; font-size: 12px;">
+            <p>Powered by <a href="https://agentweb.pro" style="color: #643B7E; text-decoration: none;">AgentWeb</a></p>
+          </div>
+        </div>`;
+
+      await emailService.sendEmail(
+        email.trim(),
+        'Your AI Report is Ready — AgentWeb',
+        `Your report is ready! View it here: ${reportUrl}`,
+        emailHtml
+      );
+
+      res.json({ success: true, message: `Report sent to ${email.trim()}` });
+    } catch (error) {
+      console.error('AgentMode: Email report to lead error:', error);
+      res.status(500).json({ error: 'Failed to send report email' });
+    }
+  },
+
   // Upload file attachment for Agent Mode
   async uploadAttachment(req: Request, res: Response) {
     try {
@@ -3228,10 +3420,6 @@ export const agentModeController = {
       if (variableError) {
         return res.status(400).json({ error: variableError });
       }
-      if (normalizedVariables.length > 0 && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
-      }
-
       const normalizedVariableValues: Record<string, string> = {};
       if (normalizedVariables.length > 0 && variableValues && typeof variableValues === 'object') {
         normalizedVariables.forEach((variable) => {
@@ -3240,6 +3428,13 @@ export const agentModeController = {
             normalizedVariableValues[variable.name] = rawValue.trim();
           }
         });
+      }
+
+      // Email is only required when variables exist but not all are pre-filled
+      const allVariablesPrefilled = normalizedVariables.length > 0
+        && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
+      if (normalizedVariables.length > 0 && !allVariablesPrefilled && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
       }
 
       scheduledChat.variables = normalizedVariables;
@@ -3386,9 +3581,6 @@ export const agentModeController = {
       const effectiveEmailNotifications = Array.isArray(emailNotifications)
         ? emailNotifications
         : (Array.isArray(existingSchedule.emailNotifications) ? existingSchedule.emailNotifications : []);
-      if (normalizedVariables.length > 0 && effectiveEmailNotifications.length === 0) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
-      }
       updates.variables = normalizedVariables;
 
       // Preserve existing values for unchanged variables unless explicitly overwritten
@@ -3415,6 +3607,13 @@ export const agentModeController = {
           normalizedVariableValues[variable.name] = existingValue.trim();
         }
       });
+
+      // Email is only required when variables exist but not all are pre-filled
+      const allUpdateVariablesPrefilled = normalizedVariables.length > 0
+        && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
+      if (normalizedVariables.length > 0 && !allUpdateVariablesPrefilled && effectiveEmailNotifications.length === 0) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
+      }
 
       updates.variableValues = normalizedVariableValues;
       updates.variableRequestStatus = normalizedVariables.length > 0
@@ -4039,10 +4238,14 @@ export const agentModeController = {
             && variableValuesUpdatedAtMs >= variableRequestSentAtMs;
           const valuesProvidedAfterLastRun = !Number.isFinite(lastRunTimeMs)
             || (Number.isFinite(variableValuesUpdatedAtMs) && variableValuesUpdatedAtMs > lastRunTimeMs);
+          // If all variable values are pre-filled (e.g. from a template) and no request
+          // has ever been sent, the schedule can run immediately without the email flow.
+          // We also require variableValuesUpdatedAt to be set to distinguish intentional
+          // pre-fills from legacy data missing timestamps.
+          const prefilledWithoutRequest = !hasVariableRequestSentAt && hasVariableValuesUpdatedAt && valuesProvidedAfterLastRun;
           const isVariableRequestSatisfied = schedule.variableRequestStatus === 'provided'
             && hasAllVariableValues
-            && valuesProvidedAfterLatestRequest
-            && valuesProvidedAfterLastRun;
+            && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
           const currentNextRun = new Date(schedule.nextRunTime);
@@ -4152,13 +4355,15 @@ export const agentModeController = {
           // Increment concurrent run counter
           currentConcurrentRuns++;
 
+          // Check if variable values came from the email request flow vs pre-filled at creation.
+          // Pre-filled values persist across runs; email-flow values are cleared after each run.
+          const hadVariableRequestFlow = typeof schedule.variableRequestSentAt === 'string' && schedule.variableRequestSentAt.length > 0;
+
           // Start the scheduled chat run asynchronously (don't await)
           runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
-
-            // Clear consumed variable values so each run requests fresh values
-            if (scheduleVariables.length > 0) {
+            if (scheduleVariables.length > 0 && hadVariableRequestFlow) {
               try {
                 await scheduleDb.updateSchedule(schedule.scheduleId, {
                   variableValues: {},
@@ -4212,7 +4417,7 @@ export const agentModeController = {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
 
-            if (scheduleVariables.length > 0) {
+            if (scheduleVariables.length > 0 && hadVariableRequestFlow) {
               scheduleDb.updateSchedule(schedule.scheduleId, {
                 variableValues: {},
                 variableRequestStatus: 'pending',
@@ -4438,26 +4643,52 @@ export const agentModeController = {
     }
   },
 
-  // Get all predefined work plans (public)
+  // Get all predefined work plans (public + user's own private, deduped by title) — reads from AW-WorkPlans table
   async getAllPredefinedWorkPlans(req: Request, res: Response) {
     try {
-      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
-      
-      if (!setting || !setting.settingValue) {
-        return res.json([]);
+      const publicPlans = await workPlanService.getPublicPlansForAgentMode();
+
+      // If user is authenticated, also include their private plans
+      let userPrivatePlans: any[] = [];
+      const result = await getUserFromToken(req);
+      if (result.user) {
+        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
+        userPrivatePlans = ownPlans.filter(p => p.visibility === 'private');
       }
-      
-      const workPlans = JSON.parse(setting.settingValue);
-      // Filter plans to only include those with showInAgentMode === true
-      const visiblePlans = workPlans.filter((plan: any) => plan.showInAgentMode === true);
-      res.json(visiblePlans);
+
+      // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
+      const mapPlan = (p: any) => ({
+        id: p.planId,
+        title: p.title,
+        description: p.description,
+        welcomeMessage: p.welcomeMessage,
+        autocomplete: p.autocomplete || false,
+        requireLogin: p.requireLogin || false,
+        showLoginSignup: p.showLoginSignup || 'after_plan_completed',
+        showInAgentMode: p.showInAgentMode !== false,
+        defaultModel: p.defaultModel,
+        steps: p.steps,
+        visibility: p.visibility,
+      });
+
+      // Put private plans first, then public — deduplicate by title so user's
+      // private plan takes priority over a system/public plan with the same title
+      const allPlans = [...userPrivatePlans.map(mapPlan), ...publicPlans.map(mapPlan)];
+      const seen = new Set<string>();
+      const deduped = allPlans.filter(p => {
+        const key = p.title.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      res.json(deduped);
     } catch (error) {
       console.error('AgentMode: Get all predefined work plans error:', error);
       res.status(500).json({ error: 'Failed to get all predefined work plans' });
     }
   },
 
-  // Get predefined work plan by title (public)
+  // Get predefined work plan by title (public + user's private) — reads from AW-WorkPlans table
   async getPredefinedWorkPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
@@ -4466,17 +4697,23 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Plan title is required' });
       }
 
-      // Load predefined work plans from settings
-      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
-
-      if (!setting || !setting.settingValue) {
-        return res.status(404).json({ error: 'No predefined work plans found' });
+      // Load system + public plans from AW-WorkPlans table
+      const [systemPlans, publicPlans] = await Promise.all([
+        workPlanService.getWorkPlansByVisibility('system'),
+        workPlanService.getWorkPlansByVisibility('public'),
+      ]);
+      // Put user's private plans FIRST so they take priority over system/public plans with same title
+      const result = await getUserFromToken(req);
+      const allPlans: any[] = [];
+      if (result.user) {
+        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
+        const privatePlans = ownPlans.filter(p => p.visibility === 'private');
+        allPlans.push(...privatePlans);
       }
+      allPlans.push(...systemPlans, ...publicPlans);
 
-      const workPlans = JSON.parse(setting.settingValue);
-
-      // Find work plan with matching title (case-insensitive)
-      const workPlan = workPlans.find((wp: any) =>
+      // Find work plan with matching title (case-insensitive) — private plans checked first
+      const workPlan = allPlans.find((wp) =>
         wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
       );
 
@@ -4484,10 +4721,23 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
+      // Enforce ownership for private plans
+      if (workPlan.visibility === 'private' && (!result.user || workPlan.ownerId !== result.user.userId)) {
+        return res.status(403).json({ error: 'Not authorized to view this private work plan' });
+      }
+
       res.json({
-        ...workPlan,
+        id: workPlan.planId,
+        title: workPlan.title,
+        description: workPlan.description,
+        welcomeMessage: workPlan.welcomeMessage,
+        autocomplete: workPlan.autocomplete || false,
+        requireLogin: workPlan.requireLogin || false,
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
-        requireLogin: workPlan.requireLogin || false
+        showInAgentMode: workPlan.showInAgentMode !== false,
+        defaultModel: workPlan.defaultModel,
+        steps: workPlan.steps,
+        visibility: workPlan.visibility,
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
@@ -4495,7 +4745,7 @@ export const agentModeController = {
     }
   },
 
-  // Create session with predefined work plan (public)
+  // Create session with predefined work plan (public) — reads from AW-WorkPlans table
   async createSessionWithPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
@@ -4505,17 +4755,26 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Plan title is required' });
       }
 
-      // Get predefined work plan
-      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+      // Check if user is authenticated (optional - route is public)
+      const result = await getUserFromToken(req);
+      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
 
-      if (!setting || !setting.settingValue) {
-        return res.status(404).json({ error: 'No predefined work plans found' });
+      // Load system + public plans from AW-WorkPlans table
+      const [systemPlans, publicPlans] = await Promise.all([
+        workPlanService.getWorkPlansByVisibility('system'),
+        workPlanService.getWorkPlansByVisibility('public'),
+      ]);
+      // Put user's private plans FIRST so they take priority over system/public plans with same title
+      const allPlans: any[] = [];
+      if (result.user) {
+        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
+        const privatePlans = ownPlans.filter(p => p.visibility === 'private');
+        allPlans.push(...privatePlans);
       }
+      allPlans.push(...systemPlans, ...publicPlans);
 
-      const workPlans = JSON.parse(setting.settingValue);
-
-      // Find work plan with matching title (case-insensitive)
-      const predefinedPlan = workPlans.find((wp: any) =>
+      // Find work plan with matching title (case-insensitive) — private plans checked first
+      const predefinedPlan = allPlans.find((wp) =>
         wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
       );
 
@@ -4523,10 +4782,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Check if user is authenticated (optional - route is public)
-      // Use the common function to extract user from token
-      const result = await getUserFromToken(req);
-      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
+      // Enforce ownership for private plans
+      if (predefinedPlan.visibility === 'private' && predefinedPlan.ownerId !== userId) {
+        return res.status(403).json({ error: 'Not authorized to use this private work plan' });
+      }
 
       // Create session with userId (authenticated or anonymous)
       const session = await chatbotDb.createChatSession(
@@ -5119,6 +5378,351 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Update foundation tools error:', error);
       res.status(500).json({ error: 'Failed to update foundation tools' });
+    }
+  },
+
+  // ─── Schedule Templates ──────────────────────────────────────────────────
+
+  // POST /api/agent-mode/schedule-templates
+  createScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const {
+        name, description, category, visibility,
+        startingMessage, variables, keywords,
+        requiredFunctionCalls, functionCallMinCalls,
+        suggestedFrequency, frequencyIntervalDays,
+        emailNotifications, dailyDigest, llmModel,
+      } = req.body;
+
+      if (!name || !startingMessage) {
+        return res.status(400).json({ error: 'name and startingMessage are required' });
+      }
+
+      if (suggestedFrequency === 'every_n_days' && (frequencyIntervalDays === undefined || !Number.isInteger(frequencyIntervalDays) || frequencyIntervalDays < 1)) {
+        return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer when suggestedFrequency is every_n_days' });
+      }
+
+      // Extract variables from message
+      const variableRegex = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+      const messageVarNames = new Set<string>();
+      let match;
+      while ((match = variableRegex.exec(startingMessage)) !== null) {
+        messageVarNames.add(match[1]);
+      }
+
+      // Build normalized variables list
+      const inputVars = Array.isArray(variables) ? variables : [];
+      const normalizedVariables = Array.from(messageVarNames).map(varName => {
+        const existing = inputVars.find((v: any) => v.name === varName);
+        return {
+          name: varName,
+          description: existing?.description || '',
+          type: existing?.type || 'text',
+        };
+      });
+
+      const templateId = uuidv4();
+      const now = new Date().toISOString();
+
+      const template = {
+        templateId,
+        createdBy: user.userId,
+        name,
+        description: description || '',
+        category: category || 'General',
+        visibility: 'private' as const,
+        startingMessage,
+        variables: normalizedVariables,
+        keywords: keywords || [],
+        requiredFunctionCalls: requiredFunctionCalls || [],
+        functionCallMinCalls: functionCallMinCalls || {},
+        suggestedFrequency: suggestedFrequency || 'daily',
+        ...(suggestedFrequency === 'every_n_days' && { frequencyIntervalDays }),
+        emailNotifications: emailNotifications || [],
+        dailyDigest: dailyDigest || false,
+        llmModel: llmModel || '',
+        usageCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await scheduleTemplateDb.createTemplate(template);
+
+      res.status(201).json({
+        templateId,
+        message: 'Schedule template created successfully',
+      });
+    } catch (error) {
+      console.error('AgentMode: Create schedule template error:', error);
+      res.status(500).json({ error: 'Failed to create schedule template' });
+    }
+  },
+
+  // GET /api/agent-mode/schedule-templates
+  getScheduleTemplates: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+
+      // Get user's own templates + all system/public templates
+      const [userTemplates, systemTemplates, publicTemplates] = await Promise.all([
+        scheduleTemplateDb.getTemplatesByCreator(user.userId),
+        scheduleTemplateDb.getTemplatesByVisibility('system'),
+        scheduleTemplateDb.getTemplatesByVisibility('public'),
+      ]);
+
+      // Merge: system + public + user's own templates, deduplicated
+      const sharedTemplates = [...(systemTemplates || []), ...(publicTemplates || [])];
+      const sharedIds = new Set(sharedTemplates.map((t: any) => t.templateId));
+      const privateTemplates = (userTemplates || []).filter((t: any) => !sharedIds.has(t.templateId));
+      const all = [...sharedTemplates, ...privateTemplates];
+
+      // Sort newest first
+      all.sort((a: any, b: any) => {
+        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+      });
+
+      res.json(all);
+    } catch (error) {
+      console.error('AgentMode: Get schedule templates error:', error);
+      res.status(500).json({ error: 'Failed to get schedule templates' });
+    }
+  },
+
+  // GET /api/agent-mode/schedule-templates/:templateId
+  getScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const template = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!template) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+
+      // Allow access if system/public visibility or owned by user
+      const isPubliclyVisible = template.visibility === 'system' || template.visibility === 'public';
+      if (!isPubliclyVisible && template.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+
+      res.json(template);
+    } catch (error) {
+      console.error('AgentMode: Get schedule template error:', error);
+      res.status(500).json({ error: 'Failed to get schedule template' });
+    }
+  },
+
+  // PUT /api/agent-mode/schedule-templates/:templateId
+  updateScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const existing = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!existing || existing.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found or not owned by you' });
+      }
+
+      const {
+        name, description, category, visibility,
+        startingMessage, variables, keywords,
+        requiredFunctionCalls, functionCallMinCalls,
+        suggestedFrequency, frequencyIntervalDays,
+        emailNotifications, dailyDigest, llmModel,
+      } = req.body;
+
+      const updates: any = { updatedAt: new Date().toISOString() };
+
+      if (name !== undefined) updates.name = name;
+      if (description !== undefined) updates.description = description;
+      if (category !== undefined) updates.category = category;
+      if (visibility !== undefined) updates.visibility = visibility;
+      if (keywords !== undefined) updates.keywords = keywords;
+      if (requiredFunctionCalls !== undefined) updates.requiredFunctionCalls = requiredFunctionCalls;
+      if (functionCallMinCalls !== undefined) updates.functionCallMinCalls = functionCallMinCalls;
+      if (suggestedFrequency !== undefined) updates.suggestedFrequency = suggestedFrequency;
+      if (frequencyIntervalDays !== undefined) updates.frequencyIntervalDays = frequencyIntervalDays;
+      if (emailNotifications !== undefined) updates.emailNotifications = emailNotifications;
+      if (dailyDigest !== undefined) updates.dailyDigest = dailyDigest;
+      if (llmModel !== undefined) updates.llmModel = llmModel;
+
+      if (startingMessage !== undefined) {
+        updates.startingMessage = startingMessage;
+
+        // Re-extract variables from updated message
+        const variableRegex = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+        const messageVarNames = new Set<string>();
+        let match;
+        while ((match = variableRegex.exec(startingMessage)) !== null) {
+          messageVarNames.add(match[1]);
+        }
+        const inputVars = Array.isArray(variables) ? variables : (existing.variables || []);
+        updates.variables = Array.from(messageVarNames).map(varName => {
+          const existingVar = inputVars.find((v: any) => v.name === varName);
+          return { name: varName, description: existingVar?.description || '', type: existingVar?.type || 'text' };
+        });
+      } else if (variables !== undefined) {
+        updates.variables = variables;
+      }
+
+      await scheduleTemplateDb.updateTemplate(templateId, updates);
+
+      res.json({ message: 'Schedule template updated successfully' });
+    } catch (error) {
+      console.error('AgentMode: Update schedule template error:', error);
+      res.status(500).json({ error: 'Failed to update schedule template' });
+    }
+  },
+
+  // DELETE /api/agent-mode/schedule-templates/:templateId
+  deleteScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const existing = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!existing || existing.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found or not owned by you' });
+      }
+
+      await scheduleTemplateDb.deleteTemplate(templateId);
+
+      res.json({ message: 'Schedule template deleted successfully' });
+    } catch (error) {
+      console.error('AgentMode: Delete schedule template error:', error);
+      res.status(500).json({ error: 'Failed to delete schedule template' });
+    }
+  },
+
+  // POST /api/agent-mode/schedule-templates/:templateId/use
+  createScheduleFromTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+      const {
+        scheduleName, nextRunTime, scheduleFrequency,
+        frequencyIntervalDays: overrideInterval,
+        emailNotifications: overrideEmails,
+        variableValues, runCount, llmModel: overrideModel,
+      } = req.body;
+
+      const template = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!template) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+      const isPubliclyVisible = template.visibility === 'system' || template.visibility === 'public';
+      if (!isPubliclyVisible && template.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+
+      const frequency = scheduleFrequency || template.suggestedFrequency || 'daily';
+      const interval = overrideInterval || template.frequencyIntervalDays;
+
+      if (frequency === 'every_n_days' && (!interval || !Number.isInteger(interval) || interval < 1)) {
+        return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer for every_n_days frequency' });
+      }
+
+      const now = new Date();
+      let scheduledNextRunTime: string;
+      if (nextRunTime) {
+        const providedDate = new Date(nextRunTime);
+        if (isNaN(providedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        }
+        scheduledNextRunTime = providedDate.toISOString();
+      } else {
+        scheduledNextRunTime = calculateNextRunTime(frequency, now, interval).toISOString();
+      }
+
+      // Build normalized variable values from template variables
+      const normalizedVariableValues: Record<string, string> = {};
+      const templateVars: any[] = template.variables || [];
+      if (templateVars.length > 0 && variableValues && typeof variableValues === 'object') {
+        templateVars.forEach((v: any) => {
+          const rawValue = (variableValues as Record<string, unknown>)[v.name];
+          if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+            normalizedVariableValues[v.name] = rawValue.trim();
+          }
+        });
+      }
+
+      const missingVars = templateVars.filter((v: any) => !normalizedVariableValues[v.name]);
+      const emails = overrideEmails || template.emailNotifications || [];
+
+      if (templateVars.length > 0 && missingVars.length > 0 && (!Array.isArray(emails) || emails.length === 0)) {
+        return res.status(400).json({ error: 'Email notifications are required when template has variables (unless all variable values are pre-filled)' });
+      }
+
+      const scheduleId = uuidv4();
+      const scheduledChat: any = {
+        scheduleId,
+        taskId: 'global',
+        userId: user.userId,
+        frequency,
+        ...(frequency === 'every_n_days' && { frequencyIntervalDays: interval }),
+        scheduleName: scheduleName || template.name,
+        description: template.description || '',
+        startingMessage: template.startingMessage,
+        keywords: template.keywords || [],
+        requiredFunctionCalls: template.requiredFunctionCalls || [],
+        functionCallMinCalls: template.functionCallMinCalls || {},
+        emailNotifications: emails,
+        dailyDigest: frequency === 'hourly' ? (template.dailyDigest || false) : false,
+        status: 'active',
+        nextRunTime: scheduledNextRunTime,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        sessionId: null,
+        type: 'scheduled_chat',
+        llmModel: overrideModel || template.llmModel || '',
+        runCount: runCount !== undefined ? runCount : -1,
+        variables: templateVars,
+        variableValues: normalizedVariableValues,
+        variableRequestStatus: missingVars.length > 0 ? 'pending' : (templateVars.length > 0 ? 'provided' : 'idle'),
+      };
+
+      await scheduleDb.createSchedule(scheduledChat);
+
+      // Increment template usage count
+      await scheduleTemplateDb.incrementUsageCount(templateId);
+
+      res.status(201).json({
+        scheduleId,
+        message: 'Scheduled chat created from template successfully',
+        nextRunTime: scheduledNextRunTime,
+        templateId,
+      });
+    } catch (error) {
+      console.error('AgentMode: Create schedule from template error:', error);
+      res.status(500).json({ error: 'Failed to create schedule from template' });
+    }
+  },
+
+  // POST /api/agent-mode/schedule-templates/:templateId/submit-for-review
+  submitTemplateForReview: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const template = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!template || template.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found or not owned by you' });
+      }
+      if (template.visibility !== 'private') {
+        return res.status(400).json({ error: 'Only private templates can be submitted for review' });
+      }
+
+      await scheduleTemplateDb.updateTemplate(templateId, {
+        visibility: 'pending_review',
+        reviewFeedback: '',
+        updatedAt: new Date().toISOString(),
+      });
+
+      res.json({ message: 'Template submitted for review successfully' });
+    } catch (error) {
+      console.error('AgentMode: Submit template for review error:', error);
+      res.status(500).json({ error: 'Failed to submit template for review' });
     }
   },
 };

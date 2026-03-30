@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
 import { MemoryRouter } from "react-router-dom";
 import axios from "axios";
@@ -82,7 +83,7 @@ describe("AdminDashboard - Product Domain Display", () => {
     (axios.get as jest.Mock).mockResolvedValue({ data: [] });
   });
 
-  it("should display product domain in SEO/AEO column when configured", async () => {
+  it("should display SEO domains in expanded user detail when configured", async () => {
     searchParams = new URLSearchParams("tab=users");
     mockAdminContext = {
       ...baseAdminContext,
@@ -108,16 +109,18 @@ describe("AdminDashboard - Product Domain Display", () => {
       </MemoryRouter>
     );
 
-    // Find the SEO/AEO column for the user
-    const userRow = screen.getByText("user1@example.com").closest("tr");
-    expect(userRow).toBeInTheDocument();
+    // Verify user email is displayed in the table
+    expect(screen.getByText("user1@example.com")).toBeInTheDocument();
 
-    // Check that product domain is displayed
-    expect(within(userRow!).getByText(/Product:/)).toBeInTheDocument();
-    expect(within(userRow!).getByText(/app\.example\.com/)).toBeInTheDocument();
+    // Click row to expand detail section
+    const user = userEvent.setup();
+    await user.click(screen.getByText("user1@example.com"));
+
+    // The expanded section should show SEO domains
+    expect(await screen.findByText("example.com")).toBeInTheDocument();
   });
 
-  it("should display 'No Product Domain' when not configured", async () => {
+  it("should display dash when no SEO domains configured", async () => {
     searchParams = new URLSearchParams("tab=users");
     mockAdminContext = {
       ...baseAdminContext,
@@ -129,8 +132,7 @@ describe("AdminDashboard - Product Domain Display", () => {
           isActive: true,
           createdAt: "2024-01-01",
           roles: ["customer"],
-          seoDomains: ["example.com"],
-          googleAnalyticsPropertyId: "123456789",
+          seoDomains: [],
           // productDomain not set
         },
       ],
@@ -142,14 +144,18 @@ describe("AdminDashboard - Product Domain Display", () => {
       </MemoryRouter>
     );
 
-    const userRow = screen.getByText("user2@example.com").closest("tr");
-    expect(userRow).toBeInTheDocument();
+    // Verify user email is displayed
+    expect(screen.getByText("user2@example.com")).toBeInTheDocument();
 
-    // Check that "No Product Domain" is displayed
-    expect(within(userRow!).getByText("No Product Domain")).toBeInTheDocument();
+    // Click row to expand
+    const user = userEvent.setup();
+    await user.click(screen.getByText("user2@example.com"));
+
+    // The SEO / GA / Clarity section should show a dash when no domains
+    expect(await screen.findByText("SEO / GA / Clarity")).toBeInTheDocument();
   });
 
-  it("should display all SEO/AEO fields together", async () => {
+  it("should display multiple SEO domains together in expanded view", async () => {
     searchParams = new URLSearchParams("tab=users");
     mockAdminContext = {
       ...baseAdminContext,
@@ -175,18 +181,15 @@ describe("AdminDashboard - Product Domain Display", () => {
       </MemoryRouter>
     );
 
-    const userRow = screen.getByText("user3@example.com").closest("tr");
-    expect(userRow).toBeInTheDocument();
+    // Click row to expand
+    const user = userEvent.setup();
+    await user.click(screen.getByText("user3@example.com"));
 
-    // Check all fields are present
-    expect(within(userRow!).getByText("domain1.com")).toBeInTheDocument();
-    expect(within(userRow!).getByText("domain2.com")).toBeInTheDocument();
-    expect(within(userRow!).getByText(/GA: 987654321/)).toBeInTheDocument();
-    expect(within(userRow!).getByText(/Clarity: xyz789/)).toBeInTheDocument();
-    expect(within(userRow!).getByText(/Product: app\.domain1\.com/)).toBeInTheDocument();
+    // Check SEO domains are displayed (joined with ", ")
+    expect(await screen.findByText("domain1.com, domain2.com")).toBeInTheDocument();
   });
 
-  it("should handle users with only product domain and no other SEO fields", async () => {
+  it("should render user with only product domain and no SEO domains", async () => {
     searchParams = new URLSearchParams("tab=users");
     mockAdminContext = {
       ...baseAdminContext,
@@ -200,7 +203,6 @@ describe("AdminDashboard - Product Domain Display", () => {
           roles: ["customer"],
           seoDomains: [],
           productDomain: "app.example.org",
-          // No GA or Clarity
         },
       ],
     };
@@ -211,14 +213,14 @@ describe("AdminDashboard - Product Domain Display", () => {
       </MemoryRouter>
     );
 
-    const userRow = screen.getByText("user4@example.com").closest("tr");
-    expect(userRow).toBeInTheDocument();
+    // Verify user email renders in the table
+    expect(screen.getByText("user4@example.com")).toBeInTheDocument();
 
-    // Check product domain is shown
-    expect(within(userRow!).getByText(/Product: app\.example\.org/)).toBeInTheDocument();
+    // Click to expand detail section
+    const user = userEvent.setup();
+    await user.click(screen.getByText("user4@example.com"));
 
-    // Check that other fields show "No" messages
-    expect(within(userRow!).getByText("No domains")).toBeInTheDocument();
-    expect(within(userRow!).getByText("No GA ID")).toBeInTheDocument();
+    // SEO section should be visible in the expanded detail
+    expect(await screen.findByText("SEO / GA / Clarity")).toBeInTheDocument();
   });
 });

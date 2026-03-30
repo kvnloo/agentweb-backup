@@ -67,6 +67,7 @@ import { format } from "date-fns";
 import axios from "axios";
 import { io, Socket } from "socket.io-client";
 import ReactMarkdown from "react-markdown";
+import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl, API_URL } from "../config";
 
@@ -158,8 +159,22 @@ function TabPanel({ children, value, index }: { children?: React.ReactNode; valu
   );
 }
 
+/**
+ * Parse a date string that may be YYYY-MM-DD or a full ISO timestamp.
+ * Extracts just the YYYY-MM-DD portion and returns [year, month, day].
+ */
+function parseDateParts(dateStr: string): [number, number, number] {
+  const datePart = dateStr.slice(0, 10); // "YYYY-MM-DD"
+  const [year, month, day] = datePart.split('-').map(Number);
+  return [year, month, day];
+}
+
 export default function GTMPlans() {
   const { token } = useAuth();
+  const [searchParams] = useSearchParams();
+  const deepLinkPlanId = searchParams.get("planId");
+  const deepLinkPhaseId = searchParams.get("phaseId");
+  const deepLinkRef = useRef<HTMLDivElement>(null);
   const [tabValue, setTabValue] = useState(0);
   const [plans, setPlans] = useState<GTMPlan[]>([]);
   const [showDone, setShowDone] = useState(false);
@@ -377,7 +392,20 @@ export default function GTMPlans() {
       });
 
       if (response.data.success) {
-        setPlans(response.data.data || []);
+        const fetchedPlans = response.data.data || [];
+        setPlans(fetchedPlans);
+
+        // Deep link: auto-select the user who owns the target plan and switch to Plans tab
+        if (deepLinkPlanId) {
+          const targetPlan = fetchedPlans.find((p: GTMPlan) => p.planId === deepLinkPlanId);
+          if (targetPlan) {
+            setSelectedUserId(targetPlan.userId);
+            setTabValue(1); // Switch to Plans tab
+            setTimeout(() => {
+              deepLinkRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+            }, 300);
+          }
+        }
       } else {
         setError("Failed to fetch GTM plans");
       }
@@ -681,7 +709,7 @@ export default function GTMPlans() {
       const dateStr = currentDueDate || "";
       setEditDueDate(dateStr);
       if (dateStr) {
-        const [year, month, day] = dateStr.split('-').map(Number);
+        const [year, month, day] = parseDateParts(dateStr);
         setEditDueDateValue(new Date(year, month - 1, day));
       } else {
         setEditDueDateValue(null);
@@ -1206,7 +1234,7 @@ export default function GTMPlans() {
     }
     
     // Parse date as local date (YYYY-MM-DD format)
-    const [year, month, day] = dueDate.split('-').map(Number);
+    const [year, month, day] = parseDateParts(dueDate);
     const due = new Date(year, month - 1, day);
     due.setHours(0, 0, 0, 0);
     
@@ -1242,7 +1270,7 @@ export default function GTMPlans() {
       // Work item due date should not be after phase due date
       const phase = plan.phases?.find((p) => p.id === phaseId);
       if (phase?.dueDate) {
-        const [year, month, day] = phase.dueDate.split('-').map(Number);
+        const [year, month, day] = parseDateParts(phase.dueDate);
         const phaseDueDate = new Date(year, month - 1, day);
         phaseDueDate.setHours(23, 59, 59, 999);
         if (date > phaseDueDate) {
@@ -1251,7 +1279,7 @@ export default function GTMPlans() {
       }
       // Also check plan due date if phase doesn't have one
       if (!warningMessage && plan.dueDate) {
-        const [year, month, day] = plan.dueDate.split('-').map(Number);
+        const [year, month, day] = parseDateParts(plan.dueDate);
         const planDueDate = new Date(year, month - 1, day);
         planDueDate.setHours(23, 59, 59, 999);
         if (date > planDueDate) {
@@ -1261,7 +1289,7 @@ export default function GTMPlans() {
     } else if (type === "phase") {
       // Phase due date should not be after plan due date
       if (plan.dueDate) {
-        const [year, month, day] = plan.dueDate.split('-').map(Number);
+        const [year, month, day] = parseDateParts(plan.dueDate);
         const planDueDate = new Date(year, month - 1, day);
         planDueDate.setHours(23, 59, 59, 999);
         if (date > planDueDate) {
@@ -1273,7 +1301,7 @@ export default function GTMPlans() {
       if (phase?.workItems) {
         for (const item of phase.workItems) {
           if (item.dueDate) {
-            const [itemYear, itemMonth, itemDay] = item.dueDate.split('-').map(Number);
+            const [itemYear, itemMonth, itemDay] = parseDateParts(item.dueDate);
             const itemDueDate = new Date(itemYear, itemMonth - 1, itemDay);
             itemDueDate.setHours(0, 0, 0, 0);
             if (date < itemDueDate) {
@@ -1287,7 +1315,7 @@ export default function GTMPlans() {
       // Plan due date should not be before phase or work item due dates
       for (const phase of plan.phases || []) {
         if (phase.dueDate) {
-          const [year, month, day] = phase.dueDate.split('-').map(Number);
+          const [year, month, day] = parseDateParts(phase.dueDate);
           const phaseDueDate = new Date(year, month - 1, day);
           phaseDueDate.setHours(0, 0, 0, 0);
           if (date < phaseDueDate) {
@@ -1299,7 +1327,7 @@ export default function GTMPlans() {
         if (!warningMessage && phase.workItems) {
           for (const item of phase.workItems) {
             if (item.dueDate) {
-              const [itemYear, itemMonth, itemDay] = item.dueDate.split('-').map(Number);
+              const [itemYear, itemMonth, itemDay] = parseDateParts(item.dueDate);
               const itemDueDate = new Date(itemYear, itemMonth - 1, itemDay);
               itemDueDate.setHours(0, 0, 0, 0);
               if (date < itemDueDate) {
@@ -1882,7 +1910,7 @@ export default function GTMPlans() {
                             </TableCell>
                             <TableCell>
                               {qi.workItem.dueDate ? (() => {
-                                const [year, month, day] = qi.workItem.dueDate!.split('-').map(Number);
+                                const [year, month, day] = parseDateParts(qi.workItem.dueDate!);
                                 const dueDateLocal = new Date(year, month - 1, day);
                                 const dueDateStatus = getDueDateStatus(qi.workItem.dueDate, qi.workItem.status, "workItem");
                                 return (
@@ -2170,7 +2198,7 @@ export default function GTMPlans() {
 
           <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
             {selectedUserStats?.plans.map((plan) => (
-            <Paper key={plan.planId} sx={{ p: 2 }}>
+            <Paper key={plan.planId} ref={plan.planId === deepLinkPlanId ? deepLinkRef : undefined} sx={{ p: 2 }}>
               <Box sx={{ mb: 2 }}>
                 <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", mb: 1 }}>
                   <Box sx={{ flex: 1 }}>
@@ -2207,7 +2235,7 @@ export default function GTMPlans() {
                         />
                       )}
                       {plan.dueDate && (() => {
-                        const [year, month, day] = plan.dueDate.split('-').map(Number);
+                        const [year, month, day] = parseDateParts(plan.dueDate);
                         const dueDateLocal = new Date(year, month - 1, day);
                         const dueDateStatus = getDueDateStatus(plan.dueDate, plan.status, "plan");
                         return (
@@ -2277,7 +2305,7 @@ export default function GTMPlans() {
               {plan.phases && plan.phases.length > 0 ? (
                 <Box>
                   {plan.phases.map((phase) => (
-                    <Accordion key={phase.id} defaultExpanded={phase.status === "in_progress"}>
+                    <Accordion key={phase.id} defaultExpanded={phase.status === "in_progress" || phase.id === deepLinkPhaseId}>
                       <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                         <Box sx={{ display: "flex", alignItems: "center", gap: 1, width: "100%", mr: 2 }}>
                           <Typography variant="subtitle1" sx={{ flexGrow: 1 }}>
@@ -2297,7 +2325,7 @@ export default function GTMPlans() {
                             />
                           )}
                           {phase.dueDate && (() => {
-                            const [year, month, day] = phase.dueDate.split('-').map(Number);
+                            const [year, month, day] = parseDateParts(phase.dueDate);
                             const dueDateLocal = new Date(year, month - 1, day);
                             const dueDateStatus = getDueDateStatus(phase.dueDate, phase.status, "phase");
                             const dueDateIcon = getDueDateIcon(phase.dueDate, phase.status, "phase");
@@ -2447,7 +2475,7 @@ export default function GTMPlans() {
                                     </TableCell>
                                     <TableCell>
                                       {item.dueDate ? (() => {
-                                        const [year, month, day] = item.dueDate.split('-').map(Number);
+                                        const [year, month, day] = parseDateParts(item.dueDate);
                                         const dueDateLocal = new Date(year, month - 1, day);
                                         const dueDateStatus = getDueDateStatus(item.dueDate, item.status, "workItem");
                                         const dueDateIcon = getDueDateIcon(item.dueDate, item.status, "workItem");

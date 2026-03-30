@@ -1,3 +1,365 @@
+# March 29, 2026: Investigation — Sonnet 4.6 vs Opus 4.6 Cost & Quality Comparison for Agent Mode
+
+## Problem
+
+Agent Mode defaults to Opus 4.6 (`anthropic.claude-opus-4-6-v1`) for all sessions. Opus is the most expensive Claude model. Need to determine whether switching the default to Sonnet 4.6 would meaningfully reduce costs without degrading output quality for typical marketing tasks.
+
+## Approach
+
+Ran identical marketing tasks on both models using the test account (`test@example.com`) and compared cost, token usage, and output quality.
+
+### Tasks Tested
+1. **SWOT Analysis** — "Create a SWOT analysis for my business"
+2. **LinkedIn Posts** — "Create 3 LinkedIn posts for my business"
+3. **Email Nurture Sequence** — email marketing content
+4. **Brand Guidelines Review** — brand strategy analysis
+5. **Competitor Analysis** — competitive landscape research
+
+## Results
+
+### Cost Comparison (Same Tasks, Same Account)
+
+| Task | Sonnet 4.6 Cost | Opus 4.6 Cost | Opus Premium |
+|------|-----------------|---------------|--------------|
+| SWOT Analysis | $0.091 | $0.677 | **7.4x** |
+| LinkedIn Posts | $0.062 | $1.270 | **20.5x** |
+
+**Average: Opus costs ~14x more per session for comparable marketing tasks.**
+
+### Sonnet 4.6 — Full Test Results
+
+| Task | Session | Cost | Output Tokens |
+|------|---------|------|---------------|
+| SWOT Analysis | 9246850b | $0.091 | 10,526 |
+| LinkedIn Posts | 53c768c5 | $0.062 | ~7,000 |
+| Email Nurture | d41e9b3c | $0.062 | ~7,000 |
+| Brand Guidelines | dfdc46b6 | $0.106 | ~10,000 |
+| Competitor Analysis | 067d7bd5 | $0.159 | ~14,000 |
+
+**Average Sonnet session cost: $0.096**
+
+### Opus 4.6 — Test Results
+
+| Task | Session | Cost | Output Tokens |
+|------|---------|------|---------------|
+| SWOT Analysis | d3173b8a | $0.677 | 10,468 |
+| LinkedIn Posts | 9b0603f3 | $1.270 | 8,654 |
+
+**Average Opus session cost: $0.974**
+
+### Pricing Reference
+
+| Model | Input (per 1M tokens) | Output (per 1M tokens) |
+|-------|----------------------|------------------------|
+| Sonnet 4.6 | $3 | $15 |
+| Opus 4.6 | $15 | $75 |
+
+## Quality Assessment
+
+Both models produced **excellent, production-quality** marketing outputs:
+
+- **SWOT Analysis**: Both generated comprehensive strategic frameworks with tables, bullet points, and actionable recommendations. Indistinguishable quality.
+- **LinkedIn Posts**: Both created well-crafted content. Opus was slightly more "feature-aware" — it discovered and used the `create_social_media_posts` tool to save posts directly, while Sonnet presented them inline. The extra tool usage drove Opus cost much higher.
+- **Email/Brand/Competitor tasks** (Sonnet only): All produced thorough, well-structured outputs comparable to what Opus would generate.
+
+### Key Observation
+
+Opus's main advantage is being more likely to discover and use platform tools (e.g., `create_social_media_posts`, `install_skills`). However, this increases cost significantly (more iterations, more tool calls) and the end-user output quality is equivalent.
+
+## Projected Monthly Savings
+
+Assuming ~500 agent mode sessions/month:
+- **Opus monthly cost**: ~$487 (500 × $0.974)
+- **Sonnet monthly cost**: ~$48 (500 × $0.096)
+- **Potential savings**: ~$439/month (~90% reduction)
+
+## Recommendation
+
+**Switch the default model to Sonnet 4.6.** The quality difference is negligible for marketing tasks, and the cost savings are dramatic (7-20x per session). Opus can remain available as a manual selection in the model dropdown for users who want it.
+
+### Also Investigated: Auto_CostSaving Meta-Model
+
+Explored building an `Auto_CostSaving` meta-model that dynamically routes between Claude models per iteration based on task complexity. Implementation was completed but ultimately unnecessary — since Sonnet handles all tested tasks at equivalent quality, a simple default switch is cleaner than a dynamic routing system.
+
+**Decision:** Discard Auto_CostSaving code; switch default model to Sonnet 4.6 instead.
+
+---
+
+# March 28, 2026: Investigation — SESSION_MESSAGE_LIMIT_EXCEEDED on Scheduled Chat (BirdDog Blog Articles)
+
+## Problem
+
+Schedule `527a6748-abc5-4475-aa1e-e9e77cd09d09` ("BirdDog Blog Articles", user `7856055c-298f-4478-ba4c-183240fe2db2`) failed after ~80 minutes with:
+
+```
+SESSION_MESSAGE_LIMIT_EXCEEDED: Adding 14 message(s) would exceed the maximum of 300 messages per session (current: 289). Please start a new session to continue the conversation.
+```
+
+Session: `e1694c29-ca30-42cf-981a-2a30f1ed2eda`
+
+## Root Cause
+
+**The LLM refused to call `search_web` despite it being listed as a required function in the schedule config.** The `runVerifiedChat` retry loop kept requesting the LLM to call `search_web`, but the LLM repeatedly declined or ignored the instruction, causing the loop to retry up to its max attempts. Each retry added ~12-18 messages (user prompt + LLM response + tool calls + tool results), and after ~15 attempts the session had accumulated 289 messages — 11 short of the 300 hard limit.
+
+This is fundamentally a **prompt-following issue** — the LLM did not comply with the instruction to call `search_web`, and the retry mechanism had no way to detect that the LLM was systematically refusing a specific tool call vs. simply needing another attempt.
+
+A secondary issue: `runVerifiedChat` had **no pre-flight check** on the session message count before retrying, so it kept retrying until it hit the hard limit and crashed instead of stopping gracefully.
+
+## Fix
+
+1. **Config fix (immediate):** Removed `search_web` from `requiredFunctionCalls` in the schedule config. The tool is not essential for blog article generation — the LLM calls it organically when needed, and forcing it via `requiredFunctionCalls` creates a brittle dependency on the LLM's willingness to comply.
+
+2. **Code fix (defensive):** Added a pre-flight message count check in `runVerifiedChat` (`agentModeController.ts`). Before each retry, the session's `messageCount` is compared against `MAX_MESSAGE_SIZE_PER_SESSION - 50`. If within 50 messages of the limit, the retry loop breaks gracefully and returns the partial result instead of crashing.
+
+## Lesson
+
+- **Don't require tool calls that aren't essential.** If the LLM can produce acceptable output without calling a specific tool, don't add it to `requiredFunctionCalls`. The retry loop will burn through attempts (and messages) trying to force a tool call the LLM may not see as necessary.
+- **LLM prompt-following is not guaranteed** — especially for tool calls the model deems irrelevant to the task. Design retry logic to degrade gracefully rather than assuming the LLM will eventually comply.
+- **Session message limits need proactive checking**, not just reactive enforcement. The hard limit at 300 was only checked when writing messages, not when deciding whether to retry.
+
+---
+
+# March 28, 2026: Investigation — Why Some Sessions Do Not Have Usage Data
+
+## Problem
+
+Some chat sessions in `AW-ChatSessions` have no `totalTokens` or `totalCost`, even though they contain messages and had LLM calls. Need to determine scope and root cause.
+
+## Investigation
+
+Analyzed last 500 sessions in production (queried `AdminUpdatedAtIndex`).
+
+### Data Breakdown
+
+| Portal Type | Total | With Usage | Without Usage | Multi-Msg Without Usage |
+|-------------|-------|------------|---------------|------------------------|
+| agent       | 118   | 96         | 22            | 4                      |
+| emma-sidebar| 202   | 1          | 201           | 0                      |
+
+### Emma-sidebar sessions (201 without usage) — NOT A BUG
+
+These are auto-created sessions when a user navigates to a page. 196 of 200 `messageCount=1` sessions have `updatedAt ≈ createdAt` (within 1 second) — the session was created with a system message in AW-ChatMessages, but the user never actually chatted. No LLM calls were made.
+
+The 1 Emma session that had a real conversation (7 messages) correctly has usage data.
+
+### Agent sessions with messageCount=0 (18 without usage) — NOT A BUG
+
+Sessions created but never started (e.g., predefined work plans set up but user hasn't interacted).
+
+### Agent sessions with messages but no usage — 4 sessions
+
+| Session | Type | Msgs | Model | Root Cause |
+|---------|------|------|-------|------------|
+| `f8cf70d9` | predefined-work-plan | 30 | gemini-3-pro | **Pre-dates usage tracking** (created 2026-03-16, earliest session with usage is 2026-03-26) |
+| `c3615c1c` | predefined-work-plan | 25 | claude-opus-4-6 | **Same** — created 2026-03-16 |
+| `a19cc80d` | scheduled | 2 | gemini-3.1-pro | Only system+user msgs, **AI response never persisted** (worker timeout/crash) |
+| `1e5af232` | regular (slack-bot) | 2 | undefined | Only system+user msgs, **AI response never persisted**, model undefined |
+
+### Root Causes
+
+1. **Historical sessions**: Sessions created before usage tracking was deployed (pre March 26). All messages have `hasUsage=false`. No fix needed.
+
+2. **Failed/incomplete sessions**: Worker crashed or timed out during `generateMarketingResponse`. Usage is completely lost because:
+   - Usage extraction only happens when `response.responseMessages` are persisted via `addMessagesToSession`
+   - If worker throws/times out, `responseMessages` is never populated
+   - `incrementTokenUsage()` at chatbotService.ts:803 is never reached
+   - No fallback to capture partial usage from the worker process
+
+### Gap: Usage Lost on Worker Failure
+
+When `generateMarketingResponseWorkerService.runInWorker()` fails:
+- User message: saved (before worker call)
+- AI response messages: NOT saved
+- Token usage on session: NOT tracked
+- User token allowance: NOT decremented (even though LLM was called)
+- Error message: saved for scheduled sessions only
+
+The worker (generateMarketingResponseWorker.ts) catches errors and sends them back to the parent process, but the error message contains no usage data. The LLM may have been called (and tokens consumed) before the error occurred.
+
+## Architecture Note
+
+**`chatbotService.ts` is legacy infrastructure** — it powers the partner portal chatbot and provides shared DB operations (session CRUD, message persistence, token tracking). The primary intelligence service is **`agentModeService.ts`** (Agent Mode), which handles all agent, emma-sidebar, scheduled, and Slack bot sessions. The `generateChatResponse()` function in chatbotService is only used by the partner portal's `/api/chatbot` endpoint and is not actively maintained. Future work should consolidate onto the Agent Mode path and deprecate the chatbot-specific response generation.
+
+## Recommendations
+
+1. **Capture partial usage on worker failure**: When the worker throws, include accumulated usage data in the error payload so the parent can still call `incrementTokenUsage()`.
+2. **Backfill historical sessions**: For sessions created before usage tracking (pre March 26), usage data is unrecoverable since individual message usage was never recorded.
+3. **Monitor for incomplete sessions**: Add alerting for sessions where `calledFunctions` is populated but `totalTokens` is missing — indicates a worker failure with lost usage.
+
+# March 27, 2026: Investigation — Sessions Not Showing Up in Customer Portal
+
+## Problem
+
+Admin page (Users tab) shows 15+ sessions for a customer (`harshitshah1989@gmail.com`), but the customer portal only shows 1 session. The session counts between admin and customer views are inconsistent.
+
+## Root Cause
+
+**Portal type filtering mismatch between admin count and customer portal query.**
+
+### Production data for the affected user (userId: `100c8fa5-8444-4dfb-81b3-805f29d8e39e`)
+
+- **16 total sessions** in `AW-ChatSessions`
+  - 1 session with `portalType = 'agent'` (main agent chat)
+  - 15 sessions with `portalType = 'emma-sidebar'` (Emma assistant sidebar)
+  - None archived
+
+### Admin page count (`db.ts` → `getChatSessionCount`)
+
+Queries `AW-ChatSessions` `UserIdIndex` with only an archived filter — counts ALL session types:
+```
+COUNT(sessions WHERE userId = :userId AND (archived not set OR archived = false))
+```
+Result: **16 sessions**
+
+### Customer portal list (`agentModeController.ts:1570`)
+
+Defaults `portalType` to `'agent'` when not passed by the frontend:
+```typescript
+const portalType = (req.query.portalType as string) === 'emma-sidebar'
+  ? 'emma-sidebar' as const : 'agent' as const;
+```
+The frontend hook (`useAgentModeSessions.ts` → `loadSessions`) calls `GET /api/agent-mode/sessions?limit=50` without a `portalType` parameter, so it defaults to `'agent'` and only returns agent sessions.
+
+Result: **1 session**
+
+### Additional note on emma-sidebar session creation
+
+The 15 emma-sidebar sessions were created in rapid bursts (many within seconds of each other around 09:13 and 09:59 UTC on March 26), suggesting repeated page loads or sidebar reconnections are creating new sessions each time.
+
+## Fix Options
+
+1. **Fix admin count** — filter `getChatSessionCount` by portalType so it matches what the customer sees (or show a breakdown)
+2. **Show emma-sidebar sessions in customer portal** — include them in the session list
+3. **Both** — accurate admin counts AND full session visibility in customer portal
+
+---
+
+# March 27, 2026: Investigation — Landing Page Preview URLs Returning `not_found`
+
+## Problem
+
+The coding agent's `get_landing_page_preview_url` tool was consistently returning `buildStatus: "not_found"` for draft branch preview deployments. Observed in session `2db6affe-75f1-4502-8cbc-5e2c476dab6b` (Waldium hero banner redesign) — the tool was called 3 times, all returning not_found despite the draft branch having valid commits pushed via the GitHub API.
+
+## Root Cause
+
+**Two Vercel projects existed for the same customer**, created at different times:
+
+1. **Original project** (`waldium-lander`, `prj_P6X3YHKGydAVFN3xtml1dxl1Haqo`) — linked to the consolidated repo `AgentWebPro/v0-waldium-lander`, serving production at `start.waldium.com`, receiving all branch push webhooks and creating preview deployments correctly.
+2. **Auto-generated project** (`lp-waldium-value-first-landing-pa-0ae94752`, `prj_ZlAxFRUuxfowuTCAsjyiDngVBj0p`) — created by the `createVercelProject()` flow in `v0Service.ts` when a new landing page was generated. Linked to a stale auto-generated repo `AgentWebPro/lp-waldium-value-first-landing-pa-0ae94752`, which had no draft branches and no recent deployments since March 18.
+
+All 5 Waldium landing page records in `AW-LandingPages` had `vercelProjectId` pointing to the **wrong** (auto-generated) project. When `getPreviewDeploymentUrl()` queried Vercel's deployments API for `prj_ZlAxFRUuxfowuTCAsjyiDngVBj0p`, it found no deployments matching the draft branch — because the coding agent pushed code to `v0-waldium-lander`, which only the original project was watching.
+
+## Investigation Steps
+
+1. Retrieved session data from `AW-ChatSessions` — `calledFunctions` showed `get_landing_page_preview_url` called 3x, `coding_agent` called 2x (retried after preview failure).
+2. Confirmed draft branch `draft/2db6affe-75f1-45` existed in `AgentWebPro/v0-waldium-lander` with 4 commits.
+3. Used Vercel API (token from `dev/AgentWeb/Vercel` in Secrets Manager) to list deployments on the DB-referenced project — found only `main` branch deployments from March 18, zero draft branch deployments.
+4. Discovered a second Vercel project (`waldium-lander`) linked to the correct repo, which had READY deployments for all draft branches including `draft/2db6affe-75f1-45`.
+
+## Fix
+
+Updated `vercelProjectId` in `AW-LandingPages` DynamoDB table for all affected records:
+
+**Waldium** (5 pages): `prj_ZlAxFRUuxfowuTCAsjyiDngVBj0p` → `prj_P6X3YHKGydAVFN3xtml1dxl1Haqo`
+**Haven** (2 pages): `prj_CRoy9Bt1h23v4az2NrRvRpq5DsRz` → `prj_U38WBYiLKZdjh1IUcfyIBhQTtzaE`
+
+Full prod scan of all 32 landing pages across 6 Vercel projects confirmed only Waldium and Haven were affected. Other customers (xCures, AgentWeb SEO, Your360, AgentWeb Main) had matching repo/project configurations.
+
+## Lesson
+
+When a customer's landing pages are consolidated into a single `v0-*` GitHub repo, the `vercelProjectId` in DynamoDB must be updated to match the Vercel project that is actually linked to that repo. The auto-generated `lp-*` Vercel project (created by `createVercelProject()` during initial page generation) becomes stale after consolidation.
+
+To diagnose similar issues in the future:
+- Compare `githubRepoUrl` in `AW-LandingPages` against the Vercel project's `link.repo` via `GET /v9/projects/{id}`
+- If they point to different GitHub repos, the preview URL flow is broken
+
+---
+
+# March 26, 2026: Investigation — Recurring S3 DeleteObject Errors on Prod EB
+
+## Problem
+
+EB event notifications for the production environment (`Agentweb-backend-env-prod-3`, `e-ag9bmkfczz`) were reporting S3 permission errors. The `agentweb-test-env-ec2-role` lacked `s3:DeleteObject` on the EB bucket, causing cleanup failures for both tail logs and bundle logs:
+
+**Tail logs** (from cron-based log monitoring):
+```
+Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-07d440d734bbbcf55
+is not authorized to perform: s3:DeleteObject on resource:
+"arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/tail/..."
+```
+
+**Bundle logs** (from manual `request-environment-info --info-type bundle`):
+```
+Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-03e403b3c8620a994
+is not authorized to perform: s3:DeleteObject on resource:
+"arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/bundle/..."
+```
+
+## Root Cause
+
+When any IAM role calls `aws elasticbeanstalk request-environment-info`, EB uploads logs to S3 and later tries to clean up (delete) old log files **using the caller's IAM role**. The `agentweb-test-env-ec2-role` had `elasticbeanstalk:RequestEnvironmentInfo` and `elasticbeanstalk:RetrieveEnvironmentInfo` but **not** `s3:DeleteObject` on the EB bucket. EB successfully collected and returned logs, but cleanup failed every time, generating ERROR events.
+
+## Fix
+
+Added `s3:DeleteObject` permission to `agentweb-test-env-ec2-role`, scoped to the entire EB bucket:
+
+```json
+{
+  "Sid": "AllowEBLogCleanup",
+  "Effect": "Allow",
+  "Action": "s3:DeleteObject",
+  "Resource": "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/*"
+}
+```
+
+Verified the fix by successfully deleting a bundle log object that previously failed.
+
+## Lesson
+
+When granting EB log retrieval permissions to an IAM role, also grant `s3:DeleteObject` on `elasticbeanstalk-<region>-<account>/*` so EB can clean up temporary log fragments (both tail and bundle types).
+
+---
+
+# March 25, 2026: Investigation — LiteLLM Vulnerability Impact on AgentWeb
+
+## Background
+
+Multiple CVEs have been disclosed against **LiteLLM** (BerriAI's LLM proxy/gateway library):
+
+| CVE | Score | Severity | Description |
+|-----|-------|----------|-------------|
+| CVE-2024-4888 | 8.1 | High | Arbitrary file deletion via `/audio/transcriptions` endpoint |
+| CVE-2024-10188 | 7.5 | High | DoS via `ast.literal_eval` on user input |
+| CVE-2025-45809 | 5.4 | Medium | SQL injection via `/key/block` and `/key/unblock` API endpoints |
+| CVE-2025-11203 | 3.5 | Low | API key information disclosure via health endpoint |
+
+## Investigation Findings
+
+**AgentWeb is NOT impacted.** LiteLLM is neither a direct nor transitive dependency.
+
+### What we checked
+
+- `agent-engine/requirements.txt` — no litellm
+- `agent-engine/environment.yml` — no litellm
+- `backend/package.json` — no litellm
+- Full codebase grep for "litellm" — zero code references
+- Transitive dependency check: browser-use, ag2 (AutoGen), and langchain packages do not pull in litellm
+
+### How AgentWeb integrates with LLMs instead
+
+AgentWeb uses direct SDK integrations, not a proxy layer:
+- **AWS Bedrock SDK** — for Claude models (via `@aws-sdk/client-bedrock-runtime`)
+- **Azure OpenAI SDK** — for GPT-4o/GPT-4.1
+- **Google GenAI SDK** — for Gemini models
+- **OpenAI SDK** — direct API access
+- **LangChain** — abstraction layer in agent-engine (does not depend on litellm)
+
+### Conclusion
+
+No remediation action required. AgentWeb's direct-SDK approach avoids the proxy-layer attack surface that LiteLLM exposes.
+
+---
+
 # March 24, 2026: Investigation — Meta Pixel / CAPI Detection on Landing Pages
 
 ## Problem
@@ -2394,3 +2756,170 @@ Token growth by session length:
 - Dynamic tool filtering (only send relevant tools based on conversation context)
 - Scheduled session reset (start each run with summary of prior run instead of full history)
 - See "Conversation Summarization Design" section above for the summarization design
+
+## Known Limitation: `get_chat_history` Tool Crashes on Large Time Ranges (2026-03-27)
+
+The `get_chat_history` admin tool (used by Emma to analyze usage) crashes when querying large time ranges (e.g. 7 days). Root cause:
+
+1. `chatbotService.getRecentSessionsPage()` with a time range does an **unbounded fetch-all-then-slice** — a `do...while` loop paginates through ALL DynamoDB pages before applying `limit` as a post-fetch `Array.slice()`. For 7 days, this fetches ~1,100+ session records into memory.
+2. The admin route (`GET /api/admin/chat-sessions`) then calls `getChatSession()` for each returned session (up to 100) via `Promise.all`, loading full message content — 100 parallel DynamoDB queries.
+3. The full response (100 sessions with all messages) is returned as a tool result to the LLM, which can exceed context/memory limits and crash the agent mid-stream.
+
+**Impact:** Session `1e5af232-1164-46cb-bce5-83d76edd6734` crashed when the user asked Emma to "fetch the chat history of last 7 days, then count the total usage and cost per accounts."
+
+**Potential fixes (not yet implemented):**
+- Push `Limit` into the DynamoDB query (early termination) instead of fetch-all-then-slice
+- Add a `metadata_only` mode to skip loading full messages when only counts/costs are needed
+- The tool's `limit` param defaults to 100, but the DynamoDB fetch still retrieves all 1,100+ sessions before slicing
+
+## Usage & Cost Analysis — Week of March 21–27, 2026
+
+### Summary
+
+| Metric | Value |
+|--------|-------|
+| Total sessions | 987 |
+| Sessions with cost tracking | 305 (31%) |
+| Sessions without cost tracking | 682 (69%) |
+| Total tracked cost | $1,414.14 |
+| Projected monthly cost (×4.3) | ~$6,081 |
+| Avg cost/session (tracked) | $4.64 |
+| Median cost/session | $0.57 |
+| Unique users | 62 |
+
+**Note:** 69% of sessions have no cost data. These are likely sessions that either (a) errored out before any LLM call, (b) used models where cost tracking wasn't implemented, or (c) are predefined-work-plan previews from anonymous users that didn't complete.
+
+### By Subscription Tier
+
+| Tier | Users | Sessions | Cost | Avg/User (7d) | Avg/Session |
+|------|------:|---------:|-----:|---------------:|------------:|
+| Super Premium | 17 | 693 | $1,138.78 | $66.99 | $1.64 |
+| Advanced | 4 | 47 | $131.21 | $32.80 | $2.79 |
+| Free / Anonymous | 40 | 210 | $138.34 | $3.46 | $0.66 |
+| Basic | 1 | 37 | $5.80 | $5.80 | $0.16 |
+
+Super Premium users drive **80.5%** of total cost ($1,139 of $1,414). Advanced users are the most expensive per-session ($2.79 avg) — they tend toward complex research workflows. Free/anonymous users are mostly work-plan previews (single-session anonymous users) plus a few registered Free accounts.
+
+### Cost Distribution (305 tracked sessions)
+
+| Percentile | Cost |
+|-----------|-----:|
+| Min | $0.01 |
+| P25 | $0.17 |
+| Median | $0.57 |
+| P75 | $3.32 |
+| P90 | $11.05 |
+| P95 | $23.25 |
+| P99 | $56.25 |
+| Max | $106.76 |
+
+The distribution is heavily right-skewed: 75% of sessions cost under $3.32, but the top 5% cost $23+ each and drive a disproportionate share of total spend.
+
+### Top Accounts by Cost (7 days)
+
+| Account | Tier | Sessions | Cost | Avg/Sess | Primary Activity |
+|---------|------|----------|------|----------|-----------------|
+| renata@your360.ai | Super Premium | 112 | $324.64 | $2.90 | Regular chats, some scheduled |
+| founders@agentweb.pro (internal) | Super Premium | 199 | $215.30 | $1.08 | Regular + 50 scheduled + testing |
+| amrutha@structuredlabs.com | Super Premium | 36 | $204.38 | $5.68 | Regular chats (high complexity) |
+| agentwebintegration@xcures.com | Super Premium | 70 | $156.07 | $2.23 | Scheduled + regular |
+| juan@usehaven.ai | Advanced | 8 | $92.72 | $11.59 | Complex regular sessions |
+| dyllan@rankai.ai | Super Premium | 54 | $57.15 | $1.06 | Regular chats |
+| harsha@agentweb.pro (internal) | Super Premium | 71 | $49.35 | $0.70 | Regular + scheduled + work plans |
+
+**Key observation:** The top 5 external users (all Super Premium / Advanced) account for $834.96 (59% of total cost). Since these tiers are not yet billed, this is pure cost with no revenue offset.
+
+### By Session Type
+
+| Type | Sessions | Cost | Avg/Session |
+|------|----------|------|------------|
+| Regular (live chat) | 752 | $948.06 | $1.26 |
+| Scheduled | 180 | $265.27 | $1.47 |
+| Predefined work plan | 49 | $188.31 | $3.84 |
+| Result endpoint | 1 | $11.95 | $11.95 |
+| Video/image gen | 5 | $0.56 | $0.11 |
+
+Predefined work plans cost ~3× more per session than regular chats — they involve multi-step workflows with many tool calls.
+
+### Daily Trend
+
+| Date | Sessions | Cost |
+|------|----------|------|
+| Mar 21 | 60 | $132.04 |
+| Mar 22 | 67 | $102.67 |
+| Mar 23 | 82 | $208.82 |
+| Mar 24 | 85 | $427.74 |
+| Mar 25 | 213 | $92.86 |
+| Mar 26 | 317 | $322.91 |
+| Mar 27 | 163 | $127.09 |
+
+Session volume is growing (~3× from Mar 21 to Mar 26). Mar 24 was the most expensive day ($427.74) despite having fewer sessions — likely driven by a few high-cost complex sessions. Mar 25 had the most sessions (213) but lowest cost ($92.86), likely due to prompt caching optimizations deployed that day.
+
+### Top 10 Most Expensive Individual Sessions
+
+| Cost | User | Type | Title |
+|------|------|------|-------|
+| $106.76 | renata@your360.ai | regular | Agent Mode Session |
+| $78.05 | xcures.com | scheduled | Weekly Competitor News Researcher |
+| $65.14 | renata@your360.ai | regular | Adding Videos to Landing Pages |
+| $56.25 | dyllan@rankai.ai | regular | SEO/GEO/AEO Competitor Ad Scraping |
+| $51.90 | amrutha@structuredlabs.com | regular | Waldium Hero Banner CSS Analysis |
+| $51.35 | juan@usehaven.ai | regular | Competitor Meta Ads Analysis |
+| $46.76 | renata@your360.ai | regular | Meta Campaign Overview |
+| $43.45 | amrutha@structuredlabs.com | regular | Landing Page Hero Banner Redesign |
+| $42.59 | amrutha@structuredlabs.com | regular | Waldium Hero Banner CSS Analysis |
+| $37.36 | ruiwangwarm@gmail.com | regular | Ella's Book Sale Poster |
+
+### Revised Token Limits (March 27, 2026)
+
+Based on the usage data above and discussion, the revised token limits are:
+
+| Tier | Current DB Value | Monthly Token Limit | Rationale |
+|------|-----------------|--------------------:|-----------|
+| **Free** | Free | **1M** | ~10–15 sessions. Enough to see value, caps within first week of active use |
+| **Basic** | Basic | **20M** | ~130–200 sessions. Basic users are not yet active so current data is limited; 20M provides comfortable headroom for light-to-moderate daily use |
+| **Pro** | Super Premium / Advanced | **100M** | ~650–1000 sessions. Covers most Pro users comfortably (avg Super Premium user projects to ~40-50M/month). Heavy users will approach the limit |
+| **Enterprise** | Enterprise (new) | **500M** | Soft cap to prevent abuse. Effectively unlimited for any realistic usage pattern |
+
+**Tier mapping (current DB `subscriptionType` → new tier names):**
+- `Free` → Free
+- `Basic` → Basic
+- `Super Premium` / `Advanced` → Pro
+- New: `Enterprise` (not yet in DB)
+
+**How the top users fit under these limits:**
+
+| Account | Current Tier | Monthly Cost (proj.) | Est. Monthly Tokens | Fits in? |
+|---------|-------------|---------------------:|--------------------:|----------|
+| renata@your360.ai | Super Premium → **Enterprise** | ~$1,396 | ~150–200M | Yes (Enterprise 500M) |
+| founders@agentweb.pro (internal) | Super Premium → **Enterprise** | ~$926 | ~100–130M | Yes (Enterprise 500M) |
+| amrutha@structuredlabs.com | Super Premium → Pro | ~$879 | ~100–120M | Tight — may hit 100M limit |
+| agentwebintegration@xcures.com | Super Premium → Pro | ~$671 | ~80–90M | Yes, with room |
+| juan@usehaven.ai | Advanced → Pro | ~$399 | ~50–60M | Yes |
+| dyllan@rankai.ai | Super Premium → Pro | ~$246 | ~30–40M | Yes, comfortable |
+| harsha@agentweb.pro (internal) | Super Premium → **Enterprise** | ~$49 | ~7M | Yes |
+
+**Key decisions:**
+- **renata@your360.ai** should be upgraded to Enterprise tier — her projected ~150–200M tokens/month exceeds the Pro 100M cap.
+- **Internal accounts** (founders@, harsha@, ruiw@) should be Enterprise tier to avoid hitting limits during testing/development.
+- **Basic users** are not currently active, so their usage data doesn't reflect real-world patterns. The 20M limit is set generously and can be adjusted once Basic users are onboarded and billing is active.
+- **Model cost multipliers** (Opus = 7x, see March 20 proposal) are still recommended to protect margins on the Pro tier. Without multipliers, a Pro user running all-Opus sessions could consume $700+ in cost against a ~$499 price point.
+
+**Margin analysis (post-caching, GPT-5 blended ~$2/1M effective):**
+
+| Tier | Price | Limit | Max Cost to Us | Min Gross Margin |
+|------|------:|------:|---------------:|-----------------:|
+| Free | $0 | 1M | ~$2 | -$2 (acquisition) |
+| Basic | $199 | 20M | ~$40 | ~$159 (80%) |
+| Pro | $499 | 100M | ~$200 | ~$299 (60%) |
+| Enterprise | Custom ($1K+) | 500M | ~$1,000 | Negotiated |
+
+Post-caching margins are healthy across all paid tiers. The risk is Opus-heavy Pro users (effective cost ~$14/1M with caching) — at 100M tokens that's $1,400, well above the $499 price. Model multipliers or tier-restricted model access would mitigate this.
+
+### Prompt Caching Impact (Mar 25 deployment)
+
+The prompt caching optimization was deployed on Mar 25. Comparing per-session costs:
+- Pre-caching (Mar 21–24, 294 sessions): $870.27 → $2.96/session avg
+- Post-caching (Mar 25–27, 693 sessions): $542.86 → $0.78/session avg
+
+**~74% reduction in avg cost per session.** Even accounting for session mix variation, caching is clearly delivering significant savings. The projected monthly cost of $6,081 already reflects the post-caching rates; without caching it would have been ~$16K+/month

@@ -953,6 +953,41 @@ export async function sendLeadNotification(
 function markdownToMrkdwn(markdown: string): string {
   let text = markdown;
 
+  // Handle markdown tables BEFORE other processing
+  // Detect tables: lines with | separators
+  const lines = text.split('\n');
+  const processedLines: string[] = [];
+  let inTable = false;
+  let tableLines: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const isTableLine = line.includes('|') && line.split('|').length >= 3;
+
+    if (isTableLine) {
+      if (!inTable) {
+        inTable = true;
+        tableLines = [];
+      }
+      tableLines.push(line);
+    } else {
+      if (inTable) {
+        // Process accumulated table
+        processedLines.push(formatTableForSlack(tableLines));
+        inTable = false;
+        tableLines = [];
+      }
+      processedLines.push(line);
+    }
+  }
+
+  // Handle table at end of content
+  if (inTable && tableLines.length > 0) {
+    processedLines.push(formatTableForSlack(tableLines));
+  }
+
+  text = processedLines.join('\n');
+
   // Strip HTML tags but preserve content
   text = text.replace(/<br\s*\/?>/gi, '\n');
   text = text.replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n');
@@ -986,6 +1021,54 @@ function markdownToMrkdwn(markdown: string): string {
   text = text.trim();
 
   return text;
+}
+
+/**
+ * Format a markdown table for Slack using plain text with proper spacing
+ */
+function formatTableForSlack(tableLines: string[]): string {
+  if (tableLines.length === 0) return '';
+
+  // Parse table rows
+  const rows = tableLines.map(line => {
+    return line.split('|')
+      .map(cell => cell.trim())
+      .filter(cell => cell.length > 0);
+  });
+
+  if (rows.length === 0) return '';
+
+  // Skip separator line (usually second line with dashes)
+  const dataRows = rows.filter(row => !row.every(cell => /^[-:]+$/.test(cell)));
+
+  if (dataRows.length === 0) return '';
+
+  // Calculate column widths
+  const numCols = Math.max(...dataRows.map(row => row.length));
+  const colWidths: number[] = new Array(numCols).fill(0);
+
+  for (const row of dataRows) {
+    for (let i = 0; i < row.length; i++) {
+      colWidths[i] = Math.max(colWidths[i], row[i].length);
+    }
+  }
+
+  // Format rows with proper spacing
+  const formattedRows = dataRows.map((row, rowIndex) => {
+    const cells = row.map((cell, colIndex) => {
+      return cell.padEnd(colWidths[colIndex], ' ');
+    });
+    return cells.join(' | ');
+  });
+
+  // Add separator after header row
+  if (formattedRows.length > 1) {
+    const separator = colWidths.map(width => '-'.repeat(width)).join('-+-');
+    formattedRows.splice(1, 0, separator);
+  }
+
+  // Wrap in code block for monospaced font
+  return '```\n' + formattedRows.join('\n') + '\n```';
 }
 
 const SLACK_MESSAGE_LIMIT = 3900; // Leave room for safety margin under 4000 char limit
@@ -1054,6 +1137,22 @@ export async function getSlackUserDisplayName(slackUserId: string): Promise<stri
     console.error(`Failed to get Slack user display name for ${slackUserId}:`, error);
   }
   return slackUserId;
+}
+
+export async function getSlackUserEmail(slackUserId: string): Promise<string | null> {
+  if (!slackClient) {
+    return null;
+  }
+
+  try {
+    const result = await slackClient.users.info({ user: slackUserId });
+    if (result.ok && result.user) {
+      return (result.user as any).profile?.email || null;
+    }
+  } catch (error) {
+    console.error(`Failed to get Slack user email for ${slackUserId}:`, error);
+  }
+  return null;
 }
 
 /**

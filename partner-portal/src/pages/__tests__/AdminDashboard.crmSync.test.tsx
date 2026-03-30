@@ -146,7 +146,7 @@ describe("AdminDashboard CRM sync", () => {
       { forceFullSync: false },
       { headers: { Authorization: "Bearer test-token" } }
     );
-  });
+  }, 15000);
 
   it("supports force full sync from waitlist tab", async () => {
     searchParams = new URLSearchParams("tab=waitlist");

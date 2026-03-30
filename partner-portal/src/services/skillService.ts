@@ -15,6 +15,7 @@ export interface Skill {
   toolNames: string[];
   systemPrompt?: string;
   isPublished: boolean;
+  ownerId?: string;
   createdAt: string;
   updatedAt: string;
 }

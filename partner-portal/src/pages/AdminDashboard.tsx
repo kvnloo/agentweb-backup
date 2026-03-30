@@ -40,6 +40,7 @@ import {
   Collapse,
   Popover,
   ButtonGroup,
+  InputAdornment,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -84,9 +85,10 @@ import {
   Replay as ReplayIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
-  ContentCopy as ContentCopyIcon,
-  ArrowUpward as ArrowUpwardIcon,
-  ArrowDownward as ArrowDownwardIcon,
+  CreditCard as CreditCardIcon,
+  Warning as WarningIcon,
+  Cancel as CancelIcon,
+  Search as SearchIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -205,7 +207,11 @@ interface User {
   workflowCount?: number;
   chatSessionCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
-  stripe_customer_id?: string; // Added stripe_customer_id
+  stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  subscription_status?: string; // active, trialing, past_due, canceled, canceling
+  has_payment_method?: boolean;
+  current_period_end?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
@@ -219,6 +225,13 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  tokenUsage?: {
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+    resetDate: string;
+  };
+  tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }
 
@@ -673,6 +686,12 @@ export default function AdminDashboard() {
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [usersOrderBy, setUsersOrderBy] = useState<keyof User>("createdAt");
   const [usersOrder, setUsersOrder] = useState<"asc" | "desc">("desc");
+  // User filters
+  const [userSearchQuery, setUserSearchQuery] = useState("");
+  const [userFilterStatus, setUserFilterStatus] = useState<"active" | "inactive" | "all">("active");
+  const [userFilterTier, setUserFilterTier] = useState<string>("all");
+  const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
+  const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
@@ -729,6 +748,10 @@ export default function AdminDashboard() {
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
   const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
+  const [adminSlackChannel, setAdminSlackChannel] = useState("");
+  const [adminSlackChannelInput, setAdminSlackChannelInput] = useState("");
+  const [adminSlackChannelLoading, setAdminSlackChannelLoading] = useState(false);
+  const [adminSlackChannelSaved, setAdminSlackChannelSaved] = useState(false);
   const [secretsDialogOpen, setSecretsDialogOpen] = useState(false);
   const [editingSecretsUserId, setEditingSecretsUserId] = useState<string | null>(null);
   const [secretEntries, setSecretEntries] = useState<Array<{ name: string; value: string }>>([]);
@@ -750,6 +773,12 @@ export default function AdminDashboard() {
   const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
+  const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
+  const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
+  const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
+  const [grantBonusEmail, setGrantBonusEmail] = useState("");
+  const [grantBonusAmount, setGrantBonusAmount] = useState("");
+  const [grantBonusLoading, setGrantBonusLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -843,6 +872,16 @@ export default function AdminDashboard() {
     if (tabValue === 2) {
       loadUsers();
       loadSubscriptionTypes();
+      // Load admin Slack channel setting
+      axios.get(buildApiUrl('/api/settings/slack_admin_channel'), {
+        headers: { Authorization: `Bearer ${token}` },
+      }).then((res) => {
+        const val = res.data?.settingValue || '';
+        setAdminSlackChannel(val);
+        setAdminSlackChannelInput(val);
+      }).catch(() => {
+        // Setting not found — leave empty
+      });
     }
   }, [tabValue]);
 
@@ -854,10 +893,13 @@ export default function AdminDashboard() {
       });
       const types = response.data;
       // Extract type names, including "Basic" as default
-      const typeNames = types.length > 0 
+      const typeNames = types.length > 0
         ? types.map((t: any) => t.name)
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
+      const allowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => { allowanceMap[t.name] = t.monthlyTokenAllowance ?? null; });
+      setSubscriptionTypeAllowanceMap(allowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
       // Default to Basic if loading fails
@@ -1379,13 +1421,40 @@ export default function AdminDashboard() {
         return user.isAdmin ? 1 : 0;
       case "isActive":
         return user.isActive === false ? 0 : 1;
+      case "tokenUsage":
+        return user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+          ? (user.tokenUsage?.totalTokens || 0) : 0;
       default:
         return (user as unknown as Record<string, unknown>)[property] ?? "";
     }
   };
 
   const sortedUsers = React.useMemo(() => {
-    return [...contextUsers].sort((a, b) => {
+    const filtered = contextUsers.filter((user) => {
+      // Search filter
+      if (userSearchQuery) {
+        const q = userSearchQuery.toLowerCase();
+        const matchEmail = user.email?.toLowerCase().includes(q);
+        const matchNote = user.supportNote?.toLowerCase().includes(q);
+        const matchId = user.userId?.toLowerCase().includes(q);
+        if (!matchEmail && !matchNote && !matchId) return false;
+      }
+      // Status filter
+      if (userFilterStatus === "active" && user.isActive === false) return false;
+      if (userFilterStatus === "inactive" && user.isActive !== false) return false;
+      // Tier filter
+      if (userFilterTier !== "all") {
+        const tier = user.subscriptionType || (user.roles?.includes("customer") ? "Basic" : "");
+        if (userFilterTier === "none" && tier) return false;
+        if (userFilterTier !== "none" && tier !== userFilterTier) return false;
+      }
+      // Paid filter
+      if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
+      if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
+      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status)) return false;
+      return true;
+    });
+    return filtered.sort((a, b) => {
       const aVal = getUserSortValue(a, usersOrderBy);
       const bVal = getUserSortValue(b, usersOrderBy);
 
@@ -1399,7 +1468,7 @@ export default function AdminDashboard() {
         ? aStr.localeCompare(bStr)
         : bStr.localeCompare(aStr);
     });
-  }, [contextUsers, usersOrder, usersOrderBy]);
+  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid]);
 
   const handleUserSort = (property: keyof User) => {
     const isAsc = usersOrderBy === property && usersOrder === "asc";
@@ -2055,6 +2124,29 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveAdminSlackChannel = async () => {
+    try {
+      setAdminSlackChannelLoading(true);
+      await axios.post(
+        buildApiUrl('/api/settings'),
+        {
+          settingName: 'slack_admin_channel',
+          settingValue: adminSlackChannelInput.trim(),
+          description: 'Admin Slack channel ID for delegated Emma access'
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setAdminSlackChannel(adminSlackChannelInput.trim());
+      setAdminSlackChannelSaved(true);
+      setTimeout(() => setAdminSlackChannelSaved(false), 3000);
+    } catch (error: any) {
+      console.error("Error saving admin Slack channel:", error);
+      setError(error.response?.data?.message || "Failed to save admin Slack channel");
+    } finally {
+      setAdminSlackChannelLoading(false);
+    }
+  };
+
   const handleSaveSecrets = async () => {
     if (!editingSecretsUserId) return;
 
@@ -2407,6 +2499,38 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update Subscription Type");
     } finally {
       setSubscriptionTypeEditLoading(false);
+    }
+  };
+
+  const handleGrantTokenBonus = async () => {
+    if (!grantBonusUserId || !grantBonusAmount) return;
+    const amount = parseInt(grantBonusAmount.replace(/,/g, ''), 10);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Bonus amount must be a positive number");
+      return;
+    }
+    try {
+      setGrantBonusLoading(true);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${grantBonusUserId}/token-bonus`),
+        { bonusTokens: amount },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === grantBonusUserId
+              ? { ...user, tokenAllowanceBonus: response.data.tokenAllowanceBonus }
+              : user
+          )
+        );
+        setSuccess(`Granted ${amount.toLocaleString()} bonus tokens to ${grantBonusEmail}`);
+        setGrantBonusDialogOpen(false);
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to grant token bonus");
+    } finally {
+      setGrantBonusLoading(false);
     }
   };
 
@@ -3283,825 +3407,559 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
-          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
-            <Button
-              variant="contained"
-              startIcon={<SyncIcon />}
-              onClick={() => handleOpenCrmSyncDialog("users")}
-            >
+          {/* Attention needed — urgent users at the top */}
+          {(() => {
+            const now = new Date();
+            const pastDue = contextUsers.filter(u => u.subscription_status === "past_due" && u.isActive !== false);
+            const trialEnding = contextUsers.filter(u => {
+              if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
+              const daysLeft = Math.ceil((new Date(u.current_period_end).getTime() - now.getTime()) / 86400000);
+              return daysLeft <= 7 && daysLeft >= 0;
+            }).map(u => ({ ...u, _daysLeft: Math.ceil((new Date(u.current_period_end!).getTime() - now.getTime()) / 86400000) }));
+            const trialExpired = contextUsers.filter(u => {
+              if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
+              return new Date(u.current_period_end).getTime() < now.getTime();
+            });
+            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0;
+            if (!hasAttention) return null;
+            return (
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
+                <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
+                  ⚠️ Attention Needed
+                </Typography>
+                {pastDue.length > 0 && (
+                  <Box sx={{ mb: 1.5 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main" }}>PAYMENT FAILED</Typography>
+                    {pastDue.map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Past Due" size="small" color="error" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {trialExpired.length > 0 && (
+                  <Box sx={{ mb: 1.5 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main" }}>TRIAL EXPIRED — AWAITING PAYMENT</Typography>
+                    {trialExpired.map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Expired" size="small" color="error" variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">expired {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {trialEnding.length > 0 && (
+                  <Box>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "warning.main" }}>TRIAL ENDING SOON</Typography>
+                    {trialEnding.sort((a, b) => a._daysLeft - b._daysLeft).map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label={u._daysLeft === 0 ? "Today!" : `${u._daysLeft}d left`} size="small" color={u._daysLeft <= 2 ? "error" : "warning"} variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""} · ends {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+              </Paper>
+            );
+          })()}
+          {/* Summary cards - Stripe-style muted design */}
+          <Box sx={{ display: "flex", gap: 2, mb: 3, flexWrap: "wrap" }}>
+            {(() => {
+              const active = contextUsers.filter(u => u.isActive !== false);
+              const paying = contextUsers.filter(u => u.subscription_status === "active");
+              const trialing = contextUsers.filter(u => u.subscription_status === "trialing");
+              const pastDue = contextUsers.filter(u => u.subscription_status === "past_due");
+              const canceled = contextUsers.filter(u => u.subscription_status === "canceled" || u.subscription_status === "canceling");
+              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status);
+              // Churn rate: canceled / (paying + canceled) — lifetime simple churn
+              const churnBase = paying.length + canceled.length;
+              const churnRate = churnBase > 0 ? ((canceled.length / churnBase) * 100).toFixed(0) : "0";
+              // Monthly churn: canceled in last 30 days
+              const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000);
+              const recentChurned = canceled.filter(u => u.current_period_end && new Date(u.current_period_end) > thirtyDaysAgo);
+              const monthlyChurnBase = paying.length + recentChurned.length;
+              const monthlyChurn = monthlyChurnBase > 0 ? ((recentChurned.length / monthlyChurnBase) * 100).toFixed(0) : "0";
+              return [
+                { label: "Active Users", value: active.length, sub: `${contextUsers.length} total` },
+                { label: "Paying", value: paying.length, sub: trialing.length > 0 ? `+${trialing.length} trial` : undefined },
+                { label: "Past Due", value: pastDue.length, sub: pastDue.length > 0 ? "⚠️ needs follow-up" : undefined, warn: pastDue.length > 0 },
+                { label: "Churned", value: canceled.length, sub: `${recentChurned.length} last 30d` },
+                { label: "Churn Rate", value: `${monthlyChurn}%`, sub: `${churnRate}% lifetime` },
+                { label: "Bounced", value: bounced.length, sub: "checkout abandoned" },
+                { label: "Showing", value: sortedUsers.length, sub: undefined },
+              ];
+            })().map((stat) => (
+              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100, borderColor: stat.warn ? "error.main" : undefined }}>
+                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2, color: stat.warn ? "error.main" : undefined }}>
+                  {stat.value}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {stat.label}
+                </Typography>
+                {stat.sub && (
+                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.65rem", mt: 0.25 }}>
+                    {stat.sub}
+                  </Typography>
+                )}
+              </Paper>
+            ))}
+          </Box>
+          {/* Filter bar */}
+          <Box sx={{ display: "flex", gap: 1.5, mb: 2, alignItems: "center" }}>
+            <TextField
+              size="small"
+              placeholder="Search users..."
+              value={userSearchQuery}
+              onChange={(e) => setUserSearchQuery(e.target.value)}
+              sx={{ minWidth: 240 }}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon fontSize="small" sx={{ color: "text.disabled" }} />
+                  </InputAdornment>
+                ),
+              }}
+            />
+            <FormControl size="small" sx={{ minWidth: 110 }}>
+              <InputLabel>Status</InputLabel>
+              <Select value={userFilterStatus} label="Status" onChange={(e) => setUserFilterStatus(e.target.value as any)}>
+                <MenuItem value="active">Active</MenuItem>
+                <MenuItem value="inactive">Inactive</MenuItem>
+                <MenuItem value="all">All</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 130 }}>
+              <InputLabel>Tier</InputLabel>
+              <Select value={userFilterTier} label="Tier" onChange={(e) => setUserFilterTier(e.target.value)}>
+                <MenuItem value="all">All Tiers</MenuItem>
+                <MenuItem value="Managed">Managed</MenuItem>
+                <MenuItem value="Super Premium">Super Premium</MenuItem>
+                <MenuItem value="Advanced">Advanced</MenuItem>
+                <MenuItem value="Basic">Basic</MenuItem>
+                <MenuItem value="Free">Free</MenuItem>
+                <MenuItem value="none">No Tier</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 120 }}>
+              <InputLabel>Payment</InputLabel>
+              <Select value={userFilterPaid} label="Payment" onChange={(e) => setUserFilterPaid(e.target.value as any)}>
+                <MenuItem value="all">All</MenuItem>
+                <MenuItem value="paid">Paying</MenuItem>
+                <MenuItem value="bounced">Bounced</MenuItem>
+                <MenuItem value="unpaid">Not Paying</MenuItem>
+              </Select>
+            </FormControl>
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all") && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); }}>
+                Clear
+              </Button>
+            )}
+            <Box sx={{ flexGrow: 1 }} />
+            <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
               Sync to CRM
             </Button>
           </Box>
-          <TableContainer component={Paper}>
-            <Table>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
+            <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channel:</Typography>
+            <TextField
+              size="small"
+              placeholder="Channel ID (e.g., C07XXXXXXXX)"
+              value={adminSlackChannelInput}
+              onChange={(e) => { setAdminSlackChannelInput(e.target.value); setAdminSlackChannelSaved(false); }}
+              sx={{ width: 280 }}
+            />
+            <Button
+              variant="contained"
+              size="small"
+              onClick={handleSaveAdminSlackChannel}
+              disabled={adminSlackChannelLoading || !adminSlackChannelInput.trim()}
+            >
+              {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
+            </Button>
+            {adminSlackChannel && (
+              <Link
+                href={`https://slack.com/app_redirect?channel=${adminSlackChannel}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                sx={{ display: 'flex', alignItems: 'center', gap: 0.5, whiteSpace: 'nowrap' }}
+              >
+                Open in Slack <OpenInNewIcon fontSize="small" />
+              </Link>
+            )}
+            {adminSlackChannelSaved && (
+              <Typography variant="caption" color="success.main">Saved!</Typography>
+            )}
+          </Box>
+          <TableContainer component={Paper} variant="outlined">
+            <Table size="small">
               <TableHead>
-                <TableRow>
+                <TableRow sx={{ "& th": { fontWeight: 600, fontSize: "0.75rem", color: "text.secondary", textTransform: "uppercase", letterSpacing: "0.05em", py: 1.5 } }}>
+                  <TableCell sx={{ width: 32, p: 0.5 }} />
                   <TableCell>
-                    <UserSortLabel property="email" label="Email" />
+                    <UserSortLabel property="email" label="User" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property="userId" label="User ID" />
+                    <UserSortLabel property="subscriptionType" label="Tier" />
+                  </TableCell>
+                  <TableCell>Payment</TableCell>
+                  <TableCell>
+                    <UserSortLabel property="chatSessionCount" label="Sessions" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel
-                      property="stripe_customer_id"
-                      label="Stripe Customer ID"
-                    />
+                    <UserSortLabel property="lastLoginTime" label="Last Active" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property="adAccount" label="Ad Account" />
+                    <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
                   </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="emailDomain"
-                      label="Email Sender"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="slackChannel"
-                      label="Slack Channel"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="secretNames" label="Secrets" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="seoDomains" label="SEO/AEO" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="googleDriveFolders" label="Shared Folders" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="cmsType" label="CMS Type" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="createdAt" label="Created" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="lastLoginTime"
-                      label="Last Login"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="supportNote"
-                      label="Support Note"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="roles" label="Roles" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="chatSessionCount"
-                      label="Chat Sessions"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="taskCount" label="Tasks" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="workflowCount" label="Workflows" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="isOAuthUser"
-                      label="OAuth User"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="isAdmin" label="Admin" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="isActive" label="Status" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="subscriptionType"
-                      label="Subscription Type"
-                    />
-                  </TableCell>
-                  <TableCell>Replays</TableCell>
-                  <TableCell>Actions</TableCell>
+                  <TableCell sx={{ width: 100 }}>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={21} align="center">
+                    <TableCell colSpan={8} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
                 ) : (
                   sortedUsers.map((user) => {
-                    // Determine roles to display, SOLELY from roles array.
-                    let displayRoles: ("partner" | "customer" | "free")[] = [];
-                    if (user.roles && user.roles.length > 0) {
-                      displayRoles = user.roles; // Use the array if present and not empty
-                    }
-                    // If user.roles is empty or undefined, displayRoles remains [], meaning no roles will be shown.
+                    const isExpanded = expandedUserId === user.userId;
+                    const tier = user.subscriptionType || (user.roles?.includes("customer") ? "Basic" : "Free");
+                    const tierColor = tier === "Managed" ? "info" as const
+                      : tier === "Super Premium" ? "success" as const
+                      : tier === "Advanced" ? "warning" as const
+                      : "default" as const;
+                    const tierVariant = (tier === "Free" || tier === "Basic") ? "outlined" as const : "filled" as const;
+                    const paymentStatus = user.subscription_status === "past_due" ? "past_due"
+                      : user.subscription_status === "canceled" || user.subscription_status === "canceling" ? "canceled"
+                      : user.subscription_status === "trialing" ? "trialing"
+                      : user.subscription_status === "active" ? "paying"
+                      : user.stripe_customer_id && !user.subscription_status ? "bounced"
+                      : "free";
+                    const lastSeen = user.lastLoginTime ? (() => {
+                      const d = new Date(user.lastLoginTime!);
+                      const now = new Date();
+                      const diffH = Math.floor((now.getTime() - d.getTime()) / 3600000);
+                      if (diffH < 1) return "Just now";
+                      if (diffH < 24) return `${diffH}h ago`;
+                      const diffD = Math.floor(diffH / 24);
+                      if (diffD < 7) return `${diffD}d ago`;
+                      return format(d, "MMM d");
+                    })() : "Never";
+                    const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+                      ? (user.tokenUsage?.totalTokens || 0) : 0;
 
                     return (
-                      <TableRow key={user.userId}>
-                        <TableCell>{user.email}</TableCell>
-                        <TableCell>{user.userId}</TableCell>
-                        <TableCell>
-                          {editingStripeCustomerIdUserId === user.userId ? (
-                            <>
-                              <TextField
-                                size="small"
-                                value={currentStripeCustomerIdText}
-                                onChange={(e) => setCurrentStripeCustomerIdText(e.target.value)}
-                                placeholder="cus_..."
-                                sx={{ minWidth: 200 }}
-                                disabled={stripeCustomerIdEditLoading}
-                                helperText="Stripe Customer ID (starts with cus_)"
-                              />
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSaveStripeCustomerId(user.userId)}
-                                disabled={stripeCustomerIdEditLoading}
-                                color="primary"
-                              >
-                                <CheckIcon />
-                              </IconButton>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingStripeCustomerIdUserId(null);
-                                  setCurrentStripeCustomerIdText("");
-                                }}
-                                disabled={stripeCustomerIdEditLoading}
-                              >
-                                <CloseIcon />
-                              </IconButton>
-                            </>
-                          ) : (
-                            <>
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                {user.stripe_customer_id || "-"}
-                              </Typography>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingStripeCustomerIdUserId(user.userId);
-                                  setCurrentStripeCustomerIdText(user.stripe_customer_id || "");
-                                }}
-                                disabled={stripeCustomerIdEditLoading}
-                              >
-                                <EditIcon />
-                              </IconButton>
-                            </>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {editingAdAccountUserId === user.userId ? (
-                            <>
-                                                              <TextField
-                                  size="small"
-                                  value={currentAdAccountText}
-                                  onChange={(e) => setCurrentAdAccountText(e.target.value)}
-                                  placeholder="Enter Meta Ad Account ID (e.g., 123456789012345)..."
-                                  sx={{ minWidth: 250 }}
-                                  disabled={adAccountEditLoading}
-                                  helperText="Meta Ad Account ID from business.facebook.com"
-                                />
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSaveAdAccount(user.userId)}
-                                disabled={adAccountEditLoading}
-                                color="primary"
-                              >
-                                <CheckIcon />
-                              </IconButton>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingAdAccountUserId(null);
-                                  setCurrentAdAccountText("");
-                                }}
-                                disabled={adAccountEditLoading}
-                              >
-                                <CloseIcon />
-                              </IconButton>
-                            </>
-                          ) : (
-                            <>
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                {user.adAccount || "-"}
-                              </Typography>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingAdAccountUserId(user.userId);
-                                  setCurrentAdAccountText(user.adAccount || "");
-                                }}
-                                disabled={adAccountEditLoading}
-                              >
-                                <EditIcon />
-                              </IconButton>
-                            </>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ flex: 1, minWidth: 100 }}>
-                            {user.emailDomain ? (
-                              <div>
-                                <div><strong>Domain:</strong> {user.emailDomain}</div>
-                                {user.defaultSenderUsername && (
-                                  <div><strong>Username:</strong> {user.defaultSenderUsername}</div>
-                                )}
-                                {user.fromName && (
-                                  <div><strong>From:</strong> {user.fromName}</div>
-                                )}
-                              </div>
-                            ) : "-"}
-                          </Box>
-                          <IconButton
-                            type="button"
-                            size="small"
-                            onClick={() => {
-                              setEditingEmailSenderUserId(user.userId);
-                              setEmailDomain(user.emailDomain || "");
-                              setDefaultSenderUsername(user.defaultSenderUsername || "");
-                              setFromName(user.fromName || "");
-                              setEmailSenderDialogOpen(true);
-                            }}
-                            disabled={emailSenderEditLoading}
-                          >
-                            <EditIcon />
+                      <React.Fragment key={user.userId}>
+                      <TableRow
+                        hover
+                        sx={{ cursor: "pointer", "& td": { py: 1.5, borderBottom: isExpanded ? "none" : undefined } }}
+                        onClick={() => setExpandedUserId(isExpanded ? null : user.userId)}
+                      >
+                        <TableCell sx={{ p: 0.5, width: 32 }}>
+                          <IconButton size="small" sx={{ p: 0.25 }}>
+                            {isExpanded ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
                           </IconButton>
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                              {user.slackChannel || "-"}
+                          <Box>
+                            <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                              {user.email}
                             </Typography>
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                setEditingSlackChannelUserId(user.userId);
-                                setCurrentSlackChannelText(user.slackChannel || "");
-                                setSlackChannelDialogOpen(true);
-                              }}
-                              disabled={slackChannelEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
+                            <Typography variant="caption" color="text.secondary">
+                              {user.supportNote || (user.roles?.includes("partner") ? "Partner" : "")}
+                            </Typography>
                           </Box>
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Box sx={{ flex: 1, minWidth: 120 }}>
-                              {user.secretNames && user.secretNames.length > 0 ? (
-                                <Box>
-                                  {user.secretNames.map((name: string, idx: number) => (
-                                    <Chip
-                                      key={idx}
-                                      label={name}
-                                      size="small"
-                                      sx={{ mr: 0.5, mb: 0.5 }}
-                                    />
-                                  ))}
-                                </Box>
-                              ) : (
-                                <Typography variant="body2">No secrets</Typography>
-                              )}
-                            </Box>
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                setEditingSecretsUserId(user.userId);
-                                // Pre-populate with existing secret names (values left empty = unchanged)
-                                const existing = user.secretNames || [];
-                                setSecretEntries(
-                                  existing.length > 0
-                                    ? existing.map((n: string) => ({ name: n, value: "" }))
-                                    : [{ name: "", value: "" }]
-                                );
-                                setSecretsDialogOpen(true);
-                              }}
-                              disabled={secretsEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Box>
+                          <Chip label={tier} size="small" color={tierColor} variant={tierVariant} sx={{ fontWeight: 500, minWidth: 60 }} />
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Box sx={{ flex: 1, minWidth: 200 }}>
-                              {user.seoDomains && user.seoDomains.length > 0 ? (
-                                <Box sx={{ mb: 1 }}>
-                                  {user.seoDomains.map((domain: string, idx: number) => (
-                                    <Chip
-                                      key={idx}
-                                      label={domain}
-                                      size="small"
-                                      sx={{ mr: 0.5, mb: 0.5 }}
-                                    />
-                                  ))}
-                                </Box>
-                              ) : (
-                                <Typography variant="body2" sx={{ mb: 1 }}>
-                                  No domains
-                                </Typography>
-                              )}
-                              {((user as any).googleAnalyticsProperties && (user as any).googleAnalyticsProperties.length > 0) ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  GA: {(user as any).googleAnalyticsProperties.map((p: any) => `${p.label} (${p.propertyId})`).join(', ')}
-                                </Typography>
-                              ) : user.googleAnalyticsPropertyId ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  GA: {user.googleAnalyticsPropertyId}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  No GA ID
-                                </Typography>
-                              )}
-                              {((user as any).clarityProjects && (user as any).clarityProjects.length > 0) ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  Clarity: {(user as any).clarityProjects.map((p: any) => `${p.label} (${p.projectId})`).join(', ')}
-                                </Typography>
-                              ) : user.clarityProjectId ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  Clarity: {user.clarityProjectId}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  No Clarity ID
-                                </Typography>
-                              )}
-                              {user.productDomain ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  Product: {user.productDomain}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  No Product Domain
-                                </Typography>
-                              )}
-                            </Box>
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                setEditingSeoDomainsUserId(user.userId);
-                                setSeoDomainsText(user.seoDomains?.join("\n") || "");
-                                setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
-
-                                // Migrate from old single value to new array format if needed
-                                const gaProps = (user as any).googleAnalyticsProperties;
-                                if (gaProps && Array.isArray(gaProps) && gaProps.length > 0) {
-                                  setGoogleAnalyticsProperties(gaProps);
-                                } else if (user.googleAnalyticsPropertyId) {
-                                  setGoogleAnalyticsProperties([{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }]);
-                                } else {
-                                  setGoogleAnalyticsProperties([]);
-                                }
-
-                                setGaFilteredDomainsText(user.gaFilteredDomains?.join("\n") || "");
-                                setClarityProjectId(user.clarityProjectId || "");
-
-                                // Migrate from old single value to new array format if needed
-                                const clarityProjs = (user as any).clarityProjects;
-                                if (clarityProjs && Array.isArray(clarityProjs) && clarityProjs.length > 0) {
-                                  setClarityProjects(clarityProjs);
-                                } else if (user.clarityProjectId) {
-                                  setClarityProjects([{ projectId: user.clarityProjectId, label: "Main Project" }]);
-                                } else {
-                                  setClarityProjects([]);
-                                }
-
-                                setProductDomain(user.productDomain || "");
-                                setSeoDomainsDialogOpen(true);
-                              }}
-                              disabled={seoDomainsEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Box>
+                          {paymentStatus === "paying" && (
+                            <Chip icon={<CreditCardIcon />} label="Paid" size="small" color="success" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "trialing" && (
+                            <Chip label="Trial" size="small" color="info" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "past_due" && (
+                            <Chip icon={<WarningIcon />} label="Past Due" size="small" color="error" sx={{ fontWeight: 600 }} />
+                          )}
+                          {paymentStatus === "canceled" && (
+                            <Chip icon={<CancelIcon />} label="Canceled" size="small" color="error" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "bounced" && (
+                            <Chip label="Bounced" size="small" color="warning" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "free" && (
+                            <Typography variant="caption" color="text.disabled">—</Typography>
+                          )}
                         </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Box sx={{ flex: 1, minWidth: 150 }}>
-                              {user.googleDriveFolders && user.googleDriveFolders.length > 0 ? (
-                                <Box>
-                                  {user.googleDriveFolders.map((folder: { folderId: string; name: string }, idx: number) => (
-                                    <Chip
-                                      key={idx}
-                                      label={folder.name}
-                                      size="small"
-                                      sx={{ mr: 0.5, mb: 0.5 }}
-                                    />
-                                  ))}
-                                </Box>
-                              ) : (
-                                <Typography variant="body2">
-                                  No folders
-                                </Typography>
-                              )}
-                            </Box>
-                            <IconButton
-                              size="small"
-                              onClick={async () => {
-                                setEditingGoogleDriveFoldersUserId(user.userId);
-                                setGoogleDriveFolderEntries(
-                                  user.googleDriveFolders && user.googleDriveFolders.length > 0
-                                    ? user.googleDriveFolders.map((f: { folderId: string; name: string }) => ({ folderId: f.folderId, name: f.name }))
-                                    : []
-                                );
-                                setGoogleDriveFoldersDialogOpen(true);
-                                // Fetch available folders from Google Drive
-                                setGoogleDriveFoldersListLoading(true);
-                                try {
-                                  const response = await axios.get(
-                                    buildApiUrl("/api/admin/google-drive-folders"),
-                                    { headers: { Authorization: `Bearer ${token}` } }
-                                  );
-                                  setAvailableGoogleDriveFolders(response.data.folders || []);
-                                } catch (err) {
-                                  console.error("Error fetching Google Drive folders:", err);
-                                  setAvailableGoogleDriveFolders([]);
-                                } finally {
-                                  setGoogleDriveFoldersListLoading(false);
-                                }
-                              }}
-                              disabled={googleDriveFoldersEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            {editingCmsTypeUserId === user.userId ? (
-                              <>
-                                <FormControl size="small" sx={{ minWidth: 120 }}>
-                                  <Select
-                                    value={currentCmsType}
-                                    onChange={(e) => setCurrentCmsType(e.target.value as "Basehub" | "Webflow" | "")}
-                                    disabled={cmsTypeEditLoading}
-                                  >
-                                    <MenuItem value="">None</MenuItem>
-                                    <MenuItem value="Basehub">Basehub</MenuItem>
-                                    <MenuItem value="Webflow">Webflow</MenuItem>
-                                  </Select>
-                                </FormControl>
-                                <IconButton
-                                  size="small"
-                                  onClick={handleSaveCmsType}
-                                  disabled={cmsTypeEditLoading}
-                                  color="primary"
-                                >
-                                  <CheckIcon />
-                                </IconButton>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingCmsTypeUserId(null);
-                                    setCurrentCmsType("");
-                                  }}
-                                  disabled={cmsTypeEditLoading}
-                                >
-                                  <CloseIcon />
-                                </IconButton>
-                              </>
-                            ) : (
-                              <>
-                                <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                  {user.cmsType || "-"}
-                                </Typography>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingCmsTypeUserId(user.userId);
-                                    setCurrentCmsType(user.cmsType || "");
-                                  }}
-                                  disabled={cmsTypeEditLoading}
-                                >
-                                  <EditIcon />
-                                </IconButton>
-                              </>
-                            )}
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          {new Date(user.createdAt).toLocaleDateString()}
-                        </TableCell>
-                        <TableCell>
-                          {user.lastLoginTime 
-                            ? new Date(user.lastLoginTime).toLocaleDateString() + ' ' + 
-                              new Date(user.lastLoginTime).toLocaleTimeString()
-                            : "Never"
-                          }
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            {editingSupportNoteUserId === user.userId ? (
-                              <>
-                                <TextField
-                                  size="small"
-                                  value={currentSupportNoteText}
-                                  onChange={(e) => setCurrentSupportNoteText(e.target.value)}
-                                  placeholder="Add support note..."
-                                  sx={{ minWidth: 200 }}
-                                  disabled={supportNoteEditLoading}
-                                />
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleSaveSupportNote(user.userId)}
-                                  disabled={supportNoteEditLoading}
-                                  color="primary"
-                                >
-                                  <CheckIcon />
-                                </IconButton>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingSupportNoteUserId(null);
-                                    setCurrentSupportNoteText("");
-                                  }}
-                                  disabled={supportNoteEditLoading}
-                                >
-                                  <CloseIcon />
-                                </IconButton>
-                              </>
-                            ) : (
-                              <>
-                                <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                  {user.supportNote || "-"}
-                                </Typography>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingSupportNoteUserId(user.userId);
-                                    setCurrentSupportNoteText(user.supportNote || "");
-                                  }}
-                                  disabled={supportNoteEditLoading}
-                                >
-                                  <EditIcon />
-                                </IconButton>
-                              </>
-                            )}
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <Box
-                            sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}
-                          >
-                            {displayRoles.map(
-                              (role) => (
-                                <Chip
-                                  key={role}
-                                  label={
-                                    role.charAt(0).toUpperCase() + role.slice(1)
-                                  }
-                                  size="small"
-                                  color={
-                                    role === "partner" ? "primary" : "secondary"
-                                  }
-                                  icon={
-                                    role === "partner" ? (
-                                      <HandshakeIcon fontSize="small" />
-                                    ) : (
-                                      <PersonIcon fontSize="small" />
-                                    )
-                                  }
-                                  sx={{
-                                    height: "auto", // Ensure icon doesn't overly stretch chip
-                                    "& .MuiChip-label": { py: "1px" }, // Adjust padding if needed
-                                  }}
-                                />
-                              )
-                            )}
-                          </Box>
-                        </TableCell>
-                        <TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
                           <Chip
                             label={user.chatSessionCount || 0}
                             size="small"
-                            color={
-                              (user.chatSessionCount ?? 0) > 0
-                                ? "primary"
-                                : "default"
-                            }
+                            color={(user.chatSessionCount ?? 0) > 0 ? "primary" : "default"}
+                            variant="outlined"
+                            sx={{ cursor: (user.chatSessionCount ?? 0) > 0 ? "pointer" : undefined }}
+                            onClick={() => {}}
                           />
                         </TableCell>
                         <TableCell>
-                          <Chip
-                            label={user.taskCount || 0}
-                            size="small"
-                            color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
-                            style={{ cursor: (user.taskCount ?? 0) > 0 ? "pointer" : undefined }}
-                            onClick={() => {
-                              if ((user.taskCount ?? 0) > 0) {
-                                setUserTasksDialogUserId(user.userId);
-                                setUserTasksDialogUserEmail(user.email);
-                                setUserTasksDialogOpen(true);
-                              }
-                            }}
-                          />
+                          <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
                         </TableCell>
                         <TableCell>
-                          <Chip
-                            label={user.workflowCount || 0}
-                            size="small"
-                            color={
-                              (user.workflowCount ?? 0) > 0
-                                ? "primary"
-                                : "default"
-                            }
-                          />
+                          <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                            {used > 0 ? used.toLocaleString() : "—"}
+                          </Typography>
                         </TableCell>
-                        <TableCell>{user.isOAuthUser ? "Yes" : "No"}</TableCell>
-                        <TableCell>{user.isAdmin ? "Yes" : "No"}</TableCell>
-                        <TableCell>
-                          <Chip
-                            label={
-                              user.isActive === false ? "Inactive" : "Active"
-                            }
-                            color={
-                              user.isActive === false ? "error" : "success"
-                            }
-                            size="small"
-                          />
-                        </TableCell>
-                        <TableCell>
-                          {user.roles && user.roles.includes("customer") ? (
-                            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                              {editingSubscriptionTypeUserId === user.userId ? (
-                                <>
-                                  <FormControl size="small" sx={{ minWidth: 120 }}>
-                                    <Select
-                                      value={currentSubscriptionType}
-                                      onChange={(e) => setCurrentSubscriptionType(e.target.value)}
-                                      disabled={subscriptionTypeEditLoading}
-                                    >
-                                      {availableSubscriptionTypes.map((type) => (
-                                        <MenuItem key={type} value={type}>
-                                          {type}
-                                        </MenuItem>
-                                      ))}
-                                    </Select>
-                                  </FormControl>
-                                  <IconButton
-                                    size="small"
-                                    onClick={handleSaveSubscriptionType}
-                                    disabled={subscriptionTypeEditLoading}
-                                    color="primary"
-                                  >
-                                    <CheckIcon />
-                                  </IconButton>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => {
-                                      setEditingSubscriptionTypeUserId(null);
-                                      setCurrentSubscriptionType("");
-                                    }}
-                                    disabled={subscriptionTypeEditLoading}
-                                  >
-                                    <CloseIcon />
-                                  </IconButton>
-                                </>
-                              ) : (
-                                <>
-                                  <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                    {user.subscriptionType || "Basic"}
-                                  </Typography>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => {
-                                      setEditingSubscriptionTypeUserId(user.userId);
-                                      setCurrentSubscriptionType(user.subscriptionType || "Basic");
-                                    }}
-                                    disabled={subscriptionTypeEditLoading}
-                                  >
-                                    <EditIcon />
-                                  </IconButton>
-                                </>
-                              )}
-                            </Box>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              -
-                            </Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {user.replayUrl ? (
-                            <Tooltip title="View Clarity Replays">
-                              <IconButton
-                                size="small"
-                                component="a"
-                                href={user.replayUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                color="primary"
-                              >
-                                <PlayCircleOutlineIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              -
-                            </Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
-                            {user.roles && user.roles.includes("customer") && (
-                              <Tooltip title="Access Customer Portal">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleAccessCustomerPortal(user.userId)}
-                                  disabled={delegateAccessLoading === user.userId}
-                                  color="primary"
-                                  sx={{
-                                    border: '1px solid',
-                                    borderColor: 'primary.main',
-                                    '&:hover': { bgcolor: 'primary.50' }
-                                  }}
-                                >
-                                  {delegateAccessLoading === user.userId ? (
-                                    <CircularProgress size={16} />
-                                  ) : (
-                                    <OpenInNewIcon fontSize="small" />
-                                  )}
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <Box sx={{ display: "flex", gap: 0.5 }}>
+                            {user.roles?.includes("customer") && (
+                              <Tooltip title="Access Portal">
+                                <IconButton size="small" onClick={() => handleAccessCustomerPortal(user.userId)} disabled={delegateAccessLoading === user.userId} color="primary">
+                                  {delegateAccessLoading === user.userId ? <CircularProgress size={14} /> : <OpenInNewIcon fontSize="small" />}
                                 </IconButton>
                               </Tooltip>
                             )}
-
                             <Tooltip title="Manage Roles">
-                              <IconButton
-                                size="small"
-                                onClick={() => handleRoleDialogOpen(user)}
-                                color="primary"
-                                sx={{ 
-                                  border: '1px solid',
-                                  borderColor: 'primary.main',
-                                  '&:hover': { bgcolor: 'primary.50' }
-                                }}
-                              >
-                                <EditIcon fontSize="small" />
-                              </IconButton>
+                              <IconButton size="small" onClick={() => handleRoleDialogOpen(user)}><EditIcon fontSize="small" /></IconButton>
                             </Tooltip>
-                            
-                            {!user.isAdmin && user.isActive !== false && (
-                              <Tooltip title="Deactivate User">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setSelectedUser(user);
-                                    setDeactivateDialogOpen(true);
-                                  }}
-                                  color="warning"
-                                  sx={{ 
-                                    border: '1px solid',
-                                    borderColor: 'warning.main',
-                                    '&:hover': { bgcolor: 'warning.50' }
-                                  }}
-                                >
-                                  <PersonOffIcon fontSize="small" />
-                                </IconButton>
-                              </Tooltip>
-                            )}
-                            
-                            <Tooltip title="Set Password">
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSetPassword(user.userId, user.email)}
-                                color="secondary"
-                                sx={{ 
-                                  border: '1px solid',
-                                  borderColor: 'secondary.main',
-                                  '&:hover': { bgcolor: 'secondary.50' }
-                                }}
-                              >
-                                <LockIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                            
-                            {!user.isAdmin && (
-                              <Tooltip title="Delete User">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleOpenUserDeleteConfirm(user.userId)}
-                                  color="error"
-                                  sx={{ 
-                                    border: '1px solid',
-                                    borderColor: 'error.main',
-                                    '&:hover': { bgcolor: 'error.50' }
-                                  }}
-                                >
-                                  <DeleteIcon fontSize="small" />
-                                </IconButton>
-                              </Tooltip>
-                            )}
                           </Box>
                         </TableCell>
                       </TableRow>
+                      {/* Expandable detail row */}
+                      <TableRow>
+                        <TableCell colSpan={8} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
+                          <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                            <Box sx={{ py: 2, px: 1 }}>
+                              <Grid container spacing={2}>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">User ID</Typography>
+                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem", wordBreak: "break-all" }}>{user.userId}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Stripe ID</Typography>
+                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Created</Typography>
+                                  <Typography variant="body2">{user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Status</Typography>
+                                  <Box><Chip label={user.isActive === false ? "Inactive" : "Active"} color={user.isActive === false ? "error" : "success"} size="small" /></Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Roles</Typography>
+                                  <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mt: 0.5 }}>
+                                    {(user.roles || []).map(r => <Chip key={r} label={r} size="small" variant="outlined" />)}
+                                    {(!user.roles || user.roles.length === 0) && <Typography variant="body2" color="text.disabled">—</Typography>}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Tasks / Workflows</Typography>
+                                  <Box sx={{ display: "flex", gap: 1, mt: 0.5 }}>
+                                    <Chip
+                                      label={`${user.taskCount || 0} tasks`}
+                                      size="small"
+                                      color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
+                                      variant="outlined"
+                                      sx={{ cursor: (user.taskCount ?? 0) > 0 ? "pointer" : undefined }}
+                                      onClick={() => { if ((user.taskCount ?? 0) > 0) { setUserTasksDialogUserId(user.userId); setUserTasksDialogUserEmail(user.email); setUserTasksDialogOpen(true); } }}
+                                    />
+                                    <Chip label={`${user.workflowCount || 0} workflows`} size="small" color={(user.workflowCount ?? 0) > 0 ? "primary" : "default"} variant="outlined" />
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">OAuth / Admin</Typography>
+                                  <Typography variant="body2">{user.isOAuthUser ? "OAuth" : "Email"} / {user.isAdmin ? "Admin" : "No"}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Subscription</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (
+                                      editingSubscriptionTypeUserId === user.userId ? (
+                                        <Box sx={{ display: "flex", gap: 0.5 }}>
+                                          <FormControl size="small" sx={{ minWidth: 100 }}>
+                                            <Select value={currentSubscriptionType} onChange={(e) => setCurrentSubscriptionType(e.target.value)} disabled={subscriptionTypeEditLoading}>
+                                              {availableSubscriptionTypes.map(t => <MenuItem key={t} value={t}>{t}</MenuItem>)}
+                                            </Select>
+                                          </FormControl>
+                                          <IconButton size="small" onClick={handleSaveSubscriptionType} disabled={subscriptionTypeEditLoading} color="primary"><CheckIcon /></IconButton>
+                                          <IconButton size="small" onClick={() => { setEditingSubscriptionTypeUserId(null); setCurrentSubscriptionType(""); }}><CloseIcon /></IconButton>
+                                        </Box>
+                                      ) : (
+                                        <>
+                                          <Chip label={tier} size="small" color={tierColor} variant={tierVariant} />
+                                          <IconButton size="small" onClick={() => { setEditingSubscriptionTypeUserId(user.userId); setCurrentSubscriptionType(user.subscriptionType || "Basic"); }}><EditIcon fontSize="small" /></IconButton>
+                                        </>
+                                      )
+                                    ) : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                  </Box>
+                                </Grid>
+                                {/* Config details — all with inline edit */}
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Stripe Customer ID</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingStripeCustomerIdUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentStripeCustomerIdText} onChange={(e) => setCurrentStripeCustomerIdText(e.target.value)} placeholder="cus_..." sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveStripeCustomerId(user.userId)} disabled={stripeCustomerIdEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingStripeCustomerIdUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingStripeCustomerIdUserId(user.userId); setCurrentStripeCustomerIdText(user.stripe_customer_id || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Ad Account</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingAdAccountUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentAdAccountText} onChange={(e) => setCurrentAdAccountText(e.target.value)} sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveAdAccount(user.userId)} disabled={adAccountEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingAdAccountUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.adAccount || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingAdAccountUserId(user.userId); setCurrentAdAccountText(user.adAccount || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Email Sender</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.emailDomain ? `${user.defaultSenderUsername || "noreply"}@${user.emailDomain}` : "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingEmailSenderUserId(user.userId); setEmailDomain(user.emailDomain || ""); setDefaultSenderUsername(user.defaultSenderUsername || ""); setFromName(user.fromName || ""); setEmailSenderDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Slack Channel</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.slackChannel || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSlackChannelUserId(user.userId); setCurrentSlackChannelText(user.slackChannel || ""); setSlackChannelDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Secrets</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.secretNames?.join(", ") || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSecretsUserId(user.userId); setSecretEntries((user.secretNames || []).map(n => ({ name: n, value: "" }))); setSecretsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">CMS Type</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingCmsTypeUserId === user.userId ? (
+                                      <>
+                                        <FormControl size="small" sx={{ minWidth: 100 }}>
+                                          <Select value={currentCmsType} onChange={(e) => setCurrentCmsType(e.target.value as any)}>
+                                            <MenuItem value="">None</MenuItem>
+                                            <MenuItem value="Basehub">Basehub</MenuItem>
+                                            <MenuItem value="Webflow">Webflow</MenuItem>
+                                          </Select>
+                                        </FormControl>
+                                        <IconButton size="small" onClick={() => handleSaveCmsType()} disabled={cmsTypeEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingCmsTypeUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.cmsType || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingCmsTypeUserId(user.userId); setCurrentCmsType(user.cmsType || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Shared Folders</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.googleDriveFolders?.map(f => f.name).join(", ") || "—"}</Typography>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">Support Note</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingSupportNoteUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentSupportNoteText} onChange={(e) => setCurrentSupportNoteText(e.target.value)} sx={{ flex: 1 }} multiline maxRows={3} />
+                                        <IconButton size="small" onClick={() => handleSaveSupportNote(user.userId)} disabled={supportNoteEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingSupportNoteUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.supportNote || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingSupportNoteUserId(user.userId); setCurrentSupportNoteText(user.supportNote || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                {/* Usage + actions row */}
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">Token Usage</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (() => {
+                                      const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      const bonus = user.tokenAllowanceBonus || 0;
+                                      const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
+                                      return (
+                                        <Typography variant="body2">
+                                          {used.toLocaleString()} / {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
+                                          {bonus > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+{bonus.toLocaleString()} bonus)</Typography>}
+                                        </Typography>
+                                      );
+                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                    {user.roles?.includes("customer") && (
+                                      <Tooltip title="Grant Bonus Tokens">
+                                        <IconButton size="small" onClick={() => { setGrantBonusUserId(user.userId); setGrantBonusEmail(user.email); setGrantBonusAmount(""); setGrantBonusDialogOpen(true); }} color="primary"><AddIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">Actions</Typography>
+                                  <Box sx={{ display: "flex", gap: 0.5, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") && (
+                                      <Button size="small" variant="outlined" startIcon={<OpenInNewIcon />} onClick={() => handleAccessCustomerPortal(user.userId)} disabled={delegateAccessLoading === user.userId}>
+                                        Portal
+                                      </Button>
+                                    )}
+                                    {user.replayUrl && (
+                                      <Button size="small" variant="outlined" startIcon={<PlayCircleOutlineIcon />} component="a" href={user.replayUrl} target="_blank" rel="noopener noreferrer">
+                                        Replays
+                                      </Button>
+                                    )}
+                                    <Button size="small" variant="outlined" startIcon={<LockIcon />} onClick={() => handleSetPassword(user.userId, user.email)}>Password</Button>
+                                    {!user.isAdmin && user.isActive !== false && (
+                                      <Button size="small" variant="outlined" color="warning" startIcon={<PersonOffIcon />} onClick={() => { setSelectedUser(user); setDeactivateDialogOpen(true); }}>Deactivate</Button>
+                                    )}
+                                    {!user.isAdmin && (
+                                      <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleOpenUserDeleteConfirm(user.userId)}>Delete</Button>
+                                    )}
+                                  </Box>
+                                </Grid>
+                              </Grid>
+                            </Box>
+                          </Collapse>
+                        </TableCell>
+                      </TableRow>
+                      </React.Fragment>
                     );
                   })
                 )}
@@ -4109,7 +3967,6 @@ export default function AdminDashboard() {
             </Table>
           </TableContainer>
         </TabPanel>
-
         <TabPanel value={tabValue} index={3}>
           {error && (
             <Alert severity="error" sx={{ mb: 2 }}>
@@ -5581,6 +5438,38 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Grant Token Bonus Dialog */}
+      <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
+        <DialogTitle>Grant Bonus Tokens</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Grant additional tokens to <strong>{grantBonusEmail}</strong> for the current month.
+          </DialogContentText>
+          <TextField
+            autoFocus
+            fullWidth
+            label="Bonus Tokens"
+            value={grantBonusAmount}
+            onChange={(e) => setGrantBonusAmount(e.target.value)}
+            placeholder="e.g. 50000"
+            type="text"
+            inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setGrantBonusDialogOpen(false)} disabled={grantBonusLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleGrantTokenBonus}
+            variant="contained"
+            disabled={grantBonusLoading || !grantBonusAmount}
+          >
+            {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       {/* Chat Dialog */}
       <ChatDialog
         session={selectedSession}
@@ -6963,39 +6852,11 @@ export default function AdminDashboard() {
 }
 
 // Agent Mode Settings Component
-interface WorkPlanStep {
-  stepCount: number;
-  title: string;
-  description?: string;
-  requiredFunctionCalls?: string[];
-}
-
-interface PredefinedWorkPlan {
-  id?: string;
-  title: string;
-  description?: string;
-  steps: WorkPlanStep[];
-  welcomeMessage?: string;
-  autocomplete?: boolean;
-  requireLogin?: boolean;
-  showLoginSignup?: 'after_plan_completed' | 'always';
-  showInAgentMode?: boolean;
-  defaultModel?: string;
-}
-
-interface AvailableFunctionCall {
-  name: string;
-  description: string;
-}
-
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
-  const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
-  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
-  const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [contentModel, setContentModel] = useState('');
@@ -7004,8 +6865,6 @@ const AgentModeSettings = () => {
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
-  const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
-  const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
   const [savingScheduledChatsDefaultModel, setSavingScheduledChatsDefaultModel] = useState(false);
@@ -7017,18 +6876,12 @@ const AgentModeSettings = () => {
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
   const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
   const [savingCustomerSupportDefaultModel, setSavingCustomerSupportDefaultModel] = useState(false);
+  const [codingAgentDefaultModel, setCodingAgentDefaultModel] = useState('');
+  const [savingCodingAgentDefaultModel, setSavingCodingAgentDefaultModel] = useState(false);
   const [backupModel, setBackupModel] = useState('');
   const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
-  const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
-  const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
-  const [planSyncStatus, setPlanSyncStatus] = useState<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>>({});
-  const [syncEnvironment, setSyncEnvironment] = useState<'development' | 'production'>('production');
-  const [syncingPlanId, setSyncingPlanId] = useState<string | null>(null);
-  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
-  const [planToSync, setPlanToSync] = useState<PredefinedWorkPlan | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
@@ -7036,25 +6889,6 @@ const AgentModeSettings = () => {
     loadAllSettings();
   }, []);
 
-  // Scroll to newly added work plan
-  useEffect(() => {
-    if (newlyAddedPlanId) {
-      // Use setTimeout to ensure DOM is updated
-      setTimeout(() => {
-        const element = document.getElementById(`work-plan-${newlyAddedPlanId}`);
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          // Focus on the title field for better UX
-          const titleInput = element.querySelector('input[type="text"]') as HTMLInputElement;
-          if (titleInput) {
-            titleInput.focus();
-          }
-        }
-        // Clear the newly added plan ID after scrolling
-        setNewlyAddedPlanId(null);
-      }, 100);
-    }
-  }, [newlyAddedPlanId, predefinedWorkPlans]);
 
   const loadAllSettings = async () => {
     try {
@@ -7073,15 +6907,6 @@ const AgentModeSettings = () => {
       // Load conversation starters
       await loadConversationStarters();
 
-      // Load available function calls
-      await loadAvailableFunctionCalls();
-
-      // Load predefined work plans
-      await loadPredefinedWorkPlans();
-
-      // Load plan sync status
-      await loadPlanSyncStatus();
-
       // Load content model
       await loadContentModel();
 
@@ -7099,6 +6924,9 @@ const AgentModeSettings = () => {
 
       // Load customer support default model
       await loadCustomerSupportDefaultModel(models);
+
+      // Load coding agent default model
+      await loadCodingAgentDefaultModel(models);
 
       // Load backup model
       await loadBackupModel(models);
@@ -7157,26 +6985,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const loadAvailableFunctionCalls = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/agent-mode/function-calls'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      if (response.data && response.data.functionCalls) {
-        // Filter out work plan management functions
-        const workPlanFunctions = ['create_work_plan', 'modify_work_plan', 'set_work_plan_status'];
-        const filtered = response.data.functionCalls.filter(
-          (func: AvailableFunctionCall) => !workPlanFunctions.includes(func.name)
-        );
-        setAvailableFunctionCalls(filtered);
-      }
-    } catch (error) {
-      console.error('Error loading available function calls:', error);
-      // Don't fail the entire load if this fails
-      setAvailableFunctionCalls([]);
-    }
-  };
 
   const loadSystemPrompt = async () => {
     try {
@@ -7271,167 +7079,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
-    id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-    autocomplete: false,
-    requireLogin: false,
-    showLoginSignup: 'after_plan_completed',
-    showInAgentMode: false,
-    title: 'Onboarding',
-    welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
-    steps: [
-      {
-        stepCount: 1,
-        title: 'Analyze website and business',
-        description: 'Research and analyze the client\'s website and business to understand their industry, target audience, and current marketing presence',
-        requiredFunctionCalls: ['search_web']
-      },
-      {
-        stepCount: 2,
-        title: 'Create/update brand guidelines',
-        description: 'Establish or update brand guidelines including colors, fonts, tone of voice, and visual identity',
-        requiredFunctionCalls: ['update_brand_guidelines']
-      },
-      {
-        stepCount: 3,
-        title: 'Create/update marketing strategy',
-        description: 'Develop a comprehensive marketing strategy based on business analysis and brand guidelines',
-        requiredFunctionCalls: ['update_marketing_strategy']
-      },
-      {
-        stepCount: 4,
-        title: 'Generate 3 blog articles',
-        description: 'Create three high-quality blog articles aligned with the marketing strategy and brand voice',
-        requiredFunctionCalls: ['create_blog_article']
-      },
-      {
-        stepCount: 5,
-        title: 'Generate social media posts',
-        description: 'Create engaging social media content and visuals to support the marketing strategy',
-        requiredFunctionCalls: ['generate_image']
-      }
-    ]
-  });
-
-  const loadPredefinedWorkPlans = async () => {
-    try {
-      try {
-        const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
-        if (response.data && response.data.settingValue) {
-          const workPlans = JSON.parse(response.data.settingValue);
-          
-          // Ensure all work plans have IDs (for backward compatibility)
-          const workPlansWithIds = workPlans.map((wp: PredefinedWorkPlan) => {
-            if (!wp.id) {
-              // Generate ID from title or create a new one
-              wp.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            }
-            return wp;
-          });
-          
-          // Check if "Onboarding" work plan already exists
-          const hasOnboarding = workPlansWithIds.some((wp: PredefinedWorkPlan) => 
-            wp.title.toLowerCase() === 'onboarding'
-          );
-          
-          // If no Onboarding plan exists, add the default one
-          if (!hasOnboarding) {
-            const defaultOnboardingPlan = getDefaultOnboardingPlan();
-            defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            workPlansWithIds.push(defaultOnboardingPlan);
-            
-            // Save the updated work plans with the default Onboarding plan
-            try {
-              await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-                settingValue: JSON.stringify(workPlansWithIds),
-                description: 'Agent Mode predefined work plans for Emma AI assistant'
-              }, {
-                headers: { Authorization: `Bearer ${token}` }
-              });
-            } catch (saveError) {
-              console.error('Error saving default Onboarding work plan:', saveError);
-              // Continue anyway - we'll still show it in the UI
-            }
-          }
-          
-          setPredefinedWorkPlans(workPlansWithIds);
-          return;
-        }
-      } catch (settingsError: any) {
-        // If setting doesn't exist (404), create default Onboarding plan
-        if (settingsError.response?.status === 404) {
-          const defaultOnboardingPlan = getDefaultOnboardingPlan();
-          defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-          
-          // Try to save the default Onboarding plan
-          try {
-            await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-              settingValue: JSON.stringify([defaultOnboardingPlan]),
-              description: 'Agent Mode predefined work plans for Emma AI assistant'
-            }, {
-              headers: { Authorization: `Bearer ${token}` }
-            });
-          } catch (saveError) {
-            console.error('Error saving default Onboarding work plan:', saveError);
-            // Continue anyway - we'll still show it in the UI
-          }
-          
-          setPredefinedWorkPlans([defaultOnboardingPlan]);
-          return;
-        } else {
-          console.error('Error loading predefined work plans:', settingsError);
-          setPredefinedWorkPlans([]);
-        }
-      }
-    } catch (error) {
-      console.error('Error loading predefined work plans:', error);
-      setPredefinedWorkPlans([]);
-    }
-  };
-
-  const loadPlanSyncStatus = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync-status'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setPlanSyncStatus(response.data.plans || {});
-      setSyncEnvironment(response.data.environment || 'production');
-    } catch (err) {
-      console.error('Error loading plan sync status:', err);
-    }
-  };
-
-  const syncDirection = syncEnvironment === 'development' ? 'dev-to-prod' : 'prod-to-dev';
-  const syncLabel = syncEnvironment === 'development' ? 'Dev → Prod' : 'Prod → Dev';
-
-  const handleOpenSyncDialog = (workPlan: PredefinedWorkPlan) => {
-    setPlanToSync(workPlan);
-    setSyncDialogOpen(true);
-  };
-
-  const handleSyncPlan = async () => {
-    if (!planToSync?.id) return;
-    try {
-      setSyncingPlanId(planToSync.id);
-      await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync'), {
-        planId: planToSync.id,
-        direction: syncDirection
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSuccess(`Plan "${planToSync.title}" synced ${syncLabel}`);
-      setSyncDialogOpen(false);
-      setPlanToSync(null);
-      await loadPlanSyncStatus();
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Failed to sync plan');
-    } finally {
-      setSyncingPlanId(null);
-    }
-  };
 
   const loadContentModel = async () => {
     try {
@@ -7734,6 +7381,57 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadCodingAgentDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setCodingAgentDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading coding agent default model:', settingsError);
+      }
+    }
+    // Default to Sonnet 4.6
+    setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
+  };
+
+  const saveCodingAgentDefaultModel = async () => {
+    try {
+      setSavingCodingAgentDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (codingAgentDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          settingValue: codingAgentDefaultModel,
+          description: 'Default LLM model for coding agent (code editing tasks)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Coding agent default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving coding agent default model:', error);
+      setError('Failed to save coding agent default model');
+    } finally {
+      setSavingCodingAgentDefaultModel(false);
+    }
+  };
+
   const loadBackupModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
@@ -7879,277 +7577,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const saveIndividualWorkPlan = async (workPlanIndex: number) => {
-    const workPlan = predefinedWorkPlans[workPlanIndex];
-    if (!workPlan) {
-      setError('Work plan not found');
-      return;
-    }
-
-    // Generate ID if it doesn't exist (for new plans)
-    const planId = workPlan.id || `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-    // Clear previous messages
-    setError('');
-    setSuccess('');
-    setWorkPlanErrors(prev => {
-      const updated = { ...prev };
-      delete updated[planId];
-      return updated;
-    });
-    
-    try {
-      setSavingWorkPlanId(planId);
-      setSavingWorkPlanIndex(workPlanIndex);
-      
-      // Validate work plan title
-      if (workPlan.title.trim().length === 0) {
-        const errorMsg = 'Work plan must have a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        // Scroll to the work plan
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate that at least one step exists
-      if (!workPlan.steps || workPlan.steps.length === 0) {
-        const errorMsg = 'Work plan must have at least one step';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate that the first step has a title (first step is required)
-      if (!workPlan.steps[0] || workPlan.steps[0].title.trim().length === 0) {
-        const errorMsg = 'The first step is required and must have a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        // Scroll to the first step input field
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            const firstStepInput = workPlanCard.querySelector('input[placeholder*="Step Title"]') as HTMLInputElement;
-            if (firstStepInput) {
-              firstStepInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              firstStepInput.focus();
-            } else {
-              workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate work plan
-      const validatedWorkPlan = {
-        id: planId,
-        title: workPlan.title.trim(),
-        description: workPlan.description?.trim() || undefined,
-        welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: workPlan.autocomplete || false,
-        requireLogin: workPlan.requireLogin || false,
-        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
-        showInAgentMode: workPlan.showInAgentMode || false,
-        defaultModel: workPlan.defaultModel?.trim() || undefined,
-        steps: workPlan.steps
-          .filter(step => step.title.trim().length > 0)
-          .map((step, index) => ({
-            stepCount: index + 1,
-            title: step.title.trim(),
-            description: step.description?.trim() || undefined,
-            requiredFunctionCalls: step.requiredFunctionCalls?.filter(f => f.trim().length > 0) || undefined
-          }))
-      };
-
-      // Final validation after filtering
-      if (validatedWorkPlan.steps.length === 0) {
-        const errorMsg = 'Work plan must have at least one step with a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Try PUT first (for existing plans), fall back to POST if plan doesn't exist (404)
-      try {
-        // Try to update existing work plan
-        await axios.put(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${planId}`), validatedWorkPlan, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (putError: any) {
-        // If PUT fails with 404, the plan doesn't exist yet, so create it with POST
-        if (putError.response?.status === 404) {
-          await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), validatedWorkPlan, {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-        } else {
-          // Re-throw other errors
-          throw putError;
-        }
-      }
-      
-      // Update local state with the validated plan (including the ID)
-      const updated = [...predefinedWorkPlans];
-      updated[workPlanIndex] = validatedWorkPlan;
-      setPredefinedWorkPlans(updated);
-      setSuccess(`Work plan "${validatedWorkPlan.title}" saved successfully!`);
-      // Clear any work plan specific errors
-      setWorkPlanErrors(prev => {
-        const updated = { ...prev };
-        delete updated[planId];
-        return updated;
-      });
-    } catch (error: any) {
-      console.error('Error saving work plan:', error);
-      const errorMessage = error.response?.data?.error || 'Failed to save work plan';
-      setError(errorMessage);
-      setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMessage }));
-    } finally {
-      setSavingWorkPlanId(null);
-      setSavingWorkPlanIndex(null);
-    }
-  };
-
-  const addWorkPlan = async () => {
-    const newWorkPlan: PredefinedWorkPlan = {
-      id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      title: '',
-      steps: [{ stepCount: 1, title: '' }],
-      autocomplete: false,
-      requireLogin: false,
-      showLoginSignup: 'after_plan_completed',
-      showInAgentMode: false,
-      defaultModel: undefined
-    };
-    
-    setPredefinedWorkPlans([
-      ...predefinedWorkPlans,
-      newWorkPlan
-    ]);
-    
-    // Set the newly added plan ID to trigger scroll and expand
-    setNewlyAddedPlanId(newWorkPlan.id || null);
-    setExpandedPlanId(newWorkPlan.id || null);
-  };
-
-  const removeWorkPlan = async (index: number) => {
-    const workPlan = predefinedWorkPlans[index];
-    if (!workPlan) return;
-
-    // If the work plan has an ID and has been saved, delete it from the backend
-    if (workPlan.id) {
-      try {
-        setSavingWorkPlanId(workPlan.id);
-        setSavingWorkPlanIndex(index);
-        await axios.delete(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${workPlan.id}`), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (error: any) {
-        console.error('Error deleting work plan from backend:', error);
-        const errorMessage = error.response?.data?.error || 'Failed to delete work plan from backend';
-        setError(errorMessage);
-        // Continue with local removal even if backend delete fails
-      } finally {
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-      }
-    }
-
-    // Remove from local state
-    setPredefinedWorkPlans(predefinedWorkPlans.filter((_, i) => i !== index));
-    
-    // Clear any errors for this work plan
-    if (workPlan.id) {
-      setWorkPlanErrors(prev => {
-        const updated = { ...prev };
-        delete updated[workPlan.id!];
-        return updated;
-      });
-    }
-  };
-
-  const updateWorkPlan = (index: number, workPlan: PredefinedWorkPlan) => {
-    const updated = [...predefinedWorkPlans];
-    updated[index] = workPlan;
-    setPredefinedWorkPlans(updated);
-  };
-
-  const addStepToWorkPlan = (workPlanIndex: number) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps.push({
-      stepCount: updated[workPlanIndex].steps.length + 1,
-      title: ''
-    });
-    setPredefinedWorkPlans(updated);
-  };
-
-  const removeStepFromWorkPlan = (workPlanIndex: number, stepIndex: number) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps = updated[workPlanIndex].steps
-      .filter((_, i) => i !== stepIndex)
-      .map((step, i) => ({ ...step, stepCount: i + 1 }));
-    setPredefinedWorkPlans(updated);
-  };
-
-  const moveStepInWorkPlan = (workPlanIndex: number, stepIndex: number, direction: 'up' | 'down') => {
-    const updated = [...predefinedWorkPlans];
-    const steps = [...updated[workPlanIndex].steps];
-    const targetIndex = direction === 'up' ? stepIndex - 1 : stepIndex + 1;
-    if (targetIndex < 0 || targetIndex >= steps.length) return;
-    [steps[stepIndex], steps[targetIndex]] = [steps[targetIndex], steps[stepIndex]];
-    updated[workPlanIndex] = { ...updated[workPlanIndex], steps: steps.map((s, i) => ({ ...s, stepCount: i + 1 })) };
-    setPredefinedWorkPlans(updated);
-  };
-
-  const duplicateWorkPlan = (index: number) => {
-    const original = predefinedWorkPlans[index];
-    const copy: PredefinedWorkPlan = {
-      ...JSON.parse(JSON.stringify(original)),
-      id: undefined,
-      title: `${original.title} (Copy)`,
-    };
-    const tempId = `new-${Date.now()}`;
-    setPredefinedWorkPlans([...predefinedWorkPlans, copy]);
-    setExpandedPlanId(tempId);
-    setNewlyAddedPlanId(tempId);
-  };
-
-  const togglePlanExpanded = (planId: string) => {
-    setExpandedPlanId(prev => prev === planId ? null : planId);
-  };
-
-  const updateStepInWorkPlan = (workPlanIndex: number, stepIndex: number, step: WorkPlanStep) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps[stepIndex] = step;
-    setPredefinedWorkPlans(updated);
-  };
-
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -8253,6 +7681,14 @@ const AgentModeSettings = () => {
 
         setCustomerSupportDefaultModel('');
         setSuccess('Reset customer support default model successfully!');
+      } else if (type === 'codingAgentDefaultModel') {
+        setSavingCodingAgentDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
+        setSuccess('Reset coding agent default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -8278,6 +7714,8 @@ const AgentModeSettings = () => {
         setSavingVideoGenerationDefaultModel(false);
       } else if (type === 'customerSupportDefaultModel') {
         setSavingCustomerSupportDefaultModel(false);
+      } else if (type === 'codingAgentDefaultModel') {
+        setSavingCodingAgentDefaultModel(false);
       }
     }
   };
@@ -8673,6 +8111,55 @@ const AgentModeSettings = () => {
         </CardContent>
       </Card>
 
+      {/* Coding Agent Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Coding Agent Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('codingAgentDefaultModel')}
+                disabled={savingCodingAgentDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveCodingAgentDefaultModel}
+                disabled={savingCodingAgentDefaultModel}
+              >
+                {savingCodingAgentDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-coding-agent-model-label">Coding Agent Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-coding-agent-model-label"
+              value={codingAgentDefaultModel}
+              label="Coding Agent Default Model"
+              onChange={(e) => setCodingAgentDefaultModel(e.target.value as string)}
+            >
+              {(supportedModels.length > 0
+                ? supportedModels
+                : ['anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-6-v1']
+              ).filter(model => model.includes('anthropic.claude')).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for the coding agent (code editing tasks for landing pages). Defaults to Sonnet 4.6. Opus 4.6 is also available for more complex coding tasks.
+          </Typography>
+        </CardContent>
+      </Card>
+
       {/* Content Agent Model for Blog/Book Generation */}
       <Card sx={{ mb: 3 }}>
         <CardContent>
@@ -8849,500 +8336,24 @@ const AgentModeSettings = () => {
         </CardContent>
       </Card>
 
-      {/* Predefined Work Plans */}
+      {/* Work Plans - moved to dedicated /work-plans page */}
       <Card>
         <CardContent>
-          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+          <Box display="flex" justifyContent="space-between" alignItems="center">
             <Typography variant="h6">
-              Predefined Work Plans
+              Work Plans
             </Typography>
-            <Box>
-              <Button
-                variant="outlined"
-                startIcon={<AddIcon />}
-                onClick={addWorkPlan}
-                disabled={false}
-                sx={{ mr: 1 }}
-              >
-                Add Work Plan
-              </Button>
-            </Box>
+            <Button variant="outlined" href="/work-plans">
+              Manage Work Plans
+            </Button>
           </Box>
-          
-          <Typography variant="body2" color="text.secondary" paragraph>
-            Configure predefined work plans that can be used in Agent Mode. Each work plan consists of a title and multiple steps.
-          </Typography>
-
-          {predefinedWorkPlans.length === 0 ? (
-            <Box sx={{ textAlign: 'center', py: 4 }}>
-              <Typography variant="body2" color="text.secondary">
-                No predefined work plans configured. Click "Add Work Plan" to create one.
-              </Typography>
-            </Box>
-          ) : (
-            <Box>
-              {predefinedWorkPlans.map((workPlan, workPlanIndex) => {
-                const planKey = workPlan.id || `index-${workPlanIndex}`;
-                const isExpanded = expandedPlanId === planKey;
-                return (
-                <Card
-                  key={workPlan.id || workPlanIndex}
-                  id={`work-plan-${workPlan.id || workPlanIndex}`}
-                  sx={{ mb: 2, border: '1px solid', borderColor: 'divider' }}
-                >
-                  <CardContent sx={{ pb: isExpanded ? undefined : '16px !important' }}>
-                    {workPlanErrors[workPlan.id || ''] && (
-                      <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
-                        setWorkPlanErrors(prev => {
-                          const updated = { ...prev };
-                          delete updated[workPlan.id || ''];
-                          return updated;
-                        });
-                      }}>
-                        {workPlanErrors[workPlan.id || '']}
-                      </Alert>
-                    )}
-                    {/* Collapsed header row */}
-                    <Box display="flex" justifyContent="space-between" alignItems="center">
-                      <Box
-                        display="flex"
-                        alignItems="center"
-                        sx={{ cursor: 'pointer', flex: 1, mr: 2, minWidth: 0 }}
-                        onClick={() => togglePlanExpanded(planKey)}
-                      >
-                        <IconButton size="small" sx={{ mr: 1 }}>
-                          {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-                        </IconButton>
-                        <Typography variant="subtitle1" fontWeight="medium" noWrap sx={{ mr: 2 }}>
-                          {workPlan.title || 'Untitled Plan'}
-                        </Typography>
-                        <Box display="flex" gap={0.5} flexWrap="wrap">
-                          <Chip label={`${workPlan.steps.length} step${workPlan.steps.length !== 1 ? 's' : ''}`} size="small" variant="outlined" />
-                          {workPlan.showInAgentMode && <Chip label="Visible" size="small" color="success" />}
-                          {workPlan.requireLogin && <Chip label="Login Required" size="small" color="warning" variant="outlined" />}
-                          {workPlan.autocomplete && <Chip label="Autocomplete" size="small" color="info" variant="outlined" />}
-                          {workPlan.defaultModel && <Chip label={workPlan.defaultModel} size="small" variant="outlined" />}
-                          {workPlan.id && planSyncStatus[workPlan.id] && (
-                            planSyncStatus[workPlan.id].inSync
-                              ? <Chip label="In Sync" size="small" color="success" variant="outlined" />
-                              : planSyncStatus[workPlan.id].existsInProd && planSyncStatus[workPlan.id].existsInDev
-                                ? <Chip label={`Out of Sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`} size="small" color="warning" variant="outlined" />
-                                : <Chip label={syncEnvironment === 'development' ? 'Dev Only' : 'Prod Only'} size="small" color="info" variant="outlined" />
-                          )}
-                        </Box>
-                      </Box>
-                      <Box display="flex" gap={0.5} flexShrink={0}>
-                        {workPlan.id && syncEnvironment && (
-                          <Tooltip title={
-                            planSyncStatus[workPlan.id]?.inSync
-                              ? "Prod & Dev in sync"
-                              : planSyncStatus[workPlan.id]?.changedFields?.length
-                                ? `Out of sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`
-                                : !planSyncStatus[workPlan.id]?.existsInProd
-                                  ? "Missing in Prod"
-                                  : !planSyncStatus[workPlan.id]?.existsInDev
-                                    ? "Missing in Dev"
-                                    : `Sync Plan (${syncLabel})`
-                          }>
-                            <span>
-                              <IconButton
-                                size="small"
-                                onClick={() => handleOpenSyncDialog(workPlan)}
-                                disabled={planSyncStatus[workPlan.id]?.inSync}
-                              >
-                                {syncingPlanId === workPlan.id ? <CircularProgress size={18} /> : <SyncIcon fontSize="small" />}
-                              </IconButton>
-                            </span>
-                          </Tooltip>
-                        )}
-                        <Tooltip title="Duplicate plan">
-                          <IconButton
-                            size="small"
-                            onClick={() => duplicateWorkPlan(workPlanIndex)}
-                            disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
-                          >
-                            <ContentCopyIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                        <Button
-                          variant="contained"
-                          onClick={() => saveIndividualWorkPlan(workPlanIndex)}
-                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
-                          size="small"
-                        >
-                          {(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) ? <CircularProgress size={20} /> : 'Save'}
-                        </Button>
-                        <IconButton
-                          color="error"
-                          onClick={() => removeWorkPlan(workPlanIndex)}
-                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
-                          size="small"
-                        >
-                          <DeleteIcon fontSize="small" />
-                        </IconButton>
-                      </Box>
-                    </Box>
-
-                    <Collapse in={isExpanded}>
-                    <Box sx={{ mt: 2 }}>
-                    <TextField
-                      label="Work Plan Title"
-                      value={workPlan.title}
-                      onChange={(e) => {
-                        updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value });
-                        if (workPlanErrors[workPlan.id || '']) {
-                          setWorkPlanErrors(prev => {
-                            const updated = { ...prev };
-                            delete updated[workPlan.id || ''];
-                            return updated;
-                          });
-                        }
-                      }}
-                      placeholder="Enter work plan title..."
-                      variant="outlined"
-                      fullWidth
-                      sx={{ mb: 2 }}
-                      error={!!workPlanErrors[workPlan.id || ''] && workPlanErrors[workPlan.id || ''].includes('title')}
-                    />
-
-                    <TextField
-                      label="Description (Optional)"
-                      value={workPlan.description || ''}
-                      onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, description: e.target.value })}
-                      placeholder="Enter a brief description of this work plan..."
-                      variant="outlined"
-                      fullWidth
-                      multiline
-                      rows={2}
-                      sx={{ mb: 2 }}
-                      helperText="This description will be displayed on the work plan card in Agent Mode."
-                    />
-
-                    <TextField
-                      label="Welcome Message (Optional)"
-                      value={workPlan.welcomeMessage || ''}
-                      onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, welcomeMessage: e.target.value })}
-                      placeholder="Enter the welcome message to display when a session is created with this plan... (supports HTML formatting)"
-                      variant="outlined"
-                      fullWidth
-                      multiline
-                      rows={4}
-                      sx={{ mb: 2 }}
-                      helperText="This message will be displayed as the welcome message when a session is created with this plan. If not provided, the default Agent Mode welcome message will be used."
-                    />
-
-                    <Box sx={{ mb: 2 }}>
-                      <Box display="flex" flexDirection="column" gap={2}>
-                        <Box display="flex" flexWrap="wrap" gap={3}>
-                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  checked={workPlan.autocomplete || false}
-                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
-                                  disabled={false}
-                                />
-                              }
-                              label="Autocomplete Steps"
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
-                              When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
-                            </Typography>
-                          </Box>
-                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  checked={workPlan.requireLogin || false}
-                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
-                                  disabled={false}
-                                />
-                              }
-                              label="Require Login"
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
-                              Users must log in before starting this plan.
-                            </Typography>
-                          </Box>
-                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  checked={workPlan.showInAgentMode || false}
-                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, showInAgentMode: e.target.checked })}
-                                  disabled={false}
-                                />
-                              }
-                              label="Show in Agent Mode"
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
-                              When enabled, this plan will be displayed on the agent-mode/new page in the customer portal.
-                            </Typography>
-                          </Box>
-                        </Box>
-                      </Box>
-                    </Box>
-
-                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                      <InputLabel>Show Login/Signup</InputLabel>
-                      <Select
-                        value={workPlan.showLoginSignup || 'after_plan_completed'}
-                        label="Show Login/Signup"
-                        onChange={(e) =>
-                          updateWorkPlan(workPlanIndex, {
-                            ...workPlan,
-                            showLoginSignup: e.target.value as 'after_plan_completed' | 'always'
-                          })
-                        }
-                        disabled={false}
-                      >
-                        <MenuItem value="after_plan_completed">After plan completed</MenuItem>
-                        <MenuItem value="always">Always</MenuItem>
-                      </Select>
-                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                        Controls when the login/signup prompt is displayed during a plan session.
-                      </Typography>
-                    </FormControl>
-
-                    {/* Default Model Selection */}
-                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                      <InputLabel>Default Model (Optional)</InputLabel>
-                      <Select
-                        value={workPlan.defaultModel || ''}
-                        onChange={(e) => {
-                          const updated = [...predefinedWorkPlans];
-                          updated[workPlanIndex].defaultModel = e.target.value || undefined;
-                          setPredefinedWorkPlans(updated);
-                        }}
-                        label="Default Model (Optional)"
-                      >
-                        <MenuItem value="">
-                          <em>Use Agent Mode Default</em>
-                        </MenuItem>
-                        {supportedModels.map((modelName) => (
-                          <MenuItem key={modelName} value={modelName}>
-                            {modelName}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                        Model to use for sessions created with this work plan. Leave empty to use the global Agent Mode default.
-                      </Typography>
-                    </FormControl>
-
-                    <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
-                      Steps:
-                    </Typography>
-
-                    {workPlan.steps.map((step, stepIndex) => (
-                      <Box key={stepIndex} sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
-                        <Box display="flex" justifyContent="space-between" alignItems="flex-start" mb={1}>
-                          <Typography variant="body2" color="text.secondary" sx={{ minWidth: 60 }}>
-                            Step {step.stepCount}:
-                          </Typography>
-                          <Box display="flex" gap={0.25}>
-                            <Tooltip title="Move up">
-                              <span>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => moveStepInWorkPlan(workPlanIndex, stepIndex, 'up')}
-                                  disabled={stepIndex === 0}
-                                >
-                                  <ArrowUpwardIcon fontSize="small" />
-                                </IconButton>
-                              </span>
-                            </Tooltip>
-                            <Tooltip title="Move down">
-                              <span>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => moveStepInWorkPlan(workPlanIndex, stepIndex, 'down')}
-                                  disabled={stepIndex === workPlan.steps.length - 1}
-                                >
-                                  <ArrowDownwardIcon fontSize="small" />
-                                </IconButton>
-                              </span>
-                            </Tooltip>
-                            <IconButton
-                              size="small"
-                              color="error"
-                              onClick={() => removeStepFromWorkPlan(workPlanIndex, stepIndex)}
-                              disabled={false}
-                            >
-                              <DeleteIcon fontSize="small" />
-                            </IconButton>
-                          </Box>
-                        </Box>
-                        <TextField
-                          label="Step Title"
-                          value={step.title}
-                          onChange={(e) => updateStepInWorkPlan(workPlanIndex, stepIndex, { ...step, title: e.target.value })}
-                          placeholder="Enter step title..."
-                          variant="outlined"
-                          fullWidth
-                          size="small"
-                          sx={{ mb: 1 }}
-                        />
-                        <TextField
-                          label="Step Description (Optional)"
-                          value={step.description || ''}
-                          onChange={(e) => updateStepInWorkPlan(workPlanIndex, stepIndex, { ...step, description: e.target.value })}
-                          placeholder="Enter step description..."
-                          variant="outlined"
-                          fullWidth
-                          multiline
-                          rows={2}
-                          size="small"
-                          sx={{ mb: 1 }}
-                        />
-                        <Box>
-                          <Typography variant="body2" fontWeight="medium" gutterBottom>
-                            Required Function Calls (Optional)
-                          </Typography>
-                          
-                          {/* Add Function Call Dropdown */}
-                          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
-                            <FormControl size="small" sx={{ flexGrow: 1 }}>
-                              <InputLabel>Add Function Call</InputLabel>
-                              <Select
-                                value={selectedFunctionCall[`${workPlanIndex}-${stepIndex}`] || ''}
-                                label="Add Function Call"
-                                onChange={(e) => {
-                                  const selectedFunc = e.target.value as string;
-                                  if (selectedFunc) {
-                                    const currentCalls = step.requiredFunctionCalls || [];
-                                    updateStepInWorkPlan(workPlanIndex, stepIndex, {
-                                      ...step,
-                                      requiredFunctionCalls: [...currentCalls, selectedFunc]
-                                    });
-                                    // Reset the select
-                                    setSelectedFunctionCall(prev => ({
-                                      ...prev,
-                                      [`${workPlanIndex}-${stepIndex}`]: ''
-                                    }));
-                                  }
-                                }}
-                                disabled={savingWorkPlanId !== null || availableFunctionCalls.length === 0}
-                              >
-                                <MenuItem value="">
-                                  <em>Select a function...</em>
-                                </MenuItem>
-                                {availableFunctionCalls.length === 0 ? (
-                                  <MenuItem disabled>Loading function calls...</MenuItem>
-                                ) : (
-                                  availableFunctionCalls.map((func) => (
-                                    <MenuItem key={func.name} value={func.name}>
-                                      <Box>
-                                        <Typography variant="body2" fontWeight="medium">
-                                          {func.name}
-                                        </Typography>
-                                        <Typography variant="caption" color="text.secondary">
-                                          {func.description}
-                                        </Typography>
-                                      </Box>
-                                    </MenuItem>
-                                  ))
-                                )}
-                              </Select>
-                            </FormControl>
-                          </Box>
-
-                          {/* Display Added Function Calls */}
-                          {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
-                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                              {step.requiredFunctionCalls.map((funcName, callIndex) => (
-                                <Chip
-                                  key={`${workPlanIndex}-${stepIndex}-${callIndex}`}
-                                  label={funcName}
-                                  onDelete={() => {
-                                    const currentCalls = step.requiredFunctionCalls || [];
-                                    const newCalls = currentCalls.filter((_, idx) => idx !== callIndex);
-                                    updateStepInWorkPlan(workPlanIndex, stepIndex, {
-                                      ...step,
-                                      requiredFunctionCalls: newCalls.length > 0 ? newCalls : undefined
-                                    });
-                                  }}
-                                  deleteIcon={<DeleteIcon />}
-                                  disabled={false}
-                                  color="primary"
-                                  variant="outlined"
-                                />
-                              ))}
-                            </Box>
-                          )}
-
-                          <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                            Add functions that must be called before this step can be marked as completed. The same function can be added multiple times.
-                          </Typography>
-                        </Box>
-                      </Box>
-                    ))}
-
-                    <Button
-                      variant="outlined"
-                      startIcon={<AddIcon />}
-                      onClick={() => addStepToWorkPlan(workPlanIndex)}
-                      disabled={false}
-                      size="small"
-                      sx={{ mt: 1 }}
-                    >
-                      Add Step
-                    </Button>
-                    </Box>
-                    </Collapse>
-                  </CardContent>
-                </Card>
-                );
-              })}
-            </Box>
-          )}
-
-          <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
-            Predefined work plans can be used to quickly set up structured workflows in Agent Mode.
-            Each step can have a title, optional description, and optional required function calls.
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            Work plans have been moved to their own page. Use the button above to manage predefined work plans and review user-submitted plans.
           </Typography>
         </CardContent>
       </Card>
 
-      {/* Sync Plan Dialog */}
-      <Dialog open={syncDialogOpen} onClose={() => { setSyncDialogOpen(false); setPlanToSync(null); }}>
-        <DialogTitle>Sync Plan ({syncLabel})</DialogTitle>
-        <DialogContent>
-          <Typography sx={{ mb: 2 }}>
-            Sync <strong>{planToSync?.title}</strong> {syncLabel}:
-          </Typography>
-          {planToSync?.id && planSyncStatus[planToSync.id] && (() => {
-            const info = planSyncStatus[planToSync.id];
-            if (!info.existsInProd) {
-              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Dev. It will be created in Prod.</Alert>;
-            }
-            if (!info.existsInDev) {
-              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Prod. It will be created in Dev.</Alert>;
-            }
-            if (info.changedFields.length > 0) {
-              return (
-                <Alert severity="info" sx={{ mb: 2 }}>
-                  <strong>Fields that will change:</strong> {info.changedFields.join(', ')}
-                </Alert>
-              );
-            }
-            return null;
-          })()}
-          {syncEnvironment === 'development' && (
-            <Alert severity="warning" sx={{ mt: 1 }}>
-              This will overwrite the production version of this plan.
-            </Alert>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => { setSyncDialogOpen(false); setPlanToSync(null); }} color="inherit">
-            Cancel
-          </Button>
-          <Button onClick={handleSyncPlan} variant="contained" color="primary" disabled={syncingPlanId === planToSync?.id}>
-            {syncingPlanId === planToSync?.id ? <CircularProgress size={20} color="inherit" /> : `Sync ${syncLabel}`}
-          </Button>
-        </DialogActions>
-      </Dialog>
     </Box>
   );
 };
+

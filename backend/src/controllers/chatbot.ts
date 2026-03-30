@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
+import { checkTokenUsage } from '../services/tokenUsageService';
 
 // Create a new chat session
 export const createChatSession = async (req: AuthenticatedRequest, res: Response) => {
@@ -147,7 +148,18 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     if (session.userId !== userId) {
       return res.status(403).json({ error: 'Unauthorized access to chat session' });
     }
-    
+
+    // Check token usage limits
+    if (userId) {
+      const usageStatus = await checkTokenUsage(userId);
+      if (!usageStatus.allowed) {
+        return res.status(429).json({
+          error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+          tokenUsage: usageStatus,
+        });
+      }
+    }
+
     try {
       // Generate response
       const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model });
@@ -203,6 +215,16 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
 
   if (!message) {
     res.status(400).json({ error: 'Message is required' });
+    return;
+  }
+
+  // Check token usage limits
+  const usageStatus = await checkTokenUsage(userId);
+  if (!usageStatus.allowed) {
+    res.status(429).json({
+      error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+      tokenUsage: usageStatus,
+    });
     return;
   }
 

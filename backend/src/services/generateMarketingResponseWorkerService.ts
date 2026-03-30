@@ -14,6 +14,7 @@ interface GenerateMarketingResponseParams {
   sessionId: string;
   mockMode?: boolean;
   isInteractiveShare?: boolean;
+  excludeTools?: string[];
 }
 
 interface GenerateMarketingResponseResult {
@@ -167,9 +168,12 @@ export class GenerateMarketingResponseWorkerService {
       if (message.type === 'success') {
         pending.resolve(message.result);
       } else if (message.type === 'error') {
-        const error = new Error(message.error);
+        const error: any = new Error(message.error);
         if (message.stack) {
           error.stack = message.stack;
+        }
+        if (message.partialUsageMessages?.length) {
+          error.partialUsageMessages = message.partialUsageMessages;
         }
         pending.reject(error);
       }

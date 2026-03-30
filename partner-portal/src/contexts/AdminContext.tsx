@@ -32,6 +32,10 @@ interface User {
   chatSessionCount?: number;
   isOAuthUser?: boolean;
   stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  subscription_status?: string; // active, trialing, past_due, canceled, canceling
+  has_payment_method?: boolean;
+  current_period_end?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
@@ -45,6 +49,13 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  tokenUsage?: {
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+    resetDate: string;
+  };
+  tokenAllowanceBonus?: number;
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }

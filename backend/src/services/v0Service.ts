@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
+import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
 
@@ -98,6 +99,7 @@ export interface GeneratedLandingPage {
   v0ChatId?: string;
   vercelProjectId?: string;
   deployedUrl?: string;
+  customDomainUrl?: string;
   githubRepoUrl?: string;
   previewImageUrl?: string;
   iterations: number;
@@ -1058,10 +1060,23 @@ export async function deployLandingPage(
 
     console.log(`[V0 SERVICE] Deployment complete: ${deployedUrl} | GitHub: ${githubRepoUrl}`);
 
+    // Auto-assign an agentwebforms.com subdomain after successful deploy
+    let customDomain: string | undefined;
+    try {
+      const subdomain = generateSubdomain(record.name || "page");
+      const domainRecord = await addSubdomain(userId, vercelProjectId, subdomain);
+      customDomain = domainRecord.domain;
+      console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
+    } catch (subdomainErr: any) {
+      // Non-fatal — the Vercel URL still works
+      console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
+    }
+
     return {
       ...record,
       status: "deployed",
       deployedUrl,
+      customDomainUrl: customDomain ? `https://${customDomain}` : undefined,
       vercelProjectId,
       githubRepoUrl,
       updatedAt: now,
@@ -1439,16 +1454,16 @@ async function createVercelProject(
 
   console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl} (requested name: ${projectName})`);
 
-  // Disable Vercel Authentication so preview deployments are publicly accessible
+  // Disable deployment protection so preview deployments are publicly accessible
   try {
     await axios.patch(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
-      { vercelAuthentication: { deploymentType: "none" } },
+      { ssoProtection: null, passwordProtection: null, trustedIps: null },
       { headers }
     );
-    console.log(`[V0 SERVICE] Disabled Vercel Authentication for ${projectName}`);
+    console.log(`[V0 SERVICE] Disabled deployment protection for ${projectName}`);
   } catch (authErr: any) {
-    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication: ${authErr.message}`);
+    console.warn(`[V0 SERVICE] Could not disable deployment protection: ${authErr.message}`);
   }
 
   // Manually trigger a deployment — Vercel doesn't always auto-deploy when linking to an existing repo
@@ -1630,54 +1645,63 @@ export async function getDeploymentStatus(
 export async function getPreviewDeploymentUrl(
   vercelProjectId: string,
   branch: string
-): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string }> {
+): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string; prUrl?: string }> {
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
 
-  // Ensure Vercel Authentication is disabled so preview URLs are publicly accessible
+  // Fetch project info and ensure Vercel Authentication is disabled
+  let projRes: any = null;
   try {
-    // First, check current project settings
-    const projRes = await axios.get<any>(
+    projRes = await axios.get<any>(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
       { headers }
     );
     console.log(`[V0 SERVICE] Project ${vercelProjectId} protection settings:`, JSON.stringify({
       ssoProtection: projRes.data?.ssoProtection,
-      vercelAuthentication: projRes.data?.vercelAuthentication,
       passwordProtection: projRes.data?.passwordProtection,
       trustedIps: projRes.data?.trustedIps,
-      protectionBypass: projRes.data?.protectionBypass,
     }));
 
     // Disable all protection types
     const patchRes = await axios.patch(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
-      {
-        ssoProtection: null,
-        vercelAuthentication: { deploymentType: "none" },
-        passwordProtection: null,
-      },
+      { ssoProtection: null, passwordProtection: null, trustedIps: null },
       { headers }
     );
-    console.log(`[V0 SERVICE] Disabled Vercel Authentication for project ${vercelProjectId}: ${patchRes.status}`);
+    console.log(`[V0 SERVICE] Disabled deployment protection for project ${vercelProjectId}: ${patchRes.status}`);
   } catch (authErr: any) {
-    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication for ${vercelProjectId}: ${authErr.response?.status} ${authErr.response?.data?.error?.message || authErr.message}`);
+    console.warn(`[V0 SERVICE] Could not disable deployment protection for ${vercelProjectId}: ${authErr.response?.status} ${authErr.response?.data?.error?.message || authErr.message}`);
   }
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)
   const deploymentsRes = await axios.get<any>(
-    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=5`,
+    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=20`,
     { headers }
   );
 
   const deployments = deploymentsRes.data?.deployments || [];
+  console.log(`[V0 SERVICE] Found ${deployments.length} deployments for project ${vercelProjectId}, looking for branch "${branch}". Branches in deployments: [${deployments.map((d: any) => d.meta?.githubCommitRef || 'none').join(', ')}]`);
+
   // Find the most recent deployment for this branch
   const branchDeployment = deployments.find((d: any) =>
     d.meta?.githubCommitRef === branch
   );
 
   if (!branchDeployment) {
-    return { buildStatus: "pending", previewUrl: undefined };
+    // No deployment found — Vercel deploys on PRs, not branch pushes.
+    // Create a draft PR to trigger the Vercel preview deployment.
+    const repoLink = projRes?.data?.link;
+    if (repoLink?.type === "github" && repoLink.repo) {
+      try {
+        const repoFullName = `${repoLink.org}/${repoLink.repo}`;
+        console.log(`[V0 SERVICE] No deployment found for branch "${branch}", creating draft PR to trigger Vercel preview`);
+        const prUrl = await createDraftPrForBranch(repoFullName, branch);
+        return { buildStatus: "building", previewUrl: undefined, prUrl };
+      } catch (prErr: any) {
+        console.warn(`[V0 SERVICE] Failed to create draft PR for branch "${branch}": ${prErr.response?.data?.message || prErr.message}`);
+      }
+    }
+    return { buildStatus: "not_found", previewUrl: undefined };
   }
 
   const state = branchDeployment.readyState || branchDeployment.state;
@@ -1694,6 +1718,40 @@ export async function getPreviewDeploymentUrl(
 
   // Still building
   return { buildStatus: state.toLowerCase(), previewUrl };
+}
+
+/**
+ * Create a draft PR for a branch if one doesn't already exist.
+ * Vercel's GitHub integration deploys on PRs, so this triggers the preview deployment.
+ */
+async function createDraftPrForBranch(repoFullName: string, branch: string): Promise<string | undefined> {
+  const { token: ghToken } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" };
+
+  // Check if a PR already exists for this branch
+  const existingPrs = await axios.get<any>(
+    `https://api.github.com/repos/${repoFullName}/pulls?head=${repoFullName.split('/')[0]}:${branch}&state=open`,
+    { headers: ghHeaders }
+  );
+  if (existingPrs.data?.length > 0) {
+    console.log(`[V0 SERVICE] Draft PR already exists for branch "${branch}": #${existingPrs.data[0].number}`);
+    return existingPrs.data[0].html_url;
+  }
+
+  // Create a draft PR
+  const prRes = await axios.post<any>(
+    `https://api.github.com/repos/${repoFullName}/pulls`,
+    {
+      title: `Preview: ${branch}`,
+      head: branch,
+      base: "main",
+      draft: true,
+      body: "Auto-created draft PR to trigger Vercel preview deployment.",
+    },
+    { headers: ghHeaders }
+  );
+  console.log(`[V0 SERVICE] Created draft PR #${prRes.data.number} for branch "${branch}" to trigger Vercel preview`);
+  return prRes.data.html_url;
 }
 
 /**
@@ -1808,6 +1866,48 @@ export async function getLandingPage(
   }
 
   return item;
+}
+
+/**
+ * Resolve the vercelProjectId for a page that is missing it by looking up
+ * sibling pages (same user, same githubRepoUrl) that have the field set.
+ * If found, backfills the value on the page record so future lookups are fast.
+ */
+export async function resolveVercelProjectId(
+  page: GeneratedLandingPage
+): Promise<string | null> {
+  if (page.vercelProjectId) return page.vercelProjectId;
+  if (!page.githubRepoUrl) return null;
+
+  const siblings = await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :userId",
+    ExpressionAttributeValues: { ":userId": page.userId },
+  });
+
+  const donor = siblings.find(
+    (s) => s.githubRepoUrl === page.githubRepoUrl && !!s.vercelProjectId
+  );
+  if (!donor?.vercelProjectId) return null;
+
+  // Backfill so this page won't need resolution again
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id: page.id },
+      UpdateExpression: "SET vercelProjectId = :vpid, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":vpid": donor.vercelProjectId,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+  console.log(
+    `[V0 SERVICE] Backfilled vercelProjectId ${donor.vercelProjectId} on page ${page.id} from sibling ${donor.id}`
+  );
+
+  return donor.vercelProjectId;
 }
 
 /**
