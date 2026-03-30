@@ -3394,4 +3394,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Supports tasks'
     ],
   },
-]; 
+  {
+    date: '2026-03-30',
+    changes: [
+      'Oncall Issues Now Tracked in Notion',
+      '- Oncall alerts automatically create items in the Sprint Tasks board tagged "Oncall"',
+      '- Oncall alert emails now include a direct link to the Notion item for faster triage',
+      '- New "Report Product Issue" tool in Emma lets you report bugs directly from chat',
+      '- Reported issues are tracked in Notion and the engineering team is notified immediately',
+    ],
+  },
+];
