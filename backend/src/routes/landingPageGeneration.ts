@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import fs from "fs";
 import path from "path";
 import axios from "axios";
+import { TEMPLATE_REGISTRY, TEMPLATES_DIR } from "../utils/templateRegistry";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, crmDb } from "../services/db";
 import {
@@ -25,13 +26,6 @@ const router = Router();
 // Constants
 // ---------------------------------------------------------------------------
 const MAX_INPUT_LENGTH = 10_000;
-
-const TEMPLATE_FILE_MAP: Record<string, string> = {
-  "event-marketing": "event-marketing.html",
-  "case-study": "case-study-lead-magnet.html",
-  "b2b-ad": "ad-campaign-optimized.html",
-  "advertorial": "advertorial.html",
-};
 
 // Expensive operations (v0 generation, deploy, iterate) — costs real credits
 const GENERATION_RATE_LIMIT_MAX = 10;
@@ -190,14 +184,17 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // If template_name provided (user picked a preset), load + condense from disk
     if (template_name && !template_html) {
-      const filename = TEMPLATE_FILE_MAP[template_name];
-      if (filename) {
-        const templatePath = path.join(__dirname, "..", "templates", filename);
-        if (fs.existsSync(templatePath)) {
-          const fullHtml = fs.readFileSync(templatePath, "utf-8");
+      const entry = TEMPLATE_REGISTRY[template_name];
+      if (entry) {
+        try {
+          const fullHtml = await fs.promises.readFile(path.join(TEMPLATES_DIR, entry.filename), "utf-8");
           template_html = extractTemplateOutline(fullHtml);
           console.log(`[LP GENERATION] Loaded template "${template_name}" (${template_html?.length} chars condensed)`);
+        } catch {
+          console.warn(`[LP GENERATION] Template file for "${template_name}" not found on disk, continuing without template`);
         }
+      } else {
+        console.warn(`[LP GENERATION] Unknown template_name "${template_name}", ignoring`);
       }
     }
 

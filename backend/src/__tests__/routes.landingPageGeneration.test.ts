@@ -79,8 +79,10 @@ jest.mock("../services/v0Service", () => ({
   BrandContext: {},
 }));
 
-jest.mock("fs");
-const mockedFs = fs as jest.Mocked<typeof fs>;
+jest.mock("fs", () => ({
+  promises: { readFile: jest.fn() },
+}));
+const mockedReadFile = fs.promises.readFile as jest.Mock;
 const mockedExtractOutline = extractTemplateOutline as jest.MockedFunction<typeof extractTemplateOutline>;
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
@@ -208,30 +210,52 @@ describe("POST /api/landing-pages/v0/generate", () => {
   });
 
   it("SUCCESS: template_name provided → loads and extracts template from disk", async () => {
-    mockedFs.existsSync.mockReturnValue(true);
-    mockedFs.readFileSync.mockReturnValue("<html>Full Template</html>");
+    mockedReadFile.mockResolvedValue("<html>Full Template</html>");
     mockedExtractOutline.mockReturnValue("Condensed Outline");
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ 
-        prompt: "Create a B2B page", 
-        template_name: "event-marketing" 
+      .send({
+        prompt: "Create a B2B page",
+        template_name: "event-marketing"
       });
 
     expect(res.status).toBe(201);
-    
-    // Check that fs was called correctly
-    expect(mockedFs.existsSync).toHaveBeenCalledWith(expect.stringContaining("event-marketing.html"));
-    expect(mockedFs.readFileSync).toHaveBeenCalledWith(expect.stringContaining("event-marketing.html"), "utf-8");
-    
-    // Check that extractTemplateOutline was called
+    expect(mockedReadFile).toHaveBeenCalledWith(expect.stringContaining("event-marketing.html"), "utf-8");
     expect(mockedExtractOutline).toHaveBeenCalledWith("<html>Full Template</html>");
 
     // Verify generateLandingPage received the condensed HTML (6th arg)
     const callArgs = mockGenerateLandingPage.mock.calls[0];
-    expect(callArgs[5]).toBe("Condensed Outline"); 
+    expect(callArgs[5]).toBe("Condensed Outline");
+  });
+
+  it("EDGE: valid template_name but file missing on disk → generation proceeds without template", async () => {
+    mockedReadFile.mockRejectedValue(Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", template_name: "event-marketing" });
+
+    expect(res.status).toBe(201);
+    // File read was attempted
+    expect(mockedReadFile).toHaveBeenCalledWith(expect.stringContaining("event-marketing.html"), "utf-8");
+    // But generation still proceeded — template_html arg (index 5) should be undefined
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("EDGE: unknown template_name is ignored, generation proceeds without template", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", template_name: "unknown-xyz" });
+
+    expect(res.status).toBe(201);
+    expect(mockedReadFile).not.toHaveBeenCalled();
+    // template_html arg (index 5) should be undefined
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBeUndefined();
   });
 
   it("SUCCESS: pulls market strategy and passes to generation", async () => {

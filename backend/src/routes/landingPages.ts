@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { userDb } from "../services/db";
 import { decryptPassword } from "../utils/crypto";
+import { TEMPLATE_REGISTRY, TEMPLATES_DIR } from "../utils/templateRegistry";
 
 const router = Router();
 
@@ -152,29 +153,7 @@ router.get("/", authenticateToken, async (req, res: Response) => {
   }
 });
 
-const TEMPLATE_REGISTRY: Record<string, { label: string; description: string; filename: string }> = {
-  "event-marketing": {
-    label: "Event Marketing",
-    description: "Webinars, conferences, and live events",
-    filename: "event-marketing.html",
-  },
-  "case-study": {
-    label: "Case Study / Lead Magnet",
-    description: "Gated PDFs, guides, and research reports",
-    filename: "case-study-lead-magnet.html",
-  },
-  "b2b-ad": {
-    label: "B2B Ad Campaign",
-    description: "Meta and LinkedIn ad landing pages",
-    filename: "ad-campaign-optimized.html",
-  },
-  "advertorial": {
-    label: "Advertorial",
-    description: "Sponsored editorial — video, article, and CTA",
-    filename: "advertorial.html",
-  },
-};
-
+// Template routes are intentionally public (no auth) — used for preview before page creation.
 router.get("/templates", (_req, res: Response) => {
   const templates = Object.entries(TEMPLATE_REGISTRY).map(([name, meta]) => ({
     name,
@@ -183,8 +162,8 @@ router.get("/templates", (_req, res: Response) => {
   res.json(templates);
 });
 
-router.get("/templates/:name", (req, res: Response) => {
-  let filename = "";
+router.get("/templates/:name", async (req, res: Response) => {
+  let filename: string;
   if (req.params.name === "default-v2") {
     filename = "landing-page-v2.html";
   } else {
@@ -194,13 +173,13 @@ router.get("/templates/:name", (req, res: Response) => {
     }
     filename = meta.filename;
   }
-  const filePath = path.join(__dirname, "..", "templates", filename);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "Template file missing" });
+  try {
+    const html = await fs.promises.readFile(path.join(TEMPLATES_DIR, filename), "utf-8");
+    res.setHeader("Content-Type", "text/html");
+    res.send(html);
+  } catch {
+    res.status(404).json({ error: "Template file missing" });
   }
-  const html = fs.readFileSync(filePath, "utf-8");
-  res.setHeader("Content-Type", "text/html");
-  res.send(html);
 });
 
 export default router;
