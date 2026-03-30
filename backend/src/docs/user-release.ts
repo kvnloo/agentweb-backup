@@ -24,6 +24,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed a bug where viewing lead details in the CRM or asking Emma for lead information would fail with an error when the lead had email engagement history',
       '- The issue occurred because email content is stored as an object with html/text fields, but the code was treating it as a plain string',
       '- Engagement history now loads correctly and displays email previews properly',
+      'Fix: LinkedIn Scheduled Outreach Context Overload',
+      '- Fixed a bug where daily LinkedIn outreach schedules would accumulate too many tokens over time, causing the agent to produce empty responses or fall back to generic connection messages',
+      '- The pending invitations list and search results were returning full profile data unnecessarily, inflating context to 600k-700k tokens per session',
+      '- Both results are now trimmed to only the fields needed for deduplication and personalization',
     ],
   },
   {
