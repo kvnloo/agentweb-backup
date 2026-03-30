@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
-import { scheduleDb, userDb, taskDb } from '../services/db';
+import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
@@ -14,7 +14,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
+import { isContextLimitError, isSessionLimitError, isTransientLLMError } from '../utils/agentModeErrors';
+import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
@@ -33,6 +34,49 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
   if (share.expiresAt) return new Date(share.expiresAt);
   if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
   return new Date(0); // No dates at all — treat as expired
+}
+
+/** Classify an error for the diagnosis agent. */
+function classifyErrorType(error: unknown): DiagnosisContext['errorType'] {
+  if (isContextLimitError(error)) return 'context_limit';
+  if (error instanceof Error) {
+    if (error.message.includes('content policies') || error.message.includes('content_filter')) return 'content_filter';
+    if (error.message.includes('high demand') || (error as any)?.status === 429) return 'rate_limit';
+    if (isTransientLLMError(error)) return 'transient';
+  }
+  return 'unknown';
+}
+
+/** Build a compact work plan summary string for the diagnosis agent. */
+function buildWorkPlanSummary(session: any): string | null {
+  if (!session?.workPlan?.steps?.length) return null;
+  return session.workPlan.steps
+    .map((s: any) => `Step ${s.stepCount}: ${s.title} [${s.status}]`)
+    .join('\n');
+}
+
+/**
+ * Invoke the diagnosis agent to produce a context-aware error message.
+ * Returns null if diagnosis fails — caller should fall back to the generic message.
+ */
+async function getDiagnosticErrorMessage(
+  error: unknown,
+  sessionId: string,
+  userMessage: string
+): Promise<string | null> {
+  try {
+    const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    const context: DiagnosisContext = {
+      errorType: classifyErrorType(error),
+      errorMessage: error instanceof Error ? error.message : String(error),
+      userMessage: userMessage || '',
+      workPlanSummary: buildWorkPlanSummary(session),
+      failedFunctions: session?.failedFunctions || null,
+    };
+    return await agentModeService.generateDiagnosticMessage(context);
+  } catch {
+    return null;
+  }
 }
 
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
@@ -1054,6 +1098,16 @@ export async function runScheduledChat(
 
     // Save error to session record if session was created
     if (sessionId) {
+      // Persist partial token usage from messages accumulated before the error
+      if ((error as any)?.partialUsageMessages?.length) {
+        try {
+          await chatbotDb.addMessagesToSession(sessionId, (error as any).partialUsageMessages);
+          console.log(`Scheduled chat: Persisted partial usage from ${(error as any).partialUsageMessages.length} messages for failed session ${sessionId}`);
+        } catch (usageErr) {
+          console.error('Failed to persist partial usage for scheduled chat:', usageErr);
+        }
+      }
+
       try {
         await chatbotDb.updateSessionError(
           sessionId,
@@ -1825,16 +1879,36 @@ export const agentModeController = {
         progressStore.delete(sessionId);
       }
 
+      // Persist partial token usage from messages accumulated before the error.
+      // This ensures we track costs even when generation fails mid-stream.
+      if (sessionId && (error as any)?.partialUsageMessages?.length) {
+        try {
+          await chatbotDb.addMessagesToSession(sessionId, (error as any).partialUsageMessages);
+          console.log(`AgentMode: Persisted partial usage from ${(error as any).partialUsageMessages.length} messages for failed session ${sessionId}`);
+        } catch (usageErr) {
+          console.error('AgentMode: Failed to persist partial usage on error:', usageErr);
+        }
+      }
+
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
+      // Use the diagnosis agent for a context-aware message when possible.
+      let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
+        // Skip diagnosis for errors that already have specific handling below (context limit, etc.)
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          const userMessage = req.body?.userMessage || '';
+          diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+        }
+
         const errorAssistantMessage: ChatMessage = {
           role: 'assistant',
-          content: 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
             isErrorMessage: true,
+            ...(diagnosticContent ? { isDiagnosticMessage: true } : {}),
           },
         };
         await chatbotDb.addMessageToSession(sessionId, errorAssistantMessage).catch(err => {
@@ -1973,7 +2047,10 @@ export const agentModeController = {
         }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
-      res.status(500).json({ error: 'Failed to generate response' });
+      res.status(500).json({
+        error: 'Failed to generate response',
+        ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
+      });
     }
   },
 
@@ -2384,14 +2461,22 @@ export const agentModeController = {
 
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
+      // Use the diagnosis agent for a context-aware message when possible.
+      let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          const userMessage = req.body?.userMessage || '';
+          diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+        }
+
         const errorAssistantMessage: ChatMessage = {
           role: 'assistant',
-          content: 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
             isErrorMessage: true,
+            ...(diagnosticContent ? { isDiagnosticMessage: true } : {}),
           },
         };
         await chatbotDb.addMessageToSession(shareId, errorAssistantMessage).catch(err => {
@@ -2532,7 +2617,10 @@ export const agentModeController = {
         }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
-      res.status(500).json({ error: 'Failed to generate response' });
+      res.status(500).json({
+        error: 'Failed to generate response',
+        ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
+      });
     }
   },
 
@@ -3332,10 +3420,6 @@ export const agentModeController = {
       if (variableError) {
         return res.status(400).json({ error: variableError });
       }
-      if (normalizedVariables.length > 0 && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
-      }
-
       const normalizedVariableValues: Record<string, string> = {};
       if (normalizedVariables.length > 0 && variableValues && typeof variableValues === 'object') {
         normalizedVariables.forEach((variable) => {
@@ -3344,6 +3428,13 @@ export const agentModeController = {
             normalizedVariableValues[variable.name] = rawValue.trim();
           }
         });
+      }
+
+      // Email is only required when variables exist but not all are pre-filled
+      const allVariablesPrefilled = normalizedVariables.length > 0
+        && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
+      if (normalizedVariables.length > 0 && !allVariablesPrefilled && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
       }
 
       scheduledChat.variables = normalizedVariables;
@@ -3490,9 +3581,6 @@ export const agentModeController = {
       const effectiveEmailNotifications = Array.isArray(emailNotifications)
         ? emailNotifications
         : (Array.isArray(existingSchedule.emailNotifications) ? existingSchedule.emailNotifications : []);
-      if (normalizedVariables.length > 0 && effectiveEmailNotifications.length === 0) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
-      }
       updates.variables = normalizedVariables;
 
       // Preserve existing values for unchanged variables unless explicitly overwritten
@@ -3519,6 +3607,13 @@ export const agentModeController = {
           normalizedVariableValues[variable.name] = existingValue.trim();
         }
       });
+
+      // Email is only required when variables exist but not all are pre-filled
+      const allUpdateVariablesPrefilled = normalizedVariables.length > 0
+        && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
+      if (normalizedVariables.length > 0 && !allUpdateVariablesPrefilled && effectiveEmailNotifications.length === 0) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
+      }
 
       updates.variableValues = normalizedVariableValues;
       updates.variableRequestStatus = normalizedVariables.length > 0
@@ -4143,10 +4238,14 @@ export const agentModeController = {
             && variableValuesUpdatedAtMs >= variableRequestSentAtMs;
           const valuesProvidedAfterLastRun = !Number.isFinite(lastRunTimeMs)
             || (Number.isFinite(variableValuesUpdatedAtMs) && variableValuesUpdatedAtMs > lastRunTimeMs);
+          // If all variable values are pre-filled (e.g. from a template) and no request
+          // has ever been sent, the schedule can run immediately without the email flow.
+          // We also require variableValuesUpdatedAt to be set to distinguish intentional
+          // pre-fills from legacy data missing timestamps.
+          const prefilledWithoutRequest = !hasVariableRequestSentAt && hasVariableValuesUpdatedAt && valuesProvidedAfterLastRun;
           const isVariableRequestSatisfied = schedule.variableRequestStatus === 'provided'
             && hasAllVariableValues
-            && valuesProvidedAfterLatestRequest
-            && valuesProvidedAfterLastRun;
+            && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
           const currentNextRun = new Date(schedule.nextRunTime);
@@ -4256,13 +4355,15 @@ export const agentModeController = {
           // Increment concurrent run counter
           currentConcurrentRuns++;
 
+          // Check if variable values came from the email request flow vs pre-filled at creation.
+          // Pre-filled values persist across runs; email-flow values are cleared after each run.
+          const hadVariableRequestFlow = typeof schedule.variableRequestSentAt === 'string' && schedule.variableRequestSentAt.length > 0;
+
           // Start the scheduled chat run asynchronously (don't await)
           runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
-
-            // Clear consumed variable values so each run requests fresh values
-            if (scheduleVariables.length > 0) {
+            if (scheduleVariables.length > 0 && hadVariableRequestFlow) {
               try {
                 await scheduleDb.updateSchedule(schedule.scheduleId, {
                   variableValues: {},
@@ -4316,7 +4417,7 @@ export const agentModeController = {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
 
-            if (scheduleVariables.length > 0) {
+            if (scheduleVariables.length > 0 && hadVariableRequestFlow) {
               scheduleDb.updateSchedule(schedule.scheduleId, {
                 variableValues: {},
                 variableRequestStatus: 'pending',
@@ -5277,6 +5378,351 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Update foundation tools error:', error);
       res.status(500).json({ error: 'Failed to update foundation tools' });
+    }
+  },
+
+  // ─── Schedule Templates ──────────────────────────────────────────────────
+
+  // POST /api/agent-mode/schedule-templates
+  createScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const {
+        name, description, category, visibility,
+        startingMessage, variables, keywords,
+        requiredFunctionCalls, functionCallMinCalls,
+        suggestedFrequency, frequencyIntervalDays,
+        emailNotifications, dailyDigest, llmModel,
+      } = req.body;
+
+      if (!name || !startingMessage) {
+        return res.status(400).json({ error: 'name and startingMessage are required' });
+      }
+
+      if (suggestedFrequency === 'every_n_days' && (frequencyIntervalDays === undefined || !Number.isInteger(frequencyIntervalDays) || frequencyIntervalDays < 1)) {
+        return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer when suggestedFrequency is every_n_days' });
+      }
+
+      // Extract variables from message
+      const variableRegex = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+      const messageVarNames = new Set<string>();
+      let match;
+      while ((match = variableRegex.exec(startingMessage)) !== null) {
+        messageVarNames.add(match[1]);
+      }
+
+      // Build normalized variables list
+      const inputVars = Array.isArray(variables) ? variables : [];
+      const normalizedVariables = Array.from(messageVarNames).map(varName => {
+        const existing = inputVars.find((v: any) => v.name === varName);
+        return {
+          name: varName,
+          description: existing?.description || '',
+          type: existing?.type || 'text',
+        };
+      });
+
+      const templateId = uuidv4();
+      const now = new Date().toISOString();
+
+      const template = {
+        templateId,
+        createdBy: user.userId,
+        name,
+        description: description || '',
+        category: category || 'General',
+        visibility: 'private' as const,
+        startingMessage,
+        variables: normalizedVariables,
+        keywords: keywords || [],
+        requiredFunctionCalls: requiredFunctionCalls || [],
+        functionCallMinCalls: functionCallMinCalls || {},
+        suggestedFrequency: suggestedFrequency || 'daily',
+        ...(suggestedFrequency === 'every_n_days' && { frequencyIntervalDays }),
+        emailNotifications: emailNotifications || [],
+        dailyDigest: dailyDigest || false,
+        llmModel: llmModel || '',
+        usageCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await scheduleTemplateDb.createTemplate(template);
+
+      res.status(201).json({
+        templateId,
+        message: 'Schedule template created successfully',
+      });
+    } catch (error) {
+      console.error('AgentMode: Create schedule template error:', error);
+      res.status(500).json({ error: 'Failed to create schedule template' });
+    }
+  },
+
+  // GET /api/agent-mode/schedule-templates
+  getScheduleTemplates: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+
+      // Get user's own templates + all system/public templates
+      const [userTemplates, systemTemplates, publicTemplates] = await Promise.all([
+        scheduleTemplateDb.getTemplatesByCreator(user.userId),
+        scheduleTemplateDb.getTemplatesByVisibility('system'),
+        scheduleTemplateDb.getTemplatesByVisibility('public'),
+      ]);
+
+      // Merge: system + public + user's own templates, deduplicated
+      const sharedTemplates = [...(systemTemplates || []), ...(publicTemplates || [])];
+      const sharedIds = new Set(sharedTemplates.map((t: any) => t.templateId));
+      const privateTemplates = (userTemplates || []).filter((t: any) => !sharedIds.has(t.templateId));
+      const all = [...sharedTemplates, ...privateTemplates];
+
+      // Sort newest first
+      all.sort((a: any, b: any) => {
+        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+      });
+
+      res.json(all);
+    } catch (error) {
+      console.error('AgentMode: Get schedule templates error:', error);
+      res.status(500).json({ error: 'Failed to get schedule templates' });
+    }
+  },
+
+  // GET /api/agent-mode/schedule-templates/:templateId
+  getScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const template = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!template) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+
+      // Allow access if system/public visibility or owned by user
+      const isPubliclyVisible = template.visibility === 'system' || template.visibility === 'public';
+      if (!isPubliclyVisible && template.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+
+      res.json(template);
+    } catch (error) {
+      console.error('AgentMode: Get schedule template error:', error);
+      res.status(500).json({ error: 'Failed to get schedule template' });
+    }
+  },
+
+  // PUT /api/agent-mode/schedule-templates/:templateId
+  updateScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const existing = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!existing || existing.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found or not owned by you' });
+      }
+
+      const {
+        name, description, category, visibility,
+        startingMessage, variables, keywords,
+        requiredFunctionCalls, functionCallMinCalls,
+        suggestedFrequency, frequencyIntervalDays,
+        emailNotifications, dailyDigest, llmModel,
+      } = req.body;
+
+      const updates: any = { updatedAt: new Date().toISOString() };
+
+      if (name !== undefined) updates.name = name;
+      if (description !== undefined) updates.description = description;
+      if (category !== undefined) updates.category = category;
+      if (visibility !== undefined) updates.visibility = visibility;
+      if (keywords !== undefined) updates.keywords = keywords;
+      if (requiredFunctionCalls !== undefined) updates.requiredFunctionCalls = requiredFunctionCalls;
+      if (functionCallMinCalls !== undefined) updates.functionCallMinCalls = functionCallMinCalls;
+      if (suggestedFrequency !== undefined) updates.suggestedFrequency = suggestedFrequency;
+      if (frequencyIntervalDays !== undefined) updates.frequencyIntervalDays = frequencyIntervalDays;
+      if (emailNotifications !== undefined) updates.emailNotifications = emailNotifications;
+      if (dailyDigest !== undefined) updates.dailyDigest = dailyDigest;
+      if (llmModel !== undefined) updates.llmModel = llmModel;
+
+      if (startingMessage !== undefined) {
+        updates.startingMessage = startingMessage;
+
+        // Re-extract variables from updated message
+        const variableRegex = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+        const messageVarNames = new Set<string>();
+        let match;
+        while ((match = variableRegex.exec(startingMessage)) !== null) {
+          messageVarNames.add(match[1]);
+        }
+        const inputVars = Array.isArray(variables) ? variables : (existing.variables || []);
+        updates.variables = Array.from(messageVarNames).map(varName => {
+          const existingVar = inputVars.find((v: any) => v.name === varName);
+          return { name: varName, description: existingVar?.description || '', type: existingVar?.type || 'text' };
+        });
+      } else if (variables !== undefined) {
+        updates.variables = variables;
+      }
+
+      await scheduleTemplateDb.updateTemplate(templateId, updates);
+
+      res.json({ message: 'Schedule template updated successfully' });
+    } catch (error) {
+      console.error('AgentMode: Update schedule template error:', error);
+      res.status(500).json({ error: 'Failed to update schedule template' });
+    }
+  },
+
+  // DELETE /api/agent-mode/schedule-templates/:templateId
+  deleteScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const existing = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!existing || existing.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found or not owned by you' });
+      }
+
+      await scheduleTemplateDb.deleteTemplate(templateId);
+
+      res.json({ message: 'Schedule template deleted successfully' });
+    } catch (error) {
+      console.error('AgentMode: Delete schedule template error:', error);
+      res.status(500).json({ error: 'Failed to delete schedule template' });
+    }
+  },
+
+  // POST /api/agent-mode/schedule-templates/:templateId/use
+  createScheduleFromTemplate: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+      const {
+        scheduleName, nextRunTime, scheduleFrequency,
+        frequencyIntervalDays: overrideInterval,
+        emailNotifications: overrideEmails,
+        variableValues, runCount, llmModel: overrideModel,
+      } = req.body;
+
+      const template = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!template) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+      const isPubliclyVisible = template.visibility === 'system' || template.visibility === 'public';
+      if (!isPubliclyVisible && template.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+
+      const frequency = scheduleFrequency || template.suggestedFrequency || 'daily';
+      const interval = overrideInterval || template.frequencyIntervalDays;
+
+      if (frequency === 'every_n_days' && (!interval || !Number.isInteger(interval) || interval < 1)) {
+        return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer for every_n_days frequency' });
+      }
+
+      const now = new Date();
+      let scheduledNextRunTime: string;
+      if (nextRunTime) {
+        const providedDate = new Date(nextRunTime);
+        if (isNaN(providedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        }
+        scheduledNextRunTime = providedDate.toISOString();
+      } else {
+        scheduledNextRunTime = calculateNextRunTime(frequency, now, interval).toISOString();
+      }
+
+      // Build normalized variable values from template variables
+      const normalizedVariableValues: Record<string, string> = {};
+      const templateVars: any[] = template.variables || [];
+      if (templateVars.length > 0 && variableValues && typeof variableValues === 'object') {
+        templateVars.forEach((v: any) => {
+          const rawValue = (variableValues as Record<string, unknown>)[v.name];
+          if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+            normalizedVariableValues[v.name] = rawValue.trim();
+          }
+        });
+      }
+
+      const missingVars = templateVars.filter((v: any) => !normalizedVariableValues[v.name]);
+      const emails = overrideEmails || template.emailNotifications || [];
+
+      if (templateVars.length > 0 && missingVars.length > 0 && (!Array.isArray(emails) || emails.length === 0)) {
+        return res.status(400).json({ error: 'Email notifications are required when template has variables (unless all variable values are pre-filled)' });
+      }
+
+      const scheduleId = uuidv4();
+      const scheduledChat: any = {
+        scheduleId,
+        taskId: 'global',
+        userId: user.userId,
+        frequency,
+        ...(frequency === 'every_n_days' && { frequencyIntervalDays: interval }),
+        scheduleName: scheduleName || template.name,
+        description: template.description || '',
+        startingMessage: template.startingMessage,
+        keywords: template.keywords || [],
+        requiredFunctionCalls: template.requiredFunctionCalls || [],
+        functionCallMinCalls: template.functionCallMinCalls || {},
+        emailNotifications: emails,
+        dailyDigest: frequency === 'hourly' ? (template.dailyDigest || false) : false,
+        status: 'active',
+        nextRunTime: scheduledNextRunTime,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        sessionId: null,
+        type: 'scheduled_chat',
+        llmModel: overrideModel || template.llmModel || '',
+        runCount: runCount !== undefined ? runCount : -1,
+        variables: templateVars,
+        variableValues: normalizedVariableValues,
+        variableRequestStatus: missingVars.length > 0 ? 'pending' : (templateVars.length > 0 ? 'provided' : 'idle'),
+      };
+
+      await scheduleDb.createSchedule(scheduledChat);
+
+      // Increment template usage count
+      await scheduleTemplateDb.incrementUsageCount(templateId);
+
+      res.status(201).json({
+        scheduleId,
+        message: 'Scheduled chat created from template successfully',
+        nextRunTime: scheduledNextRunTime,
+        templateId,
+      });
+    } catch (error) {
+      console.error('AgentMode: Create schedule from template error:', error);
+      res.status(500).json({ error: 'Failed to create schedule from template' });
+    }
+  },
+
+  // POST /api/agent-mode/schedule-templates/:templateId/submit-for-review
+  submitTemplateForReview: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user as User;
+      const { templateId } = req.params;
+
+      const template = await scheduleTemplateDb.getTemplateById(templateId);
+      if (!template || template.createdBy !== user.userId) {
+        return res.status(404).json({ error: 'Template not found or not owned by you' });
+      }
+      if (template.visibility !== 'private') {
+        return res.status(400).json({ error: 'Only private templates can be submitted for review' });
+      }
+
+      await scheduleTemplateDb.updateTemplate(templateId, {
+        visibility: 'pending_review',
+        reviewFeedback: '',
+        updatedAt: new Date().toISOString(),
+      });
+
+      res.json({ message: 'Template submitted for review successfully' });
+    } catch (error) {
+      console.error('AgentMode: Submit template for review error:', error);
+      res.status(500).json({ error: 'Failed to submit template for review' });
     }
   },
 };

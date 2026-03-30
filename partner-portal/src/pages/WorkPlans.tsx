@@ -111,6 +111,7 @@ export default function WorkPlans() {
 
   // Expanded rows
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedPendingId, setExpandedPendingId] = useState<string | null>(null);
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<WorkPlan | null>(null);
@@ -318,31 +319,73 @@ export default function WorkPlans() {
           </Typography>
           <Stack spacing={1}>
             {pendingPlans.map((plan) => (
-              <Box key={plan.planId} sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", p: 1, bgcolor: "background.paper", borderRadius: 1 }}>
-                <Box>
-                  <strong>{plan.title}</strong>
-                  <Typography variant="body2" color="text.secondary" component="span" sx={{ ml: 1 }}>
-                    — {plan.steps?.length || 0} steps
-                  </Typography>
-                  {plan.description && (
-                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                      {plan.description}
-                    </Typography>
-                  )}
-                  {plan.ownerId && (
-                    <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
-                      (by {plan.ownerId})
-                    </Typography>
-                  )}
+              <Box key={plan.planId} sx={{ bgcolor: "background.paper", borderRadius: 1, overflow: "hidden" }}>
+                <Box
+                  sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", p: 1, cursor: "pointer" }}
+                  onClick={() => setExpandedPendingId(expandedPendingId === plan.planId ? null : plan.planId)}
+                >
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <IconButton size="small">
+                      {expandedPendingId === plan.planId ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
+                    </IconButton>
+                    <Box>
+                      <strong>{plan.title}</strong>
+                      <Typography variant="body2" color="text.secondary" component="span" sx={{ ml: 1 }}>
+                        — {plan.steps?.length || 0} steps
+                      </Typography>
+                      {plan.ownerId && (
+                        <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+                          (by {plan.ownerId})
+                        </Typography>
+                      )}
+                    </Box>
+                  </Box>
+                  <Stack direction="row" spacing={1}>
+                    <Button variant="contained" color="success" size="small" onClick={(e) => { e.stopPropagation(); handleApprove(plan.planId); }}>
+                      Approve
+                    </Button>
+                    <Button variant="outlined" color="error" size="small" onClick={(e) => { e.stopPropagation(); setRejectTarget(plan); setRejectDialogOpen(true); }}>
+                      Reject
+                    </Button>
+                  </Stack>
                 </Box>
-                <Stack direction="row" spacing={1}>
-                  <Button variant="contained" color="success" size="small" onClick={() => handleApprove(plan.planId)}>
-                    Approve
-                  </Button>
-                  <Button variant="outlined" color="error" size="small" onClick={() => { setRejectTarget(plan); setRejectDialogOpen(true); }}>
-                    Reject
-                  </Button>
-                </Stack>
+                <Collapse in={expandedPendingId === plan.planId}>
+                  <Box sx={{ px: 2, pb: 2, pt: 1, borderTop: "1px solid", borderColor: "divider" }}>
+                    {plan.description && (
+                      <Typography variant="body2" sx={{ mb: 1 }}>
+                        <strong>Description:</strong> {plan.description}
+                      </Typography>
+                    )}
+                    {plan.welcomeMessage && (
+                      <Typography variant="body2" sx={{ mb: 1 }}>
+                        <strong>Welcome:</strong> {plan.welcomeMessage}
+                      </Typography>
+                    )}
+                    <Typography variant="body2" sx={{ mb: 1 }}>
+                      <strong>Settings:</strong>{" "}
+                      {plan.autocomplete && <Chip label="Autocomplete" size="small" sx={{ mr: 0.5 }} />}
+                      {plan.requireLogin && <Chip label="Login Required" size="small" sx={{ mr: 0.5 }} />}
+                      {plan.defaultModel && <Chip label={`Model: ${plan.defaultModel}`} size="small" sx={{ mr: 0.5 }} />}
+                      {!plan.autocomplete && !plan.requireLogin && !plan.defaultModel && <span>None</span>}
+                    </Typography>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}><strong>Steps:</strong></Typography>
+                    {plan.steps?.map((step, i) => (
+                      <Box key={i} sx={{ ml: 2, mb: 0.5 }}>
+                        <Typography variant="body2">
+                          {step.stepCount}. <strong>{step.title}</strong>
+                          {step.description && <span> — {step.description}</span>}
+                        </Typography>
+                        {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                          <Box sx={{ ml: 2 }}>
+                            {step.requiredFunctionCalls.map((fc, j) => (
+                              <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
+                            ))}
+                          </Box>
+                        )}
+                      </Box>
+                    ))}
+                  </Box>
+                </Collapse>
               </Box>
             ))}
           </Stack>

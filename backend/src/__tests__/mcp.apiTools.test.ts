@@ -335,4 +335,144 @@ describe('apiTools', () => {
     });
   });
 
+  // ─── get_chat_history ─────────────────────────────────────────────────
+
+  describe('get_chat_history', () => {
+    it('should return all metadata fields and exclude raw messages', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-1',
+          userId: 'user-1',
+          title: 'Test Session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          portalType: 'customer',
+          sessionType: 'regular',
+          llmModel: 'claude-sonnet-4-6',
+          totalTokens: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          totalCost: 0.003,
+          satisfactionScore: { score: 4, reason: 'Good', evaluatedAt: '2026-03-28T01:00:00Z', evaluatedMessageIndex: 3 },
+          judgeScores: { judge1: { score: 5, reason: 'Great', evaluatedAt: '2026-03-28T01:00:00Z', evaluatedMessageIndex: 3, judgeName: 'Judge 1' } },
+          workPlan: {
+            title: 'Plan A',
+            steps: [{ stepCount: 1, title: 'Step 1', description: 'Do something', status: 'completed' }],
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T00:30:00Z',
+          },
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi there', metadata: { feedback: { type: 'like' }, timestamp: '2026-03-28T00:01:00Z' } },
+            { role: 'assistant', content: 'More info', metadata: {
+              feedback: { type: 'dislike' },
+              iterationTimings: [{ llmDurationMs: 5000 }, { llmDurationMs: 3000 }],
+              memoryUsage: { currentHeapUsedMB: 2500 },
+              timestamp: '2026-03-28T00:02:00Z',
+            }},
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      const session = parsed.sessions[0];
+
+      // All metadata fields present
+      expect(session.sessionId).toBe('sess-1');
+      expect(session.portalType).toBe('customer');
+      expect(session.llmModel).toBe('claude-sonnet-4-6');
+      expect(session.sessionType).toBe('regular');
+      expect(session.messageCount).toBe(3);
+      expect(session.totalTokens).toEqual({ prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 });
+      expect(session.totalCost).toBe(0.003);
+      expect(session.satisfactionScore).toBeDefined();
+      expect(session.judgeScores).toBeDefined();
+
+      // Computed metrics
+      expect(session.feedback).toEqual({ likes: 1, dislikes: 1 });
+      expect(session.longestWaitMs).toBe(8000);
+      expect(session.maxHeapMB).toBe(2500);
+
+      // Work plan summary (no description field)
+      expect(session.workPlan).toEqual({
+        title: 'Plan A',
+        steps: [{ stepCount: 1, title: 'Step 1', status: 'completed' }],
+      });
+
+      // Raw messages NOT included
+      expect(session.messages).toBeUndefined();
+    });
+
+    it('should handle sessions with no messages gracefully', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-2',
+          userId: 'user-2',
+          title: null,
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T00:00:00Z',
+          messages: [],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      const session = parsed.sessions[0];
+
+      expect(session.messageCount).toBe(0);
+      expect(session.portalType).toBeNull();
+      expect(session.llmModel).toBeNull();
+      expect(session.sessionType).toBeNull();
+      expect(session.feedback).toBeNull();
+      expect(session.longestWaitMs).toBeNull();
+      expect(session.maxHeapMB).toBeNull();
+      expect(session.workPlan).toBeNull();
+      expect(session.messages).toBeUndefined();
+    });
+
+    it('should handle sessions with no feedback or timing data', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-3',
+          userId: 'user-3',
+          title: 'Plain Session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          llmModel: 'gpt-4o',
+          portalType: 'partner',
+          messages: [
+            { role: 'user', content: 'test' },
+            { role: 'assistant', content: 'response', metadata: { timestamp: '2026-03-28T00:01:00Z' } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      const session = parsed.sessions[0];
+
+      expect(session.llmModel).toBe('gpt-4o');
+      expect(session.portalType).toBe('partner');
+      expect(session.messageCount).toBe(2);
+      // No feedback, timings, or heap data
+      expect(session.feedback).toBeNull();
+      expect(session.longestWaitMs).toBeNull();
+      expect(session.maxHeapMB).toBeNull();
+    });
+  });
+
 });

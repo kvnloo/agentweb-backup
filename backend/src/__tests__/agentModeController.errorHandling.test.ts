@@ -34,9 +34,12 @@ jest.mock('../services/agentModeService', () => ({
     getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
+    generateDiagnosticMessage: jest.fn().mockResolvedValue(null), // default: no diagnostic (fallback to generic)
   },
   AgentModeService: jest.fn(),
 }));
+
+const mockAgentModeService = jest.requireMock('../services/agentModeService').agentModeService;
 
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn().mockResolvedValue({
@@ -336,7 +339,7 @@ describe('AgentModeController - Error Handling', () => {
 
       // Should still return 500 error
       expect(mockRes.status).toHaveBeenCalledWith(500);
-      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Failed to generate response' });
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({ error: 'Failed to generate response' }));
     });
 
     it('should handle oncall alert failure gracefully', async () => {
@@ -661,6 +664,146 @@ describe('AgentModeController - Error Handling', () => {
       expect(responseCall.content).toContain('More content');
       // Empty strings and null should be filtered out
       expect(responseCall.content.split('\n').length).toBe(2);
+    });
+  });
+
+  describe('generateResponse - Diagnosis agent', () => {
+    it('should persist diagnostic message when diagnosis agent succeeds', async () => {
+      const diagnosticMsg = '5 of 6 landing pages were generated. The second page failed. You can retry to complete it.';
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(diagnosticMsg);
+
+      const llmError = new Error('Gemini 500: internal server error');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(llmError);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Create 6 landing pages',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      // Should persist a diagnostic message (not the generic one)
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![1].content).toBe(diagnosticMsg);
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+
+      // HTTP response should include diagnosticMessage
+      expect(mockRes.status).toHaveBeenCalledWith(500);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+        error: 'Failed to generate response',
+        diagnosticMessage: diagnosticMsg,
+      }));
+    });
+
+    it('should fall back to generic message when diagnosis agent returns null', async () => {
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
+
+      const llmError = new Error('Some LLM error');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(llmError);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![1].content).toBe('I encountered an error processing your request. Please try sending your message again.');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBeUndefined();
+
+      // HTTP response should NOT include diagnosticMessage
+      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Failed to generate response' });
+    });
+
+    it('should not invoke diagnosis agent for session-limit errors', async () => {
+      const sessionLimitError = new Error('SESSION_MESSAGE_LIMIT_EXCEEDED: Too many messages');
+      mockChatbotDb.addMessageToSession.mockRejectedValue(sessionLimitError);
+
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+      } as any);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      expect(mockAgentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
+    });
+
+    it('should not invoke diagnosis agent for context-limit errors', async () => {
+      const contextError: any = new Error('The request exceeded the model context window');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(contextError);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      expect(mockAgentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
+      expect(mockRes.status).toHaveBeenCalledWith(413);
     });
   });
 });

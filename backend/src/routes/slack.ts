@@ -36,16 +36,46 @@ async function handleSlackSessionResponse(params: {
   ts: string;
   rawMessage: string;
   userMessage: string;
+  adminEmail?: string;
+  isAdminChannel?: boolean;
 }) {
-  const { session, user, channel, ts, rawMessage, userMessage } = params;
+  const { session, user, channel, ts, rawMessage, userMessage, adminEmail, isAdminChannel } = params;
   const { chatbotDb } = await import('../services/chatbotService');
   const { settingsService } = await import('../services/settingsService');
+  const { ensureGtmWorkItemForSlackSession } = await import('../services/gtmPlanService');
 
   // Set session title based on raw message (without username prefix)
   const sessionTitle = rawMessage.length > 50
     ? rawMessage.substring(0, 47) + '...'
     : rawMessage;
   await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
+
+  // Track this Slack session as a GTM Tracker work item
+  let gtmTrackerLink: string | null = null;
+  try {
+    const gtmResult = await ensureGtmWorkItemForSlackSession({
+      userId: user.userId,
+      sessionId: session.sessionId,
+      rawMessage,
+      adminEmail,
+    });
+    if (gtmResult) {
+      await chatbotDb.updateSessionGtmWorkItem(session.sessionId, gtmResult);
+      const deepLinkParams = `?planId=${gtmResult.planId}&phaseId=${gtmResult.phaseId}`;
+      if (isAdminChannel) {
+        // Admin-channel sessions: link to partner portal GTM ops page
+        const partnerPortalUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+        gtmTrackerLink = `${partnerPortalUrl}/gtm-ops${deepLinkParams}`;
+      } else {
+        // Regular user sessions: link to customer portal GTM plan page
+        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+        gtmTrackerLink = `${customerFrontendUrl}/gtm-plan${deepLinkParams}`;
+      }
+      console.log(`📊 Slack session ${session.sessionId} tracked in GTM plan ${gtmResult.planId}`);
+    }
+  } catch (gtmError) {
+    console.error('⚠️ Non-blocking: Failed to track Slack session in GTM Tracker:', gtmError);
+  }
 
   // Associate the session with this Slack thread
   const slackThread = { channel, threadTs: ts };
@@ -92,10 +122,24 @@ async function handleSlackSessionResponse(params: {
       await postThreadResponse(channel, ts, response.content);
     }
 
-    // Post iShare link as a separate follow-up message
+    // Post iShare link and GTM Tracker link as a separate follow-up message
     if (ishareLink) {
       const { WebClient } = await import('@slack/web-api');
       const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+      const contextElements: any[] = [
+        {
+          type: 'mrkdwn',
+          text: `:speech_balloon: Continue chat by simply reply or <${ishareLink}|click to chat in AgentWeb portal>`
+        }
+      ];
+      if (gtmTrackerLink) {
+        contextElements.push({
+          type: 'mrkdwn',
+          text: `:bar_chart: <${gtmTrackerLink}|Manage all sessions in GTM Tracker>`
+        });
+      }
+
       await slackClient.chat.postMessage({
         channel,
         thread_ts: ts,
@@ -103,18 +147,25 @@ async function handleSlackSessionResponse(params: {
         blocks: [
           {
             type: 'context',
-            elements: [
-              {
-                type: 'mrkdwn',
-                text: `:speech_balloon: Continue chat by simply reply or <${ishareLink}|click to chat in AgentWeb portal>`
-              }
-            ]
+            elements: contextElements
           }
         ]
       });
     }
   } catch (genError) {
     console.error('❌ Error generating agent response for Slack session:', genError);
+
+    // Persist partial token usage from messages accumulated before the error
+    if ((genError as any)?.partialUsageMessages?.length) {
+      try {
+        const { chatbotDb } = await import('../services/chatbotService');
+        await chatbotDb.addMessagesToSession(session.sessionId, (genError as any).partialUsageMessages);
+        console.log(`Slack session: Persisted partial usage from ${(genError as any).partialUsageMessages.length} messages for failed session ${session.sessionId}`);
+      } catch (usageErr) {
+        console.error('Failed to persist partial usage for Slack session:', usageErr);
+      }
+    }
+
     if (thinkingTs) {
       await deleteSlackMessage(channel, thinkingTs);
     }
@@ -292,7 +343,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           // Check if this is the admin Slack channel
           const adminChannelSetting = await settingsService.getSetting('slack_admin_channel');
-          const isAdminChannel = adminChannelSetting?.settingValue && adminChannelSetting.settingValue === channel;
+          const isAdminChannel = !!(adminChannelSetting?.settingValue && adminChannelSetting.settingValue === channel);
 
           let user = null;
           let delegateInfo: { adminUserId: string; adminEmail: string; isDelegated: boolean } | undefined;
@@ -304,51 +355,50 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             // Allow optional comma/colon after email: "for user@email.com, say hello"
             const forMatch = rawMessage.match(/^for\s+(\S+@\S+?)[,:\s]\s*([\s\S]+)$/i);
 
-            if (!forMatch) {
-              await slackClient.chat.postMessage({
-                channel,
-                text: 'This is the admin support channel. Please use the syntax:\n`@Emma for user@email.com <your message>`',
-                thread_ts: ts
-              });
-              return;
-            }
+            if (forMatch) {
+              const targetEmail = forMatch[1].toLowerCase();
+              actualMessage = forMatch[2].trim();
 
-            const targetEmail = forMatch[1].toLowerCase();
-            actualMessage = forMatch[2].trim();
-
-            // Look up the target user
-            user = await userDb.getUserByEmail(targetEmail);
-            if (!user) {
-              await slackClient.chat.postMessage({
-                channel,
-                text: `User not found: ${targetEmail}`,
-                thread_ts: ts
-              });
-              return;
-            }
-
-            // Resolve admin identity from Slack
-            const adminEmail = await getSlackUserEmail(slackUserId);
-            let adminUserId = slackUserId;
-            if (adminEmail) {
-              const adminUser = await userDb.getUserByEmail(adminEmail);
-              if (adminUser) {
-                adminUserId = adminUser.userId;
+              // Look up the target user
+              user = await userDb.getUserByEmail(targetEmail);
+              if (!user) {
+                await slackClient.chat.postMessage({
+                  channel,
+                  text: `User not found: ${targetEmail}`,
+                  thread_ts: ts
+                });
+                return;
               }
+
+              // Resolve admin identity from Slack
+              const adminEmail = await getSlackUserEmail(slackUserId);
+              let adminUserId = slackUserId;
+              if (adminEmail) {
+                const adminUser = await userDb.getUserByEmail(adminEmail);
+                if (adminUser) {
+                  adminUserId = adminUser.userId;
+                }
+              }
+
+              delegateInfo = {
+                adminUserId,
+                adminEmail: adminEmail || `slack:${slackUserId}`,
+                isDelegated: true
+              };
+              pageIdentifier = 'slack-bot-admin';
+
+              // Post confirmation
+              await postThreadResponse(channel, ts, `Starting session for ${targetEmail}`);
+              console.log(`📝 Admin channel: creating delegated session for ${targetEmail} (admin: ${delegateInfo.adminEmail})`);
+            } else {
+              // No "for email" prefix — fall through to regular user lookup below
+              console.log(`📝 Admin channel: no "for email" prefix, treating as regular user session`);
             }
+          }
 
-            delegateInfo = {
-              adminUserId,
-              adminEmail: adminEmail || `slack:${slackUserId}`,
-              isDelegated: true
-            };
-            pageIdentifier = 'slack-bot-admin';
-
-            // Post confirmation
-            await postThreadResponse(channel, ts, `Starting session for ${targetEmail}`);
-            console.log(`📝 Admin channel: creating session for ${targetEmail} (admin: ${delegateInfo.adminEmail})`);
-          } else {
-            // Regular per-user channel: existing lookup logic
+          // If user not yet resolved (regular channel OR admin channel without "for email"),
+          // look up user by channel mapping or slackChannel field
+          if (!user) {
             const mappingKey = `slack_channel_mapping_${channel}`;
 
             const cachedMapping = await settingsService.getSetting(mappingKey);
@@ -409,7 +459,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             channel,
             ts,
             rawMessage: actualMessage,
-            userMessage
+            userMessage,
+            adminEmail: delegateInfo?.adminEmail,
+            isAdminChannel,
           });
 
           console.log('✅ Emma bot mention handled successfully');

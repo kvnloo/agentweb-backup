@@ -1,3 +1,191 @@
+# March 29, 2026: Investigation — Sonnet 4.6 vs Opus 4.6 Cost & Quality Comparison for Agent Mode
+
+## Problem
+
+Agent Mode defaults to Opus 4.6 (`anthropic.claude-opus-4-6-v1`) for all sessions. Opus is the most expensive Claude model. Need to determine whether switching the default to Sonnet 4.6 would meaningfully reduce costs without degrading output quality for typical marketing tasks.
+
+## Approach
+
+Ran identical marketing tasks on both models using the test account (`test@example.com`) and compared cost, token usage, and output quality.
+
+### Tasks Tested
+1. **SWOT Analysis** — "Create a SWOT analysis for my business"
+2. **LinkedIn Posts** — "Create 3 LinkedIn posts for my business"
+3. **Email Nurture Sequence** — email marketing content
+4. **Brand Guidelines Review** — brand strategy analysis
+5. **Competitor Analysis** — competitive landscape research
+
+## Results
+
+### Cost Comparison (Same Tasks, Same Account)
+
+| Task | Sonnet 4.6 Cost | Opus 4.6 Cost | Opus Premium |
+|------|-----------------|---------------|--------------|
+| SWOT Analysis | $0.091 | $0.677 | **7.4x** |
+| LinkedIn Posts | $0.062 | $1.270 | **20.5x** |
+
+**Average: Opus costs ~14x more per session for comparable marketing tasks.**
+
+### Sonnet 4.6 — Full Test Results
+
+| Task | Session | Cost | Output Tokens |
+|------|---------|------|---------------|
+| SWOT Analysis | 9246850b | $0.091 | 10,526 |
+| LinkedIn Posts | 53c768c5 | $0.062 | ~7,000 |
+| Email Nurture | d41e9b3c | $0.062 | ~7,000 |
+| Brand Guidelines | dfdc46b6 | $0.106 | ~10,000 |
+| Competitor Analysis | 067d7bd5 | $0.159 | ~14,000 |
+
+**Average Sonnet session cost: $0.096**
+
+### Opus 4.6 — Test Results
+
+| Task | Session | Cost | Output Tokens |
+|------|---------|------|---------------|
+| SWOT Analysis | d3173b8a | $0.677 | 10,468 |
+| LinkedIn Posts | 9b0603f3 | $1.270 | 8,654 |
+
+**Average Opus session cost: $0.974**
+
+### Pricing Reference
+
+| Model | Input (per 1M tokens) | Output (per 1M tokens) |
+|-------|----------------------|------------------------|
+| Sonnet 4.6 | $3 | $15 |
+| Opus 4.6 | $15 | $75 |
+
+## Quality Assessment
+
+Both models produced **excellent, production-quality** marketing outputs:
+
+- **SWOT Analysis**: Both generated comprehensive strategic frameworks with tables, bullet points, and actionable recommendations. Indistinguishable quality.
+- **LinkedIn Posts**: Both created well-crafted content. Opus was slightly more "feature-aware" — it discovered and used the `create_social_media_posts` tool to save posts directly, while Sonnet presented them inline. The extra tool usage drove Opus cost much higher.
+- **Email/Brand/Competitor tasks** (Sonnet only): All produced thorough, well-structured outputs comparable to what Opus would generate.
+
+### Key Observation
+
+Opus's main advantage is being more likely to discover and use platform tools (e.g., `create_social_media_posts`, `install_skills`). However, this increases cost significantly (more iterations, more tool calls) and the end-user output quality is equivalent.
+
+## Projected Monthly Savings
+
+Assuming ~500 agent mode sessions/month:
+- **Opus monthly cost**: ~$487 (500 × $0.974)
+- **Sonnet monthly cost**: ~$48 (500 × $0.096)
+- **Potential savings**: ~$439/month (~90% reduction)
+
+## Recommendation
+
+**Switch the default model to Sonnet 4.6.** The quality difference is negligible for marketing tasks, and the cost savings are dramatic (7-20x per session). Opus can remain available as a manual selection in the model dropdown for users who want it.
+
+### Also Investigated: Auto_CostSaving Meta-Model
+
+Explored building an `Auto_CostSaving` meta-model that dynamically routes between Claude models per iteration based on task complexity. Implementation was completed but ultimately unnecessary — since Sonnet handles all tested tasks at equivalent quality, a simple default switch is cleaner than a dynamic routing system.
+
+**Decision:** Discard Auto_CostSaving code; switch default model to Sonnet 4.6 instead.
+
+---
+
+# March 28, 2026: Investigation — SESSION_MESSAGE_LIMIT_EXCEEDED on Scheduled Chat (BirdDog Blog Articles)
+
+## Problem
+
+Schedule `527a6748-abc5-4475-aa1e-e9e77cd09d09` ("BirdDog Blog Articles", user `7856055c-298f-4478-ba4c-183240fe2db2`) failed after ~80 minutes with:
+
+```
+SESSION_MESSAGE_LIMIT_EXCEEDED: Adding 14 message(s) would exceed the maximum of 300 messages per session (current: 289). Please start a new session to continue the conversation.
+```
+
+Session: `e1694c29-ca30-42cf-981a-2a30f1ed2eda`
+
+## Root Cause
+
+**The LLM refused to call `search_web` despite it being listed as a required function in the schedule config.** The `runVerifiedChat` retry loop kept requesting the LLM to call `search_web`, but the LLM repeatedly declined or ignored the instruction, causing the loop to retry up to its max attempts. Each retry added ~12-18 messages (user prompt + LLM response + tool calls + tool results), and after ~15 attempts the session had accumulated 289 messages — 11 short of the 300 hard limit.
+
+This is fundamentally a **prompt-following issue** — the LLM did not comply with the instruction to call `search_web`, and the retry mechanism had no way to detect that the LLM was systematically refusing a specific tool call vs. simply needing another attempt.
+
+A secondary issue: `runVerifiedChat` had **no pre-flight check** on the session message count before retrying, so it kept retrying until it hit the hard limit and crashed instead of stopping gracefully.
+
+## Fix
+
+1. **Config fix (immediate):** Removed `search_web` from `requiredFunctionCalls` in the schedule config. The tool is not essential for blog article generation — the LLM calls it organically when needed, and forcing it via `requiredFunctionCalls` creates a brittle dependency on the LLM's willingness to comply.
+
+2. **Code fix (defensive):** Added a pre-flight message count check in `runVerifiedChat` (`agentModeController.ts`). Before each retry, the session's `messageCount` is compared against `MAX_MESSAGE_SIZE_PER_SESSION - 50`. If within 50 messages of the limit, the retry loop breaks gracefully and returns the partial result instead of crashing.
+
+## Lesson
+
+- **Don't require tool calls that aren't essential.** If the LLM can produce acceptable output without calling a specific tool, don't add it to `requiredFunctionCalls`. The retry loop will burn through attempts (and messages) trying to force a tool call the LLM may not see as necessary.
+- **LLM prompt-following is not guaranteed** — especially for tool calls the model deems irrelevant to the task. Design retry logic to degrade gracefully rather than assuming the LLM will eventually comply.
+- **Session message limits need proactive checking**, not just reactive enforcement. The hard limit at 300 was only checked when writing messages, not when deciding whether to retry.
+
+---
+
+# March 28, 2026: Investigation — Why Some Sessions Do Not Have Usage Data
+
+## Problem
+
+Some chat sessions in `AW-ChatSessions` have no `totalTokens` or `totalCost`, even though they contain messages and had LLM calls. Need to determine scope and root cause.
+
+## Investigation
+
+Analyzed last 500 sessions in production (queried `AdminUpdatedAtIndex`).
+
+### Data Breakdown
+
+| Portal Type | Total | With Usage | Without Usage | Multi-Msg Without Usage |
+|-------------|-------|------------|---------------|------------------------|
+| agent       | 118   | 96         | 22            | 4                      |
+| emma-sidebar| 202   | 1          | 201           | 0                      |
+
+### Emma-sidebar sessions (201 without usage) — NOT A BUG
+
+These are auto-created sessions when a user navigates to a page. 196 of 200 `messageCount=1` sessions have `updatedAt ≈ createdAt` (within 1 second) — the session was created with a system message in AW-ChatMessages, but the user never actually chatted. No LLM calls were made.
+
+The 1 Emma session that had a real conversation (7 messages) correctly has usage data.
+
+### Agent sessions with messageCount=0 (18 without usage) — NOT A BUG
+
+Sessions created but never started (e.g., predefined work plans set up but user hasn't interacted).
+
+### Agent sessions with messages but no usage — 4 sessions
+
+| Session | Type | Msgs | Model | Root Cause |
+|---------|------|------|-------|------------|
+| `f8cf70d9` | predefined-work-plan | 30 | gemini-3-pro | **Pre-dates usage tracking** (created 2026-03-16, earliest session with usage is 2026-03-26) |
+| `c3615c1c` | predefined-work-plan | 25 | claude-opus-4-6 | **Same** — created 2026-03-16 |
+| `a19cc80d` | scheduled | 2 | gemini-3.1-pro | Only system+user msgs, **AI response never persisted** (worker timeout/crash) |
+| `1e5af232` | regular (slack-bot) | 2 | undefined | Only system+user msgs, **AI response never persisted**, model undefined |
+
+### Root Causes
+
+1. **Historical sessions**: Sessions created before usage tracking was deployed (pre March 26). All messages have `hasUsage=false`. No fix needed.
+
+2. **Failed/incomplete sessions**: Worker crashed or timed out during `generateMarketingResponse`. Usage is completely lost because:
+   - Usage extraction only happens when `response.responseMessages` are persisted via `addMessagesToSession`
+   - If worker throws/times out, `responseMessages` is never populated
+   - `incrementTokenUsage()` at chatbotService.ts:803 is never reached
+   - No fallback to capture partial usage from the worker process
+
+### Gap: Usage Lost on Worker Failure
+
+When `generateMarketingResponseWorkerService.runInWorker()` fails:
+- User message: saved (before worker call)
+- AI response messages: NOT saved
+- Token usage on session: NOT tracked
+- User token allowance: NOT decremented (even though LLM was called)
+- Error message: saved for scheduled sessions only
+
+The worker (generateMarketingResponseWorker.ts) catches errors and sends them back to the parent process, but the error message contains no usage data. The LLM may have been called (and tokens consumed) before the error occurred.
+
+## Architecture Note
+
+**`chatbotService.ts` is legacy infrastructure** — it powers the partner portal chatbot and provides shared DB operations (session CRUD, message persistence, token tracking). The primary intelligence service is **`agentModeService.ts`** (Agent Mode), which handles all agent, emma-sidebar, scheduled, and Slack bot sessions. The `generateChatResponse()` function in chatbotService is only used by the partner portal's `/api/chatbot` endpoint and is not actively maintained. Future work should consolidate onto the Agent Mode path and deprecate the chatbot-specific response generation.
+
+## Recommendations
+
+1. **Capture partial usage on worker failure**: When the worker throws, include accumulated usage data in the error payload so the parent can still call `incrementTokenUsage()`.
+2. **Backfill historical sessions**: For sessions created before usage tracking (pre March 26), usage data is unrecoverable since individual message usage was never recorded.
+3. **Monitor for incomplete sessions**: Add alerting for sessions where `calledFunctions` is populated but `totalTokens` is missing — indicates a worker failure with lost usage.
+
 # March 27, 2026: Investigation — Sessions Not Showing Up in Customer Portal
 
 ## Problem

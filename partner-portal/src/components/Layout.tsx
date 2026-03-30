@@ -122,17 +122,9 @@ export default function Layout() {
               >
                 Home
               </Button>
-              <Button 
-                color="primary" 
-                component={RouterLink} 
-                to="/guide"
-                variant={isActivePath('/guide') ? 'contained' : 'text'}
-              >
-                Guide
-              </Button>
-              <Button 
-                color="primary" 
-                component={RouterLink} 
+              <Button
+                color="primary"
+                component={RouterLink}
                 to="/release"
                 variant={isActivePath('/release') ? 'contained' : 'text'}
               >
@@ -173,6 +165,14 @@ export default function Layout() {
                         variant={isActivePath('/work-plans') ? 'contained' : 'text'}
                       >
                         Work Plans
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
+                        to="/schedule-templates"
+                        variant={isActivePath('/schedule-templates') ? 'contained' : 'text'}
+                      >
+                        Schedule Templates
                       </Button>
                       <Button
                         color="primary"
