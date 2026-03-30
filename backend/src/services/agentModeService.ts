@@ -18824,6 +18824,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       case 'AD_ACCOUNT': {
         if (action === 'LIST') {
           const result = await linkedInAdsService.listAdAccounts(accessToken);
+          if (!result.success) throw new Error(result.error || 'Failed to list ad accounts');
           return { success: true, adAccounts: result.data?.elements || [] };
         }
         throw new Error(`Unknown action "${action}" for AD_ACCOUNT`);
@@ -18832,6 +18833,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       case 'CAMPAIGN_GROUP': {
         if (action === 'LIST') {
           const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
           return { success: true, campaignGroups: result.data?.elements || [] };
         }
         if (action === 'CREATE') {
@@ -18851,6 +18853,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       case 'CAMPAIGN': {
         if (action === 'LIST') {
           const result = await linkedInAdsService.listCampaigns(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to list campaigns');
           return { success: true, campaigns: result.data?.elements || [] };
         }
         if (action === 'CREATE') {
@@ -18871,6 +18874,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         if (action === 'LIST') {
           if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
           const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to list creatives');
           return { success: true, creatives: result.data?.elements || [] };
         }
         if (action === 'CREATE') {
