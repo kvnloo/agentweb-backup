@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-30',
     changes: [
+      'Improvement: Mark Work Item as Done (GTM Tracker)',
+      '- Added a one-click "Mark as Done" button per work item in the GTM Tracker page',
+      '- Button appears on pending, in-progress, and pending-review items — not on already-completed or skipped items',
+      '- Available in both the customer portal and the admin portal',
       'Admin: Configurable Coding Agent LLM Model (Partner Portal)',
       '- Admins can now select which Claude model the coding agent uses for landing page edits in the Agent Mode settings tab',
       '- Default model is now Claude Sonnet 4.6 for better cost efficiency',
