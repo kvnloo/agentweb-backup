@@ -28,6 +28,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed a bug where daily LinkedIn outreach schedules would accumulate too many tokens over time, causing the agent to produce empty responses or fall back to generic connection messages',
       '- The pending invitations list and search results were returning full profile data unnecessarily, inflating context to 600k-700k tokens per session',
       '- Both results are now trimmed to only the fields needed for deduplication and personalization',
+      'Improvement: GTM Tracker Completion Indicator',
+      '- When a GTM work item is marked as completed, the linked Slack message now receives a ✅ reaction instead of a separate reply',
+      '- This keeps the Slack thread clean while still providing a clear visual indicator of completion',
     ],
   },
   {

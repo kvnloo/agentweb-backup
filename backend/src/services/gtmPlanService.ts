@@ -225,8 +225,7 @@ export async function ensureGtmWorkItemForSlackSession(params: {
 }
 
 /**
- * Posts a completion notice to the Slack thread (broadcast to channel) when a work item
- * is marked completed. Uses reply_broadcast so the message is visible in the channel.
+ * Adds a ✅ reaction to the original Slack message when a work item is marked completed.
  * Non-blocking: logs errors but never throws.
  */
 export async function notifySlackWorkItemCompleted(workItem: {
@@ -236,6 +235,9 @@ export async function notifySlackWorkItemCompleted(workItem: {
   try {
     if (!workItem.agentSessionId) return;
 
+    const slackToken = process.env.SLACK_BOT_TOKEN;
+    if (!slackToken) return;
+
     // Dynamic import to avoid pulling in chatbotService (and its transitive deps) at module load time
     const { chatbotDb } = await import("./chatbotService");
     const session = await chatbotDb.getChatSession(workItem.agentSessionId);
@@ -244,22 +246,17 @@ export async function notifySlackWorkItemCompleted(workItem: {
     const { channel, threadTs } = session.slackThread as { channel: string; threadTs: string };
     if (!channel || !threadTs) return;
 
-    const slackToken = process.env.SLACK_BOT_TOKEN;
-    if (!slackToken) return;
-
     const { WebClient } = await import("@slack/web-api");
     const slackClient = new WebClient(slackToken);
 
-    // Post a completion message in the thread, broadcast to channel so it's visible
-    await slackClient.chat.postMessage({
+    await slackClient.reactions.add({
       channel,
-      thread_ts: threadTs,
-      reply_broadcast: true,
-      text: `✅ Session marked as Completed`,
+      timestamp: threadTs,
+      name: "white_check_mark",
     });
 
-    console.log(`✅ Posted completion broadcast for session ${workItem.agentSessionId}`);
+    console.log(`✅ Added completion reaction for session ${workItem.agentSessionId}`);
   } catch (error) {
-    console.error("⚠️ Non-blocking: Failed to post Slack completion broadcast:", error);
+    console.error("⚠️ Non-blocking: Failed to add Slack completion reaction:", error);
   }
 }
