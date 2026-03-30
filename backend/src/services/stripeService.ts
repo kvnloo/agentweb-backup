@@ -370,6 +370,25 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     subscription_status: subscription.status,
   };
 
+  // Backfill stripe_subscription_id if it was never written (e.g., missed checkout webhook).
+  // Only write when null to preserve the line 362 guard against stale webhooks.
+  if (!user.stripe_subscription_id) {
+    updateData.stripe_subscription_id = subscription.id;
+  }
+
+  // Always sync payment method status — this is a point-in-time fact with no guard dependency
+  let hasPaymentMethod = !!(subscription.default_payment_method || subscription.default_source);
+  if (!hasPaymentMethod && customerId) {
+    try {
+      const s = getStripeOrThrow();
+      const methods = await s.paymentMethods.list({ customer: customerId, limit: 1 });
+      hasPaymentMethod = methods.data.length > 0;
+    } catch {
+      // Non-fatal — default to subscription-level check
+    }
+  }
+  updateData.has_payment_method = hasPaymentMethod;
+
   // Sync current_period_end so trial end dates are tracked
   if (subscription.current_period_end) {
     updateData.current_period_end = new Date(
@@ -395,7 +414,7 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
   await userDb.updateUser(user.userId, updateData);
 
   console.log(
-    `Subscription updated: user ${user.userId} → status=${subscription.status}, periodEnd=${updateData.current_period_end || 'unchanged'}`
+    `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}`
   );
 }
 
@@ -472,4 +491,120 @@ async function findUserByStripeCustomerId(stripeCustomerId: string): Promise<any
     console.error('Error finding user by stripe_customer_id:', error);
     return null;
   }
+}
+
+// ─── Reconciliation ──────────────────────────────────────────────────
+
+/**
+ * Reconcile all users who have a stripe_customer_id by checking their actual
+ * Stripe subscription status. Fixes any drift between DynamoDB and Stripe.
+ *
+ * Returns a summary of what was fixed.
+ */
+export async function reconcileAllStripeUsers(): Promise<{
+  checked: number;
+  fixed: number;
+  errors: number;
+  details: Array<{ email: string; action: string }>;
+}> {
+  const stripe = getStripeOrThrow();
+  const summary = { checked: 0, fixed: 0, errors: 0, details: [] as Array<{ email: string; action: string }> };
+
+  // Find all users with a stripe_customer_id
+  const users = await userDb.scanWithFilter(
+    'attribute_exists(stripe_customer_id)',
+    {},
+  );
+
+  for (const user of users) {
+    summary.checked++;
+    try {
+      // Fetch active/trialing subscriptions from Stripe
+      const subscriptions = await stripe.subscriptions.list({
+        customer: user.stripe_customer_id,
+        status: 'all',
+        limit: 10,
+      });
+
+      // Find the most relevant subscription: active > trialing > past_due > canceled
+      const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2, canceled: 3 };
+      const sorted = subscriptions.data.sort(
+        (a, b) => (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
+      );
+      const sub = sorted[0]; // best subscription, or undefined
+
+      if (!sub) {
+        // No subscriptions in Stripe — ensure DynamoDB reflects that
+        if (user.subscription_status && user.subscription_status !== 'canceled' && user.subscription_status !== 'free') {
+          await userDb.updateUser(user.userId, {
+            subscription_status: 'canceled',
+            has_payment_method: false,
+          });
+          summary.fixed++;
+          summary.details.push({ email: user.email, action: `status ${user.subscription_status} -> canceled (no Stripe subs)` });
+        }
+        continue;
+      }
+
+      // Check payment methods
+      let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+      if (!hasPaymentMethod) {
+        const methods = await stripe.paymentMethods.list({ customer: user.stripe_customer_id, limit: 1 });
+        hasPaymentMethod = methods.data.length > 0;
+      }
+
+      // Derive tier
+      const priceId = sub.items?.data?.[0]?.price?.id;
+      const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
+
+      // Build updates only for fields that are wrong
+      const updates: Record<string, any> = {};
+      const changes: string[] = [];
+
+      if (user.subscription_status !== sub.status) {
+        updates.subscription_status = sub.status;
+        changes.push(`status ${user.subscription_status || 'null'} -> ${sub.status}`);
+      }
+      if (user.stripe_subscription_id !== sub.id) {
+        updates.stripe_subscription_id = sub.id;
+        changes.push(`sub_id synced`);
+      }
+      if (user.has_payment_method !== hasPaymentMethod) {
+        updates.has_payment_method = hasPaymentMethod;
+        changes.push(`payment_method ${user.has_payment_method} -> ${hasPaymentMethod}`);
+      }
+      if (derivedType && user.subscriptionType !== derivedType) {
+        updates.subscriptionType = derivedType;
+        const tierConfig = await getTierConfig(derivedType);
+        if (tierConfig) {
+          updates.allowedPages = tierConfig.allowedPages;
+          updates.allowedSkills = tierConfig.allowedSkills;
+        }
+        changes.push(`tier ${user.subscriptionType || 'null'} -> ${derivedType}`);
+      }
+
+      const periodEnd = (sub as any).current_period_end;
+      if (periodEnd) {
+        const periodEndIso = new Date(typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd).toISOString();
+        if (user.current_period_end !== periodEndIso) {
+          updates.current_period_end = periodEndIso;
+          changes.push(`period_end synced`);
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await userDb.updateUser(user.userId, updates);
+        summary.fixed++;
+        summary.details.push({ email: user.email, action: changes.join(', ') });
+        console.log(`[STRIPE RECONCILE] Fixed ${user.email}: ${changes.join(', ')}`);
+      }
+    } catch (err: any) {
+      summary.errors++;
+      console.error(`[STRIPE RECONCILE] Error for ${user.email}:`, err.message);
+      summary.details.push({ email: user.email, action: `ERROR: ${err.message}` });
+    }
+  }
+
+  console.log(`[STRIPE RECONCILE] Done: checked=${summary.checked}, fixed=${summary.fixed}, errors=${summary.errors}`);
+  return summary;
 }

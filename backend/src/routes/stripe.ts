@@ -2,7 +2,7 @@ import express, { Request, Response } from "express";
 import Stripe from "stripe";
 import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
-import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
+import { authenticateToken, requireAdmin, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, User } from "../services/db"; // Added userDb and User
 import * as stripeController from "../controllers/stripeController";
 
@@ -758,6 +758,18 @@ router.post(
       res.status(500).json({ error: "Failed to reactivate subscription." });
     }
   }
+);
+
+/**
+ * @route POST /api/stripe/reconcile
+ * @desc Admin-only: reconcile all users' Stripe data with DynamoDB
+ * @access Private (admin only)
+ */
+router.post(
+  "/reconcile",
+  authenticateToken,
+  requireAdmin,
+  stripeController.reconcile
 );
 
 /**
