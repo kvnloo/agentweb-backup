@@ -370,6 +370,16 @@ describe('s3Utils', () => {
       );
       expect(key).toBe('users/123/file.txt');
     });
+
+    it('should return null for virtual-hosted URL with no key (empty path)', () => {
+      const key = extractS3KeyFromUrl('https://test-bucket.s3.amazonaws.com', 'test-bucket');
+      expect(key).toBeNull();
+    });
+
+    it('should return null for path-style URL with no key (trailing slash only)', () => {
+      const key = extractS3KeyFromUrl('https://s3.amazonaws.com/test-bucket/', 'test-bucket');
+      expect(key).toBeNull();
+    });
   });
 
   describe('generatePresignedUrl', () => {
@@ -397,6 +407,15 @@ describe('s3Utils', () => {
         Expires: 7200,
       });
     });
+
+    it('should use default bucket when none specified', () => {
+      delete process.env.AWS_S3_BUCKET;
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+      generatePresignedUrl('file.txt');
+      expect(mockGetSignedUrl).toHaveBeenCalledWith('getObject', expect.objectContaining({
+        Key: 'file.txt',
+      }));
+    });
   });
 
   describe('presignS3Url', () => {
@@ -418,6 +437,12 @@ describe('s3Utils', () => {
       );
       expect(result).toBeNull();
     });
+
+    it('should use default bucket when none specified', () => {
+      delete process.env.AWS_S3_BUCKET;
+      const result = presignS3Url('https://example.com/file.txt');
+      expect(result).toBeNull();
+    });
   });
 
   describe('isS3Url', () => {
@@ -433,6 +458,11 @@ describe('s3Utils', () => {
         'https://example.com/file.txt',
         'test-bucket'
       )).toBe(false);
+    });
+
+    it('should use default bucket when none specified', () => {
+      delete process.env.AWS_S3_BUCKET;
+      expect(isS3Url('https://example.com/file.txt')).toBe(false);
     });
   });
 

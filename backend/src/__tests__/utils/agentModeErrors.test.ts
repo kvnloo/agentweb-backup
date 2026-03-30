@@ -256,5 +256,21 @@ describe('agentModeErrors utils', () => {
       expect(isTransientLLMError(503)).toBe(true); // String(503) = "503" matches pattern
       expect(isTransientLLMError(200)).toBe(false);
     });
+
+    it('should detect transient error via originalMessage on wrapped error', () => {
+      const wrappedError = Object.assign(new Error('wrapped'), {
+        originalMessage: 'service temporarily unavailable',
+      });
+      expect(isTransientLLMError(wrappedError)).toBe(true);
+    });
+  });
+
+  describe('isContextLimitError — originalMessage path', () => {
+    it('should detect context limit via originalMessage on wrapped error', () => {
+      const wrappedError = Object.assign(new Error('wrapped'), {
+        originalMessage: 'context length exceeded',
+      });
+      expect(isContextLimitError(wrappedError)).toBe(true);
+    });
   });
 });
