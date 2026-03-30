@@ -117,6 +117,7 @@ export class AgentModeService {
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
+  private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -484,6 +485,24 @@ export class AgentModeService {
     }
     // Fall back to the general default model
     return this.getDefaultModel();
+  }
+
+  async getCodingAgentDefaultModel(): Promise<string> {
+    const fallbackModel = 'anthropic.claude-sonnet-4-6';
+    try {
+      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting coding agent default model setting:', error);
+    }
+    // Fall back to Sonnet 4.6
+    return fallbackModel;
   }
 
   async getBackupModel(primaryModel: string): Promise<string | null> {

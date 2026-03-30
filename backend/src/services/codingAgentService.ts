@@ -10,6 +10,7 @@
 import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
+import { agentModeService } from './agentModeService';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -43,7 +44,7 @@ interface ApplyResult {
 }
 
 const DEFAULT_MAX_ITERATIONS = 50;
-const CODING_AGENT_MODEL = 'us.anthropic.claude-opus-4-6-v1';
+const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if settings fetch fails
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 const MAX_RETRIES = 2;
@@ -762,15 +763,27 @@ export function _setBedrockClientForTest(client: AnthropicBedrock | null): void 
 
 /**
  * Call the Anthropic Messages API with retry logic for transient errors.
+ * Maps model IDs to inference profile ARNs when needed.
  */
 async function callWithRetry(
   client: AnthropicBedrock,
   params: Anthropic.MessageCreateParamsNonStreaming
 ): Promise<Anthropic.Message> {
+  // Map model IDs to inference profile ARNs for models that require them
+  const inferenceProfileMap: Record<string, string> = {
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
+    'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+  };
+
+  // Use inference profile ARN if available, otherwise use model ID as-is
+  const actualModel = inferenceProfileMap[params.model] || params.model;
+  const updatedParams = { ...params, model: actualModel };
+
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      return await client.messages.create(params);
+      return await client.messages.create(updatedParams);
     } catch (error) {
       if (error instanceof Anthropic.APIError && (error.status === 429 || (error.status && error.status >= 500))) {
         lastError = error;
@@ -872,7 +885,8 @@ function extractFailureSummary(
 async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
-  maxIterations: number
+  maxIterations: number,
+  model: string
 ): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
   const client = getBedrockClient();
@@ -904,7 +918,7 @@ async function runCodingAgentInternal(
 
       // Call Anthropic Messages API
       const response = await callWithRetry(client, {
-        model: CODING_AGENT_MODEL,
+        model,
         max_tokens: 16384,
         system: CODING_AGENT_SYSTEM_PROMPT,
         tools,
@@ -1004,6 +1018,15 @@ export async function runCodingAgent(
   maxIterations: number = DEFAULT_MAX_ITERATIONS
 ): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
+  // Fetch the coding agent model from settings (defaults to Sonnet 4.6)
+  let model: string;
+  try {
+    model = await agentModeService.getCodingAgentDefaultModel();
+  } catch (error) {
+    console.error('Error fetching coding agent model from settings, using fallback:', error);
+    model = DEFAULT_CODING_AGENT_MODEL;
+  }
+
   const timeoutPromise = new Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }>((resolve) => {
     setTimeout(() => {
       resolve({
@@ -1015,7 +1038,7 @@ export async function runCodingAgent(
   });
 
   return Promise.race([
-    runCodingAgentInternal(taskDescription, context, maxIterations),
+    runCodingAgentInternal(taskDescription, context, maxIterations, model),
     timeoutPromise
   ]);
 }

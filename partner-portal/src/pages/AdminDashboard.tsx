@@ -6876,6 +6876,8 @@ const AgentModeSettings = () => {
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
   const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
   const [savingCustomerSupportDefaultModel, setSavingCustomerSupportDefaultModel] = useState(false);
+  const [codingAgentDefaultModel, setCodingAgentDefaultModel] = useState('');
+  const [savingCodingAgentDefaultModel, setSavingCodingAgentDefaultModel] = useState(false);
   const [backupModel, setBackupModel] = useState('');
   const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
@@ -6922,6 +6924,9 @@ const AgentModeSettings = () => {
 
       // Load customer support default model
       await loadCustomerSupportDefaultModel(models);
+
+      // Load coding agent default model
+      await loadCodingAgentDefaultModel(models);
 
       // Load backup model
       await loadBackupModel(models);
@@ -7376,6 +7381,57 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadCodingAgentDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setCodingAgentDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading coding agent default model:', settingsError);
+      }
+    }
+    // Default to Sonnet 4.6
+    setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
+  };
+
+  const saveCodingAgentDefaultModel = async () => {
+    try {
+      setSavingCodingAgentDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (codingAgentDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          settingValue: codingAgentDefaultModel,
+          description: 'Default LLM model for coding agent (code editing tasks)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Coding agent default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving coding agent default model:', error);
+      setError('Failed to save coding agent default model');
+    } finally {
+      setSavingCodingAgentDefaultModel(false);
+    }
+  };
+
   const loadBackupModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
@@ -7521,7 +7577,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7625,6 +7681,14 @@ const AgentModeSettings = () => {
 
         setCustomerSupportDefaultModel('');
         setSuccess('Reset customer support default model successfully!');
+      } else if (type === 'codingAgentDefaultModel') {
+        setSavingCodingAgentDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
+        setSuccess('Reset coding agent default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -7650,6 +7714,8 @@ const AgentModeSettings = () => {
         setSavingVideoGenerationDefaultModel(false);
       } else if (type === 'customerSupportDefaultModel') {
         setSavingCustomerSupportDefaultModel(false);
+      } else if (type === 'codingAgentDefaultModel') {
+        setSavingCodingAgentDefaultModel(false);
       }
     }
   };
@@ -8041,6 +8107,55 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Sets the default model for Emma Chat in the customer portal. If not set, uses the general default model.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Coding Agent Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Coding Agent Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('codingAgentDefaultModel')}
+                disabled={savingCodingAgentDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveCodingAgentDefaultModel}
+                disabled={savingCodingAgentDefaultModel}
+              >
+                {savingCodingAgentDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-coding-agent-model-label">Coding Agent Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-coding-agent-model-label"
+              value={codingAgentDefaultModel}
+              label="Coding Agent Default Model"
+              onChange={(e) => setCodingAgentDefaultModel(e.target.value as string)}
+            >
+              {(supportedModels.length > 0
+                ? supportedModels
+                : ['anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-6-v1']
+              ).filter(model => model.includes('anthropic.claude')).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for the coding agent (code editing tasks for landing pages). Defaults to Sonnet 4.6. Opus 4.6 is also available for more complex coding tasks.
           </Typography>
         </CardContent>
       </Card>
