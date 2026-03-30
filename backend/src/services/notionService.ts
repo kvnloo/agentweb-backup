@@ -287,6 +287,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
         'Tags': { multi_select: tags },
         'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
         'Move to Current Sprint': { checkbox: true },
+        'Owner': { people: [{ id: '1c8d872b-594c-816c-8935-00027d2a3a90' }] },
       },
       children,
     }),
