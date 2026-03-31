@@ -31,14 +31,9 @@ jest.mock('../utils/crypto', () => ({
 }));
 
 jest.mock('axios');
-jest.mock('fs', () => ({
-  promises: { readFile: jest.fn() },
-}));
-
 import landingPagesRouter, { extractProductionUrls } from '../routes/landingPages';
 import { userDb } from '../services/db';
 import { decryptPassword } from '../utils/crypto';
-import fs from 'fs';
 
 const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockedDecrypt = decryptPassword as jest.MockedFunction<typeof decryptPassword>;
@@ -302,76 +297,5 @@ describe('Landing Pages Route', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.error).toBe('Failed to fetch landing pages');
-  });
-});
-
-describe('Landing Pages Templates', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  describe('GET /templates', () => {
-    it('returns the full template registry', async () => {
-      const res = await request(app).get('/api/landing-pages/templates');
-      
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
-      expect(res.body.length).toBeGreaterThanOrEqual(4);
-      
-      // Verify specific templates we added
-      const labels = res.body.map((t: any) => t.label);
-      expect(labels).toContain('Event Marketing');
-      expect(labels).toContain('Case Study / Lead Magnet');
-      expect(labels).toContain('B2B Ad Campaign');
-      expect(labels).toContain('Advertorial');
-    });
-  });
-
-  describe('GET /templates/:name', () => {
-    const mockedReadFile = fs.promises.readFile as jest.Mock;
-
-    it('returns 404 for non-existent template', async () => {
-      const res = await request(app).get('/api/landing-pages/templates/non-existent');
-      expect(res.status).toBe(404);
-      expect(res.body.error).toBe('Template not found');
-    });
-
-    it('returns HTML for event-marketing template', async () => {
-      const mockHtml = '<html>Event Marketing</html>';
-      mockedReadFile.mockResolvedValue(mockHtml);
-
-      const res = await request(app).get('/api/landing-pages/templates/event-marketing');
-
-      expect(res.status).toBe(200);
-      expect(res.header['content-type']).toContain('text/html');
-      expect(res.text).toBe(mockHtml);
-      expect(mockedReadFile).toHaveBeenCalledWith(
-        expect.stringContaining('event-marketing.html'),
-        'utf-8'
-      );
-    });
-
-    it('returns default-v2 template when requested', async () => {
-      const mockHtml = '<html>Default V2</html>';
-      mockedReadFile.mockResolvedValue(mockHtml);
-
-      const res = await request(app).get('/api/landing-pages/templates/default-v2');
-
-      expect(res.status).toBe(200);
-      expect(res.text).toBe(mockHtml);
-      expect(mockedReadFile).toHaveBeenCalledWith(
-        expect.stringContaining('landing-page-v2.html'),
-        'utf-8'
-      );
-    });
-
-    it('returns 404 if the template file is missing on disk', async () => {
-      mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' }));
-
-      const res = await request(app).get('/api/landing-pages/templates/event-marketing');
-      
-      expect(res.status).toBe(404);
-      expect(res.body.error).toBe('Template file missing');
-    });
   });
 });

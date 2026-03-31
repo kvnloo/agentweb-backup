@@ -36,6 +36,12 @@ jest.mock('crypto', () => ({
     update: jest.fn().mockReturnThis(),
     digest: jest.fn().mockReturnValue('mock-hash')
   })),
+  randomFillSync: jest.fn((arr) => {
+    for (let i = 0; i < arr.length; i++) {
+      arr[i] = Math.floor(Math.random() * 256);
+    }
+    return arr;
+  }),
   getRandomValues: jest.fn((arr) => {
     for (let i = 0; i < arr.length; i++) {
       arr[i] = Math.floor(Math.random() * 256);
@@ -162,9 +168,9 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
       // Verify template was saved
       expect(mockSetSetting).toHaveBeenCalledWith(
-        'email_templates_test-user-123',
+        'templates_test-user-123',
         expect.stringContaining('welcome_email'),
-        'User email templates',
+        'User templates',
         'test-user-123'
       );
     });
