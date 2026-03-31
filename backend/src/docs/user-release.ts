@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'Fix: Browser Tools Now Reliable in Agent Mode',
+      '- Fixed an issue where browser navigation and other Playwright browser tools would fail in agent mode sessions on EC2',
+      '- Root cause: @playwright/mcp@latest updated to a version requiring a newer Chromium revision than what was installed',
+      '- Fix: the backend now automatically installs the correct Chromium version at startup before any browser tools are used',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'Deprecation: Web Automation Task Creation',
       '- The "create task from prompt" web automation tool has been deprecated and is no longer available to Emma',
       '- Web automation via the agent engine is being phased out',
