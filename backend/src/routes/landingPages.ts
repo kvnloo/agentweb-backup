@@ -5,9 +5,11 @@ import fs from "fs";
 import path from "path";
 import { userDb } from "../services/db";
 import { decryptPassword } from "../utils/crypto";
-import { TEMPLATE_REGISTRY, TEMPLATES_DIR } from "../utils/templateRegistry";
 
 const router = Router();
+
+
+
 
 interface RepoInfo {
   name: string;
@@ -150,35 +152,6 @@ router.get("/", authenticateToken, async (req, res: Response) => {
   } catch (error) {
     console.error("[LANDING PAGES] Error fetching repos:", error);
     res.status(500).json({ error: "Failed to fetch landing pages" });
-  }
-});
-
-// Template routes are intentionally public (no auth) — used for preview before page creation.
-router.get("/templates", (_req, res: Response) => {
-  const templates = Object.entries(TEMPLATE_REGISTRY).map(([name, meta]) => ({
-    name,
-    ...meta,
-  }));
-  res.json(templates);
-});
-
-router.get("/templates/:name", async (req, res: Response) => {
-  let filename: string;
-  if (req.params.name === "default-v2") {
-    filename = "landing-page-v2.html";
-  } else {
-    const meta = TEMPLATE_REGISTRY[req.params.name];
-    if (!meta) {
-      return res.status(404).json({ error: "Template not found" });
-    }
-    filename = meta.filename;
-  }
-  try {
-    const html = await fs.promises.readFile(path.join(TEMPLATES_DIR, filename), "utf-8");
-    res.setHeader("Content-Type", "text/html");
-    res.send(html);
-  } catch {
-    res.status(404).json({ error: "Template file missing" });
   }
 });
 

@@ -341,28 +341,35 @@ async function generateFirstPage(
   // We send a condensed outline (not the full 55KB HTML) to avoid exceeding v0 prompt limits.
   let effectiveTemplate = templateHtml;
   if (!effectiveTemplate) {
+    const parseArr = (s: any): any[] => {
+      if (!s?.settingValue) return [];
+      try { return JSON.parse(s.settingValue); } catch { return []; }
+    };
+
     try {
-      const publicSetting = await settingsService.getSetting("email_templates_public");
-      if (publicSetting) {
-        let templates: any[];
-        try {
-          templates = JSON.parse(publicSetting.settingValue);
-        } catch (parseErr) {
-          console.warn("[V0 SERVICE] email_templates_public settingValue is not valid JSON, continuing without template");
-          templates = [];
-        }
-        const match = templates.find((t: any) => t.template_name === "landing-page-v2");
-        if (match && match.html_content) {
-          effectiveTemplate = extractTemplateOutline(match.html_content);
-          console.log(`[V0 SERVICE] Loaded landing page template outline from DynamoDB (${effectiveTemplate.length} chars) as design inspiration`);
-        } else {
-          console.warn("[V0 SERVICE] landing-page-v2 template not found in email_templates_public, continuing without");
-        }
-      } else {
-        console.warn("[V0 SERVICE] email_templates_public setting not found, trying filesystem fallback");
+      // Check email_templates_public first (legacy key)
+      const oldPublicSetting = await settingsService.getSetting("email_templates_public");
+      const oldMatch = parseArr(oldPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
+      if (oldMatch?.html_content) {
+        effectiveTemplate = extractTemplateOutline(oldMatch.html_content);
+        console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from email_templates_public (${effectiveTemplate.length} chars)`);
       }
     } catch (err) {
-      console.warn("[V0 SERVICE] Could not load landing page template from DynamoDB, trying filesystem fallback:", err);
+      console.warn("[V0 SERVICE] Could not load from email_templates_public:", err);
+    }
+
+    // Also check templates_public (new key) if not found yet
+    if (!effectiveTemplate) {
+      try {
+        const newPublicSetting = await settingsService.getSetting("templates_public");
+        const newMatch = parseArr(newPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
+        if (newMatch?.html_content) {
+          effectiveTemplate = extractTemplateOutline(newMatch.html_content);
+          console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from templates_public (${effectiveTemplate.length} chars)`);
+        }
+      } catch (err) {
+        console.warn("[V0 SERVICE] Could not load from templates_public:", err);
+      }
     }
 
     // Filesystem fallback: if DynamoDB didn't yield a template, try the local file

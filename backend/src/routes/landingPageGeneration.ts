@@ -1,9 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
-import fs from "fs";
-import path from "path";
 import axios from "axios";
-import { TEMPLATE_REGISTRY, TEMPLATES_DIR } from "../utils/templateRegistry";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { settingsService } from "../services/settingsService";
 import { userDb, crmDb } from "../services/db";
 import {
   generateLandingPage,
@@ -182,19 +180,33 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_name } = req.body;
     let template_html: string | undefined = rawTemplateHtml;
 
-    // If template_name provided (user picked a preset), load + condense from disk
+    // If template_name provided (user picked a template), look it up from DynamoDB
     if (template_name && !template_html) {
-      const entry = TEMPLATE_REGISTRY[template_name];
-      if (entry) {
+      const lookupKeys = [
+        `templates_${userId}`,
+        `email_templates_${userId}`,
+        'templates_public',
+        'email_templates_public',
+      ];
+      let found = false;
+      for (const key of lookupKeys) {
         try {
-          const fullHtml = await fs.promises.readFile(path.join(TEMPLATES_DIR, entry.filename), "utf-8");
-          template_html = extractTemplateOutline(fullHtml);
-          console.log(`[LP GENERATION] Loaded template "${template_name}" (${template_html?.length} chars condensed)`);
+          const setting = await settingsService.getSetting(key);
+          if (!setting?.settingValue) continue;
+          const arr: any[] = JSON.parse(setting.settingValue);
+          const match = arr.find((t: any) => t.template_name === template_name);
+          if (match?.html_content) {
+            template_html = extractTemplateOutline(match.html_content);
+            console.log(`[LP GENERATION] Loaded template "${template_name}" from ${key} (${template_html?.length} chars condensed)`);
+            found = true;
+            break;
+          }
         } catch {
-          console.warn(`[LP GENERATION] Template file for "${template_name}" not found on disk, continuing without template`);
+          // continue to next key
         }
-      } else {
-        console.warn(`[LP GENERATION] Unknown template_name "${template_name}", ignoring`);
+      }
+      if (!found) {
+        console.warn(`[LP GENERATION] Template "${template_name}" not found in any DynamoDB key, continuing without template`);
       }
     }
 

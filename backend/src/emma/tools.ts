@@ -1406,16 +1406,20 @@ emmaToolRegistry.register({
   name: 'list_html_templates',
   definition: {
     name: 'list_html_templates',
-    description: 'Get a list of all available HTML templates for the user (including email templates)',
+    description: "Get a list of all available HTML templates for the user (email and/or landing page templates). Use the optional 'type' filter to narrow results.",
     inputSchema: {
       type: 'object',
       properties: {
+        type: {
+          type: 'string',
+          description: "Filter by template type: 'email' or 'landing_page'. Omit to list all templates."
+        }
       },
       required: []
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listHtmlTemplates(context?.userId);
+    return await agentModeService.listHtmlTemplates(context?.userId, args.type);
   }
 });
 
@@ -3818,7 +3822,7 @@ emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
-    description: "Create an email template from an existing HTML file or HTML content. The template will be saved to the Email Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable email template with variables like {{user_name}} or {{items_n}} for dynamic content.",
+    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3828,18 +3832,23 @@ emmaToolRegistry.register({
         },
         template_name: {
           type: "string",
-          description: "Unique name for this email template (e.g., 'welcome_email', 'monthly_newsletter')"
+          description: "Unique name for this template (e.g., 'welcome_email', 'product_landing_page')"
         },
         subject: {
           type: "string",
-          description: "Email subject line. Can include variables like {{user_name}}"
+          description: "Email subject line (only required for email templates). Can include variables like {{user_name}}"
         },
         additional_instructions: {
           type: "string",
           description: "Optional instructions for how to process the HTML (e.g., 'Add variables for company name and logo', 'Make it more professional', 'Convert product list to array variables')"
+        },
+        types: {
+          type: "array",
+          items: { type: "string" },
+          description: "Template types, e.g. ['email'], ['landing_page'], or ['email', 'landing_page']. Defaults to ['email']."
         }
       },
-      required: ["html_source", "template_name", "subject"]
+      required: ["html_source", "template_name"]
     }
   },
   execute: async (args: any, context?: any) => {
@@ -3849,7 +3858,8 @@ emmaToolRegistry.register({
       args.subject,
       args.additional_instructions || '',
       context?.userId,
-      context?.sessionId
+      context?.sessionId,
+      args.types
     );
   }
 });
