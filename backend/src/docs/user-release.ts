@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'LinkedIn Profile Lookup Now Works Without a Connected Account',
+      '- Emma can now check LinkedIn profiles even when you have no LinkedIn Outreach account connected',
+      '- Profile lookups automatically use a shared enrichment account as a fallback',
+      '- Sending connection requests or messages still requires your own LinkedIn account in Settings → Connected Accounts',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'Fix: CRM Auto-Sync Switch Not Saved',
       '- Fixed an issue where the "Auto-sync new users to this lead list" switch in the CRM sync dialog was not being saved when clicking "Start Syncing"',
       '- Previously, clicking "Start Syncing" would run the sync but discard the auto-sync toggle state; it now saves the setting first',

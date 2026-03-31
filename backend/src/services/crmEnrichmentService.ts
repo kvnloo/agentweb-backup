@@ -112,29 +112,8 @@ export class CrmEnrichmentService {
   }
 
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
-    // 1. Try user's own Unipile account first
-    const { getAccountsByUserId } = await import('./connectedAccountsDb');
-    const accounts = await getAccountsByUserId(userId);
-    const userAccount = accounts.find((a: any) => a.platform === 'unipile');
-    if (userAccount?.account_id) {
-      return userAccount.account_id;
-    }
-
-    // 2. Fall back to site-wide Unipile accounts
-    try {
-      const { settingsService } = await import('./settingsService');
-      const setting = await settingsService.getSetting('site-wide-unipile-accounts');
-      if (setting?.settingValue) {
-        const siteAccounts = JSON.parse(setting.settingValue);
-        const enabled = siteAccounts.filter((a: any) => a.enabled !== false);
-        if (enabled.length > 0) {
-          const selected = enabled[Math.floor(Math.random() * enabled.length)];
-          return selected.account_id;
-        }
-      }
-    } catch { /* ignore parse errors or settings fetch failures */ }
-
-    return null;
+    const { linkedInOutreachService } = await import('./linkedInOutreachService');
+    return linkedInOutreachService.resolveAccountId(userId);
   }
 
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
