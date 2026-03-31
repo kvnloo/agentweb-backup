@@ -19,12 +19,28 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   try {
     const accounts = await getAccountsByUserId(userId);
 
+    // Check real connection status for Unipile accounts in a single paginated call
+    const unipileAccountIds = accounts
+      .filter(acc => acc.platform === 'unipile')
+      .map(acc => acc.account_id);
+    const unipileStatusMap = await linkedInOutreachService.getStatusesForAccounts(unipileAccountIds);
+
     const accountsWithStatus = accounts.map(acc => {
-      // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
-      // short-lived access token expiry; just show them as permanently connected.
-      const hasRefreshToken = !!(acc.config as any).refresh_token;
-      const status = hasRefreshToken ? 'active' : getTokenStatus(acc.config.token_expires_at);
-      const expiryMessage = hasRefreshToken ? 'Connected' : formatExpiryMessage(acc.config.token_expires_at);
+      let status: string;
+      let expiryMessage: string;
+
+      if (acc.platform === 'unipile') {
+        // Unipile manages credentials; use the real status from their API
+        const unipileStatus = unipileStatusMap.get(acc.account_id) || 'OK';
+        status = unipileStatus === 'OK' ? 'active' : 'disconnected';
+        expiryMessage = unipileStatus === 'OK' ? 'Connected' : `Disconnected (${unipileStatus})`;
+      } else {
+        // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
+        // short-lived access token expiry; just show them as permanently connected.
+        const hasRefreshToken = !!(acc.config as any).refresh_token;
+        status = hasRefreshToken ? 'active' : getTokenStatus(acc.config.token_expires_at);
+        expiryMessage = hasRefreshToken ? 'Connected' : formatExpiryMessage(acc.config.token_expires_at);
+      }
 
       // Gmail stores picture as picture_url; other platforms use profile_image_url
       const profileImageUrl =
