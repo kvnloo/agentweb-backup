@@ -45,6 +45,7 @@ interface SiteWideAccount {
   added_by: string;
   added_at: string;
   enabled: boolean;
+  connected?: boolean;
 }
 
 export default function CrmTab() {
@@ -189,6 +190,7 @@ export default function CrmTab() {
                 <TableCell>Owner</TableCell>
                 <TableCell>Added By</TableCell>
                 <TableCell>Added At</TableCell>
+                <TableCell>LinkedIn Status</TableCell>
                 <TableCell>Enabled</TableCell>
                 <TableCell width={80}>Actions</TableCell>
               </TableRow>
@@ -214,6 +216,15 @@ export default function CrmTab() {
                     {account.added_at
                       ? new Date(account.added_at).toLocaleDateString()
                       : '—'}
+                  </TableCell>
+                  <TableCell>
+                    {account.connected === undefined ? (
+                      <Chip label="Checking..." size="small" color="default" />
+                    ) : account.connected ? (
+                      <Chip label="Connected" size="small" color="success" />
+                    ) : (
+                      <Chip label="Disconnected" size="small" color="error" />
+                    )}
                   </TableCell>
                   <TableCell>
                     <Switch
