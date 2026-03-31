@@ -1,4 +1,4 @@
-import express, { Request, Response } from "express";
+import express, { Request, Response } from "express"; // slack-triggered-session v2
 import { authenticateToken } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
 import {
@@ -24,6 +24,133 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 
 const router = express.Router();
+
+/**
+ * Helper: handles the full slack triggered session flow.
+ * Triages message, creates session, generates Emma response, emails founders.
+ */
+async function handleSlackTriggeredSession(params: {
+  text: string;
+  slackUserId: string;
+  channel: string;
+  ts: string;
+}) {
+  const { text, slackUserId, channel, ts } = params;
+  try {
+    const { userDb } = await import('../services/db');
+    const { chatbotDb } = await import('../services/chatbotService');
+    const { agentModeService } = await import('../services/agentModeService');
+    const { settingsService } = await import('../services/settingsService');
+    const { getSlackUserDisplayName } = await import('../services/slackService');
+
+    // Normalize Slack formatting
+    const rawMessage = text
+      .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
+      .replace(/<mailto:([^|>]+)>/g, '$1')
+      .trim();
+
+    if (!rawMessage) return;
+
+    // Look up user by slackChannel field (with cache)
+    const mappingKey = `slack_channel_mapping_${channel}`;
+    let user = null;
+
+    const cachedMapping = await settingsService.getSetting(mappingKey);
+    if (cachedMapping?.settingValue) {
+      user = await userDb.getUserById(cachedMapping.settingValue);
+    }
+
+    if (!user) {
+      const allUsers = await userDb.getAllUsers();
+      user = allUsers.find((u: any) => u.slackChannel === channel);
+      if (user) {
+        await settingsService.setSetting(
+          mappingKey,
+          user.userId,
+          `Slack channel to userId mapping for channel ${channel}`,
+          'system'
+        );
+      }
+    }
+
+    if (!user) {
+      console.log(`📨 [slack-triggered] channel ${channel} not connected to any user, ignoring`);
+      return;
+    }
+
+    // Triage: does this message need handling?
+    console.log(`📨 [slack-triggered] user found (${user.email}), starting triage...`);
+    const needsHandling = await agentModeService.triageSlackMessage(rawMessage);
+    if (!needsHandling) {
+      console.log(`📨 [slack-triggered] triage: skipping message in channel ${channel}`);
+      return;
+    }
+
+    console.log(`📨 [slack-triggered] triage passed, creating session for user ${user.userId}`);
+
+    const displayName = await getSlackUserDisplayName(slackUserId);
+    const userMessage = `${displayName}: ${rawMessage}`;
+
+    const session = await chatbotDb.createChatSession(
+      user.userId,
+      undefined,
+      'agent',
+      'slack-triggered',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'regular'
+    );
+
+    const sessionTitle = rawMessage.length > 50 ? rawMessage.substring(0, 47) + '...' : rawMessage;
+    await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
+
+    // Save thread-to-session mapping so thread replies continue the session
+    const threadMappingKey = `slack_thread_${channel}_${ts}`;
+    await settingsService.setSetting(
+      threadMappingKey,
+      JSON.stringify({ sessionId: session.sessionId, userId: user.userId }),
+      `Slack thread to session mapping`,
+      'system'
+    );
+    await chatbotDb.updateSessionSlackThread(session.sessionId, { channel, threadTs: ts });
+
+    // Generate Emma's response (lazy-import controller here to avoid early event-loop flooding)
+    const { generateSessionResponse } = await import('../controllers/agentModeController');
+    const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+    let emmaResponse = '';
+    try {
+      const result = await generateSessionResponse(session.sessionId, userMessage, user.userId, llmModel);
+      emmaResponse = result.content;
+    } catch (genError) {
+      console.error('❌ Error generating Emma response for slack triggered session:', genError);
+      emmaResponse = '(Emma was unable to generate a response for this message.)';
+    }
+
+    // Resolve channel name
+    let channelName = channel;
+    try {
+      const { WebClient } = await import('@slack/web-api');
+      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+      const info = await slackClient.conversations.info({ channel });
+      channelName = (info.channel as any)?.name || channel;
+    } catch { /* non-blocking */ }
+
+    await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
+      sessionId: session.sessionId,
+      userEmail: user.email,
+      channelName,
+      originalMessage: rawMessage,
+      emmaResponse,
+      receivedAt: new Date().toISOString(),
+    });
+
+    console.log(`✅ Slack triggered session handled: ${session.sessionId}`);
+  } catch (error) {
+    console.error('❌ Error in handleSlackTriggeredSession:', error);
+  }
+}
 
 /**
  * Helper: handles the shared post-session-creation flow for Slack sessions.
@@ -478,6 +605,17 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           } catch (slackError) {
             console.error('❌ Error sending error message to Slack:', slackError);
           }
+        }
+      }
+
+      // Handle top-level message events in user-connected Slack channels (slack triggered session)
+      // Filter: plain message, NOT a thread reply, NOT a bot message, NOT a message_changed/deleted event
+      if (event.type === 'message' && !event.thread_ts && !event.bot_id && !event.subtype) {
+        const { text, user: slackUserId, channel, ts } = event;
+        if (text) {
+          console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
+          // Fire-and-forget: all logic runs in the standalone function
+          handleSlackTriggeredSession({ text, slackUserId, channel, ts });
         }
       }
 

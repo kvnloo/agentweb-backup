@@ -9178,6 +9178,36 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Triage a Slack message to determine if it requires handling (e.g. a client question).
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
+   * Returns true if the message needs to be handled, false otherwise.
+   */
+  public async triageSlackMessage(message: string): Promise<boolean> {
+    try {
+      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
+
+Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
+Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
+
+      const response = await this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message },
+      ], {
+        max_completion_tokens: 10,
+        temperature: 0,
+      });
+
+      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
+      const needsHandling = content.startsWith('yes');
+      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
+      return needsHandling;
+    } catch (error) {
+      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
+      return true; // default to handling on error to avoid missing client questions
+    }
+  }
+
   public async listMetaAdsCampaigns(userId: string): Promise<any> {
     try {
       // Import the Meta API functions
