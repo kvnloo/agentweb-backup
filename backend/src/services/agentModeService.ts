@@ -1821,8 +1821,7 @@ export class AgentModeService {
 - Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
 - Example: {"site_url": "example.com", "business_area": "e-commerce"}
 - Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
-- The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
+- **Fallback Method**: [DEPRECATED: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.]
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.

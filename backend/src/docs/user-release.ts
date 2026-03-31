@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'Deprecation: Web Automation Task Creation',
+      '- The "create task from prompt" web automation tool has been deprecated and is no longer available to Emma',
+      '- Web automation via the agent engine is being phased out',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'Fix: Meta Campaigns Not Discovered by Emma',
       '- Fixed an issue where Emma could not find Meta ad campaigns for users who connected their Meta account via OAuth (the modern flow)',
       '- Previously, the "list my Meta campaigns" tool relied on a legacy ad account field that is not populated for recently connected accounts',

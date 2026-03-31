@@ -3390,7 +3390,7 @@ emmaToolRegistry.register({
   name: 'create_task_from_prompt',
   definition: {
     name: 'create_task_from_prompt',
-    description: 'Create a web automation task using a raw prompt when no suitable template is available',
+    description: '[DEPRECATED] Create a web automation task using a raw prompt when no suitable template is available. Web automation via agent engine is being phased out. Do not use this tool.',
     inputSchema: {
       type: 'object',
       properties: {

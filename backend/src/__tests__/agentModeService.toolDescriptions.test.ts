@@ -53,10 +53,8 @@ describe('AgentModeService - Tool Descriptions', () => {
       );
 
       expect(createTaskFromPrompt).toBeDefined();
-      expect(createTaskFromPrompt?.function?.description).toContain('web automation task');
-      expect(createTaskFromPrompt?.function?.description).toBe(
-        'Create a web automation task using a raw prompt when no suitable template is available'
-      );
+      expect(createTaskFromPrompt?.function?.description).toContain('[DEPRECATED]');
+      expect(createTaskFromPrompt?.function?.description).toContain('Web automation via agent engine is being phased out');
     });
 
     it('should have distinct descriptions for template vs prompt task creation', () => {
