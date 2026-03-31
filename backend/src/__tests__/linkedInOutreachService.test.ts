@@ -592,4 +592,73 @@ describe('LinkedInOutreachService', () => {
       ).rejects.toThrow('Server error');
     });
   });
+
+  describe('resolveAccountId', () => {
+    const mockGetAccountsByUserId = jest.fn();
+    const mockGetSetting = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserId: mockGetAccountsByUserId,
+      }));
+      jest.doMock('../services/settingsService', () => ({
+        settingsService: { getSetting: mockGetSetting },
+      }));
+    });
+
+    it('returns user account_id when user has a connected unipile account', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'user-acct-123' },
+      ]);
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('user-acct-123');
+    });
+
+    it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([
+          { account_id: 'site-acct-abc', enabled: true },
+        ]),
+      });
+
+      const result = await linkedInOutreachService.resolveAccountId('user-2');
+
+      expect(result).toBe('site-acct-abc');
+    });
+
+    it('returns null when user has no account and site-wide accounts are not configured', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue(null);
+
+      const result = await linkedInOutreachService.resolveAccountId('user-3');
+
+      expect(result).toBeNull();
+    });
+
+    it('returns null when site-wide accounts list is empty', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify([]) });
+
+      const result = await linkedInOutreachService.resolveAccountId('user-4');
+
+      expect(result).toBeNull();
+    });
+
+    it('returns null when all site-wide accounts are disabled', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([
+          { account_id: 'site-acct-disabled', enabled: false },
+        ]),
+      });
+
+      const result = await linkedInOutreachService.resolveAccountId('user-5');
+
+      expect(result).toBeNull();
+    });
+  });
 });
