@@ -15,6 +15,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed an issue where a disconnected LinkedIn Outreach account always appeared as "Connected" in Settings',
       '- Settings → Connected Accounts now shows the real connection status from Unipile',
       '- Added a Reconnect button for disconnected LinkedIn Outreach accounts that opens the secure reconnect flow',
+      '- Emma no longer returns "Profile not found" when a shared LinkedIn enrichment account is disconnected — disconnected accounts are automatically skipped',
+      '- Admin CRM tab now shows live Connected/Disconnected status for site-wide LinkedIn Outreach accounts',
     ],
   },
   {

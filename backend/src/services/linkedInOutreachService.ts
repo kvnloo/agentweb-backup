@@ -10,6 +10,9 @@ export class LinkedInOutreachService {
   // Cached to avoid a Secrets Manager round-trip on every method call
   private cachedDsn: string | null = null;
   private cachedApiKey: string | null = null;
+  // Short-lived cache for connectivity checks — avoids a Unipile API call on every page load
+  private connectedStatusCache: Map<string, { connected: boolean; timestamp: number }> = new Map();
+  private static readonly CONNECTED_STATUS_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -155,6 +158,38 @@ export class LinkedInOutreachService {
     }
 
     return statusMap;
+  }
+
+  /**
+   * Check whether a single Unipile account is still connected.
+   * Used by resolveAccountId (sequential fallback) and admin status endpoints.
+   * Returns true if connected, false if disconnected or any error occurs.
+   * Results are cached for 10 minutes to avoid redundant per-request API calls.
+   */
+  async isAccountConnected(accountId: string): Promise<boolean> {
+    const cached = this.connectedStatusCache.get(accountId);
+    if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.CONNECTED_STATUS_TTL_MS) {
+      return cached.connected;
+    }
+    let connected: boolean;
+    try {
+      const client = await this.getClient();
+      const account = await client.account.getOne(accountId) as any;
+      // Unipile returns a status field; anything other than CONNECTED means degraded.
+      if (account?.status && account.status !== 'CONNECTED') {
+        this.log(`Account ${accountId} status: ${account.status} — treating as disconnected`);
+        connected = false;
+      } else {
+        connected = true;
+      }
+    } catch (error: any) {
+      const code = error?.body?.code || error?.code || '';
+      const status = error?.body?.status || error?.status;
+      this.log(`Account ${accountId} connectivity check failed`, { code, status });
+      connected = false;
+    }
+    this.connectedStatusCache.set(accountId, { connected, timestamp: Date.now() });
+    return connected;
   }
 
   /**
@@ -549,15 +584,20 @@ export class LinkedInOutreachService {
       if (userAccount?.account_id) return userAccount.account_id;
     } catch { /* ignore */ }
 
-    // 2. Site-wide accounts
+    // 2. Site-wide accounts — verify each one is still connected before returning
     try {
       const { settingsService } = await import('./settingsService');
       const setting = await settingsService.getSetting('site-wide-unipile-accounts');
       if (setting?.settingValue) {
         const siteAccounts = JSON.parse(setting.settingValue);
         const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
-        if (enabled.length > 0) {
-          return enabled[Math.floor(Math.random() * enabled.length)].account_id;
+        // Shuffle so load is distributed across accounts
+        const shuffled = enabled.sort(() => Math.random() - 0.5);
+        for (const account of shuffled) {
+          if (await this.isAccountConnected(account.account_id)) {
+            return account.account_id;
+          }
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }

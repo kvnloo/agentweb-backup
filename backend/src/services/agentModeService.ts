@@ -18716,6 +18716,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
     }
 
+    // Guard: if no account_id is available at this point, return a clear error
+    // instead of forwarding a null account_id to Unipile (which returns a
+    // misleading "Profile not found" instead of an auth/config error).
+    if (!account_id) {
+      return {
+        success: false,
+        error: 'No LinkedIn account is connected. To use LinkedIn Outreach, please connect your LinkedIn account in Settings → Connected Accounts.',
+      };
+    }
+
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
     const isUrl = !!profile_url;
