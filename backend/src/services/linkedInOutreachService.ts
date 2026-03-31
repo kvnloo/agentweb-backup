@@ -129,33 +129,19 @@ export class LinkedInOutreachService {
   }
 
   /**
-   * Fetch status for a set of Unipile account IDs in a single paginated call.
-   * Returns a map of account_id → Unipile status string (e.g. "OK", "CREDENTIALS", "ERROR").
-   * Accounts not found in Unipile are mapped to "ERROR".
+   * Fetch live connectivity status for a set of Unipile account IDs.
+   * Returns a map of account_id → "OK" (connected) or "ERROR" (disconnected/not found).
+   * Uses a self-profile lookup per account to verify the LinkedIn session is active,
+   * since account.getAll() does not expose a usable session status field.
    */
   async getStatusesForAccounts(accountIds: string[]): Promise<Map<string, string>> {
     const statusMap = new Map<string, string>(accountIds.map(id => [id, 'ERROR']));
     if (accountIds.length === 0) return statusMap;
 
-    try {
-      const client = await this.getClient();
-      const idSet = new Set(accountIds);
-      let cursor: string | undefined;
-
-      do {
-        const res: any = await client.account.getAll(cursor ? { cursor } : undefined);
-        if (res?.items) {
-          for (const item of res.items) {
-            if (idSet.has(item.id)) {
-              statusMap.set(item.id, item.status || 'OK');
-            }
-          }
-        }
-        cursor = res?.cursor || undefined;
-      } while (cursor);
-    } catch (error: any) {
-      this.log(`getStatusesForAccounts failed, marking all as ERROR`, { error: error.message });
-    }
+    await Promise.all(accountIds.map(async (id) => {
+      const connected = await this.isAccountConnected(id);
+      statusMap.set(id, connected ? 'OK' : 'ERROR');
+    }));
 
     return statusMap;
   }
@@ -174,18 +160,26 @@ export class LinkedInOutreachService {
     let connected: boolean;
     try {
       const client = await this.getClient();
+      // account.getOne() returns account metadata but no session status field.
+      // Use the account's own LinkedIn publicIdentifier for a self-profile lookup —
+      // this fails with 401 if the LinkedIn session is disconnected.
       const account = await client.account.getOne(accountId) as any;
-      // Unipile returns a status field; anything other than CONNECTED means degraded.
-      if (account?.status && account.status !== 'CONNECTED') {
-        this.log(`Account ${accountId} status: ${account.status} — treating as disconnected`);
-        connected = false;
+      const publicIdentifier = account?.connection_params?.im?.publicIdentifier;
+      if (!publicIdentifier) {
+        this.log(`Account ${accountId} has no publicIdentifier — assuming connected`);
+        connected = true;
       } else {
+        await client.request.send({
+          method: 'GET',
+          path: ['users', publicIdentifier],
+          parameters: { account_id: accountId },
+        });
         connected = true;
       }
     } catch (error: any) {
       const code = error?.body?.code || error?.code || '';
       const status = error?.body?.status || error?.status;
-      this.log(`Account ${accountId} connectivity check failed`, { code, status });
+      this.log(`Account ${accountId} connectivity check failed (${status} ${code})`);
       connected = false;
     }
     this.connectedStatusCache.set(accountId, { connected, timestamp: Date.now() });
