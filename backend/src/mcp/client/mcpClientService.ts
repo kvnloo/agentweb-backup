@@ -150,8 +150,9 @@ export class McpClientService {
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
   private cleanupInterval?: NodeJS.Timeout;
 
-  // Playwright browser pre-install: run once per process
-  private static playwrightBrowsersEnsured = false;
+  // Playwright browser pre-install: shared Promise so concurrent sessions wait on the same install
+  private static readonly PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp';
+  private static playwrightBrowsersInstall: Promise<void> | null = null;
 
   constructor() {
     // Start periodic cleanup of stale sessions
@@ -502,9 +503,7 @@ export class McpClientService {
     switch (transportType) {
       case "stdio": {
         const stdioConfig = config as StdioTransportConfig;
-        // Pre-install Playwright browsers before spawning the MCP server to avoid Chromium version mismatches.
-        // @playwright/mcp@latest updates frequently and may require a newer Chromium revision than what's installed.
-        if (stdioConfig.args?.some(arg => arg.includes('@playwright/mcp'))) {
+        if (stdioConfig.args?.some(arg => arg.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE))) {
           await this.ensurePlaywrightBrowsers();
         }
         return this.createStdioTransport(name, stdioConfig, poolKey);
@@ -525,11 +524,16 @@ export class McpClientService {
    * Ensures Playwright Chromium browsers are installed before the MCP server starts.
    * @playwright/mcp pins a specific Chromium revision; if the revision isn't cached locally
    * the browser launch will fail. This runs playwright install once per process startup.
+   * Using a shared Promise so concurrent session creation waits on the same install.
    */
   private async ensurePlaywrightBrowsers(): Promise<void> {
-    if (McpClientService.playwrightBrowsersEnsured) return;
-    McpClientService.playwrightBrowsersEnsured = true;
+    if (!McpClientService.playwrightBrowsersInstall) {
+      McpClientService.playwrightBrowsersInstall = this.runPlaywrightInstall();
+    }
+    return McpClientService.playwrightBrowsersInstall;
+  }
 
+  private async runPlaywrightInstall(): Promise<void> {
     const playwrightBin = this.findPlaywrightBinInNpxCache();
     if (!playwrightBin) {
       console.log('MCP: No playwright binary found in npx cache, skipping browser pre-install');
@@ -566,12 +570,9 @@ export class McpClientService {
   private findPlaywrightBinInNpxCache(): string | null {
     try {
       const cacheDir = path.join(os.homedir(), '.npm', '_npx');
-      if (!fs.existsSync(cacheDir)) return null;
-
       for (const hash of fs.readdirSync(cacheDir)) {
         const candidate = path.join(cacheDir, hash, 'node_modules', '.bin', 'playwright');
-        const mcpPkg = path.join(cacheDir, hash, 'node_modules', '@playwright', 'mcp');
-        if (fs.existsSync(candidate) && fs.existsSync(mcpPkg)) {
+        if (fs.existsSync(candidate)) {
           return candidate;
         }
       }
