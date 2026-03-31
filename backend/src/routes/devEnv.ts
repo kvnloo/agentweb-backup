@@ -7,9 +7,14 @@ import {
   relayPromptToEC2,
   launchEnvironment,
   teardownEnvironment,
+  updateNotionPageProperties,
 } from "../services/devEnvService";
 
 const router = express.Router();
+
+// In-process lock: page IDs currently being launched, to deduplicate concurrent
+// webhook deliveries hitting the same backend instance simultaneously.
+const launchingPageIds = new Set<string>();
 
 /**
  * POST /api/webhooks/notion-dev-env
@@ -119,6 +124,24 @@ router.post(
       const isDeployStatus = isProduction ? page.status === "Deploy" : page.status === "Deploy_Test";
 
       if (isLaunchStatus && !page.instanceId) {
+        // Guard 1: in-process lock (same backend instance, concurrent requests)
+        if (launchingPageIds.has(pageId)) {
+          console.log(`[devEnv] Launch already in progress for ${pageId}, skipping duplicate`);
+          return res.status(200).json({ action: "none", reason: "already_launching" });
+        }
+        launchingPageIds.add(pageId);
+
+        // Guard 2: optimistic lock — write "pending" to Notion immediately so
+        // other backend instances (or later webhook retries) see a non-empty
+        // instanceId and bail out before starting their own launch.
+        try {
+          await updateNotionPageProperties(pageId, { instanceId: "pending" });
+        } catch (lockErr) {
+          launchingPageIds.delete(pageId);
+          console.error(`[devEnv] Could not write pending lock to Notion for ${pageId}:`, lockErr);
+          return res.status(500).json({ error: "Failed to acquire launch lock" });
+        }
+
         // Launch
         res.status(200).json({ action: "launching", pageId });
 
@@ -128,6 +151,8 @@ router.post(
             await launchEnvironment(pageId, page.title, text, page.databaseId);
           } catch (err) {
             console.error(`[devEnv] Background launch failed:`, err);
+          } finally {
+            launchingPageIds.delete(pageId);
           }
         })();
       } else if (isDeployStatus && page.instanceId && page.publicIp) {
