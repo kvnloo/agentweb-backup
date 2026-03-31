@@ -3474,4 +3474,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Reported issues are tracked in Notion and the engineering team is notified immediately',
     ],
   },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Emma Now Knows Your Profile',
+      '- Emma can look up your account email, name, company, and subscription when you ask',
+      '- Uses the new get_user_profile foundation tool — available everywhere without installing a skill',
+    ],
+  },
 ];
