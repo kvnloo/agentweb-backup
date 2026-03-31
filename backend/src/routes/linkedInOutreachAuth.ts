@@ -93,4 +93,37 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
   }
 });
 
+/**
+ * POST /reconnect
+ * Generates a Unipile Hosted Auth Link to reconnect an existing (disconnected) LinkedIn account.
+ * The frontend opens this URL in a popup window.
+ */
+router.post('/reconnect', authenticateToken, async (req: any, res: any) => {
+  const { unipileAccountId } = req.body;
+
+  if (!unipileAccountId || typeof unipileAccountId !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid unipileAccountId' });
+  }
+
+  try {
+    const client = await linkedInOutreachService.getClient();
+    const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const expiresOn = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    const authLink = await client.account.createHostedAuthLink({
+      type: 'reconnect',
+      reconnect_account: unipileAccountId,
+      expiresOn: expiresOn as any,
+      success_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback`,
+      failure_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback?error=connection_failed`,
+      api_url: await linkedInOutreachService.getApiUrl(),
+    } as any);
+
+    res.json({ success: true, url: authLink.url });
+  } catch (error: any) {
+    console.error('[LinkedIn Outreach] Error generating reconnect link:', error);
+    res.status(500).json({ error: 'Failed to generate reconnect link', details: error.message });
+  }
+});
+
 export default router;

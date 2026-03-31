@@ -126,6 +126,38 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * Fetch status for a set of Unipile account IDs in a single paginated call.
+   * Returns a map of account_id → Unipile status string (e.g. "OK", "CREDENTIALS", "ERROR").
+   * Accounts not found in Unipile are mapped to "ERROR".
+   */
+  async getStatusesForAccounts(accountIds: string[]): Promise<Map<string, string>> {
+    const statusMap = new Map<string, string>(accountIds.map(id => [id, 'ERROR']));
+    if (accountIds.length === 0) return statusMap;
+
+    try {
+      const client = await this.getClient();
+      const idSet = new Set(accountIds);
+      let cursor: string | undefined;
+
+      do {
+        const res: any = await client.account.getAll(cursor ? { cursor } : undefined);
+        if (res?.items) {
+          for (const item of res.items) {
+            if (idSet.has(item.id)) {
+              statusMap.set(item.id, item.status || 'OK');
+            }
+          }
+        }
+        cursor = res?.cursor || undefined;
+      } while (cursor);
+    } catch (error: any) {
+      this.log(`getStatusesForAccounts failed, marking all as ERROR`, { error: error.message });
+    }
+
+    return statusMap;
+  }
+
+  /**
    * List all connected LinkedIn accounts for a specific user.
    * Fetches all pages from Unipile to ensure no accounts are missed,
    * then intersects with the user's connected accounts in the DB.

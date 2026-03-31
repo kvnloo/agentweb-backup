@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'Fix: LinkedIn Outreach Account Reconnect',
+      '- Fixed an issue where a disconnected LinkedIn Outreach account always appeared as "Connected" in Settings',
+      '- Settings → Connected Accounts now shows the real connection status from Unipile',
+      '- Added a Reconnect button for disconnected LinkedIn Outreach accounts that opens the secure reconnect flow',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'Fix: Server Restart No Longer Triggers False Error Alerts',
       '- During daily deployments, in-flight Agent Mode requests interrupted by the server restart now return a clear "Server is restarting, please try again" message instead of a generic error',
       '- Previously, these expected interruptions were incorrectly logged as unknown errors and triggered oncall alerts',
