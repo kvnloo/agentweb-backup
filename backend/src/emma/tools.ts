@@ -269,7 +269,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.listMetaAdsCampaigns(context?.userId);
+    return await agentModeService.listMetaAdsCampaignsNew(context?.userId);
   }
 });
 
