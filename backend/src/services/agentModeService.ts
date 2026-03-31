@@ -2337,6 +2337,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
 
+    'get_user_profile',         // Account info teaser
+
     // Account Memory (cross-session knowledge)
     'save_memory',
     'delete_memory',

@@ -5342,6 +5342,35 @@ emmaToolRegistry.register({
   }
 });
 
+emmaToolRegistry.register({
+  name: 'get_user_profile',
+  definition: {
+    name: 'get_user_profile',
+    description: "Retrieve the current user's profile information, including their email address, display name, company name, and subscription type. Call this when the user asks about their account details or when you need to know who you're talking to.",
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      throw new Error("Authentication required: no user context");
+    }
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return { error: 'User profile not found.' };
+    }
+    return {
+      email: user.email,
+      displayName: user.displayName || null,
+      companyName: user.companyName || null,
+      subscriptionType: user.subscriptionType || null,
+    };
+  }
+});
+
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
