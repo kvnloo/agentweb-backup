@@ -465,6 +465,28 @@ router.post("/users/:userId/deactivate", async (req, res) => {
   }
 });
 
+// Reactivate user
+router.post("/users/:userId/reactivate", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.isActive !== false) {
+      return res.status(400).json({ message: "User is already active" });
+    }
+
+    const updatedUser = await userDb.reactivateUser(userId);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error reactivating user:", error);
+    res.status(500).json({ message: "Error reactivating user" });
+  }
+});
+
 // Update user support note
 router.put("/users/:userId/support-note", async (req, res) => {
   try {
