@@ -32,6 +32,12 @@ export function isContextLimitError(error: unknown): boolean {
   return CONTEXT_LIMIT_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
 }
 
+export function isWorkerShutdownError(error: unknown): boolean {
+  if (!error) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return message === 'Worker shutdown';
+}
+
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
 
 const TRANSIENT_MESSAGE_PATTERNS = [

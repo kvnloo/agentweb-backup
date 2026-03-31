@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'Fix: Server Restart No Longer Triggers False Error Alerts',
+      '- During daily deployments, in-flight Agent Mode requests interrupted by the server restart now return a clear "Server is restarting, please try again" message instead of a generic error',
+      '- Previously, these expected interruptions were incorrectly logged as unknown errors and triggered oncall alerts',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'LinkedIn Profile Lookup Now Works Without a Connected Account',
       '- Emma can now check LinkedIn profiles even when you have no LinkedIn Outreach account connected',
       '- Profile lookups automatically use a shared enrichment account as a fallback',
