@@ -501,6 +501,37 @@ export class LinkedInOutreachService {
       return this.handleError(error, 'sendMessage');
     }
   }
+
+  /**
+   * Resolve a Unipile account_id for a given user.
+   * 1. Uses the user's own connected Unipile account if available.
+   * 2. Falls back to a randomly-selected site-wide Unipile account configured in settings.
+   * Returns null if no account can be found.
+   */
+  async resolveAccountId(userId: string): Promise<string | null> {
+    // 1. User's own account
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const userAccount = accounts.find((a: any) => a.platform === 'unipile');
+      if (userAccount?.account_id) return userAccount.account_id;
+    } catch { /* ignore */ }
+
+    // 2. Site-wide accounts
+    try {
+      const { settingsService } = await import('./settingsService');
+      const setting = await settingsService.getSetting('site-wide-unipile-accounts');
+      if (setting?.settingValue) {
+        const siteAccounts = JSON.parse(setting.settingValue);
+        const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
+        if (enabled.length > 0) {
+          return enabled[Math.floor(Math.random() * enabled.length)].account_id;
+        }
+      }
+    } catch { /* ignore parse errors or settings fetch failures */ }
+
+    return null;
+  }
 }
 
 export const linkedInOutreachService = new LinkedInOutreachService();

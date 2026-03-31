@@ -18687,8 +18687,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
-    const { action, account_id, profile_url, provider_id, message } = args;
+    let { account_id } = args;
+    const { action, profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
+
+    // Write actions must use an account owned by the calling user.
+    // This prevents an LLM from reusing a shared/enrichment account_id it may have
+    // seen in a prior get-profile tool call to send invitations or messages.
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation'];
+    if (WRITE_ACTIONS.includes(action)) {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const userAccounts = await getAccountsByUserId(userId);
+      const owned = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
+      if (!owned) {
+        return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
+      }
+    }
+
+    // For get-profile only, fall back to site-wide Unipile enrichment accounts when the
+    // user has no personally-connected account. Restricted to get-profile to prevent
+    // the shared account from being used for search quotas or discoverable via list actions.
+    if (!account_id && action === 'get-profile') {
+      account_id = await linkedInOutreachService.resolveAccountId(userId);
+      if (account_id) {
+        console.log(`[AgentMode] linkedinOutreach: using site-wide enrichment account for get-profile`);
+      }
+    }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
