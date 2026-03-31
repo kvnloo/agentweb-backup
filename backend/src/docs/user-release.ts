@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-31',
+    changes: [
+      'Fix: Meta Campaigns Not Discovered by Emma',
+      '- Fixed an issue where Emma could not find Meta ad campaigns for users who connected their Meta account via OAuth (the modern flow)',
+      '- Previously, the "list my Meta campaigns" tool relied on a legacy ad account field that is not populated for recently connected accounts',
+      '- Emma now reads campaigns directly from your connected Meta account, consistent with how other Meta Ads tools work',
+    ],
+  },
+  {
     date: '2026-03-30',
     changes: [
       'Admin: Slack Message Tools for Emma',
