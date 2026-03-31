@@ -619,15 +619,15 @@ export class LinkedInService {
     return { title: this.titleFromUrl(url) };
   }
 
-  async createPost(accessToken: string, authorUrn: string, text: string, imageUrns?: string[]): Promise<string> {
+  async createPost(accessToken: string, authorUrn: string, text: string, imageUrns?: string[], saveAsDraft?: boolean): Promise<string> {
     return this.safeRequest(async () => {
-      console.log('[LinkedIn] createPost called for author:', authorUrn);
+      console.log('[LinkedIn] createPost called for author:', authorUrn, saveAsDraft ? '(draft)' : '(published)');
 
       const payload: any = {
         author: authorUrn,
         commentary: this.escapeLinkedInLittle(text),
         visibility: 'PUBLIC',
-        lifecycleState: 'PUBLISHED',
+        lifecycleState: saveAsDraft ? 'DRAFT' : 'PUBLISHED',
         distribution: {
           feedDistribution: 'MAIN_FEED'
         }

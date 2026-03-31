@@ -75,7 +75,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, saveAsDraft?: boolean): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
@@ -88,7 +88,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Upload images if provided - track failures for transparency
       let imageUrns: string[] = [];
       let failedImageUploads: { url: string; error: string }[] = [];
-      
+
       if (mediaUrls && mediaUrls.length > 0) {
         for (const url of mediaUrls) {
           try {
@@ -103,10 +103,10 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       // Create post (with or without images)
-      const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
+      const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined, saveAsDraft);
 
-      // Store post in database for personal accounts only
-      if (userId && config.account_type === 'personal') {
+      // Store published posts in database for personal accounts only (not drafts)
+      if (!saveAsDraft && userId && config.account_type === 'personal') {
         try {
           const { createPost: storePost } = await import('../linkedInPostsDb');
           await storePost(userId, authorUrn, postUrn, content, mediaUrls);
@@ -116,14 +116,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       // Build result with optional warning for failed uploads
-      const result: PostResult = {
-        success: true,
-        message: imageUrns.length > 0
-          ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
-          : 'Posted successfully on LinkedIn',
-        postId: postUrn,
-        postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
-      };
+      const result: PostResult = saveAsDraft
+        ? {
+            success: true,
+            message: 'Draft saved on LinkedIn. To review and publish, visit LinkedIn Creator Hub.',
+            postId: postUrn,
+            postUrl: 'https://www.linkedin.com/creator/hub/'
+          }
+        : {
+            success: true,
+            message: imageUrns.length > 0
+              ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
+              : 'Posted successfully on LinkedIn',
+            postId: postUrn,
+            postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
+          };
       
       // Add warning if some images failed to upload
       if (failedImageUploads.length > 0) {

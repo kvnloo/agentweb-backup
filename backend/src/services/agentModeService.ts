@@ -18240,12 +18240,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = [], saveAsDraft?: boolean): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
       contentLength: content?.length || 0,
-      mediaUrlCount: mediaUrls?.length || 0
+      mediaUrlCount: mediaUrls?.length || 0,
+      saveAsDraft: !!saveAsDraft
     });
 
     try {
@@ -18276,7 +18277,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         console.log('[AgentMode] Getting adapter for platform:', account.platform);
         const adapter = socialPlatformService.getAdapter(account.platform);
         console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-        const result = await adapter.createPost(account, content, mediaUrls, userId);
+        const result = await adapter.createPost(account, content, mediaUrls, userId, saveAsDraft);
 
         return {
           success: true,

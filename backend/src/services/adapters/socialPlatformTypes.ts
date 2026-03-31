@@ -59,7 +59,7 @@ export interface SocialPlatformAdapter {
    * @param mediaUrls - Optional media URLs to attach
    * @param userId - Optional user ID for token refresh capability
    */
-  createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult>;
+  createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, saveAsDraft?: boolean): Promise<PostResult>;
 
   /**
    * Create a comment on a post

@@ -3207,7 +3207,7 @@ emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
+    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content. For LinkedIn: if the user wants to review before publishing, set save_as_draft to true — the post will be saved as a draft on LinkedIn and the user will receive a link to review and publish it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3217,13 +3217,17 @@ emmaToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
+        },
+        save_as_draft: {
+          type: 'boolean',
+          description: 'LinkedIn only. When true, saves the post as a draft on LinkedIn instead of publishing immediately. The user can then review and publish from LinkedIn Creator Hub. Use this when the user asks to "save as draft", "review before posting", or similar.'
         }
       },
       required: ['account_id', 'content']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls);
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.save_as_draft);
   }
 });
 
