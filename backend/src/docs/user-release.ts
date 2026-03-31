@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'Admin: Emma Can Now Freeze and Unfreeze User Accounts',
+      '- Emma now has a freeze_user_account tool available in Admin Tools',
+      '- Admins can ask Emma to freeze bot accounts or other abusive accounts by userId',
+      '- Frozen accounts are deactivated and cannot log in; admins can also unfreeze accounts to restore access',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'Fix: LinkedIn Outreach Account Reconnect',
       '- Fixed an issue where a disconnected LinkedIn Outreach account always appeared as "Connected" in Settings',
       '- Settings → Connected Accounts now shows the real connection status from Unipile',
