@@ -25,6 +25,6 @@ router.delete('/:templateName', authenticateToken, deleteTemplate);
 
 // Preview a template (legacy path support included)
 // This is used for real-time visualization of templates by name.
-router.get('/preview/:templateName', getPreviewTemplate);
+router.get('/preview/:templateName', authenticateToken, getPreviewTemplate);
 
 export default router;

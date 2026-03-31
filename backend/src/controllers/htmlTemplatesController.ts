@@ -6,6 +6,7 @@ import fs from 'fs';
 import { AuthenticatedRequest } from '../middleware/auth';
 
 const settingsService = new SettingsService();
+const MAX_HTML_BYTES = 512 * 1024; // 512KB
 
 export interface HtmlTemplate {
   template_name: string;
@@ -32,22 +33,33 @@ const getSettingKey = (userId: string, isPublic?: boolean) =>
 const getOldSettingKey = (userId: string, isPublic?: boolean) => 
   isPublic ? 'email_templates_public' : `email_templates_${userId}`;
 
+const getAuthenticatedUser = (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  if (!authReq.user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return null;
+  }
+  return authReq.user;
+};
+
 /**
  * GET All Templates
  * Supports filtering by 'type' (email|landing_page)
  */
 export const getTemplates = async (req: Request, res: Response) => {
   try {
-    const userId = (req as AuthenticatedRequest).user?.userId;
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const user = getAuthenticatedUser(req, res);
+    if (!user) return;
+    const userId = user.userId;
 
     const typeFilter = req.query.type as string;
 
+    const includeLegacyEmail = !typeFilter || typeFilter === 'email';
     const [newUserSetting, newPublicSetting, oldUserSetting, oldPublicSetting] = await Promise.all([
       settingsService.getSetting(`templates_${userId}`),
       settingsService.getSetting('templates_public'),
-      settingsService.getSetting(`email_templates_${userId}`),
-      settingsService.getSetting('email_templates_public'),
+      includeLegacyEmail ? settingsService.getSetting(`email_templates_${userId}`) : null,
+      includeLegacyEmail ? settingsService.getSetting('email_templates_public') : null,
     ]);
 
     const newUser = parseTemplateArray(newUserSetting);
@@ -110,8 +122,9 @@ export const getTemplates = async (req: Request, res: Response) => {
  */
 export const saveTemplate = async (req: Request, res: Response) => {
   try {
-    const userId = (req as AuthenticatedRequest).user?.userId;
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const user = getAuthenticatedUser(req, res);
+    if (!user) return;
+    const userId = user.userId;
 
     const { 
       template_name, 
@@ -131,8 +144,11 @@ export const saveTemplate = async (req: Request, res: Response) => {
     if (!Array.isArray(type) || type.length === 0) {
       return res.status(400).json({ error: 'type must be a non-empty array' });
     }
-    if (isPublic && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (isPublic && !user.isAdmin) {
       return res.status(403).json({ error: 'Only admins can manage public templates' });
+    }
+    if (Buffer.byteLength(html_content, 'utf-8') > MAX_HTML_BYTES) {
+      return res.status(413).json({ error: 'html_content exceeds 512KB limit' });
     }
 
     // Extraction fallback
@@ -154,14 +170,14 @@ export const saveTemplate = async (req: Request, res: Response) => {
       if (original_template_name !== template_name) {
         const conflict = templates.find((t: HtmlTemplate) => t.template_name === template_name);
         if (conflict) {
-          return res.status(400).json({ message: `A template named "${template_name}" already exists.` });
+          return res.status(400).json({ error: `A template named "${template_name}" already exists.` });
         }
       }
     } else {
       // New Create. Must not clash with any existing name.
       const conflict = templates.find((t: HtmlTemplate) => t.template_name === template_name);
       if (conflict) {
-        return res.status(400).json({ message: `A template named "${template_name}" already exists.` });
+        return res.status(400).json({ error: `A template named "${template_name}" already exists.` });
       }
     }
 
@@ -215,7 +231,7 @@ export const saveTemplate = async (req: Request, res: Response) => {
       targetKey,
       JSON.stringify(templates),
       isPublic ? 'Public templates' : 'User templates',
-      (req as AuthenticatedRequest).user?.email
+      user.email
     );
 
     res.json({ success: true, message: 'Template saved successfully', template: newTemplate });
@@ -230,13 +246,14 @@ export const saveTemplate = async (req: Request, res: Response) => {
  */
 export const deleteTemplate = async (req: Request, res: Response) => {
   try {
-    const userId = (req as AuthenticatedRequest).user?.userId;
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const user = getAuthenticatedUser(req, res);
+    if (!user) return;
+    const userId = user.userId;
 
     const { templateName } = req.params;
     const isPublic = req.query.isPublic === 'true';
 
-    if (isPublic && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (isPublic && !user.isAdmin) {
       return res.status(403).json({ error: 'Only admins can delete public templates' });
     }
 
@@ -251,7 +268,7 @@ export const deleteTemplate = async (req: Request, res: Response) => {
         targetKey,
         JSON.stringify(filtered),
         isPublic ? 'Public templates' : 'User templates',
-        (req as AuthenticatedRequest).user?.email || 'system'
+        user.email || 'system'
       );
       return res.json({ success: true, message: 'Template deleted' });
     }
@@ -267,7 +284,7 @@ export const deleteTemplate = async (req: Request, res: Response) => {
         oldKey,
         JSON.stringify(oldFiltered),
         isPublic ? 'Legacy public email templates' : 'Legacy user email templates',
-        (req as AuthenticatedRequest).user?.email || 'system'
+        user.email || 'system'
       );
       return res.json({ success: true, message: 'Template deleted from legacy storage' });
     }
@@ -286,13 +303,15 @@ export const deleteTemplate = async (req: Request, res: Response) => {
 export const getPreviewTemplate = async (req: Request, res: Response) => {
   try {
     const { templateName } = req.params;
-    const userId = (req as AuthenticatedRequest).user?.userId;
+    const user = getAuthenticatedUser(req, res);
+    if (!user) return;
+    const userId = user.userId;
 
     // 1. Try DynamoDB (New + Old keys)
     const [userNew, pubNew, userOld, pubOld] = await Promise.all([
-      userId ? settingsService.getSetting(`templates_${userId}`) : null,
+      settingsService.getSetting(`templates_${userId}`),
       settingsService.getSetting('templates_public'),
-      userId ? settingsService.getSetting(`email_templates_${userId}`) : null,
+      settingsService.getSetting(`email_templates_${userId}`),
       settingsService.getSetting('email_templates_public'),
     ]);
 

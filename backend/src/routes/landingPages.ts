@@ -1,8 +1,6 @@
 import { Router, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import axios from "axios";
-import fs from "fs";
-import path from "path";
 import { userDb } from "../services/db";
 import { decryptPassword } from "../utils/crypto";
 

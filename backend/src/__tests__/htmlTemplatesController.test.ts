@@ -570,7 +570,7 @@ describe('getPreviewTemplate', () => {
       return Promise.resolve(null);
     });
 
-    const req = makeReq({ params: { templateName: 'pub-preview' } });
+    const req = reqWithUser({ params: { templateName: 'pub-preview' } });
     const { res, send, setHeader } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -602,7 +602,7 @@ describe('getPreviewTemplate', () => {
       return Promise.resolve(null);
     });
 
-    const req = makeReq({ params: { templateName: 'legacy-public-preview' } });
+    const req = reqWithUser({ params: { templateName: 'legacy-public-preview' } });
     const { res, send, setHeader } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -625,7 +625,7 @@ describe('getPreviewTemplate', () => {
   it('returns 404 when template is not found in any store and name is not a legacy FS alias', async () => {
     mockGetSetting.mockResolvedValue(null);
 
-    const req = makeReq({ params: { templateName: 'nonexistent' } });
+    const req = reqWithUser({ params: { templateName: 'nonexistent' } });
     const { res, status } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -639,7 +639,7 @@ describe('getPreviewTemplate', () => {
     fs.existsSync.mockReturnValue(true);
     fs.promises.readFile.mockResolvedValue('<html>v2-legacy</html>');
 
-    const req = makeReq({ params: { templateName: 'default-v2' } });
+    const req = reqWithUser({ params: { templateName: 'default-v2' } });
     const { res, send, setHeader } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -654,7 +654,7 @@ describe('getPreviewTemplate', () => {
     fs.existsSync.mockReturnValue(true);
     fs.promises.readFile.mockResolvedValue('<html>v2-legacy</html>');
 
-    const req = makeReq({ params: { templateName: 'landing-page-v2' } });
+    const req = reqWithUser({ params: { templateName: 'landing-page-v2' } });
     const { res, send } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -667,7 +667,7 @@ describe('getPreviewTemplate', () => {
     const fs = require('fs');
     fs.existsSync.mockReturnValue(false);
 
-    const req = makeReq({ params: { templateName: 'default-v2' } });
+    const req = reqWithUser({ params: { templateName: 'default-v2' } });
     const { res, status } = makeRes();
 
     await getPreviewTemplate(req, res);
