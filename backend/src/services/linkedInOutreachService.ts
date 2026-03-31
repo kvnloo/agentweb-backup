@@ -10,7 +10,7 @@ export class LinkedInOutreachService {
   // Cached to avoid a Secrets Manager round-trip on every method call
   private cachedDsn: string | null = null;
   private cachedApiKey: string | null = null;
-  // Short-lived cache for isAccountConnected — avoids a Unipile API call on every page load
+  // Short-lived cache for connectivity checks — avoids a Unipile API call on every page load
   private connectedStatusCache: Map<string, { connected: boolean; timestamp: number }> = new Map();
   private static readonly CONNECTED_STATUS_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -597,7 +597,7 @@ export class LinkedInOutreachService {
           if (await this.isAccountConnected(account.account_id)) {
             return account.account_id;
           }
-          console.warn(`[LinkedInOutreach] Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
