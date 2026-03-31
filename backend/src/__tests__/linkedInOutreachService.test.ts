@@ -59,6 +59,9 @@ describe('LinkedInOutreachService', () => {
       },
       request: {
         send: jest.fn().mockResolvedValue({ provider_id: 'provider-123' })
+      },
+      account: {
+        getOne: jest.fn().mockResolvedValue({ status: 'CONNECTED' }),
       }
     } as unknown as jest.Mocked<UnipileClient>;
 
