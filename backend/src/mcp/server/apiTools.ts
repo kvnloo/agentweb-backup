@@ -1986,6 +1986,29 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'freeze_user_account',
+  definition: {
+    name: 'freeze_user_account',
+    description: 'Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', description: 'The userId of the account to freeze or unfreeze' },
+        action: { type: 'string', enum: ['freeze', 'unfreeze'], description: '"freeze" to deactivate the account, "unfreeze" to reactivate it' }
+      },
+      required: ['user_id', 'action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const path = args.action === 'freeze'
+      ? `/api/admin/users/${args.user_id}/deactivate`
+      : `/api/admin/users/${args.user_id}/reactivate`;
+    const data = await mcpFetch({ method: 'POST', path, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'save_file',
   internal: true,
   definition: {
