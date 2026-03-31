@@ -1275,6 +1275,12 @@ export default function AdminDashboard() {
   const handleStartCrmSync = async () => {
     try {
       setCrmSyncRunning(true);
+      // Save config (including autoSync) before starting sync
+      await axios.put(
+        buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}`),
+        { listId: crmSyncListId.trim(), autoSync: crmSyncAutoSync },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
       const response = await axios.post(
         buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}/start`),
         { forceFullSync: crmSyncForceFull },
@@ -1282,6 +1288,7 @@ export default function AdminDashboard() {
       );
       setCrmSyncLastSyncAt(response.data?.lastSyncAt || null);
       setSuccess(response.data?.message || `CRM sync started for ${crmSyncSource}.`);
+      await loadCrmSyncConfig(crmSyncSource);
     } catch (err: any) {
       console.error("Error starting CRM sync:", err);
       setError(err.response?.data?.message || "Failed to start CRM sync");

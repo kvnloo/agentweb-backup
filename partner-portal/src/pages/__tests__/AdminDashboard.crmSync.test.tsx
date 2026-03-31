@@ -141,11 +141,19 @@ describe("AdminDashboard CRM sync", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "Start Syncing" }));
-    expect(axios.post).toHaveBeenCalledWith(
-      "https://api.test/api/admin/crm-sync/users/start",
-      { forceFullSync: false },
-      { headers: { Authorization: "Bearer test-token" } }
-    );
+    await waitFor(() => {
+      // Start Syncing saves config first, then runs the sync
+      expect(axios.put).toHaveBeenCalledWith(
+        "https://api.test/api/admin/crm-sync/users",
+        expect.objectContaining({ autoSync: false }),
+        { headers: { Authorization: "Bearer test-token" } }
+      );
+      expect(axios.post).toHaveBeenCalledWith(
+        "https://api.test/api/admin/crm-sync/users/start",
+        { forceFullSync: false },
+        { headers: { Authorization: "Bearer test-token" } }
+      );
+    });
   }, 15000);
 
   it("supports force full sync from waitlist tab", async () => {
@@ -165,6 +173,12 @@ describe("AdminDashboard CRM sync", () => {
     await user.click(screen.getByRole("button", { name: "Start Syncing" }));
 
     await waitFor(() => {
+      // Start Syncing saves config first, then runs the sync
+      expect(axios.put).toHaveBeenCalledWith(
+        "https://api.test/api/admin/crm-sync/waitlist",
+        expect.objectContaining({ autoSync: false }),
+        { headers: { Authorization: "Bearer test-token" } }
+      );
       expect(axios.post).toHaveBeenCalledWith(
         "https://api.test/api/admin/crm-sync/waitlist/start",
         { forceFullSync: true },
