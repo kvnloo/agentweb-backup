@@ -18,6 +18,7 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 
@@ -343,6 +344,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       const nextSetting: CrmSyncSetting = {
         listId: parsed.listId,
         lastSyncAt: updatedLastSyncAt,
+        autoSync: parsed.autoSync, // preserve autoSync flag across syncs
       };
       await settingsService.setSetting(
         settingName,
@@ -1148,7 +1150,19 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       }
 
       resultUser = newUser;
-      
+
+      // Auto-sync new user to CRM lead list (fire-and-forget)
+      syncNewUserToLeadList({
+        userId,
+        email,
+        fullName: waitlistEntry.fullName,
+        roles,
+        isAdmin: false,
+        createdAt: new Date().toISOString(),
+        stripe_customer_id: waitlistEntry.stripe_customer_id,
+        subscriptionType: "Free",
+      }).catch(() => {});
+
       // Send welcome email with temporary password for new user
       await emailService.sendWelcomeEmail(email, temporaryPassword);
     }
