@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-31',
     changes: [
+      'Fix: CRM Auto-Sync Switch Not Saved',
+      '- Fixed an issue where the "Auto-sync new users to this lead list" switch in the CRM sync dialog was not being saved when clicking "Start Syncing"',
+      '- Previously, clicking "Start Syncing" would run the sync but discard the auto-sync toggle state; it now saves the setting first',
+      '- Also fixed a bug where running a sync would overwrite the saved auto-sync flag, causing it to revert to off on the next dialog open',
+      '- Users created from the waitlist via the Admin panel are now also auto-synced to the CRM lead list when auto-sync is enabled',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
       'Fix: Browser Tools Now Reliable in Agent Mode',
       '- Fixed an issue where browser navigation and other Playwright browser tools would fail in agent mode sessions on EC2',
       '- Root cause: @playwright/mcp@latest updated to a version requiring a newer Chromium revision than what was installed',
