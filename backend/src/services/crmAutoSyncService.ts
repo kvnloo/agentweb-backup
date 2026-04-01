@@ -73,8 +73,7 @@ export async function syncNewUserToLeadList(user: {
 
         // Default activation fields for a newly registered user
         chatSessionCount: 0,
-        brandGuidelinesCompleted: "false",
-        brandGuidelinesCreatedAt: "",
+        brandGuidelinesCompletedAt: "",
         lastActiveDate: (user.createdAt || new Date().toISOString()).split('T')[0],
       },
     };

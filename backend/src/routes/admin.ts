@@ -269,8 +269,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
         const parsedName = splitName(nameFromRecord);
 
         const chatSessionCount = user.chatSessionCount ?? 0;
-        const brandGuidelinesCompleted = !!user.brandGuidelines;
-        const brandGuidelinesCreatedAt = user.brandGuidelines?.createdAt || "";
+        const brandGuidelinesCompletedAt = user.brandGuidelines?.createdAt || "";
         const lastActiveDateRaw = user.lastLoginTime || user.lastActiveAt || user.createdAt;
         const lastActiveDateParsed = new Date(lastActiveDateRaw);
         const lastActiveDate = isNaN(lastActiveDateParsed.getTime())
@@ -296,8 +295,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
             slackChannel: user.slackChannel || "",
             subscriptionType: user.subscriptionType || "",
             chatSessionCount,
-            brandGuidelinesCompleted: brandGuidelinesCompleted ? "true" : "false",
-            brandGuidelinesCreatedAt,
+            brandGuidelinesCompletedAt,
             lastActiveDate,
           },
         };

@@ -250,8 +250,7 @@ describe("Admin CRM sync routes", () => {
         expect.objectContaining({
           email: "new@example.com",
           customFields: expect.objectContaining({
-            brandGuidelinesCompleted: "false",
-            brandGuidelinesCreatedAt: "",
+            brandGuidelinesCompletedAt: "",
             chatSessionCount: 0
           })
         }),

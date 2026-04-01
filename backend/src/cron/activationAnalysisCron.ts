@@ -27,8 +27,7 @@ export async function runActivationAnalysis() {
         // chatSessionCount is already computed by userDb.getAllUsers() via UserIdIndex GSI
         const metrics = allUsers.map((u: any) => {
             const chatSessionCount = u.chatSessionCount ?? 0;
-            const brandGuidelinesCompleted = !!u.brandGuidelines;
-            const brandGuidelinesCreatedAt = u.brandGuidelines?.createdAt || "";
+            const brandGuidelinesCompletedAt = u.brandGuidelines?.createdAt || "";
             const lastActiveDateRaw = u.lastLoginTime || u.lastActiveAt || u.createdAt;
             const lastActiveDateParsed = new Date(lastActiveDateRaw);
             const lastActiveDate = isNaN(lastActiveDateParsed.getTime())
@@ -40,8 +39,7 @@ export async function runActivationAnalysis() {
                 email: u.email,
                 customFields: {
                     chatSessionCount,
-                    brandGuidelinesCompleted: brandGuidelinesCompleted ? "true" : "false",
-                    brandGuidelinesCreatedAt,
+                    brandGuidelinesCompletedAt,
                     lastActiveDate,
                 }
             };

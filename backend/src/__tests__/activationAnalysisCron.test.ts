@@ -70,32 +70,28 @@ describe('ActivationAnalysisCron', () => {
                 email: 'user1@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 0,
-                    brandGuidelinesCompleted: 'false',
-                    brandGuidelinesCreatedAt: ''
+                    brandGuidelinesCompletedAt: ''
                 })
             }),
             expect.objectContaining({
                 email: 'user2@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 0,
-                    brandGuidelinesCompleted: 'true',
-                    brandGuidelinesCreatedAt: '2026-03-01'
+                    brandGuidelinesCompletedAt: '2026-03-01'
                 })
             }),
             expect.objectContaining({
                 email: 'user3@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 5,
-                    brandGuidelinesCompleted: 'true',
-                    brandGuidelinesCreatedAt: '2026-03-02'
+                    brandGuidelinesCompletedAt: '2026-03-02'
                 })
             }),
             expect.objectContaining({
                 email: 'old@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 0,
-                    brandGuidelinesCompleted: 'false',
-                    brandGuidelinesCreatedAt: ''
+                    brandGuidelinesCompletedAt: ''
                 })
             })
         ]));
