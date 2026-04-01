@@ -1117,6 +1117,10 @@ export async function postThreadResponse(
   }
 }
 
+// Cache display name lookups for the lifetime of the process — user names rarely change
+// and the bot serves a single workspace, so unbounded growth is not a concern.
+const displayNameCache = new Map<string, Promise<string>>();
+
 /**
  * Get a Slack user's display name
  */
@@ -1125,18 +1129,43 @@ export async function getSlackUserDisplayName(slackUserId: string): Promise<stri
     return slackUserId;
   }
 
-  try {
-    const result = await slackClient.users.info({ user: slackUserId });
-    if (result.ok && result.user) {
-      return (result.user as any).profile?.display_name
-        || (result.user as any).profile?.real_name
-        || (result.user as any).real_name
-        || slackUserId;
+  const cached = displayNameCache.get(slackUserId);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    try {
+      const result = await slackClient!.users.info({ user: slackUserId });
+      if (result.ok && result.user) {
+        return (result.user as any).profile?.display_name
+          || (result.user as any).profile?.real_name
+          || (result.user as any).real_name
+          || slackUserId;
+      }
+    } catch (error) {
+      console.error(`Failed to get Slack user display name for ${slackUserId}:`, error);
     }
-  } catch (error) {
-    console.error(`Failed to get Slack user display name for ${slackUserId}:`, error);
-  }
-  return slackUserId;
+    return slackUserId;
+  })();
+
+  displayNameCache.set(slackUserId, promise);
+  return promise;
+}
+
+/**
+ * Resolve display names for a list of Slack messages, deduplicating user ID lookups.
+ */
+async function resolveDisplayNames(messages: any[]): Promise<Map<string, string>> {
+  const uniqueUserIds = [...new Set(messages.map((m) => m.user).filter((id): id is string => !!id))];
+  const nameEntries = await Promise.all(
+    uniqueUserIds.map(async (id) => {
+      try {
+        return [id, await getSlackUserDisplayName(id)] as const;
+      } catch {
+        return [id, id] as const;
+      }
+    })
+  );
+  return new Map(nameEntries);
 }
 
 export async function getSlackUserEmail(slackUserId: string): Promise<string | null> {
@@ -1229,19 +1258,7 @@ export async function getRecentChannelMessages(
   });
 
   const messages = result.messages ?? [];
-
-  // Resolve display names for unique user IDs only (avoids N+1 API calls)
-  const uniqueUserIds = [...new Set(messages.map((m) => m.user).filter((id): id is string => !!id))];
-  const nameEntries = await Promise.all(
-    uniqueUserIds.map(async (id) => {
-      try {
-        return [id, await getSlackUserDisplayName(id)] as const;
-      } catch {
-        return [id, id] as const;
-      }
-    })
-  );
-  const displayNameMap = new Map(nameEntries);
+  const displayNameMap = await resolveDisplayNames(messages);
 
   return messages.map((msg) => {
     const userId = msg.user ?? msg.bot_id ?? 'unknown';
@@ -1252,6 +1269,38 @@ export async function getRecentChannelMessages(
       text: msg.text ?? '',
       threadTs: msg.thread_ts,
       replyCount: msg.reply_count,
+    } as SlackMessage;
+  });
+}
+
+/**
+ * Fetch all replies in a Slack thread (conversations.replies).
+ * Returns every message in the thread including the parent, with display names resolved.
+ */
+export async function getThreadReplies(
+  channelId: string,
+  threadTs: string
+): Promise<SlackMessage[]> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const result = await slackClient.conversations.replies({
+    channel: channelId,
+    ts: threadTs,
+  });
+
+  const messages = result.messages ?? [];
+  const displayNameMap = await resolveDisplayNames(messages);
+
+  return messages.map((msg) => {
+    const userId = msg.user ?? msg.bot_id ?? 'unknown';
+    return {
+      ts: msg.ts ?? '',
+      user: userId,
+      displayName: msg.user ? (displayNameMap.get(msg.user) ?? userId) : userId,
+      text: msg.text ?? '',
+      threadTs: msg.thread_ts,
     } as SlackMessage;
   });
 }
