@@ -80,6 +80,27 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Pattern:** Use `userDb.getUserById(userId)` to verify admin status; don't trust context fields that may not exist.
   - **Date:** 2026-03-13
 
+## Cloud Test Environment SSH
+
+### SSH User is ec2-user, NOT ubuntu
+- **Lesson:** Test-env EC2 instances use `ec2-user`, not `ubuntu`
+  - **Why:** The AMI is Amazon Linux (not Ubuntu). The user-data script sets the password via `echo "ec2-user:${SSH_PASSWORD}" | chpasswd`. Tried `ubuntu@` repeatedly before realizing the correct user.
+  - **Fix:** Always SSH as `ec2-user@<PUBLIC_IP>` with the password from `agentweb/test-env/ssh-password`
+  - **Secret:** `agentweb/test-env/ssh-password` (NOT `agentweb/cloud-dev/ssh-password`)
+  - **Date:** 2026-04-01
+
+### Stop/Start Changes the Public IP
+- **Lesson:** After an EC2 stop/start, the public IP changes
+  - **Why:** Stop/start deallocates and reassigns the public IP (unlike reboot)
+  - **Fix:** After stop/start, run `aws ec2 describe-instances --instance-ids <id> --query 'Reservations[0].Instances[0].PublicIpAddress'` to get the new IP
+  - **Date:** 2026-04-01
+
+### Claude tmux Session Doesn't Auto-Restart After Stop/Start
+- **Lesson:** The Claude tmux session is started by user-data at launch time only — it does NOT restart on stop/start
+  - **Why:** cloud-init user-data only runs once (at first boot). Stop/start only re-runs lightweight cloud-init phases (config/final), not the full user-data script.
+  - **Fix:** After stop/start, SSH in and manually restart: `tmux new-session -d -s claude /home/ec2-user/agentweb/.claude-run.sh`
+  - **Date:** 2026-04-01
+
 ## Code Patterns
 
 ### DynamoDB Queries
