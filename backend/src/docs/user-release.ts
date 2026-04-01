@@ -3537,4 +3537,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Override the agent mode default on a per-plan basis using the new "Default AI Model" dropdown',
     ],
   },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Custom Subdomain for Landing Pages Now Persists',
+      '- Setting a custom subdomain (e.g. rankai.agentwebforms.com) on a landing page now saves correctly',
+      '- The custom URL is shown in the Landing Pages view after page reload',
+      '- If a subdomain was already registered in Vercel, Set Subdomain now correctly recognises it instead of creating a duplicate',
+    ],
+  },
 ];
