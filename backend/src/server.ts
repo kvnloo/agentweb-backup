@@ -299,6 +299,29 @@ createTestAccount().then(async () => {
         setInterval(() => {
           scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
         }, SCANNER_INTERVAL_MS);
+
+        // Activation Analysis Automation
+        // Runs daily at midnight PST (00:00 PST = 08:00 UTC)
+        const ACTIVATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runActivationAnalysis } = await import('./cron/activationAnalysisCron');
+
+        // Calculate delay until next midnight PST
+        const nowForCron = new Date();
+        const nextMidnightPST = new Date(nowForCron);
+        nextMidnightPST.setUTCHours(8, 0, 0, 0); // 00:00 PST = 08:00 UTC
+        if (nextMidnightPST <= nowForCron) {
+          nextMidnightPST.setUTCDate(nextMidnightPST.getUTCDate() + 1);
+        }
+        const msUntilMidnightPST = nextMidnightPST.getTime() - nowForCron.getTime();
+
+        console.log(`[ActivationCron] Initialized — first run at midnight PST (in ${Math.round(msUntilMidnightPST / 60000)} min)`);
+        setTimeout(() => {
+          runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+          setInterval(() => {
+            runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+          }, ACTIVATION_INTERVAL_MS);
+        }, msUntilMidnightPST);
+
       } catch (error) {
         console.error('[SocialEngagement] Failed to initialize scanner:', error);
       }

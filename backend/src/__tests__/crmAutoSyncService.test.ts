@@ -122,6 +122,10 @@ describe("crmAutoSyncService", () => {
           roles: "customer",
           isAdmin: "no",
           subscriptionType: "Free",
+          chatSessionCount: 0,
+          brandGuidelinesCompleted: "false",
+          brandGuidelinesCreatedAt: "",
+          lastActiveDate: "2026-03-25",
         }),
       }),
     ]);
