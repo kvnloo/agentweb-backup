@@ -134,9 +134,9 @@ cmd_launch() {
     esac
   done
 
-  # Dev mode: auto-upgrade to t3.xlarge (16 GB) unless user specified --instance-type
+  # Dev mode: auto-upgrade to t3.2xlarge (32 GB) unless user specified --instance-type
   if is_dev_mode && [[ "$INSTANCE_TYPE_SPECIFIED" == "false" ]]; then
-    INSTANCE_TYPE="t3.xlarge"
+    INSTANCE_TYPE="t3.2xlarge"
   fi
 
   # If config missing and no flags provided, interactively create it
@@ -971,7 +971,7 @@ case "$CMD" in
     echo "  --dev            Dev mode: hot-reload dev servers + Claude Code (no Docker)"
     echo "  --key-name K     EC2 key pair name"
     echo "  --key-file F     Path to private key file"
-    echo "  --instance-type T  Instance type (default: t3.large, dev mode: t3.xlarge)"
+    echo "  --instance-type T  Instance type (default: t3.large, dev mode: t3.2xlarge)"
     echo "  --no-watchdog    Disable auto-shutdown watchdog"
     echo ""
     echo "The environment name is derived automatically from your AWS username"
