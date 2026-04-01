@@ -1,9 +1,16 @@
 import { emmaToolRegistry } from './registry';
+import { SlackMessage } from '../services/slackService';
 import {
   getSlackChannels,
   getRecentChannelMessages,
+  getThreadReplies,
   postSlackMessage,
 } from '../services/slackService';
+
+// conversations.replies includes the parent as the first item; skip it to return only replies.
+function formatReplies(messages: SlackMessage[]): Array<{ ts: string; author: string; text: string }> {
+  return messages.slice(1).map((r) => ({ ts: r.ts, author: r.displayName, text: r.text }));
+}
 
 async function resolveChannelId(
   channelId: string | undefined,
@@ -50,8 +57,10 @@ emmaToolRegistry.register({
   definition: {
     name: 'slack_get_recent_messages',
     description:
-      'Fetch messages from a Slack channel. Resolves each message author to a display name. ' +
-      'Use this to review what clients or team members have said and decide if a reply is needed. ' +
+      'Fetch messages from a Slack channel, including all thread replies for any message that has them. ' +
+      'Resolves each message author to a display name. ' +
+      'Use this to review what clients or team members have said and decide if a reply is needed — ' +
+      'thread replies are included automatically so you can see the full conversation in one call. ' +
       'If you only know the channel name (e.g. #sales), call this with channel_name and omit channel_id; ' +
       'if you already have the channel ID use channel_id directly. ' +
       'Filter by time using since_hours (e.g. 24 = last 24 hours) or provide explicit oldest/latest Unix timestamps.',
@@ -97,17 +106,84 @@ emmaToolRegistry.register({
       return { success: true, channel_id: resolved.id, messages: [], summary: 'No messages found.' };
     }
 
+    // Fetch thread replies inline for any message that has them
+    const messagesWithReplies = await Promise.all(
+      messages.map(async (m) => {
+        const base: Record<string, any> = {
+          ts: m.ts,
+          author: m.displayName,
+          text: m.text,
+          ...(m.threadTs && m.threadTs !== m.ts ? { thread_ts: m.threadTs } : {}),
+        };
+
+        if (m.replyCount && m.replyCount > 0) {
+          const allReplies = await getThreadReplies(resolved.id, m.ts);
+          base.reply_count = m.replyCount;
+          base.replies = formatReplies(allReplies);
+        }
+
+        return base;
+      })
+    );
+
     return {
       success: true,
       channel_id: resolved.id,
       count: messages.length,
-      messages: messages.map((m) => ({
-        ts: m.ts,
-        author: m.displayName,
-        text: m.text,
-        ...(m.threadTs && m.threadTs !== m.ts ? { thread_ts: m.threadTs } : {}),
-        ...(m.replyCount ? { reply_count: m.replyCount } : {}),
-      })),
+      messages: messagesWithReplies,
+    };
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'slack_get_thread_replies',
+  definition: {
+    name: 'slack_get_thread_replies',
+    description:
+      'Fetch all replies in a Slack thread. Use this to get the latest replies for a specific thread ' +
+      'when you need up-to-date information after the initial channel fetch. ' +
+      'Pass the ts value from slack_get_recent_messages as thread_ts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel_id: {
+          type: 'string',
+          description: 'Slack channel ID (e.g. C012AB3CD). Use this or channel_name, not both.',
+        },
+        channel_name: {
+          type: 'string',
+          description:
+            'Channel name without the # prefix (e.g. "sales"). Used to look up the channel ID automatically.',
+        },
+        thread_ts: {
+          type: 'string',
+          description: 'Timestamp of the parent message (the ts field from slack_get_recent_messages).',
+        },
+      },
+      required: ['thread_ts'],
+    },
+  },
+  execute: async (args: any) => {
+    if (!args.thread_ts) {
+      return { success: false, error: 'thread_ts is required.' };
+    }
+
+    const resolved = await resolveChannelId(args.channel_id, args.channel_name);
+    if ('error' in resolved) return { success: false, error: resolved.error };
+
+    const allReplies = await getThreadReplies(resolved.id, args.thread_ts);
+    const replies = formatReplies(allReplies);
+
+    if (replies.length === 0) {
+      return { success: true, channel_id: resolved.id, thread_ts: args.thread_ts, replies: [], summary: 'No replies found.' };
+    }
+
+    return {
+      success: true,
+      channel_id: resolved.id,
+      thread_ts: args.thread_ts,
+      count: replies.length,
+      replies,
     };
   },
 });
