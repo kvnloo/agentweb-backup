@@ -2,7 +2,7 @@
  * Tests for error classification functions working with wrapped errors
  * from generateMarketingResponse's catch block (Fix B).
  */
-import { isContextLimitError, isTransientLLMError } from '../utils/agentModeErrors';
+import { isContextLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 
 describe('isContextLimitError - wrapped errors', () => {
   it('should detect context limit from originalMessage', () => {
@@ -63,5 +63,28 @@ describe('isTransientLLMError - wrapped errors', () => {
     wrapped.status = 429;
     wrapped.originalMessage = '';
     expect(isTransientLLMError(wrapped)).toBe(true);
+  });
+});
+
+describe('isWorkerShutdownError', () => {
+  it('should return true for exact Worker shutdown message', () => {
+    expect(isWorkerShutdownError(new Error('Worker shutdown'))).toBe(true);
+  });
+
+  it('should return false for unrelated errors', () => {
+    expect(isWorkerShutdownError(new Error('some other error'))).toBe(false);
+  });
+
+  it('should return false for null/undefined', () => {
+    expect(isWorkerShutdownError(null)).toBe(false);
+    expect(isWorkerShutdownError(undefined)).toBe(false);
+  });
+
+  it('should return false for partial match', () => {
+    expect(isWorkerShutdownError(new Error('Worker shutdown unexpectedly'))).toBe(false);
+  });
+
+  it('should return false for a non-Error string value', () => {
+    expect(isWorkerShutdownError('some error string')).toBe(false);
   });
 });

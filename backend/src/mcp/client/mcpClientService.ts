@@ -10,6 +10,8 @@ import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
+import { spawn } from "child_process";
 
 // SSE transport configuration
 export interface SseTransportConfig {
@@ -147,6 +149,10 @@ export class McpClientService {
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
   private cleanupInterval?: NodeJS.Timeout;
+
+  // Playwright browser pre-install: shared Promise so concurrent sessions wait on the same install
+  private static readonly PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp';
+  private static playwrightBrowsersInstall: Promise<void> | null = null;
 
   constructor() {
     // Start periodic cleanup of stale sessions
@@ -495,8 +501,13 @@ export class McpClientService {
     const transportType = getTransportType(config);
 
     switch (transportType) {
-      case "stdio":
-        return this.createStdioTransport(name, config as StdioTransportConfig, poolKey);
+      case "stdio": {
+        const stdioConfig = config as StdioTransportConfig;
+        if (stdioConfig.args?.some(arg => arg.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE))) {
+          await this.ensurePlaywrightBrowsers();
+        }
+        return this.createStdioTransport(name, stdioConfig, poolKey);
+      }
       
       case "streamable-http":
         return this.createStreamableHttpTransport(name, config as StreamableHttpTransportConfig);
@@ -507,6 +518,68 @@ export class McpClientService {
         const sseConfig = config as SseTransportConfig | LegacyConfig;
         return this.createSseTransport(name, sseConfig);
     }
+  }
+
+  /**
+   * Ensures Playwright Chromium browsers are installed before the MCP server starts.
+   * @playwright/mcp pins a specific Chromium revision; if the revision isn't cached locally
+   * the browser launch will fail. This runs playwright install once per process startup.
+   * Using a shared Promise so concurrent session creation waits on the same install.
+   */
+  private async ensurePlaywrightBrowsers(): Promise<void> {
+    if (!McpClientService.playwrightBrowsersInstall) {
+      McpClientService.playwrightBrowsersInstall = this.runPlaywrightInstall();
+    }
+    return McpClientService.playwrightBrowsersInstall;
+  }
+
+  private async runPlaywrightInstall(): Promise<void> {
+    const playwrightBin = this.findPlaywrightBinInNpxCache();
+    if (!playwrightBin) {
+      console.log('MCP: No playwright binary found in npx cache, skipping browser pre-install');
+      return;
+    }
+
+    console.log(`MCP: Pre-installing Playwright browsers using ${playwrightBin}...`);
+    await new Promise<void>((resolve) => {
+      const proc = spawn(playwrightBin, ['install', 'chromium'], {
+        env: process.env,
+        stdio: 'pipe',
+      });
+      proc.stdout?.on('data', (d: Buffer) => console.log('MCP [playwright-install]:', d.toString().trim()));
+      proc.stderr?.on('data', (d: Buffer) => console.warn('MCP [playwright-install]:', d.toString().trim()));
+      proc.on('exit', (code: number | null) => {
+        if (code !== 0) {
+          console.warn(`MCP: Playwright browser install exited with code ${code} — browser tools may fail`);
+        } else {
+          console.log('MCP: Playwright browsers installed successfully');
+        }
+        resolve(); // Always resolve — don't block MCP startup on install failure
+      });
+      proc.on('error', (err: Error) => {
+        console.warn('MCP: Playwright browser install error:', err.message);
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Finds the playwright CLI binary inside the npx cache for @playwright/mcp.
+   * The npx cache lives at ~/.npm/_npx/<hash>/node_modules/.bin/playwright.
+   */
+  private findPlaywrightBinInNpxCache(): string | null {
+    try {
+      const cacheDir = path.join(os.homedir(), '.npm', '_npx');
+      for (const hash of fs.readdirSync(cacheDir)) {
+        const candidate = path.join(cacheDir, hash, 'node_modules', '.bin', 'playwright');
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+      }
+    } catch (e) {
+      console.warn('MCP: Error searching for playwright binary:', (e as Error).message);
+    }
+    return null;
   }
 
   /**

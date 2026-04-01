@@ -615,9 +615,16 @@ class UserDB {
     return items;
   }
 
+  async reactivateUser(userId: string) {
+    return this.setUserActiveStatus(userId, true);
+  }
+
   async deactivateUser(userId: string) {
+    return this.setUserActiveStatus(userId, false);
+  }
+
+  private async setUserActiveStatus(userId: string, isActive: boolean) {
     try {
-      // First get the user to get the email (primary key)
       const user = await this.getUserById(userId);
       if (!user) {
         throw new Error("User not found");
@@ -625,20 +632,16 @@ class UserDB {
 
       const params = {
         TableName: this.tableName,
-        Key: {
-          email: user.email, // Using email as the primary key
-        },
+        Key: { email: user.email },
         UpdateExpression: "set isActive = :isActive",
-        ExpressionAttributeValues: {
-          ":isActive": false,
-        },
+        ExpressionAttributeValues: { ":isActive": isActive },
         ReturnValues: "ALL_NEW",
       };
 
       const result = await this.docClient.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      this.handleError(error, "deactivateUser");
+      this.handleError(error, isActive ? "reactivateUser" : "deactivateUser");
     }
   }
 

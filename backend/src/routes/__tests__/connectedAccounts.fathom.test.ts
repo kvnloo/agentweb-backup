@@ -33,7 +33,10 @@ jest.mock('../../services/fathomApiService', () => ({
 }));
 
 jest.mock('../../services/linkedInOutreachService', () => ({
-  linkedInOutreachService: { deleteAccount: jest.fn() },
+  linkedInOutreachService: {
+    deleteAccount: jest.fn(),
+    getStatusesForAccounts: jest.fn().mockResolvedValue(new Map()),
+  },
 }));
 
 jest.mock('../../utils/tokenUtils', () => ({

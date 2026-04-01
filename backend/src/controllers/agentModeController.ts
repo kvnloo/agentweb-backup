@@ -14,7 +14,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { isContextLimitError, isSessionLimitError, isTransientLLMError } from '../utils/agentModeErrors';
+import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
@@ -1895,8 +1895,8 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
-        // Skip diagnosis for errors that already have specific handling below (context limit, etc.)
-        if (!(error instanceof Error && isContextLimitError(error))) {
+        // Skip diagnosis for errors that already have specific handling below (context limit, worker shutdown, etc.)
+        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
           const userMessage = req.body?.userMessage || '';
           diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
         }
@@ -1938,6 +1938,16 @@ export const agentModeController = {
             message: 'Please start a new session to continue the conversation.',
             code: 'SESSION_SIZE_LIMIT_EXCEEDED',
             suggestion: 'start_new_session'
+          });
+          return;
+        }
+
+        if (isWorkerShutdownError(error)) {
+          res.status(503).json({
+            error: 'Server is restarting',
+            message: 'The server is restarting. Please try again in a moment.',
+            code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
           });
           return;
         }
@@ -2464,7 +2474,7 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
-        if (!(error instanceof Error && isContextLimitError(error))) {
+        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
           const userMessage = req.body?.userMessage || '';
           diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
         }
@@ -2577,6 +2587,16 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (isWorkerShutdownError(error)) {
+          res.status(503).json({
+            error: 'Server is restarting',
+            message: 'The server is restarting. Please try again in a moment.',
+            code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -4633,6 +4653,16 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (isWorkerShutdownError(error)) {
+          res.status(503).json({
+            error: 'Server is restarting',
+            message: 'The server is restarting. Please try again in a moment.',
+            code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
           });
           return;

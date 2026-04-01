@@ -558,10 +558,11 @@ async function processQueue() {
         console.error(`[relay] Failed to post error comment:`, commentErr);
       }
 
-      // If Claude crashed (exit code 143=SIGTERM, timeout, etc.), re-queue the
+      // If Claude crashed (non-zero exit, but NOT 143=SIGTERM/timeout), re-queue the
       // prompt so the user's message isn't lost.  Post the error comment above
       // so the user knows what happened, then retry after a short delay.
-      if (/exited with code (?!0\b)\d+/.test(errMsg)) {
+      // Exit 143 = SIGTERM (timeout or OOM kill) — don't retry, it will just loop.
+      if (/exited with code (?!0\b)(?!143\b)\d+/.test(errMsg)) {
         console.log(`[relay] Re-queuing prompt after crash for page ${notionPageId}`);
         await new Promise((r) => setTimeout(r, 5000)); // 5s cooldown
         promptQueue.push({ prompt, notionPageId });
@@ -637,12 +638,12 @@ function runClaude(prompt) {
     const escaped = prompt.replace(/'/g, "'\\''");
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model sonnet --permission-mode auto --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
         env: { ...process.env, HOME: "/home/ec2-user" },
-        timeout: 30 * 60 * 1000, // 30 minutes
+        timeout: 60 * 60 * 1000, // 60 minutes
       }
     );
 

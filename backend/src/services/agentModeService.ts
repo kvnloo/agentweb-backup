@@ -24,13 +24,14 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'slack_list_channels', 'slack_get_recent_messages', 'slack_send_message', 'freeze_user_account'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import * as linkedInAdsService from './linkedInAdsService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
@@ -151,15 +152,15 @@ export class AgentModeService {
     toolNames: string[];
     category?: string;
   }> = [
-    {
-      name: 'Meeting Intelligence',
-      description:
-        'Access meeting recordings, transcripts, and action items from Fathom. ' +
-        'Requires a connected Fathom account (Settings → Connected Accounts).',
-      toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
-      category: 'tool_bundle',
-    },
-  ];
+      {
+        name: 'Meeting Intelligence',
+        description:
+          'Access meeting recordings, transcripts, and action items from Fathom. ' +
+          'Requires a connected Fathom account (Settings → Connected Accounts).',
+        toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        category: 'tool_bundle',
+      },
+    ];
 
   /**
    * Ensure all built-in skills exist in the database.
@@ -331,6 +332,7 @@ export class AgentModeService {
         await import('../emma/fathomTools');
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
+        await import('../emma/slackMessageTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -1820,8 +1822,7 @@ export class AgentModeService {
 - Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
 - Example: {"site_url": "example.com", "business_area": "e-commerce"}
 - Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
-- The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
+- **Fallback Method**: [DEPRECATED: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.]
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
@@ -1840,6 +1841,7 @@ export class AgentModeService {
 - **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
 - **Web Search**: Use 'search_web' proactively to gather information from the internet before asking users for clarification
 - **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
+- **Exception — Ad creation with landing page**: When creating LinkedIn or Meta ads and the user has already provided a landing page URL, do NOT web search for company information. Use the provided URL and inputs directly. Only search if no landing page is given and you need context about the company.
 - **When to search**: Before asking users for more details, search for market data, industry trends, competitor information, or other information available on the internet
 - **Search first, ask second**: Use web search to gather background information and context from the internet before requesting additional details from users
 - **Search topics include**: Market trends, industry benchmarks, competitor analysis, news, regulatory information, technology updates, or any information from the internet that would help provide better recommendations
@@ -2335,6 +2337,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
+
+    'get_user_profile',         // Account info teaser
 
     // Account Memory (cross-session knowledge)
     'save_memory',
@@ -6346,6 +6350,41 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  /**
+   * Helper function to extract text preview from emailContent field.
+   * The emailContent can be either a string (legacy) or an object with html/text properties.
+   */
+  private getEmailContentPreview(emailContent: any, maxLength: number): string | undefined {
+    if (!emailContent) {
+      return undefined;
+    }
+
+    let textContent: string;
+
+    // Handle object format (new format with html/text properties)
+    if (typeof emailContent === 'object' && !Array.isArray(emailContent)) {
+      // Prefer html over text, but use whichever is available
+      textContent = emailContent.html || emailContent.text || '';
+    }
+    // Handle string format (legacy format)
+    else if (typeof emailContent === 'string') {
+      textContent = emailContent;
+    }
+    else {
+      return undefined;
+    }
+
+    // Strip HTML tags and truncate
+    const plainText = textContent.replace(/<[^>]*>/g, '').trim();
+    if (plainText.length === 0) {
+      return undefined;
+    }
+
+    return plainText.length > maxLength
+      ? plainText.substring(0, maxLength) + '...'
+      : plainText;
+  }
+
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -6417,9 +6456,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate email content for preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 150) + '...'
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 150)
         })),
         listName: list.name
       };
@@ -7060,9 +7097,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate HTML email content to text preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 200) + (eng.emailContent.length > 200 ? '...' : '')
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 200)
         })),
         leadName: `${lead.firstName || ''} ${lead.lastName || ''}`.trim()
       };
@@ -9141,6 +9176,36 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('AgentMode: Diagnostic message generation failed:', error);
       return null;
+    }
+  }
+
+  /**
+   * Triage a Slack message to determine if it requires handling (e.g. a client question).
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
+   * Returns true if the message needs to be handled, false otherwise.
+   */
+  public async triageSlackMessage(message: string): Promise<boolean> {
+    try {
+      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
+
+Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
+Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
+
+      const response = await this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message },
+      ], {
+        max_completion_tokens: 10,
+        temperature: 0,
+      });
+
+      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
+      const needsHandling = content.startsWith('yes');
+      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
+      return needsHandling;
+    } catch (error) {
+      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
+      return true; // default to handling on error to avoid missing client questions
     }
   }
 
@@ -18587,8 +18652,42 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
-    const { action, account_id, profile_url, provider_id, message } = args;
+    let { account_id } = args;
+    const { action, profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
+
+    // Write actions must use an account owned by the calling user.
+    // This prevents an LLM from reusing a shared/enrichment account_id it may have
+    // seen in a prior get-profile tool call to send invitations or messages.
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation'];
+    if (WRITE_ACTIONS.includes(action)) {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const userAccounts = await getAccountsByUserId(userId);
+      const owned = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
+      if (!owned) {
+        return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
+      }
+    }
+
+    // For get-profile only, fall back to site-wide Unipile enrichment accounts when the
+    // user has no personally-connected account. Restricted to get-profile to prevent
+    // the shared account from being used for search quotas or discoverable via list actions.
+    if (!account_id && action === 'get-profile') {
+      account_id = await linkedInOutreachService.resolveAccountId(userId);
+      if (account_id) {
+        console.log(`[AgentMode] linkedinOutreach: using site-wide enrichment account for get-profile`);
+      }
+    }
+
+    // Guard: if no account_id is available at this point, return a clear error
+    // instead of forwarding a null account_id to Unipile (which returns a
+    // misleading "Profile not found" instead of an auth/config error).
+    if (!account_id) {
+      return {
+        success: false,
+        error: 'No LinkedIn account is connected. To use LinkedIn Outreach, please connect your LinkedIn account in Settings → Connected Accounts.',
+      };
+    }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
@@ -18603,6 +18702,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
             keywords, url: search_url, title, company, cursor
           });
+          // Trim to essential fields only — full profiles (skills, education, photos, etc.)
+          // inflate context by 10x and degrade LLM output quality in long sessions.
+          if (Array.isArray(searchResult?.items)) {
+            const trimmedItems = searchResult.items.map((item: any) => {
+              const trimmed: any = {
+                provider_id: item.provider_id,
+                public_identifier: item.public_identifier,
+                first_name: item.first_name,
+                last_name: item.last_name,
+                headline: item.headline,
+                location: item.location,
+                network_distance: item.network_distance,
+                public_profile_url: item.public_profile_url,
+                is_open_profile: item.is_open_profile,
+              };
+              if (item.work_experience?.length) {
+                const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+                if (current) trimmed.current_role = { position: current.position, company: current.company };
+              }
+              if (item.summary) trimmed.summary = item.summary.slice(0, 200);
+              return trimmed;
+            });
+            return { success: true, data: { ...searchResult, items: trimmedItems } };
+          }
           return { success: true, data: searchResult };
         }
 
@@ -18623,6 +18746,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-sent-invitations': {
           const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
+          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
+          if (Array.isArray(invitationsResult?.items)) {
+            const trimmedItems = invitationsResult.items.map((item: any) => ({
+              id: item.id,
+              invited_user_id: item.invited_user_id,
+              invited_user_public_id: item.invited_user_public_id,
+              invited_user: item.invited_user,
+            }));
+            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
+          }
           return { success: true, data: invitationsResult };
         }
 
@@ -18671,6 +18805,384 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         error: errorMessage
       };
     }
+  }
+
+  // --- LinkedIn Ads ---
+
+  private async getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(userId);
+    if (!user) throw new Error('User not found');
+
+    const connectedAccounts = user.connected_accounts || [];
+    const adsAccounts = (connectedAccounts as any[]).filter(
+      (acc: any) =>
+        acc.platform === 'linkedin_ads' &&
+        acc.config?.account_type === 'ad_account' &&
+        acc.config?.access_token
+    );
+
+    if (adsAccounts.length === 0) {
+      throw new Error('LinkedIn Ads account not connected. Please connect your LinkedIn Ads account in settings.');
+    }
+
+    let selected: any;
+    if (accountId) {
+      selected = adsAccounts.find((acc: any) => acc.account_id === accountId);
+      if (!selected) {
+        throw new Error(`LinkedIn Ads account "${accountId}" not found. Check your connected accounts.`);
+      }
+    } else if (adsAccounts.length > 1) {
+      const list = adsAccounts.map((a: any) => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+      throw new Error(`Multiple LinkedIn Ads accounts found: [${list}]. Specify account_id.`);
+    } else {
+      selected = adsAccounts[0];
+    }
+
+    const cfg = selected.config;
+    const now = Date.now();
+    const bufferMs = 5 * 60 * 1000;
+
+    if (cfg.token_expires_at && cfg.token_expires_at > now + bufferMs) {
+      return { accountId: selected.account_id, accessToken: cfg.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
+    }
+
+    // Token expired or expiring soon — refresh it
+    if (!cfg.refresh_token) {
+      throw new Error('LinkedIn Ads access token expired and no refresh token available. Please reconnect your account.');
+    }
+
+    const { getLinkedInAdsConfig } = await import('../config/integrations');
+    const oauthConfig = await getLinkedInAdsConfig();
+
+    const newTokens = await linkedInAdsService.refreshAccessToken(
+      cfg.refresh_token,
+      oauthConfig.clientId,
+      oauthConfig.clientSecret
+    );
+
+    const { updateAccountTokens } = await import('./connectedAccountsDb');
+    await updateAccountTokens(userId, 'linkedin_ads' as any, {
+      access_token: newTokens.access_token,
+      refresh_token: newTokens.refresh_token,
+      token_expires_at: Date.now() + newTokens.expires_in * 1000,
+    });
+
+    return { accountId: selected.account_id, accessToken: newTokens.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
+  }
+
+  /**
+   * Master method for LinkedIn Ads entity management (campaigns, creatives, targeting, etc.)
+   */
+  public async callLinkedInMarketingApi(
+    userId: string,
+    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
+    action: string,
+    account_id: string,
+    params: any = {}
+  ): Promise<any> {
+    console.log(`AgentMode: callLinkedInMarketingApi -> ${entity_type} / ${action}`);
+
+    const { accountId, accessToken, organizationUrn, personUrn } = await this.getLinkedInAdsCredentials(userId, account_id);
+
+    switch (entity_type) {
+      case 'AD_ACCOUNT': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listAdAccounts(accessToken);
+          if (!result.success) throw new Error(result.error || 'Failed to list ad accounts');
+          return { success: true, adAccounts: result.data?.elements || [] };
+        }
+        throw new Error(`Unknown action "${action}" for AD_ACCOUNT`);
+      }
+
+      case 'CAMPAIGN_GROUP': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
+          return { success: true, campaignGroups: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          const result = await linkedInAdsService.createCampaignGroup(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create campaign group');
+          return { success: true, message: 'Campaign group created', campaignGroup: result.data };
+        }
+        if (action === 'UPDATE') {
+          if (!params.campaign_group_id) throw new Error('UPDATE requires campaign_group_id');
+          const result = await linkedInAdsService.updateCampaignGroup(accessToken, accountId, params.campaign_group_id, params);
+          if (!result.success) throw new Error(result.error || 'Failed to update campaign group');
+          return { success: true, message: 'Campaign group updated', result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CAMPAIGN_GROUP`);
+      }
+
+      case 'CAMPAIGN': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listCampaigns(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to list campaigns');
+          return { success: true, campaigns: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          const result = await linkedInAdsService.createCampaign(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create campaign');
+          return { success: true, message: 'Campaign created', campaign: result.data };
+        }
+        if (action === 'UPDATE') {
+          if (!params.campaign_id) throw new Error('UPDATE requires campaign_id');
+          const result = await linkedInAdsService.updateCampaign(accessToken, accountId, params.campaign_id, params);
+          if (!result.success) throw new Error(result.error || 'Failed to update campaign');
+          return { success: true, message: 'Campaign updated', result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CAMPAIGN`);
+      }
+
+      case 'CREATIVE': {
+        if (action === 'LIST') {
+          if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
+          const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to list creatives');
+          return { success: true, creatives: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
+          const result = await linkedInAdsService.createCreative(accessToken, { ...params, ad_account_id: accountId });
+          if (!result.success) throw new Error(result.error || 'Failed to create creative');
+          return { success: true, message: 'Creative created', creative: result.data };
+        }
+        if (action === 'CREATE_INLINE') {
+          if (!params.campaign_id) throw new Error('CREATE_INLINE requires campaign_id');
+          if (!organizationUrn) throw new Error('Could not determine organization URN. Please reconnect your LinkedIn Ads account.');
+          const result = await linkedInAdsService.createCreativeInline(accessToken, {
+            ...params,
+            ad_account_id: accountId,
+            author_urn: organizationUrn,
+          });
+          if (!result.success) throw new Error(result.error || 'Failed to create inline creative');
+          return { success: true, message: 'Creative and post created in one step', creative: result.data };
+        }
+        if (action === 'CREATE_DYNAMIC') {
+          // Dynamic Ads: Jobs, Spotlight, Follower — campaign type must be DYNAMIC
+          if (!params.campaign_id) throw new Error('CREATE_DYNAMIC requires campaign_id');
+          if (!params.format) throw new Error('CREATE_DYNAMIC requires format (JOBS|SPOTLIGHT|FOLLOW_COMPANY)');
+          const result = await linkedInAdsService.createDynamicCreative(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
+          return { success: true, message: 'Dynamic creative created', creative: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CREATIVE`);
+      }
+
+      case 'POST': {
+        if (action === 'CREATE') {
+          const feedDistribution = params.feed_distribution || 'NONE';
+          if (!organizationUrn) throw new Error('Could not determine author_urn. Please reconnect your LinkedIn Ads account.');
+          const postParams = { ...params, author_urn: organizationUrn, ad_account_id: accountId };
+          // MAIN_FEED requires w_organization_social scope — reconnect LinkedIn Ads account if 403
+          const result = await linkedInAdsService.createPost(accessToken, postParams);
+          if (!result.success) throw new Error(result.error || 'Failed to create post');
+          const postUrn = result.data?.id;
+          const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
+          const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
+          return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for POST`);
+      }
+
+      case 'TARGETING': {
+        if (action === 'LIST_FACETS') {
+          const result = await linkedInAdsService.listTargetingFacets(accessToken);
+          return { success: true, facets: result.data?.elements || [] };
+        }
+        if (action === 'SEARCH') {
+          if (!params.facet) throw new Error('SEARCH requires facet');
+          const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+          return { success: true, entities: result.data?.elements || [] };
+        }
+        if (action === 'ESTIMATE_REACH') {
+          if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
+          const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          return { success: true, audienceCount: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for TARGETING`);
+      }
+
+      case 'MEDIA': {
+        // Helper: if the URL is an S3 URL from our bucket, presign it before downloading.
+        // This handles the case where the user uploads a file to the chat (stored in S3)
+        // and Emma receives the S3 URL — direct S3 access requires a presigned URL.
+        const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
+        const resolveDownloadUrl = (url: string): string => {
+          if (isS3Url(url)) {
+            const presigned = presignS3Url(url);
+            return presigned || url;
+          }
+          return url;
+        };
+
+        if (action === 'UPLOAD_IMAGE') {
+          if (!params.image_url) throw new Error('UPLOAD_IMAGE requires image_url (a public URL to the image)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          // Step 1: initialize upload to get signed URL + image URN
+          const initResult = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize image upload');
+          const uploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
+          const imageUrn: string = initResult.data?.value?.image || initResult.data?.image;
+          if (!uploadUrl || !imageUrn) throw new Error('LinkedIn did not return uploadUrl or image URN');
+          // Step 2: download the image (presign if S3 URL) and PUT to LinkedIn's signed URL
+          const axios = require('axios');
+          const imageResp = await axios.get(resolveDownloadUrl(params.image_url), { responseType: 'arraybuffer' });
+          const contentType = imageResp.headers['content-type'] || 'image/jpeg';
+          await linkedInAdsService.uploadImageBinary(uploadUrl, Buffer.from(imageResp.data), contentType);
+          return { success: true, image_urn: imageUrn, message: 'Image uploaded to LinkedIn. Use image_urn in CREATIVE/CREATE_INLINE.' };
+        }
+        if (action === 'UPLOAD_VIDEO') {
+          // Convenience action: download video from URL, auto-detect size, handle full upload flow.
+          // Emma never asks the user for file_size — it's derived from the downloaded buffer.
+          if (!params.video_url) throw new Error('UPLOAD_VIDEO requires video_url (a public URL to the video file)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const axios = require('axios');
+          // Step 1: download video (presign if S3 URL — handles user-uploaded files from chat)
+          const videoResp = await axios.get(resolveDownloadUrl(params.video_url), { responseType: 'arraybuffer' });
+          const videoBuffer = Buffer.from(videoResp.data);
+          const fileSizeBytes = videoBuffer.length;
+          // Step 2: initialize upload — fileSizeBytes auto-calculated from buffer
+          const initResult = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, fileSizeBytes);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize video upload');
+          const uploadInstructions: any[] = initResult.data?.value?.uploadInstructions || [];
+          const videoUrn: string = initResult.data?.value?.video || initResult.data?.video;
+          const uploadToken: string = initResult.data?.value?.uploadToken || '';
+          if (!videoUrn) throw new Error('LinkedIn did not return video URN');
+          // Step 3: upload each part, collect ETag from each response (required for finalize)
+          const uploadedPartIds: string[] = [];
+          for (const instruction of uploadInstructions) {
+            const partStart: number = instruction.firstByte ?? 0;
+            const partEnd: number = instruction.lastByte ?? fileSizeBytes - 1;
+            const partBuffer = videoBuffer.slice(partStart, partEnd + 1);
+            const etag = await linkedInAdsService.uploadVideoPart(instruction.uploadUrl, partBuffer);
+            uploadedPartIds.push(etag);
+          }
+          // Step 4: finalize — pass uploadToken and ETags from part uploads
+          const finalizeResult = await linkedInAdsService.finalizeVideoUpload(accessToken, videoUrn, uploadToken, uploadedPartIds);
+          if (!finalizeResult.success) throw new Error(finalizeResult.error || 'Failed to finalize video upload');
+          return { success: true, video_urn: videoUrn, message: 'Video uploaded to LinkedIn. Use video_urn in CREATIVE/CREATE_INLINE.' };
+        }
+        if (action === 'UPLOAD_DOCUMENT') {
+          // Convenience action: download document from URL and upload to LinkedIn.
+          if (!params.document_url) throw new Error('UPLOAD_DOCUMENT requires document_url (a public URL to the document, e.g. PDF)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const axios = require('axios');
+          // Step 1: download document (presign if S3 URL — handles user-uploaded files from chat)
+          const docResp = await axios.get(resolveDownloadUrl(params.document_url), { responseType: 'arraybuffer' });
+          const docBuffer = Buffer.from(docResp.data);
+          const contentType = docResp.headers['content-type'] || 'application/pdf';
+          // Step 2: initialize upload
+          const initResult = await linkedInAdsService.initializeDocumentUpload(accessToken, ownerUrn);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize document upload');
+          const docUploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
+          const documentUrn: string = initResult.data?.value?.document || initResult.data?.document;
+          if (!docUploadUrl || !documentUrn) throw new Error('LinkedIn did not return uploadUrl or document URN');
+          // Step 3: upload binary
+          await linkedInAdsService.uploadDocumentBinary(docUploadUrl, docBuffer, contentType);
+          return { success: true, document_urn: documentUrn, message: 'Document uploaded to LinkedIn. Use document_urn in POST/CREATE.' };
+        }
+        if (action === 'INIT_IMAGE_UPLOAD') {
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const result = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          return { success: true, uploadInstructions: result.data };
+        }
+        if (action === 'INIT_VIDEO_UPLOAD') {
+          if (!params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires file_size');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const result = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, params.file_size);
+          return { success: true, uploadInstructions: result.data };
+        }
+        if (action === 'FINALIZE_VIDEO') {
+          if (!params.video_urn) throw new Error('FINALIZE_VIDEO requires video_urn');
+          const result = await linkedInAdsService.finalizeVideoUpload(accessToken, params.video_urn);
+          return { success: true, result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for MEDIA`);
+      }
+
+      case 'INMAIL': {
+        if (action === 'CREATE_CONTENT') {
+          // Use person URN from connected account (captured at OAuth time). If missing, user needs to reconnect.
+          const sender = params.sender || personUrn;
+          if (!sender) throw new Error('Could not determine sender person URN. Please reconnect your LinkedIn Ads account to capture your person URN.');
+          const result = await linkedInAdsService.createInMailContent(accessToken, { ...params, sender, ad_account_id: accountId });
+          if (!result.success) throw new Error(result.error || 'Failed to create InMail content');
+          const inmailUrn = result.data?.id;
+          return { success: true, message: 'InMail content created. Use inmail_content_urn in CREATIVE/CREATE.', inmail_content_urn: inmailUrn, data: result.data };
+        }
+        if (action === 'SEND_TEST') {
+          if (!params.inmail_content_urn) throw new Error('SEND_TEST requires inmail_content_urn');
+          if (!params.recipient_email) throw new Error('SEND_TEST requires recipient_email');
+          const result = await linkedInAdsService.sendTestInMail(accessToken, params.inmail_content_urn, params.recipient_email);
+          if (!result.success) throw new Error(result.error || 'Failed to send test InMail');
+          return { success: true, message: 'Test InMail sent successfully', data: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for INMAIL`);
+      }
+
+      case 'CONVERSATION_AD': {
+        if (action === 'CREATE') {
+          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
+          const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
+          const conversationAdUrn = result.data?.id;
+          return { success: true, message: 'Conversation ad created. Add message nodes with CONVERSATION_AD/CREATE_CONTENT, then set the first node with CONVERSATION_AD/SET_FIRST_CONTENT.', conversation_ad_urn: conversationAdUrn, data: result.data };
+        }
+        if (action === 'CREATE_CONTENT') {
+          if (!params.conversation_ad_urn) throw new Error('CONVERSATION_AD CREATE_CONTENT requires conversation_ad_urn');
+          if (!params.body) throw new Error('CONVERSATION_AD CREATE_CONTENT requires body (message text)');
+          if (!params.buttons || !Array.isArray(params.buttons) || params.buttons.length === 0) throw new Error('CONVERSATION_AD CREATE_CONTENT requires buttons array');
+          const result = await linkedInAdsService.createConversationAdContent(accessToken, params.conversation_ad_urn, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create conversation ad content');
+          const contentUrn = result.data?.id;
+          return { success: true, message: 'Message node added to conversation ad', content_urn: contentUrn, data: result.data };
+        }
+        if (action === 'SET_FIRST_CONTENT') {
+          if (!params.conversation_ad_urn) throw new Error('SET_FIRST_CONTENT requires conversation_ad_urn');
+          if (!params.first_content_urn) throw new Error('SET_FIRST_CONTENT requires first_content_urn');
+          const result = await linkedInAdsService.setConversationAdFirstContent(accessToken, params.conversation_ad_urn, params.first_content_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to set first content');
+          return { success: true, message: 'First message node set. Conversation ad is ready. Create a CREATIVE with inmail_content_urn = conversation_ad_urn.' };
+        }
+        throw new Error(`Unknown action "${action}" for CONVERSATION_AD`);
+      }
+
+      default:
+        throw new Error(`Invalid entity_type: ${entity_type}`);
+    }
+  }
+
+  /**
+   * LinkedIn Ads analytics — synchronous (no polling needed unlike Meta).
+   */
+  public async callLinkedInAdsInsightsApi(
+    userId: string,
+    account_id: string,
+    params: {
+      pivot: string;
+      dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } };
+      timeGranularity?: string;
+      fields?: string[];
+      campaigns?: string[];
+      adGroups?: string[];
+      creatives?: string[];
+    }
+  ): Promise<any> {
+    console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
+
+    const { accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+
+    const result = await linkedInAdsService.getAdAnalytics(
+      accessToken,
+      params.pivot,
+      params.timeGranularity || 'ALL',
+      params.dateRange,
+      params.fields || ['impressions', 'clicks', 'costInLocalCurrency'],
+      { campaign_ids: params.campaigns, creative_ids: params.creatives }
+    );
+    return { success: true, analytics: result.data?.elements || result.data };
   }
 
   // --- Client Health Assessment (admin-only) ---

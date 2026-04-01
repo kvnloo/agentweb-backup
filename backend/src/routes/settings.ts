@@ -2,6 +2,7 @@ import express from 'express';
 import { settingsService } from '../services/settingsService';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
 import { userDb } from '../services/db';
+import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
 const router = express.Router();
 
@@ -9,12 +10,21 @@ const router = express.Router();
 
 const SITE_WIDE_UNIPILE_SETTING = 'site-wide-unipile-accounts';
 
-// Get all site-wide Unipile accounts
+// Get all site-wide Unipile accounts with live connectivity status
 router.get('/site-wide-unipile-accounts', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const setting = await settingsService.getSetting(SITE_WIDE_UNIPILE_SETTING);
-    const accounts = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
-    res.json({ accounts });
+    const accounts: any[] = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+
+    // Verify live connectivity for each account in parallel
+    const accountsWithStatus = await Promise.all(
+      accounts.map(async (account) => ({
+        ...account,
+        connected: await linkedInOutreachService.isAccountConnected(account.account_id),
+      }))
+    );
+
+    res.json({ accounts: accountsWithStatus });
   } catch (error) {
     console.error('Error getting site-wide Unipile accounts:', error);
     res.status(500).json({ error: 'Failed to get site-wide Unipile accounts' });

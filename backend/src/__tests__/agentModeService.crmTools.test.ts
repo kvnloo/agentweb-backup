@@ -419,6 +419,42 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe('Lead not found');
     });
+
+    it('should handle emailContent object in recent engagements', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 2, last7Days: 2, totalAllMessages: 2 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({
+        engagements: [
+          {
+            eventType: 'email.delivered',
+            createdAt: '2026-02-01T00:00:00.000Z',
+            eventData: { email_id: 'msg-123' },
+            emailContent: {
+              html: '<p>Welcome to our service!</p>',
+              text: 'Welcome to our service!',
+              headers: {}
+            }
+          },
+          {
+            eventType: 'email.received',
+            createdAt: '2026-02-02T00:00:00.000Z',
+            eventData: { email_id: 'msg-456' },
+            emailContent: {
+              text: 'Thanks for reaching out',
+              headers: {}
+            }
+          },
+        ]
+      } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.recentEngagements).toHaveLength(2);
+      expect(result.recentEngagements[0].emailContentPreview).toBe('Welcome to our service!');
+      expect(result.recentEngagements[1].emailContentPreview).toBe('Thanks for reaching out');
+    });
   });
 
   // ─── updateLead ────────────────────────────────────────────────────────
@@ -659,7 +695,7 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.engagements[0].eventType).toBe('email.sent');
     });
 
-    it('should truncate HTML email content in engagements', async () => {
+    it('should truncate HTML email content in engagements (legacy string format)', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
       mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 1, last7Days: 1, totalAllMessages: 1 });
@@ -671,7 +707,103 @@ describe('AgentModeService - CRM Tools', () => {
 
       const result = await service.getLeadEngagements(listId, leadId, userId);
 
+      expect(result.engagements[0].emailContentPreview).toBeDefined();
       expect(result.engagements[0].emailContentPreview.length).toBeLessThanOrEqual(210);
+    });
+
+    it('should handle emailContent as object with html field', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 1, last7Days: 1, totalAllMessages: 1 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({
+        engagements: [
+          {
+            eventId: 'e1',
+            eventType: 'email.received',
+            createdAt: '2026-02-01T00:00:00.000Z',
+            eventData: {},
+            emailContent: {
+              html: '<p><strong>Hello</strong> World!</p>' + 'X'.repeat(300),
+              text: 'Hello World!',
+              headers: { 'From': 'test@example.com' }
+            }
+          },
+        ]
+      } as any);
+
+      const result = await service.getLeadEngagements(listId, leadId, userId);
+
+      expect(result.engagements[0].emailContentPreview).toBeDefined();
+      expect(result.engagements[0].emailContentPreview).toContain('Hello World');
+      expect(result.engagements[0].emailContentPreview).not.toContain('<p>');
+      expect(result.engagements[0].emailContentPreview.length).toBeLessThanOrEqual(210);
+    });
+
+    it('should handle emailContent as object with text field only', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 1, last7Days: 1, totalAllMessages: 1 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({
+        engagements: [
+          {
+            eventId: 'e1',
+            eventType: 'email.received',
+            createdAt: '2026-02-01T00:00:00.000Z',
+            eventData: {},
+            emailContent: {
+              text: 'Plain text email content',
+              headers: { 'From': 'test@example.com' }
+            }
+          },
+        ]
+      } as any);
+
+      const result = await service.getLeadEngagements(listId, leadId, userId);
+
+      expect(result.engagements[0].emailContentPreview).toBe('Plain text email content');
+    });
+
+    it('should handle empty emailContent object', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 1, last7Days: 1, totalAllMessages: 1 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({
+        engagements: [
+          {
+            eventId: 'e1',
+            eventType: 'email.received',
+            createdAt: '2026-02-01T00:00:00.000Z',
+            eventData: {},
+            emailContent: {
+              headers: { 'From': 'test@example.com' }
+            }
+          },
+        ]
+      } as any);
+
+      const result = await service.getLeadEngagements(listId, leadId, userId);
+
+      expect(result.engagements[0].emailContentPreview).toBeUndefined();
+    });
+
+    it('should handle missing emailContent', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 1, last7Days: 1, totalAllMessages: 1 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({
+        engagements: [
+          {
+            eventId: 'e1',
+            eventType: 'custom.meeting',
+            createdAt: '2026-02-01T00:00:00.000Z',
+            eventData: { notes: 'Had a great meeting' }
+          },
+        ]
+      } as any);
+
+      const result = await service.getLeadEngagements(listId, leadId, userId);
+
+      expect(result.engagements[0].emailContentPreview).toBeUndefined();
     });
 
     it('should respect limit parameter', async () => {

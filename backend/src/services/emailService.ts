@@ -1301,26 +1301,189 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     }
   },
 
+  async sendSlackTriggeredSessionEmail(
+    toEmails: string | string[],
+    params: {
+      sessionId: string;
+      userEmail: string;
+      channelName: string;
+      originalMessage: string;
+      emmaResponse: string;
+      receivedAt: string;
+    }
+  ) {
+    try {
+      const { sessionId, userEmail, channelName, originalMessage, emmaResponse, receivedAt } = params;
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+      let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
+      try {
+        const { chatbotDb } = await import('./chatbotService');
+        sessionUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
+      } catch (shareError) {
+        console.error('Error creating interactive share for slack triggered session:', shareError);
+      }
+
+      const formattedDate = new Date(receivedAt).toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #611f69; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .header p { margin: 5px 0 0 0; opacity: 0.9; font-size: 14px; }
+            .content { padding: 20px; }
+            .meta { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px; }
+            .meta-item { padding: 10px 15px; background-color: #f8f9fa; border-radius: 6px; border-left: 3px solid #611f69; }
+            .meta-item .label { font-size: 11px; text-transform: uppercase; color: #6c757d; margin-bottom: 4px; }
+            .meta-item .value { font-size: 14px; color: #212529; font-weight: 500; }
+            .section { margin: 20px 0; }
+            .section-title { font-size: 14px; font-weight: bold; text-transform: uppercase; color: #6c757d; margin-bottom: 8px; letter-spacing: 0.5px; }
+            .message-box { background-color: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #611f69; white-space: pre-wrap; word-wrap: break-word; font-size: 14px; line-height: 1.6; }
+            .response-box { background-color: #f0f7ff; padding: 15px; border-radius: 6px; border-left: 4px solid #1976d2; white-space: pre-wrap; word-wrap: break-word; font-size: 14px; line-height: 1.6; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; border-top: 1px solid #e9ecef; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 14px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>💬 New Client Question from Slack</h1>
+              <p>Emma has prepared a draft response for your review</p>
+            </div>
+            <div class="content">
+              <div class="meta">
+                <div class="meta-item">
+                  <div class="label">Client Account</div>
+                  <div class="value">${this.escapeHtml(userEmail)}</div>
+                </div>
+                <div class="meta-item">
+                  <div class="label">Slack Channel</div>
+                  <div class="value">#${this.escapeHtml(channelName)}</div>
+                </div>
+                <div class="meta-item">
+                  <div class="label">Received At</div>
+                  <div class="value">${formattedDate}</div>
+                </div>
+              </div>
+
+              <div class="section">
+                <div class="section-title">Original Message</div>
+                <div class="message-box">${this.escapeHtml(originalMessage)}</div>
+              </div>
+
+              <div class="section">
+                <div class="section-title">Emma's Draft Response</div>
+                <div class="response-box">${this.escapeHtml(emmaResponse)}</div>
+              </div>
+            </div>
+            <div class="footer">
+              <a href="${sessionUrl}" class="button">View Full Session</a>
+              <p style="margin: 15px 0 0 0; color: #6c757d; font-size: 12px;">
+                Open the session to review the conversation, edit Emma's response, or continue the chat.
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `New Client Question from Slack
+
+Client: ${userEmail}
+Channel: #${channelName}
+Received: ${formattedDate}
+
+Original Message:
+${originalMessage}
+
+Emma's Draft Response:
+${emmaResponse}
+
+View Session: ${sessionUrl}`;
+
+      const subject = `💬 Client question from #${channelName} (${userEmail})`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Slack triggered session email sent to: ${emailList.join(', ')} for session ${sessionId}`);
+    } catch (error) {
+      console.error('Error sending slack triggered session email:', error);
+      // Non-blocking: email failure should not interrupt the session flow
+    }
+  },
+
   async sendOncallAlert(
     subject: string,
     message: string,
-    context?: Record<string, any>
+    context?: Record<string, any>,
+    notionUrl?: string
   ) {
     try {
       const oncallEmails = process.env.ONCALL_EMAIL_LIST?.split(',').filter(Boolean) || ['ruiw@agentweb.pro'];
       const env = process.env.NODE_ENV || 'unknown';
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
-      const contextHtml = context
-        ? Object.entries(context)
-            .map(([key, value]) => {
-              const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
-              return `<tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f8f9fa;">${this.escapeHtml(key)}</td><td style="padding: 8px; border: 1px solid #ddd; white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(displayValue)}</td></tr>`;
-            })
-            .join('')
-        : '';
+      // Attempt to create a Notion oncall item if no URL was provided
+      let resolvedNotionUrl = notionUrl || null;
+      if (!resolvedNotionUrl) {
+        try {
+          const { createOncallItem } = await import('./notionService');
+          const result = await createOncallItem({
+            title: subject,
+            description: message,
+            context,
+          });
+          resolvedNotionUrl = result.notionUrl;
+          console.log(`Oncall Notion item created: ${resolvedNotionUrl}`);
+        } catch (notionError) {
+          console.error('Failed to create Notion oncall item, falling back to full email:', notionError);
+        }
+      }
 
-      const html = `
+      let html: string;
+      let text: string;
+
+      if (resolvedNotionUrl) {
+        // Slim email with Notion link
+        html = `
+        <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
+          <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h1 style="margin: 0; font-size: 24px;">⚠️ [${envLabel}] Oncall Alert</h1>
+          </div>
+          <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="color: #dc3545; margin-top: 0;">${this.escapeHtml(subject)}</h2>
+            <div style="margin: 20px 0;">
+              <a href="${this.escapeHtml(resolvedNotionUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View in Notion</a>
+            </div>
+            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 12px;">
+              <p>Full details available in the Notion item above.</p>
+            </div>
+          </div>
+        </div>
+        `;
+
+        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nNotion: ${resolvedNotionUrl}`;
+      } else {
+        // Full detail email (fallback when Notion creation failed)
+        const contextHtml = context
+          ? Object.entries(context)
+              .map(([key, value]) => {
+                const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+                return `<tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f8f9fa;">${this.escapeHtml(key)}</td><td style="padding: 8px; border: 1px solid #ddd; white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(displayValue)}</td></tr>`;
+              })
+              .join('')
+          : '';
+
+        html = `
         <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
           <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
             <h1 style="margin: 0; font-size: 24px;">⚠️ [${envLabel}] Oncall Alert</h1>
@@ -1341,9 +1504,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
             </div>
           </div>
         </div>
-      `;
+        `;
 
-      const text = `
+        text = `
 ⚠️ [${envLabel}] Oncall Alert
 
 ${subject}
@@ -1351,7 +1514,8 @@ ${subject}
 ${message}
 
 ${context ? Object.entries(context).map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value, null, 2) : value}`).join('\n') : ''}
-      `.trim();
+        `.trim();
+      }
 
       await this.sendEmail(oncallEmails, `[${envLabel}] ${subject}`, text, html);
       console.log(`Oncall alert sent to: ${oncallEmails.join(', ')}`);

@@ -9,13 +9,125 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-01',
+    changes: [
+      'Emma Now Responds to Client Slack Messages Automatically',
+      '- When a client posts a top-level message in their connected Slack channel, Emma automatically reviews it and prepares a draft response',
+      '- The team receives an email at founders@agentweb.pro with the original message and Emma\'s suggested reply, plus a link to the full session',
+      '- Only actionable messages (questions, requests, status inquiries) trigger a response — greetings and one-word reactions are ignored',
+      '- Thread replies in the same channel continue the existing session for seamless conversation tracking',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Admin: Emma Can Now Freeze and Unfreeze User Accounts',
+      '- Emma now has a freeze_user_account tool available in Admin Tools',
+      '- Admins can ask Emma to freeze bot accounts or other abusive accounts by userId',
+      '- Frozen accounts are deactivated and cannot log in; admins can also unfreeze accounts to restore access',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Fix: LinkedIn Outreach Account Reconnect',
+      '- Fixed an issue where a disconnected LinkedIn Outreach account always appeared as "Connected" in Settings',
+      '- Settings → Connected Accounts now shows the real connection status from Unipile',
+      '- Added a Reconnect button for disconnected LinkedIn Outreach accounts that opens the secure reconnect flow',
+      '- Emma no longer returns "Profile not found" when a shared LinkedIn enrichment account is disconnected — disconnected accounts are automatically skipped',
+      '- Admin CRM tab now shows live Connected/Disconnected status for site-wide LinkedIn Outreach accounts',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Fix: Server Restart No Longer Triggers False Error Alerts',
+      '- During daily deployments, in-flight Agent Mode requests interrupted by the server restart now return a clear "Server is restarting, please try again" message instead of a generic error',
+      '- Previously, these expected interruptions were incorrectly logged as unknown errors and triggered oncall alerts',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'LinkedIn Profile Lookup Now Works Without a Connected Account',
+      '- Emma can now check LinkedIn profiles even when you have no LinkedIn Outreach account connected',
+      '- Profile lookups automatically use a shared enrichment account as a fallback',
+      '- Sending connection requests or messages still requires your own LinkedIn account in Settings → Connected Accounts',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Fix: CRM Auto-Sync Switch Not Saved',
+      '- Fixed an issue where the "Auto-sync new users to this lead list" switch in the CRM sync dialog was not being saved when clicking "Start Syncing"',
+      '- Previously, clicking "Start Syncing" would run the sync but discard the auto-sync toggle state; it now saves the setting first',
+      '- Also fixed a bug where running a sync would overwrite the saved auto-sync flag, causing it to revert to off on the next dialog open',
+      '- Users created from the waitlist via the Admin panel are now also auto-synced to the CRM lead list when auto-sync is enabled',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Fix: Browser Tools Now Reliable in Agent Mode',
+      '- Fixed an issue where browser navigation and other Playwright browser tools would fail in agent mode sessions on EC2',
+      '- Root cause: @playwright/mcp@latest updated to a version requiring a newer Chromium revision than what was installed',
+      '- Fix: the backend now automatically installs the correct Chromium version at startup before any browser tools are used',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Deprecation: Web Automation Task Creation',
+      '- The "create task from prompt" web automation tool has been deprecated and is no longer available to Emma',
+      '- Web automation via the agent engine is being phased out',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Fix: Meta Campaigns Not Discovered by Emma',
+      '- Fixed an issue where Emma could not find Meta ad campaigns for users who connected their Meta account via OAuth (the modern flow)',
+      '- Previously, the "list my Meta campaigns" tool relied on a legacy ad account field that is not populated for recently connected accounts',
+      '- Emma now reads campaigns directly from your connected Meta account, consistent with how other Meta Ads tools work',
+    ],
+  },
+  {
     date: '2026-03-30',
     changes: [
+      'Admin: Slack Message Tools for Emma',
+      '- Emma can now list Slack channels, read recent messages from any channel, and send messages or thread replies',
+      '- Filter messages by time window using since_hours (e.g. last 24 hours) or explicit Unix timestamps',
+      '- Use this to ask Emma to review client messages in a channel and draft or send replies on your behalf',
+      '- These tools are admin-only',
+    ],
+  },
+  {
+    date: '2026-03-30',
+    changes: [
+      'Improvement: Mark Work Item as Done (GTM Tracker)',
+      '- Added a one-click "Mark as Done" button per work item in the GTM Tracker page',
+      '- Button appears on pending, in-progress, and pending-review items — not on already-completed or skipped items',
+      '- Available in both the customer portal and the admin portal',
+      'Admin: Configurable Model for Predefined Work Plans (Partner Portal)',
+      '- Admins can now select a specific LLM model for each predefined work plan in the Work Plans page',
+      '- A "Default Model" dropdown appears in the create/edit dialog — leave empty to use the global Agent Mode default',
+      '- The selected model is shown in a new Model column in the work plans table',
       'Admin: Configurable Coding Agent LLM Model (Partner Portal)',
       '- Admins can now select which Claude model the coding agent uses for landing page edits in the Agent Mode settings tab',
       '- Default model is now Claude Sonnet 4.6 for better cost efficiency',
       '- Claude Opus 4.6 is available as an option for more complex coding tasks that require advanced reasoning',
       '- The selected model is stored in the database and persists across sessions',
+      'Fix: CRM Engagement History Loading',
+      '- Fixed a bug where viewing lead details in the CRM or asking Emma for lead information would fail with an error when the lead had email engagement history',
+      '- The issue occurred because email content is stored as an object with html/text fields, but the code was treating it as a plain string',
+      '- Engagement history now loads correctly and displays email previews properly',
+      'Fix: LinkedIn Scheduled Outreach Context Overload',
+      '- Fixed a bug where daily LinkedIn outreach schedules would accumulate too many tokens over time, causing the agent to produce empty responses or fall back to generic connection messages',
+      '- The pending invitations list and search results were returning full profile data unnecessarily, inflating context to 600k-700k tokens per session',
+      '- Both results are now trimmed to only the fields needed for deduplication and personalization',
+      'Improvement: GTM Tracker Completion Indicator',
+      '- When a GTM work item is marked as completed, the linked Slack message now receives a ✅ reaction instead of a separate reply',
+      '- This keeps the Slack thread clean while still providing a clear visual indicator of completion',
     ],
   },
   {
@@ -3390,4 +3502,22 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Supports tasks'
     ],
   },
-]; 
+  {
+    date: '2026-03-30',
+    changes: [
+      'Oncall Issues Now Tracked in Notion',
+      '- Oncall alerts automatically create items in the Sprint Tasks board tagged "Oncall"',
+      '- Oncall alert emails now include a direct link to the Notion item for faster triage',
+      '- New "Report Product Issue" tool in Emma lets you report bugs directly from chat',
+      '- Reported issues are tracked in Notion and the engineering team is notified immediately',
+    ],
+  },
+  {
+    date: '2026-03-31',
+    changes: [
+      'Emma Now Knows Your Profile',
+      '- Emma can look up your account email, name, company, and subscription when you ask',
+      '- Uses the new get_user_profile foundation tool — available everywhere without installing a skill',
+    ],
+  },
+];

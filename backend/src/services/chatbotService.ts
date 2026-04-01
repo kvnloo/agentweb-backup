@@ -3729,13 +3729,14 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // Base tools always available to Emma
-        const toolsToInclude = [
+        // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
+        const toolsToInclude = new Set<string>([
+          ...AgentModeService.FOUNDATION_TOOLS,
           'read_page_source',
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
-        ];
+        ]);
 
         // Page-aware tool injection based on the current page URL
         const urlPath = (currentUrl || '').replace(/^\//, '');
@@ -3763,7 +3764,7 @@ export async function generateChatResponse(
           'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
         };
         if (pageToolMap[pageKey]) {
-          toolsToInclude.push(...pageToolMap[pageKey]);
+          pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
         }
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');

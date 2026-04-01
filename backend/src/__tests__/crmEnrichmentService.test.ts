@@ -44,6 +44,13 @@ jest.mock('../services/settingsService', () => ({
   },
 }));
 
+jest.mock('../services/linkedInOutreachService', () => {
+  const actual = jest.requireActual('../services/linkedInOutreachService');
+  // Prevent isAccountConnected from calling the Unipile API in unit tests
+  actual.linkedInOutreachService.isAccountConnected = jest.fn().mockResolvedValue(true);
+  return actual;
+});
+
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
