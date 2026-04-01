@@ -808,7 +808,33 @@ function getHeartbeatStatus() {
     // ignore
   }
 
-  // 7. Timestamp
+  // 7. EC2 cost (Option A: hardcoded price table)
+  const EC2_PRICES = {
+    "t3.micro": 0.0104, "t3.small": 0.0208, "t3.medium": 0.0416,
+    "t3.large": 0.0832, "t3.xlarge": 0.1664, "t3.2xlarge": 0.3328,
+  };
+  try {
+    const meta = {};
+    fs.readFileSync("/home/ec2-user/agentweb/.ec2-session-meta", "utf-8")
+      .split("\n")
+      .forEach((line) => {
+        const eq = line.indexOf("=");
+        if (eq > 0) meta[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+      });
+    const itype = meta.instance_type || "";
+    const launchEpoch = parseInt(meta.launch_epoch || "0", 10);
+    if (itype && launchEpoch) {
+      const elapsedH = (Date.now() / 1000 - launchEpoch) / 3600;
+      const ec2Cost = elapsedH * (EC2_PRICES[itype] || 0);
+      const h = Math.floor(elapsedH);
+      const m = Math.floor((elapsedH - h) * 60);
+      parts.push(`EC2: $${ec2Cost.toFixed(4)} (${h}h ${m}m @ ${itype})`);
+    }
+  } catch {
+    // ignore if meta file not present
+  }
+
+  // 8. Timestamp
   parts.push(`Updated: ${now.toISOString().slice(11, 19)}Z`);
 
   return parts.join(" | ");
