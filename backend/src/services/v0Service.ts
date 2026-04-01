@@ -274,6 +274,54 @@ export function buildBrandEnrichedPrompt(
 }
 
 /**
+ * Load the landing-page-v2 template outline as a fallback design inspiration for v0.
+ * Checks email_templates_public → templates_public → filesystem, in that order.
+ */
+async function loadDefaultTemplateOutline(): Promise<string | undefined> {
+  const parseArr = (s: any): any[] => {
+    if (!s?.settingValue) return [];
+    try { return JSON.parse(s.settingValue); } catch { return []; }
+  };
+
+  try {
+    const oldPublicSetting = await settingsService.getSetting("email_templates_public");
+    const oldMatch = parseArr(oldPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
+    if (oldMatch?.html_content) {
+      const outline = extractTemplateOutline(oldMatch.html_content);
+      console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from email_templates_public (${outline.length} chars)`);
+      return outline;
+    }
+  } catch (err) {
+    console.warn("[V0 SERVICE] Could not load from email_templates_public:", err);
+  }
+
+  try {
+    const newPublicSetting = await settingsService.getSetting("templates_public");
+    const newMatch = parseArr(newPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
+    if (newMatch?.html_content) {
+      const outline = extractTemplateOutline(newMatch.html_content);
+      console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from templates_public (${outline.length} chars)`);
+      return outline;
+    }
+  } catch (err) {
+    console.warn("[V0 SERVICE] Could not load from templates_public:", err);
+  }
+
+  try {
+    const fallbackPath = path.join(__dirname, "..", "templates", "landing-page-v2.html");
+    if (fs.existsSync(fallbackPath)) {
+      const outline = extractTemplateOutline(fs.readFileSync(fallbackPath, "utf-8"));
+      console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from filesystem (${outline.length} chars)`);
+      return outline;
+    }
+  } catch (fsErr) {
+    console.warn("[V0 SERVICE] Filesystem template fallback failed:", fsErr);
+  }
+
+  return undefined;
+}
+
+/**
  * Create a v0 client using the stored API key.
  * Uses dynamic import since v0-sdk is an ESM package.
  */
@@ -339,53 +387,7 @@ async function generateFirstPage(
 
   // Auto-load the HTML template structure as design inspiration for v0.
   // We send a condensed outline (not the full 55KB HTML) to avoid exceeding v0 prompt limits.
-  let effectiveTemplate = templateHtml;
-  if (!effectiveTemplate) {
-    const parseArr = (s: any): any[] => {
-      if (!s?.settingValue) return [];
-      try { return JSON.parse(s.settingValue); } catch { return []; }
-    };
-
-    try {
-      // Check email_templates_public first (legacy key)
-      const oldPublicSetting = await settingsService.getSetting("email_templates_public");
-      const oldMatch = parseArr(oldPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
-      if (oldMatch?.html_content) {
-        effectiveTemplate = extractTemplateOutline(oldMatch.html_content);
-        console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from email_templates_public (${effectiveTemplate.length} chars)`);
-      }
-    } catch (err) {
-      console.warn("[V0 SERVICE] Could not load from email_templates_public:", err);
-    }
-
-    // Also check templates_public (new key) if not found yet
-    if (!effectiveTemplate) {
-      try {
-        const newPublicSetting = await settingsService.getSetting("templates_public");
-        const newMatch = parseArr(newPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
-        if (newMatch?.html_content) {
-          effectiveTemplate = extractTemplateOutline(newMatch.html_content);
-          console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from templates_public (${effectiveTemplate.length} chars)`);
-        }
-      } catch (err) {
-        console.warn("[V0 SERVICE] Could not load from templates_public:", err);
-      }
-    }
-
-    // Filesystem fallback: if DynamoDB didn't yield a template, try the local file
-    if (!effectiveTemplate) {
-      try {
-        const fallbackPath = path.join(__dirname, "..", "templates", "landing-page-v2.html");
-        if (fs.existsSync(fallbackPath)) {
-          const fallbackHtml = fs.readFileSync(fallbackPath, "utf-8");
-          effectiveTemplate = extractTemplateOutline(fallbackHtml);
-          console.log(`[V0 SERVICE] Loaded landing page template outline from filesystem fallback (${effectiveTemplate.length} chars)`);
-        }
-      } catch (fsErr) {
-        console.warn("[V0 SERVICE] Filesystem template fallback also failed, continuing without:", fsErr);
-      }
-    }
-  }
+  const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
 
   const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
 
@@ -536,7 +538,10 @@ async function addPageToExistingRepo(
 
   try {
     // ── Step 1: Call v0 to generate proper page content ──
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, templateHtml);
+    // If no template provided, fall back to landing-page-v2 (same behaviour as generateFirstPage)
+    const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
+
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
