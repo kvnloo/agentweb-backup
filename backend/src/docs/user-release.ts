@@ -15,6 +15,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When Emma reviews a Slack channel, she now automatically fetches and reads all thread replies for each message',
       '- This lets Emma determine whether a question has already been answered before suggesting a follow-up',
       '- A new slack_get_thread_replies tool is also available for fetching the latest replies on a specific thread on demand',
+      'Fix: Landing Page Generation No Longer Times Out',
+      '- Fixed a bug where generate_landing_page consistently aborted with "This operation was aborted" on the first attempt',
+      '- Root cause: DynamoDB reads at the start of generation had no timeout, causing indefinite hangs that eventually hit the 15-minute abort limit',
+      '- DynamoDB client now has a 30-second timeout; all GitHub and Vercel API calls also have explicit timeouts',
+      '- Extended the generate_landing_page tool timeout from 15 to 25 minutes for extra headroom on slow v0 builds',
+      '- Fixed a 404 after generating additional landing pages: Vercel polling now waits for the newly triggered build instead of returning the previous deployment',
+      '- Fixed broken import paths in multi-page sites where component files referenced sibling components via an incorrect nested path',
     ],
   },
   {

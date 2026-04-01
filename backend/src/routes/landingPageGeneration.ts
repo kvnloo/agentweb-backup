@@ -281,8 +281,14 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html);
     res.status(201).json(result);
   } catch (error: any) {
-    console.error("[LP GENERATION] Error generating landing page:", error);
-    res.status(500).json({ error: "Failed to generate landing page" });
+    console.error("[LP GENERATION] Error generating landing page:", {
+      userId: (req as unknown as AuthenticatedRequest).user?.userId,
+      errorName: error?.name,
+      errorCode: error?.code,
+      errorMessage: error?.message,
+      stack: error?.stack,
+    });
+    res.status(500).json({ error: "Failed to generate landing page", details: error?.message });
   }
 });
 
