@@ -827,6 +827,87 @@ if (NOTION_PAGE_ID) {
   }, 5000);
 }
 
+// Fetch this instance's current public IP from EC2 metadata
+async function getInstancePublicIp() {
+  try {
+    const tokenRes = await fetch("http://169.254.169.254/latest/api/token", {
+      method: "PUT",
+      headers: { "X-aws-ec2-metadata-token-ttl-seconds": "60" },
+      signal: AbortSignal.timeout(3000),
+    });
+    const token = await tokenRes.text();
+    const ipRes = await fetch("http://169.254.169.254/latest/meta-data/public-ipv4", {
+      headers: { "X-aws-ec2-metadata-token": token },
+      signal: AbortSignal.timeout(3000),
+    });
+    return (await ipRes.text()).trim();
+  } catch {
+    return null;
+  }
+}
+
+// On startup, detect if the public IP changed since last launch and notify via Notion comment
+async function checkForIpChange() {
+  if (!NOTION_PAGE_ID) return;
+  try {
+    const currentIp = await getInstancePublicIp();
+    if (!currentIp) return;
+
+    const token = await getNotionToken();
+    const pageRes = await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+      headers: { Authorization: `Bearer ${token}`, "Notion-Version": NOTION_VERSION },
+    });
+    if (!pageRes.ok) return;
+    const page = await pageRes.json();
+
+    const storedIp = page.properties?.["Public IP"]?.rich_text?.[0]?.plain_text?.trim();
+
+    if (storedIp && storedIp !== currentIp) {
+      console.log(`[ip-change] IP changed from ${storedIp} to ${currentIp} — posting Notion comment`);
+
+      const msg =
+        `⚠️ Cloud env IP changed — the instance was stopped and restarted.\n\n` +
+        `Old IP: ${storedIp} (no longer valid)\n` +
+        `New IP: ${currentIp}\n\n` +
+        `Updated URLs:\n` +
+        `• Customer portal: http://${currentIp}:5174\n` +
+        `• Partner portal:  http://${currentIp}:5173\n` +
+        `• Backend API:     http://${currentIp}:3001\n` +
+        `• IP unlock:       http://${currentIp}:5175`;
+
+      await postNotionComment(NOTION_PAGE_ID, msg);
+
+      // Update the Public IP field
+      await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Notion-Version": NOTION_VERSION,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          properties: { "Public IP": { rich_text: [{ text: { content: currentIp } }] } },
+        }),
+      });
+    } else if (!storedIp && currentIp) {
+      // No IP stored yet — just set it
+      await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Notion-Version": NOTION_VERSION,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          properties: { "Public IP": { rich_text: [{ text: { content: currentIp } }] } },
+        }),
+      });
+    }
+  } catch (err) {
+    console.error("[ip-change] Error:", err.message || err);
+  }
+}
+
 // On startup, ensure all allowlisted IPs have SG rules (handles repo clone / new SG drift)
 async function enforceAllowlist() {
   const allowlist = readAllowlist();
@@ -845,6 +926,9 @@ async function enforceAllowlist() {
 
 app.listen(PORT, () => {
   console.log(`IP allowlist service running on http://localhost:${PORT}`);
+  checkForIpChange().catch((err) =>
+    console.error("[ip-change] Failed to check for IP change on startup:", err)
+  );
   enforceAllowlist().catch((err) =>
     console.error("[allowlist] Failed to enforce allowlist on startup:", err)
   );
