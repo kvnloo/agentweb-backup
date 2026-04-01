@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-01',
+    changes: [
+      'Emma Now Responds to Client Slack Messages Automatically',
+      '- When a client posts a top-level message in their connected Slack channel, Emma automatically reviews it and prepares a draft response',
+      '- The team receives an email at founders@agentweb.pro with the original message and Emma\'s suggested reply, plus a link to the full session',
+      '- Only actionable messages (questions, requests, status inquiries) trigger a response — greetings and one-word reactions are ignored',
+      '- Thread replies in the same channel continue the existing session for seamless conversation tracking',
+    ],
+  },
+  {
     date: '2026-03-31',
     changes: [
       'Admin: Emma Can Now Freeze and Unfreeze User Accounts',
