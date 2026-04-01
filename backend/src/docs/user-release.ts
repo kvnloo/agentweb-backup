@@ -3553,4 +3553,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- If a subdomain was already registered in Vercel, Set Subdomain now correctly recognises it instead of creating a duplicate',
     ],
   },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Copy Button Fix in Agent Mode',
+      '- Fixed copy buttons in Agent Mode chat that required precise clicking to activate',
+    ],
+  },
 ];
