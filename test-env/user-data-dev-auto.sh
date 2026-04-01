@@ -42,6 +42,14 @@ get_public_ip() {
     http://169.254.169.254/latest/meta-data/public-ipv4
 }
 
+get_instance_type() {
+  local token
+  token=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+  curl -s -H "X-aws-ec2-metadata-token: $token" \
+    http://169.254.169.254/latest/meta-data/instance-type
+}
+
 # 1. System packages + password SSH (early for debugging)
 dnf install -y git tmux rsync cronie gcc-c++ make jq \
   alsa-lib at-spi2-atk atk at-spi2-core cairo cups-libs dbus-libs \
@@ -178,6 +186,11 @@ echo "$GITHUB_PAT" | sudo -u ec2-user gh auth login --with-token
 
 # 4. Configure backend .env
 PUBLIC_IP=$(get_public_ip)
+INSTANCE_TYPE=$(get_instance_type)
+LAUNCH_EPOCH=$(date -u +%s)
+printf 'instance_type=%s\nlaunch_epoch=%s\n' "$INSTANCE_TYPE" "$LAUNCH_EPOCH" \
+  > "$APP_DIR/.ec2-session-meta"
+chown ec2-user:ec2-user "$APP_DIR/.ec2-session-meta"
 
 get_secret "agentweb/test-env/backend-env" > "$APP_DIR/backend/.env"
 
@@ -374,9 +387,15 @@ echo "$CLAUDE_PROMPT" > "$APP_DIR/.claude-prompt"
 chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
 
 cat > "$APP_DIR/.claude-comment.py" <<'PYEOF'
-import json, sys, os
+import json, sys, os, time
 
 COST_FILE = os.path.expanduser("~/agentweb/.claude-total-cost")
+META_FILE = os.path.expanduser("~/agentweb/.ec2-session-meta")
+
+EC2_PRICES = {
+    "t3.micro": 0.0104, "t3.small": 0.0208, "t3.medium": 0.0416,
+    "t3.large": 0.0832, "t3.xlarge": 0.1664, "t3.2xlarge": 0.3328,
+}
 
 with open("/tmp/.claude-raw.json", "r", errors="replace") as f:
     raw = f.read()
@@ -422,6 +441,26 @@ try:
     models = list(data.get("modelUsage", {}).keys())
     if models:
         parts.append("Model: " + ", ".join(models))
+
+    # EC2 cost (Option A: hardcoded price table)
+    try:
+        meta = {}
+        with open(META_FILE) as mf:
+            for line in mf:
+                k, _, v = line.strip().partition("=")
+                if k:
+                    meta[k] = v
+        itype = meta.get("instance_type", "")
+        launch_epoch = int(meta.get("launch_epoch", 0))
+        if itype and launch_epoch:
+            elapsed_h = (time.time() - launch_epoch) / 3600
+            ec2_cost = elapsed_h * EC2_PRICES.get(itype, 0)
+            h = int(elapsed_h)
+            m = int((elapsed_h - h) * 60)
+            parts.append(f"EC2: ${ec2_cost:.4f} ({h}h {m}m @ {itype})")
+    except Exception:
+        pass
+
     usage_line = " | ".join(parts)
 except Exception:
     text = raw
