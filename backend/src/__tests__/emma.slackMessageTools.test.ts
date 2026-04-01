@@ -7,6 +7,7 @@
 jest.mock('../services/slackService', () => ({
   getSlackChannels: jest.fn(),
   getRecentChannelMessages: jest.fn(),
+  getThreadReplies: jest.fn(),
   postSlackMessage: jest.fn(),
 }));
 
@@ -15,11 +16,13 @@ import '../emma/slackMessageTools';
 import {
   getSlackChannels,
   getRecentChannelMessages,
+  getThreadReplies,
   postSlackMessage,
 } from '../services/slackService';
 
 const mockedGetChannels = getSlackChannels as jest.MockedFunction<typeof getSlackChannels>;
 const mockedGetMessages = getRecentChannelMessages as jest.MockedFunction<typeof getRecentChannelMessages>;
+const mockedGetReplies = getThreadReplies as jest.MockedFunction<typeof getThreadReplies>;
 const mockedPostMessage = postSlackMessage as jest.MockedFunction<typeof postSlackMessage>;
 
 const executeTool = async (name: string, args: any, context: any = {}) => {
@@ -33,9 +36,17 @@ const CHANNELS = [
   { id: 'C002', name: 'sales', displayName: '#sales', isPrivate: false },
 ];
 
+// Parent message has replyCount=2; no-reply message has none
 const MESSAGES = [
   { ts: '1711234567.000100', user: 'U001', displayName: 'Alice', text: 'Hey, any update on the proposal?' },
   { ts: '1711234500.000200', user: 'U002', displayName: 'Bob', text: 'I sent it over yesterday.', threadTs: '1711234500.000200', replyCount: 2 },
+];
+
+// conversations.replies returns parent first, then actual replies
+const THREAD_REPLIES = [
+  { ts: '1711234500.000200', user: 'U002', displayName: 'Bob', text: 'I sent it over yesterday.', threadTs: '1711234500.000200' },
+  { ts: '1711234600.000300', user: 'U003', displayName: 'Carol', text: 'Got it, thanks!', threadTs: '1711234500.000200' },
+  { ts: '1711234700.000400', user: 'U001', displayName: 'Alice', text: 'Perfect, no further action needed.', threadTs: '1711234500.000200' },
 ];
 
 beforeEach(() => {
@@ -55,6 +66,10 @@ describe('tool registration', () => {
 
   it('registers slack_send_message', () => {
     expect(emmaToolRegistry.getTool('slack_send_message')).toBeDefined();
+  });
+
+  it('registers slack_get_thread_replies', () => {
+    expect(emmaToolRegistry.getTool('slack_get_thread_replies')).toBeDefined();
   });
 });
 
@@ -88,6 +103,7 @@ describe('slack_list_channels', () => {
 describe('slack_get_recent_messages', () => {
   it('fetches messages by channel_id directly', async () => {
     mockedGetMessages.mockResolvedValue(MESSAGES as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
 
     const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' });
 
@@ -103,6 +119,7 @@ describe('slack_get_recent_messages', () => {
   it('resolves channel_name to an ID', async () => {
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
     mockedGetMessages.mockResolvedValue(MESSAGES as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
 
     const result = await executeTool('slack_get_recent_messages', { channel_name: 'sales' });
 
@@ -190,12 +207,31 @@ describe('slack_get_recent_messages', () => {
     expect(result.error).toContain('not found');
   });
 
-  it('includes reply_count on messages that have replies', async () => {
+  it('inlines replies for messages that have replyCount > 0', async () => {
     mockedGetMessages.mockResolvedValue(MESSAGES as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
 
     const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' });
 
+    // Message without replies has no replies array
+    expect(result.messages[0].replies).toBeUndefined();
+
+    // Message with replies has inlined replies (parent skipped)
     expect(result.messages[1].reply_count).toBe(2);
+    expect(result.messages[1].replies).toHaveLength(2);
+    expect(result.messages[1].replies[0]).toEqual({ ts: '1711234600.000300', author: 'Carol', text: 'Got it, thanks!' });
+    expect(result.messages[1].replies[1]).toEqual({ ts: '1711234700.000400', author: 'Alice', text: 'Perfect, no further action needed.' });
+    expect(mockedGetReplies).toHaveBeenCalledWith('C002', '1711234500.000200');
+  });
+
+  it('does not call getThreadReplies for messages without replies', async () => {
+    mockedGetMessages.mockResolvedValue([
+      { ts: '1711234567.000100', user: 'U001', displayName: 'Alice', text: 'Hello' },
+    ] as any);
+
+    await executeTool('slack_get_recent_messages', { channel_id: 'C001' });
+
+    expect(mockedGetReplies).not.toHaveBeenCalled();
   });
 
   it('omits thread_ts when threadTs equals the message ts (thread parent)', async () => {
@@ -206,6 +242,86 @@ describe('slack_get_recent_messages', () => {
     const result = await executeTool('slack_get_recent_messages', { channel_id: 'C001' });
 
     expect(result.messages[0].thread_ts).toBeUndefined();
+  });
+});
+
+// ─── slack_get_thread_replies ────────────────────────────────────────────────
+
+describe('slack_get_thread_replies', () => {
+  it('fetches thread replies by channel_id and thread_ts', async () => {
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
+
+    const result = await executeTool('slack_get_thread_replies', {
+      channel_id: 'C002',
+      thread_ts: '1711234500.000200',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C002');
+    expect(result.thread_ts).toBe('1711234500.000200');
+    // parent is skipped, so 2 replies returned
+    expect(result.count).toBe(2);
+    expect(result.replies[0]).toEqual({ ts: '1711234600.000300', author: 'Carol', text: 'Got it, thanks!' });
+    expect(mockedGetReplies).toHaveBeenCalledWith('C002', '1711234500.000200');
+    expect(mockedGetChannels).not.toHaveBeenCalled();
+  });
+
+  it('resolves channel_name to an ID before fetching replies', async () => {
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
+
+    const result = await executeTool('slack_get_thread_replies', {
+      channel_name: 'sales',
+      thread_ts: '1711234500.000200',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C002');
+    expect(mockedGetChannels).toHaveBeenCalled();
+    expect(mockedGetReplies).toHaveBeenCalledWith('C002', '1711234500.000200');
+  });
+
+  it('returns empty summary when thread has no replies beyond the parent', async () => {
+    // Only the parent message returned — no actual replies
+    mockedGetReplies.mockResolvedValue([THREAD_REPLIES[0]] as any);
+
+    const result = await executeTool('slack_get_thread_replies', {
+      channel_id: 'C001',
+      thread_ts: '1711234500.000200',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.replies).toHaveLength(0);
+    expect(result.summary).toContain('No replies');
+  });
+
+  it('returns error when thread_ts is missing', async () => {
+    const result = await executeTool('slack_get_thread_replies', { channel_id: 'C002' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
+    expect(mockedGetReplies).not.toHaveBeenCalled();
+  });
+
+  it('returns error when neither channel_id nor channel_name provided', async () => {
+    const result = await executeTool('slack_get_thread_replies', {
+      thread_ts: '1711234500.000200',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
+  });
+
+  it('returns error when channel_name not found', async () => {
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+
+    const result = await executeTool('slack_get_thread_replies', {
+      channel_name: 'nonexistent',
+      thread_ts: '1711234500.000200',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('not found');
   });
 });
 
