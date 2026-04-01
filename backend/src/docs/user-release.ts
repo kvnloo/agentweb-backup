@@ -3520,4 +3520,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Uses the new get_user_profile foundation tool — available everywhere without installing a skill',
     ],
   },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Choose AI Model for Your Work Plans',
+      '- Private work plans in Settings now support selecting a specific AI model',
+      '- Override the agent mode default on a per-plan basis using the new "Default AI Model" dropdown',
+    ],
+  },
 ];
