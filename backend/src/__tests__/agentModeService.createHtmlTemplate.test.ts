@@ -163,7 +163,8 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Verify LLM was called with correct prompts
       expect(mockGenerateHTML).toHaveBeenCalledWith(
         expect.stringContaining('HTML email template designer'),
-        expect.stringContaining('welcome_email')
+        expect.stringContaining('welcome_email'),
+        expect.any(Function)
       );
 
       // Verify template was saved

@@ -7,7 +7,8 @@ import * as imageGeneration from '../services/imageGeneration';
 jest.mock('../services/imageGeneration');
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
-    addMessageToSession: jest.fn().mockResolvedValue({})
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    addToolCostToSession: jest.fn().mockResolvedValue({}),
   }
 }));
 

@@ -40,7 +40,12 @@ jest.mock('@langchain/core/prompts', () => ({
 }));
 
 jest.mock('@langchain/core/output_parsers', () => ({
-  JsonOutputParser: jest.fn().mockImplementation(() => ({}))
+  JsonOutputParser: jest.fn().mockImplementation(() => ({
+    invoke: jest.fn().mockImplementation((input: any) => {
+      const str = typeof input === 'string' ? input : JSON.stringify(input);
+      try { return JSON.parse(str); } catch { return input; }
+    })
+  }))
 }));
 
 import { LLMService, createLLMService } from '../../utils/llmService';
@@ -241,7 +246,7 @@ describe('llmService', () => {
     });
 
     it('should generate JSON content', async () => {
-      mockInvoke.mockResolvedValue({ data: 'value' });
+      mockInvoke.mockResolvedValue({ content: '{"data":"value"}' });
 
       const result = await service.generateJSONContent('system', 'user', 'json');
       expect(result).toEqual({ data: 'value' });

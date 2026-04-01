@@ -7,7 +7,8 @@ import * as videoGeneration from '../services/videoGeneration';
 jest.mock('../services/videoGeneration');
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
-    addMessageToSession: jest.fn().mockResolvedValue({})
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    addToolCostToSession: jest.fn().mockResolvedValue({}),
   }
 }));
 
