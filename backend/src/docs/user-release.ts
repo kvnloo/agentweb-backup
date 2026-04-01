@@ -11,6 +11,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-01',
     changes: [
+      'Improved Session Cost Tracking for AI Tools',
+      '- Token usage and costs from tools that call AI models internally (HTML generation, book content, image generation, video generation) are now counted toward your monthly usage total',
+      '- Each session record now includes a per-tool cost breakdown so you can see exactly which tools consumed AI credits',
       'Emma: Slack Thread Replies Included in Channel Review',
       '- When Emma reviews a Slack channel, she now automatically fetches and reads all thread replies for each message',
       '- This lets Emma determine whether a question has already been answered before suggesting a follow-up',
