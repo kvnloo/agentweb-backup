@@ -49,6 +49,9 @@ describe('ActivationAnalysisCron', () => {
 
     const RECENT_DATE = new Date().toISOString();
     const OLD_DATE = new Date('2020-01-01T00:00:00Z').toISOString();
+    // lastActiveDate falls back to createdAt when lastLoginTime/lastActiveAt are absent
+    const RECENT_DATE_DAY = RECENT_DATE.split('T')[0];
+    const OLD_DATE_DAY = '2020-01-01';
 
     it('should correctly process all users and map the new metrics', async () => {
         // chatSessionCount is returned by userDb.getAllUsers() (UserWithCounts)
@@ -70,28 +73,32 @@ describe('ActivationAnalysisCron', () => {
                 email: 'user1@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 0,
-                    brandGuidelinesCompletedAt: ''
+                    brandGuidelinesCompletedAt: '',
+                    lastActiveDate: RECENT_DATE_DAY,
                 })
             }),
             expect.objectContaining({
                 email: 'user2@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 0,
-                    brandGuidelinesCompletedAt: '2026-03-01'
+                    brandGuidelinesCompletedAt: '2026-03-01',
+                    lastActiveDate: RECENT_DATE_DAY,
                 })
             }),
             expect.objectContaining({
                 email: 'user3@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 5,
-                    brandGuidelinesCompletedAt: '2026-03-02'
+                    brandGuidelinesCompletedAt: '2026-03-02',
+                    lastActiveDate: RECENT_DATE_DAY,
                 })
             }),
             expect.objectContaining({
                 email: 'old@test.com',
                 customFields: expect.objectContaining({
                     chatSessionCount: 0,
-                    brandGuidelinesCompletedAt: ''
+                    brandGuidelinesCompletedAt: '',
+                    lastActiveDate: OLD_DATE_DAY,
                 })
             })
         ]));
@@ -99,6 +106,18 @@ describe('ActivationAnalysisCron', () => {
         // Ensure all users are included in the CRM payload
         const batchCreateArgs = mockCrmDb.batchCreateLeads.mock.calls[0][1];
         expect(batchCreateArgs).toHaveLength(4);
+    });
+
+    it('should use lastLoginTime for lastActiveDate when available', async () => {
+        const loginTime = '2026-03-20T12:00:00Z';
+        mockUserDb.getAllUsers.mockResolvedValue([
+            { userId: 'u1', email: 'user1@test.com', createdAt: OLD_DATE, lastLoginTime: loginTime, brandGuidelines: undefined, chatSessionCount: 0 } as any,
+        ]);
+
+        await runActivationAnalysis();
+
+        const batchCreateArgs = mockCrmDb.batchCreateLeads.mock.calls[0]?.[1];
+        expect(batchCreateArgs?.[0]?.customFields?.lastActiveDate).toBe('2026-03-20');
     });
 
     it('should run CRM update even when autoSync is false', async () => {

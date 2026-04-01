@@ -14,6 +14,25 @@ const parseCrmSyncSetting = (rawValue?: string | null) => {
 };
 
 /**
+ * Computes activation custom fields from a user record.
+ * Shared between the daily cron and the manual admin CRM sync route.
+ */
+export function getActivationFields(user: any): {
+    chatSessionCount: number;
+    brandGuidelinesCompletedAt: string;
+    lastActiveDate: string;
+} {
+    const chatSessionCount = user.chatSessionCount ?? 0;
+    const brandGuidelinesCompletedAt = user.brandGuidelines?.createdAt || "";
+    const lastActiveDateRaw = user.lastLoginTime || user.lastActiveAt || user.createdAt;
+    const lastActiveDateParsed = new Date(lastActiveDateRaw);
+    const lastActiveDate = isNaN(lastActiveDateParsed.getTime())
+        ? new Date().toISOString().split('T')[0]
+        : lastActiveDateParsed.toISOString().split('T')[0];
+    return { chatSessionCount, brandGuidelinesCompletedAt, lastActiveDate };
+}
+
+/**
  * Runs the daily Activation User Analysis.
  * 1. Updates CRM with activation fields (daily).
  * 2. Sends nudge emails for users stuck in needs_first_session or needs_brand_setup (weekly on Mondays).
@@ -25,25 +44,11 @@ export async function runActivationAnalysis() {
         console.log(`[ActivationCron] Found ${allUsers.length} users to analyze`);
 
         // chatSessionCount is already computed by userDb.getAllUsers() via UserIdIndex GSI
-        const metrics = allUsers.map((u: any) => {
-            const chatSessionCount = u.chatSessionCount ?? 0;
-            const brandGuidelinesCompletedAt = u.brandGuidelines?.createdAt || "";
-            const lastActiveDateRaw = u.lastLoginTime || u.lastActiveAt || u.createdAt;
-            const lastActiveDateParsed = new Date(lastActiveDateRaw);
-            const lastActiveDate = isNaN(lastActiveDateParsed.getTime())
-                ? new Date().toISOString().split('T')[0]
-                : lastActiveDateParsed.toISOString().split('T')[0];
-
-            return {
-                userId: u.userId,
-                email: u.email,
-                customFields: {
-                    chatSessionCount,
-                    brandGuidelinesCompletedAt,
-                    lastActiveDate,
-                }
-            };
-        });
+        const metrics = allUsers.map((u: any) => ({
+            userId: u.userId,
+            email: u.email,
+            customFields: getActivationFields(u),
+        }));
 
         // 1. Update CRM
         const syncSettingRaw = await settingsService.getSetting(getCrmSyncSettingName('users'));
@@ -53,7 +58,7 @@ export async function runActivationAnalysis() {
             const leadList = await crmDb.getLeadListById(parsed.listId);
             if (!leadList || leadList.publicAccessEnabled !== true) {
                 console.log("[ActivationCron] Lead list not found or public access not enabled — skipping CRM update.");
-                console.log("[ActivationCron] Execution completed successfully.");
+                console.log("[ActivationCron] Execution completed (CRM update skipped).");
                 return;
             }
             // Map back to the format crmDb expects for leads

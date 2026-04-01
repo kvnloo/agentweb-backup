@@ -19,6 +19,7 @@ import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
+import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 
@@ -267,14 +268,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       leads = filteredUsers.map((user: any) => {
         const nameFromRecord = user.fullName || user.displayName || user.name || "";
         const parsedName = splitName(nameFromRecord);
-
-        const chatSessionCount = user.chatSessionCount ?? 0;
-        const brandGuidelinesCompletedAt = user.brandGuidelines?.createdAt || "";
-        const lastActiveDateRaw = user.lastLoginTime || user.lastActiveAt || user.createdAt;
-        const lastActiveDateParsed = new Date(lastActiveDateRaw);
-        const lastActiveDate = isNaN(lastActiveDateParsed.getTime())
-          ? new Date().toISOString().split('T')[0]
-          : lastActiveDateParsed.toISOString().split('T')[0];
+        const activationFields = getActivationFields(user);
 
         return {
           email: String(user.email || "").toLowerCase(),
@@ -294,9 +288,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
             emailDomain: user.emailDomain || "",
             slackChannel: user.slackChannel || "",
             subscriptionType: user.subscriptionType || "",
-            chatSessionCount,
-            brandGuidelinesCompletedAt,
-            lastActiveDate,
+            ...activationFields,
           },
         };
       });
@@ -4622,7 +4614,4 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   }
 });
 
-
-
 export default router;
-

@@ -300,30 +300,33 @@ createTestAccount().then(async () => {
           scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
         }, SCANNER_INTERVAL_MS);
 
-        // Activation Analysis Automation
-        // Runs daily at midnight PST (00:00 PST = 08:00 UTC)
+      } catch (error) {
+        console.error('[SocialEngagement] Failed to initialize scanner:', error);
+      }
+
+      // Activation Analysis Automation — runs daily at 08:00 UTC (00:00 PST / 01:00 PDT)
+      try {
         const ACTIVATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
         const { runActivationAnalysis } = await import('./cron/activationAnalysisCron');
 
-        // Calculate delay until next midnight PST
+        // Calculate delay until next 08:00 UTC
         const nowForCron = new Date();
-        const nextMidnightPST = new Date(nowForCron);
-        nextMidnightPST.setUTCHours(8, 0, 0, 0); // 00:00 PST = 08:00 UTC
-        if (nextMidnightPST <= nowForCron) {
-          nextMidnightPST.setUTCDate(nextMidnightPST.getUTCDate() + 1);
+        const nextRunUTC = new Date(nowForCron);
+        nextRunUTC.setUTCHours(8, 0, 0, 0);
+        if (nextRunUTC <= nowForCron) {
+          nextRunUTC.setUTCDate(nextRunUTC.getUTCDate() + 1);
         }
-        const msUntilMidnightPST = nextMidnightPST.getTime() - nowForCron.getTime();
+        const msUntilNextRun = nextRunUTC.getTime() - nowForCron.getTime();
 
-        console.log(`[ActivationCron] Initialized — first run at midnight PST (in ${Math.round(msUntilMidnightPST / 60000)} min)`);
+        console.log(`[ActivationCron] Initialized — first run at 08:00 UTC (in ${Math.round(msUntilNextRun / 60000)} min)`);
         setTimeout(() => {
           runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
           setInterval(() => {
             runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
           }, ACTIVATION_INTERVAL_MS);
-        }, msUntilMidnightPST);
-
+        }, msUntilNextRun);
       } catch (error) {
-        console.error('[SocialEngagement] Failed to initialize scanner:', error);
+        console.error('[ActivationCron] Failed to initialize:', error);
       }
 
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
