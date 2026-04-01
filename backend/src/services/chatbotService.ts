@@ -721,6 +721,35 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Atomically add a tool-generated cost to the session's totalCost and toolCosts breakdown map.
+   * Used when tools make their own LLM/API calls (e.g. LLMService, image gen, video gen).
+   *
+   * Two DynamoDB calls are required: DynamoDB cannot initialize a map and increment a nested key
+   * in a single expression — SET processes before ADD within a request, so the map is guaranteed
+   * to exist when the nested ADD runs.
+   */
+  async addToolCostToSession(sessionId: string, cost: number, toolName: string): Promise<void> {
+    if (cost <= 0) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET toolCosts = if_not_exists(toolCosts, :emptyMap) ADD totalCost :cost',
+        ExpressionAttributeValues: { ':emptyMap': {}, ':cost': cost },
+      }).promise();
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'ADD toolCosts.#tool :cost',
+        ExpressionAttributeNames: { '#tool': toolName },
+        ExpressionAttributeValues: { ':cost': cost },
+      }).promise();
+    } catch (error) {
+      console.error(`Error adding tool cost to session ${sessionId}:`, error);
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage

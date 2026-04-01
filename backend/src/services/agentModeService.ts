@@ -20,6 +20,8 @@ import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
+import { incrementUserTokenUsage } from './tokenUsageService';
+import type { LLMUsageData } from '../utils/llmService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -1027,6 +1029,43 @@ export class AgentModeService {
     const cacheWritePrice = inputPrice * 1.25;
     return (inputTokens * inputPrice + outputTokens * outputPrice
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
+  }
+
+  /** Cost per image generation in USD (fixed per-generation pricing). */
+  private estimateImageGenerationCost(model: string): number {
+    const pricing: Record<string, number> = {
+      'gpt-image-1': 0.04,
+      'gemini-2.5-flash-image': 0.039,
+      'gemini-3-pro-image-preview': 0.039,
+      'gemini-3.1-flash-image-preview': 0.039,
+      'gen4_image': 0.05,
+      'gemini_2.5_flash': 0.04,
+    };
+    return pricing[model] ?? 0.04;
+  }
+
+  /** Cost per video generation in USD (fixed per-generation pricing, based on ~8s clip). */
+  private estimateVideoGenerationCost(model: string): number {
+    const pricing: Record<string, number> = {
+      'veo-3.1-generate-preview': 2.80,
+      'veo-3.1-fast-generate-preview': 1.40,
+    };
+    return pricing[model] ?? 2.80;
+  }
+
+  /** Returns an onUsage callback that records LLM token usage for a named tool. */
+  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+    return (usage) => {
+      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
+      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
+        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
+      );
+      if (sessionId) {
+        chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
+          console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
+        );
+      }
+    };
   }
 
   // Generate AI response for marketing conversation
@@ -13743,6 +13782,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.imageUrl) {
+        // Track generation cost (image APIs are billed per generation, not per token)
+        const imageCost = this.estimateImageGenerationCost(imageModel || 'gemini-2.5-flash-image');
+        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
+          console.error('AgentMode: Failed to track token usage for generateImage:', err)
+        );
+        chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
+          console.error('AgentMode: Failed to add image cost to session:', err)
+        );
+
         // Save the image URL to the session for reference
         const imageData = {
           url: result.imageUrl,
@@ -13832,6 +13880,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
+        // Track generation cost (video APIs are billed per generation, not per token)
+        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview');
+        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
+          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
+        );
+        chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
+          console.error('AgentMode: Failed to add video cost to session:', err)
+        );
+
         // Save the video URL to the session for reference
         const videoData = {
           url: result.videoUrl,
@@ -16754,7 +16811,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log('AgentMode: Generating HTML file with LLMService (Claude model)');
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt);
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -16885,7 +16942,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt);
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -17628,7 +17685,8 @@ Please:
     length: string,
     imagine: boolean,
     userId: string,
-    researchUrl?: string
+    researchUrl?: string,
+    sessionId?: string
   ): Promise<any> {
     try {
       console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
@@ -17829,7 +17887,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format);
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
 
       // Extract content from JSON
       if (!contentData.content) {

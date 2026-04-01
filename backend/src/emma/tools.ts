@@ -1407,7 +1407,8 @@ emmaToolRegistry.register({
       args.length || 'medium',
       args.imagine !== undefined ? args.imagine : true,
       context?.userId,
-      args.research_url
+      args.research_url,
+      context?.sessionId
     );
   }
 });
