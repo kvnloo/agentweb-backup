@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-01',
     changes: [
+      'Emma: Slack Thread Replies Included in Channel Review',
+      '- When Emma reviews a Slack channel, she now automatically fetches and reads all thread replies for each message',
+      '- This lets Emma determine whether a question has already been answered before suggesting a follow-up',
+      '- A new slack_get_thread_replies tool is also available for fetching the latest replies on a specific thread on demand',
+    ],
+  },
+  {
+    date: '2026-04-01',
+    changes: [
       'Emma Now Responds to Client Slack Messages Automatically',
       '- When a client posts a top-level message in their connected Slack channel, Emma automatically reviews it and prepares a draft response',
       '- The team receives an email at founders@agentweb.pro with the original message and Emma\'s suggested reply, plus a link to the full session',
