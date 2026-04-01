@@ -18,6 +18,7 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
+import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 
 // Constant for the virtual "other skills" identifier
@@ -16826,7 +16827,7 @@ Please:
       }
 
       // Extract variables from the enhanced HTML and subject
-      const { variables, arrayVariables } = this.extractVariables(enhancedHtml, subject);
+      const { variables, arrayVariables } = extractVariables(enhancedHtml, subject);
 
       console.log('AgentMode: Extracted variables:', { variables, arrayVariables });
 
@@ -16896,89 +16897,6 @@ Please:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
-  }
-
-  // Extract variables from HTML content and subject (same logic as in settings.ts)
-  private extractVariables(htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } {
-    const variableRegex = /\{\{([^}]+)\}\}/g;
-    const allVariables: string[] = [];
-    const regularVariables: string[] = [];
-    const arrayVariableNames = new Set<string>();
-    let match;
-
-    // Collect all variables from HTML content
-    while ((match = variableRegex.exec(htmlContent)) !== null) {
-      const variable = match[1].trim();
-      if (!allVariables.includes(variable)) {
-        allVariables.push(variable);
-      }
-    }
-
-    // Also collect variables from subject if provided
-    if (subject) {
-      const subjectRegex = /\{\{([^}]+)\}\}/g;
-      let subjectMatch;
-      while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
-        const variable = subjectMatch[1].trim();
-        if (!allVariables.includes(variable)) {
-          allVariables.push(variable);
-        }
-      }
-    }
-
-    // Find all _n and _n_ patterns first
-    const nPatterns = new Set<string>();
-    allVariables.forEach(variable => {
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        if (suffix) {
-          nPatterns.add(`${baseName}_n_${suffix}`);
-        } else {
-          nPatterns.add(`${baseName}_n`);
-        }
-      }
-    });
-
-    // Now process all variables
-    const processedArrayNames = new Set<string>();
-
-    allVariables.forEach(variable => {
-      let isArrayVariable = false;
-
-      // Check if this variable matches any _n pattern
-      nPatterns.forEach(nPattern => {
-        const baseName = nPattern.replace(/_n.*$/, '');
-        const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
-        if (numericMatch) {
-          if (!processedArrayNames.has(nPattern)) {
-            arrayVariableNames.add(nPattern);
-            processedArrayNames.add(nPattern);
-          }
-          isArrayVariable = true;
-        }
-      });
-
-      // Check if this is already an _n pattern
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
-        if (!processedArrayNames.has(fullName)) {
-          arrayVariableNames.add(fullName);
-          processedArrayNames.add(fullName);
-        }
-        isArrayVariable = true;
-      }
-
-      if (!isArrayVariable) {
-        regularVariables.push(variable);
-      }
-    });
-
-    return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
   }
 
   // Work Plan Management Methods
