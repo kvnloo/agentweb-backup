@@ -2,6 +2,30 @@
 
 ## Cloud Dev Environment Recovery
 
+### Instance Stopped and Restarted (Stop/Start)
+After an EC2 stop/start, the tmux sessions (backend, partner-portal, customer-portal, test-env-access) do NOT auto-restart — user-data only runs once at first launch.
+
+Check if services are down:
+```bash
+~/agentweb/test-env/dev-services.sh status
+```
+
+If all services are dead, restart them all:
+```bash
+~/agentweb/test-env/dev-services.sh start-all
+```
+
+**Note:** The public IP also changes after stop/start. The `.env` files on the instance still have the OLD IP hardcoded. Fix before restarting:
+```bash
+NEW_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+sed -i "s|FRONTEND_URL=http://[0-9.]*:5173|FRONTEND_URL=http://${NEW_IP}:5173|" ~/agentweb/backend/.env
+sed -i "s|CUSTOMER_FRONTEND_URL=http://[0-9.]*:5174|CUSTOMER_FRONTEND_URL=http://${NEW_IP}:5174|" ~/agentweb/backend/.env
+sed -i "s|BACKEND_URL=http://[0-9.]*:3001|BACKEND_URL=http://${NEW_IP}:3001|" ~/agentweb/backend/.env
+sed -i "s|VITE_API_URL=http://[0-9.]*:3001|VITE_API_URL=http://${NEW_IP}:3001|" ~/agentweb/partner-portal/.env.local
+sed -i "s|VITE_API_URL=http://[0-9.]*:3001|VITE_API_URL=http://${NEW_IP}:3001|" ~/agentweb/customer-portal/.env.local
+~/agentweb/test-env/dev-services.sh start-all
+```
+
 ### Service Crashed
 1. Check: `~/agentweb/test-env/dev-services.sh status`
 2. View logs: `tail -100 ~/agentweb/logs/backend.log`

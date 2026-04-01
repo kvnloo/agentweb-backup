@@ -3,7 +3,7 @@
 set -euxo pipefail
 
 # 0. Swap space (prevents OOM when tsc + Claude + services run together)
-fallocate -l 4G /swapfile
+fallocate -l 8G /swapfile
 chmod 600 /swapfile
 mkswap /swapfile
 swapon /swapfile
