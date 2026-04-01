@@ -234,6 +234,26 @@ export const saveTemplate = async (req: Request, res: Response) => {
       user.email
     );
 
+    // On any edit, remove the old copy from all other keys (both new and legacy).
+    // This migrates templates out of legacy keys and prevents shadowing when isPublic changes.
+    // Non-admins are scoped to their own keys only — they cannot touch public keys.
+    if (original_template_name) {
+      const nameToRemove = original_template_name;
+      const candidateKeys = user.isAdmin
+        ? [`templates_${userId}`, 'templates_public', `email_templates_${userId}`, 'email_templates_public']
+        : [`templates_${userId}`, `email_templates_${userId}`];
+      const otherKeys = candidateKeys.filter(k => k !== targetKey);
+
+      await Promise.all(otherKeys.map(async (key) => {
+        const setting = await settingsService.getSetting(key);
+        const list = parseTemplateArray(setting);
+        const filtered = list.filter((t: HtmlTemplate) => t.template_name !== nameToRemove);
+        if (filtered.length !== list.length) {
+          await settingsService.setSetting(key, JSON.stringify(filtered), key, user.email || 'system');
+        }
+      }));
+    }
+
     res.json({ success: true, message: 'Template saved successfully', template: newTemplate });
   } catch (error) {
     console.error('[HTML TEMPLATES] Error saving template:', error);
@@ -257,36 +277,24 @@ export const deleteTemplate = async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Only admins can delete public templates' });
     }
 
-    const targetKey = getSettingKey(userId, isPublic);
-    const existingSetting = await settingsService.getSetting(targetKey);
-    let templates = parseTemplateArray(existingSetting);
+    // Admins can delete from all keys; regular users are scoped to their own keys only
+    const allKeys = user.isAdmin
+      ? [`templates_${userId}`, 'templates_public', `email_templates_${userId}`, 'email_templates_public']
+      : [`templates_${userId}`, `email_templates_${userId}`];
 
-    const filtered = templates.filter((t: HtmlTemplate) => t.template_name !== templateName);
+    const results = await Promise.all(allKeys.map(async (key) => {
+      const setting = await settingsService.getSetting(key);
+      const list = parseTemplateArray(setting);
+      const filtered = list.filter((t: HtmlTemplate) => t.template_name !== templateName);
+      if (filtered.length !== list.length) {
+        await settingsService.setSetting(key, JSON.stringify(filtered), key, user.email || 'system');
+        return true;
+      }
+      return false;
+    }));
 
-    if (filtered.length !== templates.length) {
-      await settingsService.setSetting(
-        targetKey,
-        JSON.stringify(filtered),
-        isPublic ? 'Public templates' : 'User templates',
-        user.email || 'system'
-      );
+    if (results.some(Boolean)) {
       return res.json({ success: true, message: 'Template deleted' });
-    }
-
-    // Try deleting from legacy keys if not in new key
-    const oldKey = getOldSettingKey(userId, isPublic);
-    const oldSetting = await settingsService.getSetting(oldKey);
-    let oldTemplates = parseTemplateArray(oldSetting);
-    const oldFiltered = oldTemplates.filter((t: any) => t.template_name !== templateName);
-    
-    if (oldFiltered.length !== oldTemplates.length) {
-      await settingsService.setSetting(
-        oldKey,
-        JSON.stringify(oldFiltered),
-        isPublic ? 'Legacy public email templates' : 'Legacy user email templates',
-        user.email || 'system'
-      );
-      return res.json({ success: true, message: 'Template deleted from legacy storage' });
     }
 
     res.status(404).json({ error: 'Template not found' });

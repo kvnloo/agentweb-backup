@@ -419,6 +419,80 @@ describe('saveTemplate', () => {
 
     expect(status).toHaveBeenCalledWith(500);
   });
+
+  it('migrates template from legacy user key to new user key on update', async () => {
+    const legacyTpl = { ...validBody, template_name: 'my-tpl', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([]));
+      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([legacyTpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = reqWithUser({ body: { ...validBody, original_template_name: 'my-tpl' } });
+    const { res, json } = makeRes();
+
+    await saveTemplate(req, res);
+
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+    // Saved to new user key
+    expect(calledKeys).toContain(`templates_${USER_ID}`);
+    // Removed from legacy user key
+    expect(calledKeys).toContain(`email_templates_${USER_ID}`);
+  });
+
+  it('promotes template to public: saves to templates_public and removes from user key', async () => {
+    const userTpl = { ...validBody, template_name: 'my-tpl', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([userTpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = adminReq({ body: { ...validBody, isPublic: true, original_template_name: 'my-tpl' } });
+    const { res, json } = makeRes();
+
+    await saveTemplate(req, res);
+
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+    expect(calledKeys).toContain('templates_public');
+    expect(calledKeys).toContain(`templates_${USER_ID}`);
+  });
+
+  it('demotes template to private: saves to user key and removes from public key', async () => {
+    const pubTpl = { ...validBody, template_name: 'my-tpl', isPublic: true, created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === 'templates_public') return Promise.resolve(settingWith([pubTpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = adminReq({ body: { ...validBody, isPublic: false, original_template_name: 'my-tpl' } });
+    const { res, json } = makeRes();
+
+    await saveTemplate(req, res);
+
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+    expect(calledKeys).toContain(`templates_${USER_ID}`);
+    expect(calledKeys).toContain('templates_public');
+  });
+
+  it('non-admin update cleanup does not touch public keys', async () => {
+    const userTpl = { ...validBody, template_name: 'my-tpl', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([userTpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = reqWithUser({ body: { ...validBody, original_template_name: 'my-tpl' } });
+    const { res } = makeRes();
+
+    await saveTemplate(req, res);
+
+    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+    expect(calledKeys).not.toContain('templates_public');
+    expect(calledKeys).not.toContain('email_templates_public');
+  });
 });
 
 // ── deleteTemplate ────────────────────────────────────────────────────────────
@@ -464,7 +538,7 @@ describe('deleteTemplate', () => {
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
   });
 
-  it('falls back to legacy key when template is not found in new key', async () => {
+  it('deletes from legacy user key when template is not in new key', async () => {
     const legacyTpl = { template_name: 'legacy', html_content: '<p/>', variables: [], arrayVariables: [] };
     mockGetSetting.mockImplementation((key: string) => {
       if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([]));
@@ -478,6 +552,49 @@ describe('deleteTemplate', () => {
     await deleteTemplate(req, res);
 
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    expect(mockSetSetting).toHaveBeenCalledWith(
+      `email_templates_${USER_ID}`,
+      JSON.stringify([]),
+      `email_templates_${USER_ID}`,
+      'dev@test.com'
+    );
+  });
+
+  it('deletes from all keys simultaneously when template exists in multiple keys', async () => {
+    const tpl = { template_name: 'multi', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
+      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = reqWithUser({ params: { templateName: 'multi' }, query: {} });
+    const { res, json } = makeRes();
+
+    await deleteTemplate(req, res);
+
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    // Both the new and legacy user keys should be cleaned up
+    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+    expect(calledKeys).toContain(`templates_${USER_ID}`);
+    expect(calledKeys).toContain(`email_templates_${USER_ID}`);
+  });
+
+  it('non-admin delete only touches user keys, not public keys', async () => {
+    const tpl = { template_name: 'mine', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = reqWithUser({ params: { templateName: 'mine' }, query: {} });
+    const { res } = makeRes();
+
+    await deleteTemplate(req, res);
+
+    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+    expect(calledKeys).not.toContain('templates_public');
+    expect(calledKeys).not.toContain('email_templates_public');
   });
 
   it('returns 404 when template does not exist in any store', async () => {
@@ -522,7 +639,7 @@ describe('deleteTemplate', () => {
     expect(mockSetSetting).toHaveBeenCalledWith(
       'email_templates_public',
       JSON.stringify([]),
-      'Legacy public email templates',
+      'email_templates_public',
       'admin@test.com'
     );
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));

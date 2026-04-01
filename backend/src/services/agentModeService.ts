@@ -16942,6 +16942,17 @@ Please:
         userId
       );
 
+      // Migrate: remove old copy from legacy user key to prevent shadowing.
+      // Never touch public keys — createHtmlTemplate is always a user-scoped operation.
+      const { parseTemplateArray } = await import('../utils/templateParser');
+      const legacyKey = `email_templates_${userId}`;
+      const legacySetting = await settingsService.getSetting(legacyKey);
+      const legacyList = parseTemplateArray(legacySetting);
+      const legacyFiltered = legacyList.filter((t: any) => t.template_name !== templateName);
+      if (legacyFiltered.length !== legacyList.length) {
+        await settingsService.setSetting(legacyKey, JSON.stringify(legacyFiltered), legacyKey, userId);
+      }
+
       console.log('AgentMode: HTML template created successfully:', templateName);
 
       return {

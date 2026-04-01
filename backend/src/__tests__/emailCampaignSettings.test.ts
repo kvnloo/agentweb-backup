@@ -714,7 +714,7 @@ describe('Email Campaign Settings API', () => {
       expect(mockedSettingsService.setSetting).toHaveBeenCalledWith(
         'templates_test-user-123',
         expect.stringContaining('template2'),
-        'User templates',
+        'templates_test-user-123',
         'test@example.com'
       );
     });
