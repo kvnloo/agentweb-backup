@@ -18,6 +18,7 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
+import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 
 // Constant for the virtual "other skills" identifier
@@ -15742,31 +15743,37 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
   }
 
-  // Fetch both user-specific and public templates
+  // Fetch templates from all 4 keys (new + old), deduplicated (new key wins)
   private async getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {
-    const [userSetting, publicSetting] = await Promise.all([
+    const [newUserSetting, newPublicSetting, oldUserSetting, oldPublicSetting] = await Promise.all([
+      settingsService.getSetting(`templates_${userId}`),
+      settingsService.getSetting('templates_public'),
       settingsService.getSetting(`email_templates_${userId}`),
-      settingsService.getSetting('email_templates_public')
+      settingsService.getSetting('email_templates_public'),
     ]);
 
-    let userTemplates: any[] = [];
-    let publicTemplates: any[] = [];
+    const parse = (s: any): any[] => {
+      if (!s?.settingValue) return [];
+      try { return JSON.parse(s.settingValue); } catch { return []; }
+    };
 
-    if (userSetting) {
-      try {
-        userTemplates = JSON.parse(userSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing user email templates:', error);
-      }
-    }
+    const newUser = parse(newUserSetting);
+    const newPublic = parse(newPublicSetting);
+    const oldUser = parse(oldUserSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
+    const oldPublic = parse(oldPublicSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
 
-    if (publicSetting) {
-      try {
-        publicTemplates = JSON.parse(publicSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing public email templates:', error);
-      }
-    }
+    // Deduplicate: new key wins over old key
+    const userSeen = new Set(newUser.map((t: any) => t.template_name));
+    const userTemplates = [
+      ...newUser,
+      ...oldUser.filter((t: any) => !userSeen.has(t.template_name)),
+    ];
+
+    const publicSeen = new Set(newPublic.map((t: any) => t.template_name));
+    const publicTemplates = [
+      ...newPublic,
+      ...oldPublic.filter((t: any) => !publicSeen.has(t.template_name)),
+    ];
 
     return { userTemplates, publicTemplates };
   }
@@ -15788,16 +15795,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return { template: null, isPublic: false };
   }
 
-  // List all HTML templates for the user (including email templates)
-  public async listHtmlTemplates(userId: string): Promise<any> {
+  // List all HTML templates for the user (merged from all 4 keys)
+  public async listHtmlTemplates(userId: string, type?: string): Promise<any> {
     try {
       const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
-      // Build a name set from user templates for dedup
       const userTemplateNames = new Set(userTemplates.map((t: any) => t.template_name));
 
       const mapTemplate = (template: any, isPublic: boolean) => ({
         template_name: template.template_name,
+        type: template.type || ['email'],
         subject: template.subject,
         variables: template.variables || [],
         arrayVariables: template.arrayVariables || [],
@@ -15806,12 +15813,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(isPublic ? { isPublic: true } : {})
       });
 
-      const merged = [
+      let merged = [
         ...userTemplates.map((t: any) => mapTemplate(t, false)),
         ...publicTemplates
           .filter((t: any) => !userTemplateNames.has(t.template_name))
           .map((t: any) => mapTemplate(t, true))
       ];
+
+      if (type) {
+        merged = merged.filter((t: any) => Array.isArray(t.type) && t.type.includes(type));
+      }
 
       return {
         success: true,
@@ -16785,7 +16796,8 @@ Please generate a complete, professional HTML document that properly formats and
     subject: string,
     additionalInstructions: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    types?: string[]
   ): Promise<any> {
     try {
       // Read HTML content from source (either S3 URL or direct HTML content)
@@ -16880,13 +16892,13 @@ Please:
       }
 
       // Extract variables from the enhanced HTML and subject
-      const { variables, arrayVariables } = this.extractVariables(enhancedHtml, subject);
+      const { variables, arrayVariables } = extractVariables(enhancedHtml, subject);
 
       console.log('AgentMode: Extracted variables:', { variables, arrayVariables });
 
-      // Save template to DynamoDB settings
+      // Save template to DynamoDB settings (new key)
       const { settingsService } = await import('./settingsService');
-      const settingName = `email_templates_${userId}`;
+      const settingName = `templates_${userId}`;
       const existingSetting = await settingsService.getSetting(settingName);
 
       let templates = [];
@@ -16904,8 +16916,11 @@ Please:
         (t: any) => t.template_name === templateName
       );
 
+      const templateTypes = types && types.length > 0 ? types : ['email'];
+
       const newTemplate = {
         template_name: templateName,
+        type: templateTypes,
         subject: subject,
         html_content: enhancedHtml,
         variables: variables,
@@ -16923,20 +16938,32 @@ Please:
       await settingsService.setSetting(
         settingName,
         JSON.stringify(templates),
-        'User email templates',
+        'User templates',
         userId
       );
 
-      console.log('AgentMode: HTML email template created successfully:', templateName);
+      // Migrate: remove old copy from legacy user key to prevent shadowing.
+      // Never touch public keys — createHtmlTemplate is always a user-scoped operation.
+      const { parseTemplateArray } = await import('../utils/templateParser');
+      const legacyKey = `email_templates_${userId}`;
+      const legacySetting = await settingsService.getSetting(legacyKey);
+      const legacyList = parseTemplateArray(legacySetting);
+      const legacyFiltered = legacyList.filter((t: any) => t.template_name !== templateName);
+      if (legacyFiltered.length !== legacyList.length) {
+        await settingsService.setSetting(legacyKey, JSON.stringify(legacyFiltered), legacyKey, userId);
+      }
+
+      console.log('AgentMode: HTML template created successfully:', templateName);
 
       return {
         success: true,
         template_name: templateName,
+        type: templateTypes,
         subject: subject,
         variables: variables,
         arrayVariables: arrayVariables,
-        message: `Email template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
-        preview_note: 'Template is now available in Email Templates section for editing and preview'
+        message: `Template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
+        preview_note: 'Template is now available in Templates section for editing and preview'
       };
     } catch (error) {
       console.error('Error creating HTML template:', error);
@@ -16946,89 +16973,6 @@ Please:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
-  }
-
-  // Extract variables from HTML content and subject (same logic as in settings.ts)
-  private extractVariables(htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } {
-    const variableRegex = /\{\{([^}]+)\}\}/g;
-    const allVariables: string[] = [];
-    const regularVariables: string[] = [];
-    const arrayVariableNames = new Set<string>();
-    let match;
-
-    // Collect all variables from HTML content
-    while ((match = variableRegex.exec(htmlContent)) !== null) {
-      const variable = match[1].trim();
-      if (!allVariables.includes(variable)) {
-        allVariables.push(variable);
-      }
-    }
-
-    // Also collect variables from subject if provided
-    if (subject) {
-      const subjectRegex = /\{\{([^}]+)\}\}/g;
-      let subjectMatch;
-      while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
-        const variable = subjectMatch[1].trim();
-        if (!allVariables.includes(variable)) {
-          allVariables.push(variable);
-        }
-      }
-    }
-
-    // Find all _n and _n_ patterns first
-    const nPatterns = new Set<string>();
-    allVariables.forEach(variable => {
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        if (suffix) {
-          nPatterns.add(`${baseName}_n_${suffix}`);
-        } else {
-          nPatterns.add(`${baseName}_n`);
-        }
-      }
-    });
-
-    // Now process all variables
-    const processedArrayNames = new Set<string>();
-
-    allVariables.forEach(variable => {
-      let isArrayVariable = false;
-
-      // Check if this variable matches any _n pattern
-      nPatterns.forEach(nPattern => {
-        const baseName = nPattern.replace(/_n.*$/, '');
-        const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
-        if (numericMatch) {
-          if (!processedArrayNames.has(nPattern)) {
-            arrayVariableNames.add(nPattern);
-            processedArrayNames.add(nPattern);
-          }
-          isArrayVariable = true;
-        }
-      });
-
-      // Check if this is already an _n pattern
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
-        if (!processedArrayNames.has(fullName)) {
-          arrayVariableNames.add(fullName);
-          processedArrayNames.add(fullName);
-        }
-        isArrayVariable = true;
-      }
-
-      if (!isArrayVariable) {
-        regularVariables.push(variable);
-      }
-    });
-
-    return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
   }
 
   // Work Plan Management Methods

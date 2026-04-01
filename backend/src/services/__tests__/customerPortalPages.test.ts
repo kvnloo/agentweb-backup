@@ -10,7 +10,7 @@ describe('customerPortalPages', () => {
       expect(pagePaths).toContain('/brand-guidelines');
       expect(pagePaths).toContain('/market-strategy');
       expect(pagePaths).toContain('/knowledge-base');
-      expect(pagePaths).toContain('/email-templates');
+      expect(pagePaths).toContain('/templates');
       
       // Creative Hub pages
       expect(pagePaths).toContain('/research-reports');

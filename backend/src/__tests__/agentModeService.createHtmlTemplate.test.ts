@@ -36,6 +36,12 @@ jest.mock('crypto', () => ({
     update: jest.fn().mockReturnThis(),
     digest: jest.fn().mockReturnValue('mock-hash')
   })),
+  randomFillSync: jest.fn((arr) => {
+    for (let i = 0; i < arr.length; i++) {
+      arr[i] = Math.floor(Math.random() * 256);
+    }
+    return arr;
+  }),
   getRandomValues: jest.fn((arr) => {
     for (let i = 0; i < arr.length; i++) {
       arr[i] = Math.floor(Math.random() * 256);
@@ -162,9 +168,9 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
       // Verify template was saved
       expect(mockSetSetting).toHaveBeenCalledWith(
-        'email_templates_test-user-123',
+        'templates_test-user-123',
         expect.stringContaining('welcome_email'),
-        'User email templates',
+        'User templates',
         'test-user-123'
       );
     });
@@ -307,6 +313,64 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(result.arrayVariables).toEqual(
         expect.arrayContaining(['features_n', 'features_n_title', 'features_n_description'])
       );
+    });
+
+    it('should remove old copy from legacy user key after saving', async () => {
+      const legacyTemplates = [
+        {
+          template_name: 'welcome_email',
+          subject: 'Old Subject',
+          html_content: '<html>Old</html>',
+          variables: [],
+          arrayVariables: [],
+          created_at: '2024-01-01T00:00:00.000Z',
+          updated_at: '2024-01-01T00:00:00.000Z',
+        }
+      ];
+
+      mockGetSetting.mockImplementation((key: string) => {
+        if (key === 'templates_test-user-123') return Promise.resolve(null);
+        if (key === 'email_templates_test-user-123') return Promise.resolve({ settingValue: JSON.stringify(legacyTemplates) });
+        return Promise.resolve(null);
+      });
+      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+      mockSetSetting.mockResolvedValue(undefined);
+
+      await agentModeService.createHtmlTemplate(
+        mockInputHtml,
+        'welcome_email',
+        'Welcome!',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+      // Saved to new key
+      expect(calledKeys).toContain('templates_test-user-123');
+      // Cleaned up from legacy key
+      expect(calledKeys).toContain('email_templates_test-user-123');
+      const legacyCall = mockSetSetting.mock.calls.find((c: any[]) => c[0] === 'email_templates_test-user-123');
+      expect(JSON.parse(legacyCall![1])).toEqual([]);
+    });
+
+    it('should never touch public keys when saving', async () => {
+      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+      mockGetSetting.mockResolvedValue(null);
+      mockSetSetting.mockResolvedValue(undefined);
+
+      await agentModeService.createHtmlTemplate(
+        mockInputHtml,
+        'welcome_email',
+        'Welcome!',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
+      expect(calledKeys).not.toContain('templates_public');
+      expect(calledKeys).not.toContain('email_templates_public');
     });
 
     it('should add template to existing templates list', async () => {

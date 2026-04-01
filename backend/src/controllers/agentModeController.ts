@@ -1444,7 +1444,7 @@ export async function generateSessionResponse(
   let excludeTools: string[] | undefined;
   if (session.portalType === 'emma-sidebar') {
     // Only include get_visual_context on pages where seeing the rendered UI is useful
-    const visualPages = new Set(['brand-guidelines', 'social-posts', 'images', 'videos', 'email-templates', 'newsletter', 'blog']);
+    const visualPages = new Set(['brand-guidelines', 'social-posts', 'images', 'videos', 'templates', 'newsletter', 'blog']);
     const urlPath = (pageContext?.currentUrl || '').replace(/^\//, '');
     const page = urlPath.split('/')[0].split('?')[0];
     if (!visualPages.has(page)) {
@@ -1844,8 +1844,8 @@ export const agentModeController = {
           'update_book_content': ['books'],
           'create_book': ['books'],
           'generate_book_content': ['books'],
-          'create_html_from_template': ['email-templates'],
-          'update_html_file': ['email-templates'],
+          'create_html_from_template': ['templates'],
+          'update_html_file': ['templates'],
           'create_knowledge_base': ['knowledge-base'],
           'update_knowledge_base_file': ['knowledge-base'],
           'generate_image': ['images'],
