@@ -133,7 +133,14 @@ export async function incrementUserTokenUsage(
     const existingMonth = user.tokenUsage?.month;
 
     if (existingMonth !== currentMonth) {
-      // New month — reset usage and clear bonus
+      // New month — archive previous month to history, reset usage, clear bonus
+      const prevUsage = user.tokenUsage;
+      const existingHistory = user.tokenUsageHistory || [];
+      let newHistory = existingHistory;
+      if (prevUsage && prevUsage.month) {
+        const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
+        newHistory = [...existingHistory, entry].slice(-24);
+      }
       await userDb.updateUser(userId, {
         tokenUsage: {
           month: currentMonth,
@@ -142,6 +149,7 @@ export async function incrementUserTokenUsage(
           resetDate: getNextResetDate(),
         },
         tokenAllowanceBonus: 0,
+        tokenUsageHistory: newHistory,
       });
     } else {
       // Same month — increment atomically

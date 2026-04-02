@@ -260,6 +260,83 @@ describe("incrementUserTokenUsage", () => {
     }));
   });
 
+  it("saves previous month usage to tokenUsageHistory on monthly reset", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: "2025-01", totalTokens: 50000, totalCost: 5.0, resetDate: "2025-02-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 10000,
+      tokenUsageHistory: [],
+    });
+    mockUpdateUser.mockResolvedValue(undefined);
+
+    await incrementUserTokenUsage("u1", 1000, 0.1);
+
+    expect(mockUpdateUser).toHaveBeenCalledWith("u1", expect.objectContaining({
+      tokenUsageHistory: [{ month: "2025-01", totalTokens: 50000, totalCost: 5.0 }],
+    }));
+  });
+
+  it("appends to existing tokenUsageHistory on monthly reset", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: "2025-02", totalTokens: 30000, totalCost: 3.0, resetDate: "2025-03-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+      tokenUsageHistory: [{ month: "2025-01", totalTokens: 50000, totalCost: 5.0 }],
+    });
+    mockUpdateUser.mockResolvedValue(undefined);
+
+    await incrementUserTokenUsage("u1", 500, 0.05);
+
+    expect(mockUpdateUser).toHaveBeenCalledWith("u1", expect.objectContaining({
+      tokenUsageHistory: [
+        { month: "2025-01", totalTokens: 50000, totalCost: 5.0 },
+        { month: "2025-02", totalTokens: 30000, totalCost: 3.0 },
+      ],
+    }));
+  });
+
+  it("caps tokenUsageHistory at 24 entries on reset", async () => {
+    const oldHistory = Array.from({ length: 24 }, (_, i) => ({
+      month: `2023-${String(i + 1).padStart(2, "0")}`,
+      totalTokens: 1000,
+      totalCost: 0.1,
+    }));
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: "2025-01", totalTokens: 5000, totalCost: 0.5, resetDate: "2025-02-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+      tokenUsageHistory: oldHistory,
+    });
+    mockUpdateUser.mockResolvedValue(undefined);
+
+    await incrementUserTokenUsage("u1", 100, 0.01);
+
+    const call = mockUpdateUser.mock.calls[0][1];
+    expect(call.tokenUsageHistory).toHaveLength(24);
+    // The oldest entry should have been dropped
+    expect(call.tokenUsageHistory[0].month).toBe("2023-02");
+    // The newest entry should be the just-reset month
+    expect(call.tokenUsageHistory[23].month).toBe("2025-01");
+  });
+
+  it("does not save to history when there is no previous usage", async () => {
+    // User with no prior tokenUsage at all
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+    });
+    mockUpdateUser.mockResolvedValue(undefined);
+
+    await incrementUserTokenUsage("u1", 1000, 0.1);
+
+    const call = mockUpdateUser.mock.calls[0][1];
+    // No tokenUsageHistory should be set (or it's empty)
+    expect(call.tokenUsageHistory ?? []).toEqual([]);
+  });
+
   it("increments within same month", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
