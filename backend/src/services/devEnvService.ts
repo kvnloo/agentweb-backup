@@ -504,7 +504,7 @@ export async function launchEnvironment(
       }
     }
 
-    // 4. Read user-data script
+    // 4. Read user-data script (EC2 limit: 16384 bytes raw; keep test-env/user-data-dev-auto.sh under that)
     const userDataPath = path.resolve(
       __dirname,
       "../user-data-dev-auto.sh"
