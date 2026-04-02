@@ -309,6 +309,42 @@ describe('llmService', () => {
       );
     });
 
+    it('should call onUsage callback with token counts when provided', async () => {
+      mockInvoke.mockResolvedValue({
+        content: '{"data":"value"}',
+        usage_metadata: { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
+      });
+      const onUsage = jest.fn();
+
+      await service.generateJSONContent('system', 'user', 'json', onUsage);
+
+      expect(onUsage).toHaveBeenCalledWith({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+        model: 'gpt-4',
+      });
+    });
+
+    it('should compute totalTokens from input+output when usage_metadata.total_tokens absent', async () => {
+      mockInvoke.mockResolvedValue({
+        content: '{"data":"value"}',
+        usage_metadata: { input_tokens: 5, output_tokens: 15 },
+      });
+      const onUsage = jest.fn();
+
+      await service.generateJSONContent('system', 'user', 'json', onUsage);
+
+      expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ totalTokens: 20 }));
+    });
+
+    it('should not call onUsage when not provided', async () => {
+      mockInvoke.mockResolvedValue({ content: '{"data":"value"}' });
+
+      // Should not throw
+      await expect(service.generateJSONContent('system', 'user', 'json')).resolves.toBeDefined();
+    });
+
     it('should throw error on generation failure', async () => {
       mockInvoke.mockRejectedValue(new Error('JSON generation failed'));
 
@@ -369,6 +405,39 @@ describe('llmService', () => {
 
       const result = await service.generateHTML('system', 'user');
       expect(result).toBe('<!DOCTYPE html><html><body>Content');
+    });
+
+    it('should call onUsage callback with token counts when provided', async () => {
+      mockInvoke.mockResolvedValue({
+        content: '<actual_html_content><!DOCTYPE html><html></html></actual_html_content>',
+        usage_metadata: { input_tokens: 100, output_tokens: 200, total_tokens: 300 },
+      });
+      const onUsage = jest.fn();
+
+      await service.generateHTML('system', 'user', onUsage);
+
+      expect(onUsage).toHaveBeenCalledWith({
+        inputTokens: 100,
+        outputTokens: 200,
+        totalTokens: 300,
+        model: 'gpt-4',
+      });
+    });
+
+    it('should default token counts to 0 when usage_metadata absent', async () => {
+      mockInvoke.mockResolvedValue({
+        content: '<actual_html_content><!DOCTYPE html><html></html></actual_html_content>',
+      });
+      const onUsage = jest.fn();
+
+      await service.generateHTML('system', 'user', onUsage);
+
+      expect(onUsage).toHaveBeenCalledWith({
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        model: 'gpt-4',
+      });
     });
 
     it('should throw error on generation failure', async () => {
