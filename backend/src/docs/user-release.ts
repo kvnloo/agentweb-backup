@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-02',
+    changes: [
+      'Settings: Each Tab Now Has Its Own URL',
+      '- Settings tabs are now bookmarkable and shareable — e.g. /settings/profile, /settings/accounts, /settings/billing',
+      '- The browser back button now works correctly when navigating between Settings tabs',
+      '- Visiting /settings redirects automatically to /settings/profile',
+    ],
+  },
+  {
     date: '2026-04-01',
     changes: [
       'Improved Session Cost Tracking for AI Tools',
