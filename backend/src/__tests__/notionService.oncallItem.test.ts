@@ -45,7 +45,7 @@ describe('notionService - createOncallItem', () => {
     const body = JSON.parse(options.body);
     expect(body.parent).toEqual({ type: 'data_source_id', data_source_id: expect.any(String) });
     expect(body.properties['Name'].title[0].text.content).toBe('Test oncall issue');
-    expect(body.properties['Status'].status.name).toBe('In progress');
+    expect(body.properties['Status'].status.name).toBe('To-do');
     expect(body.properties['Tags'].multi_select).toEqual([{ name: 'Oncall' }]);
     expect(body.properties['Sprint'].rich_text[0].text.content).toBe('Backlog');
     expect(body.properties['Move to Current Sprint'].checkbox).toBe(true);
