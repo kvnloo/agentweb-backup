@@ -888,6 +888,18 @@ async function checkForIpChange() {
 
     const storedIp = page.properties?.["Public IP"]?.rich_text?.[0]?.plain_text?.trim();
 
+    const patchIp = () => fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: { "Public IP": { rich_text: [{ text: { content: currentIp } }] } },
+      }),
+    });
+
     if (storedIp && storedIp !== currentIp) {
       console.log(`[ip-change] IP changed from ${storedIp} to ${currentIp} — posting Notion comment`);
 
@@ -905,7 +917,7 @@ async function checkForIpChange() {
         link(`http://${currentIp}:5175`),
       ];
 
-      await fetch(`${NOTION_API}/comments`, {
+      const postComment = () => fetch(`${NOTION_API}/comments`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -915,31 +927,9 @@ async function checkForIpChange() {
         body: JSON.stringify({ parent: { page_id: NOTION_PAGE_ID }, rich_text: richText }),
       });
 
-      // Update the Public IP field
-      await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Notion-Version": NOTION_VERSION,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          properties: { "Public IP": { rich_text: [{ text: { content: currentIp } }] } },
-        }),
-      });
-    } else if (!storedIp && currentIp) {
-      // No IP stored yet — just set it
-      await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Notion-Version": NOTION_VERSION,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          properties: { "Public IP": { rich_text: [{ text: { content: currentIp } }] } },
-        }),
-      });
+      await Promise.all([postComment(), patchIp()]);
+    } else if (!storedIp) {
+      await patchIp();
     }
   } catch (err) {
     console.error("[ip-change] Error:", err.message || err);

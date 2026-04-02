@@ -721,6 +721,35 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Atomically add a tool-generated cost to the session's totalCost and toolCosts breakdown map.
+   * Used when tools make their own LLM/API calls (e.g. LLMService, image gen, video gen).
+   *
+   * Two DynamoDB calls are required: DynamoDB cannot initialize a map and increment a nested key
+   * in a single expression — SET processes before ADD within a request, so the map is guaranteed
+   * to exist when the nested ADD runs.
+   */
+  async addToolCostToSession(sessionId: string, cost: number, toolName: string): Promise<void> {
+    if (cost <= 0) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET toolCosts = if_not_exists(toolCosts, :emptyMap) ADD totalCost :cost',
+        ExpressionAttributeValues: { ':emptyMap': {}, ':cost': cost },
+      }).promise();
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'ADD toolCosts.#tool :cost',
+        ExpressionAttributeNames: { '#tool': toolName },
+        ExpressionAttributeValues: { ':cost': cost },
+      }).promise();
+    } catch (error) {
+      console.error(`Error adding tool cost to session ${sessionId}:`, error);
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -3754,7 +3783,7 @@ export async function generateChatResponse(
           'images':           ['generate_image', 'describe_image', 'get_visual_context'],
           'videos':           ['generate_video', 'describe_video', 'get_visual_context'],
           'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
-          'email-templates':  ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
+          'templates':        ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
           'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
           'research-reports': ['perform_deep_research', 'search_web'],
           'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
@@ -3999,8 +4028,8 @@ export async function generateChatResponse(
       'create_lead_list': ['crm'],
       'update_book_content': ['books'],
       'create_book': ['books'],
-      'create_html_from_template': ['email-templates'],
-      'update_html_file': ['email-templates'],
+      'create_html_from_template': ['templates'],
+      'update_html_file': ['templates'],
       'create_knowledge_base': ['knowledge-base'],
       'update_knowledge_base_file': ['knowledge-base'],
     };

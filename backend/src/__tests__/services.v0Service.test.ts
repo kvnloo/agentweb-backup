@@ -99,6 +99,23 @@ jest.mock("uuid", () => ({
   v4: () => "test-uuid-1234",
 }));
 
+// Mock settingsService
+const mockGetSetting = jest.fn().mockResolvedValue(null);
+jest.mock("../services/settingsService", () => ({
+  settingsService: {
+    getSetting: (...args: any[]) => mockGetSetting(...args),
+  },
+}));
+
+// Mock fs for filesystem fallback tests
+const mockFsExistsSync = jest.fn().mockReturnValue(false);
+const mockFsReadFileSync = jest.fn().mockReturnValue("");
+jest.mock("fs", () => ({
+  ...jest.requireActual("fs"),
+  existsSync: (...args: any[]) => mockFsExistsSync(...args),
+  readFileSync: (...args: any[]) => mockFsReadFileSync(...args),
+}));
+
 import {
   buildBrandEnrichedPrompt,
   generateLandingPage,
@@ -1009,5 +1026,109 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("deployed");
     // At least 2 Vercel polling calls after the GitHub GET ref call
     expect(mockAxiosGet).toHaveBeenCalledTimes(3); // 1 GitHub ref + 2 Vercel polls
+  });
+});
+
+// =============================================================================
+// loadDefaultTemplateOutline fallback (via generateLandingPage)
+// =============================================================================
+describe("v0Service - loadDefaultTemplateOutline fallback", () => {
+  const createTestZip = async () => {
+    const AdmZip = (await import("adm-zip")).default;
+    const zip = new AdmZip();
+    zip.addFile("app/page.tsx", Buffer.from('export default function Page() { return <div>Hello</div>; }'));
+    return zip.toBuffer();
+  };
+
+  const existingSiteRecord = {
+    id: "existing-site-id",
+    userId: "user-1",
+    name: "Main Page",
+    prompt: "main page",
+    status: "deployed",
+    iterations: 0,
+    isRootPage: true,
+    githubRepoUrl: "https://github.com/AgentWebPro/lp-test-repo",
+    vercelProjectId: "prj_test123",
+    deployedUrl: "https://lp-test-repo.vercel.app",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  const setupFullSuccess = async () => {
+    const zipBuffer = await createTestZip();
+    mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_new" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zipBuffer);
+    mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } }); // GitHub ref
+    mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_sha" } });           // blob
+    mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });           // tree
+    mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });         // commit
+    mockAxiosPatch.mockResolvedValueOnce({ data: {} });                           // patch ref
+    mockAxiosGet.mockResolvedValueOnce({ data: { deployments: [{ uid: "dpl_1", readyState: "READY" }] } }); // Vercel
+  };
+
+  // FAIL tests — boundary/error cases
+
+  it("FAIL: no template provided and all fallbacks fail → v0 prompt has no DESIGN INSPIRATION", async () => {
+    mockGetSetting.mockResolvedValue(null);
+    mockFsExistsSync.mockReturnValue(false);
+    await setupFullSuccess();
+
+    await generateLandingPage("user-1", "Create page", "Test Page", {});
+
+    const prompt = mockChatsCreate.mock.calls[0][0].message;
+    expect(prompt).not.toContain("DESIGN INSPIRATION");
+  });
+
+  it("FAIL: email_templates_public has no landing-page-v2 entry → falls through to templates_public", async () => {
+    mockGetSetting
+      .mockResolvedValueOnce({ settingValue: JSON.stringify([{ template_name: "other", html_content: "<html/>" }]) }) // email_templates_public — no match
+      .mockResolvedValueOnce({ settingValue: JSON.stringify([{ template_name: 'landing-page-v2', html_content: '<html><body><section id="hero"><h1>{{headline}}</h1></section></body></html>' }]) }); // templates_public — match
+    mockFsExistsSync.mockReturnValue(false);
+    await setupFullSuccess();
+
+    await generateLandingPage("user-1", "Create page", "Test Page", {});
+
+    const prompt = mockChatsCreate.mock.calls[0][0].message;
+    expect(prompt).toContain("DESIGN INSPIRATION");
+  });
+
+  it("FAIL: both DynamoDB keys return nothing → filesystem fallback used", async () => {
+    mockGetSetting.mockResolvedValue(null);
+    mockFsExistsSync.mockReturnValue(true);
+    mockFsReadFileSync.mockReturnValue('<html><body><section id="hero"><h1>{{headline}}</h1></section></body></html>');
+    await setupFullSuccess();
+
+    await generateLandingPage("user-1", "Create page", "Test Page", {});
+
+    const prompt = mockChatsCreate.mock.calls[0][0].message;
+    expect(prompt).toContain("DESIGN INSPIRATION");
+  });
+
+  // SUCCESS tests
+
+  it("SUCCESS: email_templates_public has landing-page-v2 → used in v0 prompt", async () => {
+    mockGetSetting.mockResolvedValueOnce({
+      settingValue: JSON.stringify([{ template_name: 'landing-page-v2', html_content: '<html><body><section id="hero"><h1>{{headline}}</h1></section></body></html>' }]),
+    });
+    await setupFullSuccess();
+
+    await generateLandingPage("user-1", "Create page", "Test Page", {});
+
+    const prompt = mockChatsCreate.mock.calls[0][0].message;
+    expect(prompt).toContain("DESIGN INSPIRATION");
+    expect(mockGetSetting).toHaveBeenCalledWith("email_templates_public");
+  });
+
+  it("SUCCESS: explicit templateHtml provided → used directly, settingsService not called for template", async () => {
+    await setupFullSuccess();
+
+    await generateLandingPage("user-1", "Create page", "Test Page", {}, undefined, "<section id='custom'></section>");
+
+    const prompt = mockChatsCreate.mock.calls[0][0].message;
+    expect(prompt).toContain("DESIGN INSPIRATION");
+    expect(mockGetSetting).not.toHaveBeenCalled();
   });
 });

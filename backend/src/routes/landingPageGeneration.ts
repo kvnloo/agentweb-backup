@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { settingsService } from "../services/settingsService";
 import { userDb, crmDb } from "../services/db";
 import {
   generateLandingPage,
@@ -14,6 +15,7 @@ import {
   getPreviewDeploymentUrl,
   triggerVercelDeployment,
   resolveVercelProjectId,
+  extractTemplateOutline,
 } from "../services/v0Service";
 
 const router = Router();
@@ -175,7 +177,39 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { prompt, name, lead_list_id, template_html } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_name } = req.body;
+    let template_html: string | undefined = rawTemplateHtml;
+
+    // If template_name provided (user picked a template), look it up from DynamoDB
+    if (template_name && !template_html) {
+      const lookupKeys = [
+        `templates_${userId}`,
+        `email_templates_${userId}`,
+        'templates_public',
+        'email_templates_public',
+      ];
+      let found = false;
+      for (const key of lookupKeys) {
+        try {
+          const setting = await settingsService.getSetting(key);
+          if (!setting?.settingValue) continue;
+          const arr: any[] = JSON.parse(setting.settingValue);
+          const match = arr.find((t: any) => t.template_name === template_name);
+          if (match?.html_content) {
+            template_html = extractTemplateOutline(match.html_content);
+            console.log(`[LP GENERATION] Loaded template "${template_name}" from ${key} (${template_html?.length} chars condensed)`);
+            found = true;
+            break;
+          }
+        } catch {
+          // continue to next key
+        }
+      }
+      if (!found) {
+        console.warn(`[LP GENERATION] Template "${template_name}" not found in any DynamoDB key, continuing without template`);
+      }
+    }
+
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "prompt is required and must be a string" });
     }
@@ -247,8 +281,14 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html);
     res.status(201).json(result);
   } catch (error: any) {
-    console.error("[LP GENERATION] Error generating landing page:", error);
-    res.status(500).json({ error: "Failed to generate landing page" });
+    console.error("[LP GENERATION] Error generating landing page:", {
+      userId: (req as unknown as AuthenticatedRequest).user?.userId,
+      errorName: error?.name,
+      errorCode: error?.code,
+      errorMessage: error?.message,
+      stack: error?.stack,
+    });
+    res.status(500).json({ error: "Failed to generate landing page", details: error?.message });
   }
 });
 

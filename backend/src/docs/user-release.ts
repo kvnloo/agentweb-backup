@@ -9,12 +9,38 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-02',
+    changes: [
+      'Settings: Each Tab Now Has Its Own URL',
+      '- Settings tabs are now bookmarkable and shareable — e.g. /settings/profile, /settings/accounts, /settings/billing',
+      '- The browser back button now works correctly when navigating between Settings tabs',
+      '- Visiting /settings redirects automatically to /settings/profile',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Fix: Expand Button in Scheduled Chat Now Works Correctly',
+      '- Fixed an issue where clicking "Expand" next to the Starting Message in the schedule editor did not open the full-screen editing popup',
+    ],
+  },
+  {
     date: '2026-04-01',
     changes: [
+      'Improved Session Cost Tracking for AI Tools',
+      '- Token usage and costs from tools that call AI models internally (HTML generation, book content, image generation, video generation) are now counted toward your monthly usage total',
+      '- Each session record now includes a per-tool cost breakdown so you can see exactly which tools consumed AI credits',
       'Emma: Slack Thread Replies Included in Channel Review',
       '- When Emma reviews a Slack channel, she now automatically fetches and reads all thread replies for each message',
       '- This lets Emma determine whether a question has already been answered before suggesting a follow-up',
       '- A new slack_get_thread_replies tool is also available for fetching the latest replies on a specific thread on demand',
+      'Fix: Landing Page Generation No Longer Times Out',
+      '- Fixed a bug where generate_landing_page consistently aborted with "This operation was aborted" on the first attempt',
+      '- Root cause: DynamoDB reads at the start of generation had no timeout, causing indefinite hangs that eventually hit the 15-minute abort limit',
+      '- DynamoDB client now has a 30-second timeout; all GitHub and Vercel API calls also have explicit timeouts',
+      '- Extended the generate_landing_page tool timeout from 15 to 25 minutes for extra headroom on slow v0 builds',
+      '- Fixed a 404 after generating additional landing pages: Vercel polling now waits for the newly triggered build instead of returning the previous deployment',
+      '- Fixed broken import paths in multi-page sites where component files referenced sibling components via an incorrect nested path',
     ],
   },
   {
@@ -3544,6 +3570,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Setting a custom subdomain (e.g. rankai.agentwebforms.com) on a landing page now saves correctly',
       '- The custom URL is shown in the Landing Pages view after page reload',
       '- If a subdomain was already registered in Vercel, Set Subdomain now correctly recognises it instead of creating a duplicate',
+    ],
+  },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Copy Button Fix in Agent Mode',
+      '- Fixed copy buttons in Agent Mode chat that required precise clicking to activate',
     ],
   },
 ];

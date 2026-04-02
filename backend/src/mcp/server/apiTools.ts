@@ -1148,7 +1148,8 @@ mcpToolRegistry.register({
       properties: {
         prompt: { type: 'string', description: 'Detailed description of the landing page including brand colors, fonts, tone, sections, copy guidance, and any specific requirements. The more detail, the better v0 output.' },
         name: { type: 'string', description: 'Optional display name for the page' },
-        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' }
+        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' },
+        template_name: { type: 'string', description: 'Optional name of a saved landing page template to use as design inspiration (from list_html_templates with type=landing_page)' }
       },
       required: ['prompt']
     }
@@ -1156,8 +1157,8 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
-      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id },
-      timeoutMs: 15 * 60 * 1000, // 15 minutes — v0 generation + GitHub + Vercel deploy
+      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_name: args.template_name },
+      timeoutMs: 25 * 60 * 1000, // 25 minutes — v0 generation + GitHub + Vercel deploy (extra headroom vs 15 min default)
     });
     return jsonResult(data);
   }
@@ -1180,7 +1181,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
       body: {},
-      timeoutMs: 15 * 60 * 1000, // 15 minutes — GitHub + Vercel deploy
+      timeoutMs: 25 * 60 * 1000, // 25 minutes — GitHub + Vercel deploy (extra headroom)
     });
     return jsonResult(data);
   }
