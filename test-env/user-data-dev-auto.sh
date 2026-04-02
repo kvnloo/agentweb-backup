@@ -394,11 +394,21 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
+NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
+NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
+
+# Set status to In progress before starting work
+if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
+  curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    -d '{"properties": {"Status": {"status": {"name": "In progress"}}}}' > /dev/null
+fi
+
 RAW=$(claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
-NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
-NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
   printf '%s' "$RAW" > /tmp/.claude-raw.json
   python3 ~/agentweb/.claude-comment.py "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
@@ -411,6 +421,12 @@ if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
       -d "$BODY"
   fi
   rm -f /tmp/.claude-raw.json /tmp/.claude-comment.json
+  # Set status to In Review after work is done
+  curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    -d '{"properties": {"Status": {"status": {"name": "In Review"}}}}' > /dev/null
 fi
 exec bash
 RUNEOF

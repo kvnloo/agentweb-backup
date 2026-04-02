@@ -499,6 +499,8 @@ async function processQueue() {
     lastPromptTime = new Date();
 
     try {
+      await updateNotionStatus(notionPageId, "In progress");
+
       // Fetch and download any attachments from the Notion page
       const attachments = await fetchNotionAttachments(notionPageId);
       const downloadedPaths = await downloadAttachments(attachments);
@@ -541,10 +543,15 @@ async function processQueue() {
         }, delaySec * 1000);
       }
 
-      // If this was a deploy prompt, set status to Done to trigger teardown
-      if (prompt === "Prep for deploy") {
-        const isProduction = (process.env.NODE_ENV || "") === "production";
-        await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+      // Update status when Claude is done (not waiting for retry)
+      if (!retryMatch) {
+        if (prompt === "Prep for deploy") {
+          // Deploy prompt triggers teardown via Done status
+          const isProduction = (process.env.NODE_ENV || "") === "production";
+          await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+        } else {
+          await updateNotionStatus(notionPageId, "In Review");
+        }
       }
     } catch (err) {
       console.error(`[relay] Error processing prompt:`, err);
