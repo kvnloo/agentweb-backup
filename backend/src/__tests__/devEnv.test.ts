@@ -758,3 +758,14 @@ describe('devEnv webhook route', () => {
     expect(pageId).toBe('page-from-field');
   });
 });
+
+describe('user-data-dev-auto.sh size', () => {
+  it('should be under the EC2 user-data 16384-byte limit', () => {
+    // Use jest.requireActual to bypass any fs mocking in the test environment
+    const fs = jest.requireActual('fs') as typeof import('fs');
+    const path = jest.requireActual('path') as typeof import('path');
+    const scriptPath = path.resolve(__dirname, '../../../test-env/user-data-dev-auto.sh');
+    const size = fs.statSync(scriptPath).size;
+    expect(size).toBeLessThan(16384);
+  });
+});
