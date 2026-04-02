@@ -17,6 +17,7 @@ import {
   resolveVercelProjectId,
   extractTemplateOutline,
 } from "../services/v0Service";
+import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
 const router = Router();
 
@@ -355,6 +356,35 @@ router.get("/generated", async (req, res: Response) => {
     }
 
     const pages = await listLandingPages(userId);
+
+    // Enrich pages that have a vercelProjectId but no customDomainUrl saved,
+    // by looking up the most recent active domain in AW-CustomDomains.
+    // This handles historical records created before customDomainUrl persistence was added.
+    try {
+      const domains = await listDomains(userId);
+      if (domains.length > 0) {
+        // Build a map: vercelProjectId → most recent domain record
+        const latestByProject = new Map<string, CustomDomainRecord>();
+        for (const d of domains) {
+          if (!d.vercelProjectId) continue;
+          const existing = latestByProject.get(d.vercelProjectId);
+          if (!existing || d.updatedAt > existing.updatedAt) {
+            latestByProject.set(d.vercelProjectId, d);
+          }
+        }
+        for (const page of pages) {
+          if (!page.customDomainUrl && page.vercelProjectId) {
+            const domain = latestByProject.get(page.vercelProjectId);
+            if (domain) {
+              page.customDomainUrl = `https://${domain.domain}`;
+            }
+          }
+        }
+      }
+    } catch {
+      // Non-fatal — return pages without enrichment if domain lookup fails
+    }
+
     res.json({ pages });
   } catch (error) {
     console.error("[LP GENERATION] Error listing pages:", error);

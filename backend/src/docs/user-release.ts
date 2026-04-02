@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-02',
     changes: [
+      'Fix: Custom Domain URL Now Shows Correctly on Landing Pages',
+      '- Fixed an issue where landing pages created before domain linking was introduced did not display their custom domain URL',
+      '- The landing page list now automatically looks up and fills in the custom domain for any page that has a linked Vercel project',
+      '- Subdomain creation no longer fails if the landing page record update encounters a transient error',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
       'Settings: Each Tab Now Has Its Own URL',
       '- Settings tabs are now bookmarkable and shareable — e.g. /settings/profile, /settings/accounts, /settings/billing',
       '- The browser back button now works correctly when navigating between Settings tabs',
