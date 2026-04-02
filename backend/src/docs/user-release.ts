@@ -3588,4 +3588,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed copy buttons in Agent Mode chat that required precise clicking to activate',
     ],
   },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Token Usage History Now Tracked Per User',
+      '- Previous months\' token usage is now archived automatically on monthly reset',
+      '- Up to 24 months of history stored per user',
+      '- Admins can view per-user token usage history in the Admin Dashboard',
+    ],
+  },
 ];
