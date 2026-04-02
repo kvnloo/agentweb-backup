@@ -903,17 +903,31 @@ async function checkForIpChange() {
     if (storedIp && storedIp !== currentIp) {
       console.log(`[ip-change] IP changed from ${storedIp} to ${currentIp} — posting Notion comment`);
 
-      const msg =
-        `⚠️ Cloud env IP changed — the instance was stopped and restarted.\n\n` +
-        `Old IP: ${storedIp} (no longer valid)\n` +
-        `New IP: ${currentIp}\n\n` +
-        `Updated URLs:\n` +
-        `• Customer portal: http://${currentIp}:5174\n` +
-        `• Partner portal:  http://${currentIp}:5173\n` +
-        `• Backend API:     http://${currentIp}:3001\n` +
-        `• IP unlock:       http://${currentIp}:5175`;
+      const plain = (text) => ({ text: { content: text } });
+      const link = (url) => ({ text: { content: url, link: { url } } });
 
-      await Promise.all([postNotionComment(NOTION_PAGE_ID, msg), patchIp()]);
+      const richText = [
+        plain(`⚠️ Cloud env IP changed — the instance was stopped and restarted.\n\nOld IP: ${storedIp} (no longer valid)\nNew IP: ${currentIp}\n\nUpdated URLs:\n• Customer portal: `),
+        link(`http://${currentIp}:5174`),
+        plain(`\n• Partner portal:  `),
+        link(`http://${currentIp}:5173`),
+        plain(`\n• Backend API:     `),
+        link(`http://${currentIp}:3001`),
+        plain(`\n• IP unlock:       `),
+        link(`http://${currentIp}:5175`),
+      ];
+
+      const postComment = () => fetch(`${NOTION_API}/comments`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Notion-Version": NOTION_VERSION,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ parent: { page_id: NOTION_PAGE_ID }, rich_text: richText }),
+      });
+
+      await Promise.all([postComment(), patchIp()]);
     } else if (!storedIp) {
       await patchIp();
     }
