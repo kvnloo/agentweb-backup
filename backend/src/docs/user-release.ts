@@ -18,6 +18,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-02',
+    changes: [
+      'Fix: Expand Button in Scheduled Chat Now Works Correctly',
+      '- Fixed an issue where clicking "Expand" next to the Starting Message in the schedule editor did not open the full-screen editing popup',
+    ],
+  },
+  {
     date: '2026-04-01',
     changes: [
       'Improved Session Cost Tracking for AI Tools',
