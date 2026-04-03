@@ -1892,6 +1892,7 @@ Returns for each client:
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
+- signup_time: account creation / sign-up timestamp
 
 Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
     inputSchema: {
