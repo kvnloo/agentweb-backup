@@ -334,7 +334,6 @@ export class LinkedInService {
         }
       );
 
-      console.log('[LinkedIn] getFollowerStatistics raw response:', JSON.stringify(response.data).slice(0, 2000));
       return response.data.elements;
     });
   }

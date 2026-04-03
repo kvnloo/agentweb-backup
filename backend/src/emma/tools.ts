@@ -3201,19 +3201,25 @@ emmaToolRegistry.register({
         },
         start_date: {
           type: 'string',
-          description: 'Optional start date for metrics in ISO 8601 format (e.g. "2024-01-01"). If omitted, platform default is used.'
+          description: 'Optional start date for metrics in ISO 8601 format (e.g. "2024-01-01"). Both start_date and end_date must be provided together — specifying only one has no effect.'
         },
         end_date: {
           type: 'string',
-          description: 'Optional end date for metrics in ISO 8601 format (e.g. "2024-01-31"). If omitted, platform default is used.'
+          description: 'Optional end date for metrics in ISO 8601 format (e.g. "2024-01-31"). Both start_date and end_date must be provided together — specifying only one has no effect.'
         }
       },
       required: ['account_id']
     }
   },
   execute: async (args: any, context?: any) => {
-    const startDate = args.start_date ? new Date(args.start_date) : undefined;
-    const endDate = args.end_date ? new Date(args.end_date) : undefined;
+    const parseDate = (val: string | undefined): Date | undefined => {
+      if (!val) return undefined;
+      const d = new Date(val);
+      if (isNaN(d.getTime())) throw new Error(`Invalid date: "${val}"`);
+      return d;
+    };
+    const startDate = parseDate(args.start_date);
+    const endDate = parseDate(args.end_date);
     return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id, startDate, endDate);
   }
 });
