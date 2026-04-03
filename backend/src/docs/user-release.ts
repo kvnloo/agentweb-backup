@@ -3640,4 +3640,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Screenshots are uploaded to secure storage instead of sending large image payloads',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Send and Read Slack Messages',
+      '- Emma can send messages to your Slack channel and read recent messages',
+      '- Regular users are automatically scoped to their configured channel — no need to specify it',
+      '- Admins can target any channel as before',
+    ],
+  },
 ];
