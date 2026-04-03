@@ -409,6 +409,22 @@ fi
 RAW=$(claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
+# Save session ID so the relay can resume the exact same session on follow-up prompts
+SESSION_ID=$(echo "$RAW" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('session_id',''))" 2>/dev/null)
+if [[ -z "$SESSION_ID" ]]; then
+  # Fall back to reading sessionId from the most recently modified JSONL
+  SESSION_ID=$(ls -t ~/.claude/projects/-home-ec2-user-agentweb/*.jsonl 2>/dev/null | head -1 | xargs -I{} python3 -c "
+import json
+for line in open('{}'):
+    try:
+        d = json.loads(line.strip())
+        if d.get('type') == 'last-prompt':
+            print(d.get('sessionId', ''))
+    except: pass
+" 2>/dev/null | tail -1)
+fi
+[[ -n "$SESSION_ID" ]] && echo "$SESSION_ID" > ~/agentweb/.claude-session-id
+
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
   printf '%s' "$RAW" > /tmp/.claude-raw.json
   python3 ~/agentweb/.claude-comment.py "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
