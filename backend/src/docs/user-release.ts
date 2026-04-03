@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Error Reports Now Route Directly to the Engineering Team',
       '- Error reports submitted via the "Report an Error" button are now sent directly to the engineering team for faster triage',
+      'Fix: Emma No Longer Auto-Replies to Slack Messages',
+      '- Removed a behavior where Emma would automatically respond to any message posted in a connected Slack channel',
+      '- Emma now only replies when explicitly @mentioned in Slack',
     ],
   },
   {
