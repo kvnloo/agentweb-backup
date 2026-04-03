@@ -63,6 +63,11 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing pa
 - Before your first edit, note the current commit SHA (via list_commits) so you can revert if needed.
 - When done, check_deployment once, then call report_to_user with a summary and the preview URL.
 
+## Adding images and logos
+- To add a logo or image to a page, first use upload_asset to commit the binary file to the repo, then edit the HTML/CSS to reference it.
+- Use target_path like "public/logo.png" — the public/ directory is served at the root URL, so <img src="/logo.png" /> will work.
+- The source_url should be a direct URL to the image (e.g., an S3 URL returned by generate_image or read_brand_guidelines).
+
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
@@ -405,6 +410,28 @@ function getToolDefinitions(): Anthropic.Tool[] {
         },
         required: []
       }
+    },
+    {
+      name: 'upload_asset',
+      description: 'Upload a binary asset (image, logo, etc.) from a URL to the landing page repository. Use this when you need to add an image or logo that does not yet exist in the repo. After uploading, reference the asset by its target_path in HTML/CSS (e.g., upload to "public/logo.png" then use <img src="/logo.png" />). The public/ directory is served at the root URL.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          source_url: {
+            type: 'string',
+            description: 'The URL of the asset to upload (e.g., an S3 URL of a logo image from generate_image or read_brand_guidelines)'
+          },
+          target_path: {
+            type: 'string',
+            description: 'Where to place the asset in the repository, relative to the repo root (e.g., "public/logo.png"). Use the public/ directory for assets that should be served at the root URL.'
+          },
+          commit_message: {
+            type: 'string',
+            description: 'Optional commit message for the upload'
+          }
+        },
+        required: ['source_url', 'target_path']
+      }
     }
   ];
 }
@@ -682,6 +709,24 @@ async function executeTool(
         fullPage: args.full_page || false
       });
       return typeof result?.content === 'string' ? result.content : 'Screenshot taken successfully.';
+    }
+
+    case 'upload_asset': {
+      if (!args.source_url || !args.target_path) {
+        return 'Error: source_url and target_path are required.';
+      }
+      const result = await mcpFetch({
+        method: 'PUT',
+        path: `${basePath}/github-upload-asset`,
+        body: {
+          source_url: args.source_url,
+          target_path: args.target_path,
+          commit_message: args.commit_message,
+          ...(branch !== "main" ? { branch } : {}),
+        },
+        context: { userId: context.userId }
+      });
+      return JSON.stringify(result, null, 2);
     }
 
     default:
