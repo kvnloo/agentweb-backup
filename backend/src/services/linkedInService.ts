@@ -346,7 +346,7 @@ export class LinkedInService {
       if (startDate && endDate) {
         const start = startDate.getTime();
         const end = endDate.getTime();
-        queryString += `&timeIntervals=List((timeGranularityType:DAY,timeRange:(start:${start},end:${end})))`;
+        queryString += `&timeIntervals=(timeRange:(start:${start},end:${end}),timeGranularityType:DAY)`;
       }
 
       const response = await this.client.get<{ elements: LinkedInPageStatistics[] }>(
@@ -388,7 +388,7 @@ export class LinkedInService {
       if (startDate && endDate) {
         const start = startDate.getTime();
         const end = endDate.getTime();
-        queryString += `&timeIntervals=List((timeGranularityType:DAY,timeRange:(start:${start},end:${end})))`;
+        queryString += `&timeIntervals=(timeRange:(start:${start},end:${end}),timeGranularityType:DAY)`;
       }
 
       const response = await this.client.get<{ elements: LinkedInShareStatistics[] }>(

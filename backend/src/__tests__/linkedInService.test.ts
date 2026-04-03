@@ -260,10 +260,7 @@ describe('LinkedInService', () => {
       await service.getPageStatistics('token', 'urn:li:organization:123', startDate, endDate);
 
       const callArgs = mockClient.get.mock.calls[0];
-      expect(callArgs[0]).toContain('timeIntervals=List');
-      expect(callArgs[0]).toContain(`start:${startDate.getTime()}`);
-      expect(callArgs[0]).toContain(`end:${endDate.getTime()}`);
-      expect(callArgs[0]).toContain('timeGranularityType:DAY');
+      expect(callArgs[0]).toContain(`timeIntervals=(timeRange:(start:${startDate.getTime()},end:${endDate.getTime()}),timeGranularityType:DAY)`);
     });
 
     it('should NOT include timeIntervals when no date range provided', async () => {
@@ -313,10 +310,7 @@ describe('LinkedInService', () => {
       await service.getShareStatistics('token', 'urn:li:organization:123', undefined, startDate, endDate);
 
       const callArgs = mockClient.get.mock.calls[0];
-      expect(callArgs[0]).toContain('timeIntervals=List');
-      expect(callArgs[0]).toContain(`start:${startDate.getTime()}`);
-      expect(callArgs[0]).toContain(`end:${endDate.getTime()}`);
-      expect(callArgs[0]).toContain('timeGranularityType:DAY');
+      expect(callArgs[0]).toContain(`timeIntervals=(timeRange:(start:${startDate.getTime()},end:${endDate.getTime()}),timeGranularityType:DAY)`);
     });
 
     it('should NOT include timeIntervals when no date range provided', async () => {
@@ -750,8 +744,8 @@ describe('LinkedInService', () => {
 
       const pageStatsCall = mockClient.get.mock.calls[2];
       const shareStatsCall = mockClient.get.mock.calls[3];
-      expect(pageStatsCall[0]).toContain('timeIntervals=List');
-      expect(shareStatsCall[0]).toContain('timeIntervals=List');
+      expect(pageStatsCall[0]).toContain('timeIntervals=');
+      expect(shareStatsCall[0]).toContain('timeIntervals=');
     });
   });
 
