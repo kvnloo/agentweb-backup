@@ -1471,9 +1471,11 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
-            // Block non-admin users from invoking admin-only tools
-            if (!isAdmin && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is restricted to admin users only.`;
+            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions
+            if ((!isAdmin || isInteractiveShare) && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
+              const errorMsg = isInteractiveShare
+                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
+                : `Tool "${toolCall.function.name}" is restricted to admin users only.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
                 role: 'tool',
