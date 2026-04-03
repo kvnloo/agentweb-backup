@@ -3597,4 +3597,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Admins can view per-user token usage history in the Admin Dashboard',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Paid Social Now Works with Connected Meta Ad Accounts',
+      '- The Paid Social dashboard now uses your connected Meta ad account when no legacy ad account is configured',
+      '- Ad performance data, campaigns, and ad sets are fetched using the access token from the connected account',
+    ],
+  },
 ];
