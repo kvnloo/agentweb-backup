@@ -76,6 +76,54 @@ interface PDFData {
   version: string;
 }
 
+/**
+ * Custom pdf-parse pagerender function that preserves table structure.
+ *
+ * The default pdf-parse renderer concatenates items sharing the same exact Y
+ * coordinate without adding spaces, and doesn't sort items by X position.
+ * This causes numbers in tabular PDFs to run together or appear out of order.
+ *
+ * This renderer:
+ * 1. Sorts all text items by Y (descending = top-to-bottom) then X (ascending = left-to-right)
+ * 2. Groups items into rows using a Y-tolerance to handle slight vertical misalignments
+ * 3. Separates items on the same row with a space so numbers don't concatenate
+ */
+function pdfPageRender(pageData: any): Promise<string> {
+  return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
+    .then((textContent: any) => {
+      const Y_TOLERANCE = 3; // points — items within this vertical distance are on the same row
+
+      // Sort: top-to-bottom (higher Y first in PDF coords), left-to-right
+      const items: Array<{ str: string; x: number; y: number }> = textContent.items
+        .filter((item: any) => item.str && item.str.trim() !== '')
+        .map((item: any) => ({ str: item.str, x: item.transform[4], y: item.transform[5] }))
+        .sort((a: any, b: any) => {
+          if (Math.abs(a.y - b.y) > Y_TOLERANCE) return b.y - a.y; // top first
+          return a.x - b.x; // left first within same row
+        });
+
+      if (items.length === 0) return '';
+
+      // Group items into rows
+      const rows: string[][] = [];
+      let currentRow: string[] = [];
+      let rowY = items[0].y;
+
+      for (const item of items) {
+        if (Math.abs(item.y - rowY) <= Y_TOLERANCE) {
+          currentRow.push(item.str);
+        } else {
+          rows.push(currentRow);
+          currentRow = [item.str];
+          rowY = item.y;
+        }
+      }
+      if (currentRow.length > 0) rows.push(currentRow);
+
+      return rows.map(row => row.join(' ')).join('\n');
+    });
+}
+
 // Type for LLM model configuration
 interface LLMModelConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
@@ -12613,7 +12661,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (extension === 'pdf' || mimeType === 'application/pdf') {
       const pdfParse = require('pdf-parse');
-      const pdfData = await pdfParse(content);
+      const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
@@ -12706,7 +12754,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         const pdfParse = require('pdf-parse');
-        const pdfData = await pdfParse(content);
+        const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
@@ -13691,7 +13739,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try {
           // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer);
+          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
