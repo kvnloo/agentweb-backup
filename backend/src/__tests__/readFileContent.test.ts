@@ -350,4 +350,154 @@ describe('readFileContent', () => {
       expect(result.message).toContain('Successfully read text file content');
     });
   });
+
+  describe('PDF position-aware rendering (pdfPageRender)', () => {
+    it('should pass a pagerender function to pdf-parse so table numbers are not concatenated', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake pdf data'),
+        headers: { 'content-type': 'application/pdf' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+      const pdfParse = require('pdf-parse');
+      pdfParse.mockResolvedValue({ text: 'some content' });
+
+      await (agentModeService as any).readFileContent('https://example.com/report.pdf');
+
+      expect(pdfParse).toHaveBeenCalledWith(
+        expect.any(Buffer),
+        expect.objectContaining({ pagerender: expect.any(Function) })
+      );
+    });
+
+    it('pagerender: items on same row (within Y tolerance) should be space-separated, not concatenated', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake pdf data'),
+        headers: { 'content-type': 'application/pdf' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+      const pdfParse = require('pdf-parse');
+
+      let capturedPageRender: ((pageData: any) => Promise<string>) | undefined;
+      pdfParse.mockImplementation((_buf: any, opts: any) => {
+        capturedPageRender = opts?.pagerender;
+        return Promise.resolve({ text: 'irrelevant' });
+      });
+
+      await (agentModeService as any).readFileContent('https://example.com/report.pdf');
+      expect(capturedPageRender).toBeDefined();
+
+      // Simulate a PDF table row: three numbers at the same Y, stored left-to-right
+      const mockPageData = {
+        getTextContent: jest.fn().mockResolvedValue({
+          items: [
+            { str: '1,234', transform: [1, 0, 0, 1, 50, 100] },   // x=50
+            { str: '5.6%',  transform: [1, 0, 0, 1, 200, 100] },  // x=200 same Y
+            { str: '3.2',   transform: [1, 0, 0, 1, 350, 100] },  // x=350 same Y
+          ]
+        })
+      };
+
+      const rendered = await capturedPageRender!(mockPageData);
+      // Items should be space-separated, not run together
+      expect(rendered).toBe('1,234 5.6% 3.2');
+    });
+
+    it('pagerender: items with Y difference beyond tolerance should be on separate lines', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake pdf data'),
+        headers: { 'content-type': 'application/pdf' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+      const pdfParse = require('pdf-parse');
+
+      let capturedPageRender: ((pageData: any) => Promise<string>) | undefined;
+      pdfParse.mockImplementation((_buf: any, opts: any) => {
+        capturedPageRender = opts?.pagerender;
+        return Promise.resolve({ text: 'irrelevant' });
+      });
+
+      await (agentModeService as any).readFileContent('https://example.com/report.pdf');
+      expect(capturedPageRender).toBeDefined();
+
+      // Two rows with Y difference > tolerance
+      const mockPageData = {
+        getTextContent: jest.fn().mockResolvedValue({
+          items: [
+            { str: 'Row1Col1', transform: [1, 0, 0, 1, 50, 200] },
+            { str: 'Row1Col2', transform: [1, 0, 0, 1, 200, 200] },
+            { str: 'Row2Col1', transform: [1, 0, 0, 1, 50, 180] }, // Y=180, different row
+            { str: 'Row2Col2', transform: [1, 0, 0, 1, 200, 180] },
+          ]
+        })
+      };
+
+      const rendered = await capturedPageRender!(mockPageData);
+      const lines = rendered.split('\n');
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toBe('Row1Col1 Row1Col2');
+      expect(lines[1]).toBe('Row2Col1 Row2Col2');
+    });
+
+    it('pagerender: items stored out of left-to-right order should be sorted correctly', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake pdf data'),
+        headers: { 'content-type': 'application/pdf' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+      const pdfParse = require('pdf-parse');
+
+      let capturedPageRender: ((pageData: any) => Promise<string>) | undefined;
+      pdfParse.mockImplementation((_buf: any, opts: any) => {
+        capturedPageRender = opts?.pagerender;
+        return Promise.resolve({ text: 'irrelevant' });
+      });
+
+      await (agentModeService as any).readFileContent('https://example.com/report.pdf');
+      expect(capturedPageRender).toBeDefined();
+
+      // PDF stores items right-to-left (common in multi-column layouts)
+      const mockPageData = {
+        getTextContent: jest.fn().mockResolvedValue({
+          items: [
+            { str: 'Third',  transform: [1, 0, 0, 1, 400, 100] }, // rightmost, stored first
+            { str: 'First',  transform: [1, 0, 0, 1, 50, 100] },  // leftmost, stored second
+            { str: 'Second', transform: [1, 0, 0, 1, 200, 100] }, // middle, stored last
+          ]
+        })
+      };
+
+      const rendered = await capturedPageRender!(mockPageData);
+      expect(rendered).toBe('First Second Third');
+    });
+
+    it('pagerender: empty page should return empty string', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake pdf data'),
+        headers: { 'content-type': 'application/pdf' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+      const pdfParse = require('pdf-parse');
+
+      let capturedPageRender: ((pageData: any) => Promise<string>) | undefined;
+      pdfParse.mockImplementation((_buf: any, opts: any) => {
+        capturedPageRender = opts?.pagerender;
+        return Promise.resolve({ text: '' });
+      });
+
+      await (agentModeService as any).readFileContent('https://example.com/report.pdf');
+      expect(capturedPageRender).toBeDefined();
+
+      const mockPageData = {
+        getTextContent: jest.fn().mockResolvedValue({ items: [] })
+      };
+
+      const rendered = await capturedPageRender!(mockPageData);
+      expect(rendered).toBe('');
+    });
+  });
 });
