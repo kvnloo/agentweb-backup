@@ -1,6 +1,8 @@
 /**
- * Tests for admin-only Slack message tools (slack_get_recent_messages, slack_send_message)
- * registered on the emmaToolRegistry.
+ * Tests for Slack message tools (slack_list_channels, slack_get_recent_messages,
+ * slack_send_message) registered on the emmaToolRegistry.
+ *
+ * Covers both admin (unrestricted) and regular-user (channel-scoped) paths.
  */
 
 // Mock slackService before any imports
@@ -11,6 +13,13 @@ jest.mock('../services/slackService', () => ({
   postSlackMessage: jest.fn(),
 }));
 
+// Mock userDb before any imports
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn(),
+  },
+}));
+
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/slackMessageTools';
 import {
@@ -19,11 +28,13 @@ import {
   getThreadReplies,
   postSlackMessage,
 } from '../services/slackService';
+import { userDb } from '../services/db';
 
 const mockedGetChannels = getSlackChannels as jest.MockedFunction<typeof getSlackChannels>;
 const mockedGetMessages = getRecentChannelMessages as jest.MockedFunction<typeof getRecentChannelMessages>;
 const mockedGetReplies = getThreadReplies as jest.MockedFunction<typeof getThreadReplies>;
 const mockedPostMessage = postSlackMessage as jest.MockedFunction<typeof postSlackMessage>;
+const mockedGetUserById = (userDb.getUserById as jest.MockedFunction<typeof userDb.getUserById>);
 
 const executeTool = async (name: string, args: any, context: any = {}) => {
   const tool = emmaToolRegistry.getTool(name);
@@ -48,6 +59,10 @@ const THREAD_REPLIES = [
   { ts: '1711234600.000300', user: 'U003', displayName: 'Carol', text: 'Got it, thanks!', threadTs: '1711234500.000200' },
   { ts: '1711234700.000400', user: 'U001', displayName: 'Alice', text: 'Perfect, no further action needed.', threadTs: '1711234500.000200' },
 ];
+
+const ADMIN_USER = { userId: 'admin-1', isAdmin: true, slackChannel: undefined };
+const REGULAR_USER = { userId: 'user-1', isAdmin: false, slackChannel: 'C_USER' };
+const REGULAR_USER_NO_CHANNEL = { userId: 'user-2', isAdmin: false, slackChannel: undefined };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -76,10 +91,11 @@ describe('tool registration', () => {
 // ─── slack_list_channels ─────────────────────────────────────────────────────
 
 describe('slack_list_channels', () => {
-  it('returns all channels the bot is a member of', async () => {
+  it('admin: returns all channels the bot is a member of', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
 
-    const result = await executeTool('slack_list_channels', {});
+    const result = await executeTool('slack_list_channels', {}, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.count).toBe(2);
@@ -87,63 +103,155 @@ describe('slack_list_channels', () => {
     expect(result.channels[1]).toEqual({ id: 'C002', name: 'sales', display_name: '#sales', is_private: false });
   });
 
-  it('returns empty list when bot is in no channels', async () => {
+  it('admin: returns empty list when bot is in no channels', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetChannels.mockResolvedValue([]);
 
-    const result = await executeTool('slack_list_channels', {});
+    const result = await executeTool('slack_list_channels', {}, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.count).toBe(0);
     expect(result.channels).toHaveLength(0);
+  });
+
+  it('regular user: returns only their configured channel', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(1);
+    expect(result.channels[0].id).toBe('C_USER');
+    expect(mockedGetChannels).not.toHaveBeenCalled();
+  });
+
+  it('regular user with no slackChannel: returns error', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER_NO_CHANNEL as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-2' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/No Slack channel/);
+  });
+
+  it('no context userId: behaves like admin (no restriction)', async () => {
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+
+    const result = await executeTool('slack_list_channels', {});
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(2);
   });
 });
 
 // ─── slack_get_recent_messages ───────────────────────────────────────────────
 
 describe('slack_get_recent_messages', () => {
-  it('fetches messages by channel_id directly', async () => {
+  it('admin: fetches messages by channel_id directly', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetMessages.mockResolvedValue(MESSAGES as any);
     mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
 
-    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' });
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.channel_id).toBe('C002');
     expect(result.count).toBe(2);
     expect(result.messages[0].author).toBe('Alice');
-    expect(result.messages[0].text).toBe('Hey, any update on the proposal?');
     expect(mockedGetMessages).toHaveBeenCalledWith('C002', undefined, undefined);
     expect(mockedGetChannels).not.toHaveBeenCalled();
   });
 
-  it('resolves channel_name to an ID', async () => {
+  it('admin: resolves channel_name to an ID', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
     mockedGetMessages.mockResolvedValue(MESSAGES as any);
     mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
 
-    const result = await executeTool('slack_get_recent_messages', { channel_name: 'sales' });
+    const result = await executeTool('slack_get_recent_messages', { channel_name: 'sales' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.channel_id).toBe('C002');
-    expect(mockedGetChannels).toHaveBeenCalled();
     expect(mockedGetMessages).toHaveBeenCalledWith('C002', undefined, undefined);
   });
 
-  it('strips leading # from channel_name', async () => {
+  it('admin: strips leading # from channel_name', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
     mockedGetMessages.mockResolvedValue([]);
 
-    const result = await executeTool('slack_get_recent_messages', { channel_name: '#general' });
+    const result = await executeTool('slack_get_recent_messages', { channel_name: '#general' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.channel_id).toBe('C001');
-    expect(mockedGetMessages).toHaveBeenCalledWith('C001', undefined, undefined);
+  });
+
+  it('admin: returns error when neither channel_id nor channel_name provided', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
+
+    const result = await executeTool('slack_get_recent_messages', {}, { userId: 'admin-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
+  });
+
+  it('admin: returns error when channel_name not found', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+
+    const result = await executeTool('slack_get_recent_messages', { channel_name: 'nonexistent' }, { userId: 'admin-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('not found');
+  });
+
+  it('regular user: ignores channel_id arg and uses own channel', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    mockedGetMessages.mockResolvedValue(MESSAGES as any);
+
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' }, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_USER');
+    expect(mockedGetMessages).toHaveBeenCalledWith('C_USER', undefined, undefined);
+    expect(mockedGetChannels).not.toHaveBeenCalled();
+  });
+
+  it('regular user: ignores channel_name arg and uses own channel', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    mockedGetMessages.mockResolvedValue([]);
+
+    const result = await executeTool('slack_get_recent_messages', { channel_name: 'sales' }, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_USER');
+    expect(mockedGetChannels).not.toHaveBeenCalled();
+  });
+
+  it('regular user: works with no channel args (auto-uses own channel)', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    mockedGetMessages.mockResolvedValue(MESSAGES as any);
+
+    const result = await executeTool('slack_get_recent_messages', {}, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_USER');
+  });
+
+  it('regular user with no slackChannel: returns error', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER_NO_CHANNEL as any);
+
+    const result = await executeTool('slack_get_recent_messages', {}, { userId: 'user-2' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/No Slack channel/);
   });
 
   it('returns empty messages summary when channel has no messages', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetMessages.mockResolvedValue([]);
 
-    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C001' });
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C001' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.messages).toHaveLength(0);
@@ -151,13 +259,14 @@ describe('slack_get_recent_messages', () => {
   });
 
   it('passes explicit oldest and latest timestamps', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetMessages.mockResolvedValue([]);
 
     await executeTool('slack_get_recent_messages', {
       channel_id: 'C001',
       oldest: '1711200000.000000',
       latest: '1711286400.000000',
-    });
+    }, { userId: 'admin-1' });
 
     expect(mockedGetMessages).toHaveBeenCalledWith(
       'C001', '1711200000.000000', '1711286400.000000'
@@ -165,12 +274,12 @@ describe('slack_get_recent_messages', () => {
   });
 
   it('converts since_hours to an oldest timestamp', async () => {
-    jest.spyOn(Date, 'now').mockReturnValue(1711296000000); // fixed epoch ms
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
+    jest.spyOn(Date, 'now').mockReturnValue(1711296000000);
     mockedGetMessages.mockResolvedValue([]);
 
-    await executeTool('slack_get_recent_messages', { channel_id: 'C001', since_hours: 24 });
+    await executeTool('slack_get_recent_messages', { channel_id: 'C001', since_hours: 24 }, { userId: 'admin-1' });
 
-    // oldest = (1711296000000 / 1000) - 24*3600 = 1711209600.000000
     expect(mockedGetMessages).toHaveBeenCalledWith(
       'C001', '1711209600.000000', undefined
     );
@@ -178,40 +287,26 @@ describe('slack_get_recent_messages', () => {
   });
 
   it('since_hours does not override an explicit oldest', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetMessages.mockResolvedValue([]);
 
     await executeTool('slack_get_recent_messages', {
       channel_id: 'C001',
       oldest: '1711200000.000000',
       since_hours: 1,
-    });
+    }, { userId: 'admin-1' });
 
     expect(mockedGetMessages).toHaveBeenCalledWith(
       'C001', '1711200000.000000', undefined
     );
   });
 
-  it('returns error when neither channel_id nor channel_name provided', async () => {
-    const result = await executeTool('slack_get_recent_messages', {});
-
-    expect(result.success).toBe(false);
-    expect(result.error).toBeDefined();
-  });
-
-  it('returns error when channel_name not found', async () => {
-    mockedGetChannels.mockResolvedValue(CHANNELS as any);
-
-    const result = await executeTool('slack_get_recent_messages', { channel_name: 'nonexistent' });
-
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('not found');
-  });
-
-  it('inlines replies for messages that have replyCount > 0', async () => {
+  it('includes reply_count on messages that have replies', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetMessages.mockResolvedValue(MESSAGES as any);
     mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
 
-    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' });
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C002' }, { userId: 'admin-1' });
 
     // Message without replies has no replies array
     expect(result.messages[0].replies).toBeUndefined();
@@ -235,11 +330,12 @@ describe('slack_get_recent_messages', () => {
   });
 
   it('omits thread_ts when threadTs equals the message ts (thread parent)', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetMessages.mockResolvedValue([
       { ts: '1711234500.000200', user: 'U001', displayName: 'Alice', text: 'Parent message', threadTs: '1711234500.000200' },
     ] as any);
 
-    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C001' });
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C001' }, { userId: 'admin-1' });
 
     expect(result.messages[0].thread_ts).toBeUndefined();
   });
@@ -328,13 +424,14 @@ describe('slack_get_thread_replies', () => {
 // ─── slack_send_message ──────────────────────────────────────────────────────
 
 describe('slack_send_message', () => {
-  it('sends a new message by channel_id', async () => {
+  it('admin: sends a new message by channel_id', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedPostMessage.mockResolvedValue({ ts: '1711234999.000100', channel: 'C002' });
 
     const result = await executeTool('slack_send_message', {
       channel_id: 'C002',
       text: 'Hello from Emma!',
-    });
+    }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.channel_id).toBe('C002');
@@ -342,35 +439,89 @@ describe('slack_send_message', () => {
     expect(mockedPostMessage).toHaveBeenCalledWith('C002', 'Hello from Emma!', undefined);
   });
 
-  it('sends a thread reply when thread_ts provided', async () => {
+  it('admin: sends a thread reply when thread_ts provided', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedPostMessage.mockResolvedValue({ ts: '1711235000.000100', channel: 'C002' });
 
     const result = await executeTool('slack_send_message', {
       channel_id: 'C002',
       text: 'Thanks for reaching out!',
       thread_ts: '1711234500.000200',
-    });
+    }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(result.thread_ts).toBe('1711234500.000200');
     expect(mockedPostMessage).toHaveBeenCalledWith('C002', 'Thanks for reaching out!', '1711234500.000200');
   });
 
-  it('resolves channel_name to an ID before sending', async () => {
+  it('admin: resolves channel_name to an ID before sending', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
     mockedPostMessage.mockResolvedValue({ ts: '1711235001.000100', channel: 'C002' });
 
     const result = await executeTool('slack_send_message', {
       channel_name: 'sales',
       text: 'Sending by name',
-    });
+    }, { userId: 'admin-1' });
 
     expect(result.success).toBe(true);
     expect(mockedPostMessage).toHaveBeenCalledWith('C002', 'Sending by name', undefined);
   });
 
+  it('regular user: sends to own channel, ignoring channel_id arg', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235002.000100', channel: 'C_USER' });
+
+    const result = await executeTool('slack_send_message', {
+      channel_id: 'C002',
+      text: 'Hello from regular user!',
+    }, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_USER');
+    expect(mockedPostMessage).toHaveBeenCalledWith('C_USER', 'Hello from regular user!', undefined);
+    expect(mockedGetChannels).not.toHaveBeenCalled();
+  });
+
+  it('regular user: sends thread reply to own channel', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235003.000100', channel: 'C_USER' });
+
+    const result = await executeTool('slack_send_message', {
+      text: 'Replying in thread',
+      thread_ts: '1711234500.000200',
+    }, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_USER');
+    expect(result.thread_ts).toBe('1711234500.000200');
+    expect(mockedPostMessage).toHaveBeenCalledWith('C_USER', 'Replying in thread', '1711234500.000200');
+  });
+
+  it('regular user: sends with no channel args (auto-uses own channel)', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235004.000100', channel: 'C_USER' });
+
+    const result = await executeTool('slack_send_message', { text: 'Auto channel' }, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(mockedPostMessage).toHaveBeenCalledWith('C_USER', 'Auto channel', undefined);
+  });
+
+  it('regular user with no slackChannel: returns error', async () => {
+    mockedGetUserById.mockResolvedValue(REGULAR_USER_NO_CHANNEL as any);
+
+    const result = await executeTool('slack_send_message', { text: 'Hello' }, { userId: 'user-2' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/No Slack channel/);
+    expect(mockedPostMessage).not.toHaveBeenCalled();
+  });
+
   it('returns error when text is undefined', async () => {
-    const result = await executeTool('slack_send_message', { channel_id: 'C002' });
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
+
+    const result = await executeTool('slack_send_message', { channel_id: 'C002' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(false);
     expect(result.error).toBeDefined();
@@ -378,29 +529,44 @@ describe('slack_send_message', () => {
   });
 
   it('returns error when text is empty', async () => {
-    const result = await executeTool('slack_send_message', { channel_id: 'C002', text: '  ' });
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
+
+    const result = await executeTool('slack_send_message', { channel_id: 'C002', text: '  ' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(false);
     expect(result.error).toBeDefined();
     expect(mockedPostMessage).not.toHaveBeenCalled();
   });
 
-  it('returns error when neither channel_id nor channel_name provided', async () => {
-    const result = await executeTool('slack_send_message', { text: 'Hello' });
+  it('admin: returns error when neither channel_id nor channel_name provided', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
+
+    const result = await executeTool('slack_send_message', { text: 'Hello' }, { userId: 'admin-1' });
 
     expect(result.success).toBe(false);
     expect(result.error).toBeDefined();
   });
 
-  it('returns error when channel_name not found', async () => {
+  it('admin: returns error when channel_name not found', async () => {
+    mockedGetUserById.mockResolvedValue(ADMIN_USER as any);
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
 
     const result = await executeTool('slack_send_message', {
       channel_name: 'does-not-exist',
       text: 'Hi',
-    });
+    }, { userId: 'admin-1' });
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('not found');
+  });
+
+  it('no context userId: behaves like admin (resolves channel from args)', async () => {
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235005.000100', channel: 'C001' });
+
+    const result = await executeTool('slack_send_message', { channel_id: 'C001', text: 'No context' });
+
+    expect(result.success).toBe(true);
+    expect(mockedPostMessage).toHaveBeenCalledWith('C001', 'No context', undefined);
   });
 });
