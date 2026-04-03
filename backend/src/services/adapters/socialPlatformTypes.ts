@@ -48,6 +48,10 @@ export interface PostAnalytics {
 export interface AccountMetrics {
   followers: any[]; // Specific structure depends on platform
   pageViews: any[];
+  followerGains?: Array<{
+    timeRange?: { start: number; end: number };
+    followerGains: { organicFollowerGain: number; paidFollowerGain: number };
+  }>;
   [key: string]: any;
 }
 

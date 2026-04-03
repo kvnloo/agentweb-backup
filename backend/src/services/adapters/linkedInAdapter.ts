@@ -523,6 +523,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     return {
       totalFollowerCount: metrics.totalFollowerCount,
       followers: metrics.followerStatistics,
+      followerGains: metrics.followerGains,
       pageViews: metrics.pageStatistics,
       shareStatistics: metrics.shareStatistics
     };
