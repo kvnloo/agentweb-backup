@@ -3626,6 +3626,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Client List Now Includes Sign-Up Date',
       '- The list_all_clients agent tool now returns a signup_time field for each client',
       '- Enables the AI agent to report when each account was created during health assessments',
+      'Opus Models Now Admin-Only',
+      '- Claude Opus models are no longer available for standard user accounts',
+      '- Admins continue to have full access to Opus models in Agent Mode and Reports',
     ],
   },
 ];
