@@ -9,6 +9,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-03',
+    changes: [
+      'Error Reports Now Route Directly to the Engineering Team',
+      '- Error reports submitted via the "Report an Error" button are now sent directly to the engineering team for faster triage',
+    ],
+  },
+  {
     date: '2026-04-02',
     changes: [
       'Fix: Custom Domain URL Now Shows Correctly on Landing Pages',
