@@ -6,7 +6,7 @@ import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
@@ -1455,6 +1455,13 @@ export async function generateSessionResponse(
     excludeTools = ['get_visual_context'];
   }
 
+  // Upload screenshot to S3 if provided (emma-sidebar sessions only)
+  let screenshotUrl: string | undefined;
+  if (pageContext?.screenshot) {
+    const result = await uploadScreenshotToS3(pageContext.screenshot, userId);
+    if (result) screenshotUrl = result.url;
+  }
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -1466,7 +1473,8 @@ export async function generateSessionResponse(
       sessionId,
       mockMode: false,
       isInteractiveShare: isInteractiveShare || false,
-      excludeTools
+      excludeTools,
+      screenshotUrl
     },
     (progress) => {
       // Emit progress updates via SSE

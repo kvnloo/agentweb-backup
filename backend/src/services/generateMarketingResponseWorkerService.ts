@@ -15,6 +15,7 @@ interface GenerateMarketingResponseParams {
   mockMode?: boolean;
   isInteractiveShare?: boolean;
   excludeTools?: string[];
+  screenshotUrl?: string;
 }
 
 interface GenerateMarketingResponseResult {

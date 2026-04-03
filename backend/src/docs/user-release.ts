@@ -3631,4 +3631,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Admins continue to have full access to Opus models in Agent Mode and Reports',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now See Your Browser Screen',
+      '- Emma and Agent Mode can view a screenshot of your current page when you ask for help',
+      '- Browser screenshots taken during agent tasks are displayed inline in the chat',
+      '- Screenshots are uploaded to secure storage instead of sending large image payloads',
+    ],
+  },
 ];
