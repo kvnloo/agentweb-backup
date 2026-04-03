@@ -4,6 +4,7 @@ import { crmTriggerDb } from './crmTriggerDb';
 import { evaluateExpression } from './crmTriggerEvaluator';
 import { runTriggerAction } from './crmTriggerActionRunner';
 import { crmDb, userDb } from './db';
+import { leadListAlertService } from './leadListAlertService';
 
 let _io: any = null;
 
@@ -18,8 +19,20 @@ function getIo(): any {
   return _io;
 }
 
+const normalizeEvent = (e: string) => e.trim().toLowerCase();
+
+const isSystemEmail = (email: string): boolean => {
+  const lower = email.toLowerCase();
+  return [
+    'no-reply@', 'noreply@', 'do-not-reply@',
+    'donotreply@', 'mailer-daemon@', 'postmaster@',
+  ].some((p) => lower.startsWith(p));
+};
+
 /**
  * Fire all enabled triggers configured for this listId and event.
+ * Falls back to the legacy alertEvents[] behaviour when no explicit trigger
+ * is configured for the event on this list.
  * Called asynchronously after the HTTP response is sent (never throws).
  */
 export async function fireTriggers(
@@ -27,24 +40,32 @@ export async function fireTriggers(
   listId: string,
   userId: string,
   lead: Record<string, any>,
-  previousLead?: Record<string, any>
+  previousLead?: Record<string, any>,
+  eventData?: Record<string, any>,
+  list?: Record<string, any>
 ): Promise<void> {
   try {
     const allTriggers = await crmTriggerCache.getTriggersForList(listId);
     const activeTriggers = allTriggers.filter(
-      (t) => t.enabled && t.event === event
+      (t) => t.enabled && normalizeEvent(t.event) === normalizeEvent(event)
     );
 
-    if (activeTriggers.length === 0) return;
-
-    // Fetch list and user once (for action runner context)
-    const [list, user] = await Promise.all([
-      crmDb.getLeadListById(listId).catch(() => null),
+    // Fetch list and user once (needed for action runner context and legacy fallback)
+    const [resolvedList, resolvedUser] = await Promise.all([
+      list ? Promise.resolve(list) : crmDb.getLeadListById(listId).catch(() => null),
       userDb.getUserById(userId).catch(() => null),
     ]);
 
+    if (activeTriggers.length === 0) {
+      // No explicit triggers — run legacy alertEvents[] fallback if configured
+      await runLegacyFallback(event, resolvedList, lead, eventData);
+      return;
+    }
+
     const results = await Promise.allSettled(
-      activeTriggers.map((trigger) => evalAndRun(trigger, lead, previousLead, list, user))
+      activeTriggers.map((trigger) =>
+        evalAndRun(trigger, lead, previousLead, eventData, resolvedList, resolvedUser)
+      )
     );
 
     const firedCount = results.filter(
@@ -67,10 +88,86 @@ export async function fireTriggers(
   }
 }
 
+/**
+ * Fan-out entry point for email webhook events.
+ * Replaces leadListAlertService.notifyForEmailEvent() — looks up all users
+ * matching the email domain, finds their lists, resolves the lead, then
+ * calls fireTriggers() per list.
+ */
+export async function fireTriggersByEmailEvent(emailEvent: {
+  eventType: string;
+  leadEmail?: string;
+  emailDomain: string;
+  data?: Record<string, any> | any;
+  createdAt: string;
+}): Promise<void> {
+  try {
+    const { eventType, leadEmail, emailDomain, data, createdAt } = emailEvent;
+    if (!leadEmail || !eventType || !emailDomain) return;
+    if (isSystemEmail(leadEmail)) return;
+
+    const users = await userDb.getUsersByEmailDomain(emailDomain);
+    const normalizedLeadEmail = leadEmail.toLowerCase();
+    const normalizedEventType = normalizeEvent(eventType);
+
+    for (const user of users) {
+      const lists = await crmDb.getLeadListsByUserId(user.userId).catch(() => []);
+      for (const list of lists || []) {
+        const lead = await crmDb.getLeadByEmail(list.listId, normalizedLeadEmail).catch(() => null);
+        if (!lead) continue;
+
+        // Skip if user's emailDomain doesn't match (same guard as legacy service)
+        if (user.emailDomain && user.emailDomain !== emailDomain) continue;
+
+        await fireTriggers(
+          normalizedEventType as LeadEvent,
+          list.listId,
+          user.userId,
+          lead,
+          undefined,
+          data,
+          list
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[CRMTrigger] fireTriggersByEmailEvent error:', err);
+  }
+}
+
+/**
+ * Legacy fallback: when no explicit trigger is configured for this event,
+ * honour the list's alertEvents[] checkbox setting via the old alert service.
+ */
+async function runLegacyFallback(
+  event: LeadEvent,
+  list: Record<string, any> | null,
+  lead: Record<string, any>,
+  eventData?: Record<string, any>
+): Promise<void> {
+  if (!list) return;
+  const alertEvents: string[] = Array.isArray(list.alertEvents) ? list.alertEvents : ['email.received'];
+  const normalizedEvent = normalizeEvent(event as string);
+  if (!alertEvents.map(normalizeEvent).includes(normalizedEvent)) return;
+
+  try {
+    await leadListAlertService.notifyLeadListOwnerIfConfigured(
+      list,
+      lead,
+      event as string,
+      eventData ?? null,
+      new Date().toISOString()
+    );
+  } catch (err) {
+    console.error('[CRMTrigger] legacy fallback error:', err);
+  }
+}
+
 async function evalAndRun(
   trigger: CRMTrigger,
   lead: Record<string, any>,
   previousLead: Record<string, any> | undefined,
+  eventData: Record<string, any> | undefined,
   list: any,
   user: any
 ): Promise<boolean> {
@@ -80,7 +177,8 @@ async function evalAndRun(
     expressionResult = await evaluateExpression(
       trigger.conditionExpression,
       lead,
-      previousLead
+      previousLead,
+      eventData
     );
   } catch (err: any) {
     await logResult(trigger, lead, 'error', err?.message || 'Expression evaluation failed', false);
@@ -95,7 +193,7 @@ async function evalAndRun(
   let errorMessage: string | undefined;
 
   try {
-    const result = await runTriggerAction(trigger, lead, list || {}, user || {});
+    const result = await runTriggerAction(trigger, lead, list || {}, user || {}, eventData);
     actionTaken = result.actionTaken;
     if (result.error) {
       errorMessage = result.error;

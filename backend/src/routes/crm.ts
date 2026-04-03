@@ -3,7 +3,6 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
-import { leadListAlertService } from '../services/leadListAlertService';
 import { substituteVariables, extractVariables, leadHasVariable } from '../utils/emailVariables';
 import axios from 'axios';
 import multer from 'multer';
@@ -2385,15 +2384,17 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
 
     const updatedLead = await crmDb.addLeadEngagement(listId, leadId, engagement);
     try {
-      await leadListAlertService.notifyLeadListOwnerIfConfigured(
-        list,
-        updatedLead,
+      await fireTriggers(
         eventType,
-        eventData,
-        createdAt
+        listId,
+        userId,
+        updatedLead as Record<string, any>,
+        undefined,
+        eventData || undefined,
+        list
       );
     } catch (alertError) {
-      console.error('Failed to send lead list alert email:', alertError);
+      console.error('Failed to process lead list alert/trigger:', alertError);
     }
     res.json({ success: true, lead: updatedLead });
   } catch (error: any) {

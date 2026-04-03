@@ -35,15 +35,20 @@ export function leadHasVariable(lead: Record<string, any>, varName: string): boo
   return val != null && val !== '';
 }
 
-export function substituteVariables(template: string, lead: Record<string, any>): string {
+export function substituteVariables(
+  template: string,
+  lead: Record<string, any>,
+  eventData?: Record<string, any>
+): string {
   if (!template) return template;
 
   let result = template;
 
-  // Replace standard fields: {{firstName}}, {{lastName}}, etc.
+  // Replace standard fields: {{firstName}}, {{lead.firstName}}, etc.
   for (const field of STANDARD_FIELDS) {
-    const regex = new RegExp(`\\{\\{${field}\\}\\}`, 'g');
-    result = result.replace(regex, lead[field] != null ? String(lead[field]) : '');
+    const value = lead[field] != null ? String(lead[field]) : '';
+    result = result.replace(new RegExp(`\\{\\{${field}\\}\\}`, 'g'), value);
+    result = result.replace(new RegExp(`\\{\\{lead\\.${field}\\}\\}`, 'g'), value);
   }
 
   // Replace custom fields: {{customFields.xxx}}
@@ -54,6 +59,14 @@ export function substituteVariables(template: string, lead: Record<string, any>)
     }
     return '';
   });
+
+  // Replace event data: {{event.click.link}}, {{event.source}}, etc.
+  if (eventData) {
+    result = result.replace(/\{\{event\.([^}]+)\}\}/g, (_match, path) => {
+      const value = path.split('.').reduce((obj: any, key: string) => obj?.[key], eventData);
+      return value != null ? String(value) : '';
+    });
+  }
 
   return result;
 }

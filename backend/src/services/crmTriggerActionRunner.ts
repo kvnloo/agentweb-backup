@@ -7,12 +7,13 @@ export async function runTriggerAction(
   trigger: CRMTrigger,
   lead: Record<string, any>,
   list: Record<string, any>,
-  user: Record<string, any>
+  user: Record<string, any>,
+  eventData?: Record<string, any>
 ): Promise<{ actionTaken: string; error?: string }> {
   const { action } = trigger;
 
   if (action.type === 'send_email') {
-    return runSendEmailAction(action, trigger, lead, list, user);
+    return runSendEmailAction(action, trigger, lead, list, user, eventData);
   }
 
   // Future action types (linkedin_connect, etc.) would be handled here
@@ -24,7 +25,8 @@ async function runSendEmailAction(
   trigger: CRMTrigger,
   lead: Record<string, any>,
   _list: Record<string, any>,
-  user: Record<string, any>
+  user: Record<string, any>,
+  eventData?: Record<string, any>
 ): Promise<{ actionTaken: string; error?: string }> {
   try {
     let toEmails: string[];
@@ -41,8 +43,8 @@ async function runSendEmailAction(
       toEmails = action.toEmails;
     }
 
-    const subject = substituteVariables(action.subjectTemplate || '', lead);
-    const body = substituteVariables(action.bodyTemplate || '', lead);
+    const subject = substituteVariables(action.subjectTemplate || '', lead, eventData);
+    const body = substituteVariables(action.bodyTemplate || '', lead, eventData);
 
     const from = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
 

@@ -1,4 +1,21 @@
-export type LeadEvent = 'lead.created' | 'lead.updated' | 'lead.deleted';
+export type LeadEvent =
+  // Lead lifecycle
+  | 'lead.created'
+  | 'lead.updated'
+  | 'lead.deleted'
+  // Email tracking (Resend webhooks)
+  | 'email.received'
+  | 'email.opened'
+  | 'email.clicked'
+  | 'email.delivered'
+  | 'email.bounced'
+  | 'email.complained'
+  // API ingestion events
+  | 'api.lead_added'
+  | 'api.lead_updated'
+  | 'api.lead_failed'
+  // Custom events (e.g. custom.linkedin)
+  | string;
 
 export interface SendEmailAction {
   type: 'send_email';

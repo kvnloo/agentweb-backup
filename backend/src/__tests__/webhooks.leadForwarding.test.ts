@@ -2,7 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import webhookRouter from '../routes/webhooks';
 import { crmDb } from '../services/db';
-import { leadListAlertService } from '../services/leadListAlertService';
+import { fireTriggers } from '../services/crmTriggerService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 
@@ -17,10 +17,9 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-jest.mock('../services/leadListAlertService', () => ({
-  leadListAlertService: {
-    notifyLeadListOwnerIfConfigured: jest.fn(),
-  },
+jest.mock('../services/crmTriggerService', () => ({
+  fireTriggers: jest.fn().mockResolvedValue(undefined),
+  fireTriggersByEmailEvent: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -369,7 +368,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(crmDb.updateLead).not.toHaveBeenCalled();
       expect(crmDb.createLead).not.toHaveBeenCalled();
       expect(agentModeService.updateEmailDraftForLead).not.toHaveBeenCalled();
-      expect(leadListAlertService.notifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
+      expect(fireTriggers).not.toHaveBeenCalled();
     });
 
     it('should not create auto draft when autoDraftEnabled is off', async () => {
@@ -648,15 +647,17 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         // Wait for fire-and-forget
         await new Promise((r) => setTimeout(r, 200));
 
-        expect(leadListAlertService.notifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
-          expect.anything(),
-          expect.anything(),
+        expect(fireTriggers).toHaveBeenCalledWith(
           'api.lead_added',
+          expect.any(String),
+          expect.any(String),
+          expect.anything(),
+          undefined,
           expect.objectContaining({
             autoDraftStatus: 'created',
             autoSendStatus: 'sent',
           }),
-          expect.any(String)
+          expect.anything()
         );
       });
     });

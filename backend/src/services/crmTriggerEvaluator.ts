@@ -73,17 +73,16 @@ jexl.addFunction('isNotEmpty', (val: any): boolean => {
  * Build the evaluation context from a lead and optional previous lead state.
  * All top-level lead fields are available directly (e.g. `email`, `status`).
  * The previous lead state (for lead.updated) is available as `prev`.
+ * Event-specific data (e.g. click.link, bounce.reason) is available as `event`.
  */
 export function buildContext(
   lead: Record<string, any>,
-  prevLead?: Record<string, any>
+  prevLead?: Record<string, any>,
+  eventData?: Record<string, any>
 ): Record<string, any> {
   const ctx: Record<string, any> = { ...lead };
-  if (prevLead) {
-    ctx.prev = { ...prevLead };
-  } else {
-    ctx.prev = {};
-  }
+  ctx.prev = prevLead ? { ...prevLead } : {};
+  ctx.event = eventData ? { ...eventData } : {};
   return ctx;
 }
 
@@ -94,11 +93,12 @@ export function buildContext(
 export async function evaluateExpression(
   expr: string,
   lead: Record<string, any>,
-  prevLead?: Record<string, any>
+  prevLead?: Record<string, any>,
+  eventData?: Record<string, any>
 ): Promise<boolean> {
   if (!expr || expr.trim() === '') return false;
   try {
-    const context = buildContext(lead, prevLead);
+    const context = buildContext(lead, prevLead, eventData);
     const result = await jexl.eval(expr, context);
     return result === true || result === 1;
   } catch {

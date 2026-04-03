@@ -3,7 +3,7 @@ import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
-import { leadListAlertService } from '../services/leadListAlertService';
+import { fireTriggers, fireTriggersByEmailEvent } from '../services/crmTriggerService';
 import { crmDb, userDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
@@ -59,9 +59,9 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       // Store the event in the database
       const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
       try {
-        await leadListAlertService.notifyForEmailEvent(emailEvent);
+        await fireTriggersByEmailEvent(emailEvent);
       } catch (alertError) {
-        console.error('Failed to send lead list alert email:', alertError);
+        console.error('Failed to process lead list alert/trigger:', alertError);
       }
     } else {
       console.log(`Skipping CRM event storage for Emma-related email: ${event.data.email_id}`);
@@ -434,10 +434,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
           // Send alert with accurate draft/send status
           const alertEventType = isUpdated ? 'api.lead_updated' : 'api.lead_added';
-          await leadListAlertService.notifyLeadListOwnerIfConfigured(
-            leadList,
-            lead,
+          await fireTriggers(
             alertEventType,
+            leadList.listId,
+            leadList.userId,
+            lead,
+            undefined,
             {
               source: mergedCustomFields.source,
               forwardedAt: mergedCustomFields.forwardedAt,
@@ -447,7 +449,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
               ...(autoDraftError ? { autoDraftError } : {}),
               ...(autoSendStatus ? { autoSendStatus } : {}),
             },
-            new Date().toISOString()
+            leadList
           );
         } catch (err) {
           console.error('Post-response processing error:', err);
@@ -460,24 +462,26 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
     // Trigger api.lead_failed alert if configured
     try {
-      await leadListAlertService.notifyLeadListOwnerIfConfigured(
-        leadList,
+      await fireTriggers(
+        'api.lead_failed',
+        leadList.listId,
+        leadList.userId,
         {
           leadId: 'failed',
           email: req.body.email || 'unknown',
           firstName: req.body.firstName || '',
           lastName: req.body.lastName || '',
         },
-        'api.lead_failed',
+        undefined,
         {
           error: error.message || 'Unknown error',
           source: req.body.source || req.body.customFields?.source || 'api',
           email: req.body.email || 'unknown',
         },
-        new Date().toISOString()
+        leadList
       );
     } catch (alertError) {
-      console.error('Failed to send api.lead_failed alert:', alertError);
+      console.error('Failed to process api.lead_failed alert/trigger:', alertError);
     }
 
     res.status(500).json({

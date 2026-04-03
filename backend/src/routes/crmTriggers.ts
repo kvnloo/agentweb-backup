@@ -8,8 +8,17 @@ import { LeadEvent, TriggerAction } from '../types/crmTriggers';
 
 const router = express.Router();
 
-const VALID_EVENTS: LeadEvent[] = ['lead.created', 'lead.updated', 'lead.deleted'];
+const STANDARD_EVENTS: LeadEvent[] = [
+  'lead.created', 'lead.updated', 'lead.deleted',
+  'email.received', 'email.opened', 'email.clicked',
+  'email.delivered', 'email.bounced', 'email.complained',
+  'api.lead_added', 'api.lead_updated', 'api.lead_failed',
+];
 const MAX_TRIGGERS_PER_LIST = 20;
+
+function isValidEvent(event: string): boolean {
+  return STANDARD_EVENTS.includes(event as LeadEvent) || event.startsWith('custom.');
+}
 
 router.use(authenticateToken);
 
@@ -113,8 +122,8 @@ router.post('/lists/:listId/triggers', async (req: Request, res: Response) => {
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ message: 'name is required' });
     }
-    if (!VALID_EVENTS.includes(event)) {
-      return res.status(400).json({ message: `event must be one of: ${VALID_EVENTS.join(', ')}` });
+    if (!isValidEvent(event)) {
+      return res.status(400).json({ message: `event must be one of the standard events or start with "custom."` });
     }
 
     const expr = conditionExpression || 'true';
@@ -207,8 +216,8 @@ router.put(
       if (enabled !== undefined) updates.enabled = Boolean(enabled);
 
       if (event !== undefined) {
-        if (!VALID_EVENTS.includes(event)) {
-          return res.status(400).json({ message: `event must be one of: ${VALID_EVENTS.join(', ')}` });
+        if (!isValidEvent(event)) {
+          return res.status(400).json({ message: `event must be one of the standard events or start with "custom."` });
         }
         updates.event = event;
       }
