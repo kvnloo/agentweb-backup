@@ -2066,7 +2066,8 @@ export const agentModeController = {
 
   async getSupportedModels(req: Request, res: Response) {
     try {
-      const models = await agentModeService.getSupportedModels();
+      const { user } = await getUserFromToken(req);
+      const models = await agentModeService.getSupportedModels(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
@@ -2076,7 +2077,8 @@ export const agentModeController = {
 
   async getReportsModelOptions(req: Request, res: Response) {
     try {
-      const models = await agentModeService.getReportsModelOptions();
+      const { user } = await getUserFromToken(req);
+      const models = await agentModeService.getReportsModelOptions(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get reports model options error:', error);
@@ -5230,6 +5232,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // Block non-admins from using opus models
+      if (llmModel.includes('opus') && !user.isAdmin) {
+        return res.status(403).json({ error: 'Opus models are not available for your account' });
+      }
+
       // Get the session to verify ownership
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -5260,6 +5267,11 @@ export const agentModeController = {
 
       if (!llmModel) {
         return res.status(400).json({ error: 'llmModel is required' });
+      }
+
+      // Shared sessions are non-admin; block opus models
+      if (llmModel.includes('opus')) {
+        return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
       }
 
       // Get the session to verify the conversable token

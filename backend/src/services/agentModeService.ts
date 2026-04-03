@@ -871,8 +871,8 @@ export class AgentModeService {
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
-  async getSupportedModels() {
-    const models = Object.keys(this.llmModels);
+  async getSupportedModels(isAdmin: boolean = false) {
+    const models = Object.keys(this.llmModels).filter(m => isAdmin || !m.includes('opus'));
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -881,8 +881,8 @@ export class AgentModeService {
     return models;
   }
 
-  async getReportsModelOptions(): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.'));
+  async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !m.includes('opus')));
   }
   /**
    * Make an LLM call with the specified model and parameters
