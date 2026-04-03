@@ -461,18 +461,18 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics> {
+  async getAccountMetrics(account: ConnectedAccount, userId?: string, startDate?: Date, endDate?: Date): Promise<AccountMetrics> {
     const config = account.config as LinkedInConfig;
 
     if (config.account_type === 'personal') {
       try {
         // Get valid token (refreshes if needed)
         const { token } = await this.getValidToken(account, userId);
-        
+
         // Fetch personal metrics
         const [followers, analytics] = await Promise.all([
           linkedInService.getPersonalFollowerCount(token),
-          linkedInService.getPersonalPostAnalytics(token) // Aggregated last 30 days
+          linkedInService.getPersonalPostAnalytics(token, { startDate, endDate })
         ]);
 
         return {
@@ -519,8 +519,9 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const { token } = await this.getValidToken(account, userId);
     const authorUrn = account.account_id;
 
-    const metrics = await linkedInService.getAggregatedMetrics(token, authorUrn);
+    const metrics = await linkedInService.getAggregatedMetrics(token, authorUrn, startDate, endDate);
     return {
+      totalFollowerCount: metrics.totalFollowerCount,
       followers: metrics.followerStatistics,
       pageViews: metrics.pageStatistics,
       shareStatistics: metrics.shareStatistics

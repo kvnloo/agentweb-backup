@@ -94,7 +94,7 @@ export interface SocialPlatformAdapter {
    * Get overall account metrics (followers, page views, etc.)
    * @throws Error if not supported by account type
    */
-  getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics>;
+  getAccountMetrics(account: ConnectedAccount, userId?: string, startDate?: Date, endDate?: Date): Promise<AccountMetrics>;
 
   /**
    * Verify if the token is valid

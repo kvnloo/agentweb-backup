@@ -3191,20 +3191,30 @@ emmaToolRegistry.register({
   name: 'load_connected_account_metrics',
   definition: {
     name: 'load_connected_account_metrics',
-    description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement).',
+    description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement). Optionally filter by a date range using start_date and end_date. Note: YouTube metrics are always lifetime totals and are not affected by the date range.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: {
           type: 'string',
           description: 'The unique identifier (id) of the connected account to load metrics for'
+        },
+        start_date: {
+          type: 'string',
+          description: 'Optional start date for metrics in ISO 8601 format (e.g. "2024-01-01"). If omitted, platform default is used.'
+        },
+        end_date: {
+          type: 'string',
+          description: 'Optional end date for metrics in ISO 8601 format (e.g. "2024-01-31"). If omitted, platform default is used.'
         }
       },
       required: ['account_id']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id);
+    const startDate = args.start_date ? new Date(args.start_date) : undefined;
+    const endDate = args.end_date ? new Date(args.end_date) : undefined;
+    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id, startDate, endDate);
   }
 });
 

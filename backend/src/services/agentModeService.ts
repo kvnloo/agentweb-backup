@@ -18610,7 +18610,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Load metrics for connected account helper
-  async loadConnectedAccountMetrics(userId: string, accountId: string): Promise<any> {
+  async loadConnectedAccountMetrics(userId: string, accountId: string, startDate?: Date, endDate?: Date): Promise<any> {
     try {
       const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
@@ -18627,7 +18627,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         const adapter = socialPlatformService.getAdapter(account.platform);
 
-        const metrics = await adapter.getAccountMetrics(account);
+        const metrics = await adapter.getAccountMetrics(account, userId, startDate, endDate);
 
         return {
           success: true,
