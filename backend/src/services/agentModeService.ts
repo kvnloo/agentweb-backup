@@ -34,7 +34,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -1080,7 +1080,8 @@ export class AgentModeService {
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
-    excludeTools?: string[]
+    excludeTools?: string[],
+    screenshotUrl?: string
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -1138,7 +1139,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, isAdmin);
@@ -1523,7 +1524,8 @@ export class AgentModeService {
         const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
           const toolStart = Date.now();
           try {
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, socketEmit ? { socketEmit } : undefined);
+            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
             const toolDuration = Date.now() - toolStart;
             return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
           } catch (error) {
@@ -1538,7 +1540,27 @@ export class AgentModeService {
         for (const toolResult of toolResults) {
           if (toolResult.status === 'success') {
             const { toolCall, functionArgs, result, duration } = toolResult;
-            const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
+
+            // For playwright screenshots, upload the base64 image to S3.
+            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
+            // and makes the screenshot displayable in the frontend.
+            let processedResult = result;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
+              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
+              if (imageContent?.data) {
+                try {
+                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
+                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
+                  if (uploadResult) {
+                    processedResult = { screenshotUrl: uploadResult.url, success: true };
+                  }
+                } catch (e) {
+                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
+                }
+              }
+            }
+
+            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
 
             toolCalls.push({
               id: toolCall.id,
@@ -1551,7 +1573,15 @@ export class AgentModeService {
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
-            const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
+            // The screenshot is displayed to the user via the tool call card in the frontend.
+            // We intentionally omit the URL so the LLM doesn't embed it in markdown responses.
+            let toolContent: any;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
+              toolContent = `Screenshot captured successfully and displayed to the user.`;
+            } else {
+              toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            }
             const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
               ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
               : toolContent;
@@ -2130,7 +2160,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -2289,8 +2319,18 @@ When a user requests client onboarding or says "onboard new client" or similar:
       messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
-    // Append the current user message at the end
-    messages.push({ role: 'user', content: messageContent });
+    // Append the current user message at the end (with vision if a screenshot URL was provided)
+    if (screenshotUrl) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
+        ]
+      });
+    } else {
+      messages.push({ role: 'user', content: messageContent });
+    }
 
     return messages;
   }
@@ -2769,6 +2809,12 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
+
+    // For playwright screenshots, result has already been processed (base64 → S3 URL)
+    if (toolName === 'playwright_browser_take_screenshot') {
+      return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
+    }
+
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
