@@ -266,7 +266,9 @@ router.get('/connected-account-posts', async (req: Request, res: Response) => {
 router.get('/connected-account-metrics', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.loadConnectedAccountMetrics(userId(req), req.query.account_id as string);
+    const startDate = req.query.start_date ? new Date(req.query.start_date as string) : undefined;
+    const endDate = req.query.end_date ? new Date(req.query.end_date as string) : undefined;
+    const result = await svc.loadConnectedAccountMetrics(userId(req), req.query.account_id as string, startDate, endDate);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

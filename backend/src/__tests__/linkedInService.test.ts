@@ -250,6 +250,30 @@ describe('LinkedInService', () => {
       const callArgs = mockClient.get.mock.calls[0];
       expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:789'));
     });
+
+    it('should include timeIntervals in query string when date range is provided', async () => {
+      mockClient.get.mockResolvedValue({ data: { elements: [] } });
+
+      const startDate = new Date(2025, 0, 1); // Jan 1 2025
+      const endDate = new Date(2025, 0, 31);  // Jan 31 2025
+
+      await service.getPageStatistics('token', 'urn:li:organization:123', startDate, endDate);
+
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('timeIntervals=List');
+      expect(callArgs[0]).toContain('day:1,month:1,year:2025');
+      expect(callArgs[0]).toContain('day:31,month:1,year:2025');
+      expect(callArgs[0]).toContain('timeGranularityType:DAY');
+    });
+
+    it('should NOT include timeIntervals when no date range provided', async () => {
+      mockClient.get.mockResolvedValue({ data: { elements: [] } });
+
+      await service.getPageStatistics('token', 'urn:li:organization:123');
+
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).not.toContain('timeIntervals');
+    });
   });
 
   describe('getShareStatistics', () => {
@@ -278,6 +302,30 @@ describe('LinkedInService', () => {
       expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:123'));
       expect(callArgs[0]).toContain('shares=List');
       expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
+    });
+
+    it('should include timeIntervals in query string when date range is provided', async () => {
+      mockClient.get.mockResolvedValue({ data: { elements: [] } });
+
+      const startDate = new Date(2025, 1, 1);  // Feb 1 2025
+      const endDate = new Date(2025, 1, 28);   // Feb 28 2025
+
+      await service.getShareStatistics('token', 'urn:li:organization:123', undefined, startDate, endDate);
+
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('timeIntervals=List');
+      expect(callArgs[0]).toContain('day:1,month:2,year:2025');
+      expect(callArgs[0]).toContain('day:28,month:2,year:2025');
+      expect(callArgs[0]).toContain('timeGranularityType:DAY');
+    });
+
+    it('should NOT include timeIntervals when no date range provided', async () => {
+      mockClient.get.mockResolvedValue({ data: { elements: [] } });
+
+      await service.getShareStatistics('token', 'urn:li:organization:123');
+
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).not.toContain('timeIntervals');
     });
   });
 
@@ -667,23 +715,43 @@ describe('LinkedInService', () => {
   });
 
   describe('getAggregatedMetrics', () => {
-    it('should aggregate follower, page, and share statistics', async () => {
+    it('should aggregate follower, page, and share statistics with totalFollowerCount', async () => {
       const followerStats = [{ followerCount: 100 }];
       const pageStats = [{ pageViews: 500 }];
       const shareStats = [{ share: 'urn:li:share:123', totalShareStatistics: { likeCount: 50 } }];
-      
+
       mockClient.get
-        .mockResolvedValueOnce({ data: { elements: followerStats } })
-        .mockResolvedValueOnce({ data: { elements: pageStats } })
-        .mockResolvedValueOnce({ data: { elements: shareStats } });
+        .mockResolvedValueOnce({ data: { firstDegreeSize: 2500 } })  // getOrganizationFollowerCount
+        .mockResolvedValueOnce({ data: { elements: followerStats } }) // getFollowerStatistics
+        .mockResolvedValueOnce({ data: { elements: pageStats } })     // getPageStatistics
+        .mockResolvedValueOnce({ data: { elements: shareStats } });   // getShareStatistics
 
       const result = await service.getAggregatedMetrics('token', 'urn:li:organization:123');
 
       expect(result).toEqual({
+        totalFollowerCount: 2500,
         followerStatistics: followerStats,
         pageStatistics: pageStats,
         shareStatistics: shareStats,
       });
+    });
+
+    it('should pass date range to getPageStatistics and getShareStatistics', async () => {
+      mockClient.get
+        .mockResolvedValueOnce({ data: { firstDegreeSize: 100 } })
+        .mockResolvedValueOnce({ data: { elements: [] } })
+        .mockResolvedValueOnce({ data: { elements: [] } })
+        .mockResolvedValueOnce({ data: { elements: [] } });
+
+      const startDate = new Date(2025, 0, 1);
+      const endDate = new Date(2025, 0, 31);
+
+      await service.getAggregatedMetrics('token', 'urn:li:organization:123', startDate, endDate);
+
+      const pageStatsCall = mockClient.get.mock.calls[2];
+      const shareStatsCall = mockClient.get.mock.calls[3];
+      expect(pageStatsCall[0]).toContain('timeIntervals=List');
+      expect(shareStatsCall[0]).toContain('timeIntervals=List');
     });
   });
 

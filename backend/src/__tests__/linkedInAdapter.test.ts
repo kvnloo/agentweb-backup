@@ -365,8 +365,9 @@ describe('LinkedInAdapter', () => {
       );
     });
 
-    it('should return aggregated metrics for company account', async () => {
+    it('should return aggregated metrics for company account including totalFollowerCount', async () => {
       const mockMetrics = {
+        totalFollowerCount: 2500,
         followerStatistics: [{ followerCount: 1000 }],
         pageStatistics: [{ pageViews: 5000 }],
         shareStatistics: [{ share: 'urn:li:share:123', totalShareStatistics: { likeCount: 50 } }],
@@ -377,13 +378,51 @@ describe('LinkedInAdapter', () => {
 
       expect(mockLinkedInService.getAggregatedMetrics).toHaveBeenCalledWith(
         'test-org-token',
-        'urn:li:organization:123456'
+        'urn:li:organization:123456',
+        undefined,
+        undefined
       );
       expect(result).toEqual({
+        totalFollowerCount: 2500,
         followers: mockMetrics.followerStatistics,
         pageViews: mockMetrics.pageStatistics,
         shareStatistics: mockMetrics.shareStatistics,
       });
+    });
+
+    it('should pass date range to getAggregatedMetrics for company account', async () => {
+      const mockMetrics = { totalFollowerCount: 100, followerStatistics: [], pageStatistics: [], shareStatistics: [] };
+      mockLinkedInService.getAggregatedMetrics.mockResolvedValue(mockMetrics);
+
+      const startDate = new Date(2025, 0, 1);
+      const endDate = new Date(2025, 0, 31);
+
+      await adapter.getAccountMetrics(mockCompanyAccount, undefined, startDate, endDate);
+
+      expect(mockLinkedInService.getAggregatedMetrics).toHaveBeenCalledWith(
+        'test-org-token',
+        'urn:li:organization:123456',
+        startDate,
+        endDate
+      );
+    });
+
+    it('should pass date range to getPersonalPostAnalytics for personal account', async () => {
+      mockLinkedInService.getPersonalFollowerCount.mockResolvedValue(500);
+      mockLinkedInService.getPersonalPostAnalytics.mockResolvedValue({
+        impression: 1000,
+        members_reached: 800,
+      });
+
+      const startDate = new Date(2025, 2, 1);
+      const endDate = new Date(2025, 2, 31);
+
+      await adapter.getAccountMetrics(mockPersonalAccount, undefined, startDate, endDate);
+
+      expect(mockLinkedInService.getPersonalPostAnalytics).toHaveBeenCalledWith(
+        expect.any(String),
+        { startDate, endDate }
+      );
     });
 
     it('should refresh expired token for company account before fetching metrics', async () => {
@@ -413,7 +452,9 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.refreshAccessToken).toHaveBeenCalled();
       expect(mockLinkedInService.getAggregatedMetrics).toHaveBeenCalledWith(
         'refreshed-org-token',
-        'urn:li:organization:123456'
+        'urn:li:organization:123456',
+        undefined,
+        undefined
       );
       expect(result.followers).toEqual(mockMetrics.followerStatistics);
       expect(result.pageViews).toEqual(mockMetrics.pageStatistics);
