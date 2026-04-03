@@ -75,7 +75,8 @@ export interface User {
   resendDomainId?: string; // Resend domain ID for domain verification
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
-  slackChannel?: string; // Default Slack channel for this user
+  slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
+  slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead

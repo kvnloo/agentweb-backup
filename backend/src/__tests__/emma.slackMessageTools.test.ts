@@ -63,6 +63,8 @@ const THREAD_REPLIES = [
 const ADMIN_USER = { userId: 'admin-1', isAdmin: true, slackChannel: undefined };
 const REGULAR_USER = { userId: 'user-1', isAdmin: false, slackChannel: 'C_USER' };
 const REGULAR_USER_NO_CHANNEL = { userId: 'user-2', isAdmin: false, slackChannel: undefined };
+const MULTI_CHANNEL_USER = { userId: 'user-3', isAdmin: false, slackChannels: ['C001', 'C002'] };
+const MULTI_CHANNEL_USER_WITH_LEGACY = { userId: 'user-4', isAdmin: false, slackChannel: 'C_OLD', slackChannels: ['C001', 'C002'] };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -114,15 +116,17 @@ describe('slack_list_channels', () => {
     expect(result.channels).toHaveLength(0);
   });
 
-  it('regular user: returns only their configured channel', async () => {
+  it('regular user: returns only their configured channel(s)', async () => {
     mockedGetUserById.mockResolvedValue(REGULAR_USER as any);
+    // C_USER is not in the bot's channel list → returned as a stub
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
 
     const result = await executeTool('slack_list_channels', {}, { userId: 'user-1' });
 
     expect(result.success).toBe(true);
     expect(result.count).toBe(1);
     expect(result.channels[0].id).toBe('C_USER');
-    expect(mockedGetChannels).not.toHaveBeenCalled();
+    expect(mockedGetChannels).toHaveBeenCalled();
   });
 
   it('regular user with no slackChannel: returns error', async () => {
@@ -132,6 +136,43 @@ describe('slack_list_channels', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/No Slack channel/);
+  });
+
+  it('multi-channel user: returns all configured channels with resolved names', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(2);
+    expect(result.channels.map((c: any) => c.id)).toEqual(expect.arrayContaining(['C001', 'C002']));
+    expect(result.channels.find((c: any) => c.id === 'C001').name).toBe('general');
+  });
+
+  it('multi-channel user: returns stub for channel not found in Slack API', async () => {
+    const userWithUnknown = { userId: 'user-3', isAdmin: false, slackChannels: ['C001', 'C_UNKNOWN'] };
+    mockedGetUserById.mockResolvedValue(userWithUnknown as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(2);
+    const unknown = result.channels.find((c: any) => c.id === 'C_UNKNOWN');
+    expect(unknown).toBeDefined();
+    expect(unknown.name).toBe('C_UNKNOWN');
+  });
+
+  it('multi-channel user: slackChannels takes priority over legacy slackChannel', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER_WITH_LEGACY as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-4' });
+
+    expect(result.success).toBe(true);
+    expect(result.channels.some((c: any) => c.id === 'C_OLD')).toBe(false);
+    expect(result.channels.map((c: any) => c.id)).toEqual(expect.arrayContaining(['C001', 'C002']));
   });
 
   it('no context userId: behaves like admin (no restriction)', async () => {
@@ -245,6 +286,48 @@ describe('slack_get_recent_messages', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/No Slack channel/);
+  });
+
+  it('multi-channel user: returns error when no channel specified', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+
+    const result = await executeTool('slack_get_recent_messages', {}, { userId: 'user-3' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/multiple Slack channels/i);
+  });
+
+  it('multi-channel user: returns error when specified channel not in allowed list', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedGetChannels.mockResolvedValue([{ id: 'C999', name: 'other', displayName: '#other', isPrivate: false }] as any);
+
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C999' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not in your configured/i);
+  });
+
+  it('multi-channel user: succeeds when valid channel_id specified', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedGetMessages.mockResolvedValue(MESSAGES as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
+
+    const result = await executeTool('slack_get_recent_messages', { channel_id: 'C001' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C001');
+    expect(mockedGetMessages).toHaveBeenCalledWith('C001', undefined, undefined);
+  });
+
+  it('multi-channel user: succeeds when valid channel_name specified', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+    mockedGetMessages.mockResolvedValue([]);
+
+    const result = await executeTool('slack_get_recent_messages', { channel_name: 'sales' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C002');
   });
 
   it('returns empty messages summary when channel has no messages', async () => {
@@ -558,6 +641,50 @@ describe('slack_send_message', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('not found');
+  });
+
+  it('multi-channel user: returns error when no channel specified', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+
+    const result = await executeTool('slack_send_message', { text: 'Hello' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/multiple Slack channels/i);
+    expect(mockedPostMessage).not.toHaveBeenCalled();
+  });
+
+  it('multi-channel user: returns error when specified channel not in allowed list', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedGetChannels.mockResolvedValue([{ id: 'C999', name: 'other', displayName: '#other', isPrivate: false }] as any);
+
+    const result = await executeTool('slack_send_message', { channel_id: 'C999', text: 'Hi' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not in your configured/i);
+    expect(mockedPostMessage).not.toHaveBeenCalled();
+  });
+
+  it('multi-channel user: succeeds with valid channel_id', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235010.000100', channel: 'C001' });
+
+    const result = await executeTool('slack_send_message', { channel_id: 'C001', text: 'Hi' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C001');
+    expect(mockedPostMessage).toHaveBeenCalledWith('C001', 'Hi', undefined);
+  });
+
+  it('multi-channel user: succeeds with valid channel_name', async () => {
+    mockedGetUserById.mockResolvedValue(MULTI_CHANNEL_USER as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235011.000100', channel: 'C002' });
+
+    const result = await executeTool('slack_send_message', { channel_name: 'sales', text: 'Hi' }, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C002');
+    expect(mockedPostMessage).toHaveBeenCalledWith('C002', 'Hi', undefined);
   });
 
   it('no context userId: behaves like admin (resolves channel from args)', async () => {
