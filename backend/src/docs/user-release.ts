@@ -3620,4 +3620,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- If an admin tool is invoked during a shared session, the agent now explains you can use it in your own Agent Mode session',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Client List Now Includes Sign-Up Date',
+      '- The list_all_clients agent tool now returns a signup_time field for each client',
+      '- Enables the AI agent to report when each account was created during health assessments',
+    ],
+  },
 ];
