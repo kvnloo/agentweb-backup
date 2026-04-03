@@ -685,13 +685,21 @@ function formatUsageLine(data) {
   }
 }
 
+const SESSION_ID_FILE = "/home/ec2-user/agentweb/.claude-session-id";
+
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
     // Escape single quotes in prompt for shell
     const escaped = prompt.replace(/'/g, "'\\''");
+    // Use --resume <id> to continue the exact same session; fall back to --continue
+    let resumeFlag = "--continue";
+    try {
+      const sessionId = fs.readFileSync(SESSION_ID_FILE, "utf-8").trim();
+      if (sessionId) resumeFlag = `--resume ${sessionId}`;
+    } catch {}
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
@@ -710,6 +718,10 @@ function runClaude(prompt) {
       // Try to parse JSON output for result text + usage
       try {
         const data = JSON.parse(stdout);
+        // Persist session ID so future relay calls resume the same session
+        if (data.session_id) {
+          try { fs.writeFileSync(SESSION_ID_FILE, data.session_id, "utf-8"); } catch {}
+        }
         let text = data.result || "(no output)";
         const usageLine = formatUsageLine(data);
         if (usageLine) text += `\n\n---\n${usageLine}`;
