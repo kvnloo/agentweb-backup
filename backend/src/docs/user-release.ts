@@ -3605,4 +3605,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Ad performance data, campaigns, and ad sets are fetched using the access token from the connected account',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Clearer Message When Admin Tools Are Blocked in Shared Sessions',
+      '- Admin tools (e.g. manage skills, work plans) are restricted to your own session for security reasons',
+      '- If an admin tool is invoked during a shared session, the agent now explains you can use it in your own Agent Mode session',
+    ],
+  },
 ];
