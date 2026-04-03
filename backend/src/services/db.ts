@@ -162,6 +162,11 @@ export interface User {
     totalCost: number;    // cumulative cost in USD this month
     resetDate: string;    // ISO date of next monthly reset
   };
+  tokenUsageHistory?: Array<{
+    month: string;       // "YYYY-MM" format
+    totalTokens: number;
+    totalCost: number;
+  }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling

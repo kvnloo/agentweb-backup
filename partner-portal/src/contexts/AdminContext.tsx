@@ -55,6 +55,11 @@ interface User {
     totalCost: number;
     resetDate: string;
   };
+  tokenUsageHistory?: Array<{
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+  }>;
   tokenAllowanceBonus?: number;
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders

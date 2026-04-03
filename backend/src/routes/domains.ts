@@ -77,19 +77,25 @@ router.post("/subdomain", async (req, res: Response) => {
 
     const result = await addSubdomain(userId, vercelProjectId, subdomain);
 
-    // If a landing page ID was provided, persist customDomainUrl on the record
+    // If a landing page ID was provided, persist customDomainUrl on the record.
+    // This is non-fatal: if it fails (e.g. ConditionalCheckFailed), the subdomain
+    // was still successfully added to Vercel, so we return 201 regardless.
     if (landingPageId && typeof landingPageId === "string") {
-      await dynamodb.update({
-        TableName: LANDING_PAGES_TABLE,
-        Key: { id: landingPageId },
-        ConditionExpression: "userId = :uid",
-        UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
-        ExpressionAttributeValues: {
-          ":url": `https://${result.domain}`,
-          ":uid": userId,
-          ":now": new Date().toISOString(),
-        },
-      }).promise();
+      try {
+        await dynamodb.update({
+          TableName: LANDING_PAGES_TABLE,
+          Key: { id: landingPageId },
+          ConditionExpression: "userId = :uid",
+          UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":url": `https://${result.domain}`,
+            ":uid": userId,
+            ":now": new Date().toISOString(),
+          },
+        }).promise();
+      } catch (updateErr: any) {
+        console.error("[DOMAINS] Failed to persist customDomainUrl on landing page:", updateErr?.message);
+      }
     }
 
     res.status(201).json(result);

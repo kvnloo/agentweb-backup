@@ -871,8 +871,8 @@ export class AgentModeService {
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
-  async getSupportedModels() {
-    const models = Object.keys(this.llmModels);
+  async getSupportedModels(isAdmin: boolean = false) {
+    const models = Object.keys(this.llmModels).filter(m => isAdmin || !m.includes('opus'));
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -881,8 +881,8 @@ export class AgentModeService {
     return models;
   }
 
-  async getReportsModelOptions(): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.'));
+  async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !m.includes('opus')));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1471,10 +1471,10 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
-            // Block non-admin users OR interactive share sessions from invoking admin-only tools
+            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions
             if ((!isAdmin || isInteractiveShare) && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
               const errorMsg = isInteractiveShare
-                ? `Tool "${toolCall.function.name}" is not available in shared sessions.`
+                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" is restricted to admin users only.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,

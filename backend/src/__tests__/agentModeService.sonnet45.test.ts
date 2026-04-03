@@ -75,9 +75,19 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('anthropic.claude-sonnet-4-6');
     });
 
-    it('should include Claude Opus 4.6 in the supported models', async () => {
-      const models = await agentModeService.getSupportedModels();
+    it('should include Claude Opus 4.6 in the supported models for admins', async () => {
+      const models = await agentModeService.getSupportedModels(true);
       expect(models).toContain('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should NOT include Claude Opus 4.6 in the supported models for non-admins', async () => {
+      const models = await agentModeService.getSupportedModels(false);
+      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should NOT include Claude Opus 4.6 by default (non-admin)', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
     });
 
     it('should have temperature support enabled for Sonnet 4.5', async () => {
@@ -130,14 +140,33 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.1-flash-lite-preview'].client).toBeNull();
     });
 
-    it('should return only anthropic models from getReportsModelOptions', async () => {
+    it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
+      const reportsModels = await agentModeService.getReportsModelOptions(false);
+      expect(reportsModels.length).toBeGreaterThan(0);
+      reportsModels.forEach(model => {
+        expect(model).toMatch(/^anthropic\./);
+        expect(model).not.toContain('opus');
+      });
+    });
+
+    it('should include opus in getReportsModelOptions for admins', async () => {
+      const reportsModels = await agentModeService.getReportsModelOptions(true);
+      expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should NOT include opus in getReportsModelOptions by default (non-admin)', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions();
+      expect(reportsModels).not.toContain('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should return only anthropic models from getReportsModelOptions', async () => {
+      const reportsModels = await agentModeService.getReportsModelOptions(true);
       expect(reportsModels.length).toBeGreaterThan(0);
       reportsModels.forEach(model => {
         expect(model).toMatch(/^anthropic\./);
       });
       // Verify it excludes non-anthropic models
-      const allModels = await agentModeService.getSupportedModels();
+      const allModels = await agentModeService.getSupportedModels(true);
       const nonAnthropicModels = allModels.filter(m => !m.startsWith('anthropic.'));
       expect(nonAnthropicModels.length).toBeGreaterThan(0);
       nonAnthropicModels.forEach(model => {
@@ -149,7 +178,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   describe('getSupportedModels default model ordering', () => {
     it('should place the configured default model first in the list', async () => {
       const { settingsService } = require('../services/settingsService');
-      const allModels = Object.keys((agentModeService as any).llmModels);
+      const allModels = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
       // Configure a model that is NOT first in the natural object-key order
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -163,12 +192,26 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(new Set(models).size).toBe(models.length);
     });
 
+    it('should place the configured default model first in the list for admins (including opus)', async () => {
+      const { settingsService } = require('../services/settingsService');
+      const allModels = Object.keys((agentModeService as any).llmModels);
+      const nonFirstModel = allModels[allModels.length - 1];
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: nonFirstModel,
+      });
+
+      const models = await agentModeService.getSupportedModels(true);
+      expect(models[0]).toBe(nonFirstModel);
+      expect(models.length).toBe(allModels.length);
+      expect(new Set(models).size).toBe(models.length);
+    });
+
     it('should keep original order when no default model is configured', async () => {
       const { settingsService } = require('../services/settingsService');
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
 
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys((agentModeService as any).llmModels);
+      const naturalOrder = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
       expect(models).toEqual(naturalOrder);
     });
 
@@ -179,7 +222,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
 
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys((agentModeService as any).llmModels);
+      const naturalOrder = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
       expect(models).toEqual(naturalOrder);
     });
 
@@ -188,7 +231,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('DB error'));
 
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys((agentModeService as any).llmModels);
+      const naturalOrder = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
       // Falls back to env/hardcoded default which is likely first anyway
       expect(models.length).toBe(naturalOrder.length);
     });

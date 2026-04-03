@@ -231,6 +231,11 @@ interface User {
     totalCost: number;
     resetDate: string;
   };
+  tokenUsageHistory?: Array<{
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+  }>;
   tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }
@@ -3938,6 +3943,16 @@ export default function AdminDashboard() {
                                       </Tooltip>
                                     )}
                                   </Box>
+                                  {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
+                                    <Box sx={{ mt: 0.5 }}>
+                                      <Typography variant="caption" color="text.secondary">History: </Typography>
+                                      {[...user.tokenUsageHistory].reverse().slice(0, 6).map((h) => (
+                                        <Typography key={h.month} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
+                                          {h.month}: {h.totalTokens.toLocaleString()}
+                                        </Typography>
+                                      ))}
+                                    </Box>
+                                  )}
                                 </Grid>
                                 <Grid item xs={6}>
                                   <Typography variant="caption" color="text.secondary">Actions</Typography>

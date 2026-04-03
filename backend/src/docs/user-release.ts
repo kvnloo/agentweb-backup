@@ -9,6 +9,22 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-03',
+    changes: [
+      'Error Reports Now Route Directly to the Engineering Team',
+      '- Error reports submitted via the "Report an Error" button are now sent directly to the engineering team for faster triage',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Fix: Custom Domain URL Now Shows Correctly on Landing Pages',
+      '- Fixed an issue where landing pages created before domain linking was introduced did not display their custom domain URL',
+      '- The landing page list now automatically looks up and fills in the custom domain for any page that has a linked Vercel project',
+      '- Subdomain creation no longer fails if the landing page record update encounters a transient error',
+    ],
+  },
+  {
     date: '2026-04-02',
     changes: [
       'Settings: Each Tab Now Has Its Own URL',
@@ -3577,6 +3593,42 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Copy Button Fix in Agent Mode',
       '- Fixed copy buttons in Agent Mode chat that required precise clicking to activate',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Token Usage History Now Tracked Per User',
+      '- Previous months\' token usage is now archived automatically on monthly reset',
+      '- Up to 24 months of history stored per user',
+      '- Admins can view per-user token usage history in the Admin Dashboard',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Paid Social Now Works with Connected Meta Ad Accounts',
+      '- The Paid Social dashboard now uses your connected Meta ad account when no legacy ad account is configured',
+      '- Ad performance data, campaigns, and ad sets are fetched using the access token from the connected account',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Clearer Message When Admin Tools Are Blocked in Shared Sessions',
+      '- Admin tools (e.g. manage skills, work plans) are restricted to your own session for security reasons',
+      '- If an admin tool is invoked during a shared session, the agent now explains you can use it in your own Agent Mode session',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Client List Now Includes Sign-Up Date',
+      '- The list_all_clients agent tool now returns a signup_time field for each client',
+      '- Enables the AI agent to report when each account was created during health assessments',
+      'Opus Models Now Admin-Only',
+      '- Claude Opus models are no longer available for standard user accounts',
+      '- Admins continue to have full access to Opus models in Agent Mode and Reports',
     ],
   },
 ];

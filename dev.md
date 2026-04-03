@@ -2274,6 +2274,41 @@ cd backend && npm list react react-dom
 - CVE-2025-55182 Scanner: https://cve-2025-55182.com/
 - React Security Advisory: https://github.com/facebook/react/security
 
+## MAL-2026-2307 (Axios Supply Chain Attack) Security Check
+
+**Date:** 2026-04-02 | **Status:** ✅ Not affected
+
+### Summary
+
+On 2026-03-31, the `axios` npm package was compromised and malicious versions `0.30.4` and `1.14.1` were published to npm. The compromised versions included a malicious dependency called `plain-crypto-js` that installs a **Remote Access Trojan (RAT)**. The RAT phones home to `sfrclak.com:8000/6202033` (IP `142.11.206.73`).
+
+According to the advisory: _"Any computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer."_
+
+### Affected Versions
+
+- `axios@0.30.4`
+- `axios@1.14.1`
+
+### AgentWeb Findings
+
+All three components were checked and are **not affected**:
+
+| Component | Declared | Installed | Status |
+|-----------|----------|-----------|--------|
+| backend | `^1.9.0` | **1.9.0** | ✅ Safe |
+| partner-portal | `^1.7.9` | **1.11.0** | ✅ Safe |
+| customer-portal | `^1.9.0` | **1.11.0** | ✅ Safe |
+
+Additional IOC checks (all clean):
+- No `plain-crypto-js` found in any `package-lock.json` or `node_modules`
+- No references to `sfrclak.com` or `142.11.206.73` anywhere in the codebase
+
+### References
+
+- OSV Advisory: [MAL-2026-2307](https://osv.dev/vulnerability/MAL-2026-2307)
+- GitHub Advisory: [GHSA-fw8c-xr5c-95f9](https://github.com/advisories/GHSA-fw8c-xr5c-95f9)
+- StepSecurity Blog: https://www.stepsecurity.io/blog/axios-compromised-on-npm-malicious-versions-drop-remote-access-trojan
+
 ## Dec 15, 2025
 to support pdf file uploads for Knowledge Base, add OCR Parser for PDF file formats so that Vertex AI Search will uses this parser to parse PDF files.
 

@@ -79,6 +79,62 @@ describe('Meta Legacy Routes', () => {
       expect(response.body).toEqual({ hasAdAccount: false });
     });
 
+    it('should return hasAdAccount: true when user has connected Meta ad account but no legacy adAccount', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        ...mockUser,
+        adAccount: '',
+        connected_accounts: [{
+          platform: 'facebook',
+          account_id: 'act_987654321',
+          account_name: 'Test Ad Account',
+          config: {
+            account_type: 'ad_account',
+            ad_account_id: '987654321',
+            access_token: 'connected-user-token',
+          },
+        }],
+      });
+
+      const response = await request(app).get('/api/meta/account-status');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ hasAdAccount: true });
+    });
+
+    it('should return hasAdAccount: false when neither legacy adAccount nor connected accounts exist', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        ...mockUser,
+        adAccount: '',
+        connected_accounts: [],
+      });
+
+      const response = await request(app).get('/api/meta/account-status');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ hasAdAccount: false });
+    });
+
+    it('should return hasAdAccount: false when connected account has no access_token', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        ...mockUser,
+        adAccount: '',
+        connected_accounts: [{
+          platform: 'facebook',
+          account_id: 'act_987654321',
+          account_name: 'Test Ad Account',
+          config: {
+            account_type: 'ad_account',
+            ad_account_id: '987654321',
+          },
+        }],
+      });
+
+      const response = await request(app).get('/api/meta/account-status');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ hasAdAccount: false });
+    });
+
     it('should return 404 if user not found', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(null);
 
@@ -90,12 +146,51 @@ describe('Meta Legacy Routes', () => {
 
   describe('GET /ad-performance', () => {
     it('should return 400 if ad account not configured', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({ ...mockUser, adAccount: '' });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ ...mockUser, adAccount: '', connected_accounts: [] });
 
       const response = await request(app).get('/api/meta/ad-performance?timeframe=7d');
 
       expect(response.status).toBe(400);
       expect(response.body.message).toBe('Ad account not configured');
+    });
+
+    it('should use connected Meta ad account when legacy adAccount is not configured', async () => {
+      const connectedUser = {
+        ...mockUser,
+        adAccount: '',
+        connected_accounts: [{
+          platform: 'facebook',
+          account_id: 'act_987654321',
+          account_name: 'Connected Ad Account',
+          config: {
+            account_type: 'ad_account',
+            ad_account_id: '987654321',
+            access_token: 'connected-user-token',
+          },
+        }],
+      };
+      (userDb.getUserById as jest.Mock).mockResolvedValue(connectedUser);
+
+      // Mock token validation
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        json: async () => ({ id: '123', name: 'Test User' }),
+        ok: true,
+      });
+
+      const mockFetch = fetchWithRetryAndPaging as jest.Mock;
+      mockFetch.mockResolvedValueOnce({ data: [] }); // campaigns
+      mockFetch.mockResolvedValueOnce({ data: [] }); // adsets
+      mockFetch.mockResolvedValueOnce({ data: [] }); // ads
+      mockFetch.mockResolvedValueOnce({ data: [] }); // ad insights
+      mockFetch.mockResolvedValueOnce({ data: [] }); // adset insights
+      mockFetch.mockResolvedValueOnce({ data: [] }); // campaign insights
+
+      const response = await request(app).get('/api/meta/ad-performance?timeframe=7d');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('adPerformance');
+      // Should use connected account token, not Secrets Manager
+      expect(getMetaAccessToken as jest.Mock).not.toHaveBeenCalled();
     });
 
     it('should fetch and process performance data successfully', async () => {
@@ -302,6 +397,46 @@ describe('Meta Legacy Routes', () => {
 
       expect(response.status).toBe(400);
       expect(response.body.message).toBe('Missing required fields');
+    });
+
+    it('should return 400 if no ad account configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ ...mockUser, adAccount: '', connected_accounts: [] });
+
+      const response = await request(app).post('/api/meta/create-ad').send(validPayload);
+
+      expect(response.status).toBe(400);
+      expect(response.body.message).toBe('Ad account not configured');
+    });
+
+    it('should create an ad using connected account token when legacy adAccount is not configured', async () => {
+      const connectedUser = {
+        ...mockUser,
+        adAccount: '',
+        connected_accounts: [{
+          platform: 'facebook',
+          account_id: 'act_987654321',
+          config: {
+            account_type: 'ad_account',
+            ad_account_id: '987654321',
+            access_token: 'connected-user-token',
+          },
+        }],
+      };
+      (userDb.getUserById as jest.Mock).mockResolvedValue(connectedUser);
+
+      const mockFetch = global.fetch as jest.Mock;
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ account_status: 1 }), ok: true });
+      mockFetch.mockResolvedValueOnce({ arrayBuffer: async () => Buffer.from('image-data'), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ images: { 'image.jpg': { hash: 'hash1' } } }), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ id: 'creative1' }), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ id: 'ad1' }), ok: true });
+
+      const response = await request(app).post('/api/meta/create-ad').send(validPayload);
+
+      expect(response.status).toBe(200);
+      expect(response.body.adId).toBe('ad1');
+      // Should use connected account token, not Secrets Manager
+      expect(getMetaAccessToken as jest.Mock).not.toHaveBeenCalled();
     });
   });
 });

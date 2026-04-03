@@ -283,7 +283,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
       parent: { type: 'data_source_id', data_source_id: databaseId },
       properties: {
         'Name': { title: [{ text: { content: title } }] },
-        'Status': { status: { name: 'In progress' } },
+        'Status': { status: { name: 'To-do' } },
         'Tags': { multi_select: tags },
         'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
         'Move to Current Sprint': { checkbox: true },
