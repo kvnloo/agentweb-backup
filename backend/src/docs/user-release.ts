@@ -3649,4 +3649,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Admins can target any channel as before',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Connect Your Own Facebook Ad Account for Paid Social',
+      '- The "Ad Account Not Configured" screen now guides you to connect your Facebook ad account directly',
+      '- Click the new "Go to Connected Accounts" button to open Settings → Connected Accounts',
+      '- No longer requires an admin to configure the ad account on your behalf',
+    ],
+  },
 ];
