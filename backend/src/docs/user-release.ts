@@ -16,6 +16,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-03',
+    changes: [
+      'Fix: No More Duplicate Responses When Messages Are Sent Quickly',
+      '- Sending a new message while a response is still being generated no longer causes duplicate or overlapping responses',
+      '- Messages sent while the AI is still responding are now queued and delivered automatically once the current response finishes',
+    ],
+  },
+  {
     date: '2026-04-02',
     changes: [
       'Fix: Custom Domain URL Now Shows Correctly on Landing Pages',
