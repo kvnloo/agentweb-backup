@@ -3667,4 +3667,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- For your own brand logo, Emma looks it up from your brand guidelines and places it on the page',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'More Accurate PDF Data Extraction',
+      '- Numbers and values in PDF tables are now correctly separated from their labels',
+      '- Fixed an issue where table columns were concatenated without spaces (e.g. "Keywords ranked73" is now "Keywords ranked 73")',
+      '- Applies to all PDF files read by Agent Mode, including uploaded reports and knowledge base files',
+    ],
+  },
 ];
