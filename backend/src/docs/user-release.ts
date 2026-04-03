@@ -3658,4 +3658,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- No longer requires an admin to configure the ad account on your behalf',
     ],
   },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Add Logos to Landing Pages',
+      '- Ask Emma to add company logos to any landing page and she will handle it automatically',
+      '- For well-known public companies, logos are pulled from Google\'s favicon service — no uploading required',
+      '- For your own brand logo, Emma looks it up from your brand guidelines and places it on the page',
+    ],
+  },
 ];
