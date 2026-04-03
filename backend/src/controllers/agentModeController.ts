@@ -26,6 +26,13 @@ import { DynamoDB } from 'aws-sdk';
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 
 /**
+ * In-memory set of session IDs that are currently generating a response.
+ * Used to reject concurrent /generate requests for the same session with 409.
+ * Exported so tests can inspect and reset it.
+ */
+export const activeSessionGenerations = new Set<string>();
+
+/**
  * Returns the effective expiration date for an interactive share.
  * If expiresAt is set, use it. Otherwise, default to sharedAt + 7 days.
  * If neither is set, returns a date in the past (treat as expired).
@@ -1789,6 +1796,18 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Reject concurrent requests for the same session (synchronous check before any await)
+      if (activeSessionGenerations.has(sessionId)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+      activeSessionGenerations.add(sessionId);
+
+      try {
+
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
@@ -1877,6 +1896,9 @@ export const agentModeController = {
         ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+      } finally {
+        activeSessionGenerations.delete(sessionId);
+      }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
 
