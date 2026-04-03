@@ -446,9 +446,9 @@ describe('InstagramService', () => {
 
             await instagramService.getInstagramUserInsights('ig_123', 'valid_token');
 
-            const callParams = mockAxios.get.mock.calls[0][1].params;
-            expect(callParams.since).toBeUndefined();
-            expect(callParams.until).toBeUndefined();
+            const callParams = mockAxios.get.mock.calls[0]?.[1]?.params as Record<string, unknown> | undefined;
+            expect(callParams?.since).toBeUndefined();
+            expect(callParams?.until).toBeUndefined();
         });
     });
 });
