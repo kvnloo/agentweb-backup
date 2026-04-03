@@ -1,6 +1,16 @@
 import express from "express";
 import request from "supertest";
+import axios from "axios";
 import { extractTemplateOutline } from "../services/v0Service";
+
+// Mock axios for GitHub API calls
+jest.mock("axios");
+const mockedAxios = axios as jest.Mocked<typeof axios>;
+
+// Mock secretsManager for GitHub token
+jest.mock("../utils/secretsManager", () => ({
+  getGitHubOrgToken: jest.fn().mockResolvedValue({ token: "mock-github-token" }),
+}));
 
 // Mock aws-sdk
 jest.mock("aws-sdk", () => {
@@ -670,5 +680,182 @@ describe("Rate limiting on expensive endpoints", () => {
       .post("/api/landing-pages/v0/generate")
       .send({ prompt: "Valid prompt" });
     expect(res.status).toBe(429);
+  });
+});
+
+// =============================================================================
+// PUT /generated/:id/github-upload-asset
+// =============================================================================
+describe("PUT /api/landing-pages/v0/generated/:id/github-upload-asset", () => {
+  const PAGE_ID = "test-page-id";
+  const BASE_URL = `/api/landing-pages/v0/generated/${PAGE_ID}/github-upload-asset`;
+
+  const mockPage = {
+    id: PAGE_ID,
+    githubRepoUrl: "https://github.com/TestOrg/test-repo",
+    deployedUrl: "https://test-page.vercel.app",
+  };
+
+  beforeEach(() => {
+    mockGetLandingPage.mockResolvedValue(mockPage);
+    // Default: no existing file SHA (new file)
+    mockedAxios.get.mockRejectedValue({ response: { status: 404 } });
+    // Default: branch exists (no branch creation needed)
+    mockedAxios.post.mockResolvedValue({ data: {} } as any);
+  });
+
+  // ── FAIL: Invalid inputs ─────────────────────────────────────────────────
+
+  it("FAIL: missing source_url → 400", async () => {
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ target_path: "public/logo.png" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/source_url is required/);
+  });
+
+  it("FAIL: missing target_path → 400", async () => {
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/target_path is required/);
+  });
+
+  it("FAIL: path traversal in target_path → 400", async () => {
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png", target_path: "../../etc/passwd" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid target path/);
+  });
+
+  it("FAIL: .github/ path in target_path → 400", async () => {
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png", target_path: ".github/workflows/evil.yml" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid target path/);
+  });
+
+  it("FAIL: invalid branch name → 400", async () => {
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png", target_path: "public/logo.png", branch: "evil; rm -rf /" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid branch name/);
+  });
+
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png", target_path: "public/logo.png" });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page has no GitHub repo → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({ id: PAGE_ID, githubRepoUrl: null });
+
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png", target_path: "public/logo.png" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no GitHub repository/);
+  });
+
+  it("FAIL: source_url download fails → 400", async () => {
+    mockedAxios.get.mockRejectedValueOnce(new Error("Network error"));
+
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://example.com/logo.png", target_path: "public/logo.png" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Failed to download asset/);
+  });
+
+  // ── SUCCESS: happy path ──────────────────────────────────────────────────
+
+  it("SUCCESS: uploads new asset to main branch → 200 with commit info", async () => {
+    const fakeImageBuffer = Buffer.from("fake-png-data");
+    // First call: download asset from source_url
+    mockedAxios.get.mockResolvedValueOnce({ data: fakeImageBuffer } as any);
+    // Second call: check existing file SHA → 404 (new file)
+    mockedAxios.get.mockRejectedValueOnce({ response: { status: 404 } });
+    // GitHub contents PUT
+    mockedAxios.put.mockResolvedValueOnce({
+      data: { commit: { html_url: "https://github.com/TestOrg/test-repo/commit/abc123" } },
+    } as any);
+
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({ source_url: "https://s3.amazonaws.com/bucket/logo.png", target_path: "public/logo.png" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.target_path).toBe("public/logo.png");
+    expect(res.body.is_staging).toBe(false);
+    expect(res.body.message).toMatch(/uploaded/);
+  });
+
+  it("SUCCESS: uploads asset to draft branch → 200 with staging flag", async () => {
+    const fakeImageBuffer = Buffer.from("fake-png-data");
+    // download asset
+    mockedAxios.get.mockResolvedValueOnce({ data: fakeImageBuffer } as any);
+    // branch check (GET ref) → exists
+    mockedAxios.get.mockResolvedValueOnce({ data: { ref: "refs/heads/draft/test-branch-id" } } as any);
+    // file SHA check → 404 new file
+    mockedAxios.get.mockRejectedValueOnce({ response: { status: 404 } });
+    // GitHub contents PUT
+    mockedAxios.put.mockResolvedValueOnce({
+      data: { commit: { html_url: "https://github.com/TestOrg/test-repo/commit/def456" } },
+    } as any);
+
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({
+        source_url: "https://s3.amazonaws.com/bucket/logo.png",
+        target_path: "public/logo.png",
+        branch: "draft/test-branch-idXXXXXX",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_staging).toBe(true);
+    expect(res.body.message).toMatch(/branch/);
+  });
+
+  it("SUCCESS: updates existing asset (includes SHA in PUT body)", async () => {
+    const fakeImageBuffer = Buffer.from("updated-png-data");
+    // download asset
+    mockedAxios.get.mockResolvedValueOnce({ data: fakeImageBuffer } as any);
+    // file SHA check → exists
+    mockedAxios.get.mockResolvedValueOnce({ data: { sha: "existing-sha-123" } } as any);
+    // GitHub contents PUT
+    mockedAxios.put.mockResolvedValueOnce({
+      data: { commit: { html_url: "https://github.com/TestOrg/test-repo/commit/ghi789" } },
+    } as any);
+
+    const res = await request(app)
+      .put(BASE_URL)
+      .send({
+        source_url: "https://s3.amazonaws.com/bucket/logo-v2.png",
+        target_path: "public/logo.png",
+        commit_message: "Update logo",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    // Verify SHA was passed to GitHub
+    const putCall = mockedAxios.put.mock.calls[0];
+    expect(putCall[1]).toMatchObject({ sha: "existing-sha-123" });
   });
 });
