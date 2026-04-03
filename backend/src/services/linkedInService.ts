@@ -344,8 +344,8 @@ export class LinkedInService {
       let queryString = `q=organization&organization=${encodedUrn}`;
 
       if (startDate && endDate) {
-        const start = `(day:${startDate.getDate()},month:${startDate.getMonth() + 1},year:${startDate.getFullYear()})`;
-        const end = `(day:${endDate.getDate()},month:${endDate.getMonth() + 1},year:${endDate.getFullYear()})`;
+        const start = startDate.getTime();
+        const end = endDate.getTime();
         queryString += `&timeIntervals=List((timeGranularityType:DAY,timeRange:(start:${start},end:${end})))`;
       }
 
@@ -386,8 +386,8 @@ export class LinkedInService {
       }
 
       if (startDate && endDate) {
-        const start = `(day:${startDate.getDate()},month:${startDate.getMonth() + 1},year:${startDate.getFullYear()})`;
-        const end = `(day:${endDate.getDate()},month:${endDate.getMonth() + 1},year:${endDate.getFullYear()})`;
+        const start = startDate.getTime();
+        const end = endDate.getTime();
         queryString += `&timeIntervals=List((timeGranularityType:DAY,timeRange:(start:${start},end:${end})))`;
       }
 

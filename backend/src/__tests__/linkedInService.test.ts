@@ -261,8 +261,8 @@ describe('LinkedInService', () => {
 
       const callArgs = mockClient.get.mock.calls[0];
       expect(callArgs[0]).toContain('timeIntervals=List');
-      expect(callArgs[0]).toContain('day:1,month:1,year:2025');
-      expect(callArgs[0]).toContain('day:31,month:1,year:2025');
+      expect(callArgs[0]).toContain(`start:${startDate.getTime()}`);
+      expect(callArgs[0]).toContain(`end:${endDate.getTime()}`);
       expect(callArgs[0]).toContain('timeGranularityType:DAY');
     });
 
@@ -314,8 +314,8 @@ describe('LinkedInService', () => {
 
       const callArgs = mockClient.get.mock.calls[0];
       expect(callArgs[0]).toContain('timeIntervals=List');
-      expect(callArgs[0]).toContain('day:1,month:2,year:2025');
-      expect(callArgs[0]).toContain('day:28,month:2,year:2025');
+      expect(callArgs[0]).toContain(`start:${startDate.getTime()}`);
+      expect(callArgs[0]).toContain(`end:${endDate.getTime()}`);
       expect(callArgs[0]).toContain('timeGranularityType:DAY');
     });
 
