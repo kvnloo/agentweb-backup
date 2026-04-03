@@ -3669,6 +3669,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-03',
     changes: [
+      'Configure Multiple Slack Channels Per User',
+      '- Admins can now assign multiple Slack channels to a user from the Users tab',
+      '- Emma\'s Slack tools are restricted to the user\'s configured channels',
+      '- When multiple channels are configured, users must specify which channel to use',
+      '- Single-channel users continue to work as before with no change required',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
       'Emma Can Now Add Logos to Landing Pages',
       '- Ask Emma to add company logos to any landing page and she will handle it automatically',
       '- For well-known public companies, logos are pulled from Google\'s favicon service — no uploading required',

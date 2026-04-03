@@ -25,6 +25,10 @@ import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 
 const router = express.Router();
 
+function userMatchesChannel(u: any, channel: string): boolean {
+  return (u.slackChannels && u.slackChannels.includes(channel)) || u.slackChannel === channel;
+}
+
 /**
  * Helper: handles the full slack triggered session flow.
  * Triages message, creates session, generates Emma response, emails founders.
@@ -62,7 +66,7 @@ async function handleSlackTriggeredSession(params: {
 
     if (!user) {
       const allUsers = await userDb.getAllUsers();
-      user = allUsers.find((u: any) => u.slackChannel === channel);
+      user = allUsers.find((u: any) => userMatchesChannel(u, channel));
       if (user) {
         await settingsService.setSetting(
           mappingKey,
@@ -317,11 +321,12 @@ router.get("/channels", authenticateToken, async (req: Request, res: Response) =
       const { userDb } = await import("../services/db");
       const user = await userDb.getUserById(authReq.user.userId);
       
-      if (user?.slackChannel) {
-        const filteredChannels = channels.filter(channel => 
-          channel.id === user.slackChannel
-        );
-        console.log(`✅ Filtered to ${filteredChannels.length} channels based on user's account-level Slack channel`);
+      const allowedChannels = user?.slackChannels && user.slackChannels.length > 0
+        ? user.slackChannels
+        : user?.slackChannel ? [user.slackChannel] : null;
+      if (allowedChannels) {
+        const filteredChannels = channels.filter(channel => allowedChannels.includes(channel.id));
+        console.log(`✅ Filtered to ${filteredChannels.length} channels based on user's configured Slack channels`);
         res.json(filteredChannels);
         return;
       }
@@ -535,7 +540,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
             if (!user) {
               const allUsers = await userDb.getAllUsers();
-              user = allUsers.find((u: any) => u.slackChannel === channel);
+              user = allUsers.find((u: any) => userMatchesChannel(u, channel));
 
               if (user) {
                 await settingsService.setSetting(
