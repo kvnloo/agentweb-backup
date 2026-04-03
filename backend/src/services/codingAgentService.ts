@@ -64,9 +64,8 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing pa
 - When done, check_deployment once, then call report_to_user with a summary and the preview URL.
 
 ## Adding images and logos
-- To add a logo or image to a page, first use upload_asset to commit the binary file to the repo, then edit the HTML/CSS to reference it.
-- Use target_path like "public/logo.png" — the public/ directory is served at the root URL, so <img src="/logo.png" /> will work.
-- The source_url should be a direct URL to the image (e.g., an S3 URL returned by generate_image or read_brand_guidelines).
+- For well-known PUBLIC company logos (Google, Meta, etc.), use Clearbit directly — NO upload needed: <img src="https://logo.clearbit.com/{domain}" /> (e.g., https://logo.clearbit.com/google.com). This is the fastest approach.
+- For custom/private logos or images: use upload_asset to commit the binary file to the repo, then reference it by target_path. Use target_path like "public/logo.png" — the public/ directory is served at the root URL, so <img src="/logo.png" /> will work. The source_url should be a direct URL to the image (e.g., an S3 URL returned by generate_image or read_brand_guidelines).
 
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
