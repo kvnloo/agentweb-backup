@@ -16,7 +16,7 @@ import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { isTransientLLMError } from '../utils/agentModeErrors';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3566,36 +3566,14 @@ export async function generateChatResponse(
     const timestamp = new Date().toISOString();
 
     // Upload screenshot to S3 if provided
-    let uploadedScreenshotUrl = screenshot;
+    let uploadedScreenshotUrl: string | undefined = screenshot?.startsWith('data:image') ? undefined : screenshot;
     let attachments: any[] | undefined;
-    
+
     if (screenshot && screenshot.startsWith('data:image')) {
-      try {
-        const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, "");
-        const buffer = Buffer.from(base64Data, 'base64');
-        const uploadResult = await uploadFileToS3(
-          buffer,
-          `screenshot-${Date.now()}.jpg`,
-          userId || 'anonymous',
-          'image/jpeg'
-        );
-        if (uploadResult.success && uploadResult.url) {
-          uploadedScreenshotUrl = uploadResult.url;
-          attachments = [{
-            url: uploadResult.url,
-            filename: 'screenshot.jpg',
-            size: buffer.length,
-            mimetype: 'image/jpeg',
-            uploadedAt: timestamp
-          }];
-        } else {
-          // Upload did not return a URL — don't send raw base64 to the LLM
-          uploadedScreenshotUrl = undefined;
-        }
-      } catch (err) {
-        console.error('Failed to upload screenshot to S3:', err);
-        // Don't send raw base64 to the LLM on upload failure
-        uploadedScreenshotUrl = undefined;
+      const result = await uploadScreenshotToS3(screenshot, userId || 'anonymous');
+      if (result) {
+        uploadedScreenshotUrl = result.url;
+        attachments = [{ ...result.attachment, uploadedAt: timestamp }];
       }
     }
 
@@ -3643,7 +3621,7 @@ export async function generateChatResponse(
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
       if (lastUserIdx >= 0) {
         (messages[lastUserIdx] as any).content = [
-          { type: 'text', text: messages[lastUserIdx].content },
+          { type: 'text', text: `${messages[lastUserIdx].content}\n\n[Page screenshot captured. URL: ${uploadedScreenshotUrl}]` },
           { type: 'image_url', image_url: { url: uploadedScreenshotUrl, detail: 'low' } }
         ];
       }
