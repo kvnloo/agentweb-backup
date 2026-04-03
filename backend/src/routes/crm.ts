@@ -13,6 +13,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { fireTriggers } from '../services/crmTriggerService';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -949,6 +950,10 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     const lead = await crmDb.createLead(listId, leadData);
     res.status(201).json(lead);
+    setImmediate(() => {
+      fireTriggers('lead.created', listId, userId, lead)
+        .catch((err) => console.error('[CRMTrigger] create:', err));
+    });
   } catch (error: any) {
     console.error('Error creating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to create lead' });
@@ -1169,9 +1174,11 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updateData = updates;
 
+    // Fetch existing lead before update (used for trigger change detection and status engagement)
+    const existingLead = await crmDb.getLeadById(listId, leadId);
+
     // Auto-create status change engagement if status changed
     if (updates.status !== undefined) {
-      const existingLead = await crmDb.getLeadById(listId, leadId);
       if (existingLead && existingLead.status !== updates.status) {
         await crmDb.addLeadEngagement(listId, leadId, {
           eventType: 'status.changed',
@@ -1188,6 +1195,12 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
     res.json(updatedLead);
+    if (updatedLead) {
+      setImmediate(() => {
+        fireTriggers('lead.updated', listId, userId, updatedLead as Record<string, any>, existingLead || undefined)
+          .catch((err) => console.error('[CRMTrigger] update:', err));
+      });
+    }
   } catch (error: any) {
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
@@ -1219,8 +1232,17 @@ router.delete('/lists/:listId/leads/:leadId', async (req: Request, res: Response
       return res.status(403).json({ message: 'Access denied' });
     }
 
+    // Capture lead snapshot before deletion for trigger evaluation
+    const deletedLead = await crmDb.getLeadById(listId, leadId);
+
     await crmDb.deleteLead(listId, leadId);
     res.json({ success: true, message: 'Lead deleted successfully' });
+    if (deletedLead) {
+      setImmediate(() => {
+        fireTriggers('lead.deleted', listId, userId, deletedLead)
+          .catch((err) => console.error('[CRMTrigger] delete:', err));
+      });
+    }
   } catch (error: any) {
     console.error('Error deleting lead:', error);
     res.status(500).json({ message: error.message || 'Failed to delete lead' });
