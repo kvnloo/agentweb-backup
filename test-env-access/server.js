@@ -510,12 +510,21 @@ async function processQueue() {
         enrichedPrompt += `\n\nIMPORTANT: The following screenshot/image attachments from the Notion page have been downloaded. You MUST use the Read tool to view each image file BEFORE starting any work — these contain critical visual context for the task:\n${downloadedPaths.map((p) => `- ${p}`).join("\n")}`;
       }
 
+      // Prepend conversation history so Claude has context even after a session reset
+      const conversationLog = readConversationLog();
+      if (conversationLog.trim()) {
+        enrichedPrompt = `=== Previous conversation context (for continuity) ===\n${conversationLog.trim()}\n\n=== Current request ===\n${enrichedPrompt}`;
+      }
+
       const output = await runClaude(enrichedPrompt);
       lastResponseTime = new Date();
 
       // Check for retry directive: [RELAY_RETRY_AFTER:<seconds>]
       const retryMatch = output.match(/\[RELAY_RETRY_AFTER:(\d+)\]/);
       const cleanedOutput = output.replace(/\[RELAY_RETRY_AFTER:\d+\]/g, "").trim();
+
+      // Persist this turn so future sessions have context
+      appendToConversationLog(prompt, cleanedOutput);
 
       // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
       const truncated = cleanedOutput.length > 10000
@@ -598,6 +607,43 @@ function stripAnsiAndControlCodes(text) {
 }
 
 const COST_FILE = "/home/ec2-user/agentweb/.claude-total-cost";
+
+// ---------------------------------------------------------------------------
+// Conversation log — persists Q&A turns across sessions so Claude has context
+// even after a session reset (--continue doesn't reliably restore history)
+// ---------------------------------------------------------------------------
+const CONVERSATION_LOG_FILE = "/home/ec2-user/agentweb/.claude-conversation-log";
+const MAX_CONVERSATION_LOG_CHARS = 15000; // ~4k tokens, well within context window
+const MAX_RESPONSE_IN_LOG_CHARS = 1500;   // keep responses concise in the log
+
+function readConversationLog() {
+  try {
+    return fs.readFileSync(CONVERSATION_LOG_FILE, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+function appendToConversationLog(prompt, response) {
+  try {
+    const existing = readConversationLog();
+    const truncatedResponse = response.length > MAX_RESPONSE_IN_LOG_CHARS
+      ? response.slice(0, MAX_RESPONSE_IN_LOG_CHARS) + "...(truncated)"
+      : response;
+    const entry = `\n[User]: ${prompt.slice(0, 500)}\n[Claude]: ${truncatedResponse}\n`;
+    let updated = existing + entry;
+    // Trim oldest entries if log grows too large
+    if (updated.length > MAX_CONVERSATION_LOG_CHARS) {
+      updated = updated.slice(updated.length - MAX_CONVERSATION_LOG_CHARS);
+      // Snap to the start of the first complete turn to avoid cutting mid-entry
+      const firstTurn = updated.indexOf("\n[User]:");
+      if (firstTurn > 0) updated = updated.slice(firstTurn);
+    }
+    fs.writeFileSync(CONVERSATION_LOG_FILE, updated);
+  } catch (err) {
+    console.error("[relay] Failed to write conversation log:", err);
+  }
+}
 
 function formatUsageLine(data) {
   try {
