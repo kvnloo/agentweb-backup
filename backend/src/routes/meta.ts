@@ -21,20 +21,59 @@ const WEBSITE_ACTIONS = new Set([
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
 
+// ---------------------------------------------------------------------------
+// Helpers: connected-account fallback
+// ---------------------------------------------------------------------------
+
+const CLEAN_ACCOUNT_ID = (id: string) => (id || '').replace('act_', '');
+
+function getConnectedMetaAdAccounts(user: any): any[] {
+  return (user.connected_accounts || []).filter((acc: any) =>
+    (acc.platform === 'facebook' || acc.platform === 'meta') &&
+    acc.config?.account_type === 'ad_account' &&
+    acc.config?.access_token
+  );
+}
+
+function userHasMetaAdAccount(user: any): boolean {
+  if (user.adAccount && user.adAccount.trim() !== '') return true;
+  return getConnectedMetaAdAccounts(user).length > 0;
+}
+
+/**
+ * Resolve the ad account ID and access token to use for Meta API calls.
+ * Prefers the legacy user.adAccount + Secrets Manager token.
+ * Falls back to the first connected Meta ad account if legacy is not set.
+ */
+async function resolveMetaCredentials(user: any): Promise<{ adAccountId: string; accessToken: string }> {
+  if (user.adAccount && user.adAccount.trim() !== '') {
+    const accessToken = await getMetaAccessToken();
+    return { adAccountId: user.adAccount.trim(), accessToken };
+  }
+  const connectedAccounts = getConnectedMetaAdAccounts(user);
+  if (connectedAccounts.length === 0) {
+    throw new Error('Ad account not configured');
+  }
+  const account = connectedAccounts[0];
+  const adAccountId = CLEAN_ACCOUNT_ID(account.account_id || account.config?.ad_account_id || '');
+  return { adAccountId, accessToken: account.config.access_token };
+}
+
+// ---------------------------------------------------------------------------
+
 // Check if user has ad account configured
 router.get("/account-status", async (req, res) => {
   try {
     const userId = (req as any).user.userId;
-    
+
     // Get user from database
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has ad account configured
-    const hasAdAccount = !!(user.adAccount && user.adAccount.trim() !== "");
-    
+    const hasAdAccount = userHasMetaAdAccount(user);
+
     res.json({ hasAdAccount });
   } catch (error) {
     console.error("Error checking ad account status:", error);
@@ -54,37 +93,26 @@ router.get("/ad-performance", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has ad account configured
-    if (!user.adAccount || user.adAccount.trim() === "") {
-      return res.status(400).json({ message: "Ad account not configured" });
-    }
-
-    // Get Meta API access token from Secrets Manager
-    console.log("Fetching Meta access token from Secrets Manager...");
-    
+    // Resolve ad account credentials (legacy field or connected account fallback)
+    let adAccountId: string;
     let accessToken: string;
     try {
-      accessToken = await getMetaAccessToken();
-      console.log("Meta access token retrieved successfully from Secrets Manager");
+      ({ adAccountId, accessToken } = await resolveMetaCredentials(user));
     } catch (error: any) {
-      console.error("Error fetching Meta access token:", error);
-      return res.status(500).json({ 
-        message: "Meta access token not configured",
-        error: error.message || "Failed to fetch access token from Secrets Manager"
-      });
+      return res.status(400).json({ message: error.message || "Ad account not configured" });
     }
 
     // Get API version from environment or default to v18.0
     const apiVersion = process.env.META_API_VERSION || 'v18.0';
     console.log("Using Meta Graph API version:", apiVersion);
-    
+
     // Test the access token with a simple API call first
     try {
       console.log("Testing access token with /me endpoint...");
       const testResponse = await fetch(`https://graph.facebook.com/${apiVersion}/me?access_token=${accessToken}`);
       const testData = await testResponse.json();
       console.log("Token test response:", testData);
-      
+
       if (testData.error) {
         return res.status(401).json({
           message: "Meta access token validation failed",
@@ -100,13 +128,13 @@ router.get("/ad-performance", async (req, res) => {
         details: tokenError.toString()
       });
     }
-    
+
     // Validate ad account ID format
-    if (!user.adAccount || !/^\d+$/.test(user.adAccount)) {
+    if (!adAccountId || !/^\d+$/.test(adAccountId)) {
       return res.status(400).json({
         message: "Invalid ad account ID format",
         error: "Ad account ID must be a numeric string",
-        received: user.adAccount
+        received: adAccountId
       });
     }
     
@@ -132,9 +160,9 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching campaigns for timeframe:", timeframe);
     let campaigns;
     try {
-      const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`;
+      const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`;
       console.log("Campaigns URL:", campaignsUrl);
-      
+
       const campaignsData = await fetchWithRetryAndPaging(campaignsUrl);
       
       if (campaignsData.error) {
@@ -152,7 +180,7 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching ad sets for timeframe:", timeframe);
     let adSets;
     try {
-      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
+      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
       console.log("Ad Sets URL:", adSetsUrl);
       
       const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
@@ -172,7 +200,7 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching ads for timeframe:", timeframe);
     let ads;
     try {
-      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
+      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
       console.log("Ads URL:", adsUrl);
       
       const adsData = await fetchWithRetryAndPaging(adsUrl);
@@ -193,7 +221,7 @@ router.get("/ad-performance", async (req, res) => {
     let insights, adSetInsights, campaignInsights;
     try {
       // Fetch ad-level insights for ads processing
-      const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
+      const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
       
       const adInsightsData = await fetchWithRetryAndPaging(adInsightsUrl);
       
@@ -205,7 +233,7 @@ router.get("/ad-performance", async (req, res) => {
       console.log("Ad-level insights fetched successfully:", insights.length);
 
       // Fetch adset-level insights for ad sets processing
-      const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
+      const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
       
       const adSetInsightsData = await fetchWithRetryAndPaging(adSetInsightsUrl);
       
@@ -217,7 +245,7 @@ router.get("/ad-performance", async (req, res) => {
       console.log("Adset-level insights fetched successfully:", adSetInsights.length);
 
       // Fetch campaign-level insights for campaigns processing
-      const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
+      const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
       
       const campaignInsightsData = await fetchWithRetryAndPaging(campaignInsightsUrl);
       
@@ -570,48 +598,40 @@ router.get("/campaigns-and-adsets", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has ad account configured
-    if (!user.adAccount || user.adAccount.trim() === "") {
-      return res.status(400).json({ message: "Ad account not configured" });
-    }
-
-    // Get Meta API access token from Secrets Manager
+    // Resolve ad account credentials (legacy field or connected account fallback)
+    let adAccountId: string;
     let accessToken: string;
     try {
-      accessToken = await getMetaAccessToken();
+      ({ adAccountId, accessToken } = await resolveMetaCredentials(user));
     } catch (error: any) {
-      console.error("Error fetching Meta access token:", error);
-      return res.status(500).json({ 
-        message: "Meta access token not configured",
-        error: error.message || "Failed to fetch access token from Secrets Manager"
-      });
+      return res.status(400).json({ message: error.message || "Ad account not configured" });
     }
 
     const apiVersion = process.env.META_API_VERSION || 'v18.0';
-    
+
     // Fetch campaigns
-    const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status&access_token=${accessToken}`;
+    const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status&access_token=${accessToken}`;
     const campaignsResponse = await fetch(campaignsUrl);
     const campaignsData = await campaignsResponse.json();
-    
+
     if (campaignsData.error) {
       throw new Error(`Graph API Error: ${campaignsData.error.message}`);
     }
-    
+
     // Fetch ad sets
-    const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,campaign_id,status&access_token=${accessToken}`;
+    const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,campaign_id,status&access_token=${accessToken}`;
     const adSetsResponse = await fetch(adSetsUrl);
     const adSetsData = await adSetsResponse.json();
-    
+
     if (adSetsData.error) {
       throw new Error(`Graph API Error: ${adSetsData.error.message}`);
     }
-    
+
     // First, get the business account associated with the ad account
     console.log("=== Fetching Business Account ===");
-    console.log("Ad Account:", user.adAccount);
-    
-    const businessUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}?fields=account_id,name,currency,timezone_name,business&access_token=${accessToken}`;
+    console.log("Ad Account:", adAccountId);
+
+    const businessUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}?fields=account_id,name,currency,timezone_name,business&access_token=${accessToken}`;
     console.log("Business URL:", businessUrl);
     
     const businessResponse = await fetch(businessUrl);
@@ -732,21 +752,13 @@ router.post("/create-ad", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has ad account configured
-    if (!user.adAccount || user.adAccount.trim() === "") {
-      return res.status(400).json({ message: "Ad account not configured" });
-    }
-
-    // Get Meta API access token from Secrets Manager
+    // Resolve ad account credentials (legacy field or connected account fallback)
+    let adAccountId: string;
     let accessToken: string;
     try {
-      accessToken = await getMetaAccessToken();
+      ({ adAccountId, accessToken } = await resolveMetaCredentials(user));
     } catch (error: any) {
-      console.error("Error fetching Meta access token:", error);
-      return res.status(500).json({ 
-        message: "Meta access token not configured",
-        error: error.message || "Failed to fetch access token from Secrets Manager"
-      });
+      return res.status(400).json({ message: error.message || "Ad account not configured" });
     }
 
     const apiVersion = process.env.META_API_VERSION || 'v18.0';
@@ -760,7 +772,7 @@ router.post("/create-ad", async (req, res) => {
     
     // First, verify the ad account exists and get its details
     console.log("=== Verifying Ad Account ===");
-    const accountUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}?fields=account_id,name,currency,timezone_name,account_status&access_token=${accessToken}`;
+    const accountUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}?fields=account_id,name,currency,timezone_name,account_status&access_token=${accessToken}`;
     console.log("Account URL:", accountUrl);
     
     const accountResponse = await fetch(accountUrl);
@@ -776,7 +788,7 @@ router.post("/create-ad", async (req, res) => {
     
     // Try uploading image to the ad account
     console.log("=== Uploading Image ===");
-    const uploadUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adimages`;
+    const uploadUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adimages`;
     console.log("Upload URL:", uploadUrl);
     
     // Download the image
@@ -865,7 +877,7 @@ router.post("/create-ad", async (req, res) => {
     };
 
     // Create the creative
-    const creativeUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adcreatives`;
+    const creativeUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adcreatives`;
     const creativeResponse = await fetch(creativeUrl, {
       method: 'POST',
       headers: {
@@ -902,7 +914,7 @@ router.post("/create-ad", async (req, res) => {
       status: 'PAUSED' // Create in paused status for review
     };
 
-    const createAdUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads`;
+    const createAdUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads`;
     const createAdResponse = await fetch(createAdUrl, {
       method: 'POST',
       headers: {
@@ -924,7 +936,7 @@ router.post("/create-ad", async (req, res) => {
     }
     
     // Generate ad management URL using Facebook Ads Manager
-    const adManagementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${user.adAccount}`;
+    const adManagementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${adAccountId}`;
     console.log("Ad Management URL:", adManagementUrl);
     
     // Record the ad creation in the existing image file in result_files
