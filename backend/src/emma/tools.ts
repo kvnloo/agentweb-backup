@@ -1407,7 +1407,8 @@ emmaToolRegistry.register({
       args.length || 'medium',
       args.imagine !== undefined ? args.imagine : true,
       context?.userId,
-      args.research_url
+      args.research_url,
+      context?.sessionId
     );
   }
 });
@@ -1746,16 +1747,20 @@ emmaToolRegistry.register({
   name: 'list_html_templates',
   definition: {
     name: 'list_html_templates',
-    description: 'Get a list of all available HTML templates for the user (including email templates)',
+    description: "Get a list of all available HTML templates for the user (email and/or landing page templates). Use the optional 'type' filter to narrow results.",
     inputSchema: {
       type: 'object',
       properties: {
+        type: {
+          type: 'string',
+          description: "Filter by template type: 'email' or 'landing_page'. Omit to list all templates."
+        }
       },
       required: []
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listHtmlTemplates(context?.userId);
+    return await agentModeService.listHtmlTemplates(context?.userId, args.type);
   }
 });
 
@@ -4158,7 +4163,7 @@ emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
-    description: "Create an email template from an existing HTML file or HTML content. The template will be saved to the Email Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable email template with variables like {{user_name}} or {{items_n}} for dynamic content.",
+    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4168,18 +4173,23 @@ emmaToolRegistry.register({
         },
         template_name: {
           type: "string",
-          description: "Unique name for this email template (e.g., 'welcome_email', 'monthly_newsletter')"
+          description: "Unique name for this template (e.g., 'welcome_email', 'product_landing_page')"
         },
         subject: {
           type: "string",
-          description: "Email subject line. Can include variables like {{user_name}}"
+          description: "Email subject line (only required for email templates). Can include variables like {{user_name}}"
         },
         additional_instructions: {
           type: "string",
           description: "Optional instructions for how to process the HTML (e.g., 'Add variables for company name and logo', 'Make it more professional', 'Convert product list to array variables')"
+        },
+        types: {
+          type: "array",
+          items: { type: "string" },
+          description: "Template types, e.g. ['email'], ['landing_page'], or ['email', 'landing_page']. Defaults to ['email']."
         }
       },
-      required: ["html_source", "template_name", "subject"]
+      required: ["html_source", "template_name"]
     }
   },
   execute: async (args: any, context?: any) => {
@@ -4189,7 +4199,8 @@ emmaToolRegistry.register({
       args.subject,
       args.additional_instructions || '',
       context?.userId,
-      context?.sessionId
+      context?.sessionId,
+      args.types
     );
   }
 });
@@ -4943,7 +4954,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {

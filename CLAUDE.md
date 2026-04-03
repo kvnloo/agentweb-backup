@@ -752,11 +752,21 @@ You can SSH into cloud Claude (cloud-dev) EC2 instances using password authentic
 
 ```bash
 # Retrieve the SSH password
-aws secretsmanager get-secret-value --secret-id agentweb/cloud-dev/ssh-password --query SecretString --output text
+aws secretsmanager get-secret-value --secret-id agentweb/test-env/ssh-password --query SecretString --output text
 
 # SSH into the instance (use the Public IP from the Notion task's "Public IP" field)
-ssh ubuntu@<PUBLIC_IP>
+# IMPORTANT: use ec2-user, NOT ubuntu — the AMI is Amazon Linux, not Ubuntu
+ssh ec2-user@<PUBLIC_IP>
 # Enter the password from Secrets Manager when prompted
+
+# Or use sshpass for non-interactive:
+SSHPASS=$(aws secretsmanager get-secret-value --secret-id agentweb/test-env/ssh-password --query SecretString --output text) \
+  sshpass -e ssh -o StrictHostKeyChecking=no -o PasswordAuthentication=yes -o PubkeyAuthentication=no ec2-user@<PUBLIC_IP> 'uptime'
+```
+
+**Note:** After a stop/start cycle the public IP changes — always fetch the current IP from the Notion task or via `aws ec2 describe-instances`. If the instance was stopped and restarted, the Claude tmux session won't auto-restart; SSH in and run:
+```bash
+tmux new-session -d -s claude /home/ec2-user/agentweb/.claude-run.sh
 ```
 
 ## Browser Testing with Playwright MCP

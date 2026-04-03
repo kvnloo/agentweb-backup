@@ -18,12 +18,15 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
+import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
+import { incrementUserTokenUsage } from './tokenUsageService';
+import type { LLMUsageData } from '../utils/llmService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'slack_list_channels', 'slack_get_recent_messages', 'slack_send_message', 'freeze_user_account'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -31,7 +34,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -71,6 +74,54 @@ interface PDFData {
   info: any;
   metadata: any;
   version: string;
+}
+
+/**
+ * Custom pdf-parse pagerender function that preserves table structure.
+ *
+ * The default pdf-parse renderer concatenates items sharing the same exact Y
+ * coordinate without adding spaces, and doesn't sort items by X position.
+ * This causes numbers in tabular PDFs to run together or appear out of order.
+ *
+ * This renderer:
+ * 1. Sorts all text items by Y (descending = top-to-bottom) then X (ascending = left-to-right)
+ * 2. Groups items into rows using a Y-tolerance to handle slight vertical misalignments
+ * 3. Separates items on the same row with a space so numbers don't concatenate
+ */
+function pdfPageRender(pageData: any): Promise<string> {
+  return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
+    .then((textContent: any) => {
+      const Y_TOLERANCE = 3; // points — items within this vertical distance are on the same row
+
+      // Sort: top-to-bottom (higher Y first in PDF coords), left-to-right
+      const items: Array<{ str: string; x: number; y: number }> = textContent.items
+        .filter((item: any) => item.str && item.str.trim() !== '')
+        .map((item: any) => ({ str: item.str, x: item.transform[4], y: item.transform[5] }))
+        .sort((a: any, b: any) => {
+          if (Math.abs(a.y - b.y) > Y_TOLERANCE) return b.y - a.y; // top first
+          return a.x - b.x; // left first within same row
+        });
+
+      if (items.length === 0) return '';
+
+      // Group items into rows
+      const rows: string[][] = [];
+      let currentRow: string[] = [];
+      let rowY = items[0].y;
+
+      for (const item of items) {
+        if (Math.abs(item.y - rowY) <= Y_TOLERANCE) {
+          currentRow.push(item.str);
+        } else {
+          rows.push(currentRow);
+          currentRow = [item.str];
+          rowY = item.y;
+        }
+      }
+      if (currentRow.length > 0) rows.push(currentRow);
+
+      return rows.map(row => row.join(' ')).join('\n');
+    });
 }
 
 // Type for LLM model configuration
@@ -868,8 +919,8 @@ export class AgentModeService {
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
-  async getSupportedModels() {
-    const models = Object.keys(this.llmModels);
+  async getSupportedModels(isAdmin: boolean = false) {
+    const models = Object.keys(this.llmModels).filter(m => isAdmin || !m.includes('opus'));
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -878,8 +929,8 @@ export class AgentModeService {
     return models;
   }
 
-  async getReportsModelOptions(): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.'));
+  async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !m.includes('opus')));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1028,6 +1079,43 @@ export class AgentModeService {
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
+  /** Cost per image generation in USD (fixed per-generation pricing). */
+  private estimateImageGenerationCost(model: string): number {
+    const pricing: Record<string, number> = {
+      'gpt-image-1': 0.04,
+      'gemini-2.5-flash-image': 0.039,
+      'gemini-3-pro-image-preview': 0.039,
+      'gemini-3.1-flash-image-preview': 0.039,
+      'gen4_image': 0.05,
+      'gemini_2.5_flash': 0.04,
+    };
+    return pricing[model] ?? 0.04;
+  }
+
+  /** Cost per video generation in USD (fixed per-generation pricing, based on ~8s clip). */
+  private estimateVideoGenerationCost(model: string): number {
+    const pricing: Record<string, number> = {
+      'veo-3.1-generate-preview': 2.80,
+      'veo-3.1-fast-generate-preview': 1.40,
+    };
+    return pricing[model] ?? 2.80;
+  }
+
+  /** Returns an onUsage callback that records LLM token usage for a named tool. */
+  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+    return (usage) => {
+      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
+      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
+        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
+      );
+      if (sessionId) {
+        chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
+          console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
+        );
+      }
+    };
+  }
+
   // Generate AI response for marketing conversation
   async generateMarketingResponse(
     messageContent: string,
@@ -1040,7 +1128,8 @@ export class AgentModeService {
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
-    excludeTools?: string[]
+    excludeTools?: string[],
+    screenshotUrl?: string
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -1098,7 +1187,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, isAdmin);
@@ -1431,10 +1520,10 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
-            // Block non-admin users OR interactive share sessions from invoking admin-only tools
+            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions
             if ((!isAdmin || isInteractiveShare) && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
               const errorMsg = isInteractiveShare
-                ? `Tool "${toolCall.function.name}" is not available in shared sessions.`
+                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" is restricted to admin users only.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
@@ -1483,7 +1572,8 @@ export class AgentModeService {
         const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
           const toolStart = Date.now();
           try {
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, socketEmit ? { socketEmit } : undefined);
+            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
             const toolDuration = Date.now() - toolStart;
             return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
           } catch (error) {
@@ -1498,7 +1588,27 @@ export class AgentModeService {
         for (const toolResult of toolResults) {
           if (toolResult.status === 'success') {
             const { toolCall, functionArgs, result, duration } = toolResult;
-            const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
+
+            // For playwright screenshots, upload the base64 image to S3.
+            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
+            // and makes the screenshot displayable in the frontend.
+            let processedResult = result;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
+              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
+              if (imageContent?.data) {
+                try {
+                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
+                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
+                  if (uploadResult) {
+                    processedResult = { screenshotUrl: uploadResult.url, success: true };
+                  }
+                } catch (e) {
+                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
+                }
+              }
+            }
+
+            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
 
             toolCalls.push({
               id: toolCall.id,
@@ -1511,7 +1621,15 @@ export class AgentModeService {
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
-            const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
+            // The screenshot is displayed to the user via the tool call card in the frontend.
+            // We intentionally omit the URL so the LLM doesn't embed it in markdown responses.
+            let toolContent: any;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
+              toolContent = `Screenshot captured successfully and displayed to the user.`;
+            } else {
+              toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            }
             const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
               ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
               : toolContent;
@@ -2090,7 +2208,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -2249,8 +2367,18 @@ When a user requests client onboarding or says "onboard new client" or similar:
       messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
-    // Append the current user message at the end
-    messages.push({ role: 'user', content: messageContent });
+    // Append the current user message at the end (with vision if a screenshot URL was provided)
+    if (screenshotUrl) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
+        ]
+      });
+    } else {
+      messages.push({ role: 'user', content: messageContent });
+    }
 
     return messages;
   }
@@ -2355,7 +2483,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'fathom_get_transcript',
 
     // Coding Agent (sub-agent for code editing tasks)
-    'coding_agent'
+    'coding_agent',
+
+    'slack_list_channels',
+    'slack_get_recent_messages',
+    'slack_send_message',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -2729,6 +2861,12 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
+
+    // For playwright screenshots, result has already been processed (base64 → S3 URL)
+    if (toolName === 'playwright_browser_take_screenshot') {
+      return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
+    }
+
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -12523,7 +12661,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (extension === 'pdf' || mimeType === 'application/pdf') {
       const pdfParse = require('pdf-parse');
-      const pdfData = await pdfParse(content);
+      const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
@@ -12616,7 +12754,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         const pdfParse = require('pdf-parse');
-        const pdfData = await pdfParse(content);
+        const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
@@ -13601,7 +13739,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try {
           // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer);
+          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
@@ -13742,6 +13880,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.imageUrl) {
+        // Track generation cost (image APIs are billed per generation, not per token)
+        const imageCost = this.estimateImageGenerationCost(imageModel || 'gemini-2.5-flash-image');
+        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
+          console.error('AgentMode: Failed to track token usage for generateImage:', err)
+        );
+        chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
+          console.error('AgentMode: Failed to add image cost to session:', err)
+        );
+
         // Save the image URL to the session for reference
         const imageData = {
           url: result.imageUrl,
@@ -13831,6 +13978,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
+        // Track generation cost (video APIs are billed per generation, not per token)
+        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview');
+        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
+          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
+        );
+        chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
+          console.error('AgentMode: Failed to add video cost to session:', err)
+        );
+
         // Save the video URL to the session for reference
         const videoData = {
           url: result.videoUrl,
@@ -15742,31 +15898,37 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
   }
 
-  // Fetch both user-specific and public templates
+  // Fetch templates from all 4 keys (new + old), deduplicated (new key wins)
   private async getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {
-    const [userSetting, publicSetting] = await Promise.all([
+    const [newUserSetting, newPublicSetting, oldUserSetting, oldPublicSetting] = await Promise.all([
+      settingsService.getSetting(`templates_${userId}`),
+      settingsService.getSetting('templates_public'),
       settingsService.getSetting(`email_templates_${userId}`),
-      settingsService.getSetting('email_templates_public')
+      settingsService.getSetting('email_templates_public'),
     ]);
 
-    let userTemplates: any[] = [];
-    let publicTemplates: any[] = [];
+    const parse = (s: any): any[] => {
+      if (!s?.settingValue) return [];
+      try { return JSON.parse(s.settingValue); } catch { return []; }
+    };
 
-    if (userSetting) {
-      try {
-        userTemplates = JSON.parse(userSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing user email templates:', error);
-      }
-    }
+    const newUser = parse(newUserSetting);
+    const newPublic = parse(newPublicSetting);
+    const oldUser = parse(oldUserSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
+    const oldPublic = parse(oldPublicSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
 
-    if (publicSetting) {
-      try {
-        publicTemplates = JSON.parse(publicSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing public email templates:', error);
-      }
-    }
+    // Deduplicate: new key wins over old key
+    const userSeen = new Set(newUser.map((t: any) => t.template_name));
+    const userTemplates = [
+      ...newUser,
+      ...oldUser.filter((t: any) => !userSeen.has(t.template_name)),
+    ];
+
+    const publicSeen = new Set(newPublic.map((t: any) => t.template_name));
+    const publicTemplates = [
+      ...newPublic,
+      ...oldPublic.filter((t: any) => !publicSeen.has(t.template_name)),
+    ];
 
     return { userTemplates, publicTemplates };
   }
@@ -15788,16 +15950,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return { template: null, isPublic: false };
   }
 
-  // List all HTML templates for the user (including email templates)
-  public async listHtmlTemplates(userId: string): Promise<any> {
+  // List all HTML templates for the user (merged from all 4 keys)
+  public async listHtmlTemplates(userId: string, type?: string): Promise<any> {
     try {
       const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
-      // Build a name set from user templates for dedup
       const userTemplateNames = new Set(userTemplates.map((t: any) => t.template_name));
 
       const mapTemplate = (template: any, isPublic: boolean) => ({
         template_name: template.template_name,
+        type: template.type || ['email'],
         subject: template.subject,
         variables: template.variables || [],
         arrayVariables: template.arrayVariables || [],
@@ -15806,12 +15968,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(isPublic ? { isPublic: true } : {})
       });
 
-      const merged = [
+      let merged = [
         ...userTemplates.map((t: any) => mapTemplate(t, false)),
         ...publicTemplates
           .filter((t: any) => !userTemplateNames.has(t.template_name))
           .map((t: any) => mapTemplate(t, true))
       ];
+
+      if (type) {
+        merged = merged.filter((t: any) => Array.isArray(t.type) && t.type.includes(type));
+      }
 
       return {
         success: true,
@@ -16743,7 +16909,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log('AgentMode: Generating HTML file with LLMService (Claude model)');
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt);
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -16785,7 +16951,8 @@ Please generate a complete, professional HTML document that properly formats and
     subject: string,
     additionalInstructions: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    types?: string[]
   ): Promise<any> {
     try {
       // Read HTML content from source (either S3 URL or direct HTML content)
@@ -16873,20 +17040,20 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt);
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
       }
 
       // Extract variables from the enhanced HTML and subject
-      const { variables, arrayVariables } = this.extractVariables(enhancedHtml, subject);
+      const { variables, arrayVariables } = extractVariables(enhancedHtml, subject);
 
       console.log('AgentMode: Extracted variables:', { variables, arrayVariables });
 
-      // Save template to DynamoDB settings
+      // Save template to DynamoDB settings (new key)
       const { settingsService } = await import('./settingsService');
-      const settingName = `email_templates_${userId}`;
+      const settingName = `templates_${userId}`;
       const existingSetting = await settingsService.getSetting(settingName);
 
       let templates = [];
@@ -16904,8 +17071,11 @@ Please:
         (t: any) => t.template_name === templateName
       );
 
+      const templateTypes = types && types.length > 0 ? types : ['email'];
+
       const newTemplate = {
         template_name: templateName,
+        type: templateTypes,
         subject: subject,
         html_content: enhancedHtml,
         variables: variables,
@@ -16923,20 +17093,32 @@ Please:
       await settingsService.setSetting(
         settingName,
         JSON.stringify(templates),
-        'User email templates',
+        'User templates',
         userId
       );
 
-      console.log('AgentMode: HTML email template created successfully:', templateName);
+      // Migrate: remove old copy from legacy user key to prevent shadowing.
+      // Never touch public keys — createHtmlTemplate is always a user-scoped operation.
+      const { parseTemplateArray } = await import('../utils/templateParser');
+      const legacyKey = `email_templates_${userId}`;
+      const legacySetting = await settingsService.getSetting(legacyKey);
+      const legacyList = parseTemplateArray(legacySetting);
+      const legacyFiltered = legacyList.filter((t: any) => t.template_name !== templateName);
+      if (legacyFiltered.length !== legacyList.length) {
+        await settingsService.setSetting(legacyKey, JSON.stringify(legacyFiltered), legacyKey, userId);
+      }
+
+      console.log('AgentMode: HTML template created successfully:', templateName);
 
       return {
         success: true,
         template_name: templateName,
+        type: templateTypes,
         subject: subject,
         variables: variables,
         arrayVariables: arrayVariables,
-        message: `Email template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
-        preview_note: 'Template is now available in Email Templates section for editing and preview'
+        message: `Template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
+        preview_note: 'Template is now available in Templates section for editing and preview'
       };
     } catch (error) {
       console.error('Error creating HTML template:', error);
@@ -16946,89 +17128,6 @@ Please:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
-  }
-
-  // Extract variables from HTML content and subject (same logic as in settings.ts)
-  private extractVariables(htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } {
-    const variableRegex = /\{\{([^}]+)\}\}/g;
-    const allVariables: string[] = [];
-    const regularVariables: string[] = [];
-    const arrayVariableNames = new Set<string>();
-    let match;
-
-    // Collect all variables from HTML content
-    while ((match = variableRegex.exec(htmlContent)) !== null) {
-      const variable = match[1].trim();
-      if (!allVariables.includes(variable)) {
-        allVariables.push(variable);
-      }
-    }
-
-    // Also collect variables from subject if provided
-    if (subject) {
-      const subjectRegex = /\{\{([^}]+)\}\}/g;
-      let subjectMatch;
-      while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
-        const variable = subjectMatch[1].trim();
-        if (!allVariables.includes(variable)) {
-          allVariables.push(variable);
-        }
-      }
-    }
-
-    // Find all _n and _n_ patterns first
-    const nPatterns = new Set<string>();
-    allVariables.forEach(variable => {
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        if (suffix) {
-          nPatterns.add(`${baseName}_n_${suffix}`);
-        } else {
-          nPatterns.add(`${baseName}_n`);
-        }
-      }
-    });
-
-    // Now process all variables
-    const processedArrayNames = new Set<string>();
-
-    allVariables.forEach(variable => {
-      let isArrayVariable = false;
-
-      // Check if this variable matches any _n pattern
-      nPatterns.forEach(nPattern => {
-        const baseName = nPattern.replace(/_n.*$/, '');
-        const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
-        if (numericMatch) {
-          if (!processedArrayNames.has(nPattern)) {
-            arrayVariableNames.add(nPattern);
-            processedArrayNames.add(nPattern);
-          }
-          isArrayVariable = true;
-        }
-      });
-
-      // Check if this is already an _n pattern
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
-        if (!processedArrayNames.has(fullName)) {
-          arrayVariableNames.add(fullName);
-          processedArrayNames.add(fullName);
-        }
-        isArrayVariable = true;
-      }
-
-      if (!isArrayVariable) {
-        regularVariables.push(variable);
-      }
-    });
-
-    return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
   }
 
   // Work Plan Management Methods
@@ -17684,7 +17783,8 @@ Please:
     length: string,
     imagine: boolean,
     userId: string,
-    researchUrl?: string
+    researchUrl?: string,
+    sessionId?: string
   ): Promise<any> {
     try {
       console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
@@ -17885,7 +17985,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format);
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
 
       // Extract content from JSON
       if (!contentData.content) {

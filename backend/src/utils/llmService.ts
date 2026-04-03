@@ -7,11 +7,22 @@ import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 
 export type OutputFormat = 'json' | 'xml';
 
+export interface LLMUsageData {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  model: string;
+}
+
+export type OnUsageCallback = (usage: LLMUsageData) => void;
+
 export class LLMService {
   private chatModel: AzureChatOpenAI | ChatBedrockConverse;
+  private modelName: string;
 
   constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+    this.modelName = model;
     const isClaude = model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.');
 
     if (isClaude) {
@@ -57,6 +68,18 @@ export class LLMService {
         ...(maxTokens && { maxTokens }),
       });
     }
+  }
+
+  /**
+   * Extract usage data from a LangChain AIMessage response.
+   * LangChain standardizes token counts on `usage_metadata` across providers.
+   */
+  private extractUsage(response: any): LLMUsageData {
+    const meta = response?.usage_metadata;
+    const inputTokens = meta?.input_tokens || 0;
+    const outputTokens = meta?.output_tokens || 0;
+    const totalTokens = meta?.total_tokens || (inputTokens + outputTokens);
+    return { inputTokens, outputTokens, totalTokens, model: this.modelName };
   }
 
   /**
@@ -120,22 +143,27 @@ export class LLMService {
    * @param systemPrompt System prompt
    * @param userPrompt User prompt
    * @param format Output format: 'json' (default) or 'xml'
+   * @param onUsage Optional callback invoked with token usage after the LLM call
    * @returns Parsed content object
    */
   async generateJSONContent<T = any>(
     systemPrompt: string,
     userPrompt: string,
-    format: OutputFormat = 'json'
+    format: OutputFormat = 'json',
+    onUsage?: OnUsageCallback
   ): Promise<T> {
     try {
-      const prompt = ChatPromptTemplate.fromMessages([
-        ['system', systemPrompt],
-        ['user', userPrompt],
-      ]);
+      // Invoke the model directly to capture usage_metadata before any parsing
+      const messages = [
+        new SystemMessage(systemPrompt),
+        new HumanMessage(userPrompt),
+      ];
+      const response = await this.chatModel.invoke(messages) as any;
+      const rawResponse = typeof response.content === 'string' ? response.content : String(response.content || '');
 
-      const chain = prompt.pipe(this.chatModel);
-      const response = await chain.invoke({}) as { content: string };
-      const rawResponse = response.content;
+      if (onUsage) {
+        onUsage(this.extractUsage(response));
+      }
 
       if (format === 'xml') {
         const parsed = this.parseXML<T>(rawResponse);
@@ -155,10 +183,9 @@ export class LLMService {
         throw new Error('Could not extract content from XML response');
       }
 
-      // JSON format
+      // JSON format — parse the raw string
       const jsonParser = new JsonOutputParser();
-      const jsonChain = chain.pipe(jsonParser);
-      return await jsonChain.invoke({}) as T;
+      return await jsonParser.invoke(rawResponse) as T;
     } catch (error) {
       console.error('LLMService: Error generating content:', error);
       throw error;
@@ -169,11 +196,13 @@ export class LLMService {
    * Generate HTML content with required output format
    * @param systemPrompt System prompt for HTML generation
    * @param userPrompt User prompt with HTML requirements
+   * @param onUsage Optional callback invoked with token usage after the LLM call
    * @returns The generated HTML content as a string
    */
   async generateHTML(
     systemPrompt: string,
-    userPrompt: string
+    userPrompt: string,
+    onUsage?: OnUsageCallback
   ): Promise<string> {
     try {
       const htmlSystemPrompt = `${systemPrompt}
@@ -192,8 +221,12 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
         new HumanMessage(userPrompt),
       ];
 
-      const response = await this.chatModel.invoke(messages) as { content: string };
-      const rawResponse = response.content;
+      const response = await this.chatModel.invoke(messages) as any;
+      const rawResponse = typeof response.content === 'string' ? response.content : String(response.content || '');
+
+      if (onUsage) {
+        onUsage(this.extractUsage(response));
+      }
 
       // Extract HTML from <actual_html_content> tags
       const htmlMatch = rawResponse.match(/<actual_html_content>([\s\S]*?)<\/actual_html_content>/i);
@@ -234,4 +267,3 @@ export function createLLMService(
 ): LLMService {
   return new LLMService(modelName, temperature, maxTokens);
 }
-

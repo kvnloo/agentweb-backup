@@ -133,11 +133,23 @@ export async function addSubdomain(
       break; // Success — exit loop
     } catch (err: any) {
       const isConflict = err.response?.status === 409;
-      if (isConflict && attempt < MAX_RETRIES) {
-        // Append a random 4-char hex suffix and retry
-        const suffix = Math.random().toString(16).slice(2, 6);
-        finalSubdomain = `${cleanSubdomain}-${suffix}`.slice(0, 63);
-        continue;
+      if (isConflict) {
+        // Check if this domain is already on the same project — if so, treat as success
+        try {
+          await axios.get(
+            `${VERCEL_API_BASE}/v9/projects/${vercelProjectId}/domains/${fullDomain}`,
+            { headers }
+          );
+          // Domain exists on this project — no need to retry with a suffix
+          break;
+        } catch {
+          // Domain is on a different project — retry with a suffix
+        }
+        if (attempt < MAX_RETRIES) {
+          const suffix = Math.random().toString(16).slice(2, 6);
+          finalSubdomain = `${cleanSubdomain}-${suffix}`.slice(0, 63);
+          continue;
+        }
       }
       throw err; // Not a conflict or out of retries — propagate
     }

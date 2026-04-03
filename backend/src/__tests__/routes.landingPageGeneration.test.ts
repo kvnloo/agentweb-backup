@@ -1,5 +1,6 @@
 import express from "express";
 import request from "supertest";
+import { extractTemplateOutline } from "../services/v0Service";
 
 // Mock aws-sdk
 jest.mock("aws-sdk", () => {
@@ -44,10 +45,23 @@ jest.mock("../middleware/auth", () => ({
 
 // Mock db service
 const mockGetUserById = jest.fn();
+const mockGetLeadListById = jest.fn();
+const mockUpdateLeadList = jest.fn();
+
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: mockGetUserById,
   },
+  crmDb: {
+    getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
+    updateLeadList: (...args: any[]) => mockUpdateLeadList(...args),
+  },
+}));
+
+// Mock customDomainService
+const mockListDomainsForPages = jest.fn();
+jest.mock("../services/customDomainService", () => ({
+  listDomains: (...args: any[]) => mockListDomainsForPages(...args),
 }));
 
 // Mock the v0Service module (service-level mock for route tests)
@@ -66,7 +80,17 @@ jest.mock("../services/v0Service", () => ({
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
   buildBrandEnrichedPrompt: jest.fn(),
+  extractTemplateOutline: jest.fn(),
   BrandContext: {},
+}));
+
+const mockedExtractOutline = extractTemplateOutline as jest.MockedFunction<typeof extractTemplateOutline>;
+
+const mockGetSetting = jest.fn();
+jest.mock("../services/settingsService", () => ({
+  settingsService: {
+    getSetting: (...args: any[]) => mockGetSetting(...args),
+  },
 }));
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
@@ -79,6 +103,8 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockGetUserById.mockResolvedValue(null);
   mockListLandingPages.mockResolvedValue([]);
+  mockListDomainsForPages.mockResolvedValue([]);
+  mockGetSetting.mockResolvedValue(null);
   _resetRateLimitState();
 });
 
@@ -191,6 +217,101 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(brandCtx.brandPersonality).toBe("Bold");
     expect(brandCtx.targetAudience).toBe("Startups");
     expect(brandCtx.logoUrl).toBe("https://example.com/logo.png");
+  });
+
+  it("SUCCESS: template_name provided → loads and extracts template from settings", async () => {
+    mockGetSetting.mockImplementation(async (key: string) => {
+      if (key === "templates_test-user-id") {
+        return {
+          settingValue: JSON.stringify([
+            { template_name: "event-marketing", html_content: "<html>Full Template</html>" },
+          ]),
+        };
+      }
+      return null;
+    });
+    mockedExtractOutline.mockReturnValue("Condensed Outline");
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({
+        prompt: "Create a B2B page",
+        template_name: "event-marketing"
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockGetSetting).toHaveBeenCalledWith("templates_test-user-id");
+    expect(mockedExtractOutline).toHaveBeenCalledWith("<html>Full Template</html>");
+
+    // Verify generateLandingPage received the condensed HTML (6th arg)
+    const callArgs = mockGenerateLandingPage.mock.calls[0];
+    expect(callArgs[5]).toBe("Condensed Outline");
+  });
+
+  it("EDGE: valid template_name but template missing in settings → generation proceeds without template", async () => {
+    mockGetSetting.mockResolvedValue(null);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", template_name: "event-marketing" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetSetting).toHaveBeenCalled();
+    // But generation still proceeded — template_html arg (index 5) should be undefined
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("EDGE: unknown template_name is ignored, generation proceeds without template", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", template_name: "unknown-xyz" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetSetting).toHaveBeenCalled();
+    // template_html arg (index 5) should be undefined
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("SUCCESS: pulls market strategy and passes to generation", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "test-user-id",
+      marketStrategy: {
+        businessOverview: "Enterprise AI Agents",
+        icp: [{ title: "CTO", description: "Decision maker" }],
+        competitors: [{ name: "LegacyCo", description: "Old tool" }]
+      }
+    });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    const brandCtx = mockGenerateLandingPage.mock.calls[0][3];
+    expect(brandCtx.businessOverview).toBe("Enterprise AI Agents");
+    expect(brandCtx.icp[0].title).toBe("CTO");
+    expect(brandCtx.competitors[0].name).toBe("LegacyCo");
+  });
+
+  it("SUCCESS: auto-enables public access on lead list if disabled", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValueOnce({ id: "list-123", publicAccessEnabled: false });
+    mockUpdateLeadList.mockResolvedValueOnce({});
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-123" });
+
+    // Verify crmDb.updateLeadList was called to enable public access
+    expect(mockUpdateLeadList).toHaveBeenCalledWith("list-123", { publicAccessEnabled: true });
+    
+    // Verify generation service was called with the lead_list_id
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
 });
 
@@ -312,6 +433,76 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.pages).toHaveLength(2);
+  });
+
+  it("FAIL: page with vercelProjectId but no customDomainUrl → enriched from AW-CustomDomains", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://mysite.agentwebforms.com");
+  });
+
+  it("FAIL: multiple domains for same project → uses most recent one", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "old.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
+      { id: "dom-2", domain: "new.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://new.agentwebforms.com");
+  });
+
+  it("FAIL: page already has customDomainUrl → not overwritten by domain lookup", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", customDomainUrl: "https://existing.agentwebforms.com", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "other.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://existing.agentwebforms.com");
+  });
+
+  it("FAIL: domain lookup fails → still returns pages without crash", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockRejectedValueOnce(new Error("DynamoDB error"));
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages).toHaveLength(1);
+    expect(res.body.pages[0].customDomainUrl).toBeUndefined();
+  });
+
+  it("FAIL: page with no vercelProjectId → customDomainUrl not populated", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", status: "draft" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBeUndefined();
   });
 });
 

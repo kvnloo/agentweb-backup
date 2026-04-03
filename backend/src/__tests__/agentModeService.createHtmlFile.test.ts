@@ -135,7 +135,8 @@ describe('AgentModeService - createHtmlFile', () => {
 
       expect(mockGenerateHTML).toHaveBeenCalledWith(
         expect.stringContaining('dark theme'),
-        expect.stringContaining('Format Requirements:\nUse dark theme with modern design')
+        expect.stringContaining('Format Requirements:\nUse dark theme with modern design'),
+        expect.any(Function)
       );
     });
 

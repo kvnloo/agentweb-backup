@@ -589,11 +589,11 @@ router.put("/users/:userId/email-sender", async (req, res) => {
   }
 });
 
-// Update user slack channel
+// Update user slack channels (accepts an array)
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { slackChannel } = req.body;
+    const { slackChannels } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -601,14 +601,18 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Update the user's slack channel
+    // Validate: must be an array of non-empty strings (or null/empty to clear)
+    const channels: string[] = Array.isArray(slackChannels)
+      ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
+      : [];
+
     const updatedUser = await userDb.updateUser(userId, {
-      slackChannel
+      slackChannels: channels.length > 0 ? channels : (null as any),
     });
     res.json(updatedUser);
   } catch (error) {
-    console.error("Error updating user slack channel:", error);
-    res.status(500).json({ message: "Error updating slack channel" });
+    console.error("Error updating user slack channels:", error);
+    res.status(500).json({ message: "Error updating slack channels" });
   }
 });
 

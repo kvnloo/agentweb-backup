@@ -3,20 +3,18 @@ import AWS from "aws-sdk";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
-import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
 import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
 
-// v0 code generation can take several minutes — extend Node's default fetch timeouts.
-// Node 20's built-in undici has headersTimeout=300s which is too short for v0.
-setGlobalDispatcher(new Agent({
-  headersTimeout: 10 * 60 * 1000,  // 10 minutes
-  bodyTimeout: 10 * 60 * 1000,     // 10 minutes
-  connectTimeout: 30 * 1000,       // 30 seconds for initial connection
-}));
-console.log("[V0 SERVICE] Extended fetch timeouts to 10 minutes for v0 API calls");
+// Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
+// No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
+
+// Timeout constants for external API calls
+const GITHUB_API_TIMEOUT_MS = 60_000;
+const VERCEL_API_TIMEOUT_MS = 60_000;
+const VERCEL_POLL_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Retry helper — exponential backoff for transient network failures
@@ -83,6 +81,11 @@ export async function withRetry<T>(
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
+  httpOptions: {
+    // AWS SDK v2 defaults to 0 (no timeout), which can cause indefinite hangs on network issues.
+    timeout: 30_000,
+    connectTimeout: 5_000,
+  },
 });
 
 const TABLE_PREFIX =
@@ -140,7 +143,7 @@ export interface BrandContext {
  * Sends section structure, CSS variables, and key patterns to v0 as inspiration
  * without overwhelming its prompt limits.
  */
-function extractTemplateOutline(fullHtml: string): string {
+export function extractTemplateOutline(fullHtml: string): string {
   const sections: string[] = [];
 
   // Extract CSS variables block (design tokens)
@@ -274,6 +277,54 @@ export function buildBrandEnrichedPrompt(
 }
 
 /**
+ * Load the landing-page-v2 template outline as a fallback design inspiration for v0.
+ * Checks email_templates_public → templates_public → filesystem, in that order.
+ */
+async function loadDefaultTemplateOutline(): Promise<string | undefined> {
+  const parseArr = (s: any): any[] => {
+    if (!s?.settingValue) return [];
+    try { return JSON.parse(s.settingValue); } catch { return []; }
+  };
+
+  try {
+    const oldPublicSetting = await settingsService.getSetting("email_templates_public");
+    const oldMatch = parseArr(oldPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
+    if (oldMatch?.html_content) {
+      const outline = extractTemplateOutline(oldMatch.html_content);
+      console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from email_templates_public (${outline.length} chars)`);
+      return outline;
+    }
+  } catch (err) {
+    console.warn("[V0 SERVICE] Could not load from email_templates_public:", err);
+  }
+
+  try {
+    const newPublicSetting = await settingsService.getSetting("templates_public");
+    const newMatch = parseArr(newPublicSetting).find((t: any) => t.template_name === "landing-page-v2");
+    if (newMatch?.html_content) {
+      const outline = extractTemplateOutline(newMatch.html_content);
+      console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from templates_public (${outline.length} chars)`);
+      return outline;
+    }
+  } catch (err) {
+    console.warn("[V0 SERVICE] Could not load from templates_public:", err);
+  }
+
+  try {
+    const fallbackPath = path.join(__dirname, "..", "templates", "landing-page-v2.html");
+    if (fs.existsSync(fallbackPath)) {
+      const outline = extractTemplateOutline(fs.readFileSync(fallbackPath, "utf-8"));
+      console.log(`[V0 SERVICE] Loaded landing-page-v2 outline from filesystem (${outline.length} chars)`);
+      return outline;
+    }
+  } catch (fsErr) {
+    console.warn("[V0 SERVICE] Filesystem template fallback failed:", fsErr);
+  }
+
+  return undefined;
+}
+
+/**
  * Create a v0 client using the stored API key.
  * Uses dynamic import since v0-sdk is an ESM package.
  */
@@ -339,46 +390,7 @@ async function generateFirstPage(
 
   // Auto-load the HTML template structure as design inspiration for v0.
   // We send a condensed outline (not the full 55KB HTML) to avoid exceeding v0 prompt limits.
-  let effectiveTemplate = templateHtml;
-  if (!effectiveTemplate) {
-    try {
-      const publicSetting = await settingsService.getSetting("email_templates_public");
-      if (publicSetting) {
-        let templates: any[];
-        try {
-          templates = JSON.parse(publicSetting.settingValue);
-        } catch (parseErr) {
-          console.warn("[V0 SERVICE] email_templates_public settingValue is not valid JSON, continuing without template");
-          templates = [];
-        }
-        const match = templates.find((t: any) => t.template_name === "landing-page-v2");
-        if (match && match.html_content) {
-          effectiveTemplate = extractTemplateOutline(match.html_content);
-          console.log(`[V0 SERVICE] Loaded landing page template outline from DynamoDB (${effectiveTemplate.length} chars) as design inspiration`);
-        } else {
-          console.warn("[V0 SERVICE] landing-page-v2 template not found in email_templates_public, continuing without");
-        }
-      } else {
-        console.warn("[V0 SERVICE] email_templates_public setting not found, trying filesystem fallback");
-      }
-    } catch (err) {
-      console.warn("[V0 SERVICE] Could not load landing page template from DynamoDB, trying filesystem fallback:", err);
-    }
-
-    // Filesystem fallback: if DynamoDB didn't yield a template, try the local file
-    if (!effectiveTemplate) {
-      try {
-        const fallbackPath = path.join(__dirname, "..", "templates", "landing-page-v2.html");
-        if (fs.existsSync(fallbackPath)) {
-          const fallbackHtml = fs.readFileSync(fallbackPath, "utf-8");
-          effectiveTemplate = extractTemplateOutline(fallbackHtml);
-          console.log(`[V0 SERVICE] Loaded landing page template outline from filesystem fallback (${effectiveTemplate.length} chars)`);
-        }
-      } catch (fsErr) {
-        console.warn("[V0 SERVICE] Filesystem template fallback also failed, continuing without:", fsErr);
-      }
-    }
-  }
+  const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
 
   const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
 
@@ -529,7 +541,10 @@ async function addPageToExistingRepo(
 
   try {
     // ── Step 1: Call v0 to generate proper page content ──
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, templateHtml);
+    // If no template provided, fall back to landing-page-v2 (same behaviour as generateFirstPage)
+    const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
+
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
@@ -666,7 +681,7 @@ async function addPageToExistingRepo(
     // Get latest commit SHA
     const refRes = await axios.get<any>(
       `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-      { headers: ghHeaders }
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
     const latestCommitSha = refRes.data.object.sha;
 
@@ -678,7 +693,7 @@ async function addPageToExistingRepo(
           content: file.content.toString("base64"),
           encoding: "base64",
         },
-        { headers: ghHeaders }
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
       );
       return {
         path: file.path,
@@ -693,7 +708,7 @@ async function addPageToExistingRepo(
     const treeRes = await axios.post<any>(
       `https://api.github.com/repos/${repoFullName}/git/trees`,
       { base_tree: latestCommitSha, tree: treeItems },
-      { headers: ghHeaders }
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
 
     const commitRes = await axios.post<any>(
@@ -703,20 +718,24 @@ async function addPageToExistingRepo(
         tree: treeRes.data.sha,
         parents: [latestCommitSha],
       },
-      { headers: ghHeaders }
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
 
     await axios.patch<any>(
       `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
       { sha: commitRes.data.sha },
-      { headers: ghHeaders }
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
+
+    // Capture timestamp after the ref push (Vercel webhook fires on push).
+    // pollVercelDeployment uses this to ignore pre-existing READY deployments.
+    const pushTimestampMs = Date.now();
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} — polling Vercel for build status`);
 
     // Poll Vercel deployment to verify the build succeeds before marking as deployed
     const vercelToken = await getVercelToken();
-    const deploymentResult = await pollVercelDeployment(existingPage.vercelProjectId!, vercelToken);
+    const deploymentResult = await pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs);
 
     if (deploymentResult.buildStatus === "error" || deploymentResult.buildStatus === "timeout") {
       const errorMsg = `Vercel build failed for /${slug}: ${deploymentResult.buildError || "Unknown build error"}`;
@@ -849,27 +868,40 @@ export function remapFilesForSubPage(
   }
 
   // Rewrite imports in all committed .tsx/.ts files
-  if (componentRenames.size > 0) {
-    for (const file of result) {
-      if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
-      let content = file.content.toString("utf-8");
-      let changed = false;
+  for (const file of result) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+    let content = file.content.toString("utf-8");
+    let changed = false;
 
-      for (const [oldImport, newImport] of componentRenames) {
-        // Match: import ... from "@/components/foo" or '@/components/foo'
-        const regex = new RegExp(
-          `(from\\s+['"])${oldImport.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(['"])`,
-          "g"
-        );
-        if (regex.test(content)) {
-          content = content.replace(regex, `$1${newImport}$2`);
-          changed = true;
-        }
+    // 1. Rewrite @/components/foo → ./_components/foo (absolute → relative)
+    for (const [oldImport, newImport] of componentRenames) {
+      const regex = new RegExp(
+        `(from\\s+['"])${oldImport.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(['"])`,
+        "g"
+      );
+      if (regex.test(content)) {
+        content = content.replace(regex, `$1${newImport}$2`);
+        changed = true;
       }
+    }
 
-      if (changed) {
-        file.content = Buffer.from(content);
+    // 2. Fix relative imports inside _components/ files.
+    //    When v0 generates a component at components/foo.tsx that imports
+    //    from "./_components/bar", after remapping to _components/foo.tsx
+    //    the sibling is at _components/bar.tsx — so strip the extra "_components/" prefix.
+    if (file.path.includes(`/_components/`)) {
+      const fixedContent = content.replace(
+        /(from\s+['"])\.?\/_components\//g,
+        "$1./"
+      );
+      if (fixedContent !== content) {
+        content = fixedContent;
+        changed = true;
       }
+    }
+
+    if (changed) {
+      file.content = Buffer.from(content);
     }
   }
 
@@ -1285,7 +1317,7 @@ async function createGitHubRepoAndPush(
       private: true,
       auto_init: true, // Creates an initial commit with README
     },
-    { headers }
+    { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
   const githubRepoUrl = createRepoRes.data.html_url;
@@ -1359,7 +1391,7 @@ async function createGitHubRepoAndPush(
   // Step A: Get the default branch SHA
   const refRes = await axios.get<any>(
     `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-    { headers }
+    { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
   const latestCommitSha = refRes.data.object.sha;
 
@@ -1371,7 +1403,7 @@ async function createGitHubRepoAndPush(
         content: file.content.toString("base64"),
         encoding: "base64",
       },
-      { headers }
+      { headers, timeout: GITHUB_API_TIMEOUT_MS }
     );
     return {
       path: file.path,
@@ -1389,7 +1421,7 @@ async function createGitHubRepoAndPush(
       base_tree: latestCommitSha,
       tree: treeItems,
     },
-    { headers }
+    { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
   // Step D: Create a commit
@@ -1400,14 +1432,14 @@ async function createGitHubRepoAndPush(
       tree: treeRes.data.sha,
       parents: [latestCommitSha],
     },
-    { headers }
+    { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
   // Step E: Update the ref to point to the new commit
   await axios.patch<any>(
     `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
     { sha: commitRes.data.sha },
-    { headers }
+    { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
   console.log(`[V0 SERVICE] Pushed ${files.length} files to ${repoFullName}`);
@@ -1442,7 +1474,7 @@ async function createVercelProject(
         repo: repoFullName,
       },
     },
-    { headers }
+    { headers, timeout: VERCEL_API_TIMEOUT_MS }
   );
 
   const vercelProjectId = createRes.data.id;
@@ -1459,7 +1491,7 @@ async function createVercelProject(
     await axios.patch(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
       { ssoProtection: null, passwordProtection: null, trustedIps: null },
-      { headers }
+      { headers, timeout: VERCEL_API_TIMEOUT_MS }
     );
     console.log(`[V0 SERVICE] Disabled deployment protection for ${projectName}`);
   } catch (authErr: any) {
@@ -1470,9 +1502,13 @@ async function createVercelProject(
   const { token: ghToken } = await getGitHubOrgToken();
   const repoInfoRes = await axios.get<any>(`https://api.github.com/repos/${repoFullName}`, {
     headers: { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" },
+    timeout: 30_000,
   });
   const repoId = repoInfoRes.data.id;
 
+  // Capture timestamp immediately before triggering — pollVercelDeployment uses
+  // this to ignore any pre-existing READY deployment.
+  const deployTriggerMs = Date.now();
   try {
     await axios.post<any>(
       "https://api.vercel.com/v13/deployments",
@@ -1481,7 +1517,7 @@ async function createVercelProject(
         project: vercelProjectId,
         gitSource: { type: "github", repo: repoFullName, ref: "main", repoId },
       },
-      { headers }
+      { headers, timeout: VERCEL_API_TIMEOUT_MS }
     );
     console.log(`[V0 SERVICE] Triggered manual deployment for ${projectName}`);
   } catch (deployErr: any) {
@@ -1489,8 +1525,8 @@ async function createVercelProject(
     console.warn(`[V0 SERVICE] Manual deploy trigger failed (may already be deploying): ${deployErr.message}`);
   }
 
-  // Poll for deployment status
-  const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken);
+  // Poll for deployment status — only accept deployments created after our trigger
+  const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken, deployTriggerMs);
 
   // After deployment, fetch the project to get the real production alias.
   // Vercel truncates long project names in domains (e.g. our requested name
@@ -1500,7 +1536,7 @@ async function createVercelProject(
   try {
     const projectRes = await axios.get<any>(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
-      { headers }
+      { headers, timeout: VERCEL_API_TIMEOUT_MS }
     );
     const productionAliases: string[] = projectRes.data?.targets?.production?.alias || [];
     const vercelDomain = productionAliases.find((a: string) => a.endsWith(".vercel.app"));
@@ -1519,26 +1555,28 @@ async function createVercelProject(
 }
 
 /**
- * Poll Vercel for the latest deployment status. Returns build status and errors if any.
- * Polls every 10s for up to 5 minutes.
+ * Poll Vercel for a deployment created at or after `sinceMs` (Unix ms).
+ * Passing sinceMs prevents catching a previously-READY deployment when a new
+ * build has just been triggered by a GitHub push.
  */
 async function pollVercelDeployment(
   projectId: string,
-  vercelToken: string
+  vercelToken: string,
+  sinceMs?: number
 ): Promise<{ buildStatus: string; buildError?: string }> {
   const headers = { Authorization: `Bearer ${vercelToken}` };
 
   for (let attempt = 0; attempt < vercelPollMaxAttempts; attempt++) {
     try {
-      // List deployments for this project
+      const sinceParam = sinceMs !== undefined ? `&since=${sinceMs}` : "";
       const deploymentsRes = await axios.get<any>(
-        `https://api.vercel.com/v6/deployments?projectId=${projectId}&limit=1`,
-        { headers }
+        `https://api.vercel.com/v6/deployments?projectId=${projectId}&limit=1${sinceParam}`,
+        { headers, timeout: VERCEL_POLL_TIMEOUT_MS }
       );
 
       const deployment = deploymentsRes.data?.deployments?.[0];
       if (!deployment) {
-        console.log(`[V0 SERVICE] No deployment found yet (attempt ${attempt + 1})`);
+        console.log(`[V0 SERVICE] No deployment found yet${sinceMs !== undefined ? ` after ${new Date(sinceMs).toISOString()}` : ""} (attempt ${attempt + 1})`);
         await new Promise(r => setTimeout(r, vercelPollIntervalMs));
         continue;
       }
@@ -1578,7 +1616,7 @@ async function getVercelBuildErrors(deploymentId: string, vercelToken: string): 
     const headers = { Authorization: `Bearer ${vercelToken}` };
     const eventsRes = await axios.get<any>(
       `https://api.vercel.com/v3/deployments/${deploymentId}/events?limit=-1`,
-      { headers }
+      { headers, timeout: VERCEL_POLL_TIMEOUT_MS }
     );
 
     const events = eventsRes.data || [];

@@ -9,6 +9,68 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-03',
+    changes: [
+      'Error Reports Now Route Directly to the Engineering Team',
+      '- Error reports submitted via the "Report an Error" button are now sent directly to the engineering team for faster triage',
+      'Fix: Emma No Longer Auto-Replies to Slack Messages',
+      '- Removed a behavior where Emma would automatically respond to any message posted in a connected Slack channel',
+      '- Emma now only replies when explicitly @mentioned in Slack',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Fix: No More Duplicate Responses When Messages Are Sent Quickly',
+      '- Sending a new message while a response is still being generated no longer causes duplicate or overlapping responses',
+      '- Messages sent while the AI is still responding are now queued and delivered automatically once the current response finishes',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Fix: Custom Domain URL Now Shows Correctly on Landing Pages',
+      '- Fixed an issue where landing pages created before domain linking was introduced did not display their custom domain URL',
+      '- The landing page list now automatically looks up and fills in the custom domain for any page that has a linked Vercel project',
+      '- Subdomain creation no longer fails if the landing page record update encounters a transient error',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Settings: Each Tab Now Has Its Own URL',
+      '- Settings tabs are now bookmarkable and shareable — e.g. /settings/profile, /settings/accounts, /settings/billing',
+      '- The browser back button now works correctly when navigating between Settings tabs',
+      '- Visiting /settings redirects automatically to /settings/profile',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Fix: Expand Button in Scheduled Chat Now Works Correctly',
+      '- Fixed an issue where clicking "Expand" next to the Starting Message in the schedule editor did not open the full-screen editing popup',
+    ],
+  },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Improved Session Cost Tracking for AI Tools',
+      '- Token usage and costs from tools that call AI models internally (HTML generation, book content, image generation, video generation) are now counted toward your monthly usage total',
+      '- Each session record now includes a per-tool cost breakdown so you can see exactly which tools consumed AI credits',
+      'Emma: Slack Thread Replies Included in Channel Review',
+      '- When Emma reviews a Slack channel, she now automatically fetches and reads all thread replies for each message',
+      '- This lets Emma determine whether a question has already been answered before suggesting a follow-up',
+      '- A new slack_get_thread_replies tool is also available for fetching the latest replies on a specific thread on demand',
+      'Fix: Landing Page Generation No Longer Times Out',
+      '- Fixed a bug where generate_landing_page consistently aborted with "This operation was aborted" on the first attempt',
+      '- Root cause: DynamoDB reads at the start of generation had no timeout, causing indefinite hangs that eventually hit the 15-minute abort limit',
+      '- DynamoDB client now has a 30-second timeout; all GitHub and Vercel API calls also have explicit timeouts',
+      '- Extended the generate_landing_page tool timeout from 15 to 25 minutes for extra headroom on slow v0 builds',
+      '- Fixed a 404 after generating additional landing pages: Vercel polling now waits for the newly triggered build instead of returning the previous deployment',
+      '- Fixed broken import paths in multi-page sites where component files referenced sibling components via an incorrect nested path',
+    ],
+  },
+  {
     date: '2026-04-01',
     changes: [
       'Emma Now Responds to Client Slack Messages Automatically',
@@ -3518,6 +3580,121 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Emma Now Knows Your Profile',
       '- Emma can look up your account email, name, company, and subscription when you ask',
       '- Uses the new get_user_profile foundation tool — available everywhere without installing a skill',
+    ],
+  },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Choose AI Model for Your Work Plans',
+      '- Private work plans in Settings now support selecting a specific AI model',
+      '- Override the agent mode default on a per-plan basis using the new "Default AI Model" dropdown',
+    ],
+  },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Custom Subdomain for Landing Pages Now Persists',
+      '- Setting a custom subdomain (e.g. rankai.agentwebforms.com) on a landing page now saves correctly',
+      '- The custom URL is shown in the Landing Pages view after page reload',
+      '- If a subdomain was already registered in Vercel, Set Subdomain now correctly recognises it instead of creating a duplicate',
+    ],
+  },
+  {
+    date: '2026-04-01',
+    changes: [
+      'Copy Button Fix in Agent Mode',
+      '- Fixed copy buttons in Agent Mode chat that required precise clicking to activate',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Token Usage History Now Tracked Per User',
+      '- Previous months\' token usage is now archived automatically on monthly reset',
+      '- Up to 24 months of history stored per user',
+      '- Admins can view per-user token usage history in the Admin Dashboard',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Paid Social Now Works with Connected Meta Ad Accounts',
+      '- The Paid Social dashboard now uses your connected Meta ad account when no legacy ad account is configured',
+      '- Ad performance data, campaigns, and ad sets are fetched using the access token from the connected account',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Clearer Message When Admin Tools Are Blocked in Shared Sessions',
+      '- Admin tools (e.g. manage skills, work plans) are restricted to your own session for security reasons',
+      '- If an admin tool is invoked during a shared session, the agent now explains you can use it in your own Agent Mode session',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Client List Now Includes Sign-Up Date',
+      '- The list_all_clients agent tool now returns a signup_time field for each client',
+      '- Enables the AI agent to report when each account was created during health assessments',
+      'Opus Models Now Admin-Only',
+      '- Claude Opus models are no longer available for standard user accounts',
+      '- Admins continue to have full access to Opus models in Agent Mode and Reports',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now See Your Browser Screen',
+      '- Emma and Agent Mode can view a screenshot of your current page when you ask for help',
+      '- Browser screenshots taken during agent tasks are displayed inline in the chat',
+      '- Screenshots are uploaded to secure storage instead of sending large image payloads',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Send and Read Slack Messages',
+      '- Emma can send messages to your Slack channel and read recent messages',
+      '- Regular users are automatically scoped to their configured channel — no need to specify it',
+      '- Admins can target any channel as before',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Connect Your Own Facebook Ad Account for Paid Social',
+      '- The "Ad Account Not Configured" screen now guides you to connect your Facebook ad account directly',
+      '- Click the new "Go to Connected Accounts" button to open Settings → Connected Accounts',
+      '- No longer requires an admin to configure the ad account on your behalf',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Configure Multiple Slack Channels Per User',
+      '- Admins can now assign multiple Slack channels to a user from the Users tab',
+      '- Emma\'s Slack tools are restricted to the user\'s configured channels',
+      '- When multiple channels are configured, users must specify which channel to use',
+      '- Single-channel users continue to work as before with no change required',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Add Logos to Landing Pages',
+      '- Ask Emma to add company logos to any landing page and she will handle it automatically',
+      '- For well-known public companies, logos are pulled from Google\'s favicon service — no uploading required',
+      '- For your own brand logo, Emma looks it up from your brand guidelines and places it on the page',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'More Accurate PDF Data Extraction',
+      '- Numbers and values in PDF tables are now correctly separated from their labels',
+      '- Fixed an issue where table columns were concatenated without spaces (e.g. "Keywords ranked73" is now "Keywords ranked 73")',
+      '- Applies to all PDF files read by Agent Mode, including uploaded reports and knowledge base files',
     ],
   },
 ];

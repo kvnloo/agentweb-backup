@@ -16,7 +16,7 @@ import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { isTransientLLMError } from '../utils/agentModeErrors';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -718,6 +718,35 @@ export class ChatbotDB {
       } else {
         console.error(`Error incrementing token usage for session ${sessionId}:`, error);
       }
+    }
+  }
+
+  /**
+   * Atomically add a tool-generated cost to the session's totalCost and toolCosts breakdown map.
+   * Used when tools make their own LLM/API calls (e.g. LLMService, image gen, video gen).
+   *
+   * Two DynamoDB calls are required: DynamoDB cannot initialize a map and increment a nested key
+   * in a single expression — SET processes before ADD within a request, so the map is guaranteed
+   * to exist when the nested ADD runs.
+   */
+  async addToolCostToSession(sessionId: string, cost: number, toolName: string): Promise<void> {
+    if (cost <= 0) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET toolCosts = if_not_exists(toolCosts, :emptyMap) ADD totalCost :cost',
+        ExpressionAttributeValues: { ':emptyMap': {}, ':cost': cost },
+      }).promise();
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'ADD toolCosts.#tool :cost',
+        ExpressionAttributeNames: { '#tool': toolName },
+        ExpressionAttributeValues: { ':cost': cost },
+      }).promise();
+    } catch (error) {
+      console.error(`Error adding tool cost to session ${sessionId}:`, error);
     }
   }
 
@@ -3537,36 +3566,14 @@ export async function generateChatResponse(
     const timestamp = new Date().toISOString();
 
     // Upload screenshot to S3 if provided
-    let uploadedScreenshotUrl = screenshot;
+    let uploadedScreenshotUrl: string | undefined = screenshot?.startsWith('data:image') ? undefined : screenshot;
     let attachments: any[] | undefined;
-    
+
     if (screenshot && screenshot.startsWith('data:image')) {
-      try {
-        const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, "");
-        const buffer = Buffer.from(base64Data, 'base64');
-        const uploadResult = await uploadFileToS3(
-          buffer,
-          `screenshot-${Date.now()}.jpg`,
-          userId || 'anonymous',
-          'image/jpeg'
-        );
-        if (uploadResult.success && uploadResult.url) {
-          uploadedScreenshotUrl = uploadResult.url;
-          attachments = [{
-            url: uploadResult.url,
-            filename: 'screenshot.jpg',
-            size: buffer.length,
-            mimetype: 'image/jpeg',
-            uploadedAt: timestamp
-          }];
-        } else {
-          // Upload did not return a URL — don't send raw base64 to the LLM
-          uploadedScreenshotUrl = undefined;
-        }
-      } catch (err) {
-        console.error('Failed to upload screenshot to S3:', err);
-        // Don't send raw base64 to the LLM on upload failure
-        uploadedScreenshotUrl = undefined;
+      const result = await uploadScreenshotToS3(screenshot, userId || 'anonymous');
+      if (result) {
+        uploadedScreenshotUrl = result.url;
+        attachments = [{ ...result.attachment, uploadedAt: timestamp }];
       }
     }
 
@@ -3614,7 +3621,7 @@ export async function generateChatResponse(
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
       if (lastUserIdx >= 0) {
         (messages[lastUserIdx] as any).content = [
-          { type: 'text', text: messages[lastUserIdx].content },
+          { type: 'text', text: `${messages[lastUserIdx].content}\n\n[Page screenshot captured. URL: ${uploadedScreenshotUrl}]` },
           { type: 'image_url', image_url: { url: uploadedScreenshotUrl, detail: 'low' } }
         ];
       }
@@ -3754,7 +3761,7 @@ export async function generateChatResponse(
           'images':           ['generate_image', 'describe_image', 'get_visual_context'],
           'videos':           ['generate_video', 'describe_video', 'get_visual_context'],
           'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
-          'email-templates':  ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
+          'templates':        ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
           'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
           'research-reports': ['perform_deep_research', 'search_web'],
           'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
@@ -3999,8 +4006,8 @@ export async function generateChatResponse(
       'create_lead_list': ['crm'],
       'update_book_content': ['books'],
       'create_book': ['books'],
-      'create_html_from_template': ['email-templates'],
-      'update_html_file': ['email-templates'],
+      'create_html_from_template': ['templates'],
+      'update_html_file': ['templates'],
       'create_knowledge_base': ['knowledge-base'],
       'update_knowledge_base_file': ['knowledge-base'],
     };

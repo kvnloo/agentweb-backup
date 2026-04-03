@@ -247,3 +247,50 @@ export async function uploadFileToS3WithPath(
     };
   }
 }
+
+export interface ScreenshotUploadResult {
+  url: string;
+  attachment: {
+    url: string;
+    filename: string;
+    size: number;
+    mimetype: string;
+    uploadedAt: string;
+  };
+}
+
+/**
+ * Upload a base64 screenshot data URL to S3.
+ * Returns null if the input is not a data URL, or if the upload fails.
+ * Never passes raw base64 to callers on failure.
+ */
+export async function uploadScreenshotToS3(
+  screenshot: string,
+  userId: string
+): Promise<ScreenshotUploadResult | null> {
+  if (!screenshot.startsWith('data:image')) return null;
+  try {
+    const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    const uploadResult = await uploadFileToS3(
+      buffer,
+      `screenshot-${Date.now()}.jpg`,
+      userId,
+      'image/jpeg'
+    );
+    if (!uploadResult.success || !uploadResult.url) return null;
+    return {
+      url: uploadResult.url,
+      attachment: {
+        url: uploadResult.url,
+        filename: 'screenshot.jpg',
+        size: buffer.length,
+        mimetype: 'image/jpeg',
+        uploadedAt: new Date().toISOString(),
+      },
+    };
+  } catch (err) {
+    console.error('Failed to upload screenshot to S3:', err);
+    return null;
+  }
+}

@@ -31,7 +31,6 @@ jest.mock('../utils/crypto', () => ({
 }));
 
 jest.mock('axios');
-
 import landingPagesRouter, { extractProductionUrls } from '../routes/landingPages';
 import { userDb } from '../services/db';
 import { decryptPassword } from '../utils/crypto';

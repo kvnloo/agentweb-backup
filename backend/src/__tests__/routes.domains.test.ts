@@ -1,17 +1,23 @@
+// Capture the DynamoDB mock instance so individual tests can override behavior
+let mockDynamoInstance: any = null;
+
 // Mock aws-sdk before any imports
 jest.mock("aws-sdk", () => {
   return {
     __esModule: true,
     default: {
       DynamoDB: {
-        DocumentClient: jest.fn(() => ({
-          put: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-          get: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
-          update: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-          delete: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-          query: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
-          scan: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
-        })),
+        DocumentClient: jest.fn().mockImplementation(() => {
+          mockDynamoInstance = {
+            put: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+            get: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+            update: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+            delete: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+            query: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
+            scan: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
+          };
+          return mockDynamoInstance;
+        }),
       },
       SecretsManager: jest.fn(() => ({
         getSecretValue: jest.fn().mockReturnValue({
@@ -123,6 +129,26 @@ describe("Domain API Routes", () => {
         .send({ vercelProjectId: "proj-1" });
 
       expect(res.status).toBe(400);
+    });
+
+    it("FAIL: DB update for customDomainUrl throws → still returns 201 (non-fatal)", async () => {
+      mockAddSubdomain.mockResolvedValueOnce({
+        id: "dom-new",
+        domain: "mysite.agentwebforms.com",
+        type: "subdomain",
+        status: "active",
+      });
+      // Make the DynamoDB update fail (simulates ConditionalCheckFailedException)
+      mockDynamoInstance.update.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("ConditionalCheckFailedException")),
+      });
+
+      const res = await request(app)
+        .post("/api/domains/subdomain")
+        .send({ vercelProjectId: "proj-1", subdomain: "mysite", landingPageId: "page-123" });
+
+      expect(res.status).toBe(201);
+      expect(res.body.domain).toBe("mysite.agentwebforms.com");
     });
   });
 
