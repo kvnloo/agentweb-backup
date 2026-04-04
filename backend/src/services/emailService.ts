@@ -2,6 +2,7 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { resendService } from './resendService';
 import { chatbotDb } from './chatbotService';
+import { settingsService } from './settingsService';
 
 dotenv.config();
 
@@ -12,6 +13,14 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS
   }
 });
+
+// Env var ONCALL_EMAIL_LIST takes highest priority for oncall alerts.
+async function getAlertEmails(settingKey: string, fallback: string[]): Promise<string[]> {
+  if (settingKey === 'oncall_emails' && process.env.ONCALL_EMAIL_LIST) {
+    return process.env.ONCALL_EMAIL_LIST.split(',').filter(Boolean);
+  }
+  return settingsService.getJsonArraySetting(settingKey, fallback);
+}
 
 export const emailService = {
   // Escape HTML content to make it safe for emails
@@ -1428,7 +1437,7 @@ View Session: ${sessionUrl}`;
     notionUrl?: string
   ) {
     try {
-      const oncallEmails = process.env.ONCALL_EMAIL_LIST?.split(',').filter(Boolean) || ['ruiw@agentweb.pro'];
+      const oncallEmails = await getAlertEmails('oncall_emails', ['ruiw@agentweb.pro']);
       const env = process.env.NODE_ENV || 'unknown';
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 

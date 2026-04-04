@@ -21,6 +21,7 @@ import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../se
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
+import { validateEmail } from "../utils/validation";
 
 const router = express.Router();
 
@@ -4609,6 +4610,58 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   } catch (error: any) {
     console.error("Error scoring chat sessions with judge:", error);
     res.status(500).json({ message: "Failed to score chat sessions with judge" });
+  }
+});
+
+// Get alert email lists (oncall + product issue)
+router.get("/alert-emails", async (req, res) => {
+  try {
+    const [oncallEmails, productIssueEmails] = await Promise.all([
+      settingsService.getJsonArraySetting("oncall_emails", ["ruiw@agentweb.pro"]),
+      settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]),
+    ]);
+    res.json({ oncallEmails, productIssueEmails });
+  } catch (error: any) {
+    console.error("Error getting alert emails:", error);
+    res.status(500).json({ message: "Failed to get alert emails" });
+  }
+});
+
+// Update alert email lists
+router.put("/alert-emails", async (req, res) => {
+  try {
+    const { oncallEmails, productIssueEmails } = req.body;
+    const updatedBy = (req as any).user?.email || "unknown";
+
+    if (!Array.isArray(oncallEmails) || !Array.isArray(productIssueEmails)) {
+      return res.status(400).json({ message: "oncallEmails and productIssueEmails must be arrays" });
+    }
+
+    const allEmails = [...oncallEmails, ...productIssueEmails];
+    const invalid = allEmails.filter((e) => typeof e !== "string" || !validateEmail(e));
+    if (invalid.length > 0) {
+      return res.status(400).json({ message: `Invalid email addresses: ${invalid.join(", ")}` });
+    }
+
+    await Promise.all([
+      settingsService.setSetting(
+        "oncall_emails",
+        JSON.stringify(oncallEmails),
+        "Oncall alert email recipients",
+        updatedBy
+      ),
+      settingsService.setSetting(
+        "product_issue_emails",
+        JSON.stringify(productIssueEmails),
+        "Product issue / help message email recipients",
+        updatedBy
+      ),
+    ]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Error updating alert emails:", error);
+    res.status(500).json({ message: "Failed to update alert emails" });
   }
 });
 

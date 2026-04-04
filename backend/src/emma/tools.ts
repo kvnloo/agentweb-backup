@@ -5286,6 +5286,10 @@ emmaToolRegistry.register({
 
     const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
 
+    // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
+    const { settingsService } = await import('../services/settingsService');
+    const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+
     for (const issue of args.issues) {
       try {
         const issueContext: Record<string, any> = {
@@ -5310,10 +5314,9 @@ emmaToolRegistry.register({
           result.notionUrl
         );
 
-        // Send support email to founders (reuses Get Support pattern)
         await resendService.sendEmail({
           from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-          to: 'founders@agentweb.pro',
+          to: productIssueEmails,
           subject: `Product Issue from ${user.email}: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
