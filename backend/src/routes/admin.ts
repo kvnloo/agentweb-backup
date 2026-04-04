@@ -21,6 +21,7 @@ import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../se
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
+import { validateEmail } from "../utils/validation";
 
 const router = express.Router();
 
@@ -4615,21 +4616,10 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
 // Get alert email lists (oncall + product issue)
 router.get("/alert-emails", async (req, res) => {
   try {
-    const [oncallSetting, productIssueSetting] = await Promise.all([
-      settingsService.getSetting("oncall_emails"),
-      settingsService.getSetting("product_issue_emails"),
+    const [oncallEmails, productIssueEmails] = await Promise.all([
+      settingsService.getJsonArraySetting("oncall_emails", ["ruiw@agentweb.pro"]),
+      settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]),
     ]);
-
-    let oncallEmails = ["ruiw@agentweb.pro"];
-    let productIssueEmails = ["founders@agentweb.pro"];
-
-    if (oncallSetting) {
-      try { oncallEmails = JSON.parse(oncallSetting.settingValue); } catch { /* keep default */ }
-    }
-    if (productIssueSetting) {
-      try { productIssueEmails = JSON.parse(productIssueSetting.settingValue); } catch { /* keep default */ }
-    }
-
     res.json({ oncallEmails, productIssueEmails });
   } catch (error: any) {
     console.error("Error getting alert emails:", error);
@@ -4647,9 +4637,8 @@ router.put("/alert-emails", async (req, res) => {
       return res.status(400).json({ message: "oncallEmails and productIssueEmails must be arrays" });
     }
 
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     const allEmails = [...oncallEmails, ...productIssueEmails];
-    const invalid = allEmails.filter((e) => typeof e !== "string" || !emailRegex.test(e));
+    const invalid = allEmails.filter((e) => typeof e !== "string" || !validateEmail(e));
     if (invalid.length > 0) {
       return res.status(400).json({ message: `Invalid email addresses: ${invalid.join(", ")}` });
     }

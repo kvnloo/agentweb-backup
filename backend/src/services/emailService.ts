@@ -14,22 +14,12 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// Read alert email list from AW-Settings, falling back to hardcoded default.
-// Env var ONCALL_EMAIL_LIST still takes highest priority for oncall_emails.
+// Env var ONCALL_EMAIL_LIST takes highest priority for oncall alerts.
 async function getAlertEmails(settingKey: string, fallback: string[]): Promise<string[]> {
   if (settingKey === 'oncall_emails' && process.env.ONCALL_EMAIL_LIST) {
     return process.env.ONCALL_EMAIL_LIST.split(',').filter(Boolean);
   }
-  try {
-    const setting = await settingsService.getSetting(settingKey);
-    if (setting) {
-      const parsed = JSON.parse(setting.settingValue);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed as string[];
-    }
-  } catch {
-    // fall through to default
-  }
-  return fallback;
+  return settingsService.getJsonArraySetting(settingKey, fallback);
 }
 
 export const emailService = {

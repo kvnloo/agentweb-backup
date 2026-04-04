@@ -15,6 +15,8 @@ import axios from 'axios';
 import { buildApiUrl } from '../../config';
 import { useAuth } from '../../contexts/AuthContext';
 
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export default function AlertEmailsTab() {
   const { token } = useAuth();
   const [loading, setLoading] = useState(true);
@@ -51,22 +53,17 @@ export default function AlertEmailsTab() {
     }
   }, [error, success]);
 
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-  const addOncall = () => {
-    const email = newOncall.trim().toLowerCase();
+  const addEmail = (
+    newValue: string,
+    list: string[],
+    setList: (v: string[]) => void,
+    setNew: (v: string) => void,
+  ) => {
+    const email = newValue.trim().toLowerCase();
     if (!emailRegex.test(email)) { setError('Invalid email address'); return; }
-    if (oncallEmails.includes(email)) { setError('Email already in list'); return; }
-    setOncallEmails([...oncallEmails, email]);
-    setNewOncall('');
-  };
-
-  const addProduct = () => {
-    const email = newProduct.trim().toLowerCase();
-    if (!emailRegex.test(email)) { setError('Invalid email address'); return; }
-    if (productIssueEmails.includes(email)) { setError('Email already in list'); return; }
-    setProductIssueEmails([...productIssueEmails, email]);
-    setNewProduct('');
+    if (list.includes(email)) { setError('Email already in list'); return; }
+    setList([...list, email]);
+    setNew('');
   };
 
   const handleSave = async () => {
@@ -132,10 +129,14 @@ export default function AlertEmailsTab() {
               type="email"
               value={newOncall}
               onChange={(e) => setNewOncall(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addOncall()}
+              onKeyDown={(e) => e.key === 'Enter' && addEmail(newOncall, oncallEmails, setOncallEmails, setNewOncall)}
               fullWidth
             />
-            <IconButton onClick={addOncall} color="primary" disabled={!newOncall.trim()}>
+            <IconButton
+              onClick={() => addEmail(newOncall, oncallEmails, setOncallEmails, setNewOncall)}
+              color="primary"
+              disabled={!newOncall.trim()}
+            >
               <AddIcon />
             </IconButton>
           </Box>
@@ -169,10 +170,14 @@ export default function AlertEmailsTab() {
               type="email"
               value={newProduct}
               onChange={(e) => setNewProduct(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addProduct()}
+              onKeyDown={(e) => e.key === 'Enter' && addEmail(newProduct, productIssueEmails, setProductIssueEmails, setNewProduct)}
               fullWidth
             />
-            <IconButton onClick={addProduct} color="primary" disabled={!newProduct.trim()}>
+            <IconButton
+              onClick={() => addEmail(newProduct, productIssueEmails, setProductIssueEmails, setNewProduct)}
+              color="primary"
+              disabled={!newProduct.trim()}
+            >
               <AddIcon />
             </IconButton>
           </Box>

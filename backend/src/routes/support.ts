@@ -100,14 +100,7 @@ router.post("/send-help-message", async (req, res) => {
 </html>
     `;
 
-    const productIssueEmailsSetting = await settingsService.getSetting('product_issue_emails');
-    let productIssueEmails = ['founders@agentweb.pro'];
-    if (productIssueEmailsSetting) {
-      try {
-        const parsed = JSON.parse(productIssueEmailsSetting.settingValue);
-        if (Array.isArray(parsed) && parsed.length > 0) productIssueEmails = parsed;
-      } catch { /* keep default */ }
-    }
+    const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
 
     await resendService.sendEmail({
       from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
@@ -193,14 +186,7 @@ router.post("/report-error", async (req, res) => {
 </html>
     `;
 
-    const oncallEmailsSetting = await settingsService.getSetting('oncall_emails');
-    let oncallEmails = ['ruiw@agentweb.pro'];
-    if (oncallEmailsSetting) {
-      try {
-        const parsed = JSON.parse(oncallEmailsSetting.settingValue);
-        if (Array.isArray(parsed) && parsed.length > 0) oncallEmails = parsed;
-      } catch { /* keep default */ }
-    }
+    const oncallEmails = await settingsService.getJsonArraySetting('oncall_emails', ['ruiw@agentweb.pro']);
 
     await resendService.sendEmail({
       from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
