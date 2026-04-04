@@ -4612,4 +4612,68 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   }
 });
 
+// Get alert email lists (oncall + product issue)
+router.get("/alert-emails", async (req, res) => {
+  try {
+    const [oncallSetting, productIssueSetting] = await Promise.all([
+      settingsService.getSetting("oncall_emails"),
+      settingsService.getSetting("product_issue_emails"),
+    ]);
+
+    let oncallEmails = ["ruiw@agentweb.pro"];
+    let productIssueEmails = ["founders@agentweb.pro"];
+
+    if (oncallSetting) {
+      try { oncallEmails = JSON.parse(oncallSetting.settingValue); } catch { /* keep default */ }
+    }
+    if (productIssueSetting) {
+      try { productIssueEmails = JSON.parse(productIssueSetting.settingValue); } catch { /* keep default */ }
+    }
+
+    res.json({ oncallEmails, productIssueEmails });
+  } catch (error: any) {
+    console.error("Error getting alert emails:", error);
+    res.status(500).json({ message: "Failed to get alert emails" });
+  }
+});
+
+// Update alert email lists
+router.put("/alert-emails", async (req, res) => {
+  try {
+    const { oncallEmails, productIssueEmails } = req.body;
+    const updatedBy = (req as any).user?.email || "unknown";
+
+    if (!Array.isArray(oncallEmails) || !Array.isArray(productIssueEmails)) {
+      return res.status(400).json({ message: "oncallEmails and productIssueEmails must be arrays" });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const allEmails = [...oncallEmails, ...productIssueEmails];
+    const invalid = allEmails.filter((e) => typeof e !== "string" || !emailRegex.test(e));
+    if (invalid.length > 0) {
+      return res.status(400).json({ message: `Invalid email addresses: ${invalid.join(", ")}` });
+    }
+
+    await Promise.all([
+      settingsService.setSetting(
+        "oncall_emails",
+        JSON.stringify(oncallEmails),
+        "Oncall alert email recipients",
+        updatedBy
+      ),
+      settingsService.setSetting(
+        "product_issue_emails",
+        JSON.stringify(productIssueEmails),
+        "Product issue / help message email recipients",
+        updatedBy
+      ),
+    ]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Error updating alert emails:", error);
+    res.status(500).json({ message: "Failed to update alert emails" });
+  }
+});
+
 export default router;

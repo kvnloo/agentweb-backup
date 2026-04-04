@@ -5310,10 +5310,19 @@ emmaToolRegistry.register({
           result.notionUrl
         );
 
-        // Send support email to founders (reuses Get Support pattern)
+        // Send support email to product issue recipients (configurable via admin settings)
+        const { settingsService } = await import('../services/settingsService');
+        const productIssueEmailsSetting = await settingsService.getSetting('product_issue_emails');
+        let productIssueEmails = ['founders@agentweb.pro'];
+        if (productIssueEmailsSetting) {
+          try {
+            const parsed = JSON.parse(productIssueEmailsSetting.settingValue);
+            if (Array.isArray(parsed) && parsed.length > 0) productIssueEmails = parsed;
+          } catch { /* keep default */ }
+        }
         await resendService.sendEmail({
           from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-          to: 'founders@agentweb.pro',
+          to: productIssueEmails,
           subject: `Product Issue from ${user.email}: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
