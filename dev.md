@@ -1,3 +1,41 @@
+# April 4, 2026: Investigation — Axios Supply Chain Attack (AWS Security Alert)
+
+## Background
+
+Received an AWS Security email warning that our organization "may have been the target of potentially inappropriate activity" related to malicious axios npm package versions `1.14.1` and `0.30.4`, published March 30–31, 2026 via a hijacked maintainer account.
+
+AWS recommended checking for network connections to `142.11.206.73:8000` during March 31, 5:15–8:15 PM PDT, rotating credentials on affected hosts, and auditing CloudTrail.
+
+## Investigation
+
+### Axios versions in our lock files
+
+| Component | Resolved axios version | Status |
+|---|---|---|
+| backend | 1.9.0 | Safe |
+| partner-portal | 1.11.0 | Safe |
+| customer-portal | 1.11.0 | Safe |
+| agent-engine | Python only — no axios | Not applicable |
+
+The `1.14.1` hits that appeared in the lock file grep were for `tslib` (a TypeScript utility), not axios.
+
+### Why we were never exposed
+
+- **`npm ci` everywhere**: CI pipeline and cloud-dev test env both use `npm ci`, which installs exact lock file versions — no semver range resolution occurs.
+- **Lock files were clean during the attack window**: Confirmed via `git show 32c1b508:backend/package-lock.json` — backend had axios `1.9.0` as of the March 31 commit. No package-lock.json changes landed during March 30–31.
+- **EB deploys bundle the lock file**: The zip artifact includes `package-lock.json`, so EB also installs only locked versions.
+- **Agent engine is Python**: No axios dependency at all.
+
+### AWS Health Dashboard
+
+Checked the Affected Resources tab — no resources listed. This confirms the alert was a false alarm. AWS sent these notifications broadly to any account that uses axios as a dependency, as a precautionary measure.
+
+## Conclusion
+
+No compromise. No credential rotation needed. No affected hosts.
+
+The `package.json` semver ranges (`^1.9.0`, `^1.7.9`) would theoretically allow resolving to `1.14.1` under a bare `npm install`, but since all install paths use `npm ci` the lock file versions were always used. The malicious versions were removed from npm shortly after discovery. Low-priority housekeeping: update lock files to pin axios past `1.14.1` when convenient.
+
 # March 29, 2026: Investigation — Sonnet 4.6 vs Opus 4.6 Cost & Quality Comparison for Agent Mode
 
 ## Problem
