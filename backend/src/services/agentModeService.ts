@@ -14845,6 +14845,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
           console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
 
+          // Sanitize response to remove large content fields before sending to LLM
+          const responseData = response.data as any;
+          const sanitizedResponse = responseData && typeof responseData === 'object'
+            ? { ...responseData }
+            : responseData;
+
+          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
+            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
+            delete sanitizedFieldData['post-body'];
+            delete sanitizedFieldData['body'];
+            sanitizedResponse.fieldData = sanitizedFieldData;
+          }
+
           return {
             success: true,
             message: `Blog article published successfully to Webflow as ${status}`,
@@ -14852,7 +14865,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               title,
               status,
               cmsType: 'Webflow',
-              cmsResponse: response.data
+              cmsResponse: sanitizedResponse
             }
           };
         } catch (webflowError: any) {
