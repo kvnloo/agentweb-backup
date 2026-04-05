@@ -270,6 +270,10 @@ async function handleChargeRefunded(charge: any): Promise<void> {
     });
   } catch (err: any) {
     console.error(`[PaymentHistory] Failed to record refund: ${err.message}`);
+  }
+}
+
+/**
  * POST /api/stripe/reconcile
  * Admin-only: reconcile all users' Stripe subscription data with DynamoDB.
  * Fixes any drift caused by missed webhooks.
