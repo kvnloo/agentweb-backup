@@ -622,7 +622,7 @@ function buildOutboundPipeline(
     if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
       for (const acct of unipileData.accountBreakdown) {
         if (acct.messagesSent > 0) {
-          contactedSources.push(safeSource(`LinkedIn — ${acct.accountName}`, acct.messagesSent));
+          contactedSources.push(safeSource(`LinkedIn — ${acct.accountName.split(' ')[0]}`, acct.messagesSent));
         }
       }
       // If no one sent anything, still show aggregate
@@ -659,7 +659,7 @@ function buildOutboundPipeline(
     if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
       for (const acct of unipileData.accountBreakdown) {
         if (acct.repliesReceived > 0) {
-          repliesSources.push(safeSource(`LinkedIn replies — ${acct.accountName}`, acct.repliesReceived));
+          repliesSources.push(safeSource(`LinkedIn replies — ${acct.accountName.split(' ')[0]}`, acct.repliesReceived));
         }
       }
       if (!unipileData.accountBreakdown.some(a => a.repliesReceived > 0)) {
