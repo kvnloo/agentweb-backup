@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-05',
     changes: [
+      'Emma Can Now Receive Emails During Automated Tasks',
+      '- Emma can generate a session-specific email address (test+...@updates.agentweb.pro) for use when signing up for services',
+      '- Emails sent to this address are automatically captured and made available to Emma mid-task',
+      '- Enables Emma to complete sign-up flows, receive verification codes, and read confirmation emails autonomously',
+    ],
+  },
+  {
+    date: '2026-04-05',
+    changes: [
       'Admin: Chat History Time Range Now Filters by Session Start Time',
       '- The get_chat_history tool previously returned old sessions whose metadata was recently updated (e.g. when a share link was accessed or scoring ran), causing stale sessions to appear in recent time-range queries',
       '- Time ranges now correctly match when the session was created, not when it was last touched',
