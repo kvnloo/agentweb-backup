@@ -11,6 +11,9 @@ const mockStripe = {
   webhooks: {
     constructEvent: jest.fn(),
   },
+  paymentMethods: {
+    list: jest.fn().mockResolvedValue({ data: [] }),
+  },
 };
 
 jest.mock('stripe', () => {
@@ -49,8 +52,11 @@ const mockAuth = jest.fn((req: any, _res: any, next: any) => {
   }
 });
 
+const mockRequireAdmin = jest.fn((_req: any, _res: any, next: any) => next());
+
 jest.mock('../middleware/auth', () => ({
   authenticateToken: mockAuth,
+  requireAdmin: mockRequireAdmin,
   AuthenticatedRequest: {},
 }));
 
