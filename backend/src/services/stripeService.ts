@@ -624,71 +624,8 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
  * stripe_subscription_id if missing, and sets has_payment_method.
 
 /**
- * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
+ * Handle invoice.payment_failed — mark subscription as past_due and record the failure.
  */
-export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
-  const customerId = typeof invoice.customer === 'string'
-    ? invoice.customer
-    : invoice.customer?.id;
-
-  if (!customerId) {
-    console.warn('[STRIPE] invoice.payment_succeeded with no customer ID — skipping');
-    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
-    return;
-  }
-
-  const user = await findUserByStripeCustomerId(customerId);
-  if (!user) {
-    console.warn(`[STRIPE] invoice.payment_succeeded for unknown customer ${customerId} — skipping`);
-    return;
-  }
-
-  const updates: Record<string, any> = {
-    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
-    return;
-  }
-
-  const subscriptionId = typeof invoice.subscription === 'string'
-    ? invoice.subscription
-    : invoice.subscription?.id || null;
-
-  const updateData: Record<string, any> = {
-    subscription_status: 'active',
-    has_payment_method: true,
-  };
-
-  // Backfill stripe_subscription_id if missing
-  const subId = typeof invoice.subscription === 'string' ? invoice.subscription : null;
-  if (subId && !user.stripe_subscription_id) {
-    updates.stripe_subscription_id = subId;
-  }
-
-  await userDb.updateUser(user.userId, updates);
-  console.log(`[STRIPE] invoice.payment_succeeded: user ${user.userId} → active`);
-  // Backfill stripe_subscription_id if user doesn't have one yet
-  if (!user.stripe_subscription_id && subscriptionId) {
-    updateData.stripe_subscription_id = subscriptionId;
-  }
-
-  await userDb.updateUser(user.userId, updateData);
-
-  console.log(
-    `[STRIPE] Invoice payment succeeded: user ${user.userId} \u2192 status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
-  // Record in payment history
-  await paymentHistoryDb.record({
-    userId: user.userId,
-    eventType: 'payment_succeeded',
-    stripeCustomerId: customerId,
-    stripeSubscriptionId: subscriptionId || undefined,
-    stripeInvoiceId: invoice.id,
-    amountCents: invoice.amount_paid,
-    currency: invoice.currency,
-  });
-
-  console.log(
-    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
-  );
-}
 
 /**
  * Handle invoice.payment_failed — mark subscription as past_due and record the failure.
