@@ -3,6 +3,7 @@ import { fetchSearchConsoleMetrics } from "./seoService";
 import { MetaService } from "./metaService";
 import { getAccountByPlatform } from "./connectedAccountsDb";
 import { getProspectMeetingMetrics, ProspectMeetingMetrics } from "./prospectMeetingService";
+import { getSmartLeadMetrics, SmartLeadMetrics } from "./smartleadService";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -570,27 +571,57 @@ function buildLinkedInPipeline(
 
 function buildOutboundPipeline(
   leadData: LeadData,
+  smartLeadData: SmartLeadMetrics,
   meetingData: ProspectMeetingMetrics,
   userData: { data: UserCounts; status: "ok" | "error" },
 ): ChannelPipeline {
   const stages: FunnelStage[] = [];
 
-  // 1. List Size — total leads in CRM
-  const listSources = leadData.status === "ok"
-    ? [safeSource("CRM Lead Lists", leadData.total)]
-    : [errorSource("CRM Lead Lists", "Failed to fetch lead data")];
-  stages.push(makeStage("List Size", leadData.total, 0, 0, listSources));
+  // 1. List Size — SmartLead total leads loaded (fallback to CRM lead lists)
+  const listSources: SourceBreakdown[] = [];
+  let listSize = 0;
+
+  if (smartLeadData.status === "ok") {
+    listSources.push(safeSource("SmartLead Campaigns", smartLeadData.totalLeadsLoaded));
+    listSize += smartLeadData.totalLeadsLoaded;
+  } else if (smartLeadData.status === "error") {
+    listSources.push(errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data"));
+  } else {
+    listSources.push(unavailableSource("SmartLead (not configured)"));
+  }
+
+  // Also include CRM lead lists as a secondary source
+  if (leadData.status === "ok" && leadData.total > 0) {
+    listSources.push(safeSource("CRM Lead Lists", leadData.total));
+    listSize += leadData.total;
+  }
+
+  stages.push(makeStage("List Size", listSize, 0, 0, listSources));
   stages[0].conversionRate = 100;
 
-  // 2. Contacted — unavailable
-  stages.push(makeStage("Contacted", 0, 0, leadData.total, [unavailableSource("SalesRobot (not connected)")]));
+  // 2. Contacted — SmartLead leads in progress + completed (emails sent)
+  const contactedCount = smartLeadData.status === "ok"
+    ? smartLeadData.leadsInProgress + smartLeadData.leadsCompleted + smartLeadData.leadsReplied
+    : 0;
+  const contactedSources = smartLeadData.status === "ok"
+    ? [safeSource("SmartLead (emails sent)", contactedCount)]
+    : smartLeadData.status === "error"
+      ? [errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data")]
+      : [unavailableSource("SmartLead (not configured)")];
+  stages.push(makeStage("Contacted", contactedCount, 0, listSize, contactedSources));
 
-  // 3. Replies — unavailable
-  stages.push(makeStage("Replies", 0, 0, 0, [unavailableSource("SalesRobot (not connected)")]));
+  // 3. Replies — SmartLead leads that replied
+  const repliedCount = smartLeadData.status === "ok" ? smartLeadData.leadsReplied : 0;
+  const repliesSources = smartLeadData.status === "ok"
+    ? [safeSource("SmartLead (replies)", repliedCount)]
+    : smartLeadData.status === "error"
+      ? [errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data")]
+      : [unavailableSource("SmartLead (not configured)")];
+  stages.push(makeStage("Replies", repliedCount, 0, contactedCount, repliesSources));
 
   // 4. Talked — prospect meetings
   const talkedSources = [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
-  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
+  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, repliedCount, talkedSources));
 
   // 5. Paid
   const paidSources = userData.status === "ok"
@@ -714,18 +745,19 @@ export async function getBusinessFunnelMetrics(
   const previousRange = getPreviousDateRange(days);
 
   // Fetch all data sources in parallel
-  const [gscData, metaData, leadData, userData, meetingData] = await Promise.all([
+  const [gscData, metaData, leadData, userData, meetingData, smartLeadData] = await Promise.all([
     fetchGSCData(timeframe),
     fetchMetaAdsData(timeframe),
     fetchLeadCount(dateRange.start),
     fetchUserAndSubscriptionData(dateRange.start, previousRange.start, previousRange.end),
     getProspectMeetingMetrics(period),
+    getSmartLeadMetrics(),
   ]);
 
   // Build per-channel pipelines
   const seoPipeline = buildSEOPipeline(gscData, userData);
   const linkedInPipeline = buildLinkedInPipeline(meetingData, { data: userData.data, status: userData.status });
-  const outboundPipeline = buildOutboundPipeline(leadData, meetingData, { data: userData.data, status: userData.status });
+  const outboundPipeline = buildOutboundPipeline(leadData, smartLeadData, meetingData, { data: userData.data, status: userData.status });
   const paidAdsPipeline = buildPaidAdsPipeline(metaData, meetingData, { data: userData.data, status: userData.status });
 
   const channels: ChannelPipeline[] = [seoPipeline, linkedInPipeline, outboundPipeline, paidAdsPipeline];
