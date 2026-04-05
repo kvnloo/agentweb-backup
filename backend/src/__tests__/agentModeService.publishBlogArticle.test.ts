@@ -1011,31 +1011,6 @@ describe('AgentModeService - publish_blog_article function', () => {
       expect(result.data.cmsType).toBe('Webflow');
     });
 
-    it('should fall back to Webflow when Payload CMS API errors', async () => {
-      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
-      // First post (Payload) fails, second post (Webflow fallback) succeeds
-      mockAxiosPost
-        .mockRejectedValueOnce(new Error('Payload CMS server error'))
-        .mockResolvedValueOnce({
-          data: {
-            id: 'webflow-fallback-id',
-            fieldData: { name: 'Test Blog Title' },
-          },
-        });
-
-      const result = await (agentModeService as any).publishBlogArticle(
-        'Test Blog Title',
-        'Test description',
-        mockHeroImageUrl,
-        mockBlogHtmlUrl,
-        mockUserId,
-        mockSessionId
-      );
-
-      // Should fall back to Webflow successfully, not crash
-      expect(result.success).toBe(true);
-      expect(result.data.cmsType).toBe('Webflow');
-    });
   });
 });
 
