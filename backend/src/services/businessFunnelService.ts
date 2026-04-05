@@ -598,6 +598,22 @@ function buildOutboundPipeline(
     listSize += leadData.total;
   }
 
+  // Include Unipile LinkedIn connection requests in list size
+  // (connection requests = new strangers you're trying to reach)
+  if (unipileData.status === "ok" && unipileData.totalConnectionRequests > 0) {
+    if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
+      for (const acct of unipileData.accountBreakdown) {
+        if (acct.connectionRequestsSent > 0) {
+          listSources.push(safeSource(`LinkedIn requests — ${acct.accountName.split(' ')[0]}`, acct.connectionRequestsSent));
+          listSize += acct.connectionRequestsSent;
+        }
+      }
+    } else {
+      listSources.push(safeSource("LinkedIn connection requests", unipileData.totalConnectionRequests));
+      listSize += unipileData.totalConnectionRequests;
+    }
+  }
+
   stages.push(makeStage("List Size", listSize, 0, 0, listSources));
   stages[0].conversionRate = 100;
 
@@ -792,10 +808,21 @@ function buildComparison(channels: ChannelPipeline[], metaSpend: number): Channe
 
 // ─── Main Aggregator ────────────────────────────────────────────────────
 
+// ─── Response Cache (5 min TTL) ─────────────────────────────────────────
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const responseCache = new Map<string, { data: FunnelMetricsResponse; timestamp: number }>();
+
 export async function getBusinessFunnelMetrics(
   period: string = "30d",
   _channel?: string,
 ): Promise<FunnelMetricsResponse> {
+  // Check cache
+  const cacheKey = `funnel_${period}`;
+  const cached = responseCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const days = parsePeriodDays(period);
   const timeframe = `${days}d`;
   const dateRange = getDateRange(days);
@@ -852,7 +879,7 @@ export async function getBusinessFunnelMetrics(
         ...paidAdsPipeline.stages,
       ]);
 
-  return {
+  const result: FunnelMetricsResponse = {
     channels,
     comparison,
     aggregate: {
@@ -868,4 +895,8 @@ export async function getBusinessFunnelMetrics(
     },
     generatedAt: new Date().toISOString(),
   };
+
+  // Cache the response for 5 minutes
+  responseCache.set(cacheKey, { data: result, timestamp: Date.now() });
+  return result;
 }

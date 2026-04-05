@@ -19,6 +19,7 @@ export interface UnipileOutreachMetrics {
     accountName: string;
     messagesSent: number;
     repliesReceived: number;
+    connectionRequestsSent: number;
   }[];
   status: "ok" | "error" | "unavailable";
   error?: string;
@@ -230,6 +231,7 @@ export async function getUnipileOutreachMetrics(period: string): Promise<Unipile
         accountName: r.accountName,
         messagesSent: r.messagesSent,
         repliesReceived: r.repliesReceived,
+        connectionRequestsSent: r.connectionRequestsSent,
       });
     }
 
