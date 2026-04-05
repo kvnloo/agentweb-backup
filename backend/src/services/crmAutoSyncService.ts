@@ -70,6 +70,11 @@ export async function syncNewUserToLeadList(user: {
         createdAt: user.createdAt || new Date().toISOString(),
         stripe_customer_id: user.stripe_customer_id || "",
         subscriptionType: user.subscriptionType || "",
+
+        // Default activation fields for a newly registered user
+        chatSessionCount: 0,
+        brandGuidelinesCompletedAt: "",
+        lastActiveDate: (user.createdAt || new Date().toISOString()).split('T')[0],
       },
     };
 

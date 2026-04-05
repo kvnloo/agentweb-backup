@@ -21,6 +21,7 @@ import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../se
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
+import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 import { validateEmail } from "../utils/validation";
@@ -266,9 +267,12 @@ router.post("/crm-sync/:source/start", async (req, res) => {
         return isAfterLastSync(user.createdAt, previousLastSyncAt);
       });
 
+      // chatSessionCount is already computed by userDb.getAllUsers() via UserIdIndex GSI
       leads = filteredUsers.map((user: any) => {
         const nameFromRecord = user.fullName || user.displayName || user.name || "";
         const parsedName = splitName(nameFromRecord);
+        const activationFields = getActivationFields(user);
+
         return {
           email: String(user.email || "").toLowerCase(),
           firstName: parsedName.firstName,
@@ -287,6 +291,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
             emailDomain: user.emailDomain || "",
             slackChannel: user.slackChannel || "",
             subscriptionType: user.subscriptionType || "",
+            ...activationFields,
           },
         };
       });
@@ -575,10 +580,10 @@ router.put("/users/:userId/email-sender", async (req, res) => {
     }
 
     // Update the user's email sender configuration
-    const updatedUser = await userDb.updateUser(userId, { 
-      emailDomain, 
-      defaultSenderUsername, 
-      fromName 
+    const updatedUser = await userDb.updateUser(userId, {
+      emailDomain,
+      defaultSenderUsername,
+      fromName
     });
     res.json(updatedUser);
   } catch (error) {
@@ -704,16 +709,16 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
       const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
       for (const domain of seoDomains) {
         if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
-          return res.status(400).json({ 
-            message: `Invalid domain format: ${domain}. Please use format like example.com` 
+          return res.status(400).json({
+            message: `Invalid domain format: ${domain}. Please use format like example.com`
           });
         }
       }
     }
 
     // Update the user's SEO domains
-    const updatedUser = await userDb.updateUser(userId, { 
-      seoDomains: seoDomains || [] 
+    const updatedUser = await userDb.updateUser(userId, {
+      seoDomains: seoDomains || []
     });
     res.json(updatedUser);
   } catch (error) {
@@ -1065,7 +1070,7 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     // Update the user's CMS Type
     // Preserve null to allow clearing the field, convert empty string to null, otherwise use the value or undefined
     const cmsTypeValue = cmsType === null || cmsType === "" ? null : (cmsType || undefined);
-    const updatedUser = await userDb.updateUser(userId, { 
+    const updatedUser = await userDb.updateUser(userId, {
       cmsType: cmsTypeValue
     });
     res.json(updatedUser);
@@ -1142,7 +1147,7 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
         displayName: existingUser.displayName,
         roles: updatedRoles
       };
-      
+
       // Send welcome email without password for existing user upgrade
       await emailService.sendWelcomeEmail(email);
     } else {
@@ -1155,7 +1160,7 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
         }
         return password;
       };
-      
+
       temporaryPassword = generateRandomPassword(16);
       const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
@@ -1190,7 +1195,8 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
         createdAt: new Date().toISOString(),
         stripe_customer_id: waitlistEntry.stripe_customer_id,
         subscriptionType: "Free",
-      }).catch(() => {});
+      }).catch(() => { });
+
 
       // Send welcome email with temporary password for new user
       await emailService.sendWelcomeEmail(email, temporaryPassword);
@@ -1199,8 +1205,8 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
     // Update waitlist status to completed
     await waitlistDb.updateStatus(email, 'completed');
 
-    res.json({ 
-      message: "User created successfully", 
+    res.json({
+      message: "User created successfully",
       user: {
         userId: resultUser.userId,
         email: resultUser.email,
@@ -1220,7 +1226,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
   try {
     const { userId } = req.params;
     const adminReq = req as any; // Should have admin user from middleware
-    
+
     // Check if user exists
     const targetUser = await userDb.getUserById(userId);
     if (!targetUser) {
@@ -1229,8 +1235,8 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
 
     // Ensure target user has customer role
     if (!targetUser.roles || !targetUser.roles.includes("customer")) {
-      return res.status(400).json({ 
-        message: "User does not have customer portal access" 
+      return res.status(400).json({
+        message: "User does not have customer portal access"
       });
     }
 
@@ -1256,8 +1262,8 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
 
     // Return the delegate token and customer portal URL
     const customerPortalUrl = process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174";
-    
-    res.json({ 
+
+    res.json({
       delegateToken,
       customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
       expiresIn: "90d"
@@ -1656,10 +1662,10 @@ router.get("/analytics/users", async (req, res) => {
 router.get("/analytics/agent-mode", async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-    
+
     // Get all sessions
     const allSessions = await chatbotDb.getAllSessions();
-    
+
     // Filter for Agent Mode sessions only
     const agentSessions = allSessions.filter(
       (session) => session.portalType === "agent" && !session.archived
@@ -1675,7 +1681,7 @@ router.get("/analytics/agent-mode", async (req, res) => {
     // Parse date range
     const start = startDate ? new Date(startDate as string) : null;
     const end = endDate ? new Date(endDate as string) : null;
-    
+
     // Helper to check if date is in range
     const isInRange = (dateStr: string) => {
       if (!start && !end) return true;
@@ -1688,11 +1694,11 @@ router.get("/analytics/agent-mode", async (req, res) => {
       }
       return true;
     };
-    
+
     // Calculate metrics
     const totalSessions = agentSessions.length;
     const newSessions = agentSessions.filter((s) => isInRange(s.createdAt)).length;
-    
+
     // Separate scheduled and non-scheduled sessions
     const scheduledSessions = agentSessions.filter((s) => s.sessionType === "scheduled");
     const nonScheduledSessions = agentSessions.filter((s) => s.sessionType !== "scheduled");
@@ -1700,11 +1706,11 @@ router.get("/analytics/agent-mode", async (req, res) => {
     const totalNonScheduledSessions = nonScheduledSessions.length;
     const newScheduledSessions = scheduledSessions.filter((s) => isInRange(s.createdAt)).length;
     const newNonScheduledSessions = nonScheduledSessions.filter((s) => isInRange(s.createdAt)).length;
-    
+
     // Session types breakdown
     const sessionTypes: Record<string, number> = {};
     const sessionTypesInRange: Record<string, number> = {};
-    
+
     agentSessions.forEach((session) => {
       const type = session.sessionType || "regular";
       sessionTypes[type] = (sessionTypes[type] || 0) + 1;
@@ -1712,27 +1718,27 @@ router.get("/analytics/agent-mode", async (req, res) => {
         sessionTypesInRange[type] = (sessionTypesInRange[type] || 0) + 1;
       }
     });
-    
+
     // Helper function to check if user is anonymous
     const isAnonymousUser = (userId: string) => userId.startsWith('anon_');
-    
+
     // Separate actual users and anonymous users
     const actualUserSessions = agentSessions.filter((s) => !isAnonymousUser(s.userId));
     const anonymousUserSessions = agentSessions.filter((s) => isAnonymousUser(s.userId));
-    
+
     // Unique users - all time (actual users only)
     const uniqueUsers = new Set(actualUserSessions.map((s) => s.userId));
     const uniqueAnonymousUsers = new Set(anonymousUserSessions.map((s) => s.userId));
-    
+
     // Sessions in date range (agent sessions only, no messages needed)
     const sessionsInRange = agentSessions.filter((s) => isInRange(s.createdAt));
     const actualSessionsInRange = actualUserSessions.filter((s) => isInRange(s.createdAt));
     const anonymousSessionsInRange = anonymousUserSessions.filter((s) => isInRange(s.createdAt));
-    
+
     // Active users (users who used Agent Mode at least once during the period)
     const activeUsers = new Set(actualSessionsInRange.map((s) => s.userId));
     const activeAnonymousUsers = new Set(anonymousSessionsInRange.map((s) => s.userId));
-    
+
     // Sessions before the date range (to identify returning users)
     const sessionsBeforeRange = actualUserSessions.filter((s) => {
       if (!start) return false;
@@ -1740,19 +1746,19 @@ router.get("/analytics/agent-mode", async (req, res) => {
       return date < start;
     });
     const usersBeforeRange = new Set(sessionsBeforeRange.map((s) => s.userId));
-    
+
     // New users (users who used Agent Mode for the first time during the period)
     const newUsers = new Set(
       actualSessionsInRange
         .filter((s) => !usersBeforeRange.has(s.userId))
         .map((s) => s.userId)
     );
-    
+
     // Returning users (users who used Agent Mode before the period and also during the period)
     const returningUsers = new Set(
       Array.from(activeUsers).filter((userId) => usersBeforeRange.has(userId))
     );
-    
+
     // Calculate sessions per user metrics (only for actual users)
     const sessionsPerUser: Record<string, number> = {};
     actualSessionsInRange.forEach((session) => {
@@ -1762,10 +1768,10 @@ router.get("/analytics/agent-mode", async (req, res) => {
       activeUsers.size > 0
         ? actualSessionsInRange.length / activeUsers.size
         : 0;
-    
+
     // Total unique users in range (for backward compatibility)
     const uniqueUsersInRange = activeUsers;
-    
+
     const messageStatsResults = await messageStatsPromise;
 
     // Aggregate message statistics from lightweight stats
@@ -1806,10 +1812,10 @@ router.get("/analytics/agent-mode", async (req, res) => {
       totalSessions > 0 ? totalMessages / totalSessions : 0;
     const averageMessagesPerActiveUser =
       activeUsers.size > 0 ? messagesInRange / activeUsers.size : 0;
-    
+
     const averageTokensPerMessage =
       messagesWithTokenData > 0 ? totalTokens / messagesWithTokenData : 0;
-    
+
     // Sessions with work plans
     const sessionsWithWorkPlans = agentSessions.filter(
       (s) => s.workPlan !== undefined
@@ -1817,29 +1823,29 @@ router.get("/analytics/agent-mode", async (req, res) => {
     const newSessionsWithWorkPlans = agentSessions.filter(
       (s) => s.workPlan !== undefined && isInRange(s.createdAt)
     ).length;
-    
+
     // Shared sessions
     const sharedSessions = agentSessions.filter(
       (s) => s.shareMetadata?.isShared || s.interactiveShareMetadata?.isActive
     ).length;
-    
+
     // Tool calls statistics
     const totalToolCalls = agentSessions.reduce((sum, s) => {
       if (!s.calledFunctions) return sum;
       return sum + Object.values(s.calledFunctions).reduce((a, b) => a + b, 0);
     }, 0);
-    
+
     // Tool calls in date range
     const toolCallsInRange = sessionsInRange.reduce((sum, s) => {
       if (!s.calledFunctions) return sum;
       return sum + Object.values(s.calledFunctions).reduce((a, b) => a + b, 0);
     }, 0);
-    
+
     const averageToolCallsPerSession =
       totalSessions > 0 ? totalToolCalls / totalSessions : 0;
     const averageToolCallsPerActiveUser =
       activeUsers.size > 0 ? toolCallsInRange / activeUsers.size : 0;
-    
+
     // Sessions with tool calls
     const sessionsWithToolCalls = agentSessions.filter((s) => {
       if (s.calledFunctions && Object.keys(s.calledFunctions).length > 0) {
@@ -1847,30 +1853,30 @@ router.get("/analytics/agent-mode", async (req, res) => {
       }
       return false;
     }).length;
-    
+
     const sessionsWithToolCallsInRange = sessionsInRange.filter((s) => {
       if (s.calledFunctions && Object.keys(s.calledFunctions).length > 0) {
         return Object.values(s.calledFunctions).some((count) => count > 0);
       }
       return false;
     }).length;
-    
+
     // Tool calls by function name (breakdown)
     const toolCallsByFunction: Record<string, number> = {};
     const toolCallsByFunctionInRange: Record<string, number> = {};
-    
+
     agentSessions.forEach((session) => {
       if (session.calledFunctions) {
         Object.entries(session.calledFunctions).forEach(([functionName, count]) => {
           toolCallsByFunction[functionName] = (toolCallsByFunction[functionName] || 0) + count;
-          
+
           if (isInRange(session.createdAt)) {
             toolCallsByFunctionInRange[functionName] = (toolCallsByFunctionInRange[functionName] || 0) + count;
           }
         });
       }
     });
-    
+
     // Failed tool calls by function name (breakdown)
     const failedToolCallsByFunction: Record<string, number> = {};
     const failedToolCallsByFunctionInRange: Record<string, number> = {};
@@ -1915,21 +1921,21 @@ router.get("/analytics/agent-mode", async (req, res) => {
       .sort(([, a], [, b]) => b - a)
       .slice(0, 10)
       .map(([name, count]) => ({ name, count }));
-    
+
     const topToolsInRange = Object.entries(toolCallsByFunctionInRange)
       .sort(([, a], [, b]) => b - a)
       .slice(0, 10)
       .map(([name, count]) => ({ name, count }));
-    
+
     // Daily growth data for chart - separate Scheduled and Non-Scheduled sessions
     const dailyGrowthScheduled: Record<string, number> = {};
     const dailyGrowthNonScheduled: Record<string, number> = {};
-    
+
     agentSessions.forEach((session) => {
       if (isInRange(session.createdAt)) {
         const dateKey = new Date(session.createdAt).toISOString().split("T")[0];
         const isScheduled = session.sessionType === "scheduled";
-        
+
         if (isScheduled) {
           dailyGrowthScheduled[dateKey] = (dailyGrowthScheduled[dateKey] || 0) + 1;
         } else {
@@ -1937,13 +1943,13 @@ router.get("/analytics/agent-mode", async (req, res) => {
         }
       }
     });
-    
+
     // Get all unique dates from both
     const allDates = new Set([
       ...Object.keys(dailyGrowthScheduled),
       ...Object.keys(dailyGrowthNonScheduled)
     ]);
-    
+
     // Sort daily growth by date and combine
     const sortedDailyGrowth = Array.from(allDates)
       .sort((a, b) => a.localeCompare(b))
@@ -1952,7 +1958,7 @@ router.get("/analytics/agent-mode", async (req, res) => {
         scheduled: dailyGrowthScheduled[date] || 0,
         nonScheduled: dailyGrowthNonScheduled[date] || 0,
       }));
-    
+
     res.json({
       totalSessions,
       newSessions,
@@ -2093,7 +2099,7 @@ const generateAnnouncementEmailHtml = (title: string, message: string, isTest: b
       🧪 TEST EMAIL - This is a test announcement
     </div>
   ` : '';
-  
+
   return `<!DOCTYPE html>
     <html>
       <head>
@@ -2323,7 +2329,7 @@ router.post("/announcements/test", async (req, res) => {
 // Load announcement content from HTML URL
 router.post("/announcements/load-from-url", async (req, res) => {
   const { url } = req.body;
-  
+
   try {
     if (!url || typeof url !== "string") {
       return res
@@ -2374,7 +2380,7 @@ router.post("/announcements/load-from-url", async (req, res) => {
 
     // Extract body content
     let bodyContent = "";
-    
+
     // Try to extract from <body> tag first
     const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
     if (bodyMatch) {
@@ -2409,7 +2415,7 @@ router.post("/announcements/load-from-url", async (req, res) => {
     // Clean up the HTML content
     // Remove comments
     bodyContent = bodyContent.replace(/<!--[\s\S]*?-->/g, "");
-    
+
     // Remove excessive whitespace but preserve structure
     bodyContent = bodyContent
       .replace(/\s+/g, " ")
@@ -2730,7 +2736,7 @@ router.get("/workflows", async (req, res) => {
         const totalTasks = latestExecution?.tasks?.length || 0;
         const completedTasks = latestExecution?.tasks
           ? latestExecution.tasks.filter((task) => task.status === "completed")
-              .length
+            .length
           : 0;
 
         return {
@@ -2768,21 +2774,21 @@ router.get("/knowledge-base-metrics", async (req, res) => {
   try {
     // Get all tasks
     const tasks = await taskDb.getAllTasks() || [];
-    
+
     // Calculate overall metrics
     const totalTasks = tasks.length;
-    
+
     // Handle both string and number knowledgeBaseSize values - only count if size > 0
     const tasksWithKnowledgeBase = tasks.filter(task => {
       const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : task.knowledgeBaseSize;
       return size && size > 0;
     }).length;
-    
+
     const totalKnowledgeBaseSize = tasks.reduce((sum, task) => {
       const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
       return sum + size;
     }, 0);
-    
+
     const averageKnowledgeBaseSize = tasksWithKnowledgeBase > 0 ? totalKnowledgeBaseSize / tasksWithKnowledgeBase : 0;
 
     // Uploaded files metrics (from knowledgeBaseFiles array)
@@ -2800,7 +2806,7 @@ router.get("/knowledge-base-metrics", async (req, res) => {
     const tasksWithUploadedFiles = tasks.filter(task => getUploadedFileStats(task).count > 0).length;
     const averageUploadedFilesPerTask = tasksWithUploadedFiles > 0 ? totalUploadedFiles / tasksWithUploadedFiles : 0;
     const averageUploadedFileSizePerTask = tasksWithUploadedFiles > 0 ? totalUploadedFilesSize / tasksWithUploadedFiles : 0;
-    
+
     // Calculate public knowledge base metrics
     const publicTasks = tasks.filter(task => task.knowledgeBaseType === 'public');
     const publicTasksWithKnowledgeBase = publicTasks.filter(task => {
@@ -2827,7 +2833,7 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       publicUploaded.tasksWithFiles > 0 ? publicUploaded.count / publicUploaded.tasksWithFiles : 0;
     const averagePublicUploadedSizePerTask =
       publicUploaded.tasksWithFiles > 0 ? publicUploaded.size / publicUploaded.tasksWithFiles : 0;
-    
+
     // Calculate private knowledge base metrics
     const privateTasks = tasks.filter(task => task.knowledgeBaseType === 'private');
     const privateTasksWithKnowledgeBase = privateTasks.filter(task => {
@@ -2854,7 +2860,7 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       privateUploaded.tasksWithFiles > 0 ? privateUploaded.count / privateUploaded.tasksWithFiles : 0;
     const averagePrivateUploadedSizePerTask =
       privateUploaded.tasksWithFiles > 0 ? privateUploaded.size / privateUploaded.tasksWithFiles : 0;
-    
+
     // Get tasks with knowledge base details (only those with size > 0)
     const tasksWithDetails = tasks
       .filter(task => {
@@ -3267,7 +3273,7 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
         if (updatedPlan) {
           // Track changes for notifications (using originalItem stored before update)
           const changes: { status?: string; notes?: string; dri?: string; dueDate?: string | null } = {};
-          
+
           if (status !== undefined && status !== originalItem.status) {
             changes.status = status;
           }
@@ -3301,7 +3307,7 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
 
     // Notify Slack thread if work item was just marked completed
     if (status === "completed" && originalItem.status !== "completed") {
-      notifySlackWorkItemCompleted(updatedWorkItem).catch(() => {});
+      notifySlackWorkItemCompleted(updatedWorkItem).catch(() => { });
     }
 
     return res.json({
@@ -4256,21 +4262,21 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
   try {
     const { userId } = req.params;
     const { subscriptionType } = req.body;
-    
+
     if (!subscriptionType || typeof subscriptionType !== "string") {
       return res.status(400).json({ message: "subscriptionType is required and must be a string" });
     }
-    
+
     // Check if user exists
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
-    
+
     // Verify subscription type exists
     const setting = await settingsService.getSetting("subscription_types");
     let subscriptionTypes = [];
-    
+
     if (setting) {
       try {
         subscriptionTypes = JSON.parse(setting.settingValue);
@@ -4278,12 +4284,12 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
         console.error("Error parsing subscription types:", error);
       }
     }
-    
+
     // If no subscription types defined, allow "Basic" as default
     if (subscriptionTypes.length === 0 && subscriptionType !== "Basic") {
       return res.status(400).json({ message: "Subscription type not found. Only 'Basic' is available." });
     }
-    
+
     // Check if subscription type exists (unless it's Basic and no types are defined)
     if (subscriptionTypes.length > 0) {
       const typeExists = subscriptionTypes.some((type: any) => type.name === subscriptionType);
@@ -4291,7 +4297,7 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
         return res.status(400).json({ message: "Subscription type not found" });
       }
     }
-    
+
     // Update the user's subscription type
     const updatedUser = await userDb.updateUser(userId, { subscriptionType });
     res.json(updatedUser);
