@@ -1374,6 +1374,45 @@ On a heavy-context session, Opus is ~24% slower per LLM call — a smaller gap t
 
 ---
 
+# April 5, 2026: Do Parallel Tool Calls Consume More Tokens?
+
+**Question:** When the LLM returns multiple tool calls in a single response (parallel), does that consume more tokens compared to making them one at a time (sequential)?
+
+**Context:** Investigated a production session (`ce0f5737`) — "Daily Slack Check — All Channels". The agent made 1 `slack_list_channels` call followed by **65 `slack_get_recent_messages` calls** that all appeared grouped after Emma's final response in the share UI. This raised the question of whether those parallel calls came from the same LLM response and how they compare to sequential calls in terms of token cost.
+
+**How parallel tool calls work in our backend:**
+
+When a Gemini/Claude/GPT model returns a response with multiple `tool_calls` in one API response (e.g., 30 channel fetch requests at once), `agentModeService.ts` collects all of them in a single iteration and executes them concurrently via `Promise.all()` (see `agentModeService.ts:1502–1571`). This means **all N tool calls come from the same LLM API response** — the model generated all N tool-call JSON blocks in one shot.
+
+**Token breakdown — parallel vs sequential for N tools:**
+
+| | Parallel (what we do) | Sequential (hypothetical) |
+|---|---|---|
+| LLM API calls | 1 call returns all N requests | N calls, one per tool |
+| Input tokens | Sent **once** | Resent + grows each round |
+| Output tokens | More per call (N tool JSONs in one response) | Less per call, but N× calls |
+| **Total tokens** | **Much lower** | **Much higher** (context accumulates N×) |
+
+**Concrete example (the investigated session):**
+
+The session made 30 `slack_get_recent_messages` calls in parallel from a single LLM response. Compared to doing them one at a time:
+
+- **Parallel (actual):** 1 LLM call × (context + 30 tool-call outputs) + 1 final synthesis call
+- **Sequential (hypothetical):** 30 LLM calls where each input = prior context + all prior tool results accumulated
+
+For 30 channels, the sequential approach would have sent the full conversation context ~30 extra times, each iteration slightly larger. Parallel avoids that entirely — the context is sent once and the model generates all 30 requests in a single output.
+
+**Answer:** Yes, the single LLM response that generates N parallel tool calls has **more output tokens** than a response with 1 tool call (it has to emit N tool-call JSON blocks). But the **total token cost across the conversation is dramatically lower** than sequential, because you avoid resending the full growing context N times. For the 30-channel session, parallel saved roughly 29× the input token cost of the mid-conversation context window.
+
+**The 65 tool calls came from 2 LLM responses:**
+1. First response: `slack_list_channels` → 1 tool call
+2. Second response: all 30 `slack_get_recent_messages` at once → 30+ tool calls in parallel
+3. Final response: synthesis/summary (no tool calls)
+
+The share UI groups all tool calls after the final assistant message, which made it look like they all came from one response — they didn't. The sequential `slack_list_channels` was its own round trip.
+
+---
+
 # February 26, 2026: Instagram Business Login — "Unsupported request" in Production
 
 **Symptom:** Connecting an Instagram Business account via Connected Accounts failed in production with `IGApiException` code 100: `"Unsupported request - method type: get"`. Both `getLongLivedToken` (`graph.instagram.com/.../access_token`) and `getInstagramBusinessMe` (`graph.instagram.com/.../me`) returned the same error. The initial OAuth token exchange (POST to `api.instagram.com/oauth/access_token`) succeeded.
