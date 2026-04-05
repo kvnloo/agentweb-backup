@@ -19,6 +19,13 @@ jest.mock('../controllers/blog', () => ({
   getWebflowConfig: mockGetWebflowConfig
 }));
 
+// Mock secrets manager for Payload CMS credentials
+const mockGetSecret = jest.fn();
+jest.mock('../utils/secretsManager', () => ({
+  getSecret: (...args: any[]) => mockGetSecret(...args),
+  getGCSPPrivateKey: jest.fn(),
+}));
+
 // Mock database
 jest.mock('../services/db', () => ({
   userDb: {
@@ -49,6 +56,9 @@ describe('AgentModeService - publish_blog_article function', () => {
     // Reset axios mocks
     mockAxiosGet.mockClear();
     mockAxiosPost.mockClear();
+
+    // Default: no Payload secret (falls through to Webflow for existing tests)
+    mockGetSecret.mockResolvedValue(null);
   });
 
   const mockUserId = 'test-user-123';
@@ -844,6 +854,163 @@ describe('AgentModeService - publish_blog_article function', () => {
       expect(bodyContent).toContain('Content H1 That Should Stay');
       expect(bodyContent).toContain('Article content');
     });
+  });
+
+  describe('Payload CMS publishing', () => {
+    const mockPayloadSecret = JSON.stringify({
+      PAYLOAD_PUBLISH_ENDPOINT: 'https://www.agentweb.pro/api/publish-post',
+      PAYLOAD_PUBLISH_SECRET: 'test-payload-secret-123',
+    });
+
+    const mockPayloadResponse = {
+      data: {
+        id: 'payload-post-123',
+        slug: 'test-blog-title',
+        title: 'Test Blog Title',
+        status: 'draft',
+      },
+    };
+
+    beforeEach(() => {
+      // Mock user with Webflow cmsType (Payload intercepts before Webflow)
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow',
+      });
+
+      // Mock Webflow config (still needed since publishBlogArticle loads it first)
+      mockGetWebflowConfig.mockResolvedValue({
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: { summary: 'post-summary', body: 'post-body', image: 'main-image' },
+      });
+
+      // Mock getSecret to return Payload CMS credentials
+      mockGetSecret.mockImplementation((key: string) => {
+        if (key.includes('PayloadCMS')) {
+          return Promise.resolve(mockPayloadSecret);
+        }
+        return Promise.resolve(null);
+      });
+    });
+
+    it('should publish to Payload CMS when secret is available', async () => {
+      // Mock HTML fetch (first axios.get call)
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      // Mock Payload CMS publish (axios.post call)
+      mockAxiosPost.mockResolvedValueOnce(mockPayloadResponse);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.cmsType).toBe('Payload');
+      expect(result.message).toContain('Payload CMS');
+    });
+
+    it('should send correct payload to Payload CMS endpoint', async () => {
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce(mockPayloadResponse);
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'A great test article',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      // Verify the Payload CMS API was called
+      expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+      const [url, body, config] = mockAxiosPost.mock.calls[0];
+
+      // Verify endpoint
+      expect(url).toBe('https://www.agentweb.pro/api/publish-post');
+
+      // Verify auth header
+      expect(config.headers.Authorization).toBe('Bearer test-payload-secret-123');
+
+      // Verify body fields
+      expect(body.title).toBe('Test Blog Title');
+      expect(body.slug).toBe('test-blog-title');
+      expect(body.summary).toBe('A great test article');
+      expect(body.bodyHtml).toBeDefined();
+      expect(body.bodyHtml).toContain('Test blog content here');
+      expect(body.category).toBeDefined();
+      expect(body.author).toBeDefined();
+      expect(body.featuredImageUrl).toBe(mockHeroImageUrl);
+      expect(body.status).toBeDefined();
+      expect(body.publishedAt).toBeDefined();
+    });
+
+    it('should map author names to Payload slugs correctly', async () => {
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce(mockPayloadResponse);
+
+      // Default author (no author specified) should map to 'emma'
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      const body = mockAxiosPost.mock.calls[0][1];
+      expect(body.author).toBe('emma');
+    });
+
+    it('should return slug-based URL for Payload CMS posts', async () => {
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce(mockPayloadResponse);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'My Great Post',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.data.slug).toBe('my-great-post');
+      expect(result.data.url).toBe('/blog/my-great-post');
+    });
+
+    it('should fall back to Webflow when Payload secret is not available', async () => {
+      // Override getSecret to return null for Payload
+      mockGetSecret.mockImplementation(() => Promise.resolve(null));
+
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce({
+        data: {
+          id: 'webflow-item-id',
+          fieldData: { name: 'Test Blog Title' },
+        },
+      });
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.cmsType).toBe('Webflow');
+    });
+
   });
 });
 

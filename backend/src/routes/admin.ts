@@ -18,9 +18,12 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { getRevenueMetrics } from "../services/revenueService";
+import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
+import { validateEmail } from "../utils/validation";
 
 const router = express.Router();
 
@@ -584,11 +587,11 @@ router.put("/users/:userId/email-sender", async (req, res) => {
   }
 });
 
-// Update user slack channel
+// Update user slack channels (accepts an array)
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { slackChannel } = req.body;
+    const { slackChannels } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -596,14 +599,18 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Update the user's slack channel
-    const updatedUser = await userDb.updateUser(userId, { 
-      slackChannel 
+    // Validate: must be an array of non-empty strings (or null/empty to clear)
+    const channels: string[] = Array.isArray(slackChannels)
+      ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
+      : [];
+
+    const updatedUser = await userDb.updateUser(userId, {
+      slackChannels: channels.length > 0 ? channels : (null as any),
     });
     res.json(updatedUser);
   } catch (error) {
-    console.error("Error updating user slack channel:", error);
-    res.status(500).json({ message: "Error updating slack channel" });
+    console.error("Error updating user slack channels:", error);
+    res.status(500).json({ message: "Error updating slack channels" });
   }
 });
 
@@ -4605,6 +4612,85 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   } catch (error: any) {
     console.error("Error scoring chat sessions with judge:", error);
     res.status(500).json({ message: "Failed to score chat sessions with judge" });
+  }
+});
+
+// Get alert email lists (oncall + product issue)
+router.get("/alert-emails", async (req, res) => {
+  try {
+    const [oncallEmails, productIssueEmails] = await Promise.all([
+      settingsService.getJsonArraySetting("oncall_emails", ["ruiw@agentweb.pro"]),
+      settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]),
+    ]);
+    res.json({ oncallEmails, productIssueEmails });
+  } catch (error: any) {
+    console.error("Error getting alert emails:", error);
+    res.status(500).json({ message: "Failed to get alert emails" });
+  }
+});
+
+// Update alert email lists
+router.put("/alert-emails", async (req, res) => {
+  try {
+    const { oncallEmails, productIssueEmails } = req.body;
+    const updatedBy = (req as any).user?.email || "unknown";
+
+    if (!Array.isArray(oncallEmails) || !Array.isArray(productIssueEmails)) {
+      return res.status(400).json({ message: "oncallEmails and productIssueEmails must be arrays" });
+    }
+
+    const allEmails = [...oncallEmails, ...productIssueEmails];
+    const invalid = allEmails.filter((e) => typeof e !== "string" || !validateEmail(e));
+    if (invalid.length > 0) {
+      return res.status(400).json({ message: `Invalid email addresses: ${invalid.join(", ")}` });
+    }
+
+    await Promise.all([
+      settingsService.setSetting(
+        "oncall_emails",
+        JSON.stringify(oncallEmails),
+        "Oncall alert email recipients",
+        updatedBy
+      ),
+      settingsService.setSetting(
+        "product_issue_emails",
+        JSON.stringify(productIssueEmails),
+        "Product issue / help message email recipients",
+        updatedBy
+      ),
+    ]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Error updating alert emails:", error);
+    res.status(500).json({ message: "Failed to update alert emails" });
+  }
+});
+
+// ─── Revenue Metrics ─────────────────────────────────────────────────────
+
+router.get("/revenue-metrics", async (req, res) => {
+  try {
+    const months = parseInt(req.query.months as string) || 6;
+    const data = await getRevenueMetrics(Math.min(months, 24));
+    res.json(data);
+  } catch (error: any) {
+    console.error("Error fetching revenue metrics:", error.message);
+    res.status(500).json({ message: "Failed to fetch revenue metrics" });
+  }
+});
+
+// ─── Business Funnel Metrics ─────────────────────────────────────────────
+
+router.get("/funnel-metrics", async (req, res) => {
+  try {
+    const period = (req.query.period as string) || "30d";
+    const channel = (req.query.channel as string) || undefined;
+    const data = await getBusinessFunnelMetrics(period, channel);
+    res.json(data);
+  } catch (error: any) {
+    console.error("Error fetching funnel metrics:", error.message);
+    res.status(500).json({ message: "Failed to fetch funnel metrics" });
   }
 });
 

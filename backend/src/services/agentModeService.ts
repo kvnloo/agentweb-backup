@@ -26,7 +26,7 @@ import type { LLMUsageData } from '../utils/llmService';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'slack_list_channels', 'slack_get_recent_messages', 'slack_send_message', 'freeze_user_account'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -74,6 +74,54 @@ interface PDFData {
   info: any;
   metadata: any;
   version: string;
+}
+
+/**
+ * Custom pdf-parse pagerender function that preserves table structure.
+ *
+ * The default pdf-parse renderer concatenates items sharing the same exact Y
+ * coordinate without adding spaces, and doesn't sort items by X position.
+ * This causes numbers in tabular PDFs to run together or appear out of order.
+ *
+ * This renderer:
+ * 1. Sorts all text items by Y (descending = top-to-bottom) then X (ascending = left-to-right)
+ * 2. Groups items into rows using a Y-tolerance to handle slight vertical misalignments
+ * 3. Separates items on the same row with a space so numbers don't concatenate
+ */
+function pdfPageRender(pageData: any): Promise<string> {
+  return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
+    .then((textContent: any) => {
+      const Y_TOLERANCE = 3; // points — items within this vertical distance are on the same row
+
+      // Sort: top-to-bottom (higher Y first in PDF coords), left-to-right
+      const items: Array<{ str: string; x: number; y: number }> = textContent.items
+        .filter((item: any) => item.str && item.str.trim() !== '')
+        .map((item: any) => ({ str: item.str, x: item.transform[4], y: item.transform[5] }))
+        .sort((a: any, b: any) => {
+          if (Math.abs(a.y - b.y) > Y_TOLERANCE) return b.y - a.y; // top first
+          return a.x - b.x; // left first within same row
+        });
+
+      if (items.length === 0) return '';
+
+      // Group items into rows
+      const rows: string[][] = [];
+      let currentRow: string[] = [];
+      let rowY = items[0].y;
+
+      for (const item of items) {
+        if (Math.abs(item.y - rowY) <= Y_TOLERANCE) {
+          currentRow.push(item.str);
+        } else {
+          rows.push(currentRow);
+          currentRow = [item.str];
+          rowY = item.y;
+        }
+      }
+      if (currentRow.length > 0) rows.push(currentRow);
+
+      return rows.map(row => row.join(' ')).join('\n');
+    });
 }
 
 // Type for LLM model configuration
@@ -2435,7 +2483,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'fathom_get_transcript',
 
     // Coding Agent (sub-agent for code editing tasks)
-    'coding_agent'
+    'coding_agent',
+
+    'slack_list_channels',
+    'slack_get_recent_messages',
+    'slack_send_message',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -12609,7 +12661,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (extension === 'pdf' || mimeType === 'application/pdf') {
       const pdfParse = require('pdf-parse');
-      const pdfData = await pdfParse(content);
+      const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
@@ -12702,7 +12754,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         const pdfParse = require('pdf-parse');
-        const pdfData = await pdfParse(content);
+        const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
@@ -13687,7 +13739,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try {
           // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer);
+          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
@@ -14704,14 +14756,94 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
         console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
+        // Publish to Payload CMS instead of Webflow
+        let payloadEndpoint = 'https://www.agentweb.pro/api/publish-post';
+        let payloadSecret: string | undefined;
+
         try {
+          const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
+          if (payloadSecretJson) {
+            const parsed = JSON.parse(payloadSecretJson);
+            payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
+            payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
+          }
+        } catch (secretErr) {
+          console.warn('AgentMode: Could not load PayloadCMS secret, falling back to Webflow:', secretErr);
+        }
+
+        if (!payloadSecret) {
+          console.warn('AgentMode: PAYLOAD_PUBLISH_SECRET not available, falling back to Webflow');
+        }
+
+        try {
+          if (payloadSecret) {
+            // Map Webflow categories to Payload categories
+            const categoryMap: Record<string, string> = {
+              'AI in Marketing': 'AI in Marketing',
+              'Founder Playbooks': 'Founder Playbooks',
+              'Growth Tips': 'Growth Tips',
+              'Thought Leadership': 'Thought Leadership',
+              'Other': 'Other',
+              'Alternatives': 'Alternatives',
+              'Listicles': 'Listicles',
+              'User Guide': 'User Guide',
+              'Case Studies': 'Case Studies',
+            };
+            const payloadCategory = categories.length > 0
+              ? (categoryMap[categories[0]] || 'Other')
+              : 'Other';
+
+            // Map author to Payload author slug
+            const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
+              : author?.toLowerCase().includes('harsha') ? 'harsha'
+              : author?.toLowerCase().includes('fangfang') ? 'fangfang'
+              : author?.toLowerCase().includes('matthew') ? 'matthew'
+              : 'emma';
+
+            const payloadResponse = await axios.post(
+              payloadEndpoint,
+              {
+                title,
+                slug,
+                summary: description,
+                bodyHtml: cleanBodyHtml,
+                category: payloadCategory,
+                author: authorSlug,
+                featuredImageUrl: heroImageUrl,
+                publishedAt: new Date().toISOString(),
+                status,
+              },
+              {
+                headers: { 'Authorization': `Bearer ${payloadSecret}` },
+                timeout: 30000,
+              }
+            );
+
+            console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
+
+            return {
+              success: true,
+              message: `Blog article published successfully to Payload CMS as ${status}`,
+              data: {
+                title,
+                slug,
+                status,
+                cmsType: 'Payload',
+                url: `/blog/${slug}`,
+                cmsResponse: payloadResponse.data,
+              }
+            };
+          }
+
+          // Fallback to Webflow if no Payload secret
           const response = await axios.post(
             endpoint,
             cmsItemData,
             { headers }
           );
 
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}`);
+          console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
 
           // Sanitize response to remove large content fields before sending to LLM
           const responseData = response.data as any;
@@ -14721,7 +14853,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
           if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
             const sanitizedFieldData = { ...sanitizedResponse.fieldData };
-            // Remove large content fields that aren't needed by the LLM
             delete sanitizedFieldData['post-body'];
             delete sanitizedFieldData['body'];
             sanitizedResponse.fieldData = sanitizedFieldData;

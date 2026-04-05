@@ -20,6 +20,18 @@ jest.mock('../controllers/templates', () => ({
   publishTemplate: jest.fn(),
 }));
 
+// Mock AWS config to prevent real DynamoDB connections during tests
+jest.mock('../config/aws', () => ({
+  dynamodb: {
+    get: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+    put: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+    update: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+    delete: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+    query: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
+    scan: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
+  },
+}));
+
 import { Request, Response } from 'express';
 import { crmDb, userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
