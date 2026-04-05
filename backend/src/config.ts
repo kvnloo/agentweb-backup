@@ -20,3 +20,8 @@ export const RESEND_SYSTEM_NAME = 'AgentWeb';
 // Used for inbound/outbound Emma chatbot emails
 export const EMMA_EMAIL_ADDRESS = 'emma@updates.agentweb.pro';
 export const EMMA_EMAIL_FROM = 'Emma at AgentWeb <emma@updates.agentweb.pro>';
+
+// Temp Email Configuration
+// Used by Emma to receive test emails during automated tasks
+export const TEMP_EMAIL_DOMAIN = 'updates.agentweb.pro';
+export const TEMP_EMAIL_PREFIX = 'test';

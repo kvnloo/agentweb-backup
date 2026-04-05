@@ -1767,6 +1767,42 @@ const createPaymentHistoryTable = async () => {
   }
 };
 
+const createTempEmailsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TempEmails`,
+    AttributeDefinitions: [
+      { AttributeName: 'emailId', AttributeType: 'S' },
+      { AttributeName: 'toAddress', AttributeType: 'S' },
+      { AttributeName: 'receivedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'emailId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'ToAddressIndex',
+        KeySchema: [
+          { AttributeName: 'toAddress', KeyType: 'HASH' },
+          { AttributeName: 'receivedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1808,6 +1844,7 @@ const main = async () => {
     await createOrganizationsTable();
     await createScheduleTemplatesTable();
     await createPaymentHistoryTable();
+    await createTempEmailsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
