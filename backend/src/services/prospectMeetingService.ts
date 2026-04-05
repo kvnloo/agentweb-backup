@@ -461,8 +461,8 @@ async function fetchCalendarEvents(
 
 // ── Period Helpers ──────────────────────────────────────────────────────────
 
-/** Same founder user ID as businessFunnelService — this service runs for the business funnel */
-const FOUNDER_USER_ID = 'be754b6c-767e-44ec-b181-4042cfe45ea9';
+/** Harsha's account — has Gmail (Google Calendar) and Fathom connected for meeting detection */
+const HARSHA_USER_ID = '1743956381327';
 
 function parsePeriodDays(period: string): number {
   const match = period.match(/^(\d+)d$/);
@@ -510,8 +510,8 @@ function getDateRanges(period: string): {
  * @param period - Period string like "30d", "7d", "90d"
  */
 export async function getProspectMeetingMetrics(period: string): Promise<ProspectMeetingMetrics> {
-  // This service runs for the business funnel — uses the founder's calendar
-  const userId = FOUNDER_USER_ID;
+  // Uses Harsha's account which has Gmail (Calendar) and Fathom connected
+  const userId = HARSHA_USER_ID;
   const { startDate, endDate, previousStartDate, previousEndDate } = getDateRanges(period);
 
   try {

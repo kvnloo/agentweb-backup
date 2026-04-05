@@ -72,7 +72,10 @@ export interface FunnelMetricsResponse {
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
+// Founders account — has GSC, Meta Ads, CRM lead lists, ad account
 const FOUNDER_USER_ID = "be754b6c-767e-44ec-b181-4042cfe45ea9";
+// Harsha's account — has Gmail (Google Calendar), Fathom, Unipile connected
+const HARSHA_USER_ID = "1743956381327";
 const SEO_DOMAIN = "agentweb.pro";
 
 // ─── Helpers ────────────────────────────────────────────────────────────
