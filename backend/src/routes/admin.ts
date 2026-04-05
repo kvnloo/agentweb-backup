@@ -4615,27 +4615,6 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   }
 });
 
-// ─── Revenue metrics ────────────────────────────────────────────────────
-
-router.get("/revenue-metrics", async (req, res) => {
-  try {
-    const months = parseInt(req.query.months as string) || 6;
-    const data = await getRevenueMetrics(Math.min(months, 24));
-    res.json(data);
-  } catch (error: any) {
-    console.error("Error fetching revenue metrics:", error.message);
-    res.status(500).json({ message: "Failed to fetch revenue metrics" });
-// ─── Business Funnel Metrics ─────────────────────────────────────────────
-
-router.get("/funnel-metrics", async (req, res) => {
-  try {
-    const period = (req.query.period as string) || "30d";
-    const channel = (req.query.channel as string) || undefined;
-    const data = await getBusinessFunnelMetrics(period, channel);
-    res.json(data);
-  } catch (error: any) {
-    console.error("Error fetching funnel metrics:", error.message);
-    res.status(500).json({ message: "Failed to fetch funnel metrics" });
 // Get alert email lists (oncall + product issue)
 router.get("/alert-emails", async (req, res) => {
   try {

@@ -5412,8 +5412,9 @@ export default function AdminDashboard() {
         </TabPanel>
         <TabPanel value={tabValue} index={19}>
           <FunnelTab />
+        </TabPanel>
 
-        <TabPanel value={tabValue} index={18}>
+        <TabPanel value={tabValue} index={20}>
           <AlertEmailsTab />
         </TabPanel>
       </Paper>
