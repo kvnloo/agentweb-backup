@@ -789,4 +789,16 @@ router.post(
  */
 router.get("/products", stripeController.listProducts);
 
+/**
+ * @route GET /api/stripe/payment-history/:userId
+ * @desc Get payment history for a user (admin only)
+ * @access Private (admin only)
+ */
+router.get(
+  "/payment-history/:userId",
+  authenticateToken,
+  requireAdmin,
+  stripeController.getPaymentHistory
+);
+
 export default router;

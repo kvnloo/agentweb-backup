@@ -193,14 +193,27 @@ export const stripeService = {
 
 /**
  * Sync subscription status from Stripe for a user who has stripe_customer_id
- * but missing subscription_status. Called lazily from /api/auth/me.
- * Returns the updated fields or null if no active subscription found.
+ * but missing subscription data. Called lazily from /api/auth/me.
+ *
+ * ADDITIVE-ONLY: Only fills null/undefined fields — never overwrites values
+ * that webhooks already wrote to DynamoDB. Webhooks are the source of truth;
+ * this function only backfills gaps (e.g., when a webhook was missed).
+ *
+ * Returns the updated fields or null if nothing needed updating.
  */
 export async function syncSubscriptionFromStripe(
   userId: string,
   stripeCustomerId: string
-): Promise<{ subscription_status: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean } | null> {
+): Promise<{ subscription_status?: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean } | null> {
   try {
+    // 1. Read the current user record to know which fields are already set
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      console.warn(`[STRIPE SYNC] User ${userId} not found in DB`);
+      return null;
+    }
+
+    // 2. Fetch the subscription from Stripe
     const stripe = getStripeOrThrow();
     const subscriptions = await stripe.subscriptions.list({
       customer: stripeCustomerId,
@@ -213,10 +226,8 @@ export async function syncSubscriptionFromStripe(
     }
 
     const sub = subscriptions.data[0];
-    const status = sub.status; // active, trialing, past_due, canceled, etc.
 
-    // Check if customer has a payment method on file
-    // Payment method can be on the subscription OR the customer level
+    // 3. Check if customer has a payment method on file
     let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
     if (!hasPaymentMethod) {
       try {
@@ -224,7 +235,6 @@ export async function syncSubscriptionFromStripe(
         if (customer && !customer.deleted) {
           const cust = customer as any;
           hasPaymentMethod = !!(cust.default_source || cust.invoice_settings?.default_payment_method);
-          // Also check if any payment methods exist
           if (!hasPaymentMethod) {
             const methods = await stripe.paymentMethods.list({ customer: stripeCustomerId, limit: 1 });
             hasPaymentMethod = methods.data.length > 0;
@@ -235,16 +245,17 @@ export async function syncSubscriptionFromStripe(
       }
     }
 
-    const updates: any = {
-      subscription_status: status,
+    // 4. Build Stripe-sourced values
+    const stripeValues: Record<string, any> = {
+      subscription_status: sub.status,
       stripe_subscription_id: sub.id,
+      has_payment_method: hasPaymentMethod,
       current_period_end: (sub as any).current_period_end
         ? new Date(typeof (sub as any).current_period_end === 'number'
             ? (sub as any).current_period_end * 1000
             : (sub as any).current_period_end
           ).toISOString()
         : undefined,
-      has_payment_method: hasPaymentMethod,
     };
 
     // Derive tier from price if available
@@ -252,17 +263,40 @@ export async function syncSubscriptionFromStripe(
     if (priceId) {
       const derivedType = deriveSubscriptionTypeFromPriceId(priceId);
       if (derivedType) {
-        updates.subscriptionType = derivedType;
-        const tierConfig = await getTierConfig(derivedType);
-        if (tierConfig) {
-          updates.allowedPages = tierConfig.allowedPages;
-          updates.allowedSkills = tierConfig.allowedSkills;
-        }
+        stripeValues.subscriptionType = derivedType;
       }
     }
 
+    // 5. Additive-only merge: only fill fields that are null/undefined in DynamoDB
+    const SYNC_FIELDS = ['subscription_status', 'stripe_subscription_id', 'subscriptionType', 'has_payment_method', 'current_period_end'] as const;
+    const updates: Record<string, any> = {};
+
+    for (const field of SYNC_FIELDS) {
+      const dbValue = user[field];
+      const stripeValue = stripeValues[field];
+      // Only write if DB value is null/undefined AND Stripe has a value
+      if ((dbValue === null || dbValue === undefined) && stripeValue !== undefined) {
+        updates[field] = stripeValue;
+      }
+    }
+
+    // If subscriptionType is being set, also sync tier config (allowedPages/allowedSkills)
+    if (updates.subscriptionType) {
+      const tierConfig = await getTierConfig(updates.subscriptionType);
+      if (tierConfig) {
+        updates.allowedPages = tierConfig.allowedPages;
+        updates.allowedSkills = tierConfig.allowedSkills;
+      }
+    }
+
+    // 6. Only write to DB if there are actual updates
+    if (Object.keys(updates).length === 0) {
+      console.log(`[STRIPE SYNC] No gaps to fill for user ${userId} — webhook data preserved`);
+      return null;
+    }
+
     await userDb.updateUser(userId, updates);
-    console.log(`[STRIPE SYNC] Synced subscription for user ${userId}: status=${status}, sub=${sub.id}`);
+    console.log(`[STRIPE SYNC] Backfilled ${Object.keys(updates).join(', ')} for user ${userId} (additive-only)`);
 
     return updates;
   } catch (error: any) {
@@ -444,6 +478,47 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
 }
 
 /**
+ * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
+ */
+export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  const updateData: Record<string, any> = {
+    subscription_status: 'active',
+    has_payment_method: true,
+  };
+
+  // Backfill stripe_subscription_id if user doesn't have one yet
+  if (!user.stripe_subscription_id && subscriptionId) {
+    updateData.stripe_subscription_id = subscriptionId;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
+
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+  );
+}
+
+/**
+ * Handle customer.subscription.deleted — mark subscription as canceled.
  * Handle customer.subscription.deleted — mark subscription as canceled,
  * BUT only if the customer has no other active/trialing subscription.
  *
@@ -541,6 +616,12 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
 }
 
+// ─── invoice.payment_succeeded ──────────────────────────────────────────
+
+/**
+ * Handle invoice.payment_succeeded webhook event.
+ * Confirms payment went through: sets status to active, backfills
+ * stripe_subscription_id if missing, and sets has_payment_method.
 
 /**
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
@@ -551,12 +632,18 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     : invoice.customer?.id;
 
   if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded with no customer ID — skipping');
     console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
     return;
   }
 
   const user = await findUserByStripeCustomerId(customerId);
   if (!user) {
+    console.warn(`[STRIPE] invoice.payment_succeeded for unknown customer ${customerId} — skipping`);
+    return;
+  }
+
+  const updates: Record<string, any> = {
     console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
     return;
   }
@@ -570,6 +657,14 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     has_payment_method: true,
   };
 
+  // Backfill stripe_subscription_id if missing
+  const subId = typeof invoice.subscription === 'string' ? invoice.subscription : null;
+  if (subId && !user.stripe_subscription_id) {
+    updates.stripe_subscription_id = subId;
+  }
+
+  await userDb.updateUser(user.userId, updates);
+  console.log(`[STRIPE] invoice.payment_succeeded: user ${user.userId} → active`);
   // Backfill stripe_subscription_id if user doesn't have one yet
   if (!user.stripe_subscription_id && subscriptionId) {
     updateData.stripe_subscription_id = subscriptionId;
@@ -714,7 +809,7 @@ function deriveSubscriptionType(session: any): string {
  * Uses a filtered DynamoDB scan (server-side filter, no GSI required).
  * Consider adding a GSI on stripe_customer_id if user count grows past ~1000.
  */
-async function findUserByStripeCustomerId(stripeCustomerId: string): Promise<any | null> {
+export async function findUserByStripeCustomerId(stripeCustomerId: string): Promise<any | null> {
   if (!stripeCustomerId) return null;
 
   try {
