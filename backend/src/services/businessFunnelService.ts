@@ -618,7 +618,20 @@ function buildOutboundPipeline(
   }
 
   if (unipileData.status === "ok") {
-    contactedSources.push(safeSource("Unipile LinkedIn (messages sent)", unipileContacted));
+    // Show per-person breakdown
+    if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
+      for (const acct of unipileData.accountBreakdown) {
+        if (acct.messagesSent > 0) {
+          contactedSources.push(safeSource(`LinkedIn — ${acct.accountName}`, acct.messagesSent));
+        }
+      }
+      // If no one sent anything, still show aggregate
+      if (!unipileData.accountBreakdown.some(a => a.messagesSent > 0)) {
+        contactedSources.push(safeSource("Unipile LinkedIn (messages sent)", 0));
+      }
+    } else {
+      contactedSources.push(safeSource("Unipile LinkedIn (messages sent)", unipileContacted));
+    }
   } else if (unipileData.status === "error") {
     contactedSources.push(errorSource("Unipile LinkedIn", unipileData.error || "Failed to fetch Unipile data"));
   } else {
@@ -642,7 +655,19 @@ function buildOutboundPipeline(
   }
 
   if (unipileData.status === "ok") {
-    repliesSources.push(safeSource("Unipile LinkedIn (replies received)", unipileReplied));
+    // Show per-person breakdown for replies too
+    if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
+      for (const acct of unipileData.accountBreakdown) {
+        if (acct.repliesReceived > 0) {
+          repliesSources.push(safeSource(`LinkedIn replies — ${acct.accountName}`, acct.repliesReceived));
+        }
+      }
+      if (!unipileData.accountBreakdown.some(a => a.repliesReceived > 0)) {
+        repliesSources.push(safeSource("Unipile LinkedIn (replies received)", 0));
+      }
+    } else {
+      repliesSources.push(safeSource("Unipile LinkedIn (replies received)", unipileReplied));
+    }
   } else if (unipileData.status === "error") {
     repliesSources.push(errorSource("Unipile LinkedIn", unipileData.error || "Failed to fetch Unipile data"));
   } else {
