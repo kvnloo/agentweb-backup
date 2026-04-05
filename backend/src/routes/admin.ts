@@ -4589,7 +4589,8 @@ router.get("/revenue-metrics", async (req, res) => {
 router.get("/funnel-metrics", async (req, res) => {
   try {
     const period = (req.query.period as string) || "30d";
-    const data = await getBusinessFunnelMetrics(period);
+    const channel = (req.query.channel as string) || undefined;
+    const data = await getBusinessFunnelMetrics(period, channel);
     res.json(data);
   } catch (error: any) {
     console.error("Error fetching funnel metrics:", error.message);

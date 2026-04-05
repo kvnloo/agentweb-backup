@@ -2,6 +2,7 @@ import { userDb, crmDb } from "./db";
 import { fetchSearchConsoleMetrics } from "./seoService";
 import { MetaService } from "./metaService";
 import { getAccountByPlatform } from "./connectedAccountsDb";
+import { getProspectMeetingMetrics, ProspectMeetingMetrics } from "./prospectMeetingService";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -12,23 +13,47 @@ interface SourceBreakdown {
   error?: string;
 }
 
-interface BusinessFunnelStage {
+export interface FunnelStage {
   name: string;
   count: number;
   previousCount: number;
-  conversionRate: number;
+  conversionRate: number; // from previous stage
   sources: SourceBreakdown[];
+  status: "ok" | "unavailable" | "error";
 }
 
-interface FunnelBottleneck {
+export interface ConstraintAnalysis {
   stage: string;
   conversionRate: number;
+  type: "more" | "metrics" | "leads" | "sales" | "ltv" | "cashflow";
   suggestion: string;
 }
 
-export interface BusinessFunnelMetrics {
-  stages: BusinessFunnelStage[];
-  bottleneck: FunnelBottleneck | null;
+export interface ChannelPipeline {
+  channel: "seo" | "linkedin" | "outbound" | "paid_ads";
+  displayName: string;
+  stages: FunnelStage[];
+  constraint: ConstraintAnalysis | null;
+}
+
+export interface ChannelComparison {
+  channel: string;
+  leads: number;
+  conversionPercent: number;
+  demos: number;
+  closePercent: number;
+  paid: number;
+  cac: number;
+}
+
+export interface FunnelMetricsResponse {
+  channels: ChannelPipeline[];
+  comparison: ChannelComparison[];
+  aggregate: {
+    totalLeads: number;
+    totalPaid: number;
+    overallConstraint: ConstraintAnalysis | null;
+  };
   period: { start: string; end: string };
   generatedAt: string;
 }
@@ -37,9 +62,6 @@ export interface BusinessFunnelMetrics {
 
 const FOUNDER_USER_ID = "be754b6c-767e-44ec-b181-4042cfe45ea9";
 const SEO_DOMAIN = "agentweb.pro";
-
-// Stages that are placeholders (data source not connected)
-const PLACEHOLDER_STAGES = new Set(["Contacted", "Talked", "Committed"]);
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -83,11 +105,106 @@ function unavailableSource(name: string): SourceBreakdown {
   return { name, count: 0, status: "unavailable" };
 }
 
+function makeStage(
+  name: string,
+  count: number,
+  previousCount: number,
+  prevStageCount: number,
+  sources: SourceBreakdown[],
+): FunnelStage {
+  const hasOk = sources.some(s => s.status === "ok");
+  const allUnavailable = sources.every(s => s.status === "unavailable");
+  const hasError = sources.some(s => s.status === "error");
+
+  let status: "ok" | "unavailable" | "error";
+  if (allUnavailable) {
+    status = "unavailable";
+  } else if (hasOk) {
+    status = "ok";
+  } else {
+    status = hasError ? "error" : "unavailable";
+  }
+
+  return {
+    name,
+    count,
+    previousCount,
+    conversionRate: prevStageCount > 0 ? parseFloat(((count / prevStageCount) * 100).toFixed(2)) : 0,
+    sources,
+    status,
+  };
+}
+
+// ─── Constraint Classification (Hormozi Framework) ──────────────────────
+
+function classifyConstraint(stages: FunnelStage[]): ConstraintAnalysis | null {
+  // 1. METRICS: If 3+ stages have status "unavailable", constraint is tracking
+  const unavailable = stages.filter(s => s.status === "unavailable").length;
+  if (unavailable >= 3) {
+    return {
+      stage: "tracking",
+      conversionRate: 0,
+      type: "metrics",
+      suggestion: "Connect data sources first. You can't grow what you can't measure.",
+    };
+  }
+
+  // 2. MORE: If top-of-funnel absolute count < 1000, it's a volume problem
+  const topStage = stages.find(s => s.status === "ok");
+  if (topStage && topStage.count < 1000) {
+    return {
+      stage: topStage.name,
+      conversionRate: 0,
+      type: "more",
+      suggestion: `Only ${topStage.count} ${topStage.name.toLowerCase()}. Just do more — volume is too low to optimize.`,
+    };
+  }
+
+  // 3. Find worst conversion rate among available stages
+  let worstStage: FunnelStage | null = null;
+  let worstRate = Infinity;
+
+  for (const stage of stages) {
+    if (stage.status !== "ok" || stage.conversionRate === 0) continue;
+    if (stage.conversionRate < worstRate) {
+      worstRate = stage.conversionRate;
+      worstStage = stage;
+    }
+  }
+
+  if (!worstStage) return null;
+
+  // Classify based on position in the funnel
+  const stageIndex = stages.indexOf(worstStage);
+  const okStages = stages.filter(s => s.status === "ok").length;
+  const position = okStages > 0 ? stageIndex / stages.length : 0;
+
+  let type: ConstraintAnalysis["type"];
+  let suggestion: string;
+
+  if (position < 0.33) {
+    type = "leads";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Improve hooks, ad creative, or landing pages.`;
+  } else if (position < 0.66) {
+    type = "sales";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Add VSSL, improve nurture, or add proof to the sales process.`;
+  } else {
+    type = "ltv";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Improve onboarding, delivery quality, or add upsells.`;
+  }
+
+  return { stage: worstStage.name, conversionRate: worstRate, type, suggestion };
+}
+
 // ─── Data Fetchers ──────────────────────────────────────────────────────
 
-async function fetchGSCData(
-  timeframe: string
-): Promise<{ impressions: number; clicks: number; status: "ok" | "error" }> {
+interface GSCData {
+  impressions: number;
+  clicks: number;
+  status: "ok" | "error";
+}
+
+async function fetchGSCData(timeframe: string): Promise<GSCData> {
   try {
     const result = await fetchSearchConsoleMetrics(FOUNDER_USER_ID, timeframe, SEO_DOMAIN);
     if (result.error || !result.metrics || result.metrics.length === 0) {
@@ -108,26 +225,30 @@ async function fetchGSCData(
   }
 }
 
-async function fetchMetaAdsData(
-  timeframe: string
-): Promise<{ impressions: number; clicks: number; status: "ok" | "error" | "unavailable" }> {
+interface MetaAdsData {
+  impressions: number;
+  clicks: number;
+  leads: number;
+  spend: number;
+  status: "ok" | "error" | "unavailable";
+}
+
+async function fetchMetaAdsData(timeframe: string): Promise<MetaAdsData> {
   try {
-    // Get the founder's Meta connected account
     const metaAccount = await getAccountByPlatform(FOUNDER_USER_ID, "meta");
     if (!metaAccount) {
-      return { impressions: 0, clicks: 0, status: "unavailable" };
+      return { impressions: 0, clicks: 0, leads: 0, spend: 0, status: "unavailable" };
     }
 
     const accessToken = (metaAccount.config as any)?.access_token;
     if (!accessToken) {
-      return { impressions: 0, clicks: 0, status: "unavailable" };
+      return { impressions: 0, clicks: 0, leads: 0, spend: 0, status: "unavailable" };
     }
 
-    // Get the ad account ID from the user record
     const user = await userDb.getUserById(FOUNDER_USER_ID);
     const adAccountId = user?.adAccount;
     if (!adAccountId) {
-      return { impressions: 0, clicks: 0, status: "unavailable" };
+      return { impressions: 0, clicks: 0, leads: 0, spend: 0, status: "unavailable" };
     }
 
     const metaService = MetaService.getInstance();
@@ -137,26 +258,46 @@ async function fetchMetaAdsData(
     });
 
     if (!insights || !Array.isArray(insights) || insights.length === 0) {
-      return { impressions: 0, clicks: 0, status: "ok" };
+      return { impressions: 0, clicks: 0, leads: 0, spend: 0, status: "ok" };
     }
 
     let impressions = 0;
     let clicks = 0;
+    let leads = 0;
+    let spend = 0;
     for (const row of insights) {
       impressions += parseInt(row.impressions || "0", 10);
       clicks += parseInt(row.clicks || "0", 10);
+      spend += parseFloat(row.spend || "0");
+
+      // Extract lead actions from the actions array if present
+      if (Array.isArray(row.actions)) {
+        for (const action of row.actions) {
+          if (
+            action.action_type === "lead" ||
+            action.action_type === "offsite_conversion.fb_pixel_lead" ||
+            action.action_type === "onsite_conversion.lead_grouped"
+          ) {
+            leads += parseInt(action.value || "0", 10);
+          }
+        }
+      }
     }
 
-    return { impressions, clicks, status: "ok" };
+    return { impressions, clicks, leads, spend, status: "ok" };
   } catch (error: any) {
     console.error("[BusinessFunnelService] Meta Ads fetch error:", error.message);
-    return { impressions: 0, clicks: 0, status: "error" };
+    return { impressions: 0, clicks: 0, leads: 0, spend: 0, status: "error" };
   }
 }
 
-async function fetchLeadCount(
-  periodStart: Date
-): Promise<{ total: number; thisMonth: number; status: "ok" | "error" }> {
+interface LeadData {
+  total: number;
+  thisMonth: number;
+  status: "ok" | "error";
+}
+
+async function fetchLeadCount(periodStart: Date): Promise<LeadData> {
   try {
     const leadLists = await crmDb.getLeadListsByUserId(FOUNDER_USER_ID);
     let total = 0;
@@ -168,7 +309,6 @@ async function fetchLeadCount(
         const result = await crmDb.getLeadsByListId(list.listId, 100, lastKey);
         total += result.items.length;
 
-        // Count leads created in the current period
         for (const lead of result.items) {
           const createdAt = lead.createdAt ? new Date(lead.createdAt) : null;
           if (createdAt && createdAt >= periodStart) {
@@ -199,14 +339,10 @@ interface UserCounts {
 async function fetchUserAndSubscriptionData(
   periodStart: Date,
   previousPeriodStart: Date,
-  previousPeriodEnd: Date
+  previousPeriodEnd: Date,
 ): Promise<{ data: UserCounts; previousData: UserCounts; status: "ok" | "error" }> {
   try {
-    // Use scanWithFilter for efficiency instead of getAllUsers (which fetches task/workflow counts)
-    const allUsers = await userDb.scanWithFilter(
-      "attribute_exists(userId)",
-      {}
-    );
+    const allUsers = await userDb.scanWithFilter("attribute_exists(userId)", {});
 
     const currentMonth = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
 
@@ -214,43 +350,32 @@ async function fetchUserAndSubscriptionData(
     let newUsers = 0;
     let prevNewUsers = 0;
     let paidUsers = 0;
-    let prevPaidUsers = 0;
     let activeUsers = 0;
-    let prevActiveUsers = 0;
     let retainedUsers = 0;
-    let prevRetainedUsers = 0;
     let churnedUsers = 0;
-    let prevChurnedUsers = 0;
 
     for (const user of allUsers) {
       const createdAt = user.createdAt ? new Date(user.createdAt) : null;
 
-      // New users in current period
       if (createdAt && createdAt >= periodStart) {
         newUsers++;
       }
-      // New users in previous period
       if (createdAt && createdAt >= previousPeriodStart && createdAt < previousPeriodEnd) {
         prevNewUsers++;
       }
 
-      // Paid users (active or trialing subscription)
       const subStatus = user.subscription_status;
       if (subStatus === "active" || subStatus === "trialing") {
         paidUsers++;
-
-        // Retained = paid user whose account was created more than one period ago
         if (createdAt && createdAt < periodStart) {
           retainedUsers++;
         }
       }
 
-      // Churned = canceled subscription
       if (subStatus === "canceled" || subStatus === "canceling") {
         churnedUsers++;
       }
 
-      // Active = has token usage in the current month
       const tokenMonth = user.tokenUsage?.month;
       const tokenCount = user.tokenUsage?.totalTokens || 0;
       if (tokenMonth === currentMonth && tokenCount > 0) {
@@ -258,8 +383,6 @@ async function fetchUserAndSubscriptionData(
       }
     }
 
-    // For previous period, approximate with the same data
-    // (we don't have historical subscription snapshots, so use rough estimates)
     const previousData: UserCounts = {
       totalUsers: Math.max(0, totalUsers - newUsers),
       newUsers: prevNewUsers,
@@ -288,240 +411,280 @@ async function fetchUserAndSubscriptionData(
   }
 }
 
+// ─── Channel Pipeline Builders ──────────────────────────────────────────
+
+function buildSEOPipeline(
+  gscData: GSCData,
+  userData: { data: UserCounts; previousData: UserCounts; status: "ok" | "error" },
+): ChannelPipeline {
+  const stages: FunnelStage[] = [];
+
+  // 1. Impressions
+  const impressionsSources = gscData.status === "ok"
+    ? [safeSource("Google Search Console", gscData.impressions)]
+    : [errorSource("Google Search Console", "Failed to fetch GSC data")];
+  stages.push(makeStage("Impressions", gscData.impressions, 0, 0, impressionsSources));
+  // First stage: force conversionRate to 100
+  stages[0].conversionRate = 100;
+
+  // 2. Clicks
+  const clicksSources = gscData.status === "ok"
+    ? [safeSource("Google Search Console", gscData.clicks)]
+    : [errorSource("Google Search Console", "Failed to fetch GSC data")];
+  stages.push(makeStage("Clicks", gscData.clicks, 0, gscData.impressions, clicksSources));
+
+  // 3. Signups (proxy: total new signups — no UTM tracking yet)
+  const signupSources = userData.status === "ok"
+    ? [safeSource("User Signups (all channels)", userData.data.newUsers)]
+    : [errorSource("User Signups", "Failed to fetch user data")];
+  stages.push(makeStage("Signups", userData.data.newUsers, userData.previousData.newUsers, gscData.clicks, signupSources));
+
+  // 4. Active
+  const activeSources = userData.status === "ok"
+    ? [safeSource("Token Usage (current month)", userData.data.activeUsers)]
+    : [errorSource("Token Usage", "Failed to fetch usage data")];
+  stages.push(makeStage("Active", userData.data.activeUsers, userData.previousData.activeUsers, userData.data.newUsers, activeSources));
+
+  // 5. Paid
+  const paidSources = userData.status === "ok"
+    ? [safeSource("Stripe (active/trialing)", userData.data.paidUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Paid", userData.data.paidUsers, userData.previousData.paidUsers, userData.data.activeUsers, paidSources));
+
+  // 6. Retained
+  const retainedSources = userData.status === "ok"
+    ? [safeSource("Stripe (month 2+ subscribers)", userData.data.retainedUsers)]
+    : [errorSource("Stripe", "Failed to fetch retention data")];
+  stages.push(makeStage("Retained", userData.data.retainedUsers, userData.previousData.retainedUsers, userData.data.paidUsers, retainedSources));
+
+  return {
+    channel: "seo",
+    displayName: "SEO",
+    stages,
+    constraint: classifyConstraint(stages),
+  };
+}
+
+function buildLinkedInPipeline(
+  meetingData: ProspectMeetingMetrics,
+  userData: { data: UserCounts; status: "ok" | "error" },
+): ChannelPipeline {
+  const stages: FunnelStage[] = [];
+
+  // 1. Post Impressions — unavailable
+  stages.push(makeStage("Post Impressions", 0, 0, 0, [unavailableSource("LinkedIn Analytics (not connected)")]));
+  stages[0].conversionRate = 100;
+
+  // 2. Engagement — unavailable
+  stages.push(makeStage("Engagement", 0, 0, 0, [unavailableSource("LinkedIn Analytics (not connected)")]));
+
+  // 3. Profile/Link Clicks — unavailable
+  stages.push(makeStage("Profile/Link Clicks", 0, 0, 0, [unavailableSource("LinkedIn Analytics (not connected)")]));
+
+  // 4. Identified — unavailable (leads from LinkedIn)
+  stages.push(makeStage("Identified", 0, 0, 0, [unavailableSource("LinkedIn Lead Tracking (not connected)")]));
+
+  // 5. Talked — use prospect meeting service
+  const talkedSources = meetingData.totalMeetings > 0 || meetingData.noShows > 0
+    ? [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)]
+    : [safeSource("Google Calendar + Fathom", 0)];
+  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
+
+  // 6. Paid
+  const paidSources = userData.status === "ok"
+    ? [safeSource("Stripe (active/trialing)", userData.data.paidUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Paid", userData.data.paidUsers, 0, meetingData.totalMeetings, paidSources));
+
+  return {
+    channel: "linkedin",
+    displayName: "LinkedIn",
+    stages,
+    constraint: classifyConstraint(stages),
+  };
+}
+
+function buildOutboundPipeline(
+  leadData: LeadData,
+  meetingData: ProspectMeetingMetrics,
+  userData: { data: UserCounts; status: "ok" | "error" },
+): ChannelPipeline {
+  const stages: FunnelStage[] = [];
+
+  // 1. List Size — total leads in CRM
+  const listSources = leadData.status === "ok"
+    ? [safeSource("CRM Lead Lists", leadData.total)]
+    : [errorSource("CRM Lead Lists", "Failed to fetch lead data")];
+  stages.push(makeStage("List Size", leadData.total, 0, 0, listSources));
+  stages[0].conversionRate = 100;
+
+  // 2. Contacted — unavailable
+  stages.push(makeStage("Contacted", 0, 0, leadData.total, [unavailableSource("SalesRobot (not connected)")]));
+
+  // 3. Replies — unavailable
+  stages.push(makeStage("Replies", 0, 0, 0, [unavailableSource("SalesRobot (not connected)")]));
+
+  // 4. Talked — prospect meetings
+  const talkedSources = [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
+  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
+
+  // 5. Paid
+  const paidSources = userData.status === "ok"
+    ? [safeSource("Stripe (active/trialing)", userData.data.paidUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Paid", userData.data.paidUsers, 0, meetingData.totalMeetings, paidSources));
+
+  return {
+    channel: "outbound",
+    displayName: "Outbound",
+    stages,
+    constraint: classifyConstraint(stages),
+  };
+}
+
+function buildPaidAdsPipeline(
+  metaData: MetaAdsData,
+  meetingData: ProspectMeetingMetrics,
+  userData: { data: UserCounts; status: "ok" | "error" },
+): ChannelPipeline {
+  const stages: FunnelStage[] = [];
+
+  // 1. Impressions
+  const impressionsSources = metaData.status === "ok"
+    ? [safeSource("Meta Ads", metaData.impressions)]
+    : metaData.status === "unavailable"
+      ? [unavailableSource("Meta Ads (not connected)")]
+      : [errorSource("Meta Ads", "Failed to fetch Meta Ads data")];
+  stages.push(makeStage("Impressions", metaData.impressions, 0, 0, impressionsSources));
+  stages[0].conversionRate = 100;
+
+  // 2. Clicks
+  const clicksSources = metaData.status === "ok"
+    ? [safeSource("Meta Ads", metaData.clicks)]
+    : metaData.status === "unavailable"
+      ? [unavailableSource("Meta Ads (not connected)")]
+      : [errorSource("Meta Ads", "Failed to fetch Meta Ads data")];
+  stages.push(makeStage("Clicks", metaData.clicks, 0, metaData.impressions, clicksSources));
+
+  // 3. Leads (form submissions / lead actions from Meta)
+  const leadsSources = metaData.status === "ok"
+    ? [safeSource("Meta Ads (lead actions)", metaData.leads)]
+    : metaData.status === "unavailable"
+      ? [unavailableSource("Meta Ads (not connected)")]
+      : [errorSource("Meta Ads", "Failed to fetch Meta Ads data")];
+  stages.push(makeStage("Leads", metaData.leads, 0, metaData.clicks, leadsSources));
+
+  // 4. Talked — prospect meetings
+  const talkedSources = [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
+  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, metaData.leads, talkedSources));
+
+  // 5. Paid
+  const paidSources = userData.status === "ok"
+    ? [safeSource("Stripe (active/trialing)", userData.data.paidUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Paid", userData.data.paidUsers, 0, meetingData.totalMeetings, paidSources));
+
+  return {
+    channel: "paid_ads",
+    displayName: "Paid Ads",
+    stages,
+    constraint: classifyConstraint(stages),
+  };
+}
+
+// ─── Comparison Table ───────────────────────────────────────────────────
+
+function buildComparison(channels: ChannelPipeline[], metaSpend: number): ChannelComparison[] {
+  return channels.map(ch => {
+    // Find key stages by name
+    const leadsStage = ch.stages.find(s =>
+      s.name === "Signups" || s.name === "Identified" || s.name === "Leads" || s.name === "List Size"
+    );
+    const demosStage = ch.stages.find(s => s.name === "Talked");
+    const paidStage = ch.stages.find(s => s.name === "Paid");
+
+    const leads = leadsStage?.count || 0;
+    const demos = demosStage?.count || 0;
+    const paid = paidStage?.count || 0;
+
+    // Estimate CAC per channel
+    let cac = 0;
+    if (ch.channel === "paid_ads" && paid > 0) {
+      cac = Math.round(metaSpend / paid);
+    }
+    // SEO, LinkedIn, Outbound: CAC is $0 (organic/time-based, not ad spend tracked)
+
+    return {
+      channel: ch.displayName,
+      leads,
+      conversionPercent: leads > 0 ? parseFloat(((demos / leads) * 100).toFixed(1)) : 0,
+      demos,
+      closePercent: demos > 0 ? parseFloat(((paid / demos) * 100).toFixed(1)) : 0,
+      paid,
+      cac,
+    };
+  });
+}
+
 // ─── Main Aggregator ────────────────────────────────────────────────────
 
-export async function getBusinessFunnelMetrics(period: string = "30d"): Promise<BusinessFunnelMetrics> {
+export async function getBusinessFunnelMetrics(
+  period: string = "30d",
+  _channel?: string,
+): Promise<FunnelMetricsResponse> {
   const days = parsePeriodDays(period);
   const timeframe = `${days}d`;
   const dateRange = getDateRange(days);
   const previousRange = getPreviousDateRange(days);
 
   // Fetch all data sources in parallel
-  const [gscData, metaData, leadData, userData] = await Promise.all([
+  const [gscData, metaData, leadData, userData, meetingData] = await Promise.all([
     fetchGSCData(timeframe),
     fetchMetaAdsData(timeframe),
     fetchLeadCount(dateRange.start),
     fetchUserAndSubscriptionData(dateRange.start, previousRange.start, previousRange.end),
+    getProspectMeetingMetrics(period),
   ]);
 
-  // Build stages
-  const stages: BusinessFunnelStage[] = [];
+  // Build per-channel pipelines
+  const seoPipeline = buildSEOPipeline(gscData, userData);
+  const linkedInPipeline = buildLinkedInPipeline(meetingData, { data: userData.data, status: userData.status });
+  const outboundPipeline = buildOutboundPipeline(leadData, meetingData, { data: userData.data, status: userData.status });
+  const paidAdsPipeline = buildPaidAdsPipeline(metaData, meetingData, { data: userData.data, status: userData.status });
 
-  // 1. Aware: GSC impressions + Meta Ads impressions
-  const awareCount = gscData.impressions + metaData.impressions;
-  const awareSources: SourceBreakdown[] = [
-    gscData.status === "ok"
-      ? safeSource("Google Search Console", gscData.impressions)
-      : errorSource("Google Search Console", "Failed to fetch GSC data"),
-    metaData.status === "ok"
-      ? safeSource("Meta Ads", metaData.impressions)
-      : metaData.status === "unavailable"
-      ? unavailableSource("Meta Ads")
-      : errorSource("Meta Ads", "Failed to fetch Meta Ads data"),
-  ];
-  stages.push({
-    name: "Aware",
-    count: awareCount,
-    previousCount: 0,
-    conversionRate: 100,
-    sources: awareSources,
-  });
+  const channels: ChannelPipeline[] = [seoPipeline, linkedInPipeline, outboundPipeline, paidAdsPipeline];
 
-  // 2. Clicked: GSC clicks + Meta Ads clicks
-  const clickedCount = gscData.clicks + metaData.clicks;
-  const clickedSources: SourceBreakdown[] = [
-    gscData.status === "ok"
-      ? safeSource("Google Search Console", gscData.clicks)
-      : errorSource("Google Search Console", "Failed to fetch GSC data"),
-    metaData.status === "ok"
-      ? safeSource("Meta Ads", metaData.clicks)
-      : metaData.status === "unavailable"
-      ? unavailableSource("Meta Ads")
-      : errorSource("Meta Ads", "Failed to fetch Meta Ads data"),
-  ];
-  stages.push({
-    name: "Clicked",
-    count: clickedCount,
-    previousCount: 0,
-    conversionRate: awareCount > 0 ? parseFloat(((clickedCount / awareCount) * 100).toFixed(2)) : 0,
-    sources: clickedSources,
-  });
+  // Build comparison table
+  const comparison = buildComparison(channels, metaData.spend);
 
-  // 3. Identified: Leads + new user signups
-  const identifiedCount = leadData.thisMonth + userData.data.newUsers;
-  const identifiedSources: SourceBreakdown[] = [
-    leadData.status === "ok"
-      ? safeSource("Lead Lists", leadData.thisMonth)
-      : errorSource("Lead Lists", "Failed to fetch lead data"),
-    userData.status === "ok"
-      ? safeSource("User Signups", userData.data.newUsers)
-      : errorSource("User Signups", "Failed to fetch user data"),
-  ];
-  stages.push({
-    name: "Identified",
-    count: identifiedCount,
-    previousCount: userData.previousData.newUsers,
-    conversionRate: clickedCount > 0 ? parseFloat(((identifiedCount / clickedCount) * 100).toFixed(2)) : 0,
-    sources: identifiedSources,
-  });
+  // Aggregate metrics
+  const totalLeads = comparison.reduce((sum, c) => sum + c.leads, 0);
+  const totalPaid = userData.data.paidUsers;
 
-  // 4. Contacted: Placeholder
-  stages.push({
-    name: "Contacted",
-    count: 0,
-    previousCount: 0,
-    conversionRate: 0,
-    sources: [unavailableSource("SalesRobot (not connected)")],
-  });
-
-  // 5. Talked: Placeholder
-  stages.push({
-    name: "Talked",
-    count: 0,
-    previousCount: 0,
-    conversionRate: 0,
-    sources: [unavailableSource("Calendly (not connected)")],
-  });
-
-  // 6. Committed: Placeholder
-  stages.push({
-    name: "Committed",
-    count: 0,
-    previousCount: 0,
-    conversionRate: 0,
-    sources: [unavailableSource("Manual tracking")],
-  });
-
-  // 7. Paid: Active paying subscribers
-  // Conversion rate from Identified (skipping placeholders)
-  stages.push({
-    name: "Paid",
-    count: userData.data.paidUsers,
-    previousCount: userData.previousData.paidUsers,
-    conversionRate: identifiedCount > 0
-      ? parseFloat(((userData.data.paidUsers / identifiedCount) * 100).toFixed(2))
-      : 0,
-    sources: [
-      userData.status === "ok"
-        ? safeSource("Stripe (active/trialing)", userData.data.paidUsers)
-        : errorSource("Stripe", "Failed to fetch subscription data"),
-    ],
-  });
-
-  // 8. Active: Users with token usage > 0 this month
-  stages.push({
-    name: "Active",
-    count: userData.data.activeUsers,
-    previousCount: userData.previousData.activeUsers,
-    conversionRate: userData.data.paidUsers > 0
-      ? parseFloat(((userData.data.activeUsers / userData.data.paidUsers) * 100).toFixed(2))
-      : 0,
-    sources: [
-      userData.status === "ok"
-        ? safeSource("Token Usage (current month)", userData.data.activeUsers)
-        : errorSource("Token Usage", "Failed to fetch usage data"),
-    ],
-  });
-
-  // 9. Retained: Subscribers who signed up before the current period
-  stages.push({
-    name: "Retained",
-    count: userData.data.retainedUsers,
-    previousCount: userData.previousData.retainedUsers,
-    conversionRate: userData.data.paidUsers > 0
-      ? parseFloat(((userData.data.retainedUsers / userData.data.paidUsers) * 100).toFixed(2))
-      : 0,
-    sources: [
-      userData.status === "ok"
-        ? safeSource("Stripe (month 2+ subscribers)", userData.data.retainedUsers)
-        : errorSource("Stripe", "Failed to fetch retention data"),
-    ],
-  });
-
-  // 10. Churned: Canceled subscriptions
-  stages.push({
-    name: "Churned",
-    count: userData.data.churnedUsers,
-    previousCount: userData.previousData.churnedUsers,
-    conversionRate:
-      userData.data.paidUsers + userData.data.churnedUsers > 0
-        ? parseFloat(
-            ((userData.data.churnedUsers / (userData.data.paidUsers + userData.data.churnedUsers)) * 100).toFixed(2)
-          )
-        : 0,
-    sources: [
-      userData.status === "ok"
-        ? safeSource("Stripe (canceled/canceling)", userData.data.churnedUsers)
-        : errorSource("Stripe", "Failed to fetch churn data"),
-    ],
-  });
-
-  // Find bottleneck: worst conversion rate among stages with real data
-  let bottleneck: FunnelBottleneck | null = null;
-  let worstRate = Infinity;
-
-  for (let i = 1; i < stages.length; i++) {
-    const stage = stages[i];
-    // Skip placeholder stages and Churned (it's not a conversion stage)
-    if (PLACEHOLDER_STAGES.has(stage.name) || stage.name === "Churned") continue;
-
-    // Find the previous non-placeholder stage
-    const prevStage = findPreviousRealStage(stages, i);
-    if (!prevStage || prevStage.count === 0) continue;
-
-    const rate = (stage.count / prevStage.count) * 100;
-    if (rate < worstRate) {
-      worstRate = rate;
-      bottleneck = {
-        stage: stage.name,
-        conversionRate: parseFloat(rate.toFixed(2)),
-        suggestion: getBottleneckSuggestion(stage.name, rate),
-      };
-    }
-  }
+  // Overall constraint: pick the constraint from the channel with the most available data
+  // Prefer channels that have real data (not all unavailable)
+  const channelsWithData = channels.filter(ch =>
+    ch.stages.some(s => s.status === "ok" && s.count > 0),
+  );
+  const overallConstraint = channelsWithData.length > 0
+    ? channelsWithData[0].constraint
+    : classifyConstraint([
+        ...seoPipeline.stages,
+        ...paidAdsPipeline.stages,
+      ]);
 
   return {
-    stages,
-    bottleneck,
+    channels,
+    comparison,
+    aggregate: {
+      totalLeads,
+      totalPaid,
+      overallConstraint,
+    },
     period: {
       start: dateRange.startStr,
       end: dateRange.endStr,
     },
     generatedAt: new Date().toISOString(),
   };
-}
-
-/**
- * Find the previous stage with real data (skipping placeholders).
- */
-function findPreviousRealStage(stages: BusinessFunnelStage[], currentIndex: number): BusinessFunnelStage | null {
-  for (let i = currentIndex - 1; i >= 0; i--) {
-    if (!PLACEHOLDER_STAGES.has(stages[i].name)) {
-      return stages[i];
-    }
-  }
-  return null;
-}
-
-/**
- * Generate actionable suggestions based on which stage is the bottleneck.
- */
-function getBottleneckSuggestion(stageName: string, rate: number): string {
-  const suggestions: Record<string, string> = {
-    Clicked:
-      "Low CTR. Improve meta titles/descriptions and ad copy to drive more clicks from impressions.",
-    Identified:
-      "Visitors aren't converting to leads/signups. Add lead magnets, improve CTAs, or simplify the signup flow.",
-    Paid:
-      "Leads aren't converting to paid. Review pricing, onboarding experience, and value demonstration.",
-    Active:
-      "Paid users aren't engaging. Improve onboarding, send activation emails, or add feature tutorials.",
-    Retained:
-      "Low retention. Investigate churn reasons, improve product value, and add re-engagement campaigns.",
-  };
-
-  return (
-    suggestions[stageName] ||
-    `${stageName} conversion is ${rate.toFixed(1)}%. Investigate drop-off reasons.`
-  );
 }

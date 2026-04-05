@@ -7,6 +7,15 @@ import {
   CircularProgress,
   Chip,
   Grid,
+  Tab,
+  Tabs,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TableSortLabel,
   ToggleButton,
   ToggleButtonGroup,
 } from '@mui/material';
@@ -15,6 +24,10 @@ import {
   TrendingDown as TrendingDownIcon,
   ArrowForward as ArrowForwardIcon,
   LinkOff as LinkOffIcon,
+  VolumeUp as VolumeUpIcon,
+  Warning as WarningIcon,
+  ErrorOutline as ErrorOutlineIcon,
+  Info as InfoIcon,
 } from '@mui/icons-material';
 import axios from 'axios';
 import { Chart, ChartConfiguration, registerables } from 'chart.js';
@@ -29,7 +42,7 @@ Chart.register(...registerables);
 interface FunnelSource {
   name: string;
   count: number;
-  status: string;
+  status: 'ok' | 'unavailable' | 'error';
 }
 
 interface FunnelStage {
@@ -41,25 +54,62 @@ interface FunnelStage {
   status: 'ok' | 'unavailable' | 'error';
 }
 
-interface Bottleneck {
+interface ConstraintAnalysis {
   stage: string;
   conversionRate: number;
+  type: 'more' | 'metrics' | 'leads' | 'sales' | 'ltv' | 'cashflow';
   suggestion: string;
 }
 
-interface FunnelData {
+interface ChannelPipeline {
+  channel: 'seo' | 'linkedin' | 'outbound' | 'paid_ads';
+  displayName: string;
   stages: FunnelStage[];
-  bottleneck: Bottleneck | null;
+  constraint: ConstraintAnalysis | null;
+}
+
+interface ChannelComparison {
+  channel: string;
+  leads: number;
+  conversionPercent: number;
+  demos: number;
+  closePercent: number;
+  paid: number;
+  cac: number;
+}
+
+interface FunnelMetricsResponse {
+  channels: ChannelPipeline[];
+  comparison: ChannelComparison[];
+  aggregate: {
+    totalLeads: number;
+    totalPaid: number;
+    overallConstraint: ConstraintAnalysis | null;
+  };
   period: { start: string; end: string };
 }
 
 type PeriodOption = '7d' | '30d' | '90d' | 'YTD';
+type ChannelTab = 'overview' | 'seo' | 'linkedin' | 'outbound' | 'paid_ads';
+
+type SortKey = keyof ChannelComparison;
+type SortDir = 'asc' | 'desc';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+const nf = new Intl.NumberFormat('en-US');
+
 function formatNumber(n: number): string {
-  return n.toLocaleString();
+  return nf.format(n);
+}
+
+function formatCurrency(n: number): string {
+  return n === 0 ? '$0' : `$${nf.format(n)}`;
+}
+
+function formatPercent(n: number): string {
+  return `${n.toFixed(1)}%`;
 }
 
 function getChangePercent(current: number, previous: number): number {
@@ -73,10 +123,8 @@ function getConversionColor(rate: number): 'success' | 'warning' | 'error' {
   return 'error';
 }
 
-function getBarColor(index: number, total: number, stageName: string): string {
-  // Red for churned stages
-  if (stageName.toLowerCase().includes('churn')) return '#f44336';
-  // Gradient from blue (top) to green (bottom)
+function getBarColor(index: number, total: number, status: string): string {
+  if (status === 'unavailable') return '#bdbdbd';
   const ratio = total > 1 ? index / (total - 1) : 0;
   const r = Math.round(25 + (76 - 25) * ratio);
   const g = Math.round(118 + (175 - 118) * ratio);
@@ -85,9 +133,99 @@ function getBarColor(index: number, total: number, stageName: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Constraint Alert
+// ---------------------------------------------------------------------------
+function ConstraintAlert({
+  constraint,
+  prefix,
+}: {
+  constraint: ConstraintAnalysis;
+  prefix?: string;
+}) {
+  const config: Record<
+    ConstraintAnalysis['type'],
+    { severity: 'info' | 'warning' | 'error'; color: string; icon: React.ReactNode; label: string }
+  > = {
+    more: {
+      severity: 'info',
+      color: '#e3f2fd',
+      icon: <VolumeUpIcon />,
+      label: 'VOLUME',
+    },
+    metrics: {
+      severity: 'info',
+      color: '#f5f5f5',
+      icon: <WarningIcon />,
+      label: 'DATA',
+    },
+    leads: {
+      severity: 'warning',
+      color: '#fff3e0',
+      icon: <WarningIcon />,
+      label: 'LEADS',
+    },
+    sales: {
+      severity: 'error',
+      color: '#ffebee',
+      icon: <ErrorOutlineIcon />,
+      label: 'SALES',
+    },
+    ltv: {
+      severity: 'info',
+      color: '#f3e5f5',
+      icon: <InfoIcon />,
+      label: 'LTV',
+    },
+    cashflow: {
+      severity: 'warning',
+      color: '#fff8e1',
+      icon: <WarningIcon />,
+      label: 'CASHFLOW',
+    },
+  };
+
+  const c = config[constraint.type];
+  const title = prefix ? `${prefix} CONSTRAINT` : 'YOUR #1 CONSTRAINT';
+
+  return (
+    <Alert
+      severity={c.severity}
+      icon={c.icon}
+      sx={{
+        mb: 2,
+        backgroundColor: c.color,
+        '& .MuiAlert-icon': { alignItems: 'center' },
+      }}
+    >
+      <Typography variant="subtitle2" component="span" sx={{ fontWeight: 700 }}>
+        {title}: {c.label}
+      </Typography>
+      {' '}
+      &mdash;{' '}
+      <Typography variant="body2" component="span">
+        {constraint.suggestion}
+      </Typography>
+      {constraint.stage && (
+        <Typography variant="caption" component="span" color="text.secondary" sx={{ ml: 1 }}>
+          (at {constraint.stage}, {formatPercent(constraint.conversionRate)} conv.)
+        </Typography>
+      )}
+    </Alert>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Funnel Bar Chart
 // ---------------------------------------------------------------------------
-function FunnelBarChart({ stages }: { stages: FunnelStage[] }) {
+function FunnelBarChart({
+  stages,
+  constraintStage,
+  title,
+}: {
+  stages: FunnelStage[];
+  constraintStage?: string;
+  title?: string;
+}) {
   const chartRef = useRef<HTMLCanvasElement>(null);
   const chartInstance = useRef<Chart | null>(null);
 
@@ -100,13 +238,14 @@ function FunnelBarChart({ stages }: { stages: FunnelStage[] }) {
 
     const labels = stages.map((s) => s.name);
     const data = stages.map((s) => s.count);
-    const backgroundColors = stages.map((s, i) =>
-      s.status === 'unavailable' ? '#bdbdbd' : getBarColor(i, stages.length, s.name)
-    );
+    const backgroundColors = stages.map((s, i) => {
+      if (s.status === 'unavailable') return '#bdbdbd';
+      if (constraintStage && s.name === constraintStage) return '#ef5350';
+      return getBarColor(i, stages.length, s.status);
+    });
     const borderColors = stages.map((s) =>
       s.status === 'unavailable' ? '#9e9e9e' : 'transparent'
     );
-    const borderDash = stages.map((s) => (s.status === 'unavailable' ? [6, 3] : []));
 
     const config: ChartConfiguration = {
       type: 'bar',
@@ -128,7 +267,7 @@ function FunnelBarChart({ stages }: { stages: FunnelStage[] }) {
         responsive: true,
         maintainAspectRatio: false,
         plugins: {
-          title: { display: true, text: 'Marketing Funnel' },
+          title: { display: !!title, text: title ?? '' },
           legend: { display: false },
           tooltip: {
             callbacks: {
@@ -139,9 +278,8 @@ function FunnelBarChart({ stages }: { stages: FunnelStage[] }) {
               },
               afterLabel: (ctx) => {
                 const stage = stages[ctx.dataIndex];
-                if (stage.status === 'unavailable') return '';
-                if (ctx.dataIndex === 0) return '';
-                return `Conversion from prev: ${stage.conversionRate.toFixed(1)}%`;
+                if (stage.status === 'unavailable' || ctx.dataIndex === 0) return '';
+                return `Conversion from prev: ${formatPercent(stage.conversionRate)}`;
               },
             },
           },
@@ -169,7 +307,7 @@ function FunnelBarChart({ stages }: { stages: FunnelStage[] }) {
         chartInstance.current.destroy();
       }
     };
-  }, [stages]);
+  }, [stages, constraintStage, title]);
 
   return (
     <Paper sx={{ p: 3, mb: 2 }}>
@@ -202,7 +340,7 @@ function FunnelBarChart({ stages }: { stages: FunnelStage[] }) {
                 {stage.name}:
               </Typography>
               <Chip
-                label={`${stage.conversionRate.toFixed(1)}%`}
+                label={formatPercent(stage.conversionRate)}
                 size="small"
                 color={color}
                 variant="outlined"
@@ -233,6 +371,7 @@ function StageCard({ stage }: { stage: FunnelStage }) {
           borderStyle: 'dashed',
           borderColor: 'grey.400',
           borderWidth: 1,
+          backgroundColor: 'grey.50',
           opacity: 0.7,
         }),
       }}
@@ -254,7 +393,10 @@ function StageCard({ stage }: { stage: FunnelStage }) {
         )}
       </Box>
 
-      <Typography variant="h4" sx={{ fontWeight: 700, mb: 0.5, color: isUnavailable ? 'text.disabled' : 'text.primary' }}>
+      <Typography
+        variant="h4"
+        sx={{ fontWeight: 700, mb: 0.5, color: isUnavailable ? 'text.disabled' : 'text.primary' }}
+      >
         {isUnavailable ? '--' : formatNumber(stage.count)}
       </Typography>
 
@@ -301,56 +443,261 @@ function StageCard({ stage }: { stage: FunnelStage }) {
 }
 
 // ---------------------------------------------------------------------------
-// Conversion Rate Summary
+// Channel Comparison Table
 // ---------------------------------------------------------------------------
-function ConversionSummary({ stages }: { stages: FunnelStage[] }) {
-  const conversions = stages
-    .filter((_, i) => i > 0)
-    .map((stage, i) => ({
-      from: stages[i].name,
-      to: stage.name,
-      rate: stage.conversionRate,
-      available: stage.status !== 'unavailable' && stages[i].status !== 'unavailable',
-    }));
+function ChannelComparisonTable({
+  comparison,
+  onChannelClick,
+}: {
+  comparison: ChannelComparison[];
+  onChannelClick: (channel: ChannelTab) => void;
+}) {
+  const [sortKey, setSortKey] = useState<SortKey>('leads');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
 
-  if (conversions.length === 0) return null;
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  };
+
+  const sorted = [...comparison].sort((a, b) => {
+    const aVal = a[sortKey];
+    const bVal = b[sortKey];
+    if (typeof aVal === 'number' && typeof bVal === 'number') {
+      return sortDir === 'asc' ? aVal - bVal : bVal - aVal;
+    }
+    return 0;
+  });
+
+  // Find best/worst for highlighting
+  const bestCloseIdx = comparison.reduce(
+    (best, row, i) => (row.closePercent > comparison[best].closePercent ? i : best),
+    0
+  );
+  const worstCacIdx = comparison.reduce(
+    (worst, row, i) => (row.cac > comparison[worst].cac ? i : worst),
+    0
+  );
+  const bestCloseChannel = comparison[bestCloseIdx]?.channel;
+  const worstCacChannel = comparison[worstCacIdx]?.channel;
+
+  const channelToTab = (ch: string): ChannelTab => {
+    const map: Record<string, ChannelTab> = {
+      SEO: 'seo',
+      LinkedIn: 'linkedin',
+      Outbound: 'outbound',
+      'Paid Ads': 'paid_ads',
+      seo: 'seo',
+      linkedin: 'linkedin',
+      outbound: 'outbound',
+      paid_ads: 'paid_ads',
+    };
+    return map[ch] ?? 'overview';
+  };
+
+  const columns: { key: SortKey; label: string; format: (v: number) => string }[] = [
+    { key: 'leads', label: 'Leads', format: formatNumber },
+    { key: 'conversionPercent', label: 'Conv%', format: formatPercent },
+    { key: 'demos', label: 'Demos', format: formatNumber },
+    { key: 'closePercent', label: 'Close%', format: formatPercent },
+    { key: 'paid', label: 'Paid', format: formatNumber },
+    { key: 'cac', label: 'CAC', format: formatCurrency },
+  ];
 
   return (
     <Paper sx={{ p: 2, mb: 2 }}>
-      <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1 }}>
-        Stage-to-Stage Conversion Rates
+      <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1.5 }}>
+        Channel Comparison
       </Typography>
-      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center' }}>
-        {conversions.map((c, i) => (
-          <Box key={c.to} sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-            {i > 0 && (
-              <Typography variant="caption" color="text.disabled" sx={{ mx: 0.5 }}>
-                |
-              </Typography>
-            )}
-            <Typography variant="caption" color="text.secondary">
-              {c.from} &rarr; {c.to}:
-            </Typography>
-            {c.available ? (
-              <Chip
-                label={`${c.rate.toFixed(1)}%`}
-                size="small"
-                color={getConversionColor(c.rate)}
-                variant="outlined"
-                sx={{ height: 20, fontSize: '0.7rem' }}
-              />
-            ) : (
-              <Chip
-                label="N/A"
-                size="small"
-                variant="outlined"
-                sx={{ height: 20, fontSize: '0.7rem' }}
-              />
-            )}
-          </Box>
-        ))}
-      </Box>
+      <TableContainer>
+        <Table size="small">
+          <TableHead>
+            <TableRow>
+              <TableCell sx={{ fontWeight: 600 }}>Channel</TableCell>
+              {columns.map((col) => (
+                <TableCell key={col.key} align="right" sx={{ fontWeight: 600 }}>
+                  <TableSortLabel
+                    active={sortKey === col.key}
+                    direction={sortKey === col.key ? sortDir : 'desc'}
+                    onClick={() => handleSort(col.key)}
+                  >
+                    {col.label}
+                  </TableSortLabel>
+                </TableCell>
+              ))}
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {sorted.map((row) => {
+              const isBestClose = row.channel === bestCloseChannel;
+              const isWorstCac = row.channel === worstCacChannel && row.cac > 0;
+
+              return (
+                <TableRow key={row.channel} hover>
+                  <TableCell>
+                    <Typography
+                      variant="body2"
+                      sx={{
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                        color: 'primary.main',
+                        '&:hover': { textDecoration: 'underline' },
+                      }}
+                      onClick={() => onChannelClick(channelToTab(row.channel))}
+                    >
+                      {row.channel}
+                    </Typography>
+                  </TableCell>
+                  {columns.map((col) => {
+                    const val = row[col.key];
+                    let cellSx: Record<string, string> = {};
+                    if (col.key === 'closePercent' && isBestClose) {
+                      cellSx = { color: 'success.main', fontWeight: '700' };
+                    }
+                    if (col.key === 'cac' && isWorstCac) {
+                      cellSx = { color: 'error.main', fontWeight: '700' };
+                    }
+                    return (
+                      <TableCell key={col.key} align="right" sx={cellSx}>
+                        {typeof val === 'number' ? col.format(val) : val}
+                      </TableCell>
+                    );
+                  })}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </TableContainer>
     </Paper>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Overview View
+// ---------------------------------------------------------------------------
+function OverviewView({
+  data,
+  onChannelClick,
+}: {
+  data: FunnelMetricsResponse;
+  onChannelClick: (channel: ChannelTab) => void;
+}) {
+  // Build aggregate stages from all channels
+  const aggregateStages = buildAggregateStages(data.channels);
+
+  return (
+    <>
+      {/* Constraint Alert */}
+      {data.aggregate.overallConstraint && (
+        <ConstraintAlert constraint={data.aggregate.overallConstraint} />
+      )}
+
+      {/* Channel Comparison Table */}
+      {data.comparison.length > 0 && (
+        <ChannelComparisonTable comparison={data.comparison} onChannelClick={onChannelClick} />
+      )}
+
+      {/* Aggregate Funnel Chart */}
+      {aggregateStages.length > 0 && (
+        <FunnelBarChart
+          stages={aggregateStages}
+          constraintStage={data.aggregate.overallConstraint?.stage}
+          title="Aggregate Funnel (All Channels)"
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * Combine stages across channels into aggregate totals.
+ * Stages are merged by name; counts are summed.
+ */
+function buildAggregateStages(channels: ChannelPipeline[]): FunnelStage[] {
+  const stageMap = new Map<string, FunnelStage>();
+  const stageOrder: string[] = [];
+
+  for (const channel of channels) {
+    for (const stage of channel.stages) {
+      const existing = stageMap.get(stage.name);
+      if (existing) {
+        existing.count += stage.count;
+        existing.previousCount += stage.previousCount;
+        // Merge sources
+        for (const src of stage.sources) {
+          const existingSrc = existing.sources.find((s) => s.name === src.name);
+          if (existingSrc) {
+            existingSrc.count += src.count;
+          } else {
+            existing.sources.push({ ...src });
+          }
+        }
+        // If any channel has this stage available, mark as ok
+        if (stage.status === 'ok') {
+          existing.status = 'ok';
+        }
+      } else {
+        stageMap.set(stage.name, {
+          name: stage.name,
+          count: stage.count,
+          previousCount: stage.previousCount,
+          conversionRate: 0, // recalculated below
+          sources: stage.sources.map((s) => ({ ...s })),
+          status: stage.status,
+        });
+        if (!stageOrder.includes(stage.name)) {
+          stageOrder.push(stage.name);
+        }
+      }
+    }
+  }
+
+  const ordered = stageOrder.map((name) => stageMap.get(name)!);
+
+  // Recalculate conversion rates
+  for (let i = 1; i < ordered.length; i++) {
+    const prev = ordered[i - 1];
+    const curr = ordered[i];
+    if (prev.status !== 'unavailable' && curr.status !== 'unavailable' && prev.count > 0) {
+      curr.conversionRate = (curr.count / prev.count) * 100;
+    }
+  }
+
+  return ordered;
+}
+
+// ---------------------------------------------------------------------------
+// Channel View
+// ---------------------------------------------------------------------------
+function ChannelView({ pipeline }: { pipeline: ChannelPipeline }) {
+  return (
+    <>
+      {/* Channel Constraint Alert */}
+      {pipeline.constraint && (
+        <ConstraintAlert constraint={pipeline.constraint} prefix={pipeline.displayName} />
+      )}
+
+      {/* Channel Funnel Chart */}
+      <FunnelBarChart
+        stages={pipeline.stages}
+        constraintStage={pipeline.constraint?.stage}
+        title={`${pipeline.displayName} Funnel`}
+      />
+
+      {/* Stage Detail Cards */}
+      <Grid container spacing={2}>
+        {pipeline.stages.map((stage) => (
+          <Grid item xs={12} sm={6} md={4} lg={3} key={stage.name}>
+            <StageCard stage={stage} />
+          </Grid>
+        ))}
+      </Grid>
+    </>
   );
 }
 
@@ -359,23 +706,30 @@ function ConversionSummary({ stages }: { stages: FunnelStage[] }) {
 // ---------------------------------------------------------------------------
 export default function FunnelTab() {
   const { token } = useAuth();
-  const [data, setData] = useState<FunnelData | null>(null);
+  const [data, setData] = useState<FunnelMetricsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [period, setPeriod] = useState<PeriodOption>('30d');
+  const [activeChannel, setActiveChannel] = useState<ChannelTab>('overview');
 
   useEffect(() => {
     if (!token) return;
+
+    let cancelled = false;
 
     const fetchFunnel = async () => {
       try {
         setLoading(true);
         setError('');
-        const res = await axios.get(buildApiUrl(`/api/admin/funnel-metrics?period=${period}`), {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        setData(res.data);
+        const res = await axios.get(
+          buildApiUrl(`/api/admin/funnel-metrics?period=${period}`),
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!cancelled) {
+          setData(res.data);
+        }
       } catch (err: any) {
+        if (cancelled) return;
         console.error('Error fetching funnel metrics:', err);
         if (err.response?.status === 404) {
           setError('Funnel metrics endpoint not available yet.');
@@ -383,15 +737,25 @@ export default function FunnelTab() {
           setError('Failed to load funnel metrics.');
         }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
 
     fetchFunnel();
+
+    return () => {
+      cancelled = true;
+    };
   }, [token, period]);
 
   const handlePeriodChange = (_: React.MouseEvent<HTMLElement>, newPeriod: PeriodOption | null) => {
     if (newPeriod) setPeriod(newPeriod);
+  };
+
+  const handleChannelChange = (_: React.SyntheticEvent, newValue: ChannelTab) => {
+    setActiveChannel(newValue);
   };
 
   if (loading) {
@@ -410,7 +774,7 @@ export default function FunnelTab() {
     );
   }
 
-  if (!data || data.stages.length === 0) {
+  if (!data || data.channels.length === 0) {
     return (
       <Alert severity="info" sx={{ mb: 2 }}>
         No funnel data available.
@@ -418,19 +782,14 @@ export default function FunnelTab() {
     );
   }
 
-  const { stages, bottleneck } = data;
+  const selectedPipeline = data.channels.find((ch) => ch.channel === activeChannel);
 
   return (
     <Box>
       {/* Header + Period Selector */}
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
         <Typography variant="h6">Marketing Funnel</Typography>
-        <ToggleButtonGroup
-          value={period}
-          exclusive
-          onChange={handlePeriodChange}
-          size="small"
-        >
+        <ToggleButtonGroup value={period} exclusive onChange={handlePeriodChange} size="small">
           <ToggleButton value="7d">7d</ToggleButton>
           <ToggleButton value="30d">30d</ToggleButton>
           <ToggleButton value="90d">90d</ToggleButton>
@@ -438,28 +797,32 @@ export default function FunnelTab() {
         </ToggleButtonGroup>
       </Box>
 
-      {/* Bottleneck Alert */}
-      {bottleneck && (
-        <Alert severity="warning" sx={{ mb: 2 }}>
-          Biggest drop-off: <strong>{bottleneck.stage}</strong> ({bottleneck.conversionRate.toFixed(1)}%).{' '}
-          {bottleneck.suggestion}
+      {/* Channel Tabs */}
+      <Paper sx={{ mb: 2 }}>
+        <Tabs
+          value={activeChannel}
+          onChange={handleChannelChange}
+          variant="scrollable"
+          scrollButtons="auto"
+          sx={{ borderBottom: 1, borderColor: 'divider' }}
+        >
+          <Tab label="Overview" value="overview" />
+          {data.channels.map((ch) => (
+            <Tab key={ch.channel} label={ch.displayName} value={ch.channel} />
+          ))}
+        </Tabs>
+      </Paper>
+
+      {/* Content */}
+      {activeChannel === 'overview' ? (
+        <OverviewView data={data} onChannelClick={setActiveChannel} />
+      ) : selectedPipeline ? (
+        <ChannelView pipeline={selectedPipeline} />
+      ) : (
+        <Alert severity="info" sx={{ mb: 2 }}>
+          No data available for this channel.
         </Alert>
       )}
-
-      {/* Funnel Bar Chart */}
-      <FunnelBarChart stages={stages} />
-
-      {/* Conversion Rate Summary */}
-      <ConversionSummary stages={stages} />
-
-      {/* Stage Detail Cards */}
-      <Grid container spacing={2}>
-        {stages.map((stage) => (
-          <Grid item xs={12} sm={6} md={4} lg={3} key={stage.name}>
-            <StageCard stage={stage} />
-          </Grid>
-        ))}
-      </Grid>
     </Box>
   );
 }
