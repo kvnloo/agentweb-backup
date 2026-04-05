@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
+import { paymentHistoryDb } from './paymentHistoryDb';
 
 dotenv.config();
 
@@ -423,6 +424,47 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
   });
 
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
+}
+
+
+/**
+ * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
+ */
+export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  const updateData: Record<string, any> = {
+    subscription_status: 'active',
+    has_payment_method: true,
+  };
+
+  // Backfill stripe_subscription_id if user doesn't have one yet
+  if (!user.stripe_subscription_id && subscriptionId) {
+    updateData.stripe_subscription_id = subscriptionId;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
+
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} \u2192 status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+  );
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

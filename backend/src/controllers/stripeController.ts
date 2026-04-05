@@ -6,6 +6,7 @@ import {
   handleCheckoutSessionCompleted,
   handleSubscriptionUpdated,
   handleSubscriptionDeleted,
+  handleInvoicePaymentSucceeded,
 } from '../services/stripeService';
 
 const CUSTOMER_FRONTEND_URL =
@@ -71,6 +72,9 @@ export async function handleWebhook(req: Request, res: Response) {
         break;
       case 'customer.subscription.deleted':
         await handleSubscriptionDeleted(event.data.object);
+        break;
+      case 'invoice.payment_succeeded':
+        await handleInvoicePaymentSucceeded(event.data.object);
         break;
       default:
         console.log(`Unhandled Stripe event type: ${event.type}`);
