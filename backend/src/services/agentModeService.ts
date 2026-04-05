@@ -14756,28 +14756,94 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
         console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
+        // Publish to Payload CMS instead of Webflow
+        let payloadEndpoint = 'https://hireemma.ai/api/publish-post';
+        let payloadSecret: string | undefined;
+
         try {
+          const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
+          if (payloadSecretJson) {
+            const parsed = JSON.parse(payloadSecretJson);
+            payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
+            payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
+          }
+        } catch (secretErr) {
+          console.warn('AgentMode: Could not load PayloadCMS secret, falling back to Webflow:', secretErr);
+        }
+
+        if (!payloadSecret) {
+          console.warn('AgentMode: PAYLOAD_PUBLISH_SECRET not available, falling back to Webflow');
+        }
+
+        try {
+          if (payloadSecret) {
+            // Map Webflow categories to Payload categories
+            const categoryMap: Record<string, string> = {
+              'AI in Marketing': 'AI in Marketing',
+              'Founder Playbooks': 'Founder Playbooks',
+              'Growth Tips': 'Growth Tips',
+              'Thought Leadership': 'Thought Leadership',
+              'Other': 'Other',
+              'Alternatives': 'Alternatives',
+              'Listicles': 'Listicles',
+              'User Guide': 'User Guide',
+              'Case Studies': 'Case Studies',
+            };
+            const payloadCategory = categories.length > 0
+              ? (categoryMap[categories[0]] || 'Other')
+              : 'Other';
+
+            // Map author to Payload author slug
+            const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
+              : author?.toLowerCase().includes('harsha') ? 'harsha'
+              : author?.toLowerCase().includes('fangfang') ? 'fangfang'
+              : author?.toLowerCase().includes('matthew') ? 'matthew'
+              : 'emma';
+
+            const payloadResponse = await axios.post(
+              payloadEndpoint,
+              {
+                title,
+                slug,
+                summary: description,
+                bodyHtml: cleanBodyHtml,
+                category: payloadCategory,
+                author: authorSlug,
+                featuredImageUrl: heroImageUrl,
+                publishedAt: new Date().toISOString(),
+                status,
+              },
+              {
+                headers: { 'Authorization': `Bearer ${payloadSecret}` },
+                timeout: 30000,
+              }
+            );
+
+            console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
+
+            return {
+              success: true,
+              message: `Blog article published successfully to Payload CMS as ${status}`,
+              data: {
+                title,
+                slug,
+                status,
+                cmsType: 'Payload',
+                url: `/blog/${slug}`,
+                cmsResponse: payloadResponse.data,
+              }
+            };
+          }
+
+          // Fallback to Webflow if no Payload secret
           const response = await axios.post(
             endpoint,
             cmsItemData,
             { headers }
           );
 
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}`);
-
-          // Sanitize response to remove large content fields before sending to LLM
-          const responseData = response.data as any;
-          const sanitizedResponse = responseData && typeof responseData === 'object'
-            ? { ...responseData }
-            : responseData;
-
-          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
-            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
-            // Remove large content fields that aren't needed by the LLM
-            delete sanitizedFieldData['post-body'];
-            delete sanitizedFieldData['body'];
-            sanitizedResponse.fieldData = sanitizedFieldData;
-          }
+          console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
 
           return {
             success: true,
@@ -14786,7 +14852,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               title,
               status,
               cmsType: 'Webflow',
-              cmsResponse: sanitizedResponse
+              cmsResponse: response.data
             }
           };
         } catch (webflowError: any) {
