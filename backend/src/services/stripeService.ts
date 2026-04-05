@@ -541,6 +541,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
 }
 
+
 /**
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
@@ -576,6 +577,8 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
 
   await userDb.updateUser(user.userId, updateData);
 
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} \u2192 status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
   // Record in payment history
   await paymentHistoryDb.record({
     userId: user.userId,
