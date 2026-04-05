@@ -4,6 +4,7 @@ import { MetaService } from "./metaService";
 import { getAccountByPlatform } from "./connectedAccountsDb";
 import { getProspectMeetingMetrics, ProspectMeetingMetrics } from "./prospectMeetingService";
 import { getSmartLeadMetrics, SmartLeadMetrics } from "./smartleadService";
+import { getUnipileOutreachMetrics, UnipileOutreachMetrics } from "./unipileOutreachService";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -572,6 +573,7 @@ function buildLinkedInPipeline(
 function buildOutboundPipeline(
   leadData: LeadData,
   smartLeadData: SmartLeadMetrics,
+  unipileData: UnipileOutreachMetrics,
   meetingData: ProspectMeetingMetrics,
   userData: { data: UserCounts; status: "ok" | "error" },
 ): ChannelPipeline {
@@ -599,24 +601,54 @@ function buildOutboundPipeline(
   stages.push(makeStage("List Size", listSize, 0, 0, listSources));
   stages[0].conversionRate = 100;
 
-  // 2. Contacted — SmartLead leads in progress + completed (emails sent)
-  const contactedCount = smartLeadData.status === "ok"
+  // 2. Contacted — SmartLead leads in progress + completed (emails sent) + Unipile LinkedIn messages
+  const smartLeadContacted = smartLeadData.status === "ok"
     ? smartLeadData.leadsInProgress + smartLeadData.leadsCompleted + smartLeadData.leadsReplied
     : 0;
-  const contactedSources = smartLeadData.status === "ok"
-    ? [safeSource("SmartLead (emails sent)", contactedCount)]
-    : smartLeadData.status === "error"
-      ? [errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data")]
-      : [unavailableSource("SmartLead (not configured)")];
+  const unipileContacted = unipileData.status === "ok" ? unipileData.totalMessagesSent : 0;
+  const contactedCount = smartLeadContacted + unipileContacted;
+
+  const contactedSources: SourceBreakdown[] = [];
+  if (smartLeadData.status === "ok") {
+    contactedSources.push(safeSource("SmartLead (emails sent)", smartLeadContacted));
+  } else if (smartLeadData.status === "error") {
+    contactedSources.push(errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data"));
+  } else {
+    contactedSources.push(unavailableSource("SmartLead (not configured)"));
+  }
+
+  if (unipileData.status === "ok") {
+    contactedSources.push(safeSource("Unipile LinkedIn (messages sent)", unipileContacted));
+  } else if (unipileData.status === "error") {
+    contactedSources.push(errorSource("Unipile LinkedIn", unipileData.error || "Failed to fetch Unipile data"));
+  } else {
+    contactedSources.push(unavailableSource("Unipile LinkedIn (not connected)"));
+  }
+
   stages.push(makeStage("Contacted", contactedCount, 0, listSize, contactedSources));
 
-  // 3. Replies — SmartLead leads that replied
-  const repliedCount = smartLeadData.status === "ok" ? smartLeadData.leadsReplied : 0;
-  const repliesSources = smartLeadData.status === "ok"
-    ? [safeSource("SmartLead (replies)", repliedCount)]
-    : smartLeadData.status === "error"
-      ? [errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data")]
-      : [unavailableSource("SmartLead (not configured)")];
+  // 3. Replies — SmartLead leads that replied + Unipile LinkedIn replies received
+  const smartLeadReplied = smartLeadData.status === "ok" ? smartLeadData.leadsReplied : 0;
+  const unipileReplied = unipileData.status === "ok" ? unipileData.totalRepliesReceived : 0;
+  const repliedCount = smartLeadReplied + unipileReplied;
+
+  const repliesSources: SourceBreakdown[] = [];
+  if (smartLeadData.status === "ok") {
+    repliesSources.push(safeSource("SmartLead (replies)", smartLeadReplied));
+  } else if (smartLeadData.status === "error") {
+    repliesSources.push(errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data"));
+  } else {
+    repliesSources.push(unavailableSource("SmartLead (not configured)"));
+  }
+
+  if (unipileData.status === "ok") {
+    repliesSources.push(safeSource("Unipile LinkedIn (replies received)", unipileReplied));
+  } else if (unipileData.status === "error") {
+    repliesSources.push(errorSource("Unipile LinkedIn", unipileData.error || "Failed to fetch Unipile data"));
+  } else {
+    repliesSources.push(unavailableSource("Unipile LinkedIn (not connected)"));
+  }
+
   stages.push(makeStage("Replies", repliedCount, 0, contactedCount, repliesSources));
 
   // 4. Talked — prospect meetings
@@ -745,19 +777,20 @@ export async function getBusinessFunnelMetrics(
   const previousRange = getPreviousDateRange(days);
 
   // Fetch all data sources in parallel
-  const [gscData, metaData, leadData, userData, meetingData, smartLeadData] = await Promise.all([
+  const [gscData, metaData, leadData, userData, meetingData, smartLeadData, unipileData] = await Promise.all([
     fetchGSCData(timeframe),
     fetchMetaAdsData(timeframe),
     fetchLeadCount(dateRange.start),
     fetchUserAndSubscriptionData(dateRange.start, previousRange.start, previousRange.end),
     getProspectMeetingMetrics(period),
     getSmartLeadMetrics(),
+    getUnipileOutreachMetrics(period),
   ]);
 
   // Build per-channel pipelines
   const seoPipeline = buildSEOPipeline(gscData, userData);
   const linkedInPipeline = buildLinkedInPipeline(meetingData, { data: userData.data, status: userData.status });
-  const outboundPipeline = buildOutboundPipeline(leadData, smartLeadData, meetingData, { data: userData.data, status: userData.status });
+  const outboundPipeline = buildOutboundPipeline(leadData, smartLeadData, unipileData, meetingData, { data: userData.data, status: userData.status });
   const paidAdsPipeline = buildPaidAdsPipeline(metaData, meetingData, { data: userData.data, status: userData.status });
 
   const channels: ChannelPipeline[] = [seoPipeline, linkedInPipeline, outboundPipeline, paidAdsPipeline];
