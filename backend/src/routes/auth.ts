@@ -65,7 +65,9 @@ router.get('/me', authenticateToken, async (req, res) => {
       };
     }
 
-    // Lazy-sync subscription status from Stripe if missing
+    // Lazy-sync subscription status from Stripe if missing.
+    // This catches legacy records where webhooks failed. Ongoing sync is handled
+    // by webhooks (which now retry on transient errors).
     if (user.stripe_customer_id && !user.subscription_status) {
       try {
         const { syncSubscriptionFromStripe } = await import('../services/stripeService');

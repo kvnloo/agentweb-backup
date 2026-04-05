@@ -11,6 +11,7 @@ const mockCheckoutSessionsRetrieve = jest.fn();
 const mockBillingPortalSessionsCreate = jest.fn();
 const mockProductsList = jest.fn();
 const mockWebhooksConstructEvent = jest.fn();
+const mockPaymentMethodsList = jest.fn();
 
 jest.mock('stripe', () => {
   return jest.fn().mockImplementation(() => ({
@@ -30,6 +31,9 @@ jest.mock('stripe', () => {
     },
     webhooks: {
       constructEvent: mockWebhooksConstructEvent,
+    },
+    paymentMethods: {
+      list: mockPaymentMethodsList,
     },
   }));
 });
@@ -327,6 +331,8 @@ describe('Stripe Backend Integration', () => {
         ...mockUser,
         subscription_status: 'past_due',
       });
+      // Mock paymentMethods.list for has_payment_method backfill
+      mockPaymentMethodsList.mockResolvedValue({ data: [] });
 
       const { handleSubscriptionUpdated } = await import('../services/stripeService');
 
@@ -339,6 +345,8 @@ describe('Stripe Backend Integration', () => {
 
       expect(userDb.updateUser).toHaveBeenCalledWith('user-123', {
         subscription_status: 'past_due',
+        stripe_subscription_id: 'sub_123',
+        has_payment_method: false,
       });
     });
   });
