@@ -2830,9 +2830,16 @@ export class ChatbotDB {
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
+        // Filter by createdAt to exclude sessions that were created outside the time range
+        // but had their updatedAt bumped into the range (e.g., by satisfaction scoring).
+        const filtered = accumulated.filter((s) => {
+          if (!s.createdAt) return true;
+          return s.createdAt >= timeRange.startTime && s.createdAt <= timeRange.endTime;
+        });
+
         return {
-          sessions: accumulated.slice(0, limit),
-          lastEvaluatedKey: accumulated.length > limit ? undefined : undefined,
+          sessions: filtered.slice(0, limit),
+          lastEvaluatedKey: undefined,
         };
       } catch (error) {
         console.error("Error getting chat sessions by time range:", error);
