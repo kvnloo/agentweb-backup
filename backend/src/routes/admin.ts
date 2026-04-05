@@ -18,6 +18,7 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 
@@ -4569,6 +4570,19 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   } catch (error: any) {
     console.error("Error scoring chat sessions with judge:", error);
     res.status(500).json({ message: "Failed to score chat sessions with judge" });
+  }
+});
+
+// ─── Business Funnel Metrics ─────────────────────────────────────────────
+
+router.get("/funnel-metrics", async (req, res) => {
+  try {
+    const period = (req.query.period as string) || "30d";
+    const data = await getBusinessFunnelMetrics(period);
+    res.json(data);
+  } catch (error: any) {
+    console.error("Error fetching funnel metrics:", error.message);
+    res.status(500).json({ message: "Failed to fetch funnel metrics" });
   }
 });
 

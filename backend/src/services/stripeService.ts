@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
+import { paymentHistoryDb } from './paymentHistoryDb';
 
 dotenv.config();
 
@@ -352,6 +353,16 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     }
   }
 
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'subscription_created',
+    stripeCustomerId,
+    stripeSubscriptionId,
+    subscriptionType,
+    metadata: { sessionId: session.id, status: actualStatus },
+  });
+
   console.log(
     `Checkout completed: user ${user.userId} → stripe_customer_id=${stripeCustomerId}, subscription=${stripeSubscriptionId}, status=${actualStatus}, periodEnd=${currentPeriodEnd || 'unknown'}`
   );
@@ -455,7 +466,151 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     allowedSkills: freeTierConfig?.allowedSkills ?? [],
   });
 
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'subscription_canceled',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id,
+  });
+
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
+}
+
+/**
+ * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
+ */
+export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  const updateData: Record<string, any> = {
+    subscription_status: 'active',
+    has_payment_method: true,
+  };
+
+  // Backfill stripe_subscription_id if user doesn't have one yet
+  if (!user.stripe_subscription_id && subscriptionId) {
+    updateData.stripe_subscription_id = subscriptionId;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'payment_succeeded',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscriptionId || undefined,
+    stripeInvoiceId: invoice.id,
+    amountCents: invoice.amount_paid,
+    currency: invoice.currency,
+  });
+
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+  );
+}
+
+/**
+ * Handle invoice.payment_failed — mark subscription as past_due and record the failure.
+ */
+export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_failed missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for invoice.payment_failed. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  await userDb.updateUser(user.userId, {
+    subscription_status: 'past_due',
+  });
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'payment_failed',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscriptionId || undefined,
+    stripeInvoiceId: invoice.id,
+    amountCents: invoice.amount_due,
+    currency: invoice.currency,
+    metadata: {
+      attemptCount: invoice.attempt_count,
+      nextPaymentAttempt: invoice.next_payment_attempt,
+    },
+  });
+
+  console.log(
+    `[STRIPE] Invoice payment failed: user ${user.userId} → status=past_due, invoice=${invoice.id}`
+  );
+}
+
+/**
+ * Handle charge.refunded — record the refund in payment history.
+ */
+export async function handleChargeRefunded(charge: any): Promise<void> {
+  const customerId = typeof charge.customer === 'string'
+    ? charge.customer
+    : charge.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] charge.refunded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for charge.refunded. customer=${customerId}`);
+    return;
+  }
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'refund',
+    stripeCustomerId: customerId,
+    stripeChargeId: charge.id,
+    amountCents: charge.amount_refunded,
+    currency: charge.currency,
+    metadata: {
+      refundReason: charge.refunds?.data?.[0]?.reason,
+      fullRefund: charge.refunded,
+    },
+  });
+
+  console.log(
+    `[STRIPE] Charge refunded: user ${user.userId}, charge=${charge.id}, amount_refunded=${charge.amount_refunded}`
+  );
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

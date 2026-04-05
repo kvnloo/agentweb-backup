@@ -6,6 +6,9 @@ import {
   handleCheckoutSessionCompleted,
   handleSubscriptionUpdated,
   handleSubscriptionDeleted,
+  handleInvoicePaymentSucceeded,
+  handleInvoicePaymentFailed,
+  handleChargeRefunded,
   reconcileAllStripeUsers,
 } from '../services/stripeService';
 
@@ -88,6 +91,15 @@ export async function handleWebhook(req: Request, res: Response) {
         break;
       case 'customer.subscription.deleted':
         await handleSubscriptionDeleted(event.data.object);
+        break;
+      case 'invoice.payment_succeeded':
+        await handleInvoicePaymentSucceeded(event.data.object);
+        break;
+      case 'invoice.payment_failed':
+        await handleInvoicePaymentFailed(event.data.object);
+        break;
+      case 'charge.refunded':
+        await handleChargeRefunded(event.data.object);
         break;
       default:
         console.log(`Unhandled Stripe event type: ${event.type}`);
