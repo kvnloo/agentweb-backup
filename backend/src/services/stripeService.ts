@@ -444,7 +444,12 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
 }
 
 /**
- * Handle customer.subscription.deleted — mark subscription as canceled.
+ * Handle customer.subscription.deleted — mark subscription as canceled,
+ * BUT only if the customer has no other active/trialing subscription.
+ *
+ * When a subscription is downgraded by canceling the old sub and creating a new
+ * cheaper one, Stripe fires customer.subscription.deleted on the OLD sub.
+ * We must check for a remaining active sub before marking the user as canceled.
  */
 export async function handleSubscriptionDeleted(subscription: any): Promise<void> {
   const customerId = typeof subscription.customer === 'string'
@@ -457,6 +462,65 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     return;
   }
 
+  // Check if the customer still has another active or trialing subscription.
+  // This happens during downgrades: old sub is canceled, new (cheaper) sub is created.
+  if (customerId) {
+    try {
+      const s = getStripeOrThrow();
+      for (const status of ['active', 'trialing'] as const) {
+        const remaining = await s.subscriptions.list({
+          customer: customerId,
+          status,
+          limit: 1,
+        });
+        if (remaining.data.length > 0) {
+          const activeSub = remaining.data[0];
+          console.log(
+            `[STRIPE] Subscription ${subscription.id} deleted, but customer ${customerId} still has ${status} subscription ${activeSub.id} — treating as downgrade, not cancellation`
+          );
+
+          // Sync the user to the remaining active subscription instead of canceling
+          const updateData: Record<string, any> = {
+            subscription_status: activeSub.status,
+            stripe_subscription_id: activeSub.id,
+          };
+
+          // Derive tier from the remaining subscription's price
+          const priceId = activeSub.items?.data?.[0]?.price?.id;
+          if (priceId) {
+            const newType = deriveSubscriptionTypeFromPriceId(priceId);
+            if (newType) {
+              updateData.subscriptionType = newType;
+              const tierConfig = await getTierConfig(newType);
+              if (tierConfig) {
+                updateData.allowedPages = tierConfig.allowedPages;
+                updateData.allowedSkills = tierConfig.allowedSkills;
+              }
+            }
+          }
+
+          // Sync period end
+          const periodEnd = (activeSub as any).current_period_end;
+          if (periodEnd) {
+            updateData.current_period_end = new Date(
+              typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
+            ).toISOString();
+          }
+
+          await userDb.updateUser(user.userId, updateData);
+          console.log(
+            `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
+          );
+          return;
+        }
+      }
+    } catch (err: any) {
+      console.error(`[STRIPE] Error checking remaining subscriptions for ${customerId}:`, err.message);
+      // Fall through to cancel — safer to cancel than to leave in a stale state
+    }
+  }
+
+  // No remaining active/trialing subscriptions — this is a genuine cancellation
   const freeTierConfig = await getTierConfig('Free');
 
   await userDb.updateUser(user.userId, {
