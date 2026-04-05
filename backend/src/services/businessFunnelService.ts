@@ -598,19 +598,25 @@ function buildOutboundPipeline(
     listSize += leadData.total;
   }
 
-  // Include Unipile LinkedIn connection requests in list size
-  // (connection requests = new strangers you're trying to reach)
-  if (unipileData.status === "ok" && unipileData.totalConnectionRequests > 0) {
+  // Include Unipile LinkedIn targets in list size
+  // Use max(connectionRequests, messagesSent) per person — because if you DMed 69
+  // people but only sent 43 connection requests, you reached at least 69 unique people
+  // (some were already connections who didn't need a request)
+  if (unipileData.status === "ok") {
     if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
       for (const acct of unipileData.accountBreakdown) {
-        if (acct.connectionRequestsSent > 0) {
-          listSources.push(safeSource(`LinkedIn requests — ${acct.accountName.split(' ')[0]}`, acct.connectionRequestsSent));
-          listSize += acct.connectionRequestsSent;
+        const reach = Math.max(acct.connectionRequestsSent, acct.messagesSent);
+        if (reach > 0) {
+          listSources.push(safeSource(`LinkedIn reach — ${acct.accountName.split(' ')[0]}`, reach));
+          listSize += reach;
         }
       }
     } else {
-      listSources.push(safeSource("LinkedIn connection requests", unipileData.totalConnectionRequests));
-      listSize += unipileData.totalConnectionRequests;
+      const reach = Math.max(unipileData.totalConnectionRequests, unipileData.totalMessagesSent);
+      if (reach > 0) {
+        listSources.push(safeSource("LinkedIn reach (Unipile)", reach));
+        listSize += reach;
+      }
     }
   }
 
