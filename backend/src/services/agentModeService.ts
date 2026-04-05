@@ -383,6 +383,7 @@ export class AgentModeService {
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
+        await import('../emma/tempEmailTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {

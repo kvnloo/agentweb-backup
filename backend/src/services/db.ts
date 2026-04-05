@@ -5484,3 +5484,57 @@ export const scheduleTemplateDb = {
     }
   },
 };
+
+const TEMP_EMAILS_TABLE = `${TABLE_PREFIX}AW-TempEmails`;
+
+export const tempEmailDb = {
+  async save(email: {
+    emailId: string;
+    toAddress: string;
+    fromAddress: string;
+    subject: string;
+    text?: string;
+    receivedAt: string;
+  }) {
+    try {
+      const ttlSeconds = Math.floor(Date.now() / 1000) + 3600; // 1 hour TTL
+      await dynamodb.put({
+        TableName: TEMP_EMAILS_TABLE,
+        Item: {
+          emailId: email.emailId,
+          toAddress: email.toAddress.toLowerCase(),
+          fromAddress: email.fromAddress,
+          subject: email.subject || '',
+          text: email.text || '',
+          receivedAt: email.receivedAt,
+          ttl: ttlSeconds,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, "tempEmailDb.save");
+    }
+  },
+
+  async getByAddress(toAddress: string, since?: string): Promise<any[]> {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: TEMP_EMAILS_TABLE,
+        IndexName: 'ToAddressIndex',
+        KeyConditionExpression: since
+          ? 'toAddress = :addr AND receivedAt >= :since'
+          : 'toAddress = :addr',
+        ExpressionAttributeValues: {
+          ':addr': toAddress.toLowerCase(),
+          ...(since ? { ':since': since } : {}),
+        },
+        ScanIndexForward: false,
+        Limit: 20,
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "tempEmailDb.getByAddress");
+      return [];
+    }
+  },
+};

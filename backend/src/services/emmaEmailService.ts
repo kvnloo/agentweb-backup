@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { EMMA_EMAIL_ADDRESS, EMMA_EMAIL_FROM } from '../config';
+import { EMMA_EMAIL_ADDRESS, EMMA_EMAIL_FROM, TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { resendService } from './resendService';
 import { chatbotDb } from './chatbotService';
 import { generateSessionResponse } from '../controllers/agentModeController';
@@ -35,7 +35,13 @@ export class EmmaEmailService {
     const emmaLower = EMMA_EMAIL_ADDRESS.toLowerCase();
     if (extractBareEmail(from) === emmaLower) return true;
     const toArray = Array.isArray(to) ? to : [to];
-    return toArray.some((addr) => extractBareEmail(addr) === emmaLower);
+    if (toArray.some((addr) => extractBareEmail(addr) === emmaLower)) return true;
+    // Also treat temp test emails as Emma-related so they don't get tracked in CRM
+    const tempPrefix = `${TEMP_EMAIL_PREFIX}+`;
+    return toArray.some((addr) => {
+      const bare = extractBareEmail(addr).toLowerCase();
+      return bare.startsWith(tempPrefix) && bare.endsWith(`@${TEMP_EMAIL_DOMAIN}`);
+    });
   }
 
   /**
