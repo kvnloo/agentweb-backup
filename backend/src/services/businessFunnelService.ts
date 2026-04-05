@@ -25,7 +25,9 @@ export interface FunnelStage {
 export interface ConstraintAnalysis {
   stage: string;
   conversionRate: number;
-  type: "more" | "metrics" | "leads" | "sales" | "ltv" | "cashflow";
+  type: "more" | "metrics" | "market" | "model" | "money_leads" | "money_sales" | "money_ltv" | "money_cashflow" | "manpower";
+  moseyM: "More" | "Metrics" | "Market" | "Model" | "Money" | "Manpower";
+  moneySubType?: "leads" | "sales" | "ltv" | "cashflow";
   suggestion: string;
 }
 
@@ -52,6 +54,16 @@ export interface FunnelMetricsResponse {
   aggregate: {
     totalLeads: number;
     totalPaid: number;
+    netNewRevenue: {
+      newCustomers: number;
+      description: string;
+    };
+    netRetainedRevenue: {
+      retainedCustomers: number;
+      churnedCustomers: number;
+      retentionRate: number;
+      description: string;
+    };
     overallConstraint: ConstraintAnalysis | null;
   };
   period: { start: string; end: string };
@@ -135,37 +147,61 @@ function makeStage(
   };
 }
 
-// ─── Constraint Classification (Hormozi Framework) ──────────────────────
+// ─── Constraint Classification (Hormozi "Mosey 6" Framework) ────────────
+//
+// The 6 M's checked in order — exit at the first one that's the constraint:
+// 1. More — Can you just do more of what works?
+// 2. Metrics — Do you have the data?
+// 3. Market — Is the market big enough? (almost always yes)
+// 4. Model — Is the business model right for your goals?
+// 5. Money — Can you afford to grow? (leads/sales/ltv/cashflow)
+// 6. Manpower — Do you have the people?
 
 function classifyConstraint(stages: FunnelStage[]): ConstraintAnalysis | null {
-  // 1. METRICS: If 3+ stages have status "unavailable", constraint is tracking
-  const unavailable = stages.filter(s => s.status === "unavailable").length;
-  if (unavailable >= 3) {
-    return {
-      stage: "tracking",
-      conversionRate: 0,
-      type: "metrics",
-      suggestion: "Connect data sources first. You can't grow what you can't measure.",
-    };
-  }
+  const okStages = stages.filter(s => s.status === "ok");
+  const unavailableCount = stages.filter(s => s.status === "unavailable").length;
 
-  // 2. MORE: If top-of-funnel absolute count < 1000, it's a volume problem
+  // ── M1: MORE ──
+  // If top-of-funnel count is low, you just need to do more volume.
+  // "If you can double your company doing one thing, why do three?"
   const topStage = stages.find(s => s.status === "ok");
-  if (topStage && topStage.count < 1000) {
+  if (topStage && topStage.count < 1000 && topStage.count > 0) {
     return {
       stage: topStage.name,
       conversionRate: 0,
       type: "more",
-      suggestion: `Only ${topStage.count} ${topStage.name.toLowerCase()}. Just do more — volume is too low to optimize.`,
+      moseyM: "More",
+      suggestion: `Only ${topStage.count.toLocaleString()} ${topStage.name.toLowerCase()}. Can you just do more? More is the highest risk-adjusted return. Do more of what's already working before trying to optimize.`,
     };
   }
 
-  // 3. Find worst conversion rate among available stages
+  // ── M2: METRICS ──
+  // If you can't see your numbers, that's the constraint.
+  // "If you can't do more because you don't know your numbers, knowing your numbers becomes priority #1."
+  if (unavailableCount >= 3) {
+    return {
+      stage: "tracking",
+      conversionRate: 0,
+      type: "metrics",
+      moseyM: "Metrics",
+      suggestion: `${unavailableCount} of ${stages.length} stages have no data. You can't grow what you can't measure. Connect your data sources first — that's your #1 priority.`,
+    };
+  }
+
+  // ── M3: MARKET — Skip (SaaS with global reach, market is never too small) ──
+
+  // ── M4: MODEL — Skip (checked at business level, not per-channel) ──
+
+  // ── M5: MONEY ──
+  // Find the worst conversion rate and classify which Money sub-constraint it is.
+  // "Is it because leads cost too much, sales close rate too low, LTV too low, or cash flow too slow?"
   let worstStage: FunnelStage | null = null;
   let worstRate = Infinity;
 
-  for (const stage of stages) {
-    if (stage.status !== "ok" || stage.conversionRate === 0) continue;
+  for (const stage of okStages) {
+    // Skip the first stage (top of funnel has no conversion from a previous stage)
+    if (stages.indexOf(stage) === 0) continue;
+    if (stage.conversionRate <= 0) continue;
     if (stage.conversionRate < worstRate) {
       worstRate = stage.conversionRate;
       worstStage = stage;
@@ -174,26 +210,45 @@ function classifyConstraint(stages: FunnelStage[]): ConstraintAnalysis | null {
 
   if (!worstStage) return null;
 
-  // Classify based on position in the funnel
   const stageIndex = stages.indexOf(worstStage);
-  const okStages = stages.filter(s => s.status === "ok").length;
-  const position = okStages > 0 ? stageIndex / stages.length : 0;
+  const totalStages = stages.length;
+  const position = stageIndex / totalStages;
 
+  // Map funnel position to Money sub-type
   let type: ConstraintAnalysis["type"];
+  let moneySubType: ConstraintAnalysis["moneySubType"];
   let suggestion: string;
 
-  if (position < 0.33) {
-    type = "leads";
-    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Improve hooks, ad creative, or landing pages.`;
-  } else if (position < 0.66) {
-    type = "sales";
-    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Add VSSL, improve nurture, or add proof to the sales process.`;
+  if (position <= 0.3) {
+    // Top of funnel: leads too expensive / not enough clicks
+    type = "money_leads";
+    moneySubType = "leads";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Your leads cost too much or you're not getting enough. Improve ad creative, hooks, landing pages, or lead magnets.`;
+  } else if (position <= 0.55) {
+    // Mid funnel: sales/conversion problem
+    type = "money_sales";
+    moneySubType = "sales";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. You're not closing enough. Add a VSSL before sales calls, improve lead nurture, add proof, or train your sales process.`;
+  } else if (position <= 0.8) {
+    // Lower funnel: LTV problem (active/paid)
+    type = "money_ltv";
+    moneySubType = "ltv";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. You're not making enough per customer. Improve onboarding, raise prices, add upsells, or increase delivery quality.`;
   } else {
-    type = "ltv";
-    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Improve onboarding, delivery quality, or add upsells.`;
+    // Bottom: retention/churn = also LTV
+    type = "money_ltv";
+    moneySubType = "ltv";
+    suggestion = `${worstStage.name} conversion is ${worstRate.toFixed(1)}%. Customers aren't staying. This is a retention problem — fix delivery, add long-term stickiness, or build compounding vehicles.`;
   }
 
-  return { stage: worstStage.name, conversionRate: worstRate, type, suggestion };
+  return {
+    stage: worstStage.name,
+    conversionRate: worstRate,
+    type,
+    moseyM: "Money",
+    moneySubType,
+    suggestion,
+  };
 }
 
 // ─── Data Fetchers ──────────────────────────────────────────────────────
@@ -679,8 +734,21 @@ export async function getBusinessFunnelMetrics(
   const totalLeads = comparison.reduce((sum, c) => sum + c.leads, 0);
   const totalPaid = userData.data.paidUsers;
 
-  // Overall constraint: pick the constraint from the channel with the most available data
-  // Prefer channels that have real data (not all unavailable)
+  // Net New vs Net Retained Revenue
+  const netNewRevenue = {
+    newCustomers: userData.data.newUsers,
+    description: `${userData.data.newUsers} new signups this period`,
+  };
+  const netRetainedRevenue = {
+    retainedCustomers: userData.data.retainedUsers,
+    churnedCustomers: userData.data.churnedUsers || 0,
+    retentionRate: userData.data.paidUsers > 0
+      ? parseFloat(((userData.data.retainedUsers / (userData.data.retainedUsers + (userData.data.churnedUsers || 0))) * 100).toFixed(1))
+      : 0,
+    description: `${userData.data.retainedUsers} retained, ${userData.data.churnedUsers || 0} churned`,
+  };
+
+  // Overall constraint: pick the worst constraint across channels with real data
   const channelsWithData = channels.filter(ch =>
     ch.stages.some(s => s.status === "ok" && s.count > 0),
   );
@@ -697,6 +765,8 @@ export async function getBusinessFunnelMetrics(
     aggregate: {
       totalLeads,
       totalPaid,
+      netNewRevenue,
+      netRetainedRevenue,
       overallConstraint,
     },
     period: {

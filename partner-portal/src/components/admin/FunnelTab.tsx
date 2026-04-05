@@ -84,6 +84,16 @@ interface FunnelMetricsResponse {
   aggregate: {
     totalLeads: number;
     totalPaid: number;
+    netNewRevenue?: {
+      newCustomers: number;
+      description: string;
+    };
+    netRetainedRevenue?: {
+      retainedCustomers: number;
+      churnedCustomers: number;
+      retentionRate: number;
+      description: string;
+    };
     overallConstraint: ConstraintAnalysis | null;
   };
   period: { start: string; end: string };
@@ -142,50 +152,70 @@ function ConstraintAlert({
   constraint: ConstraintAnalysis;
   prefix?: string;
 }) {
+  // Hormozi "Mosey 6" constraint types
   const config: Record<
-    ConstraintAnalysis['type'],
+    string,
     { severity: 'info' | 'warning' | 'error'; color: string; icon: React.ReactNode; label: string }
   > = {
     more: {
       severity: 'info',
       color: '#e3f2fd',
       icon: <VolumeUpIcon />,
-      label: 'VOLUME',
+      label: 'M1: MORE',
     },
     metrics: {
       severity: 'info',
       color: '#f5f5f5',
       icon: <WarningIcon />,
-      label: 'DATA',
+      label: 'M2: METRICS',
     },
-    leads: {
+    market: {
+      severity: 'info',
+      color: '#e8f5e9',
+      icon: <InfoIcon />,
+      label: 'M3: MARKET',
+    },
+    model: {
+      severity: 'info',
+      color: '#e0f7fa',
+      icon: <InfoIcon />,
+      label: 'M4: MODEL',
+    },
+    money_leads: {
       severity: 'warning',
       color: '#fff3e0',
       icon: <WarningIcon />,
-      label: 'LEADS',
+      label: 'M5: MONEY → Leads',
     },
-    sales: {
+    money_sales: {
       severity: 'error',
       color: '#ffebee',
       icon: <ErrorOutlineIcon />,
-      label: 'SALES',
+      label: 'M5: MONEY → Sales',
     },
-    ltv: {
+    money_ltv: {
       severity: 'info',
       color: '#f3e5f5',
       icon: <InfoIcon />,
-      label: 'LTV',
+      label: 'M5: MONEY → LTV',
     },
-    cashflow: {
+    money_cashflow: {
       severity: 'warning',
       color: '#fff8e1',
       icon: <WarningIcon />,
-      label: 'CASHFLOW',
+      label: 'M5: MONEY → Cash Flow',
+    },
+    manpower: {
+      severity: 'error',
+      color: '#fce4ec',
+      icon: <ErrorOutlineIcon />,
+      label: 'M6: MANPOWER',
     },
   };
 
-  const c = config[constraint.type];
-  const title = prefix ? `${prefix} CONSTRAINT` : 'YOUR #1 CONSTRAINT';
+  const c = config[constraint.type] || config['more'];
+  const moseyLabel = (constraint as any).moseyM ? `[${(constraint as any).moseyM}]` : '';
+  const title = prefix ? `${prefix} CONSTRAINT ${moseyLabel}` : `YOUR #1 CONSTRAINT ${moseyLabel}`;
 
   return (
     <Alert
@@ -602,27 +632,66 @@ function OverviewView({
         <ChannelComparisonTable comparison={data.comparison} onChannelClick={onChannelClick} />
       )}
 
-      {/* Summary KPIs */}
-      <Paper sx={{ p: 3, mb: 2 }}>
-        <Grid container spacing={3}>
-          <Grid item xs={4}>
-            <Typography variant="subtitle2" color="text.secondary">Total Leads (all channels)</Typography>
-            <Typography variant="h4">{formatNumber(data.aggregate.totalLeads)}</Typography>
-          </Grid>
-          <Grid item xs={4}>
-            <Typography variant="subtitle2" color="text.secondary">Total Paid Customers</Typography>
-            <Typography variant="h4">{formatNumber(data.aggregate.totalPaid)}</Typography>
-          </Grid>
-          <Grid item xs={4}>
-            <Typography variant="subtitle2" color="text.secondary">Overall Conversion</Typography>
-            <Typography variant="h4">
-              {data.aggregate.totalLeads > 0
-                ? `${((data.aggregate.totalPaid / data.aggregate.totalLeads) * 100).toFixed(1)}%`
-                : '—'}
+      {/* Summary KPIs — Net New vs Net Retained */}
+      <Grid container spacing={2} sx={{ mb: 2 }}>
+        {/* Net New Revenue */}
+        <Grid item xs={6}>
+          <Paper sx={{ p: 3, borderLeft: '4px solid #2196f3' }}>
+            <Typography variant="overline" color="text.secondary" fontWeight={600}>
+              NET NEW (Acquisition)
             </Typography>
-          </Grid>
+            <Grid container spacing={2} sx={{ mt: 0.5 }}>
+              <Grid item xs={4}>
+                <Typography variant="caption" color="text.secondary">Total Leads</Typography>
+                <Typography variant="h5">{formatNumber(data.aggregate.totalLeads)}</Typography>
+              </Grid>
+              <Grid item xs={4}>
+                <Typography variant="caption" color="text.secondary">New Signups</Typography>
+                <Typography variant="h5">{formatNumber(data.aggregate.netNewRevenue?.newCustomers ?? 0)}</Typography>
+              </Grid>
+              <Grid item xs={4}>
+                <Typography variant="caption" color="text.secondary">Lead → Paid</Typography>
+                <Typography variant="h5">
+                  {data.aggregate.totalLeads > 0
+                    ? `${((data.aggregate.totalPaid / data.aggregate.totalLeads) * 100).toFixed(1)}%`
+                    : '—'}
+                </Typography>
+              </Grid>
+            </Grid>
+          </Paper>
         </Grid>
-      </Paper>
+
+        {/* Net Retained Revenue */}
+        <Grid item xs={6}>
+          <Paper sx={{ p: 3, borderLeft: `4px solid ${
+            (data.aggregate.netRetainedRevenue?.retentionRate ?? 0) >= 80 ? '#4caf50' :
+            (data.aggregate.netRetainedRevenue?.retentionRate ?? 0) >= 50 ? '#ff9800' : '#f44336'
+          }` }}>
+            <Typography variant="overline" color="text.secondary" fontWeight={600}>
+              NET RETAINED (Delivery)
+            </Typography>
+            <Grid container spacing={2} sx={{ mt: 0.5 }}>
+              <Grid item xs={4}>
+                <Typography variant="caption" color="text.secondary">Retained</Typography>
+                <Typography variant="h5">{formatNumber(data.aggregate.netRetainedRevenue?.retainedCustomers ?? 0)}</Typography>
+              </Grid>
+              <Grid item xs={4}>
+                <Typography variant="caption" color="text.secondary">Churned</Typography>
+                <Typography variant="h5" color="error.main">{formatNumber(data.aggregate.netRetainedRevenue?.churnedCustomers ?? 0)}</Typography>
+              </Grid>
+              <Grid item xs={4}>
+                <Typography variant="caption" color="text.secondary">Retention Rate</Typography>
+                <Typography variant="h5" color={
+                  (data.aggregate.netRetainedRevenue?.retentionRate ?? 0) >= 80 ? 'success.main' :
+                  (data.aggregate.netRetainedRevenue?.retentionRate ?? 0) >= 50 ? 'warning.main' : 'error.main'
+                }>
+                  {data.aggregate.netRetainedRevenue?.retentionRate ?? 0}%
+                </Typography>
+              </Grid>
+            </Grid>
+          </Paper>
+        </Grid>
+      </Grid>
     </>
   );
 }
