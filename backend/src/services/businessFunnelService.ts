@@ -3,6 +3,8 @@ import { fetchSearchConsoleMetrics } from "./seoService";
 import { MetaService } from "./metaService";
 import { getAccountByPlatform } from "./connectedAccountsDb";
 import { getProspectMeetingMetrics, ProspectMeetingMetrics } from "./prospectMeetingService";
+import { getSmartLeadMetrics, SmartLeadMetrics } from "./smartleadService";
+import { getUnipileOutreachMetrics, UnipileOutreachMetrics } from "./unipileOutreachService";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -72,7 +74,10 @@ export interface FunnelMetricsResponse {
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
+// Founders account — has GSC, Meta Ads, CRM lead lists, ad account
 const FOUNDER_USER_ID = "be754b6c-767e-44ec-b181-4042cfe45ea9";
+// Harsha's account — has Gmail (Google Calendar), Fathom, Unipile connected
+const HARSHA_USER_ID = "1743956381327";
 const SEO_DOMAIN = "agentweb.pro";
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -567,27 +572,144 @@ function buildLinkedInPipeline(
 
 function buildOutboundPipeline(
   leadData: LeadData,
+  smartLeadData: SmartLeadMetrics,
+  unipileData: UnipileOutreachMetrics,
   meetingData: ProspectMeetingMetrics,
   userData: { data: UserCounts; status: "ok" | "error" },
 ): ChannelPipeline {
   const stages: FunnelStage[] = [];
 
-  // 1. List Size — total leads in CRM
-  const listSources = leadData.status === "ok"
-    ? [safeSource("CRM Lead Lists", leadData.total)]
-    : [errorSource("CRM Lead Lists", "Failed to fetch lead data")];
-  stages.push(makeStage("List Size", leadData.total, 0, 0, listSources));
+  // 1. List Size — SmartLead total leads loaded (fallback to CRM lead lists)
+  const listSources: SourceBreakdown[] = [];
+  let listSize = 0;
+
+  if (smartLeadData.status === "ok") {
+    listSources.push(safeSource("SmartLead Campaigns", smartLeadData.totalLeadsLoaded));
+    listSize += smartLeadData.totalLeadsLoaded;
+  } else if (smartLeadData.status === "error") {
+    listSources.push(errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data"));
+  } else {
+    listSources.push(unavailableSource("SmartLead (not configured)"));
+  }
+
+  // Also include CRM lead lists as a secondary source
+  if (leadData.status === "ok" && leadData.total > 0) {
+    listSources.push(safeSource("CRM Lead Lists", leadData.total));
+    listSize += leadData.total;
+  }
+
+  // Include Unipile LinkedIn targets in list size
+  // Connection requests = new strangers targeted
+  // DMs sent = total people contacted (includes existing connections)
+  // Show both separately so you can see the breakdown
+  if (unipileData.status === "ok") {
+    if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
+      for (const acct of unipileData.accountBreakdown) {
+        if (acct.connectionRequestsSent > 0) {
+          listSources.push(safeSource(`LinkedIn requests — ${acct.accountName.split(' ')[0]}`, acct.connectionRequestsSent));
+          listSize += acct.connectionRequestsSent;
+        }
+        // DMs to existing connections (people messaged who didn't need a connection request)
+        const existingConnectionDMs = Math.max(0, acct.messagesSent - acct.connectionRequestsSent);
+        if (existingConnectionDMs > 0) {
+          listSources.push(safeSource(`LinkedIn existing — ${acct.accountName.split(' ')[0]}`, existingConnectionDMs));
+          listSize += existingConnectionDMs;
+        }
+      }
+    } else {
+      if (unipileData.totalConnectionRequests > 0) {
+        listSources.push(safeSource("LinkedIn connection requests", unipileData.totalConnectionRequests));
+        listSize += unipileData.totalConnectionRequests;
+      }
+      const existingDMs = Math.max(0, unipileData.totalMessagesSent - unipileData.totalConnectionRequests);
+      if (existingDMs > 0) {
+        listSources.push(safeSource("LinkedIn existing connections DMed", existingDMs));
+        listSize += existingDMs;
+      }
+    }
+  }
+
+  stages.push(makeStage("List Size", listSize, 0, 0, listSources));
   stages[0].conversionRate = 100;
 
-  // 2. Contacted — unavailable
-  stages.push(makeStage("Contacted", 0, 0, leadData.total, [unavailableSource("SalesRobot (not connected)")]));
+  // 2. Contacted — SmartLead leads in progress + completed (emails sent) + Unipile LinkedIn messages
+  const smartLeadContacted = smartLeadData.status === "ok"
+    ? smartLeadData.leadsInProgress + smartLeadData.leadsCompleted + smartLeadData.leadsReplied
+    : 0;
+  const unipileContacted = unipileData.status === "ok" ? unipileData.totalMessagesSent : 0;
+  const contactedCount = smartLeadContacted + unipileContacted;
 
-  // 3. Replies — unavailable
-  stages.push(makeStage("Replies", 0, 0, 0, [unavailableSource("SalesRobot (not connected)")]));
+  const contactedSources: SourceBreakdown[] = [];
+  if (smartLeadData.status === "ok") {
+    contactedSources.push(safeSource("SmartLead (emails sent)", smartLeadContacted));
+  } else if (smartLeadData.status === "error") {
+    contactedSources.push(errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data"));
+  } else {
+    contactedSources.push(unavailableSource("SmartLead (not configured)"));
+  }
+
+  if (unipileData.status === "ok") {
+    // Show per-person breakdown
+    if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
+      for (const acct of unipileData.accountBreakdown) {
+        if (acct.messagesSent > 0) {
+          contactedSources.push(safeSource(`LinkedIn — ${acct.accountName.split(' ')[0]}`, acct.messagesSent));
+        }
+      }
+      // If no one sent anything, still show aggregate
+      if (!unipileData.accountBreakdown.some(a => a.messagesSent > 0)) {
+        contactedSources.push(safeSource("Unipile LinkedIn (messages sent)", 0));
+      }
+    } else {
+      contactedSources.push(safeSource("Unipile LinkedIn (messages sent)", unipileContacted));
+    }
+  } else if (unipileData.status === "error") {
+    contactedSources.push(errorSource("Unipile LinkedIn", unipileData.error || "Failed to fetch Unipile data"));
+  } else {
+    contactedSources.push(unavailableSource("Unipile LinkedIn (not connected)"));
+  }
+
+  stages.push(makeStage("Contacted", contactedCount, 0, listSize, contactedSources));
+
+  // 3. Replies — SmartLead leads that replied + Unipile LinkedIn replies received
+  const smartLeadReplied = smartLeadData.status === "ok" ? smartLeadData.leadsReplied : 0;
+  const unipileReplied = unipileData.status === "ok" ? unipileData.totalRepliesReceived : 0;
+  const repliedCount = smartLeadReplied + unipileReplied;
+
+  const repliesSources: SourceBreakdown[] = [];
+  if (smartLeadData.status === "ok") {
+    repliesSources.push(safeSource("SmartLead (replies)", smartLeadReplied));
+  } else if (smartLeadData.status === "error") {
+    repliesSources.push(errorSource("SmartLead", smartLeadData.error || "Failed to fetch SmartLead data"));
+  } else {
+    repliesSources.push(unavailableSource("SmartLead (not configured)"));
+  }
+
+  if (unipileData.status === "ok") {
+    // Show per-person breakdown for replies too
+    if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
+      for (const acct of unipileData.accountBreakdown) {
+        if (acct.repliesReceived > 0) {
+          repliesSources.push(safeSource(`LinkedIn replies — ${acct.accountName.split(' ')[0]}`, acct.repliesReceived));
+        }
+      }
+      if (!unipileData.accountBreakdown.some(a => a.repliesReceived > 0)) {
+        repliesSources.push(safeSource("Unipile LinkedIn (replies received)", 0));
+      }
+    } else {
+      repliesSources.push(safeSource("Unipile LinkedIn (replies received)", unipileReplied));
+    }
+  } else if (unipileData.status === "error") {
+    repliesSources.push(errorSource("Unipile LinkedIn", unipileData.error || "Failed to fetch Unipile data"));
+  } else {
+    repliesSources.push(unavailableSource("Unipile LinkedIn (not connected)"));
+  }
+
+  stages.push(makeStage("Replies", repliedCount, 0, contactedCount, repliesSources));
 
   // 4. Talked — prospect meetings
   const talkedSources = [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
-  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
+  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, repliedCount, talkedSources));
 
   // 5. Paid
   const paidSources = userData.status === "ok"
@@ -701,28 +823,41 @@ function buildComparison(channels: ChannelPipeline[], metaSpend: number): Channe
 
 // ─── Main Aggregator ────────────────────────────────────────────────────
 
+// ─── Response Cache (5 min TTL) ─────────────────────────────────────────
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const responseCache = new Map<string, { data: FunnelMetricsResponse; timestamp: number }>();
+
 export async function getBusinessFunnelMetrics(
   period: string = "30d",
   _channel?: string,
 ): Promise<FunnelMetricsResponse> {
+  // Check cache
+  const cacheKey = `funnel_${period}`;
+  const cached = responseCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const days = parsePeriodDays(period);
   const timeframe = `${days}d`;
   const dateRange = getDateRange(days);
   const previousRange = getPreviousDateRange(days);
 
   // Fetch all data sources in parallel
-  const [gscData, metaData, leadData, userData, meetingData] = await Promise.all([
+  const [gscData, metaData, leadData, userData, meetingData, smartLeadData, unipileData] = await Promise.all([
     fetchGSCData(timeframe),
     fetchMetaAdsData(timeframe),
     fetchLeadCount(dateRange.start),
     fetchUserAndSubscriptionData(dateRange.start, previousRange.start, previousRange.end),
     getProspectMeetingMetrics(period),
+    getSmartLeadMetrics(),
+    getUnipileOutreachMetrics(period),
   ]);
 
   // Build per-channel pipelines
   const seoPipeline = buildSEOPipeline(gscData, userData);
   const linkedInPipeline = buildLinkedInPipeline(meetingData, { data: userData.data, status: userData.status });
-  const outboundPipeline = buildOutboundPipeline(leadData, meetingData, { data: userData.data, status: userData.status });
+  const outboundPipeline = buildOutboundPipeline(leadData, smartLeadData, unipileData, meetingData, { data: userData.data, status: userData.status });
   const paidAdsPipeline = buildPaidAdsPipeline(metaData, meetingData, { data: userData.data, status: userData.status });
 
   const channels: ChannelPipeline[] = [seoPipeline, linkedInPipeline, outboundPipeline, paidAdsPipeline];
@@ -759,7 +894,7 @@ export async function getBusinessFunnelMetrics(
         ...paidAdsPipeline.stages,
       ]);
 
-  return {
+  const result: FunnelMetricsResponse = {
     channels,
     comparison,
     aggregate: {
@@ -775,4 +910,8 @@ export async function getBusinessFunnelMetrics(
     },
     generatedAt: new Date().toISOString(),
   };
+
+  // Cache the response for 5 minutes
+  responseCache.set(cacheKey, { data: result, timestamp: Date.now() });
+  return result;
 }

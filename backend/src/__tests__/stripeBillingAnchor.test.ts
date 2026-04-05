@@ -62,7 +62,12 @@ describe('Billing Cycle Anchor — 1st of Month', () => {
     mockStripe.checkout.sessions.create.mockResolvedValue({ id: 'cs_test_123' });
   });
 
-  it('should include billing_cycle_anchor set to the 1st of next month', async () => {
+  // NOTE: billing_cycle_anchor is NOT supported in checkout.sessions.create
+  // subscription_data. These tests verify it is NOT passed (it would be silently
+  // ignored by Stripe). Anchoring to the 1st should be done post-checkout via
+  // stripe.subscriptions.update() in the webhook handler.
+
+  it('should NOT include billing_cycle_anchor in checkout session (not supported)', async () => {
     await stripeService.createCheckoutSession(
       'user-1',
       'price_abc',
@@ -73,19 +78,13 @@ describe('Billing Cycle Anchor — 1st of Month', () => {
     expect(mockStripe.checkout.sessions.create).toHaveBeenCalledTimes(1);
     const callArgs = mockStripe.checkout.sessions.create.mock.calls[0][0];
 
-    // Must have subscription_data with billing_cycle_anchor
-    expect(callArgs.subscription_data).toBeDefined();
-    expect(callArgs.subscription_data.billing_cycle_anchor).toBeDefined();
-
-    // The anchor should be a Unix timestamp for the 1st of some month at 00:00:00 UTC
-    const anchorDate = new Date(callArgs.subscription_data.billing_cycle_anchor * 1000);
-    expect(anchorDate.getUTCDate()).toBe(1);
-    expect(anchorDate.getUTCHours()).toBe(0);
-    expect(anchorDate.getUTCMinutes()).toBe(0);
-    expect(anchorDate.getUTCSeconds()).toBe(0);
+    // subscription_data should either not exist or not contain billing_cycle_anchor
+    if (callArgs.subscription_data) {
+      expect(callArgs.subscription_data.billing_cycle_anchor).toBeUndefined();
+    }
   });
 
-  it('should set billing_cycle_anchor always in the future', async () => {
+  it('should create a valid checkout session without subscription_data overrides', async () => {
     await stripeService.createCheckoutSession(
       'user-2',
       'price_abc',
@@ -94,23 +93,11 @@ describe('Billing Cycle Anchor — 1st of Month', () => {
     );
 
     const callArgs = mockStripe.checkout.sessions.create.mock.calls[0][0];
-    const anchorTimestamp = callArgs.subscription_data.billing_cycle_anchor;
-    const nowTimestamp = Math.floor(Date.now() / 1000);
-
-    // Anchor must always be in the future
-    expect(anchorTimestamp).toBeGreaterThan(nowTimestamp);
-  });
-
-  it('should enable proration on new checkout sessions', async () => {
-    await stripeService.createCheckoutSession(
-      'user-3',
-      'price_abc',
-      'https://example.com/success',
-      'https://example.com/cancel'
-    );
-
-    const callArgs = mockStripe.checkout.sessions.create.mock.calls[0][0];
-    expect(callArgs.subscription_data.proration_behavior).toBe('create_prorations');
+    expect(callArgs.mode).toBe('subscription');
+    expect(callArgs.line_items).toBeDefined();
+    expect(callArgs.success_url).toBe('https://example.com/success');
+    expect(callArgs.cancel_url).toBe('https://example.com/cancel');
+    expect(callArgs.metadata.userId).toBe('user-2');
   });
 
   it('should preserve existing billing cycle on upgrade (no anchor override)', async () => {
