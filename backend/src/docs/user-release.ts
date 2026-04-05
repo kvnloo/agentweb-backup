@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-04',
+    changes: [
+      'Admin: Alert Emails Are Now Configurable',
+      '- Oncall alert recipients and product issue email recipients can now be managed from the Admin dashboard under the new "Alert Emails" tab',
+      '- Changes take effect immediately without a redeployment',
+    ],
+  },
+  {
     date: '2026-04-03',
     changes: [
       'Error Reports Now Route Directly to the Engineering Team',
