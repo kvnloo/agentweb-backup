@@ -238,42 +238,6 @@ async function handleInvoicePayment(
 }
 
 /**
- * Handle charge.refunded
- */
-async function handleChargeRefunded(charge: any): Promise<void> {
-  const customerId = typeof charge.customer === 'string'
-    ? charge.customer
-    : charge.customer?.id;
-
-  if (!customerId) {
-    console.warn(`[PaymentHistory] No customer on charge ${charge.id}`);
-    return;
-  }
-
-  const user = await findUserByStripeCustomerId(customerId);
-  if (!user) {
-    console.warn(`[PaymentHistory] No user found for customer ${customerId}`);
-    return;
-  }
-
-  try {
-    const { paymentHistoryDb } = await import('../services/paymentHistoryDb');
-    await paymentHistoryDb.record({
-      userId: user.userId,
-      timestamp: new Date().toISOString(),
-      eventType: 'refund',
-      amount: charge.amount_refunded || 0,
-      currency: charge.currency || 'usd',
-      status: 'refunded',
-      stripeInvoiceId: charge.invoice || undefined,
-      metadata: { chargeId: charge.id },
-    });
-  } catch (err: any) {
-    console.error(`[PaymentHistory] Failed to record refund: ${err.message}`);
-  }
-}
-
-/**
  * POST /api/stripe/reconcile
  * Admin-only: reconcile all users' Stripe subscription data with DynamoDB.
  * Fixes any drift caused by missed webhooks.

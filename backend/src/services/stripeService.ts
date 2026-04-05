@@ -391,9 +391,11 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   await paymentHistoryDb.record({
     userId: user.userId,
     eventType: 'subscription_created',
-    stripeCustomerId,
+    amount: 0,
+    currency: "usd",
+    status: "created",
+    timestamp: new Date().toISOString(),
     stripeSubscriptionId,
-    subscriptionType,
     metadata: { sessionId: session.id, status: actualStatus },
   });
 
@@ -608,8 +610,11 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
   // Record in payment history
   await paymentHistoryDb.record({
     userId: user.userId,
+    timestamp: new Date().toISOString(),
     eventType: 'subscription_canceled',
-    stripeCustomerId: customerId,
+    amount: 0,
+    currency: 'usd',
+    status: 'canceled',
     stripeSubscriptionId: subscription.id,
   });
 
@@ -657,12 +662,13 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
   // Record in payment history
   await paymentHistoryDb.record({
     userId: user.userId,
+    timestamp: new Date().toISOString(),
     eventType: 'payment_failed',
-    stripeCustomerId: customerId,
+    amount: invoice.amount_due || 0,
+    currency: invoice.currency || 'usd',
+    status: 'failed',
     stripeSubscriptionId: subscriptionId || undefined,
     stripeInvoiceId: invoice.id,
-    amountCents: invoice.amount_due,
-    currency: invoice.currency,
     metadata: {
       attemptCount: invoice.attempt_count,
       nextPaymentAttempt: invoice.next_payment_attempt,
@@ -696,12 +702,13 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
   // Record in payment history
   await paymentHistoryDb.record({
     userId: user.userId,
+    timestamp: new Date().toISOString(),
     eventType: 'refund',
-    stripeCustomerId: customerId,
-    stripeChargeId: charge.id,
-    amountCents: charge.amount_refunded,
-    currency: charge.currency,
+    amount: charge.amount_refunded || 0,
+    currency: charge.currency || 'usd',
+    status: 'refunded',
     metadata: {
+      chargeId: charge.id,
       refundReason: charge.refunds?.data?.[0]?.reason,
       fullRefund: charge.refunded,
     },
