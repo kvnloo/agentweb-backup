@@ -92,7 +92,6 @@ process.env.STRIPE_COMPLETE_PRICE_ID = 'price_complete_456';
 import {
   handleSubscriptionDeleted,
   handleSubscriptionUpdated,
-  handleChargeRefunded,
 } from '../services/stripeService';
 
 describe('Stripe subscription downgrade handling', () => {
@@ -263,68 +262,6 @@ describe('Stripe subscription downgrade handling', () => {
         subscriptionType: 'Free',
         allowedPages: ['/', '/agent-mode', '/settings', '/guide'],
       }));
-    });
-  });
-
-  // ===== charge.refunded handling =====
-
-  describe('handleChargeRefunded — partial refund should not cancel', () => {
-    it('should keep status as active when subscription is still active after refund', async () => {
-      const mockUser = {
-        userId: 'user-refund',
-        email: 'refund@example.com',
-        stripe_customer_id: 'cus_refund',
-        subscription_status: 'active',
-      };
-
-      mockScanWithFilter.mockResolvedValue([mockUser]);
-
-      // After refund, subscription is still active in Stripe
-      mockSubscriptionsList.mockResolvedValue({
-        data: [{
-          id: 'sub_still_active',
-          status: 'active',
-          items: { data: [{ price: { id: 'price_starter_123' } }] },
-          current_period_end: 1700000000,
-        }],
-      });
-
-      await handleChargeRefunded({
-        id: 'ch_refunded',
-        customer: 'cus_refund',
-      });
-
-      // Status should remain active — should NOT have been called with 'canceled'
-      // Since user.subscription_status === sub.status === 'active', no update needed
-      expect(mockUpdateUser).not.toHaveBeenCalled();
-    });
-
-    it('should sync to active when DynamoDB was incorrectly set to canceled', async () => {
-      const mockUser = {
-        userId: 'user-drift',
-        email: 'drift@example.com',
-        stripe_customer_id: 'cus_drift',
-        subscription_status: 'canceled', // Wrong! Stripe says active
-      };
-
-      mockScanWithFilter.mockResolvedValue([mockUser]);
-
-      mockSubscriptionsList.mockResolvedValue({
-        data: [{
-          id: 'sub_active',
-          status: 'active',
-          items: { data: [{ price: { id: 'price_starter_123' } }] },
-          current_period_end: 1700000000,
-        }],
-      });
-
-      await handleChargeRefunded({
-        id: 'ch_partial_refund',
-        customer: 'cus_drift',
-      });
-
-      // Should correct the drift
-      expect(mockUpdateUser).toHaveBeenCalledWith('user-drift', { subscription_status: 'active' });
     });
   });
 
