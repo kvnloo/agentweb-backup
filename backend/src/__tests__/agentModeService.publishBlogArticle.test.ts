@@ -858,7 +858,7 @@ describe('AgentModeService - publish_blog_article function', () => {
 
   describe('Payload CMS publishing', () => {
     const mockPayloadSecret = JSON.stringify({
-      PAYLOAD_PUBLISH_ENDPOINT: 'https://hireemma.ai/api/publish-post',
+      PAYLOAD_PUBLISH_ENDPOINT: 'https://www.hireemma.ai/api/publish-post',
       PAYLOAD_PUBLISH_SECRET: 'test-payload-secret-123',
     });
 
@@ -933,7 +933,7 @@ describe('AgentModeService - publish_blog_article function', () => {
       const [url, body, config] = mockAxiosPost.mock.calls[0];
 
       // Verify endpoint
-      expect(url).toBe('https://hireemma.ai/api/publish-post');
+      expect(url).toBe('https://www.hireemma.ai/api/publish-post');
 
       // Verify auth header
       expect(config.headers.Authorization).toBe('Bearer test-payload-secret-123');

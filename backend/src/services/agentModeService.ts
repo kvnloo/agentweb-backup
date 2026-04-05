@@ -14757,7 +14757,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
         // Publish to Payload CMS instead of Webflow
-        let payloadEndpoint = 'https://hireemma.ai/api/publish-post';
+        let payloadEndpoint = 'https://www.hireemma.ai/api/publish-post';
         let payloadSecret: string | undefined;
 
         try {
