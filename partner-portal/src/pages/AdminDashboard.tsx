@@ -57,6 +57,7 @@ import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
 import RevenueTab from "../components/admin/RevenueTab";
+import FunnelTab from "../components/admin/FunnelTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -667,6 +668,7 @@ export default function AdminDashboard() {
     'scoring-judges': 16,
     'crm': 17,
     'revenue': 18,
+    'funnel': 19,
   };
   
   // Get initial tab value from URL or default to Users
@@ -2699,6 +2701,7 @@ export default function AdminDashboard() {
             <Tab label="Scoring Judges" {...a11yProps(16)} />
             <Tab label="CRM" {...a11yProps(17)} />
             <Tab label="Revenue" {...a11yProps(18)} />
+            <Tab label="Funnel" {...a11yProps(19)} />
           </Tabs>
         </Box>
 
@@ -5373,6 +5376,9 @@ export default function AdminDashboard() {
         </TabPanel>
         <TabPanel value={tabValue} index={18}>
           <RevenueTab />
+        </TabPanel>
+        <TabPanel value={tabValue} index={19}>
+          <FunnelTab />
         </TabPanel>
       </Paper>
 
