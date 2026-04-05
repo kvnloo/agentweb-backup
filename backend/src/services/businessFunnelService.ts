@@ -599,23 +599,32 @@ function buildOutboundPipeline(
   }
 
   // Include Unipile LinkedIn targets in list size
-  // Use max(connectionRequests, messagesSent) per person — because if you DMed 69
-  // people but only sent 43 connection requests, you reached at least 69 unique people
-  // (some were already connections who didn't need a request)
+  // Connection requests = new strangers targeted
+  // DMs sent = total people contacted (includes existing connections)
+  // Show both separately so you can see the breakdown
   if (unipileData.status === "ok") {
     if (unipileData.accountBreakdown && unipileData.accountBreakdown.length > 0) {
       for (const acct of unipileData.accountBreakdown) {
-        const reach = Math.max(acct.connectionRequestsSent, acct.messagesSent);
-        if (reach > 0) {
-          listSources.push(safeSource(`LinkedIn reach — ${acct.accountName.split(' ')[0]}`, reach));
-          listSize += reach;
+        if (acct.connectionRequestsSent > 0) {
+          listSources.push(safeSource(`LinkedIn requests — ${acct.accountName.split(' ')[0]}`, acct.connectionRequestsSent));
+          listSize += acct.connectionRequestsSent;
+        }
+        // DMs to existing connections (people messaged who didn't need a connection request)
+        const existingConnectionDMs = Math.max(0, acct.messagesSent - acct.connectionRequestsSent);
+        if (existingConnectionDMs > 0) {
+          listSources.push(safeSource(`LinkedIn existing — ${acct.accountName.split(' ')[0]}`, existingConnectionDMs));
+          listSize += existingConnectionDMs;
         }
       }
     } else {
-      const reach = Math.max(unipileData.totalConnectionRequests, unipileData.totalMessagesSent);
-      if (reach > 0) {
-        listSources.push(safeSource("LinkedIn reach (Unipile)", reach));
-        listSize += reach;
+      if (unipileData.totalConnectionRequests > 0) {
+        listSources.push(safeSource("LinkedIn connection requests", unipileData.totalConnectionRequests));
+        listSize += unipileData.totalConnectionRequests;
+      }
+      const existingDMs = Math.max(0, unipileData.totalMessagesSent - unipileData.totalConnectionRequests);
+      if (existingDMs > 0) {
+        listSources.push(safeSource("LinkedIn existing connections DMed", existingDMs));
+        listSize += existingDMs;
       }
     }
   }
