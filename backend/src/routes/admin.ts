@@ -18,6 +18,7 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
@@ -4573,6 +4574,16 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
   }
 });
 
+// ─── Revenue metrics ────────────────────────────────────────────────────
+
+router.get("/revenue-metrics", async (req, res) => {
+  try {
+    const months = parseInt(req.query.months as string) || 6;
+    const data = await getRevenueMetrics(Math.min(months, 24));
+    res.json(data);
+  } catch (error: any) {
+    console.error("Error fetching revenue metrics:", error.message);
+    res.status(500).json({ message: "Failed to fetch revenue metrics" });
 // ─── Business Funnel Metrics ─────────────────────────────────────────────
 
 router.get("/funnel-metrics", async (req, res) => {

@@ -478,40 +478,6 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
 }
 
 /**
- * Handle customer.subscription.deleted — mark subscription as canceled.
- */
-export async function handleSubscriptionDeleted(subscription: any): Promise<void> {
-  const customerId = typeof subscription.customer === 'string'
-    ? subscription.customer
-    : subscription.customer?.id;
-
-  const user = await findUserByStripeCustomerId(customerId);
-  if (!user) {
-    console.warn(`No user found for subscription deletion. customer=${customerId}`);
-    return;
-  }
-
-  const freeTierConfig = await getTierConfig('Free');
-
-  await userDb.updateUser(user.userId, {
-    subscription_status: 'canceled',
-    subscriptionType: 'Free',
-    allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
-    allowedSkills: freeTierConfig?.allowedSkills ?? [],
-  });
-
-  // Record in payment history
-  await paymentHistoryDb.record({
-    userId: user.userId,
-    eventType: 'subscription_canceled',
-    stripeCustomerId: customerId,
-    stripeSubscriptionId: subscription.id,
-  });
-
-  console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
-}
-
-/**
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
 export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
@@ -546,6 +512,168 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
 
   await userDb.updateUser(user.userId, updateData);
 
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+  );
+}
+
+/**
+ * Handle customer.subscription.deleted — mark subscription as canceled.
+ * Handle customer.subscription.deleted — mark subscription as canceled,
+ * BUT only if the customer has no other active/trialing subscription.
+ *
+ * When a subscription is downgraded by canceling the old sub and creating a new
+ * cheaper one, Stripe fires customer.subscription.deleted on the OLD sub.
+ * We must check for a remaining active sub before marking the user as canceled.
+ */
+export async function handleSubscriptionDeleted(subscription: any): Promise<void> {
+  const customerId = typeof subscription.customer === 'string'
+    ? subscription.customer
+    : subscription.customer?.id;
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`No user found for subscription deletion. customer=${customerId}`);
+    return;
+  }
+
+  // Check if the customer still has another active or trialing subscription.
+  // This happens during downgrades: old sub is canceled, new (cheaper) sub is created.
+  if (customerId) {
+    try {
+      const s = getStripeOrThrow();
+      for (const status of ['active', 'trialing'] as const) {
+        const remaining = await s.subscriptions.list({
+          customer: customerId,
+          status,
+          limit: 1,
+        });
+        if (remaining.data.length > 0) {
+          const activeSub = remaining.data[0];
+          console.log(
+            `[STRIPE] Subscription ${subscription.id} deleted, but customer ${customerId} still has ${status} subscription ${activeSub.id} — treating as downgrade, not cancellation`
+          );
+
+          // Sync the user to the remaining active subscription instead of canceling
+          const updateData: Record<string, any> = {
+            subscription_status: activeSub.status,
+            stripe_subscription_id: activeSub.id,
+          };
+
+          // Derive tier from the remaining subscription's price
+          const priceId = activeSub.items?.data?.[0]?.price?.id;
+          if (priceId) {
+            const newType = deriveSubscriptionTypeFromPriceId(priceId);
+            if (newType) {
+              updateData.subscriptionType = newType;
+              const tierConfig = await getTierConfig(newType);
+              if (tierConfig) {
+                updateData.allowedPages = tierConfig.allowedPages;
+                updateData.allowedSkills = tierConfig.allowedSkills;
+              }
+            }
+          }
+
+          // Sync period end
+          const periodEnd = (activeSub as any).current_period_end;
+          if (periodEnd) {
+            updateData.current_period_end = new Date(
+              typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
+            ).toISOString();
+          }
+
+          await userDb.updateUser(user.userId, updateData);
+          console.log(
+            `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
+          );
+          return;
+        }
+      }
+    } catch (err: any) {
+      console.error(`[STRIPE] Error checking remaining subscriptions for ${customerId}:`, err.message);
+      // Fall through to cancel — safer to cancel than to leave in a stale state
+    }
+  }
+
+  // No remaining active/trialing subscriptions — this is a genuine cancellation
+  const freeTierConfig = await getTierConfig('Free');
+
+  await userDb.updateUser(user.userId, {
+    subscription_status: 'canceled',
+    subscriptionType: 'Free',
+    allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+    allowedSkills: freeTierConfig?.allowedSkills ?? [],
+  });
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'subscription_canceled',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id,
+  });
+
+  console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
+}
+
+// ─── invoice.payment_succeeded ──────────────────────────────────────────
+
+/**
+ * Handle invoice.payment_succeeded webhook event.
+ * Confirms payment went through: sets status to active, backfills
+ * stripe_subscription_id if missing, and sets has_payment_method.
+
+/**
+ * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
+ */
+export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded with no customer ID — skipping');
+    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] invoice.payment_succeeded for unknown customer ${customerId} — skipping`);
+    return;
+  }
+
+  const updates: Record<string, any> = {
+    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  const updateData: Record<string, any> = {
+    subscription_status: 'active',
+    has_payment_method: true,
+  };
+
+  // Backfill stripe_subscription_id if missing
+  const subId = typeof invoice.subscription === 'string' ? invoice.subscription : null;
+  if (subId && !user.stripe_subscription_id) {
+    updates.stripe_subscription_id = subId;
+  }
+
+  await userDb.updateUser(user.userId, updates);
+  console.log(`[STRIPE] invoice.payment_succeeded: user ${user.userId} → active`);
+  // Backfill stripe_subscription_id if user doesn't have one yet
+  if (!user.stripe_subscription_id && subscriptionId) {
+    updateData.stripe_subscription_id = subscriptionId;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
+
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} \u2192 status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
   // Record in payment history
   await paymentHistoryDb.record({
     userId: user.userId,
@@ -681,7 +809,7 @@ function deriveSubscriptionType(session: any): string {
  * Uses a filtered DynamoDB scan (server-side filter, no GSI required).
  * Consider adding a GSI on stripe_customer_id if user count grows past ~1000.
  */
-async function findUserByStripeCustomerId(stripeCustomerId: string): Promise<any | null> {
+export async function findUserByStripeCustomerId(stripeCustomerId: string): Promise<any | null> {
   if (!stripeCustomerId) return null;
 
   try {
