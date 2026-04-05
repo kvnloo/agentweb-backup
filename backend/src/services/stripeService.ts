@@ -42,25 +42,17 @@ export const stripeService = {
 
     const s = getStripeOrThrow();
 
-    // Anchor all new subscriptions to the 1st of the next month.
-    // The user pays a prorated amount for the remainder of the current month,
-    // then full price on the 1st going forward.
-    const now = new Date();
-    const firstOfNextMonth = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0)
-    );
-    const billingCycleAnchor = Math.floor(firstOfNextMonth.getTime() / 1000);
-
+    // NOTE: billing_cycle_anchor is NOT supported in checkout.sessions.create
+    // subscription_data. To anchor billing to the 1st of the month, we would
+    // need to update the subscription after checkout completes via the webhook.
+    // For now, subscriptions start billing on the day the customer signs up.
+    // TODO: Implement post-checkout anchor in handleCheckoutSessionCompleted.
     return s.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
       metadata: { userId },
-      subscription_data: {
-        billing_cycle_anchor: billingCycleAnchor,
-        proration_behavior: 'create_prorations',
-      },
     });
   },
 
