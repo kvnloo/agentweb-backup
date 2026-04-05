@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
+import { paymentHistoryDb } from './paymentHistoryDb';
 
 dotenv.config();
 
@@ -386,6 +387,16 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     }
   }
 
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'subscription_created',
+    stripeCustomerId,
+    stripeSubscriptionId,
+    subscriptionType,
+    metadata: { sessionId: session.id, status: actualStatus },
+  });
+
   console.log(
     `Checkout completed: user ${user.userId} → stripe_customer_id=${stripeCustomerId}, subscription=${stripeSubscriptionId}, status=${actualStatus}, periodEnd=${currentPeriodEnd || 'unknown'}`
   );
@@ -418,6 +429,25 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     subscription_status: subscription.status,
   };
 
+  // Backfill stripe_subscription_id if it was never written (e.g., missed checkout webhook).
+  // Only write when null to preserve the line 362 guard against stale webhooks.
+  if (!user.stripe_subscription_id) {
+    updateData.stripe_subscription_id = subscription.id;
+  }
+
+  // Always sync payment method status — this is a point-in-time fact with no guard dependency
+  let hasPaymentMethod = !!(subscription.default_payment_method || subscription.default_source);
+  if (!hasPaymentMethod && customerId) {
+    try {
+      const s = getStripeOrThrow();
+      const methods = await s.paymentMethods.list({ customer: customerId, limit: 1 });
+      hasPaymentMethod = methods.data.length > 0;
+    } catch {
+      // Non-fatal — default to subscription-level check
+    }
+  }
+  updateData.has_payment_method = hasPaymentMethod;
+
   // Sync current_period_end so trial end dates are tracked
   if (subscription.current_period_end) {
     updateData.current_period_end = new Date(
@@ -443,7 +473,7 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
   await userDb.updateUser(user.userId, updateData);
 
   console.log(
-    `Subscription updated: user ${user.userId} → status=${subscription.status}, periodEnd=${updateData.current_period_end || 'unchanged'}`
+    `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}`
   );
 }
 
@@ -489,6 +519,12 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
 
 /**
  * Handle customer.subscription.deleted — mark subscription as canceled.
+ * Handle customer.subscription.deleted — mark subscription as canceled,
+ * BUT only if the customer has no other active/trialing subscription.
+ *
+ * When a subscription is downgraded by canceling the old sub and creating a new
+ * cheaper one, Stripe fires customer.subscription.deleted on the OLD sub.
+ * We must check for a remaining active sub before marking the user as canceled.
  */
 export async function handleSubscriptionDeleted(subscription: any): Promise<void> {
   const customerId = typeof subscription.customer === 'string'
@@ -501,6 +537,65 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     return;
   }
 
+  // Check if the customer still has another active or trialing subscription.
+  // This happens during downgrades: old sub is canceled, new (cheaper) sub is created.
+  if (customerId) {
+    try {
+      const s = getStripeOrThrow();
+      for (const status of ['active', 'trialing'] as const) {
+        const remaining = await s.subscriptions.list({
+          customer: customerId,
+          status,
+          limit: 1,
+        });
+        if (remaining.data.length > 0) {
+          const activeSub = remaining.data[0];
+          console.log(
+            `[STRIPE] Subscription ${subscription.id} deleted, but customer ${customerId} still has ${status} subscription ${activeSub.id} — treating as downgrade, not cancellation`
+          );
+
+          // Sync the user to the remaining active subscription instead of canceling
+          const updateData: Record<string, any> = {
+            subscription_status: activeSub.status,
+            stripe_subscription_id: activeSub.id,
+          };
+
+          // Derive tier from the remaining subscription's price
+          const priceId = activeSub.items?.data?.[0]?.price?.id;
+          if (priceId) {
+            const newType = deriveSubscriptionTypeFromPriceId(priceId);
+            if (newType) {
+              updateData.subscriptionType = newType;
+              const tierConfig = await getTierConfig(newType);
+              if (tierConfig) {
+                updateData.allowedPages = tierConfig.allowedPages;
+                updateData.allowedSkills = tierConfig.allowedSkills;
+              }
+            }
+          }
+
+          // Sync period end
+          const periodEnd = (activeSub as any).current_period_end;
+          if (periodEnd) {
+            updateData.current_period_end = new Date(
+              typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
+            ).toISOString();
+          }
+
+          await userDb.updateUser(user.userId, updateData);
+          console.log(
+            `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
+          );
+          return;
+        }
+      }
+    } catch (err: any) {
+      console.error(`[STRIPE] Error checking remaining subscriptions for ${customerId}:`, err.message);
+      // Fall through to cancel — safer to cancel than to leave in a stale state
+    }
+  }
+
+  // No remaining active/trialing subscriptions — this is a genuine cancellation
   const freeTierConfig = await getTierConfig('Free');
 
   await userDb.updateUser(user.userId, {
@@ -508,6 +603,14 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     subscriptionType: 'Free',
     allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
     allowedSkills: freeTierConfig?.allowedSkills ?? [],
+  });
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'subscription_canceled',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id,
   });
 
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
@@ -519,6 +622,8 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
  * Handle invoice.payment_succeeded webhook event.
  * Confirms payment went through: sets status to active, backfills
  * stripe_subscription_id if missing, and sets has_payment_method.
+/**
+ * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
 export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
   const customerId = typeof invoice.customer === 'string'
@@ -527,6 +632,7 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
 
   if (!customerId) {
     console.warn('[STRIPE] invoice.payment_succeeded with no customer ID — skipping');
+    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
     return;
   }
 
@@ -537,6 +643,15 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
   }
 
   const updates: Record<string, any> = {
+    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  const updateData: Record<string, any> = {
     subscription_status: 'active',
     has_payment_method: true,
   };
@@ -549,6 +664,112 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
 
   await userDb.updateUser(user.userId, updates);
   console.log(`[STRIPE] invoice.payment_succeeded: user ${user.userId} → active`);
+  // Backfill stripe_subscription_id if user doesn't have one yet
+  if (!user.stripe_subscription_id && subscriptionId) {
+    updateData.stripe_subscription_id = subscriptionId;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'payment_succeeded',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscriptionId || undefined,
+    stripeInvoiceId: invoice.id,
+    amountCents: invoice.amount_paid,
+    currency: invoice.currency,
+  });
+
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+  );
+}
+
+/**
+ * Handle invoice.payment_failed — mark subscription as past_due and record the failure.
+ */
+export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_failed missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for invoice.payment_failed. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  await userDb.updateUser(user.userId, {
+    subscription_status: 'past_due',
+  });
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'payment_failed',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscriptionId || undefined,
+    stripeInvoiceId: invoice.id,
+    amountCents: invoice.amount_due,
+    currency: invoice.currency,
+    metadata: {
+      attemptCount: invoice.attempt_count,
+      nextPaymentAttempt: invoice.next_payment_attempt,
+    },
+  });
+
+  console.log(
+    `[STRIPE] Invoice payment failed: user ${user.userId} → status=past_due, invoice=${invoice.id}`
+  );
+}
+
+/**
+ * Handle charge.refunded — record the refund in payment history.
+ */
+export async function handleChargeRefunded(charge: any): Promise<void> {
+  const customerId = typeof charge.customer === 'string'
+    ? charge.customer
+    : charge.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] charge.refunded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for charge.refunded. customer=${customerId}`);
+    return;
+  }
+
+  // Record in payment history
+  await paymentHistoryDb.record({
+    userId: user.userId,
+    eventType: 'refund',
+    stripeCustomerId: customerId,
+    stripeChargeId: charge.id,
+    amountCents: charge.amount_refunded,
+    currency: charge.currency,
+    metadata: {
+      refundReason: charge.refunds?.data?.[0]?.reason,
+      fullRefund: charge.refunded,
+    },
+  });
+
+  console.log(
+    `[STRIPE] Charge refunded: user ${user.userId}, charge=${charge.id}, amount_refunded=${charge.amount_refunded}`
+  );
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -598,4 +819,127 @@ export async function findUserByStripeCustomerId(stripeCustomerId: string): Prom
     console.error('Error finding user by stripe_customer_id:', error);
     return null;
   }
+}
+
+// ─── Reconciliation ──────────────────────────────────────────────────
+
+/**
+ * Reconcile all users who have a stripe_customer_id by checking their actual
+ * Stripe subscription status. Fixes any drift between DynamoDB and Stripe.
+ *
+ * Returns a summary of what was fixed.
+ */
+export async function reconcileAllStripeUsers(): Promise<{
+  checked: number;
+  fixed: number;
+  errors: number;
+  details: Array<{ email: string; action: string }>;
+}> {
+  const stripe = getStripeOrThrow();
+  const summary = { checked: 0, fixed: 0, errors: 0, details: [] as Array<{ email: string; action: string }> };
+
+  // Find all users with a stripe_customer_id
+  const users = await userDb.scanWithFilter(
+    'attribute_exists(stripe_customer_id)',
+    {},
+  );
+
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
+    summary.checked++;
+
+    // Rate limit: pause 100ms every 10 users to stay well under Stripe's 100 req/s limit
+    if (i > 0 && i % 10 === 0) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    try {
+      // Fetch active/trialing subscriptions from Stripe
+      const subscriptions = await stripe.subscriptions.list({
+        customer: user.stripe_customer_id,
+        status: 'all',
+        limit: 10,
+      });
+
+      // Find the most relevant subscription: active > trialing > past_due > canceled
+      const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2, canceled: 3 };
+      const sorted = [...subscriptions.data].sort(
+        (a, b) => (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
+      );
+      const sub = sorted[0]; // best subscription, or undefined
+
+      if (!sub) {
+        // No subscriptions in Stripe — ensure DynamoDB reflects that
+        if (user.subscription_status && user.subscription_status !== 'canceled' && user.subscription_status !== 'free') {
+          await userDb.updateUser(user.userId, {
+            subscription_status: 'canceled',
+            has_payment_method: false,
+          });
+          summary.fixed++;
+          summary.details.push({ email: user.email, action: `status ${user.subscription_status} -> canceled (no Stripe subs)` });
+        }
+        continue;
+      }
+
+      // Check payment methods
+      let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+      if (!hasPaymentMethod) {
+        const methods = await stripe.paymentMethods.list({ customer: user.stripe_customer_id, limit: 1 });
+        hasPaymentMethod = methods.data.length > 0;
+      }
+
+      // Derive tier
+      const priceId = sub.items?.data?.[0]?.price?.id;
+      const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
+
+      // Build updates only for fields that are wrong
+      const updates: Record<string, any> = {};
+      const changes: string[] = [];
+
+      if (user.subscription_status !== sub.status) {
+        updates.subscription_status = sub.status;
+        changes.push(`status ${user.subscription_status || 'null'} -> ${sub.status}`);
+      }
+      if (user.stripe_subscription_id !== sub.id) {
+        updates.stripe_subscription_id = sub.id;
+        changes.push(`sub_id synced`);
+      }
+      if (user.has_payment_method !== hasPaymentMethod) {
+        updates.has_payment_method = hasPaymentMethod;
+        changes.push(`payment_method ${user.has_payment_method} -> ${hasPaymentMethod}`);
+      }
+      if (derivedType && user.subscriptionType !== derivedType) {
+        updates.subscriptionType = derivedType;
+        const tierConfig = await getTierConfig(derivedType);
+        if (tierConfig) {
+          updates.allowedPages = tierConfig.allowedPages;
+          updates.allowedSkills = tierConfig.allowedSkills;
+        }
+        changes.push(`tier ${user.subscriptionType || 'null'} -> ${derivedType}`);
+      }
+
+      const periodEnd = (sub as any).current_period_end;
+      if (periodEnd) {
+        const periodEndIso = new Date(typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd).toISOString();
+        if (user.current_period_end !== periodEndIso) {
+          updates.current_period_end = periodEndIso;
+          changes.push(`period_end synced`);
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await userDb.updateUser(user.userId, updates);
+        summary.fixed++;
+        summary.details.push({ email: user.email, action: changes.join(', ') });
+        console.log(`[STRIPE RECONCILE] Fixed ${user.email}: ${changes.join(', ')}`);
+      }
+    } catch (err: any) {
+      summary.errors++;
+      console.error(`[STRIPE RECONCILE] Error for ${user.email}:`, err.message);
+      summary.details.push({ email: user.email, action: `ERROR: ${err.message}` });
+    }
+  }
+
+  console.log(`[STRIPE RECONCILE] Done: checked=${summary.checked}, fixed=${summary.fixed}, errors=${summary.errors}`);
+  return summary;
 }
