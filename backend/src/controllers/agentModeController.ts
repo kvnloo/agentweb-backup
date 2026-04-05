@@ -6,7 +6,7 @@ import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
@@ -14,7 +14,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { isContextLimitError, isSessionLimitError, isTransientLLMError } from '../utils/agentModeErrors';
+import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
@@ -24,6 +24,13 @@ import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+
+/**
+ * In-memory set of session IDs that are currently generating a response.
+ * Used to reject concurrent /generate requests for the same session with 409.
+ * Exported so tests can inspect and reset it.
+ */
+export const activeSessionGenerations = new Set<string>();
 
 /**
  * Returns the effective expiration date for an interactive share.
@@ -1444,7 +1451,7 @@ export async function generateSessionResponse(
   let excludeTools: string[] | undefined;
   if (session.portalType === 'emma-sidebar') {
     // Only include get_visual_context on pages where seeing the rendered UI is useful
-    const visualPages = new Set(['brand-guidelines', 'social-posts', 'images', 'videos', 'email-templates', 'newsletter', 'blog']);
+    const visualPages = new Set(['brand-guidelines', 'social-posts', 'images', 'videos', 'templates', 'newsletter', 'blog']);
     const urlPath = (pageContext?.currentUrl || '').replace(/^\//, '');
     const page = urlPath.split('/')[0].split('?')[0];
     if (!visualPages.has(page)) {
@@ -1453,6 +1460,13 @@ export async function generateSessionResponse(
   } else {
     // Non-sidebar sessions (agent mode, scheduled chats) never need visual context
     excludeTools = ['get_visual_context'];
+  }
+
+  // Upload screenshot to S3 if provided (emma-sidebar sessions only)
+  let screenshotUrl: string | undefined;
+  if (pageContext?.screenshot) {
+    const result = await uploadScreenshotToS3(pageContext.screenshot, userId);
+    if (result) screenshotUrl = result.url;
   }
 
   // Generate AI response using worker process to prevent blocking the main event loop
@@ -1466,7 +1480,8 @@ export async function generateSessionResponse(
       sessionId,
       mockMode: false,
       isInteractiveShare: isInteractiveShare || false,
-      excludeTools
+      excludeTools,
+      screenshotUrl
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -1781,6 +1796,18 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Reject concurrent requests for the same session (synchronous check before any await)
+      if (activeSessionGenerations.has(sessionId)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+      activeSessionGenerations.add(sessionId);
+
+      try {
+
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
@@ -1844,8 +1871,8 @@ export const agentModeController = {
           'update_book_content': ['books'],
           'create_book': ['books'],
           'generate_book_content': ['books'],
-          'create_html_from_template': ['email-templates'],
-          'update_html_file': ['email-templates'],
+          'create_html_from_template': ['templates'],
+          'update_html_file': ['templates'],
           'create_knowledge_base': ['knowledge-base'],
           'update_knowledge_base_file': ['knowledge-base'],
           'generate_image': ['images'],
@@ -1869,6 +1896,9 @@ export const agentModeController = {
         ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+      } finally {
+        activeSessionGenerations.delete(sessionId);
+      }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
 
@@ -1895,8 +1925,8 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
-        // Skip diagnosis for errors that already have specific handling below (context limit, etc.)
-        if (!(error instanceof Error && isContextLimitError(error))) {
+        // Skip diagnosis for errors that already have specific handling below (context limit, worker shutdown, etc.)
+        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
           const userMessage = req.body?.userMessage || '';
           diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
         }
@@ -1938,6 +1968,16 @@ export const agentModeController = {
             message: 'Please start a new session to continue the conversation.',
             code: 'SESSION_SIZE_LIMIT_EXCEEDED',
             suggestion: 'start_new_session'
+          });
+          return;
+        }
+
+        if (isWorkerShutdownError(error)) {
+          res.status(503).json({
+            error: 'Server is restarting',
+            message: 'The server is restarting. Please try again in a moment.',
+            code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
           });
           return;
         }
@@ -2056,7 +2096,8 @@ export const agentModeController = {
 
   async getSupportedModels(req: Request, res: Response) {
     try {
-      const models = await agentModeService.getSupportedModels();
+      const { user } = await getUserFromToken(req);
+      const models = await agentModeService.getSupportedModels(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
@@ -2066,7 +2107,8 @@ export const agentModeController = {
 
   async getReportsModelOptions(req: Request, res: Response) {
     try {
-      const models = await agentModeService.getReportsModelOptions();
+      const { user } = await getUserFromToken(req);
+      const models = await agentModeService.getReportsModelOptions(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get reports model options error:', error);
@@ -2464,7 +2506,7 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
-        if (!(error instanceof Error && isContextLimitError(error))) {
+        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
           const userMessage = req.body?.userMessage || '';
           diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
         }
@@ -2577,6 +2619,16 @@ export const agentModeController = {
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (isWorkerShutdownError(error)) {
+          res.status(503).json({
+            error: 'Server is restarting',
+            message: 'The server is restarting. Please try again in a moment.',
+            code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -4637,6 +4689,16 @@ export const agentModeController = {
           });
           return;
         }
+
+        if (isWorkerShutdownError(error)) {
+          res.status(503).json({
+            error: 'Server is restarting',
+            message: 'The server is restarting. Please try again in a moment.',
+            code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
@@ -5200,6 +5262,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // Block non-admins from using opus models
+      if (llmModel.includes('opus') && !user.isAdmin) {
+        return res.status(403).json({ error: 'Opus models are not available for your account' });
+      }
+
       // Get the session to verify ownership
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -5230,6 +5297,11 @@ export const agentModeController = {
 
       if (!llmModel) {
         return res.status(400).json({ error: 'llmModel is required' });
+      }
+
+      // Shared sessions are non-admin; block opus models
+      if (llmModel.includes('opus')) {
+        return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
       }
 
       // Get the session to verify the conversable token

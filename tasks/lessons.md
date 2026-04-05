@@ -80,6 +80,34 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Pattern:** Use `userDb.getUserById(userId)` to verify admin status; don't trust context fields that may not exist.
   - **Date:** 2026-03-13
 
+## Cloud Test Environment SSH
+
+### SSH User is ec2-user, NOT ubuntu
+- **Lesson:** Test-env EC2 instances use `ec2-user`, not `ubuntu`
+  - **Why:** The AMI is Amazon Linux (not Ubuntu). The user-data script sets the password via `echo "ec2-user:${SSH_PASSWORD}" | chpasswd`. Tried `ubuntu@` repeatedly before realizing the correct user.
+  - **Fix:** Always SSH as `ec2-user@<PUBLIC_IP>` with the password from `agentweb/test-env/ssh-password`
+  - **Secret:** `agentweb/test-env/ssh-password` (NOT `agentweb/cloud-dev/ssh-password`)
+  - **Date:** 2026-04-01
+
+### Stop/Start Changes the Public IP
+- **Lesson:** After an EC2 stop/start, the public IP changes
+  - **Why:** Stop/start deallocates and reassigns the public IP (unlike reboot)
+  - **Fix:** After stop/start, run `aws ec2 describe-instances --instance-ids <id> --query 'Reservations[0].Instances[0].PublicIpAddress'` to get the new IP
+  - **Date:** 2026-04-01
+
+### ALL Cloud Env Services Don't Auto-Restart After Stop/Start
+- **Lesson:** ALL 5 tmux services are started by user-data at first boot only — NONE restart on stop/start
+  - **Why:** cloud-init user-data only runs once (at first boot). Stop/start only re-runs lightweight cloud-init phases (config/final), not the full user-data script.
+  - **Services:** `backend`, `partner-portal`, `customer-portal`, `test-env-access`, `claude` — all 5 must be manually started
+  - **Also:** The public IP changes on stop/start — must update `.env`, `.env.local` files AND Notion page IP field
+  - **Fix after stop/start:**
+    1. Get new IP: `aws ec2 describe-instances --instance-ids <id> --query 'Reservations[0].Instances[0].PublicIpAddress'`
+    2. Update `.env` files with new IP (use sudo for `.env.local` files, they're root-owned)
+    3. Start all 5 sessions: backend, partner-portal, customer-portal, test-env-access, claude
+    4. Update Notion Public IP field
+  - **Monitoring service:** `test-env-access` is the one that polls Notion for new comments and re-triggers Claude. If it's not running, new comments won't be processed.
+  - **Date:** 2026-04-02
+
 ## Code Patterns
 
 ### DynamoDB Queries

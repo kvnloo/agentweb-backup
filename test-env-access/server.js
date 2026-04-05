@@ -499,6 +499,8 @@ async function processQueue() {
     lastPromptTime = new Date();
 
     try {
+      await updateNotionStatus(notionPageId, "In progress");
+
       // Fetch and download any attachments from the Notion page
       const attachments = await fetchNotionAttachments(notionPageId);
       const downloadedPaths = await downloadAttachments(attachments);
@@ -508,12 +510,21 @@ async function processQueue() {
         enrichedPrompt += `\n\nIMPORTANT: The following screenshot/image attachments from the Notion page have been downloaded. You MUST use the Read tool to view each image file BEFORE starting any work — these contain critical visual context for the task:\n${downloadedPaths.map((p) => `- ${p}`).join("\n")}`;
       }
 
+      // Prepend conversation history so Claude has context even after a session reset
+      const conversationLog = readConversationLog();
+      if (conversationLog.trim()) {
+        enrichedPrompt = `=== Previous conversation context (for continuity) ===\n${conversationLog.trim()}\n\n=== Current request ===\n${enrichedPrompt}`;
+      }
+
       const output = await runClaude(enrichedPrompt);
       lastResponseTime = new Date();
 
       // Check for retry directive: [RELAY_RETRY_AFTER:<seconds>]
       const retryMatch = output.match(/\[RELAY_RETRY_AFTER:(\d+)\]/);
       const cleanedOutput = output.replace(/\[RELAY_RETRY_AFTER:\d+\]/g, "").trim();
+
+      // Persist this turn so future sessions have context
+      appendToConversationLog(prompt, cleanedOutput);
 
       // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
       const truncated = cleanedOutput.length > 10000
@@ -541,10 +552,15 @@ async function processQueue() {
         }, delaySec * 1000);
       }
 
-      // If this was a deploy prompt, set status to Done to trigger teardown
-      if (prompt === "Prep for deploy") {
-        const isProduction = (process.env.NODE_ENV || "") === "production";
-        await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+      // Update status when Claude is done (not waiting for retry)
+      if (!retryMatch) {
+        if (prompt === "Prep for deploy") {
+          // Deploy prompt triggers teardown via Done status
+          const isProduction = (process.env.NODE_ENV || "") === "production";
+          await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+        } else {
+          await updateNotionStatus(notionPageId, "In Review");
+        }
       }
     } catch (err) {
       console.error(`[relay] Error processing prompt:`, err);
@@ -558,10 +574,11 @@ async function processQueue() {
         console.error(`[relay] Failed to post error comment:`, commentErr);
       }
 
-      // If Claude crashed (exit code 143=SIGTERM, timeout, etc.), re-queue the
+      // If Claude crashed (non-zero exit, but NOT 143=SIGTERM/timeout), re-queue the
       // prompt so the user's message isn't lost.  Post the error comment above
       // so the user knows what happened, then retry after a short delay.
-      if (/exited with code (?!0\b)\d+/.test(errMsg)) {
+      // Exit 143 = SIGTERM (timeout or OOM kill) — don't retry, it will just loop.
+      if (/exited with code (?!0\b)(?!143\b)\d+/.test(errMsg)) {
         console.log(`[relay] Re-queuing prompt after crash for page ${notionPageId}`);
         await new Promise((r) => setTimeout(r, 5000)); // 5s cooldown
         promptQueue.push({ prompt, notionPageId });
@@ -590,6 +607,43 @@ function stripAnsiAndControlCodes(text) {
 }
 
 const COST_FILE = "/home/ec2-user/agentweb/.claude-total-cost";
+
+// ---------------------------------------------------------------------------
+// Conversation log — persists Q&A turns across sessions so Claude has context
+// even after a session reset (--continue doesn't reliably restore history)
+// ---------------------------------------------------------------------------
+const CONVERSATION_LOG_FILE = "/home/ec2-user/agentweb/.claude-conversation-log";
+const MAX_CONVERSATION_LOG_CHARS = 15000; // ~4k tokens, well within context window
+const MAX_RESPONSE_IN_LOG_CHARS = 1500;   // keep responses concise in the log
+
+function readConversationLog() {
+  try {
+    return fs.readFileSync(CONVERSATION_LOG_FILE, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+function appendToConversationLog(prompt, response) {
+  try {
+    const existing = readConversationLog();
+    const truncatedResponse = response.length > MAX_RESPONSE_IN_LOG_CHARS
+      ? response.slice(0, MAX_RESPONSE_IN_LOG_CHARS) + "...(truncated)"
+      : response;
+    const entry = `\n[User]: ${prompt.slice(0, 500)}\n[Claude]: ${truncatedResponse}\n`;
+    let updated = existing + entry;
+    // Trim oldest entries if log grows too large
+    if (updated.length > MAX_CONVERSATION_LOG_CHARS) {
+      updated = updated.slice(updated.length - MAX_CONVERSATION_LOG_CHARS);
+      // Snap to the start of the first complete turn to avoid cutting mid-entry
+      const firstTurn = updated.indexOf("\n[User]:");
+      if (firstTurn > 0) updated = updated.slice(firstTurn);
+    }
+    fs.writeFileSync(CONVERSATION_LOG_FILE, updated);
+  } catch (err) {
+    console.error("[relay] Failed to write conversation log:", err);
+  }
+}
 
 function formatUsageLine(data) {
   try {
@@ -631,18 +685,26 @@ function formatUsageLine(data) {
   }
 }
 
+const SESSION_ID_FILE = "/home/ec2-user/agentweb/.claude-session-id";
+
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
     // Escape single quotes in prompt for shell
     const escaped = prompt.replace(/'/g, "'\\''");
+    // Use --resume <id> to continue the exact same session; fall back to --continue
+    let resumeFlag = "--continue";
+    try {
+      const sessionId = fs.readFileSync(SESSION_ID_FILE, "utf-8").trim();
+      if (sessionId) resumeFlag = `--resume ${sessionId}`;
+    } catch {}
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model sonnet --permission-mode auto --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
         env: { ...process.env, HOME: "/home/ec2-user" },
-        timeout: 30 * 60 * 1000, // 30 minutes
+        timeout: 60 * 60 * 1000, // 60 minutes
       }
     );
 
@@ -656,6 +718,10 @@ function runClaude(prompt) {
       // Try to parse JSON output for result text + usage
       try {
         const data = JSON.parse(stdout);
+        // Persist session ID so future relay calls resume the same session
+        if (data.session_id) {
+          try { fs.writeFileSync(SESSION_ID_FILE, data.session_id, "utf-8"); } catch {}
+        }
         let text = data.result || "(no output)";
         const usageLine = formatUsageLine(data);
         if (usageLine) text += `\n\n---\n${usageLine}`;
@@ -807,7 +873,33 @@ function getHeartbeatStatus() {
     // ignore
   }
 
-  // 7. Timestamp
+  // 7. EC2 cost (Option A: hardcoded price table)
+  const EC2_PRICES = {
+    "t3.micro": 0.0104, "t3.small": 0.0208, "t3.medium": 0.0416,
+    "t3.large": 0.0832, "t3.xlarge": 0.1664, "t3.2xlarge": 0.3328,
+  };
+  try {
+    const meta = {};
+    fs.readFileSync("/home/ec2-user/agentweb/.ec2-session-meta", "utf-8")
+      .split("\n")
+      .forEach((line) => {
+        const eq = line.indexOf("=");
+        if (eq > 0) meta[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+      });
+    const itype = meta.instance_type || "";
+    const launchEpoch = parseInt(meta.launch_epoch || "0", 10);
+    if (itype && launchEpoch) {
+      const elapsedH = (Date.now() / 1000 - launchEpoch) / 3600;
+      const ec2Cost = elapsedH * (EC2_PRICES[itype] || 0);
+      const h = Math.floor(elapsedH);
+      const m = Math.floor((elapsedH - h) * 60);
+      parts.push(`EC2: $${ec2Cost.toFixed(4)} (${h}h ${m}m @ ${itype})`);
+    }
+  } catch {
+    // ignore if meta file not present
+  }
+
+  // 8. Timestamp
   parts.push(`Updated: ${now.toISOString().slice(11, 19)}Z`);
 
   return parts.join(" | ");
@@ -824,6 +916,89 @@ if (NOTION_PAGE_ID) {
     await updateNotionCloudEnvStatus(getHeartbeatStatus());
     console.log("[heartbeat] Initial status posted to Notion");
   }, 5000);
+}
+
+// Fetch this instance's current public IP from EC2 metadata
+async function getInstancePublicIp() {
+  try {
+    const tokenRes = await fetch("http://169.254.169.254/latest/api/token", {
+      method: "PUT",
+      headers: { "X-aws-ec2-metadata-token-ttl-seconds": "60" },
+      signal: AbortSignal.timeout(3000),
+    });
+    const token = await tokenRes.text();
+    const ipRes = await fetch("http://169.254.169.254/latest/meta-data/public-ipv4", {
+      headers: { "X-aws-ec2-metadata-token": token },
+      signal: AbortSignal.timeout(3000),
+    });
+    return (await ipRes.text()).trim();
+  } catch {
+    return null;
+  }
+}
+
+// On startup, detect if the public IP changed since last launch and notify via Notion comment
+async function checkForIpChange() {
+  if (!NOTION_PAGE_ID) return;
+  try {
+    const currentIp = await getInstancePublicIp();
+    if (!currentIp) return;
+
+    const token = await getNotionToken();
+    const pageRes = await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+      headers: { Authorization: `Bearer ${token}`, "Notion-Version": NOTION_VERSION },
+    });
+    if (!pageRes.ok) return;
+    const page = await pageRes.json();
+
+    const storedIp = page.properties?.["Public IP"]?.rich_text?.[0]?.plain_text?.trim();
+
+    const patchIp = () => fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: { "Public IP": { rich_text: [{ text: { content: currentIp } }] } },
+      }),
+    });
+
+    if (storedIp && storedIp !== currentIp) {
+      console.log(`[ip-change] IP changed from ${storedIp} to ${currentIp} — posting Notion comment`);
+
+      const plain = (text) => ({ text: { content: text } });
+      const link = (url) => ({ text: { content: url, link: { url } } });
+
+      const richText = [
+        plain(`⚠️ Cloud env IP changed — the instance was stopped and restarted.\n\nOld IP: ${storedIp} (no longer valid)\nNew IP: ${currentIp}\n\nUpdated URLs:\n• Customer portal: `),
+        link(`http://${currentIp}:5174`),
+        plain(`\n• Partner portal:  `),
+        link(`http://${currentIp}:5173`),
+        plain(`\n• Backend API:     `),
+        link(`http://${currentIp}:3001`),
+        plain(`\n• IP unlock:       `),
+        link(`http://${currentIp}:5175`),
+      ];
+
+      const postComment = () => fetch(`${NOTION_API}/comments`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Notion-Version": NOTION_VERSION,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ parent: { page_id: NOTION_PAGE_ID }, rich_text: richText }),
+      });
+
+      await Promise.all([postComment(), patchIp()]);
+    } else if (!storedIp) {
+      await patchIp();
+    }
+  } catch (err) {
+    console.error("[ip-change] Error:", err.message || err);
+  }
 }
 
 // On startup, ensure all allowlisted IPs have SG rules (handles repo clone / new SG drift)
@@ -844,6 +1019,9 @@ async function enforceAllowlist() {
 
 app.listen(PORT, () => {
   console.log(`IP allowlist service running on http://localhost:${PORT}`);
+  checkForIpChange().catch((err) =>
+    console.error("[ip-change] Failed to check for IP change on startup:", err)
+  );
   enforceAllowlist().catch((err) =>
     console.error("[allowlist] Failed to enforce allowlist on startup:", err)
   );

@@ -157,5 +157,60 @@ describe('secretsManager', () => {
       await expect(getUnipileCredentials()).rejects.toThrow('Failed to fetch Unipile credentials');
     });
   });
+
+  // ── getLinkedInAdsSecrets ─────────────────────────────────────────────────
+
+  describe('getLinkedInAdsSecrets', () => {
+    it('returns credentials from dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockResolvedValue({
+        SecretString: JSON.stringify({ clientId: 'li-id', clientSecret: 'li-secret' }),
+      });
+
+      const { getLinkedInAdsSecrets } = require('../utils/secretsManager');
+      const creds = await getLinkedInAdsSecrets();
+
+      expect(creds).toEqual({ clientId: 'li-id', clientSecret: 'li-secret' });
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/LinkedIn/Ads' });
+    });
+
+    it('uses prod secret name in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockResolvedValue({
+        SecretString: JSON.stringify({ clientId: 'prod-id', clientSecret: 'prod-secret' }),
+      });
+
+      const { getLinkedInAdsSecrets } = require('../utils/secretsManager');
+      await getLinkedInAdsSecrets();
+
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/LinkedIn/Ads' });
+    });
+
+    it('throws when secret is empty', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockResolvedValue({ SecretString: '' });
+
+      const { getLinkedInAdsSecrets } = require('../utils/secretsManager');
+      await expect(getLinkedInAdsSecrets()).rejects.toThrow('Failed to fetch LinkedIn Ads credentials');
+    });
+
+    it('throws when clientId is missing', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockResolvedValue({
+        SecretString: JSON.stringify({ clientSecret: 'secret-only' }),
+      });
+
+      const { getLinkedInAdsSecrets } = require('../utils/secretsManager');
+      await expect(getLinkedInAdsSecrets()).rejects.toThrow('Failed to fetch LinkedIn Ads credentials');
+    });
+
+    it('throws when secrets manager call fails', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockRejectedValue(new Error('Network error'));
+
+      const { getLinkedInAdsSecrets } = require('../utils/secretsManager');
+      await expect(getLinkedInAdsSecrets()).rejects.toThrow('Failed to fetch LinkedIn Ads credentials');
+    });
+  });
 });
 

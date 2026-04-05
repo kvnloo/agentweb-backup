@@ -445,6 +445,50 @@ export async function getVercelToken(): Promise<string> {
   }
 }
 
+/**
+ * Interface for LinkedIn Ads OAuth credentials returned from Secrets Manager
+ */
+export interface LinkedInAdsCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get LinkedIn Ads OAuth credentials from AWS Secrets Manager.
+ * These are credentials for the separate MDP (Marketing Developer Platform) app,
+ * distinct from the existing LinkedIn posting app.
+ *
+ * Secret location: dev/AgentWeb/LinkedIn/Ads (or prod/... for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns The LinkedIn Ads client credentials (clientId and clientSecret)
+ */
+export async function getLinkedInAdsSecrets(): Promise<LinkedInAdsCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/LinkedIn/Ads'
+      : 'dev/AgentWeb/LinkedIn/Ads';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('LinkedIn Ads credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as LinkedInAdsCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('LinkedIn Ads credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching LinkedIn Ads credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch LinkedIn Ads credentials from Secrets Manager');
+  }
+}
+
 export interface FathomCredentials {
   clientId: string;
   clientSecret: string;

@@ -58,6 +58,7 @@ import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
+import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -218,7 +219,8 @@ interface User {
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
-  slackChannel?: string; // Default Slack channel for this user
+  slackChannel?: string; // @deprecated — use slackChannels
+  slackChannels?: string[]; // Slack channels configured for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -233,6 +235,11 @@ interface User {
     totalCost: number;
     resetDate: string;
   };
+  tokenUsageHistory?: Array<{
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+  }>;
   tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }
@@ -669,6 +676,7 @@ export default function AdminDashboard() {
     'crm': 17,
     'revenue': 18,
     'funnel': 19,
+    'alert-emails': 18,
   };
   
   // Get initial tab value from URL or default to Users
@@ -750,7 +758,8 @@ export default function AdminDashboard() {
   const [emailSenderEditLoading, setEmailSenderEditLoading] = useState(false);
   const [slackChannelDialogOpen, setSlackChannelDialogOpen] = useState(false);
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
-  const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
+  const [currentSlackChannels, setCurrentSlackChannels] = useState<string[]>([]);
+  const [slackChannelInputText, setSlackChannelInputText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
   const [adminSlackChannel, setAdminSlackChannel] = useState("");
   const [adminSlackChannelInput, setAdminSlackChannelInput] = useState("");
@@ -1279,6 +1288,12 @@ export default function AdminDashboard() {
   const handleStartCrmSync = async () => {
     try {
       setCrmSyncRunning(true);
+      // Save config (including autoSync) before starting sync
+      await axios.put(
+        buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}`),
+        { listId: crmSyncListId.trim(), autoSync: crmSyncAutoSync },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
       const response = await axios.post(
         buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}/start`),
         { forceFullSync: crmSyncForceFull },
@@ -1286,6 +1301,7 @@ export default function AdminDashboard() {
       );
       setCrmSyncLastSyncAt(response.data?.lastSyncAt || null);
       setSuccess(response.data?.message || `CRM sync started for ${crmSyncSource}.`);
+      await loadCrmSyncConfig(crmSyncSource);
     } catch (err: any) {
       console.error("Error starting CRM sync:", err);
       setError(err.response?.data?.message || "Failed to start CRM sync");
@@ -2089,36 +2105,30 @@ export default function AdminDashboard() {
 
   const handleSaveSlackChannel = async () => {
     if (!editingSlackChannelUserId) return;
-    
+
     try {
       setSlackChannelEditLoading(true);
-      
+
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSlackChannelUserId}/slack-channel`),
-        { 
-          slackChannel: currentSlackChannelText.trim() || null
-        },
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
+        { slackChannels: currentSlackChannels },
+        { headers: { Authorization: `Bearer ${token}` } }
       );
 
       if (response.status === 200) {
         // Update the user in the local state without reloading
-        setUsers((prevUsers: User[]) => 
-          prevUsers.map((user: User) => 
-            user.userId === editingSlackChannelUserId 
-              ? { 
-                  ...user, 
-                  slackChannel: response.data.slackChannel
-                }
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === editingSlackChannelUserId
+              ? { ...user, slackChannels: response.data.slackChannels ?? [] }
               : user
           )
         );
-        setSuccess("Slack channel updated successfully!");
+        setSuccess("Slack channels updated successfully!");
         setSlackChannelDialogOpen(false);
         setEditingSlackChannelUserId(null);
-        setCurrentSlackChannelText("");
+        setCurrentSlackChannels([]);
+        setSlackChannelInputText("");
       }
     } catch (error: any) {
       console.error("Error updating slack channel:", error);
@@ -2702,6 +2712,7 @@ export default function AdminDashboard() {
             <Tab label="CRM" {...a11yProps(17)} />
             <Tab label="Revenue" {...a11yProps(18)} />
             <Tab label="Funnel" {...a11yProps(19)} />
+            <Tab label="Alert Emails" {...a11yProps(18)} />
           </Tabs>
         </Box>
 
@@ -3850,10 +3861,22 @@ export default function AdminDashboard() {
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Slack Channel</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                                    <Typography variant="body2">{user.slackChannel || "—"}</Typography>
-                                    <IconButton size="small" onClick={() => { setEditingSlackChannelUserId(user.userId); setCurrentSlackChannelText(user.slackChannel || ""); setSlackChannelDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  <Typography variant="caption" color="text.secondary">Slack Channels</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                                    <Typography variant="body2">
+                                      {(user.slackChannels && user.slackChannels.length > 0)
+                                        ? user.slackChannels.join(", ")
+                                        : (user.slackChannel || "—")}
+                                    </Typography>
+                                    <IconButton size="small" onClick={() => {
+                                      setEditingSlackChannelUserId(user.userId);
+                                      const channels = user.slackChannels && user.slackChannels.length > 0
+                                        ? user.slackChannels
+                                        : user.slackChannel ? [user.slackChannel] : [];
+                                      setCurrentSlackChannels(channels);
+                                      setSlackChannelInputText("");
+                                      setSlackChannelDialogOpen(true);
+                                    }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
@@ -3937,6 +3960,16 @@ export default function AdminDashboard() {
                                       </Tooltip>
                                     )}
                                   </Box>
+                                  {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
+                                    <Box sx={{ mt: 0.5 }}>
+                                      <Typography variant="caption" color="text.secondary">History: </Typography>
+                                      {[...user.tokenUsageHistory].reverse().slice(0, 6).map((h) => (
+                                        <Typography key={h.month} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
+                                          {h.month}: {h.totalTokens.toLocaleString()}
+                                        </Typography>
+                                      ))}
+                                    </Box>
+                                  )}
                                 </Grid>
                                 <Grid item xs={6}>
                                   <Typography variant="caption" color="text.secondary">Actions</Typography>
@@ -5379,6 +5412,9 @@ export default function AdminDashboard() {
         </TabPanel>
         <TabPanel value={tabValue} index={19}>
           <FunnelTab />
+
+        <TabPanel value={tabValue} index={18}>
+          <AlertEmailsTab />
         </TabPanel>
       </Paper>
 
@@ -6394,53 +6430,99 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Slack Channel Configuration Dialog */}
+      {/* Slack Channels Configuration Dialog */}
       <Dialog
         open={slackChannelDialogOpen}
         onClose={() => {
           setSlackChannelDialogOpen(false);
           setEditingSlackChannelUserId(null);
-          setCurrentSlackChannelText("");
+          setCurrentSlackChannels([]);
+          setSlackChannelInputText("");
         }}
         maxWidth="sm"
         fullWidth
       >
         <DialogTitle>
-          Configure Slack Channel
+          Configure Slack Channels
           <IconButton
             aria-label="close"
             onClick={() => {
               setSlackChannelDialogOpen(false);
               setEditingSlackChannelUserId(null);
-              setCurrentSlackChannelText("");
+              setCurrentSlackChannels([]);
+              setSlackChannelInputText("");
             }}
-            sx={{
-              position: 'absolute',
-              right: 8,
-              top: 8,
-            }}
+            sx={{ position: 'absolute', right: 8, top: 8 }}
           >
             <CloseIcon />
           </IconButton>
         </DialogTitle>
         <DialogContent dividers>
-          <TextField
-            autoFocus
-            fullWidth
-            label="Slack Channel ID"
-            value={currentSlackChannelText}
-            onChange={(e) => setCurrentSlackChannelText(e.target.value)}
-            placeholder="C1234567890"
-            helperText="Enter the Slack channel ID where this user's approval requests should be sent. Leave empty to disable account-level Slack channel restriction."
-            disabled={slackChannelEditLoading}
-          />
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+              Configured channels (agent tools are restricted to these):
+            </Typography>
+            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minHeight: 32 }}>
+              {currentSlackChannels.length === 0 && (
+                <Typography variant="body2" color="text.disabled">No channels configured</Typography>
+              )}
+              {currentSlackChannels.map((ch) => (
+                <Chip
+                  key={ch}
+                  label={ch}
+                  size="small"
+                  onDelete={() => setCurrentSlackChannels((prev) => prev.filter((c) => c !== ch))}
+                  disabled={slackChannelEditLoading}
+                />
+              ))}
+            </Box>
+          </Box>
+          <Box sx={{ display: "flex", gap: 1 }}>
+            <TextField
+              autoFocus
+              fullWidth
+              size="small"
+              label="Add Slack Channel ID"
+              value={slackChannelInputText}
+              onChange={(e) => setSlackChannelInputText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  const val = slackChannelInputText.trim();
+                  if (val && !currentSlackChannels.includes(val)) {
+                    setCurrentSlackChannels((prev) => [...prev, val]);
+                  }
+                  setSlackChannelInputText("");
+                }
+              }}
+              placeholder="C1234567890"
+              helperText="Enter a channel ID and press Enter or click Add"
+              disabled={slackChannelEditLoading}
+            />
+            <Button
+              variant="outlined"
+              size="small"
+              sx={{ mt: 0, mb: "auto", height: 40, whiteSpace: "nowrap" }}
+              disabled={slackChannelEditLoading || !slackChannelInputText.trim()}
+              onClick={() => {
+                const val = slackChannelInputText.trim();
+                if (val && !currentSlackChannels.includes(val)) {
+                  setCurrentSlackChannels((prev) => [...prev, val]);
+                }
+                setSlackChannelInputText("");
+              }}
+            >
+              Add
+            </Button>
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button
             onClick={() => {
               setSlackChannelDialogOpen(false);
               setEditingSlackChannelUserId(null);
-              setCurrentSlackChannelText("");
+              setCurrentSlackChannels([]);
+              setSlackChannelInputText("");
             }}
             disabled={slackChannelEditLoading}
           >
@@ -6888,6 +6970,8 @@ const AgentModeSettings = () => {
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
   const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
   const [savingCustomerSupportDefaultModel, setSavingCustomerSupportDefaultModel] = useState(false);
+  const [codingAgentDefaultModel, setCodingAgentDefaultModel] = useState('');
+  const [savingCodingAgentDefaultModel, setSavingCodingAgentDefaultModel] = useState(false);
   const [backupModel, setBackupModel] = useState('');
   const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
@@ -6934,6 +7018,9 @@ const AgentModeSettings = () => {
 
       // Load customer support default model
       await loadCustomerSupportDefaultModel(models);
+
+      // Load coding agent default model
+      await loadCodingAgentDefaultModel(models);
 
       // Load backup model
       await loadBackupModel(models);
@@ -7388,6 +7475,57 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadCodingAgentDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setCodingAgentDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading coding agent default model:', settingsError);
+      }
+    }
+    // Default to Sonnet 4.6
+    setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
+  };
+
+  const saveCodingAgentDefaultModel = async () => {
+    try {
+      setSavingCodingAgentDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (codingAgentDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          settingValue: codingAgentDefaultModel,
+          description: 'Default LLM model for coding agent (code editing tasks)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Coding agent default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving coding agent default model:', error);
+      setError('Failed to save coding agent default model');
+    } finally {
+      setSavingCodingAgentDefaultModel(false);
+    }
+  };
+
   const loadBackupModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
@@ -7533,7 +7671,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7637,6 +7775,14 @@ const AgentModeSettings = () => {
 
         setCustomerSupportDefaultModel('');
         setSuccess('Reset customer support default model successfully!');
+      } else if (type === 'codingAgentDefaultModel') {
+        setSavingCodingAgentDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
+        setSuccess('Reset coding agent default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -7662,6 +7808,8 @@ const AgentModeSettings = () => {
         setSavingVideoGenerationDefaultModel(false);
       } else if (type === 'customerSupportDefaultModel') {
         setSavingCustomerSupportDefaultModel(false);
+      } else if (type === 'codingAgentDefaultModel') {
+        setSavingCodingAgentDefaultModel(false);
       }
     }
   };
@@ -8053,6 +8201,55 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Sets the default model for Emma Chat in the customer portal. If not set, uses the general default model.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Coding Agent Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Coding Agent Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('codingAgentDefaultModel')}
+                disabled={savingCodingAgentDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveCodingAgentDefaultModel}
+                disabled={savingCodingAgentDefaultModel}
+              >
+                {savingCodingAgentDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-coding-agent-model-label">Coding Agent Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-coding-agent-model-label"
+              value={codingAgentDefaultModel}
+              label="Coding Agent Default Model"
+              onChange={(e) => setCodingAgentDefaultModel(e.target.value as string)}
+            >
+              {(supportedModels.length > 0
+                ? supportedModels
+                : ['anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-6-v1']
+              ).filter(model => model.includes('anthropic.claude')).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for the coding agent (code editing tasks for landing pages). Defaults to Sonnet 4.6. Opus 4.6 is also available for more complex coding tasks.
           </Typography>
         </CardContent>
       </Card>

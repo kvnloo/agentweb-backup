@@ -3,7 +3,7 @@
 set -euxo pipefail
 
 # 0. Swap space (prevents OOM when tsc + Claude + services run together)
-fallocate -l 4G /swapfile
+fallocate -l 8G /swapfile
 chmod 600 /swapfile
 mkswap /swapfile
 swapon /swapfile
@@ -40,6 +40,14 @@ get_public_ip() {
     -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
   curl -s -H "X-aws-ec2-metadata-token: $token" \
     http://169.254.169.254/latest/meta-data/public-ipv4
+}
+
+get_instance_type() {
+  local token
+  token=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+  curl -s -H "X-aws-ec2-metadata-token: $token" \
+    http://169.254.169.254/latest/meta-data/instance-type
 }
 
 # 1. System packages + password SSH (early for debugging)
@@ -178,6 +186,11 @@ echo "$GITHUB_PAT" | sudo -u ec2-user gh auth login --with-token
 
 # 4. Configure backend .env
 PUBLIC_IP=$(get_public_ip)
+INSTANCE_TYPE=$(get_instance_type)
+LAUNCH_EPOCH=$(date -u +%s)
+printf 'instance_type=%s\nlaunch_epoch=%s\n' "$INSTANCE_TYPE" "$LAUNCH_EPOCH" \
+  > "$APP_DIR/.ec2-session-meta"
+chown ec2-user:ec2-user "$APP_DIR/.ec2-session-meta"
 
 get_secret "agentweb/test-env/backend-env" > "$APP_DIR/backend/.env"
 
@@ -373,74 +386,7 @@ fi
 echo "$CLAUDE_PROMPT" > "$APP_DIR/.claude-prompt"
 chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
 
-cat > "$APP_DIR/.claude-comment.py" <<'PYEOF'
-import json, sys, os
-
-COST_FILE = os.path.expanduser("~/agentweb/.claude-total-cost")
-
-with open("/tmp/.claude-raw.json", "r", errors="replace") as f:
-    raw = f.read()
-
-try:
-    data = json.loads(raw)
-    text = data.get("result", raw)
-    cost = data.get("total_cost_usd", 0)
-    usage = data.get("usage", {})
-    duration_ms = data.get("duration_ms", 0)
-    input_tok = usage.get("input_tokens", 0)
-    output_tok = usage.get("output_tokens", 0)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_create = usage.get("cache_creation_input_tokens", 0)
-
-    # Read previous total and accumulate
-    prev_total = 0
-    try:
-        with open(COST_FILE, "r") as cf:
-            prev_total = float(cf.read().strip())
-    except Exception:
-        pass
-    total = prev_total + cost
-    try:
-        with open(COST_FILE, "w") as cf:
-            cf.write(f"{total:.6f}")
-    except Exception:
-        pass
-
-    parts = []
-    parts.append(f"Cost: ${cost:.4f} (Total: ${total:.4f})")
-    cache_parts = []
-    if cache_read:
-        cache_parts.append(f"{cache_read:,} cache-read")
-    if cache_create:
-        cache_parts.append(f"{cache_create:,} cache-write")
-    tok_detail = f"{input_tok:,} in + {output_tok:,} out"
-    if cache_parts:
-        tok_detail += " (" + ", ".join(cache_parts) + ")"
-    parts.append(f"Tokens: {tok_detail}")
-    if duration_ms:
-        parts.append(f"Duration: {duration_ms / 1000:.0f}s")
-    models = list(data.get("modelUsage", {}).keys())
-    if models:
-        parts.append("Model: " + ", ".join(models))
-    usage_line = " | ".join(parts)
-except Exception:
-    text = raw
-    usage_line = ""
-
-exit_code = int(sys.argv[2])
-if exit_code != 0:
-    text = f"Claude Code exited with code {exit_code}:\n{text}"
-
-if usage_line:
-    text += f"\n\n---\n{usage_line}"
-
-if len(text) > 9900:
-    text = text[:9900] + "\n\n...(truncated)"
-chunks = [{"text": {"content": text[i:i+1900]}} for i in range(0, len(text), 1900)]
-if not chunks:
-    chunks = [{"text": {"content": "(no output)"}}]
-print(json.dumps({"parent": {"page_id": sys.argv[1]}, "rich_text": chunks}))
-PYEOF
+cp "$APP_DIR/test-env/claude-comment.py" "$APP_DIR/.claude-comment.py"
 chown ec2-user:ec2-user "$APP_DIR/.claude-comment.py"
 
 cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
@@ -448,11 +394,37 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
-RAW=$(claude --model sonnet --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
-EXIT_CODE=$?
-
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
 NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
+
+# Set status to In progress before starting work
+if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
+  curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    -d '{"properties": {"Status": {"status": {"name": "In progress"}}}}' > /dev/null
+fi
+
+RAW=$(claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
+EXIT_CODE=$?
+
+# Save session ID so the relay can resume the exact same session on follow-up prompts
+SESSION_ID=$(echo "$RAW" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('session_id',''))" 2>/dev/null)
+if [[ -z "$SESSION_ID" ]]; then
+  # Fall back to reading sessionId from the most recently modified JSONL
+  SESSION_ID=$(ls -t ~/.claude/projects/-home-ec2-user-agentweb/*.jsonl 2>/dev/null | head -1 | xargs -I{} python3 -c "
+import json
+for line in open('{}'):
+    try:
+        d = json.loads(line.strip())
+        if d.get('type') == 'last-prompt':
+            print(d.get('sessionId', ''))
+    except: pass
+" 2>/dev/null | tail -1)
+fi
+[[ -n "$SESSION_ID" ]] && echo "$SESSION_ID" > ~/agentweb/.claude-session-id
+
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
   printf '%s' "$RAW" > /tmp/.claude-raw.json
   python3 ~/agentweb/.claude-comment.py "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
@@ -465,6 +437,12 @@ if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
       -d "$BODY"
   fi
   rm -f /tmp/.claude-raw.json /tmp/.claude-comment.json
+  # Set status to In Review after work is done
+  curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    -d '{"properties": {"Status": {"status": {"name": "In Review"}}}}' > /dev/null
 fi
 exec bash
 RUNEOF

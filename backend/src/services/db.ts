@@ -75,7 +75,8 @@ export interface User {
   resendDomainId?: string; // Resend domain ID for domain verification
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
-  slackChannel?: string; // Default Slack channel for this user
+  slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
+  slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
@@ -162,6 +163,11 @@ export interface User {
     totalCost: number;    // cumulative cost in USD this month
     resetDate: string;    // ISO date of next monthly reset
   };
+  tokenUsageHistory?: Array<{
+    month: string;       // "YYYY-MM" format
+    totalTokens: number;
+    totalCost: number;
+  }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
@@ -615,9 +621,16 @@ class UserDB {
     return items;
   }
 
+  async reactivateUser(userId: string) {
+    return this.setUserActiveStatus(userId, true);
+  }
+
   async deactivateUser(userId: string) {
+    return this.setUserActiveStatus(userId, false);
+  }
+
+  private async setUserActiveStatus(userId: string, isActive: boolean) {
     try {
-      // First get the user to get the email (primary key)
       const user = await this.getUserById(userId);
       if (!user) {
         throw new Error("User not found");
@@ -625,20 +638,16 @@ class UserDB {
 
       const params = {
         TableName: this.tableName,
-        Key: {
-          email: user.email, // Using email as the primary key
-        },
+        Key: { email: user.email },
         UpdateExpression: "set isActive = :isActive",
-        ExpressionAttributeValues: {
-          ":isActive": false,
-        },
+        ExpressionAttributeValues: { ":isActive": isActive },
         ReturnValues: "ALL_NEW",
       };
 
       const result = await this.docClient.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      this.handleError(error, "deactivateUser");
+      this.handleError(error, isActive ? "reactivateUser" : "deactivateUser");
     }
   }
 

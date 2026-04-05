@@ -1,4 +1,5 @@
 import { Router, Response } from "express";
+import AWS from "aws-sdk";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import {
   addSubdomain,
@@ -8,6 +9,12 @@ import {
   getDomain,
   verifyDomain,
 } from "../services/customDomainService";
+
+const dynamodb = new AWS.DynamoDB.DocumentClient({
+  region: process.env.AWS_REGION || "us-west-2",
+});
+const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+const LANDING_PAGES_TABLE = `${TABLE_PREFIX}AW-LandingPages`;
 
 const router = Router();
 
@@ -60,7 +67,7 @@ router.post("/subdomain", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const { vercelProjectId, subdomain } = req.body;
+    const { vercelProjectId, subdomain, landingPageId } = req.body;
     if (!vercelProjectId || typeof vercelProjectId !== "string") {
       return res.status(400).json({ error: "vercelProjectId is required" });
     }
@@ -69,6 +76,28 @@ router.post("/subdomain", async (req, res: Response) => {
     }
 
     const result = await addSubdomain(userId, vercelProjectId, subdomain);
+
+    // If a landing page ID was provided, persist customDomainUrl on the record.
+    // This is non-fatal: if it fails (e.g. ConditionalCheckFailed), the subdomain
+    // was still successfully added to Vercel, so we return 201 regardless.
+    if (landingPageId && typeof landingPageId === "string") {
+      try {
+        await dynamodb.update({
+          TableName: LANDING_PAGES_TABLE,
+          Key: { id: landingPageId },
+          ConditionExpression: "userId = :uid",
+          UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":url": `https://${result.domain}`,
+            ":uid": userId,
+            ":now": new Date().toISOString(),
+          },
+        }).promise();
+      } catch (updateErr: any) {
+        console.error("[DOMAINS] Failed to persist customDomainUrl on landing page:", updateErr?.message);
+      }
+    }
+
     res.status(201).json(result);
   } catch (error: any) {
     console.error("[DOMAINS] Error adding subdomain:", error);

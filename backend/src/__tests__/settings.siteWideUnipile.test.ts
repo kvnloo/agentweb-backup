@@ -1,8 +1,14 @@
 import { Request, Response } from 'express';
 import settingsRouter from '../routes/settings';
 import { settingsService } from '../services/settingsService';
+import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
 jest.mock('../services/settingsService');
+jest.mock('../services/linkedInOutreachService', () => ({
+  linkedInOutreachService: { isAccountConnected: jest.fn().mockResolvedValue(true) },
+}));
+
+const mockIsAccountConnected = linkedInOutreachService.isAccountConnected as jest.Mock;
 
 const mockedSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 
@@ -47,20 +53,42 @@ describe('Site-Wide Unipile Accounts API', () => {
       expect(res.json).toHaveBeenCalledWith({ accounts: [] });
     });
 
-    it('should return accounts when setting exists', async () => {
+    it('should return accounts with live connectivity status when setting exists', async () => {
       const accounts = [{ account_id: 'acc1', account_name: 'Test', enabled: true }];
       mockedSettingsService.getSetting.mockResolvedValue({
         settingName: 'site-wide-unipile-accounts',
         settingValue: JSON.stringify(accounts),
         updatedAt: '', updatedBy: '',
       });
+      mockIsAccountConnected.mockResolvedValue(true);
 
       const req = {} as unknown as Request;
       const res = mockResponse();
 
       await handler(req, res);
 
-      expect(res.json).toHaveBeenCalledWith({ accounts });
+      expect(res.json).toHaveBeenCalledWith({
+        accounts: [{ account_id: 'acc1', account_name: 'Test', enabled: true, connected: true }],
+      });
+    });
+
+    it('should mark account as disconnected when Unipile reports it offline', async () => {
+      const accounts = [{ account_id: 'acc1', account_name: 'Test', enabled: true }];
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'site-wide-unipile-accounts',
+        settingValue: JSON.stringify(accounts),
+        updatedAt: '', updatedBy: '',
+      });
+      mockIsAccountConnected.mockResolvedValue(false);
+
+      const req = {} as unknown as Request;
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      expect(res.json).toHaveBeenCalledWith({
+        accounts: [{ account_id: 'acc1', account_name: 'Test', enabled: true, connected: false }],
+      });
     });
   });
 

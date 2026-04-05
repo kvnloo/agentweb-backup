@@ -20,8 +20,10 @@ import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
+import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
+import { validateEmail } from "../utils/validation";
 
 const router = express.Router();
 
@@ -345,6 +347,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       const nextSetting: CrmSyncSetting = {
         listId: parsed.listId,
         lastSyncAt: updatedLastSyncAt,
+        autoSync: parsed.autoSync, // preserve autoSync flag across syncs
       };
       await settingsService.setSetting(
         settingName,
@@ -465,6 +468,28 @@ router.post("/users/:userId/deactivate", async (req, res) => {
   }
 });
 
+// Reactivate user
+router.post("/users/:userId/reactivate", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.isActive !== false) {
+      return res.status(400).json({ message: "User is already active" });
+    }
+
+    const updatedUser = await userDb.reactivateUser(userId);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error reactivating user:", error);
+    res.status(500).json({ message: "Error reactivating user" });
+  }
+});
+
 // Update user support note
 router.put("/users/:userId/support-note", async (req, res) => {
   try {
@@ -562,11 +587,11 @@ router.put("/users/:userId/email-sender", async (req, res) => {
   }
 });
 
-// Update user slack channel
+// Update user slack channels (accepts an array)
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { slackChannel } = req.body;
+    const { slackChannels } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -574,14 +599,18 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Update the user's slack channel
-    const updatedUser = await userDb.updateUser(userId, { 
-      slackChannel 
+    // Validate: must be an array of non-empty strings (or null/empty to clear)
+    const channels: string[] = Array.isArray(slackChannels)
+      ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
+      : [];
+
+    const updatedUser = await userDb.updateUser(userId, {
+      slackChannels: channels.length > 0 ? channels : (null as any),
     });
     res.json(updatedUser);
   } catch (error) {
-    console.error("Error updating user slack channel:", error);
-    res.status(500).json({ message: "Error updating slack channel" });
+    console.error("Error updating user slack channels:", error);
+    res.status(500).json({ message: "Error updating slack channels" });
   }
 });
 
@@ -1150,7 +1179,19 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       }
 
       resultUser = newUser;
-      
+
+      // Auto-sync new user to CRM lead list (fire-and-forget)
+      syncNewUserToLeadList({
+        userId,
+        email,
+        fullName: waitlistEntry.fullName,
+        roles,
+        isAdmin: false,
+        createdAt: new Date().toISOString(),
+        stripe_customer_id: waitlistEntry.stripe_customer_id,
+        subscriptionType: "Free",
+      }).catch(() => {});
+
       // Send welcome email with temporary password for new user
       await emailService.sendWelcomeEmail(email, temporaryPassword);
     }
@@ -4595,6 +4636,55 @@ router.get("/funnel-metrics", async (req, res) => {
   } catch (error: any) {
     console.error("Error fetching funnel metrics:", error.message);
     res.status(500).json({ message: "Failed to fetch funnel metrics" });
+// Get alert email lists (oncall + product issue)
+router.get("/alert-emails", async (req, res) => {
+  try {
+    const [oncallEmails, productIssueEmails] = await Promise.all([
+      settingsService.getJsonArraySetting("oncall_emails", ["ruiw@agentweb.pro"]),
+      settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]),
+    ]);
+    res.json({ oncallEmails, productIssueEmails });
+  } catch (error: any) {
+    console.error("Error getting alert emails:", error);
+    res.status(500).json({ message: "Failed to get alert emails" });
+  }
+});
+
+// Update alert email lists
+router.put("/alert-emails", async (req, res) => {
+  try {
+    const { oncallEmails, productIssueEmails } = req.body;
+    const updatedBy = (req as any).user?.email || "unknown";
+
+    if (!Array.isArray(oncallEmails) || !Array.isArray(productIssueEmails)) {
+      return res.status(400).json({ message: "oncallEmails and productIssueEmails must be arrays" });
+    }
+
+    const allEmails = [...oncallEmails, ...productIssueEmails];
+    const invalid = allEmails.filter((e) => typeof e !== "string" || !validateEmail(e));
+    if (invalid.length > 0) {
+      return res.status(400).json({ message: `Invalid email addresses: ${invalid.join(", ")}` });
+    }
+
+    await Promise.all([
+      settingsService.setSetting(
+        "oncall_emails",
+        JSON.stringify(oncallEmails),
+        "Oncall alert email recipients",
+        updatedBy
+      ),
+      settingsService.setSetting(
+        "product_issue_emails",
+        JSON.stringify(productIssueEmails),
+        "Product issue / help message email recipients",
+        updatedBy
+      ),
+    ]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Error updating alert emails:", error);
+    res.status(500).json({ message: "Failed to update alert emails" });
   }
 });
 

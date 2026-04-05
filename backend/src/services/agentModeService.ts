@@ -18,19 +18,23 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
+import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
+import { incrementUserTokenUsage } from './tokenUsageService';
+import type { LLMUsageData } from '../utils/llmService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import * as linkedInAdsService from './linkedInAdsService';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -70,6 +74,54 @@ interface PDFData {
   info: any;
   metadata: any;
   version: string;
+}
+
+/**
+ * Custom pdf-parse pagerender function that preserves table structure.
+ *
+ * The default pdf-parse renderer concatenates items sharing the same exact Y
+ * coordinate without adding spaces, and doesn't sort items by X position.
+ * This causes numbers in tabular PDFs to run together or appear out of order.
+ *
+ * This renderer:
+ * 1. Sorts all text items by Y (descending = top-to-bottom) then X (ascending = left-to-right)
+ * 2. Groups items into rows using a Y-tolerance to handle slight vertical misalignments
+ * 3. Separates items on the same row with a space so numbers don't concatenate
+ */
+function pdfPageRender(pageData: any): Promise<string> {
+  return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
+    .then((textContent: any) => {
+      const Y_TOLERANCE = 3; // points — items within this vertical distance are on the same row
+
+      // Sort: top-to-bottom (higher Y first in PDF coords), left-to-right
+      const items: Array<{ str: string; x: number; y: number }> = textContent.items
+        .filter((item: any) => item.str && item.str.trim() !== '')
+        .map((item: any) => ({ str: item.str, x: item.transform[4], y: item.transform[5] }))
+        .sort((a: any, b: any) => {
+          if (Math.abs(a.y - b.y) > Y_TOLERANCE) return b.y - a.y; // top first
+          return a.x - b.x; // left first within same row
+        });
+
+      if (items.length === 0) return '';
+
+      // Group items into rows
+      const rows: string[][] = [];
+      let currentRow: string[] = [];
+      let rowY = items[0].y;
+
+      for (const item of items) {
+        if (Math.abs(item.y - rowY) <= Y_TOLERANCE) {
+          currentRow.push(item.str);
+        } else {
+          rows.push(currentRow);
+          currentRow = [item.str];
+          rowY = item.y;
+        }
+      }
+      if (currentRow.length > 0) rows.push(currentRow);
+
+      return rows.map(row => row.join(' ')).join('\n');
+    });
 }
 
 // Type for LLM model configuration
@@ -117,6 +169,7 @@ export class AgentModeService {
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
+  private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -149,15 +202,15 @@ export class AgentModeService {
     toolNames: string[];
     category?: string;
   }> = [
-    {
-      name: 'Meeting Intelligence',
-      description:
-        'Access meeting recordings, transcripts, and action items from Fathom. ' +
-        'Requires a connected Fathom account (Settings → Connected Accounts).',
-      toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
-      category: 'tool_bundle',
-    },
-  ];
+      {
+        name: 'Meeting Intelligence',
+        description:
+          'Access meeting recordings, transcripts, and action items from Fathom. ' +
+          'Requires a connected Fathom account (Settings → Connected Accounts).',
+        toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        category: 'tool_bundle',
+      },
+    ];
 
   /**
    * Ensure all built-in skills exist in the database.
@@ -329,6 +382,7 @@ export class AgentModeService {
         await import('../emma/fathomTools');
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
+        await import('../emma/slackMessageTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -484,6 +538,24 @@ export class AgentModeService {
     }
     // Fall back to the general default model
     return this.getDefaultModel();
+  }
+
+  async getCodingAgentDefaultModel(): Promise<string> {
+    const fallbackModel = 'anthropic.claude-sonnet-4-6';
+    try {
+      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting coding agent default model setting:', error);
+    }
+    // Fall back to Sonnet 4.6
+    return fallbackModel;
   }
 
   async getBackupModel(primaryModel: string): Promise<string | null> {
@@ -847,8 +919,8 @@ export class AgentModeService {
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
-  async getSupportedModels() {
-    const models = Object.keys(this.llmModels);
+  async getSupportedModels(isAdmin: boolean = false) {
+    const models = Object.keys(this.llmModels).filter(m => isAdmin || !m.includes('opus'));
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -857,8 +929,8 @@ export class AgentModeService {
     return models;
   }
 
-  async getReportsModelOptions(): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.'));
+  async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !m.includes('opus')));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1007,6 +1079,43 @@ export class AgentModeService {
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
+  /** Cost per image generation in USD (fixed per-generation pricing). */
+  private estimateImageGenerationCost(model: string): number {
+    const pricing: Record<string, number> = {
+      'gpt-image-1': 0.04,
+      'gemini-2.5-flash-image': 0.039,
+      'gemini-3-pro-image-preview': 0.039,
+      'gemini-3.1-flash-image-preview': 0.039,
+      'gen4_image': 0.05,
+      'gemini_2.5_flash': 0.04,
+    };
+    return pricing[model] ?? 0.04;
+  }
+
+  /** Cost per video generation in USD (fixed per-generation pricing, based on ~8s clip). */
+  private estimateVideoGenerationCost(model: string): number {
+    const pricing: Record<string, number> = {
+      'veo-3.1-generate-preview': 2.80,
+      'veo-3.1-fast-generate-preview': 1.40,
+    };
+    return pricing[model] ?? 2.80;
+  }
+
+  /** Returns an onUsage callback that records LLM token usage for a named tool. */
+  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+    return (usage) => {
+      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
+      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
+        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
+      );
+      if (sessionId) {
+        chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
+          console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
+        );
+      }
+    };
+  }
+
   // Generate AI response for marketing conversation
   async generateMarketingResponse(
     messageContent: string,
@@ -1019,7 +1128,8 @@ export class AgentModeService {
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
-    excludeTools?: string[]
+    excludeTools?: string[],
+    screenshotUrl?: string
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -1077,7 +1187,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, isAdmin);
@@ -1410,10 +1520,10 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
-            // Block non-admin users OR interactive share sessions from invoking admin-only tools
+            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions
             if ((!isAdmin || isInteractiveShare) && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
               const errorMsg = isInteractiveShare
-                ? `Tool "${toolCall.function.name}" is not available in shared sessions.`
+                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" is restricted to admin users only.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
@@ -1462,7 +1572,8 @@ export class AgentModeService {
         const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
           const toolStart = Date.now();
           try {
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, socketEmit ? { socketEmit } : undefined);
+            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
             const toolDuration = Date.now() - toolStart;
             return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
           } catch (error) {
@@ -1477,7 +1588,27 @@ export class AgentModeService {
         for (const toolResult of toolResults) {
           if (toolResult.status === 'success') {
             const { toolCall, functionArgs, result, duration } = toolResult;
-            const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
+
+            // For playwright screenshots, upload the base64 image to S3.
+            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
+            // and makes the screenshot displayable in the frontend.
+            let processedResult = result;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
+              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
+              if (imageContent?.data) {
+                try {
+                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
+                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
+                  if (uploadResult) {
+                    processedResult = { screenshotUrl: uploadResult.url, success: true };
+                  }
+                } catch (e) {
+                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
+                }
+              }
+            }
+
+            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
 
             toolCalls.push({
               id: toolCall.id,
@@ -1490,7 +1621,15 @@ export class AgentModeService {
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
-            const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
+            // The screenshot is displayed to the user via the tool call card in the frontend.
+            // We intentionally omit the URL so the LLM doesn't embed it in markdown responses.
+            let toolContent: any;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
+              toolContent = `Screenshot captured successfully and displayed to the user.`;
+            } else {
+              toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            }
             const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
               ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
               : toolContent;
@@ -1800,8 +1939,7 @@ export class AgentModeService {
 - Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
 - Example: {"site_url": "example.com", "business_area": "e-commerce"}
 - Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
-- The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
+- **Fallback Method**: [DEPRECATED: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.]
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
@@ -1820,6 +1958,7 @@ export class AgentModeService {
 - **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
 - **Web Search**: Use 'search_web' proactively to gather information from the internet before asking users for clarification
 - **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
+- **Exception — Ad creation with landing page**: When creating LinkedIn or Meta ads and the user has already provided a landing page URL, do NOT web search for company information. Use the provided URL and inputs directly. Only search if no landing page is given and you need context about the company.
 - **When to search**: Before asking users for more details, search for market data, industry trends, competitor information, or other information available on the internet
 - **Search first, ask second**: Use web search to gather background information and context from the internet before requesting additional details from users
 - **Search topics include**: Market trends, industry benchmarks, competitor analysis, news, regulatory information, technology updates, or any information from the internet that would help provide better recommendations
@@ -2069,7 +2208,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -2228,8 +2367,18 @@ When a user requests client onboarding or says "onboard new client" or similar:
       messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
-    // Append the current user message at the end
-    messages.push({ role: 'user', content: messageContent });
+    // Append the current user message at the end (with vision if a screenshot URL was provided)
+    if (screenshotUrl) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
+        ]
+      });
+    } else {
+      messages.push({ role: 'user', content: messageContent });
+    }
 
     return messages;
   }
@@ -2316,6 +2465,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
 
+    'get_user_profile',         // Account info teaser
+
     // Account Memory (cross-session knowledge)
     'save_memory',
     'delete_memory',
@@ -2332,7 +2483,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'fathom_get_transcript',
 
     // Coding Agent (sub-agent for code editing tasks)
-    'coding_agent'
+    'coding_agent',
+
+    'slack_list_channels',
+    'slack_get_recent_messages',
+    'slack_send_message',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -2706,6 +2861,12 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
+
+    // For playwright screenshots, result has already been processed (base64 → S3 URL)
+    if (toolName === 'playwright_browser_take_screenshot') {
+      return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
+    }
+
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -6326,6 +6487,41 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  /**
+   * Helper function to extract text preview from emailContent field.
+   * The emailContent can be either a string (legacy) or an object with html/text properties.
+   */
+  private getEmailContentPreview(emailContent: any, maxLength: number): string | undefined {
+    if (!emailContent) {
+      return undefined;
+    }
+
+    let textContent: string;
+
+    // Handle object format (new format with html/text properties)
+    if (typeof emailContent === 'object' && !Array.isArray(emailContent)) {
+      // Prefer html over text, but use whichever is available
+      textContent = emailContent.html || emailContent.text || '';
+    }
+    // Handle string format (legacy format)
+    else if (typeof emailContent === 'string') {
+      textContent = emailContent;
+    }
+    else {
+      return undefined;
+    }
+
+    // Strip HTML tags and truncate
+    const plainText = textContent.replace(/<[^>]*>/g, '').trim();
+    if (plainText.length === 0) {
+      return undefined;
+    }
+
+    return plainText.length > maxLength
+      ? plainText.substring(0, maxLength) + '...'
+      : plainText;
+  }
+
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -6397,9 +6593,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate email content for preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 150) + '...'
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 150)
         })),
         listName: list.name
       };
@@ -7040,9 +7234,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           createdAt: eng.createdAt,
           eventData: eng.eventData || {},
           // Truncate HTML email content to text preview
-          emailContentPreview: eng.emailContent
-            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 200) + (eng.emailContent.length > 200 ? '...' : '')
-            : undefined
+          emailContentPreview: this.getEmailContentPreview(eng.emailContent, 200)
         })),
         leadName: `${lead.firstName || ''} ${lead.lastName || ''}`.trim()
       };
@@ -9121,6 +9313,36 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('AgentMode: Diagnostic message generation failed:', error);
       return null;
+    }
+  }
+
+  /**
+   * Triage a Slack message to determine if it requires handling (e.g. a client question).
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
+   * Returns true if the message needs to be handled, false otherwise.
+   */
+  public async triageSlackMessage(message: string): Promise<boolean> {
+    try {
+      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
+
+Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
+Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
+
+      const response = await this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message },
+      ], {
+        max_completion_tokens: 10,
+        temperature: 0,
+      });
+
+      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
+      const needsHandling = content.startsWith('yes');
+      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
+      return needsHandling;
+    } catch (error) {
+      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
+      return true; // default to handling on error to avoid missing client questions
     }
   }
 
@@ -12439,7 +12661,7 @@ Format the response as JSON with this structure:
 
     if (extension === 'pdf' || mimeType === 'application/pdf') {
       const pdfParse = require('pdf-parse');
-      const pdfData = await pdfParse(content);
+      const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
@@ -12532,7 +12754,7 @@ Format the response as JSON with this structure:
     try {
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         const pdfParse = require('pdf-parse');
-        const pdfData = await pdfParse(content);
+        const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
@@ -13517,7 +13739,7 @@ Format the response as JSON with this structure:
         try {
           // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer);
+          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
@@ -13658,6 +13880,15 @@ Format the response as JSON with this structure:
       });
 
       if (result.success && result.imageUrl) {
+        // Track generation cost (image APIs are billed per generation, not per token)
+        const imageCost = this.estimateImageGenerationCost(imageModel || 'gemini-2.5-flash-image');
+        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
+          console.error('AgentMode: Failed to track token usage for generateImage:', err)
+        );
+        chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
+          console.error('AgentMode: Failed to add image cost to session:', err)
+        );
+
         // Save the image URL to the session for reference
         const imageData = {
           url: result.imageUrl,
@@ -13747,6 +13978,15 @@ Format the response as JSON with this structure:
       });
 
       if (result.success && result.videoUrl) {
+        // Track generation cost (video APIs are billed per generation, not per token)
+        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview');
+        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
+          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
+        );
+        chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
+          console.error('AgentMode: Failed to add video cost to session:', err)
+        );
+
         // Save the video URL to the session for reference
         const videoData = {
           url: result.videoUrl,
@@ -15658,31 +15898,37 @@ Format the response as JSON with this structure:
     };
   }
 
-  // Fetch both user-specific and public templates
+  // Fetch templates from all 4 keys (new + old), deduplicated (new key wins)
   private async getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {
-    const [userSetting, publicSetting] = await Promise.all([
+    const [newUserSetting, newPublicSetting, oldUserSetting, oldPublicSetting] = await Promise.all([
+      settingsService.getSetting(`templates_${userId}`),
+      settingsService.getSetting('templates_public'),
       settingsService.getSetting(`email_templates_${userId}`),
-      settingsService.getSetting('email_templates_public')
+      settingsService.getSetting('email_templates_public'),
     ]);
 
-    let userTemplates: any[] = [];
-    let publicTemplates: any[] = [];
+    const parse = (s: any): any[] => {
+      if (!s?.settingValue) return [];
+      try { return JSON.parse(s.settingValue); } catch { return []; }
+    };
 
-    if (userSetting) {
-      try {
-        userTemplates = JSON.parse(userSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing user email templates:', error);
-      }
-    }
+    const newUser = parse(newUserSetting);
+    const newPublic = parse(newPublicSetting);
+    const oldUser = parse(oldUserSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
+    const oldPublic = parse(oldPublicSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
 
-    if (publicSetting) {
-      try {
-        publicTemplates = JSON.parse(publicSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing public email templates:', error);
-      }
-    }
+    // Deduplicate: new key wins over old key
+    const userSeen = new Set(newUser.map((t: any) => t.template_name));
+    const userTemplates = [
+      ...newUser,
+      ...oldUser.filter((t: any) => !userSeen.has(t.template_name)),
+    ];
+
+    const publicSeen = new Set(newPublic.map((t: any) => t.template_name));
+    const publicTemplates = [
+      ...newPublic,
+      ...oldPublic.filter((t: any) => !publicSeen.has(t.template_name)),
+    ];
 
     return { userTemplates, publicTemplates };
   }
@@ -15704,16 +15950,16 @@ Format the response as JSON with this structure:
     return { template: null, isPublic: false };
   }
 
-  // List all HTML templates for the user (including email templates)
-  public async listHtmlTemplates(userId: string): Promise<any> {
+  // List all HTML templates for the user (merged from all 4 keys)
+  public async listHtmlTemplates(userId: string, type?: string): Promise<any> {
     try {
       const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
-      // Build a name set from user templates for dedup
       const userTemplateNames = new Set(userTemplates.map((t: any) => t.template_name));
 
       const mapTemplate = (template: any, isPublic: boolean) => ({
         template_name: template.template_name,
+        type: template.type || ['email'],
         subject: template.subject,
         variables: template.variables || [],
         arrayVariables: template.arrayVariables || [],
@@ -15722,12 +15968,16 @@ Format the response as JSON with this structure:
         ...(isPublic ? { isPublic: true } : {})
       });
 
-      const merged = [
+      let merged = [
         ...userTemplates.map((t: any) => mapTemplate(t, false)),
         ...publicTemplates
           .filter((t: any) => !userTemplateNames.has(t.template_name))
           .map((t: any) => mapTemplate(t, true))
       ];
+
+      if (type) {
+        merged = merged.filter((t: any) => Array.isArray(t.type) && t.type.includes(type));
+      }
 
       return {
         success: true,
@@ -16659,7 +16909,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log('AgentMode: Generating HTML file with LLMService (Claude model)');
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt);
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -16701,7 +16951,8 @@ Please generate a complete, professional HTML document that properly formats and
     subject: string,
     additionalInstructions: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    types?: string[]
   ): Promise<any> {
     try {
       // Read HTML content from source (either S3 URL or direct HTML content)
@@ -16789,20 +17040,20 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt);
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
       }
 
       // Extract variables from the enhanced HTML and subject
-      const { variables, arrayVariables } = this.extractVariables(enhancedHtml, subject);
+      const { variables, arrayVariables } = extractVariables(enhancedHtml, subject);
 
       console.log('AgentMode: Extracted variables:', { variables, arrayVariables });
 
-      // Save template to DynamoDB settings
+      // Save template to DynamoDB settings (new key)
       const { settingsService } = await import('./settingsService');
-      const settingName = `email_templates_${userId}`;
+      const settingName = `templates_${userId}`;
       const existingSetting = await settingsService.getSetting(settingName);
 
       let templates = [];
@@ -16820,8 +17071,11 @@ Please:
         (t: any) => t.template_name === templateName
       );
 
+      const templateTypes = types && types.length > 0 ? types : ['email'];
+
       const newTemplate = {
         template_name: templateName,
+        type: templateTypes,
         subject: subject,
         html_content: enhancedHtml,
         variables: variables,
@@ -16839,20 +17093,32 @@ Please:
       await settingsService.setSetting(
         settingName,
         JSON.stringify(templates),
-        'User email templates',
+        'User templates',
         userId
       );
 
-      console.log('AgentMode: HTML email template created successfully:', templateName);
+      // Migrate: remove old copy from legacy user key to prevent shadowing.
+      // Never touch public keys — createHtmlTemplate is always a user-scoped operation.
+      const { parseTemplateArray } = await import('../utils/templateParser');
+      const legacyKey = `email_templates_${userId}`;
+      const legacySetting = await settingsService.getSetting(legacyKey);
+      const legacyList = parseTemplateArray(legacySetting);
+      const legacyFiltered = legacyList.filter((t: any) => t.template_name !== templateName);
+      if (legacyFiltered.length !== legacyList.length) {
+        await settingsService.setSetting(legacyKey, JSON.stringify(legacyFiltered), legacyKey, userId);
+      }
+
+      console.log('AgentMode: HTML template created successfully:', templateName);
 
       return {
         success: true,
         template_name: templateName,
+        type: templateTypes,
         subject: subject,
         variables: variables,
         arrayVariables: arrayVariables,
-        message: `Email template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
-        preview_note: 'Template is now available in Email Templates section for editing and preview'
+        message: `Template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
+        preview_note: 'Template is now available in Templates section for editing and preview'
       };
     } catch (error) {
       console.error('Error creating HTML template:', error);
@@ -16862,89 +17128,6 @@ Please:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
-  }
-
-  // Extract variables from HTML content and subject (same logic as in settings.ts)
-  private extractVariables(htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } {
-    const variableRegex = /\{\{([^}]+)\}\}/g;
-    const allVariables: string[] = [];
-    const regularVariables: string[] = [];
-    const arrayVariableNames = new Set<string>();
-    let match;
-
-    // Collect all variables from HTML content
-    while ((match = variableRegex.exec(htmlContent)) !== null) {
-      const variable = match[1].trim();
-      if (!allVariables.includes(variable)) {
-        allVariables.push(variable);
-      }
-    }
-
-    // Also collect variables from subject if provided
-    if (subject) {
-      const subjectRegex = /\{\{([^}]+)\}\}/g;
-      let subjectMatch;
-      while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
-        const variable = subjectMatch[1].trim();
-        if (!allVariables.includes(variable)) {
-          allVariables.push(variable);
-        }
-      }
-    }
-
-    // Find all _n and _n_ patterns first
-    const nPatterns = new Set<string>();
-    allVariables.forEach(variable => {
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        if (suffix) {
-          nPatterns.add(`${baseName}_n_${suffix}`);
-        } else {
-          nPatterns.add(`${baseName}_n`);
-        }
-      }
-    });
-
-    // Now process all variables
-    const processedArrayNames = new Set<string>();
-
-    allVariables.forEach(variable => {
-      let isArrayVariable = false;
-
-      // Check if this variable matches any _n pattern
-      nPatterns.forEach(nPattern => {
-        const baseName = nPattern.replace(/_n.*$/, '');
-        const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
-        if (numericMatch) {
-          if (!processedArrayNames.has(nPattern)) {
-            arrayVariableNames.add(nPattern);
-            processedArrayNames.add(nPattern);
-          }
-          isArrayVariable = true;
-        }
-      });
-
-      // Check if this is already an _n pattern
-      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
-      if (nMatch) {
-        const baseName = nMatch[1];
-        const suffix = nMatch[2];
-        const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
-        if (!processedArrayNames.has(fullName)) {
-          arrayVariableNames.add(fullName);
-          processedArrayNames.add(fullName);
-        }
-        isArrayVariable = true;
-      }
-
-      if (!isArrayVariable) {
-        regularVariables.push(variable);
-      }
-    });
-
-    return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
   }
 
   // Work Plan Management Methods
@@ -17600,7 +17783,8 @@ Please:
     length: string,
     imagine: boolean,
     userId: string,
-    researchUrl?: string
+    researchUrl?: string,
+    sessionId?: string
   ): Promise<any> {
     try {
       console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
@@ -17801,7 +17985,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format);
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
 
       // Extract content from JSON
       if (!contentData.content) {
@@ -18635,8 +18819,42 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
-    const { action, account_id, profile_url, provider_id, message } = args;
+    let { account_id } = args;
+    const { action, profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
+
+    // Write actions must use an account owned by the calling user.
+    // This prevents an LLM from reusing a shared/enrichment account_id it may have
+    // seen in a prior get-profile tool call to send invitations or messages.
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation'];
+    if (WRITE_ACTIONS.includes(action)) {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const userAccounts = await getAccountsByUserId(userId);
+      const owned = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
+      if (!owned) {
+        return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
+      }
+    }
+
+    // For get-profile only, fall back to site-wide Unipile enrichment accounts when the
+    // user has no personally-connected account. Restricted to get-profile to prevent
+    // the shared account from being used for search quotas or discoverable via list actions.
+    if (!account_id && action === 'get-profile') {
+      account_id = await linkedInOutreachService.resolveAccountId(userId);
+      if (account_id) {
+        console.log(`[AgentMode] linkedinOutreach: using site-wide enrichment account for get-profile`);
+      }
+    }
+
+    // Guard: if no account_id is available at this point, return a clear error
+    // instead of forwarding a null account_id to Unipile (which returns a
+    // misleading "Profile not found" instead of an auth/config error).
+    if (!account_id) {
+      return {
+        success: false,
+        error: 'No LinkedIn account is connected. To use LinkedIn Outreach, please connect your LinkedIn account in Settings → Connected Accounts.',
+      };
+    }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
@@ -18651,6 +18869,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
             keywords, url: search_url, title, company, cursor
           });
+          // Trim to essential fields only — full profiles (skills, education, photos, etc.)
+          // inflate context by 10x and degrade LLM output quality in long sessions.
+          if (Array.isArray(searchResult?.items)) {
+            const trimmedItems = searchResult.items.map((item: any) => {
+              const trimmed: any = {
+                provider_id: item.provider_id,
+                public_identifier: item.public_identifier,
+                first_name: item.first_name,
+                last_name: item.last_name,
+                headline: item.headline,
+                location: item.location,
+                network_distance: item.network_distance,
+                public_profile_url: item.public_profile_url,
+                is_open_profile: item.is_open_profile,
+              };
+              if (item.work_experience?.length) {
+                const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+                if (current) trimmed.current_role = { position: current.position, company: current.company };
+              }
+              if (item.summary) trimmed.summary = item.summary.slice(0, 200);
+              return trimmed;
+            });
+            return { success: true, data: { ...searchResult, items: trimmedItems } };
+          }
           return { success: true, data: searchResult };
         }
 
@@ -18671,6 +18913,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-sent-invitations': {
           const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
+          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
+          if (Array.isArray(invitationsResult?.items)) {
+            const trimmedItems = invitationsResult.items.map((item: any) => ({
+              id: item.id,
+              invited_user_id: item.invited_user_id,
+              invited_user_public_id: item.invited_user_public_id,
+              invited_user: item.invited_user,
+            }));
+            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
+          }
           return { success: true, data: invitationsResult };
         }
 
@@ -18719,6 +18972,384 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         error: errorMessage
       };
     }
+  }
+
+  // --- LinkedIn Ads ---
+
+  private async getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(userId);
+    if (!user) throw new Error('User not found');
+
+    const connectedAccounts = user.connected_accounts || [];
+    const adsAccounts = (connectedAccounts as any[]).filter(
+      (acc: any) =>
+        acc.platform === 'linkedin_ads' &&
+        acc.config?.account_type === 'ad_account' &&
+        acc.config?.access_token
+    );
+
+    if (adsAccounts.length === 0) {
+      throw new Error('LinkedIn Ads account not connected. Please connect your LinkedIn Ads account in settings.');
+    }
+
+    let selected: any;
+    if (accountId) {
+      selected = adsAccounts.find((acc: any) => acc.account_id === accountId);
+      if (!selected) {
+        throw new Error(`LinkedIn Ads account "${accountId}" not found. Check your connected accounts.`);
+      }
+    } else if (adsAccounts.length > 1) {
+      const list = adsAccounts.map((a: any) => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+      throw new Error(`Multiple LinkedIn Ads accounts found: [${list}]. Specify account_id.`);
+    } else {
+      selected = adsAccounts[0];
+    }
+
+    const cfg = selected.config;
+    const now = Date.now();
+    const bufferMs = 5 * 60 * 1000;
+
+    if (cfg.token_expires_at && cfg.token_expires_at > now + bufferMs) {
+      return { accountId: selected.account_id, accessToken: cfg.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
+    }
+
+    // Token expired or expiring soon — refresh it
+    if (!cfg.refresh_token) {
+      throw new Error('LinkedIn Ads access token expired and no refresh token available. Please reconnect your account.');
+    }
+
+    const { getLinkedInAdsConfig } = await import('../config/integrations');
+    const oauthConfig = await getLinkedInAdsConfig();
+
+    const newTokens = await linkedInAdsService.refreshAccessToken(
+      cfg.refresh_token,
+      oauthConfig.clientId,
+      oauthConfig.clientSecret
+    );
+
+    const { updateAccountTokens } = await import('./connectedAccountsDb');
+    await updateAccountTokens(userId, 'linkedin_ads' as any, {
+      access_token: newTokens.access_token,
+      refresh_token: newTokens.refresh_token,
+      token_expires_at: Date.now() + newTokens.expires_in * 1000,
+    });
+
+    return { accountId: selected.account_id, accessToken: newTokens.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
+  }
+
+  /**
+   * Master method for LinkedIn Ads entity management (campaigns, creatives, targeting, etc.)
+   */
+  public async callLinkedInMarketingApi(
+    userId: string,
+    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
+    action: string,
+    account_id: string,
+    params: any = {}
+  ): Promise<any> {
+    console.log(`AgentMode: callLinkedInMarketingApi -> ${entity_type} / ${action}`);
+
+    const { accountId, accessToken, organizationUrn, personUrn } = await this.getLinkedInAdsCredentials(userId, account_id);
+
+    switch (entity_type) {
+      case 'AD_ACCOUNT': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listAdAccounts(accessToken);
+          if (!result.success) throw new Error(result.error || 'Failed to list ad accounts');
+          return { success: true, adAccounts: result.data?.elements || [] };
+        }
+        throw new Error(`Unknown action "${action}" for AD_ACCOUNT`);
+      }
+
+      case 'CAMPAIGN_GROUP': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
+          return { success: true, campaignGroups: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          const result = await linkedInAdsService.createCampaignGroup(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create campaign group');
+          return { success: true, message: 'Campaign group created', campaignGroup: result.data };
+        }
+        if (action === 'UPDATE') {
+          if (!params.campaign_group_id) throw new Error('UPDATE requires campaign_group_id');
+          const result = await linkedInAdsService.updateCampaignGroup(accessToken, accountId, params.campaign_group_id, params);
+          if (!result.success) throw new Error(result.error || 'Failed to update campaign group');
+          return { success: true, message: 'Campaign group updated', result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CAMPAIGN_GROUP`);
+      }
+
+      case 'CAMPAIGN': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listCampaigns(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to list campaigns');
+          return { success: true, campaigns: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          const result = await linkedInAdsService.createCampaign(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create campaign');
+          return { success: true, message: 'Campaign created', campaign: result.data };
+        }
+        if (action === 'UPDATE') {
+          if (!params.campaign_id) throw new Error('UPDATE requires campaign_id');
+          const result = await linkedInAdsService.updateCampaign(accessToken, accountId, params.campaign_id, params);
+          if (!result.success) throw new Error(result.error || 'Failed to update campaign');
+          return { success: true, message: 'Campaign updated', result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CAMPAIGN`);
+      }
+
+      case 'CREATIVE': {
+        if (action === 'LIST') {
+          if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
+          const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to list creatives');
+          return { success: true, creatives: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
+          const result = await linkedInAdsService.createCreative(accessToken, { ...params, ad_account_id: accountId });
+          if (!result.success) throw new Error(result.error || 'Failed to create creative');
+          return { success: true, message: 'Creative created', creative: result.data };
+        }
+        if (action === 'CREATE_INLINE') {
+          if (!params.campaign_id) throw new Error('CREATE_INLINE requires campaign_id');
+          if (!organizationUrn) throw new Error('Could not determine organization URN. Please reconnect your LinkedIn Ads account.');
+          const result = await linkedInAdsService.createCreativeInline(accessToken, {
+            ...params,
+            ad_account_id: accountId,
+            author_urn: organizationUrn,
+          });
+          if (!result.success) throw new Error(result.error || 'Failed to create inline creative');
+          return { success: true, message: 'Creative and post created in one step', creative: result.data };
+        }
+        if (action === 'CREATE_DYNAMIC') {
+          // Dynamic Ads: Jobs, Spotlight, Follower — campaign type must be DYNAMIC
+          if (!params.campaign_id) throw new Error('CREATE_DYNAMIC requires campaign_id');
+          if (!params.format) throw new Error('CREATE_DYNAMIC requires format (JOBS|SPOTLIGHT|FOLLOW_COMPANY)');
+          const result = await linkedInAdsService.createDynamicCreative(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
+          return { success: true, message: 'Dynamic creative created', creative: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CREATIVE`);
+      }
+
+      case 'POST': {
+        if (action === 'CREATE') {
+          const feedDistribution = params.feed_distribution || 'NONE';
+          if (!organizationUrn) throw new Error('Could not determine author_urn. Please reconnect your LinkedIn Ads account.');
+          const postParams = { ...params, author_urn: organizationUrn, ad_account_id: accountId };
+          // MAIN_FEED requires w_organization_social scope — reconnect LinkedIn Ads account if 403
+          const result = await linkedInAdsService.createPost(accessToken, postParams);
+          if (!result.success) throw new Error(result.error || 'Failed to create post');
+          const postUrn = result.data?.id;
+          const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
+          const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
+          return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for POST`);
+      }
+
+      case 'TARGETING': {
+        if (action === 'LIST_FACETS') {
+          const result = await linkedInAdsService.listTargetingFacets(accessToken);
+          return { success: true, facets: result.data?.elements || [] };
+        }
+        if (action === 'SEARCH') {
+          if (!params.facet) throw new Error('SEARCH requires facet');
+          const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+          return { success: true, entities: result.data?.elements || [] };
+        }
+        if (action === 'ESTIMATE_REACH') {
+          if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
+          const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          return { success: true, audienceCount: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for TARGETING`);
+      }
+
+      case 'MEDIA': {
+        // Helper: if the URL is an S3 URL from our bucket, presign it before downloading.
+        // This handles the case where the user uploads a file to the chat (stored in S3)
+        // and Emma receives the S3 URL — direct S3 access requires a presigned URL.
+        const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
+        const resolveDownloadUrl = (url: string): string => {
+          if (isS3Url(url)) {
+            const presigned = presignS3Url(url);
+            return presigned || url;
+          }
+          return url;
+        };
+
+        if (action === 'UPLOAD_IMAGE') {
+          if (!params.image_url) throw new Error('UPLOAD_IMAGE requires image_url (a public URL to the image)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          // Step 1: initialize upload to get signed URL + image URN
+          const initResult = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize image upload');
+          const uploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
+          const imageUrn: string = initResult.data?.value?.image || initResult.data?.image;
+          if (!uploadUrl || !imageUrn) throw new Error('LinkedIn did not return uploadUrl or image URN');
+          // Step 2: download the image (presign if S3 URL) and PUT to LinkedIn's signed URL
+          const axios = require('axios');
+          const imageResp = await axios.get(resolveDownloadUrl(params.image_url), { responseType: 'arraybuffer' });
+          const contentType = imageResp.headers['content-type'] || 'image/jpeg';
+          await linkedInAdsService.uploadImageBinary(uploadUrl, Buffer.from(imageResp.data), contentType);
+          return { success: true, image_urn: imageUrn, message: 'Image uploaded to LinkedIn. Use image_urn in CREATIVE/CREATE_INLINE.' };
+        }
+        if (action === 'UPLOAD_VIDEO') {
+          // Convenience action: download video from URL, auto-detect size, handle full upload flow.
+          // Emma never asks the user for file_size — it's derived from the downloaded buffer.
+          if (!params.video_url) throw new Error('UPLOAD_VIDEO requires video_url (a public URL to the video file)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const axios = require('axios');
+          // Step 1: download video (presign if S3 URL — handles user-uploaded files from chat)
+          const videoResp = await axios.get(resolveDownloadUrl(params.video_url), { responseType: 'arraybuffer' });
+          const videoBuffer = Buffer.from(videoResp.data);
+          const fileSizeBytes = videoBuffer.length;
+          // Step 2: initialize upload — fileSizeBytes auto-calculated from buffer
+          const initResult = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, fileSizeBytes);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize video upload');
+          const uploadInstructions: any[] = initResult.data?.value?.uploadInstructions || [];
+          const videoUrn: string = initResult.data?.value?.video || initResult.data?.video;
+          const uploadToken: string = initResult.data?.value?.uploadToken || '';
+          if (!videoUrn) throw new Error('LinkedIn did not return video URN');
+          // Step 3: upload each part, collect ETag from each response (required for finalize)
+          const uploadedPartIds: string[] = [];
+          for (const instruction of uploadInstructions) {
+            const partStart: number = instruction.firstByte ?? 0;
+            const partEnd: number = instruction.lastByte ?? fileSizeBytes - 1;
+            const partBuffer = videoBuffer.slice(partStart, partEnd + 1);
+            const etag = await linkedInAdsService.uploadVideoPart(instruction.uploadUrl, partBuffer);
+            uploadedPartIds.push(etag);
+          }
+          // Step 4: finalize — pass uploadToken and ETags from part uploads
+          const finalizeResult = await linkedInAdsService.finalizeVideoUpload(accessToken, videoUrn, uploadToken, uploadedPartIds);
+          if (!finalizeResult.success) throw new Error(finalizeResult.error || 'Failed to finalize video upload');
+          return { success: true, video_urn: videoUrn, message: 'Video uploaded to LinkedIn. Use video_urn in CREATIVE/CREATE_INLINE.' };
+        }
+        if (action === 'UPLOAD_DOCUMENT') {
+          // Convenience action: download document from URL and upload to LinkedIn.
+          if (!params.document_url) throw new Error('UPLOAD_DOCUMENT requires document_url (a public URL to the document, e.g. PDF)');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const axios = require('axios');
+          // Step 1: download document (presign if S3 URL — handles user-uploaded files from chat)
+          const docResp = await axios.get(resolveDownloadUrl(params.document_url), { responseType: 'arraybuffer' });
+          const docBuffer = Buffer.from(docResp.data);
+          const contentType = docResp.headers['content-type'] || 'application/pdf';
+          // Step 2: initialize upload
+          const initResult = await linkedInAdsService.initializeDocumentUpload(accessToken, ownerUrn);
+          if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize document upload');
+          const docUploadUrl: string = initResult.data?.value?.uploadUrl || initResult.data?.uploadUrl;
+          const documentUrn: string = initResult.data?.value?.document || initResult.data?.document;
+          if (!docUploadUrl || !documentUrn) throw new Error('LinkedIn did not return uploadUrl or document URN');
+          // Step 3: upload binary
+          await linkedInAdsService.uploadDocumentBinary(docUploadUrl, docBuffer, contentType);
+          return { success: true, document_urn: documentUrn, message: 'Document uploaded to LinkedIn. Use document_urn in POST/CREATE.' };
+        }
+        if (action === 'INIT_IMAGE_UPLOAD') {
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const result = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          return { success: true, uploadInstructions: result.data };
+        }
+        if (action === 'INIT_VIDEO_UPLOAD') {
+          if (!params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires file_size');
+          const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
+          const result = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, params.file_size);
+          return { success: true, uploadInstructions: result.data };
+        }
+        if (action === 'FINALIZE_VIDEO') {
+          if (!params.video_urn) throw new Error('FINALIZE_VIDEO requires video_urn');
+          const result = await linkedInAdsService.finalizeVideoUpload(accessToken, params.video_urn);
+          return { success: true, result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for MEDIA`);
+      }
+
+      case 'INMAIL': {
+        if (action === 'CREATE_CONTENT') {
+          // Use person URN from connected account (captured at OAuth time). If missing, user needs to reconnect.
+          const sender = params.sender || personUrn;
+          if (!sender) throw new Error('Could not determine sender person URN. Please reconnect your LinkedIn Ads account to capture your person URN.');
+          const result = await linkedInAdsService.createInMailContent(accessToken, { ...params, sender, ad_account_id: accountId });
+          if (!result.success) throw new Error(result.error || 'Failed to create InMail content');
+          const inmailUrn = result.data?.id;
+          return { success: true, message: 'InMail content created. Use inmail_content_urn in CREATIVE/CREATE.', inmail_content_urn: inmailUrn, data: result.data };
+        }
+        if (action === 'SEND_TEST') {
+          if (!params.inmail_content_urn) throw new Error('SEND_TEST requires inmail_content_urn');
+          if (!params.recipient_email) throw new Error('SEND_TEST requires recipient_email');
+          const result = await linkedInAdsService.sendTestInMail(accessToken, params.inmail_content_urn, params.recipient_email);
+          if (!result.success) throw new Error(result.error || 'Failed to send test InMail');
+          return { success: true, message: 'Test InMail sent successfully', data: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for INMAIL`);
+      }
+
+      case 'CONVERSATION_AD': {
+        if (action === 'CREATE') {
+          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
+          const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
+          const conversationAdUrn = result.data?.id;
+          return { success: true, message: 'Conversation ad created. Add message nodes with CONVERSATION_AD/CREATE_CONTENT, then set the first node with CONVERSATION_AD/SET_FIRST_CONTENT.', conversation_ad_urn: conversationAdUrn, data: result.data };
+        }
+        if (action === 'CREATE_CONTENT') {
+          if (!params.conversation_ad_urn) throw new Error('CONVERSATION_AD CREATE_CONTENT requires conversation_ad_urn');
+          if (!params.body) throw new Error('CONVERSATION_AD CREATE_CONTENT requires body (message text)');
+          if (!params.buttons || !Array.isArray(params.buttons) || params.buttons.length === 0) throw new Error('CONVERSATION_AD CREATE_CONTENT requires buttons array');
+          const result = await linkedInAdsService.createConversationAdContent(accessToken, params.conversation_ad_urn, params);
+          if (!result.success) throw new Error(result.error || 'Failed to create conversation ad content');
+          const contentUrn = result.data?.id;
+          return { success: true, message: 'Message node added to conversation ad', content_urn: contentUrn, data: result.data };
+        }
+        if (action === 'SET_FIRST_CONTENT') {
+          if (!params.conversation_ad_urn) throw new Error('SET_FIRST_CONTENT requires conversation_ad_urn');
+          if (!params.first_content_urn) throw new Error('SET_FIRST_CONTENT requires first_content_urn');
+          const result = await linkedInAdsService.setConversationAdFirstContent(accessToken, params.conversation_ad_urn, params.first_content_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to set first content');
+          return { success: true, message: 'First message node set. Conversation ad is ready. Create a CREATIVE with inmail_content_urn = conversation_ad_urn.' };
+        }
+        throw new Error(`Unknown action "${action}" for CONVERSATION_AD`);
+      }
+
+      default:
+        throw new Error(`Invalid entity_type: ${entity_type}`);
+    }
+  }
+
+  /**
+   * LinkedIn Ads analytics — synchronous (no polling needed unlike Meta).
+   */
+  public async callLinkedInAdsInsightsApi(
+    userId: string,
+    account_id: string,
+    params: {
+      pivot: string;
+      dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } };
+      timeGranularity?: string;
+      fields?: string[];
+      campaigns?: string[];
+      adGroups?: string[];
+      creatives?: string[];
+    }
+  ): Promise<any> {
+    console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
+
+    const { accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+
+    const result = await linkedInAdsService.getAdAnalytics(
+      accessToken,
+      params.pivot,
+      params.timeGranularity || 'ALL',
+      params.dateRange,
+      params.fields || ['impressions', 'clicks', 'costInLocalCurrency'],
+      { campaign_ids: params.campaigns, creative_ids: params.creatives }
+    );
+    return { success: true, analytics: result.data?.elements || result.data };
   }
 
   // --- Client Health Assessment (admin-only) ---

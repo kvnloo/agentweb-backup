@@ -266,6 +266,7 @@ describe('Client Health - listAllClients', () => {
         adAccount: '111',
         roles: ['customer'],
         lastLoginTime: '2024-06-01T00:00:00Z',
+        createdAt: '2024-01-15T10:00:00Z',
       },
       {
         userId: 'client-2',
@@ -275,6 +276,7 @@ describe('Client Health - listAllClients', () => {
         adAccount: '',
         roles: ['free'],
         lastLoginTime: '2024-05-01T00:00:00Z',
+        createdAt: '2024-02-20T08:30:00Z',
       },
     ]);
 
@@ -292,7 +294,9 @@ describe('Client Health - listAllClients', () => {
     expect(result.clients[0].email).toBe('admin@example.com');
     expect(result.clients[1].email).toBe('client1@example.com');
     expect(result.clients[1].has_ads).toBe(true);
+    expect(result.clients[1].signup_time).toBe('2024-01-15T10:00:00Z');
     expect(result.clients[2].email).toBe('client2@example.com');
     expect(result.clients[2].has_ads).toBe(false);
+    expect(result.clients[2].signup_time).toBe('2024-02-20T08:30:00Z');
   });
 });

@@ -134,9 +134,9 @@ cmd_launch() {
     esac
   done
 
-  # Dev mode: auto-upgrade to t3.xlarge (16 GB) unless user specified --instance-type
+  # Dev mode: auto-upgrade to t3.2xlarge (32 GB) unless user specified --instance-type
   if is_dev_mode && [[ "$INSTANCE_TYPE_SPECIFIED" == "false" ]]; then
-    INSTANCE_TYPE="t3.xlarge"
+    INSTANCE_TYPE="t3.2xlarge"
   fi
 
   # If config missing and no flags provided, interactively create it
@@ -900,7 +900,7 @@ cmd_claude() {
     # Run Claude Code with a prompt (non-interactive, streams output back)
     ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
-        "source ~/.bashrc && cd /home/ec2-user/agentweb && claude --model sonnet --permission-mode auto -p $(printf '%q' "$message")"
+        "source ~/.bashrc && cd /home/ec2-user/agentweb && claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto -p $(printf '%q' "$message")"
   else
     # Interactive Claude Code session
     ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -971,7 +971,7 @@ case "$CMD" in
     echo "  --dev            Dev mode: hot-reload dev servers + Claude Code (no Docker)"
     echo "  --key-name K     EC2 key pair name"
     echo "  --key-file F     Path to private key file"
-    echo "  --instance-type T  Instance type (default: t3.large, dev mode: t3.xlarge)"
+    echo "  --instance-type T  Instance type (default: t3.large, dev mode: t3.2xlarge)"
     echo "  --no-watchdog    Disable auto-shutdown watchdog"
     echo ""
     echo "The environment name is derived automatically from your AWS username"

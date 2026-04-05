@@ -1148,7 +1148,8 @@ mcpToolRegistry.register({
       properties: {
         prompt: { type: 'string', description: 'Detailed description of the landing page including brand colors, fonts, tone, sections, copy guidance, and any specific requirements. The more detail, the better v0 output.' },
         name: { type: 'string', description: 'Optional display name for the page' },
-        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' }
+        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' },
+        template_name: { type: 'string', description: 'Optional name of a saved landing page template to use as design inspiration (from list_html_templates with type=landing_page)' }
       },
       required: ['prompt']
     }
@@ -1156,8 +1157,8 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
-      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id },
-      timeoutMs: 15 * 60 * 1000, // 15 minutes — v0 generation + GitHub + Vercel deploy
+      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_name: args.template_name },
+      timeoutMs: 25 * 60 * 1000, // 25 minutes — v0 generation + GitHub + Vercel deploy (extra headroom vs 15 min default)
     });
     return jsonResult(data);
   }
@@ -1180,7 +1181,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
       body: {},
-      timeoutMs: 15 * 60 * 1000, // 15 minutes — GitHub + Vercel deploy
+      timeoutMs: 25 * 60 * 1000, // 25 minutes — GitHub + Vercel deploy (extra headroom)
     });
     return jsonResult(data);
   }
@@ -1891,6 +1892,7 @@ Returns for each client:
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
+- signup_time: account creation / sign-up timestamp
 
 Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
     inputSchema: {
@@ -1982,6 +1984,29 @@ mcpToolRegistry.register({
       text: formatDigestText(results),
       results,
     });
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'freeze_user_account',
+  definition: {
+    name: 'freeze_user_account',
+    description: 'Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', description: 'The userId of the account to freeze or unfreeze' },
+        action: { type: 'string', enum: ['freeze', 'unfreeze'], description: '"freeze" to deactivate the account, "unfreeze" to reactivate it' }
+      },
+      required: ['user_id', 'action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const path = args.action === 'freeze'
+      ? `/api/admin/users/${args.user_id}/deactivate`
+      : `/api/admin/users/${args.user_id}/reactivate`;
+    const data = await mcpFetch({ method: 'POST', path, context: ctx(context) });
+    return jsonResult(data);
   }
 });
 

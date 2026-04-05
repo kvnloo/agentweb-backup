@@ -2,6 +2,7 @@ import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { resendService } from "../services/resendService";
 import { userDb } from "../services/db";
+import { settingsService } from "../services/settingsService";
 
 const router = express.Router();
 
@@ -99,9 +100,11 @@ router.post("/send-help-message", async (req, res) => {
 </html>
     `;
 
+    const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+
     await resendService.sendEmail({
       from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
-      to: "founders@agentweb.pro",
+      to: productIssueEmails,
       subject: emailSubject,
       html: emailHtml,
       replyTo: user.email
@@ -111,6 +114,92 @@ router.post("/send-help-message", async (req, res) => {
   } catch (error) {
     console.error("Error sending help message:", error);
     res.status(500).json({ message: "Failed to send help message" });
+  }
+});
+
+// Report a UI error to the support team
+router.post("/report-error", async (req, res) => {
+  try {
+    const authenticatedReq = req as any;
+    const userId = authenticatedReq.user.userId;
+    const userEmail = authenticatedReq.user.email;
+    const { errorMessage, errorCode, sessionId, pageUrl, additionalDetails } = req.body;
+
+    if (!errorMessage || !errorMessage.trim()) {
+      return res.status(400).json({ message: "Error message is required" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const emailSubject = `Error Report from ${user.email}`;
+
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background-color: #fef2f2; padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #ef4444; }
+    .message-box { background-color: #fff; border-left: 4px solid #ef4444; padding: 15px; margin: 20px 0; }
+    .info-row { margin: 8px 0; }
+    .label { font-weight: 600; color: #666; }
+    .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2 style="margin: 0; color: #b91c1c;">Error Report</h2>
+    </div>
+
+    <div class="info-row">
+      <span class="label">From:</span> ${user.displayName || user.email} (${user.email})
+    </div>
+    <div class="info-row">
+      <span class="label">User ID:</span> ${userId}
+    </div>
+    ${sessionId ? `<div class="info-row"><span class="label">Session ID:</span> ${sessionId}</div>` : ''}
+    ${errorCode ? `<div class="info-row"><span class="label">Error Code:</span> ${errorCode}</div>` : ''}
+    ${pageUrl ? `<div class="info-row"><span class="label">Page URL:</span> <a href="${pageUrl}">${pageUrl}</a></div>` : ''}
+
+    <div class="message-box">
+      <div class="label" style="margin-bottom: 10px;">Error Message:</div>
+      <div>${errorMessage.replace(/\n/g, '<br>')}</div>
+    </div>
+
+    ${additionalDetails ? `
+    <div class="message-box" style="border-color: #6b7280;">
+      <div class="label" style="margin-bottom: 10px;">Additional Details:</div>
+      <div>${additionalDetails.replace(/\n/g, '<br>')}</div>
+    </div>` : ''}
+
+    <div class="footer">
+      This is an automated error report from AgentWeb. Reply-To is set to the customer's email.
+    </div>
+  </div>
+</body>
+</html>
+    `;
+
+    const oncallEmails = await settingsService.getJsonArraySetting('oncall_emails', ['ruiw@agentweb.pro']);
+
+    await resendService.sendEmail({
+      from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
+      to: oncallEmails,
+      subject: emailSubject,
+      html: emailHtml,
+      replyTo: user.email
+    });
+
+    res.json({ success: true, message: "Error report sent successfully" });
+  } catch (error) {
+    console.error("Error sending error report:", error);
+    res.status(500).json({ message: "Failed to send error report" });
   }
 });
 

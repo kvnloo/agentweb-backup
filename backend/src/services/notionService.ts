@@ -3,6 +3,15 @@ import { getSecret } from '../utils/secretsManager';
 export interface NotionCredentials {
   apiToken: string;
   userGuidePageId: string;
+  sprintTasksDatabaseId?: string;
+}
+
+// Data source ID for "Sprint Tasks - Argusoft" (used with API v2025-09-03)
+const DEFAULT_SPRINT_TASKS_DB_ID = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
+
+export async function getSprintTasksDatabaseId(): Promise<string> {
+  const creds = await getNotionCredentials();
+  return creds.sprintTasksDatabaseId || DEFAULT_SPRINT_TASKS_DB_ID;
 }
 
 const credentialsCache: Record<string, NotionCredentials> = {};
@@ -214,6 +223,84 @@ export async function deleteBlock(blockId: string): Promise<any> {
   return notionFetch(`/blocks/${blockId}`, {
     method: 'DELETE',
   });
+}
+
+// --- Oncall item creation ---
+
+export interface CreateOncallItemParams {
+  title: string;
+  description: string;
+  additionalTags?: string[];
+  context?: Record<string, any>;
+}
+
+export interface CreateOncallItemResult {
+  pageId: string;
+  notionUrl: string;
+}
+
+export async function createOncallItem(params: CreateOncallItemParams): Promise<CreateOncallItemResult> {
+  const { apiToken } = await getNotionCredentials();
+  const databaseId = await getSprintTasksDatabaseId();
+  const { title, description, additionalTags = [], context } = params;
+
+  const tags = [{ name: 'Oncall' }, ...additionalTags.map(t => ({ name: t }))];
+
+  const children: any[] = [
+    {
+      object: 'block',
+      type: 'paragraph',
+      paragraph: { rich_text: [{ type: 'text', text: { content: description } }] },
+    },
+  ];
+
+  if (context && Object.keys(context).length > 0) {
+    children.push({
+      object: 'block',
+      type: 'heading_3',
+      heading_3: { rich_text: [{ type: 'text', text: { content: 'Context' } }] },
+    });
+    for (const [key, value] of Object.entries(context)) {
+      const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+      const truncated = displayValue.length > 500 ? displayValue.slice(0, 500) + '...' : displayValue;
+      children.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ type: 'text', text: { content: `${key}: ${truncated}` } }] },
+      });
+    }
+  }
+
+  // Use API version 2025-09-03 with data_source_id parent for Notion Projects compatibility
+  const res = await fetch(`${NOTION_API_BASE}/pages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiToken}`,
+      'Notion-Version': '2025-09-03',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      parent: { type: 'data_source_id', data_source_id: databaseId },
+      properties: {
+        'Name': { title: [{ text: { content: title } }] },
+        'Status': { status: { name: 'To-do' } },
+        'Tags': { multi_select: tags },
+        'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
+        'Move to Current Sprint': { checkbox: true },
+        'Owner': { people: [{ id: '1c8d872b-594c-816c-8935-00027d2a3a90' }] },
+      },
+      children,
+    }),
+  });
+  const data = await res.json();
+  if (data.object === 'error') {
+    throw new Error(`Notion API error: ${data.message}`);
+  }
+
+  const pageId: string = data.id;
+  const notionUrl = `https://notion.so/${pageId.replace(/-/g, '')}`;
+
+  return { pageId, notionUrl };
 }
 
 // --- Sync infrastructure ---

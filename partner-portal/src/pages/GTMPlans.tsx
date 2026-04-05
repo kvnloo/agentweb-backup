@@ -61,6 +61,7 @@ import {
   InsertDriveFile as InsertDriveFileIcon,
   Close as CloseIcon,
   RateReview as RateReviewIcon,
+  CheckBox as CheckBoxIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
@@ -198,6 +199,7 @@ export default function GTMPlans() {
   const [editDueDate, setEditDueDate] = useState<string>("");
   const [editDueDateValue, setEditDueDateValue] = useState<Date | null>(null);
   const [saving, setSaving] = useState(false);
+  const [markingItemDone, setMarkingItemDone] = useState<string | null>(null);
   const [constraintDialogOpen, setConstraintDialogOpen] = useState(false);
   const [constraintMessage, setConstraintMessage] = useState("");
   const [pendingConstraintUpdate, setPendingConstraintUpdate] = useState<{
@@ -595,6 +597,15 @@ export default function GTMPlans() {
       return { ...cat, items: sorted };
     });
     saveCommonItems(updated);
+  };
+
+  const handleMarkAsDone = async (planId: string, phaseId: string, workItemId: string) => {
+    setMarkingItemDone(workItemId);
+    try {
+      await performUpdate({ status: "completed" }, planId, phaseId, workItemId);
+    } finally {
+      setMarkingItemDone(null);
+    }
   };
 
   const handleStartSession = async (planId: string, phaseId: string, workItemId: string) => {
@@ -2527,6 +2538,22 @@ export default function GTMPlans() {
                                     </TableCell>
                                     <TableCell align="right">
                                       <Box sx={{ display: "flex", gap: 0.5, justifyContent: "flex-end" }}>
+                                        {item.status !== "completed" && item.status !== "skipped" && item.status !== "agent_in_progress" && (
+                                          <Tooltip title="Mark as Done">
+                                            <IconButton
+                                              size="small"
+                                              color="success"
+                                              disabled={markingItemDone === item.id}
+                                              onClick={() => handleMarkAsDone(plan.planId, phase.id, item.id)}
+                                            >
+                                              {markingItemDone === item.id ? (
+                                                <CircularProgress size={18} />
+                                              ) : (
+                                                <CheckBoxIcon fontSize="small" />
+                                              )}
+                                            </IconButton>
+                                          </Tooltip>
+                                        )}
                                         {item.status === "pending" && (
                                           <Tooltip title="Start in Agent Mode">
                                             <IconButton

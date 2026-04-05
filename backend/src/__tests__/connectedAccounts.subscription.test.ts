@@ -27,6 +27,7 @@ jest.mock('../utils/tokenUtils', () => ({
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     deleteAccount: jest.fn(),
+    getStatusesForAccounts: jest.fn().mockResolvedValue(new Map()),
   },
 }));
 

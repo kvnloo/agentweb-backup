@@ -1,3 +1,41 @@
+# April 4, 2026: Investigation — Axios Supply Chain Attack (AWS Security Alert)
+
+## Background
+
+Received an AWS Security email warning that our organization "may have been the target of potentially inappropriate activity" related to malicious axios npm package versions `1.14.1` and `0.30.4`, published March 30–31, 2026 via a hijacked maintainer account.
+
+AWS recommended checking for network connections to `142.11.206.73:8000` during March 31, 5:15–8:15 PM PDT, rotating credentials on affected hosts, and auditing CloudTrail.
+
+## Investigation
+
+### Axios versions in our lock files
+
+| Component | Resolved axios version | Status |
+|---|---|---|
+| backend | 1.9.0 | Safe |
+| partner-portal | 1.11.0 | Safe |
+| customer-portal | 1.11.0 | Safe |
+| agent-engine | Python only — no axios | Not applicable |
+
+The `1.14.1` hits that appeared in the lock file grep were for `tslib` (a TypeScript utility), not axios.
+
+### Why we were never exposed
+
+- **`npm ci` everywhere**: CI pipeline and cloud-dev test env both use `npm ci`, which installs exact lock file versions — no semver range resolution occurs.
+- **Lock files were clean during the attack window**: Confirmed via `git show 32c1b508:backend/package-lock.json` — backend had axios `1.9.0` as of the March 31 commit. No package-lock.json changes landed during March 30–31.
+- **EB deploys bundle the lock file**: The zip artifact includes `package-lock.json`, so EB also installs only locked versions.
+- **Agent engine is Python**: No axios dependency at all.
+
+### AWS Health Dashboard
+
+Checked the Affected Resources tab — no resources listed. This confirms the alert was a false alarm. AWS sent these notifications broadly to any account that uses axios as a dependency, as a precautionary measure.
+
+## Conclusion
+
+No compromise. No credential rotation needed. No affected hosts.
+
+The `package.json` semver ranges (`^1.9.0`, `^1.7.9`) would theoretically allow resolving to `1.14.1` under a bare `npm install`, but since all install paths use `npm ci` the lock file versions were always used. The malicious versions were removed from npm shortly after discovery. Low-priority housekeeping: update lock files to pin axios past `1.14.1` when convenient.
+
 # March 29, 2026: Investigation — Sonnet 4.6 vs Opus 4.6 Cost & Quality Comparison for Agent Mode
 
 ## Problem
@@ -2273,6 +2311,41 @@ cd backend && npm list react react-dom
 ### References
 - CVE-2025-55182 Scanner: https://cve-2025-55182.com/
 - React Security Advisory: https://github.com/facebook/react/security
+
+## MAL-2026-2307 (Axios Supply Chain Attack) Security Check
+
+**Date:** 2026-04-02 | **Status:** ✅ Not affected
+
+### Summary
+
+On 2026-03-31, the `axios` npm package was compromised and malicious versions `0.30.4` and `1.14.1` were published to npm. The compromised versions included a malicious dependency called `plain-crypto-js` that installs a **Remote Access Trojan (RAT)**. The RAT phones home to `sfrclak.com:8000/6202033` (IP `142.11.206.73`).
+
+According to the advisory: _"Any computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer."_
+
+### Affected Versions
+
+- `axios@0.30.4`
+- `axios@1.14.1`
+
+### AgentWeb Findings
+
+All three components were checked and are **not affected**:
+
+| Component | Declared | Installed | Status |
+|-----------|----------|-----------|--------|
+| backend | `^1.9.0` | **1.9.0** | ✅ Safe |
+| partner-portal | `^1.7.9` | **1.11.0** | ✅ Safe |
+| customer-portal | `^1.9.0` | **1.11.0** | ✅ Safe |
+
+Additional IOC checks (all clean):
+- No `plain-crypto-js` found in any `package-lock.json` or `node_modules`
+- No references to `sfrclak.com` or `142.11.206.73` anywhere in the codebase
+
+### References
+
+- OSV Advisory: [MAL-2026-2307](https://osv.dev/vulnerability/MAL-2026-2307)
+- GitHub Advisory: [GHSA-fw8c-xr5c-95f9](https://github.com/advisories/GHSA-fw8c-xr5c-95f9)
+- StepSecurity Blog: https://www.stepsecurity.io/blog/axios-compromised-on-npm-malicious-versions-drop-remote-access-trojan
 
 ## Dec 15, 2025
 to support pdf file uploads for Knowledge Base, add OCR Parser for PDF file formats so that Vertex AI Search will uses this parser to parse PDF files.

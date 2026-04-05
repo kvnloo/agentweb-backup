@@ -72,9 +72,9 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'View market research reports'
   },
   {
-    path: '/email-templates',
-    label: 'Email Templates',
-    description: 'Create and manage email templates'
+    path: '/templates',
+    label: 'Templates',
+    description: 'Create and manage email and landing page templates'
   },
   {
     path: '/knowledge-base',

@@ -294,4 +294,50 @@ describe("Admin CRM sync routes", () => {
     expect(res.body.lastSyncAt).toBe("2026-02-10T00:00:00.000Z");
     expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
   });
+
+  it("POST /api/admin/crm-sync/:source/start preserves autoSync flag when updating lastSyncAt", async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: "admin_crm_sync_users",
+      settingValue: JSON.stringify({
+        listId: "list-1",
+        lastSyncAt: "2026-02-10T00:00:00.000Z",
+        autoSync: true,
+      }),
+    } as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: "list-1",
+      publicAccessEnabled: true,
+    } as any);
+    mockUserDb.getAllUsers.mockResolvedValue([
+      {
+        userId: "u1",
+        email: "u1@example.com",
+        isAdmin: false,
+        isActive: true,
+        roles: ["customer"],
+        createdAt: "2026-02-10T01:00:00.000Z",
+      },
+    ] as any);
+    mockCrmDb.batchCreateLeads.mockResolvedValue({
+      successCount: 1,
+      newCount: 1,
+      mergedCount: 0,
+      errorCount: 0,
+      errors: [],
+    } as any);
+    mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+    await request(app)
+      .post("/api/admin/crm-sync/users/start")
+      .set("Authorization", "Bearer test-token")
+      .send({ forceFullSync: false })
+      .expect(200);
+
+    expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+      "admin_crm_sync_users",
+      expect.stringContaining('"autoSync":true'),
+      expect.any(String),
+      expect.any(String)
+    );
+  });
 });
