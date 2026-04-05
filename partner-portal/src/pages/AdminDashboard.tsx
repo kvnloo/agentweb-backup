@@ -56,6 +56,8 @@ import McpServersTab from "../components/admin/McpServersTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
+import RevenueTab from "../components/admin/RevenueTab";
+import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import {
   UserGrowthChart,
@@ -672,6 +674,8 @@ export default function AdminDashboard() {
     'emma-settings': 15,
     'scoring-judges': 16,
     'crm': 17,
+    'revenue': 18,
+    'funnel': 19,
     'alert-emails': 18,
   };
   
@@ -2706,6 +2710,8 @@ export default function AdminDashboard() {
             <Tab label="Emma Chat Settings" {...a11yProps(15)} />
             <Tab label="Scoring Judges" {...a11yProps(16)} />
             <Tab label="CRM" {...a11yProps(17)} />
+            <Tab label="Revenue" {...a11yProps(18)} />
+            <Tab label="Funnel" {...a11yProps(19)} />
             <Tab label="Alert Emails" {...a11yProps(18)} />
           </Tabs>
         </Box>
@@ -5401,8 +5407,14 @@ export default function AdminDashboard() {
         <TabPanel value={tabValue} index={17}>
           <CrmTab />
         </TabPanel>
-
         <TabPanel value={tabValue} index={18}>
+          <RevenueTab />
+        </TabPanel>
+        <TabPanel value={tabValue} index={19}>
+          <FunnelTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={20}>
           <AlertEmailsTab />
         </TabPanel>
       </Paper>

@@ -57,14 +57,19 @@ const mockAuth = jest.fn((req: any, _res: any, next: any) => {
   }
 });
 
+const mockRequireAdmin = jest.fn((_req: any, _res: any, next: any) => next());
+
 jest.mock('../middleware/auth', () => ({
   authenticateToken: mockAuth,
+  requireAdmin: mockRequireAdmin,
   AuthenticatedRequest: {},
 }));
 
 jest.mock('../controllers/stripeController', () => ({
   handleWebhook: jest.fn(),
   listProducts: jest.fn(),
+  reconcile: jest.fn((_req: any, res: any) => res.json({ ok: true })),
+  getPaymentHistory: jest.fn((_req: any, res: any) => res.json([])),
 }));
 
 // Set env vars before importing route
