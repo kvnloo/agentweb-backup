@@ -588,7 +588,7 @@ function OverviewView({
   onChannelClick: (channel: ChannelTab) => void;
 }) {
   // Build aggregate stages from all channels
-  const aggregateStages = buildAggregateStages(data.channels);
+  // KPI summary for overview
 
   return (
     <>
@@ -602,14 +602,27 @@ function OverviewView({
         <ChannelComparisonTable comparison={data.comparison} onChannelClick={onChannelClick} />
       )}
 
-      {/* Aggregate Funnel Chart */}
-      {aggregateStages.length > 0 && (
-        <FunnelBarChart
-          stages={aggregateStages}
-          constraintStage={data.aggregate.overallConstraint?.stage}
-          title="Aggregate Funnel (All Channels)"
-        />
-      )}
+      {/* Summary KPIs */}
+      <Paper sx={{ p: 3, mb: 2 }}>
+        <Grid container spacing={3}>
+          <Grid item xs={4}>
+            <Typography variant="subtitle2" color="text.secondary">Total Leads (all channels)</Typography>
+            <Typography variant="h4">{formatNumber(data.aggregate.totalLeads)}</Typography>
+          </Grid>
+          <Grid item xs={4}>
+            <Typography variant="subtitle2" color="text.secondary">Total Paid Customers</Typography>
+            <Typography variant="h4">{formatNumber(data.aggregate.totalPaid)}</Typography>
+          </Grid>
+          <Grid item xs={4}>
+            <Typography variant="subtitle2" color="text.secondary">Overall Conversion</Typography>
+            <Typography variant="h4">
+              {data.aggregate.totalLeads > 0
+                ? `${((data.aggregate.totalPaid / data.aggregate.totalLeads) * 100).toFixed(1)}%`
+                : '—'}
+            </Typography>
+          </Grid>
+        </Grid>
+      </Paper>
     </>
   );
 }

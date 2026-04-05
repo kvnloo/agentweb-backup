@@ -496,6 +496,12 @@ function buildLinkedInPipeline(
     : [errorSource("Stripe", "Failed to fetch subscription data")];
   stages.push(makeStage("Paid", userData.data.paidUsers, 0, meetingData.totalMeetings, paidSources));
 
+  // 7. Retained
+  const retainedSources = userData.status === "ok"
+    ? [safeSource("Stripe (month 2+ subscribers)", userData.data.retainedUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Retained", userData.data.retainedUsers, 0, userData.data.paidUsers, retainedSources));
+
   return {
     channel: "linkedin",
     displayName: "LinkedIn",
@@ -533,6 +539,12 @@ function buildOutboundPipeline(
     ? [safeSource("Stripe (active/trialing)", userData.data.paidUsers)]
     : [errorSource("Stripe", "Failed to fetch subscription data")];
   stages.push(makeStage("Paid", userData.data.paidUsers, 0, meetingData.totalMeetings, paidSources));
+
+  // 6. Retained
+  const retainedSources = userData.status === "ok"
+    ? [safeSource("Stripe (month 2+ subscribers)", userData.data.retainedUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Retained", userData.data.retainedUsers, 0, userData.data.paidUsers, retainedSources));
 
   return {
     channel: "outbound",
@@ -583,6 +595,12 @@ function buildPaidAdsPipeline(
     ? [safeSource("Stripe (active/trialing)", userData.data.paidUsers)]
     : [errorSource("Stripe", "Failed to fetch subscription data")];
   stages.push(makeStage("Paid", userData.data.paidUsers, 0, meetingData.totalMeetings, paidSources));
+
+  // 6. Retained
+  const retainedSources = userData.status === "ok"
+    ? [safeSource("Stripe (month 2+ subscribers)", userData.data.retainedUsers)]
+    : [errorSource("Stripe", "Failed to fetch subscription data")];
+  stages.push(makeStage("Retained", userData.data.retainedUsers, 0, userData.data.paidUsers, retainedSources));
 
   return {
     channel: "paid_ads",
