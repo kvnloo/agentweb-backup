@@ -40,12 +40,26 @@ export const stripeService = {
     if (!cancelUrl) throw new Error('cancelUrl is required');
 
     const s = getStripeOrThrow();
+
+    // Anchor all new subscriptions to the 1st of the next month.
+    // The user pays a prorated amount for the remainder of the current month,
+    // then full price on the 1st going forward.
+    const now = new Date();
+    const firstOfNextMonth = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0)
+    );
+    const billingCycleAnchor = Math.floor(firstOfNextMonth.getTime() / 1000);
+
     return s.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
       metadata: { userId },
+      subscription_data: {
+        billing_cycle_anchor: billingCycleAnchor,
+        proration_behavior: 'create_prorations',
+      },
     });
   },
 
@@ -400,6 +414,46 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
 }
 
 /**
+ * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
+ */
+export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for invoice.payment_succeeded. customer=${customerId}`);
+    return;
+  }
+
+  const subscriptionId = typeof invoice.subscription === 'string'
+    ? invoice.subscription
+    : invoice.subscription?.id || null;
+
+  const updateData: Record<string, any> = {
+    subscription_status: 'active',
+    has_payment_method: true,
+  };
+
+  // Backfill stripe_subscription_id if user doesn't have one yet
+  if (!user.stripe_subscription_id && subscriptionId) {
+    updateData.stripe_subscription_id = subscriptionId;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
+
+  console.log(
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+  );
+}
+
+/**
  * Handle customer.subscription.deleted — mark subscription as canceled.
  */
 export async function handleSubscriptionDeleted(subscription: any): Promise<void> {
@@ -423,6 +477,44 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
   });
 
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
+}
+
+// ─── invoice.payment_succeeded ──────────────────────────────────────────
+
+/**
+ * Handle invoice.payment_succeeded webhook event.
+ * Confirms payment went through: sets status to active, backfills
+ * stripe_subscription_id if missing, and sets has_payment_method.
+ */
+export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.warn('[STRIPE] invoice.payment_succeeded with no customer ID — skipping');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] invoice.payment_succeeded for unknown customer ${customerId} — skipping`);
+    return;
+  }
+
+  const updates: Record<string, any> = {
+    subscription_status: 'active',
+    has_payment_method: true,
+  };
+
+  // Backfill stripe_subscription_id if missing
+  const subId = typeof invoice.subscription === 'string' ? invoice.subscription : null;
+  if (subId && !user.stripe_subscription_id) {
+    updates.stripe_subscription_id = subId;
+  }
+
+  await userDb.updateUser(user.userId, updates);
+  console.log(`[STRIPE] invoice.payment_succeeded: user ${user.userId} → active`);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
