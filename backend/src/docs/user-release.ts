@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-05',
+    changes: [
+      'Admin: Chat History Time Range Now Filters by Session Start Time',
+      '- The get_chat_history tool previously returned old sessions whose metadata was recently updated (e.g. when a share link was accessed or scoring ran), causing stale sessions to appear in recent time-range queries',
+      '- Time ranges now correctly match when the session was created, not when it was last touched',
+      '- Session updatedAt timestamp now reflects the time of the last message only — metadata changes such as scoring, title edits, and share link access no longer advance it',
+    ],
+  },
+  {
     date: '2026-04-04',
     changes: [
       'Admin: Alert Emails Are Now Configurable',
