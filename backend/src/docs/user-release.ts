@@ -3704,6 +3704,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-06',
+    changes: [
+      'Emma Now Analyzes Images and Videos When Asked to "Read" Them',
+      '- Asking Emma to "read" an image now triggers visual analysis instead of a text extraction error',
+      '- Asking Emma to "read" a video now triggers video analysis using Gemini',
+      '- Emma correctly routes image files to describe_image and video files to describe_video automatically',
+    ],
+  },
+  {
     date: '2026-04-03',
     changes: [
       'Emma Can Now See Your Browser Screen',
