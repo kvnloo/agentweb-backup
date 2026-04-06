@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-06',
     changes: [
+      'Scheduled Tasks Now Respect Your Stated Volume Limits',
+      '- Fixed an issue where scheduled automation tasks (e.g. LinkedIn connection requests) would batch in small groups and pause for confirmation, even when a specific volume was requested',
+      '- Scheduled sessions are fully automated — the agent now executes the full stated quantity in a single run without stopping to ask "should I continue?"',
+      '- Confirmation prompts are now scoped to web browser automation tasks only (create_task_from_template), not to direct actions like sending invitations or posting',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
       'Admin: New Tool to Manage Judge System Prompts From Chat',
       '- Added manage_scoring_judges admin tool to Emma agent mode, allowing admins to view, update, reset, and manage custom judge system prompts directly from the chat interface',
       '- Supports 7 actions: get_default, update_default, reset_default, list, create, update, delete',
