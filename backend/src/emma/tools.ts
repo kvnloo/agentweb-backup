@@ -4949,7 +4949,13 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'read_user_guide_structure',
+  'update_user_guide_block',
+  'append_to_user_guide',
+  'delete_user_guide_block',
   'get_pr_digest',
+  'freeze_user_account',
+  'manage_scoring_judges',
 ];
 
 for (const toolName of bridgedToolNames) {
