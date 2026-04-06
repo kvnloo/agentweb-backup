@@ -4543,6 +4543,19 @@ export const crmDb = {
     }
   },
 
+  async updateLeadLinkedInSyncAt(listId: string, leadId: string, syncAt: string): Promise<void> {
+    const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { listId, leadId },
+      UpdateExpression: 'SET linkedinMessageSyncAt = :syncAt, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':syncAt': syncAt,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }).promise();
+  },
+
   async addLeadEngagement(listId: string, leadId: string, engagement: {
     eventType: string;
     eventData: any;
