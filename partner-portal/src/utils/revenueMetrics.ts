@@ -27,6 +27,8 @@ export interface RevenueSnapshot {
   activeSubscriptions: number;
   newSubscriptions: number;
   churnedSubscriptions: number;
+  customerChurnRate: number;
+  revenueChurnRate: number;
 }
 
 export interface RevenueMetrics {

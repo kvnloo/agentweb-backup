@@ -4677,8 +4677,8 @@ router.put("/alert-emails", async (req, res) => {
 
 router.get("/revenue-metrics", async (req, res) => {
   try {
-    const months = parseInt(req.query.months as string) || 6;
-    const data = await getRevenueMetrics(Math.min(months, 24));
+    const months = parseInt(req.query.months as string) || 24;
+    const data = await getRevenueMetrics(Math.min(months, 48));
     res.json(data);
   } catch (error: any) {
     console.error("Error fetching revenue metrics:", error.message);
