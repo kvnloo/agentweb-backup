@@ -143,6 +143,9 @@ interface LLMCallOptions {
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
 
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
+
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
   errorType: 'transient' | 'context_limit' | 'content_filter' | 'rate_limit' | 'unknown';
@@ -4177,15 +4180,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      // Reject image files — the LLM should use describe_image instead
-      const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.tif', '.ico', '.heic', '.heif', '.avif'];
       try {
         const parsedUrl = new URL(videoFileUrl);
-        const ext = path.extname(parsedUrl.pathname).toLowerCase();
-        if (imageExtensions.includes(ext)) {
+        const ext = path.extname(parsedUrl.pathname).toLowerCase().replace(/^\./, '');
+        if (IMAGE_EXTENSIONS.has(ext)) {
           return {
             success: false,
-            message: `This appears to be an image file (${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+            message: `This appears to be an image file (.${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
           };
         }
       } catch {
@@ -13727,6 +13728,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Determine file type from URL
       const urlPath = new URL(fileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
+
+      if (IMAGE_EXTENSIONS.has(extension)) {
+        return {
+          success: false,
+          message: `This is an image file (.${extension}). Use the describe_image tool to analyze its visual content instead.`,
+          error: 'Image files must be analyzed with describe_image, not read_file_content'
+        };
+      }
+
+      if (VIDEO_EXTENSIONS.has(extension)) {
+        return {
+          success: false,
+          message: `This is a video file (.${extension}). Use the describe_video tool to analyze its content instead.`,
+          error: 'Video files must be analyzed with describe_video, not read_file_content'
+        };
+      }
 
       // Fetch the file content
       const response = await axios.get(fileUrl, {
