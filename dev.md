@@ -1,3 +1,93 @@
+# April 6, 2026: Investigation — Claude Code Source Analysis (Agent Architecture Patterns)
+
+## Background
+
+Anthropic's Claude Code CLI source was recently deobfuscated and analyzed by the community (~386K–500K lines, ~1,900 files). Two primary analysis repositories surfaced:
+- `github.com/chat2dev/ClaudeCodeAnalysis` — 7-part architectural breakdown
+- `github.com/luzhenqian/Claude-Harness` — 31-article deep-dive series
+
+Investigated what patterns could be borrowed into AgentWeb's agent infrastructure (`agentModeService.ts`, `toolRegistry.ts`, Emma pipeline).
+
+## Key Findings
+
+### 1. Tiered Context Compaction (three layers, zero-cost first two)
+
+Claude Code uses a three-layer compaction strategy triggered before context overflow:
+
+- **Layer 1 (free)**: Replace old `tool_result` content with `[result cleared]` placeholders. No LLM call — the model has already acted on these results.
+- **Layer 2 (free)**: Use a pre-built "session memory" object maintained in the background after each turn (key decisions, completed actions, open questions). No extra API call — the summary is ready when needed.
+- **Layer 3 (LLM call)**: Full summarization via a forked agent with an `<analysis>`/`<summary>` prompt structure. Strips reasoning from the stored output.
+
+**Circuit breaker**: After 3 consecutive compaction failures, auto-compaction is disabled for the session. This was added after a production incident where 1,279 sessions experienced 50–3,272 consecutive failures, wasting ~250K API calls/day.
+
+### 2. Hybrid Token Counting
+
+Rather than re-estimating the full message history every turn (slow) or using pure heuristics (inaccurate), Claude Code uses the last API response's `usage.prompt_tokens` as an anchor and only estimates deltas for new messages (~4 chars/token). Four pressure thresholds: warning → auto-compact → blocking → effective-window.
+
+AgentWeb already captures `response.usage` at `agentModeService.ts:1429-1445` — this data is available to implement the same pattern without any API changes.
+
+### 3. Tool Safety Metadata + Smart Concurrency
+
+Each tool declares `isConcurrencySafe(input)`, `isReadOnly(input)`, and optional `isDestructive(input)` at the type level. The `StreamingToolExecutor` runs read-only tools in parallel and serializes write tools. Critically, `isConcurrencySafe` accepts the actual input (same tool can be safe or unsafe depending on what it's operating on).
+
+AgentWeb's `ToolRegistry` currently has no such metadata — `AgentTool` is `{name, definition, execute}` only. Tools already run in parallel (`agentModeService.ts:1503-1505`) but with no write-safety guarantee.
+
+### 4. Tool Pair Integrity on Context Trim
+
+When pruning old messages, Claude Code enforces that a `tool_use` (assistant message) is never left without its matching `tool_result`. An orphaned `tool_use` causes certain LLMs (especially Claude-family) to return an API error. The function `adjustIndexToPreserveAPIInvariants` enforces this.
+
+AgentWeb's `trimToolMessagesForContext` (`agentModeService.ts:13144`) only trims `tool` role messages — it does not check or remove the paired assistant `tool_calls` block. This is a latent correctness issue for very long sessions.
+
+### 5. Analysis-Output XML Separation in LLM Prompts
+
+For complex structured outputs, Claude Code prompts include `<analysis>` (reasoning, gets stripped) and `<summary>` (output, gets stored) tags. The analysis block gets stripped before storing — the model reasons without the reasoning eating into future context budget. This reliably improves quality for structured generation (work plans, summaries, reports).
+
+### 6. Max-Tokens Recovery Message
+
+Claude Code's continuation injection explicitly bans preamble:
+> *"Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."*
+
+AgentWeb's current version (`agentModeService.ts:1463`) says *"Please continue exactly where you left off"* — allows the model to start with an apology and restatement before resuming.
+
+### 7. Error Withholding Pattern
+
+Recoverable errors (`max_output_tokens`, `prompt_too_long`, media-size) are withheld from the caller while recovery is attempted. The error is only surfaced if all recovery strategies fail. This prevents SDK consumers from terminating sessions on transient errors.
+
+AgentWeb has basic max-tokens continuation (3x) and backup model fallback, but `prompt_too_long` has no recovery path — it propagates immediately to the user.
+
+## Current AgentWeb Gaps vs. Claude Code
+
+| Area | AgentWeb Current | Claude Code Pattern |
+|------|-----------------|---------------------|
+| Context compaction | `trimToolMessagesForContext` (crude truncation) | 3-layer tiered strategy with circuit breaker |
+| Token awareness | None | Hybrid counting + 4 pressure thresholds |
+| Tool safety metadata | None (`AgentTool` has no `isReadOnly`) | `isConcurrencySafe`, `isReadOnly`, `isDestructive` per-tool |
+| Tool pair integrity | Not enforced | `adjustIndexToPreserveAPIInvariants` |
+| Prompt quality | Direct prompts | `<analysis>`/`<output>` separation for structured generation |
+| Recovery message | Allows preamble | Explicitly bans apology/recap |
+| `prompt_too_long` | Propagates immediately | Reactive compaction + retry |
+
+## Decision
+
+**No immediate adoption** — AgentWeb sessions are not yet long enough to make context compaction a user-visible problem. No urgent need to invest the engineering time.
+
+**Future work signal**: If any of the following happen, revisit these patterns:
+
+- Long agent sessions (>50 turns) start failing or degrading in quality
+- Context window errors appear in production logs (`prompt_too_long` / 400 errors)
+- Users report agents "forgetting" earlier context in long sessions
+- We add sub-agent / coordinator-worker orchestration (then tool safety metadata becomes critical)
+
+**Prioritized if/when adopted** (easiest wins first):
+1. Fix max-tokens recovery message (1-liner, `agentModeService.ts:1463`)
+2. Tool pair integrity in `trimToolMessagesForContext` (prevents latent API errors)
+3. `<analysis>`/`<output>` separation in work plan / GTM plan generation
+4. `isReadOnly` / `isDestructive` metadata on `AgentTool` interface
+5. Token pressure thresholds using existing `response.usage` data
+6. Full tiered context compaction (largest investment, highest long-session impact)
+
+---
+
 # April 4, 2026: Investigation — Axios Supply Chain Attack (AWS Security Alert)
 
 ## Background
