@@ -1385,6 +1385,7 @@ export async function generateSessionResponse(
           if (scheduleIdMatch) {
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
+          systemPrompt += `\n\n[AUTOMATED UNATTENDED EXECUTION]\nThis is a scheduled, automated run. No human is present. You MUST:\n- Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.\n- If the task specifies a volume or range (e.g. "send 30-40 connection requests", "post 5 times"), treat the FULL stated amount as your target for this session. Do NOT split into sub-batches and pause between them.\n- Never ask "should I continue?" or "shall I proceed with the next batch?" — just execute continuously until the stated goal is reached.\n- If you encounter an unrecoverable error, stop and report it in your final message. Otherwise, keep going.`;
         }
       }
 

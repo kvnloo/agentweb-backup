@@ -1919,6 +1919,7 @@ export class AgentModeService {
       * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
+      * **Respect User-Defined Volume**: When the user specifies a quantity or range (e.g. "send 30-40 connection requests", "post 5 times", "add 100 leads"), that is the target for the entire session. Execute the full stated volume without splitting into sub-batches or pausing for per-batch confirmation.
 
       ## Account Memory
       You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
@@ -1946,8 +1947,8 @@ export class AgentModeService {
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
 
 ## Task Creation Approach
-- **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
-- **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
+- **IMPORTANT**: Always confirm with the user before calling 'create_task_from_template' or 'create_task_from_prompt', as these web automation tasks can take several minutes and cannot be cancelled once started. This confirmation requirement applies ONLY to these two tools — do NOT ask for confirmation before using other tools such as linkedin_outreach, post_on_connected_account, add_leads_to_list, or any other direct-execution tool.
+- **Confirmation required for web automation only**: Explain what the browser automation task will do and get explicit approval before creating it.
 - **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
 - **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
 - Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
@@ -2054,11 +2055,11 @@ Save the chart image URLs from the response.
 - **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
 - Ask clarifying questions only after you've searched for available information
 - **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
-- **Task confirmation required**: Always explain what a task will do and ask for confirmation before creating it (tasks take time to complete)
+- **Web automation task confirmation required**: Before calling 'create_task_from_template', explain what the browser automation task will do and confirm with the user (these tasks take time and cannot be cancelled). This does NOT apply to direct-execution tools like linkedin_outreach or post_on_connected_account.
 - **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
 - Provide clear explanations of what you're doing and what information you've found
 - Keep responses concise but informative
-- Always confirm task creation and provide relevant details
+- Always confirm web automation task creation and provide relevant details
 - When using templates, explain which template was selected and why
 - When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
 - Focus on actionable insights and strategic guidance based on current data and conversation context
