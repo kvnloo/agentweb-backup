@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-06',
     changes: [
+      'Set Up Website Scanning Directly from Brand Guidelines',
+      '- Added a Website Domain field to Brand Guidelines so you can record your domain without waiting for an admin to configure SEO domains',
+      '- A new "Setup Website Scan" button opens Emma pre-loaded with a message to create a recurring website scan schedule',
+      '- Emma checks whether a scan schedule already exists before creating a new one',
+      '- The scan focuses on issues observable directly from the site: broken links, missing meta tags, layout problems, slow load times, and unclear copy',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
       'Scheduled Tasks Now Respect Your Stated Volume Limits',
       '- Fixed an issue where scheduled automation tasks (e.g. LinkedIn connection requests) would batch in small groups and pause for confirmation, even when a specific volume was requested',
       '- Scheduled sessions are fully automated — the agent now executes the full stated quantity in a single run without stopping to ask "should I continue?"',
