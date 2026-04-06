@@ -2,93 +2,83 @@ import { v4 as uuidv4 } from 'uuid';
 import { dynamodb } from '../config/aws';
 import { CRMTrigger, CRMTriggerLog } from '../types/crmTriggers';
 import { TABLE_PREFIX } from '../config/constants';
+import { crmDb } from './db';
 
-const TRIGGERS_TABLE = `${TABLE_PREFIX}AW-CRMTriggers`;
 const LOGS_TABLE = `${TABLE_PREFIX}AW-CRMTriggerLogs`;
 
 const TTL_90_DAYS_SECONDS = 90 * 24 * 60 * 60;
+
+const MAX_TRIGGERS = 20;
 
 const generateTriggerId = () => `trig_${uuidv4()}`;
 const generateLogId = () => `tlog_${uuidv4()}`;
 
 export const crmTriggerDb = {
+  // ── Trigger CRUD (embedded in list record) ──────────────────────────────
+
+  async getTriggersByListId(listId: string): Promise<CRMTrigger[]> {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return [];
+    return Array.isArray(list.triggers) ? list.triggers : [];
+  },
+
+  async getTriggerById(triggerId: string, listId: string): Promise<CRMTrigger | null> {
+    const triggers = await this.getTriggersByListId(listId);
+    return triggers.find((t) => t.triggerId === triggerId) ?? null;
+  },
+
   async createTrigger(
     trigger: Omit<CRMTrigger, 'triggerId' | 'createdAt' | 'updatedAt'>
   ): Promise<CRMTrigger> {
+    const triggers = await this.getTriggersByListId(trigger.listId);
+    if (triggers.length >= MAX_TRIGGERS) {
+      throw new Error(`Maximum of ${MAX_TRIGGERS} triggers per list`);
+    }
+
     const now = new Date().toISOString();
-    const item: CRMTrigger = {
+    const newTrigger: CRMTrigger = {
       ...trigger,
       triggerId: generateTriggerId(),
       createdAt: now,
       updatedAt: now,
     };
 
-    await dynamodb
-      .put({ TableName: TRIGGERS_TABLE, Item: item })
-      .promise();
+    await crmDb.updateLeadList(trigger.listId, {
+      triggers: [...triggers, newTrigger],
+    });
 
-    return item;
-  },
-
-  async getTriggersByListId(listId: string): Promise<CRMTrigger[]> {
-    const result = await dynamodb
-      .query({
-        TableName: TRIGGERS_TABLE,
-        IndexName: 'listId-index',
-        KeyConditionExpression: 'listId = :listId',
-        ExpressionAttributeValues: { ':listId': listId },
-      })
-      .promise();
-
-    return (result.Items || []) as CRMTrigger[];
-  },
-
-  async getTriggerById(triggerId: string): Promise<CRMTrigger | null> {
-    const result = await dynamodb
-      .get({ TableName: TRIGGERS_TABLE, Key: { triggerId } })
-      .promise();
-
-    return (result.Item as CRMTrigger) || null;
+    return newTrigger;
   },
 
   async updateTrigger(
     triggerId: string,
+    listId: string,
     updates: Partial<Omit<CRMTrigger, 'triggerId' | 'createdAt'>>
   ): Promise<CRMTrigger> {
-    const now = new Date().toISOString();
-    const fields = { ...updates, updatedAt: now };
+    const triggers = await this.getTriggersByListId(listId);
+    const idx = triggers.findIndex((t) => t.triggerId === triggerId);
+    if (idx === -1) throw new Error('Trigger not found');
 
-    const setExpressions: string[] = [];
-    const expressionAttributeNames: Record<string, string> = {};
-    const expressionAttributeValues: Record<string, any> = {};
+    const updated: CRMTrigger = {
+      ...triggers[idx],
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    triggers[idx] = updated;
 
-    Object.entries(fields).forEach(([key, value]) => {
-      const attrName = `#${key}`;
-      const attrValue = `:${key}`;
-      setExpressions.push(`${attrName} = ${attrValue}`);
-      expressionAttributeNames[attrName] = key;
-      expressionAttributeValues[attrValue] = value;
-    });
-
-    const result = await dynamodb
-      .update({
-        TableName: TRIGGERS_TABLE,
-        Key: { triggerId },
-        UpdateExpression: `SET ${setExpressions.join(', ')}`,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: 'ALL_NEW',
-      })
-      .promise();
-
-    return result.Attributes as CRMTrigger;
+    await crmDb.updateLeadList(listId, { triggers });
+    return updated;
   },
 
-  async deleteTrigger(triggerId: string): Promise<void> {
-    await dynamodb
-      .delete({ TableName: TRIGGERS_TABLE, Key: { triggerId } })
-      .promise();
+  async deleteTrigger(triggerId: string, listId: string): Promise<void> {
+    const triggers = await this.getTriggersByListId(listId);
+    const filtered = triggers.filter((t) => t.triggerId !== triggerId);
+    if (filtered.length === triggers.length) throw new Error('Trigger not found');
+
+    await crmDb.updateLeadList(listId, { triggers: filtered });
   },
+
+  // ── Trigger Logs (separate AW-CRMTriggerLogs table, unchanged) ──────────
 
   async writeTriggerLog(
     log: Omit<CRMTriggerLog, 'logId'>

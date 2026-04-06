@@ -3067,6 +3067,7 @@ export const crmDb = {
             { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
           ]),
           ...(listType ? { listType } : {}),
+          triggers: [],
         },
       };
 
@@ -3163,6 +3164,7 @@ export const crmDb = {
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       listType?: 'sales' | 'customers';
+      triggers?: any[];
     }
   ) {
     try {
@@ -3264,6 +3266,12 @@ export const crmDb = {
         expressionAttributeNames['#listType'] = 'listType';
         updateExpressions.push('#listType = :listType');
         expressionAttributeValues[':listType'] = updates.listType;
+      }
+
+      if (updates.triggers !== undefined) {
+        expressionAttributeNames['#triggers'] = 'triggers';
+        updateExpressions.push('#triggers = :triggers');
+        expressionAttributeValues[':triggers'] = updates.triggers;
       }
 
       if (updateExpressions.length === 0) {

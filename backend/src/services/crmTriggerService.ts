@@ -1,5 +1,4 @@
 import { LeadEvent, CRMTrigger } from '../types/crmTriggers';
-import { crmTriggerCache } from './crmTriggerCache';
 import { crmTriggerDb } from './crmTriggerDb';
 import { evaluateExpression } from './crmTriggerEvaluator';
 import { runTriggerAction } from './crmTriggerActionRunner';
@@ -45,16 +44,20 @@ export async function fireTriggers(
   list?: Record<string, any>
 ): Promise<void> {
   try {
-    const allTriggers = await crmTriggerCache.getTriggersForList(listId);
-    const activeTriggers = allTriggers.filter(
-      (t) => t.enabled && normalizeEvent(t.event) === normalizeEvent(event)
-    );
-
-    // Fetch list and user once (needed for action runner context and legacy fallback)
+    // Fetch list and user once (needed for trigger evaluation and legacy fallback)
     const [resolvedList, resolvedUser] = await Promise.all([
       list ? Promise.resolve(list) : crmDb.getLeadListById(listId).catch(() => null),
       userDb.getUserById(userId).catch(() => null),
     ]);
+
+    // Read triggers directly from the list record
+    const allTriggers: CRMTrigger[] = Array.isArray(resolvedList?.triggers)
+      ? resolvedList.triggers
+      : [];
+
+    const activeTriggers = allTriggers.filter(
+      (t) => t.enabled && normalizeEvent(t.event) === normalizeEvent(event)
+    );
 
     if (activeTriggers.length === 0) {
       // No explicit triggers — run legacy alertEvents[] fallback if configured

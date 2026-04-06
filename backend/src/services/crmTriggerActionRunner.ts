@@ -36,6 +36,11 @@ async function runSendEmailAction(
         return { actionTaken: '', error: 'List owner email not available' };
       }
       toEmails = [user.email];
+    } else if (action.toType === 'lead') {
+      if (!lead?.email) {
+        return { actionTaken: '', error: 'Lead email not available' };
+      }
+      toEmails = [lead.email];
     } else {
       if (!action.toEmails || action.toEmails.length === 0) {
         return { actionTaken: '', error: 'No recipient emails configured' };
@@ -43,8 +48,16 @@ async function runSendEmailAction(
       toEmails = action.toEmails;
     }
 
-    const subject = substituteVariables(action.subjectTemplate || '', lead, eventData);
-    const body = substituteVariables(action.bodyTemplate || '', lead, eventData);
+    const subject = substituteVariables(
+      (action.subjectTemplate || '').replace(/\{\{event\}\}/g, trigger.event),
+      lead,
+      eventData
+    );
+    const body = substituteVariables(
+      (action.bodyTemplate || '').replace(/\{\{event\}\}/g, trigger.event),
+      lead,
+      eventData
+    );
 
     const from = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
 

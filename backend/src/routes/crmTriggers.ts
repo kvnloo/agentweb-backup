@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb } from '../services/db';
 import { crmTriggerDb } from '../services/crmTriggerDb';
-import { crmTriggerCache } from '../services/crmTriggerCache';
 import { validateExpression } from '../services/crmTriggerEvaluator';
 import { LeadEvent, TriggerAction } from '../types/crmTriggers';
 
@@ -44,8 +43,8 @@ function validateAction(action: any): string | null {
   if (!action.type) return 'action.type is required';
 
   if (action.type === 'send_email') {
-    if (!action.toType || !['list_owner', 'custom'].includes(action.toType)) {
-      return 'action.toType must be "list_owner" or "custom"';
+    if (!action.toType || !['list_owner', 'custom', 'lead'].includes(action.toType)) {
+      return 'action.toType must be "list_owner", "custom", or "lead"';
     }
     if (action.toType === 'custom') {
       if (!Array.isArray(action.toEmails) || action.toEmails.length === 0) {
@@ -137,27 +136,24 @@ router.post('/lists/:listId/triggers', async (req: Request, res: Response) => {
       return res.status(400).json({ message: actionError });
     }
 
-    // Enforce max triggers per list
-    const existing = await crmTriggerDb.getTriggersByListId(listId);
-    if (existing.length >= MAX_TRIGGERS_PER_LIST) {
-      return res
-        .status(400)
-        .json({ message: `Maximum of ${MAX_TRIGGERS_PER_LIST} triggers per list` });
+    try {
+      const trigger = await crmTriggerDb.createTrigger({
+        listId,
+        userId,
+        event,
+        name: name.trim(),
+        description: description?.trim(),
+        enabled: enabled !== false,
+        conditionExpression: expr,
+        action: action as TriggerAction,
+      });
+      res.status(201).json(trigger);
+    } catch (err: any) {
+      if (err.message?.includes('Maximum of')) {
+        return res.status(400).json({ message: err.message });
+      }
+      throw err;
     }
-
-    const trigger = await crmTriggerDb.createTrigger({
-      listId,
-      userId,
-      event,
-      name: name.trim(),
-      description: description?.trim(),
-      enabled: enabled !== false,
-      conditionExpression: expr,
-      action: action as TriggerAction,
-    });
-
-    crmTriggerCache.invalidate(listId);
-    res.status(201).json(trigger);
   } catch (err: any) {
     res.status(500).json({ message: err.message || 'Failed to create trigger' });
   }
@@ -176,8 +172,8 @@ router.get(
       if (!userId) return res.status(401).json({ message: 'Unauthorized' });
       if (!(await verifyListOwnership(listId, userId, res))) return;
 
-      const trigger = await crmTriggerDb.getTriggerById(triggerId);
-      if (!trigger || trigger.listId !== listId) {
+      const trigger = await crmTriggerDb.getTriggerById(triggerId, listId);
+      if (!trigger) {
         return res.status(404).json({ message: 'Trigger not found' });
       }
       res.json(trigger);
@@ -200,8 +196,8 @@ router.put(
       if (!userId) return res.status(401).json({ message: 'Unauthorized' });
       if (!(await verifyListOwnership(listId, userId, res))) return;
 
-      const existing = await crmTriggerDb.getTriggerById(triggerId);
-      if (!existing || existing.listId !== listId) {
+      const existing = await crmTriggerDb.getTriggerById(triggerId, listId);
+      if (!existing) {
         return res.status(404).json({ message: 'Trigger not found' });
       }
 
@@ -236,8 +232,7 @@ router.put(
         updates.action = action;
       }
 
-      const updated = await crmTriggerDb.updateTrigger(triggerId, updates);
-      crmTriggerCache.invalidate(listId);
+      const updated = await crmTriggerDb.updateTrigger(triggerId, listId, updates);
       res.json(updated);
     } catch (err: any) {
       res.status(500).json({ message: err.message || 'Failed to update trigger' });
@@ -258,13 +253,12 @@ router.delete(
       if (!userId) return res.status(401).json({ message: 'Unauthorized' });
       if (!(await verifyListOwnership(listId, userId, res))) return;
 
-      const existing = await crmTriggerDb.getTriggerById(triggerId);
-      if (!existing || existing.listId !== listId) {
+      const existing = await crmTriggerDb.getTriggerById(triggerId, listId);
+      if (!existing) {
         return res.status(404).json({ message: 'Trigger not found' });
       }
 
-      await crmTriggerDb.deleteTrigger(triggerId);
-      crmTriggerCache.invalidate(listId);
+      await crmTriggerDb.deleteTrigger(triggerId, listId);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ message: err.message || 'Failed to delete trigger' });
@@ -307,8 +301,8 @@ router.get(
       if (!userId) return res.status(401).json({ message: 'Unauthorized' });
       if (!(await verifyListOwnership(listId, userId, res))) return;
 
-      const trigger = await crmTriggerDb.getTriggerById(triggerId);
-      if (!trigger || trigger.listId !== listId) {
+      const trigger = await crmTriggerDb.getTriggerById(triggerId, listId);
+      if (!trigger) {
         return res.status(404).json({ message: 'Trigger not found' });
       }
 

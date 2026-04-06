@@ -540,7 +540,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType, triggers } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -569,6 +569,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       engagedOnly?: boolean;
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       listType?: 'sales' | 'customers';
+      triggers?: any[];
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -695,6 +696,30 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         return res.status(400).json({ message: 'listType is already set and cannot be changed' });
       }
       updates.listType = listType;
+    }
+
+    if (triggers !== undefined) {
+      if (!Array.isArray(triggers)) {
+        return res.status(400).json({ message: 'triggers must be an array' });
+      }
+      if (triggers.length > 20) {
+        return res.status(400).json({ message: 'Maximum of 20 triggers per list' });
+      }
+      for (const t of triggers) {
+        if (!t.triggerId || typeof t.triggerId !== 'string') {
+          return res.status(400).json({ message: 'Each trigger must have a triggerId string' });
+        }
+        if (!t.event || typeof t.event !== 'string') {
+          return res.status(400).json({ message: 'Each trigger must have an event string' });
+        }
+        if (typeof t.enabled !== 'boolean') {
+          return res.status(400).json({ message: 'Each trigger enabled must be a boolean' });
+        }
+        if (!t.action || typeof t.action.type !== 'string') {
+          return res.status(400).json({ message: 'Each trigger must have an action with a type' });
+        }
+      }
+      updates.triggers = triggers;
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);

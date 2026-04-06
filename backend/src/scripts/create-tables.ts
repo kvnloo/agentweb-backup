@@ -1843,7 +1843,6 @@ const main = async () => {
     await createBrowserCookiesTable();
     await createOrganizationsTable();
     await createScheduleTemplatesTable();
-    await createCRMTriggersTable();
     await createCRMTriggerLogsTable();
     await createPaymentHistoryTable();
     await createTempEmailsTable();
@@ -1968,48 +1967,6 @@ const createScheduleTemplatesTable = async () => {
         KeySchema: [
           { AttributeName: 'visibility', KeyType: 'HASH' },
           { AttributeName: 'category', KeyType: 'RANGE' },
-        ],
-        Projection: { ProjectionType: 'ALL' },
-      },
-    ],
-    BillingMode: 'PAY_PER_REQUEST',
-  };
-
-  try {
-    const result = await dynamodb.createTable(params).promise();
-    console.log(`Created ${params.TableName} table:`, result);
-  } catch (error: any) {
-    if (error.code === 'ResourceInUseException') {
-      console.log(`${params.TableName} table already exists`);
-    } else {
-      throw error;
-    }
-  }
-};
-
-const createCRMTriggersTable = async () => {
-  const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: `${TABLE_PREFIX}AW-CRMTriggers`,
-    AttributeDefinitions: [
-      { AttributeName: 'triggerId', AttributeType: 'S' },
-      { AttributeName: 'listId', AttributeType: 'S' },
-      { AttributeName: 'userId', AttributeType: 'S' },
-    ],
-    KeySchema: [
-      { AttributeName: 'triggerId', KeyType: 'HASH' },
-    ],
-    GlobalSecondaryIndexes: [
-      {
-        IndexName: 'listId-index',
-        KeySchema: [
-          { AttributeName: 'listId', KeyType: 'HASH' },
-        ],
-        Projection: { ProjectionType: 'ALL' },
-      },
-      {
-        IndexName: 'userId-index',
-        KeySchema: [
-          { AttributeName: 'userId', KeyType: 'HASH' },
         ],
         Projection: { ProjectionType: 'ALL' },
       },

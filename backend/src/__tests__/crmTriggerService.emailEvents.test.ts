@@ -6,17 +6,9 @@ jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
 }));
 
-jest.mock('../services/crmTriggerCache', () => ({
-  crmTriggerCache: {
-    getTriggersForList: jest.fn(),
-    invalidate: jest.fn(),
-  },
-}));
-
 jest.mock('../services/crmTriggerDb', () => ({
   crmTriggerDb: {
     writeTriggerLog: jest.fn().mockResolvedValue({}),
-    getTriggersByListId: jest.fn(),
   },
 }));
 
@@ -47,7 +39,6 @@ jest.mock('../server', () => ({
 }), { virtual: true });
 
 import { fireTriggers, fireTriggersByEmailEvent } from '../services/crmTriggerService';
-import { crmTriggerCache } from '../services/crmTriggerCache';
 import { runTriggerAction } from '../services/crmTriggerActionRunner';
 import { crmDb, userDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
@@ -66,6 +57,7 @@ const baseList = {
   userId: 'user_1',
   name: 'Test List',
   alertEvents: ['email.received'],
+  triggers: [],
 };
 
 const baseUser = {
@@ -100,7 +92,7 @@ describe('fireTriggers — email and api events', () => {
       event: 'email.clicked',
       conditionExpression: 'contains(event.click.link, "pricing")',
     });
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([trigger]);
+    const list = { ...baseList, triggers: [trigger] };
 
     await fireTriggers(
       'email.clicked',
@@ -109,7 +101,7 @@ describe('fireTriggers — email and api events', () => {
       baseLead,
       undefined,
       { click: { link: 'https://example.com/pricing' } },
-      baseList
+      list
     );
 
     expect(runTriggerAction).toHaveBeenCalledTimes(1);
@@ -121,7 +113,7 @@ describe('fireTriggers — email and api events', () => {
       event: 'email.clicked',
       conditionExpression: 'contains(event.click.link, "pricing")',
     });
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([trigger]);
+    const list = { ...baseList, triggers: [trigger] };
 
     await fireTriggers(
       'email.clicked',
@@ -130,7 +122,7 @@ describe('fireTriggers — email and api events', () => {
       baseLead,
       undefined,
       { click: { link: 'https://example.com/home' } },
-      baseList
+      list
     );
 
     expect(runTriggerAction).not.toHaveBeenCalled();
@@ -138,8 +130,7 @@ describe('fireTriggers — email and api events', () => {
 
   // Test 3: legacy fallback fires when alertEvents includes event and no explicit trigger exists
   it('calls legacy alert when event is in alertEvents and no explicit trigger exists', async () => {
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([]);
-    const list = { ...baseList, alertEvents: ['email.received'] };
+    const list = { ...baseList, triggers: [], alertEvents: ['email.received'] };
 
     await fireTriggers(
       'email.received',
@@ -164,8 +155,7 @@ describe('fireTriggers — email and api events', () => {
   // Test 4: legacy fallback skipped when an explicit trigger exists for the event
   it('skips legacy alert when an explicit trigger exists for the event', async () => {
     const trigger = makeTrigger({ event: 'email.received', conditionExpression: 'true' });
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([trigger]);
-    const list = { ...baseList, alertEvents: ['email.received'] };
+    const list = { ...baseList, triggers: [trigger], alertEvents: ['email.received'] };
 
     await fireTriggers(
       'email.received',
@@ -185,10 +175,9 @@ describe('fireTriggers — email and api events', () => {
   it('fireTriggersByEmailEvent resolves lead by domain and processes triggers', async () => {
     (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([baseUser]);
     (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([
-      { ...baseList, alertEvents: ['email.received'] },
+      { ...baseList, triggers: [], alertEvents: ['email.received'] },
     ]);
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(baseLead);
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([]);
 
     await fireTriggersByEmailEvent({
       eventType: 'email.received',
@@ -206,7 +195,7 @@ describe('fireTriggers — email and api events', () => {
   // Test 6: custom event custom.linkedin fires trigger
   it('fires trigger for custom event type custom.linkedin', async () => {
     const trigger = makeTrigger({ event: 'custom.linkedin', conditionExpression: 'true' });
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([trigger]);
+    const list = { ...baseList, triggers: [trigger] };
 
     await fireTriggers(
       'custom.linkedin',
@@ -215,7 +204,7 @@ describe('fireTriggers — email and api events', () => {
       baseLead,
       undefined,
       {},
-      baseList
+      list
     );
 
     expect(runTriggerAction).toHaveBeenCalledTimes(1);
@@ -227,7 +216,7 @@ describe('fireTriggers — email and api events', () => {
       event: 'api.lead_added',
       conditionExpression: 'event.source == "hubspot"',
     });
-    (crmTriggerCache.getTriggersForList as jest.Mock).mockResolvedValue([trigger]);
+    const list = { ...baseList, triggers: [trigger] };
 
     await fireTriggers(
       'api.lead_added',
@@ -236,7 +225,7 @@ describe('fireTriggers — email and api events', () => {
       baseLead,
       undefined,
       { source: 'hubspot' },
-      baseList
+      list
     );
 
     expect(runTriggerAction).toHaveBeenCalledTimes(1);

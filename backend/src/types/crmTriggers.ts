@@ -19,7 +19,7 @@ export type LeadEvent =
 
 export interface SendEmailAction {
   type: 'send_email';
-  toType: 'list_owner' | 'custom';
+  toType: 'list_owner' | 'custom' | 'lead';
   toEmails?: string[];
   subjectTemplate: string;
   bodyTemplate: string;
