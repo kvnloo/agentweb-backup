@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-06',
+    changes: [
+      'Improvement: Agent Can Now Complete More Complex Tasks Without Hitting Step Limits',
+      '- Raised the maximum number of steps per session from 20 to 40, giving the agent more room to finish multi-step workflows like LinkedIn outreach, paginated searches, and bulk CRM writes',
+      '- The agent now receives step-budget reminders as it approaches the limit, prompting it to prefer batch operations and wrap up gracefully rather than stopping mid-task',
+    ],
+  },
+  {
     date: '2026-04-05',
     changes: [
       'Emma Can Now Receive Emails During Automated Tasks',
