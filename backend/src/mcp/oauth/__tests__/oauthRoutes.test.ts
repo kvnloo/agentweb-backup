@@ -319,6 +319,60 @@ describe('MCP OAuth Routes', () => {
       expect(location).toContain('error=access_denied');
       expect(location).toContain('state=random-state');
     });
+
+    // Form POST path: the consent page submits an HTML <form> so the
+    // browser can natively follow the cross-origin 302 (fetch can't).
+    // Form POSTs coerce everything to strings and can't set custom
+    // headers, so we have to accept `approved` as a string and read the
+    // JWT from a body field.
+
+    it('should accept form-urlencoded body with approved=true (browser form POST path)', async () => {
+      mockGetClient.mockResolvedValue({
+        clientId: 'client-123',
+        redirectUris: ['https://example.com/callback'],
+      });
+      mockCreateAuthorizationCode.mockResolvedValue({ code: 'auth-code-form' });
+
+      const res = await request(app)
+        .post('/oauth/authorize/decision')
+        .type('form')
+        .send({
+          client_id: 'client-123',
+          redirect_uri: 'https://example.com/callback',
+          scope: 'mcp:tools',
+          state: 'form-state',
+          code_challenge: 'challenge',
+          code_challenge_method: 'S256',
+          approved: 'true', // string, not boolean — form encoding
+          jwt: 'dummy-jwt-value', // authenticateToken mock ignores it, but the middleware should still copy it to the auth header
+        })
+        .expect(302);
+
+      const location = res.headers.location;
+      expect(location).toContain('https://example.com/callback');
+      expect(location).toContain('code=auth-code-form');
+      expect(location).toContain('state=form-state');
+    });
+
+    it('should reject form-urlencoded body with approved="false" (string, not boolean)', async () => {
+      // Regression guard: a naive `if (!approved)` would treat the
+      // string "false" as truthy and mistakenly approve the request.
+      const res = await request(app)
+        .post('/oauth/authorize/decision')
+        .type('form')
+        .send({
+          client_id: 'client-123',
+          redirect_uri: 'https://example.com/callback',
+          state: 'deny-state',
+          approved: 'false',
+          jwt: 'dummy-jwt-value',
+        })
+        .expect(302);
+
+      const location = res.headers.location;
+      expect(location).toContain('error=access_denied');
+      expect(location).toContain('state=deny-state');
+    });
   });
 
   // ─── Token Exchange ─────────────────────────────────────────────────────
