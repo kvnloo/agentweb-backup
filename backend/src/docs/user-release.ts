@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-06',
     changes: [
+      'Admin: New Tool to Manage Judge System Prompts From Chat',
+      '- Added manage_scoring_judges admin tool to Emma agent mode, allowing admins to view, update, reset, and manage custom judge system prompts directly from the chat interface',
+      '- Supports 7 actions: get_default, update_default, reset_default, list, create, update, delete',
+      '- Enables quick fixes to scoring behavior (e.g. adding rules for correct-but-flagged sessions) without navigating to the admin settings UI',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
       'Fix: Scheduled Chat Default Variable Values Now Persist Across All Runs',
       '- Default variable values set when creating a scheduled chat (e.g. a LinkedIn account ID) were being cleared after the first run, causing the schedule to incorrectly send a variable-request email on subsequent runs',
       '- Default values now persist permanently — the schedule uses them every run without interruption',
