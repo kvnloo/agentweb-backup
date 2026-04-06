@@ -3696,6 +3696,7 @@ export default function AdminDashboard() {
                           <Chip label={tier} size="small" color={tierColor} variant={tierVariant} sx={{ fontWeight: 500, minWidth: 60 }} />
                         </TableCell>
                         <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
                           {paymentStatus === "paying" && (
                             <Chip icon={<CreditCardIcon />} label="Paid" size="small" color="success" variant="outlined" sx={{ fontWeight: 500 }} />
                           )}
@@ -3714,6 +3715,12 @@ export default function AdminDashboard() {
                           {paymentStatus === "free" && (
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
+                          {user.subscription_amount != null && user.subscription_amount > 0 && (
+                            <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
+                              ${(user.subscription_amount / 100).toFixed(0)}/mo
+                            </Typography>
+                          )}
+                          </Box>
                         </TableCell>
                         <TableCell onClick={(e) => e.stopPropagation()}>
                           <Chip

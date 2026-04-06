@@ -3776,4 +3776,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Applies to all PDF files read by Agent Mode, including uploaded reports and knowledge base files',
     ],
   },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Admin Users Tab Now Shows Subscription Amount',
+      '- The Users tab in the admin dashboard now displays the monthly charge amount next to each user\'s payment status',
+      '- Amounts are recorded automatically from Stripe invoices on each successful payment',
+    ],
+  },
 ];

@@ -173,6 +173,7 @@ export interface User {
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
+  subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
     | 'meta' | 'twitter' | 'instagram';
