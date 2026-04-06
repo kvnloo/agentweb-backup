@@ -11,6 +11,62 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-06',
     changes: [
+      'LinkedIn Outreach: Conversation History Sync',
+      '- Added update-conversation-history action to the LinkedIn outreach tool — fetches the full message thread with a contact from LinkedIn via Unipile and persists it to the lead\'s CRM engagement feed',
+      '- Messages now appear in the lead\'s engagement activity timeline (sent and received), going back to the first message',
+      '- Re-syncing is fully idempotent: running the action again on the same contact never creates duplicate entries',
+      '- When sending a LinkedIn message to a CRM lead (with list_id + lead_id provided), the agent now enforces that conversation history was synced within the last 24 hours — stale context is blocked with a clear instruction to sync first',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Set Up Website Scanning Directly from Brand Guidelines',
+      '- Added a Website Domain field to Brand Guidelines so you can record your domain without waiting for an admin to configure SEO domains',
+      '- A new "Setup Website Scan" button opens Emma pre-loaded with a message to create a recurring website scan schedule',
+      '- Emma checks whether a scan schedule already exists before creating a new one',
+      '- The scan focuses on issues observable directly from the site: broken links, missing meta tags, layout problems, slow load times, and unclear copy',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Scheduled Tasks Now Respect Your Stated Volume Limits',
+      '- Fixed an issue where scheduled automation tasks (e.g. LinkedIn connection requests) would batch in small groups and pause for confirmation, even when a specific volume was requested',
+      '- Scheduled sessions are fully automated — the agent now executes the full stated quantity in a single run without stopping to ask "should I continue?"',
+      '- Confirmation prompts are now scoped to web browser automation tasks only (create_task_from_template), not to direct actions like sending invitations or posting',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Admin: New Tool to Manage Judge System Prompts From Chat',
+      '- Added manage_scoring_judges admin tool to Emma agent mode, allowing admins to view, update, reset, and manage custom judge system prompts directly from the chat interface',
+      '- Supports 7 actions: get_default, update_default, reset_default, list, create, update, delete',
+      '- Enables quick fixes to scoring behavior (e.g. adding rules for correct-but-flagged sessions) without navigating to the admin settings UI',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Fix: Scheduled Chat Default Variable Values Now Persist Across All Runs',
+      '- Default variable values set when creating a scheduled chat (e.g. a LinkedIn account ID) were being cleared after the first run, causing the schedule to incorrectly send a variable-request email on subsequent runs',
+      '- Default values now persist permanently — the schedule uses them every run without interruption',
+      '- To recover an existing schedule affected by this bug, open it in Scheduled Chats → Agent Mode and click Update Schedule (no changes needed)',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Emma Can Now Save and Reuse Test Accounts for Client Websites',
+      '- Emma now remembers login credentials for websites she tests on your behalf — no more signing up from scratch every session',
+      '- When testing a site, Emma checks for a saved account first; if none exists, she creates one via temp email and saves the credentials automatically',
+      '- You can manage test accounts from Settings → Test Accounts: add, edit, or delete credentials for any site',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
       'Improvement: Agent Can Now Complete More Complex Tasks Without Hitting Step Limits',
       '- Raised the maximum number of steps per session from 20 to 40, giving the agent more room to finish multi-step workflows like LinkedIn outreach, paginated searches, and bulk CRM writes',
       '- The agent now receives step-budget reminders as it approaches the limit, prompting it to prefer batch operations and wrap up gracefully rather than stopping mid-task',
@@ -3677,6 +3733,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-06',
+    changes: [
+      'Emma Now Analyzes Images and Videos When Asked to "Read" Them',
+      '- Asking Emma to "read" an image now triggers visual analysis instead of a text extraction error',
+      '- Asking Emma to "read" a video now triggers video analysis using Gemini',
+      '- Emma correctly routes image files to describe_image and video files to describe_video automatically',
+    ],
+  },
+  {
     date: '2026-04-03',
     changes: [
       'Emma Can Now See Your Browser Screen',
@@ -3729,6 +3794,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Numbers and values in PDF tables are now correctly separated from their labels',
       '- Fixed an issue where table columns were concatenated without spaces (e.g. "Keywords ranked73" is now "Keywords ranked 73")',
       '- Applies to all PDF files read by Agent Mode, including uploaded reports and knowledge base files',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Admin Users Tab Now Shows Subscription Amount',
+      '- The Users tab in the admin dashboard now displays the monthly charge amount next to each user\'s payment status',
+      '- Amounts are recorded automatically from Stripe invoices on each successful payment',
     ],
   },
 ];

@@ -26,7 +26,7 @@ import type { LLMUsageData } from '../utils/llmService';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -142,6 +142,9 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -384,6 +387,7 @@ export class AgentModeService {
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
         await import('../emma/tempEmailTools');
+        await import('../emma/testAccountTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -1915,6 +1919,7 @@ export class AgentModeService {
       * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
+      * **Respect User-Defined Volume**: When the user specifies a quantity or range (e.g. "send 30-40 connection requests", "post 5 times", "add 100 leads"), that is the target for the entire session. Execute the full stated volume without splitting into sub-batches or pausing for per-batch confirmation.
 
       ## Account Memory
       You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
@@ -1942,8 +1947,8 @@ export class AgentModeService {
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
 
 ## Task Creation Approach
-- **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
-- **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
+- **IMPORTANT**: Always confirm with the user before calling 'create_task_from_template' or 'create_task_from_prompt', as these web automation tasks can take several minutes and cannot be cancelled once started. This confirmation requirement applies ONLY to these two tools — do NOT ask for confirmation before using other tools such as linkedin_outreach, post_on_connected_account, add_leads_to_list, or any other direct-execution tool.
+- **Confirmation required for web automation only**: Explain what the browser automation task will do and get explicit approval before creating it.
 - **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
 - **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
 - Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
@@ -2050,11 +2055,11 @@ Save the chart image URLs from the response.
 - **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
 - Ask clarifying questions only after you've searched for available information
 - **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
-- **Task confirmation required**: Always explain what a task will do and ask for confirmation before creating it (tasks take time to complete)
+- **Web automation task confirmation required**: Before calling 'create_task_from_template', explain what the browser automation task will do and confirm with the user (these tasks take time and cannot be cancelled). This does NOT apply to direct-execution tools like linkedin_outreach or post_on_connected_account.
 - **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
 - Provide clear explanations of what you're doing and what information you've found
 - Keep responses concise but informative
-- Always confirm task creation and provide relevant details
+- Always confirm web automation task creation and provide relevant details
 - When using templates, explain which template was selected and why
 - When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
 - Focus on actionable insights and strategic guidance based on current data and conversation context
@@ -4176,15 +4181,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      // Reject image files — the LLM should use describe_image instead
-      const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.tif', '.ico', '.heic', '.heif', '.avif'];
       try {
         const parsedUrl = new URL(videoFileUrl);
-        const ext = path.extname(parsedUrl.pathname).toLowerCase();
-        if (imageExtensions.includes(ext)) {
+        const ext = path.extname(parsedUrl.pathname).toLowerCase().replace(/^\./, '');
+        if (IMAGE_EXTENSIONS.has(ext)) {
           return {
             success: false,
-            message: `This appears to be an image file (${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+            message: `This appears to be an image file (.${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
           };
         }
       } catch {
@@ -13727,6 +13730,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const urlPath = new URL(fileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
 
+      if (IMAGE_EXTENSIONS.has(extension)) {
+        return {
+          success: false,
+          message: `This is an image file (.${extension}). Use the describe_image tool to analyze its visual content instead.`,
+          error: 'Image files must be analyzed with describe_image, not read_file_content'
+        };
+      }
+
+      if (VIDEO_EXTENSIONS.has(extension)) {
+        return {
+          success: false,
+          message: `This is a video file (.${extension}). Use the describe_video tool to analyze its content instead.`,
+          error: 'Video files must be analyzed with describe_video, not read_file_content'
+        };
+      }
+
       // Fetch the file content
       const response = await axios.get(fileUrl, {
         timeout: 30000, // 30 seconds timeout for larger files
@@ -19026,8 +19045,78 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'send-message': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-message');
           if (!message) throw new Error('message is required for send-message action');
+
+          // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
+          const { list_id: sendListId, lead_id: sendLeadId } = args;
+          if (sendListId && sendLeadId) {
+            const { crmDb } = await import('./db');
+            const lead = await crmDb.getLeadById(sendListId, sendLeadId);
+            if (lead) {
+              const syncAt = (lead as any).linkedinMessageSyncAt as string | undefined;
+              const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+              if (!syncAt || syncAt < oneDayAgo) {
+                return {
+                  success: false,
+                  error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
+                  requiresSync: true,
+                };
+              }
+            }
+          }
+
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
           return { success: true, data: messageResponse };
+        }
+
+        case 'update-conversation-history': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for update-conversation-history');
+          const { list_id, lead_id } = args;
+          if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
+
+          // Resolve the Unipile attendee/provider ID for this contact
+          const providerId = isUrl
+            ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
+            : target;
+
+          // Load the lead to get the normalized LinkedIn URL used as the storage key
+          const { crmDb } = await import('./db');
+          const lead = await crmDb.getLeadById(list_id, lead_id);
+          if (!lead) throw new Error(`Lead ${lead_id} not found in list ${list_id}`);
+          const leadLinkedIn = ((lead as any).linkedin as string | undefined)?.toLowerCase();
+          if (!leadLinkedIn) throw new Error('Lead has no LinkedIn URL — add a LinkedIn profile URL to this lead first');
+
+          // Fetch all messages with this contact from Unipile
+          const messages = await linkedInOutreachService.getMessagesWithContact(providerId);
+
+          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp
+          const { emailEventsDb } = await import('./emailEventsDb');
+          const emailDomain = `linkedin-${list_id}`;
+
+          const syncAt = new Date().toISOString();
+          await Promise.all([
+            ...messages.map(msg => emailEventsDb.addLinkedInMessageEvent({
+              eventId: `linkedin_msg_${msg.id}`,
+              emailDomain,
+              leadEmail: leadLinkedIn,
+              eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',
+              text: msg.text ?? null,
+              timestamp: msg.timestamp,
+              senderId: msg.sender_id,
+              messageProviderId: msg.provider_id,
+            })),
+            crmDb.updateLeadLinkedInSyncAt(list_id, lead_id, syncAt),
+          ]);
+          const totalSynced = messages.length;
+
+          console.log(`[AgentMode] update-conversation-history: synced ${totalSynced} messages for lead ${lead_id}`);
+          return {
+            success: true,
+            data: {
+              synced: totalSynced,
+              syncedAt: syncAt,
+              message: `Synced ${totalSynced} messages for this LinkedIn contact. Conversation history is now up to date in the CRM.`,
+            },
+          };
         }
 
         case 'get-company': {

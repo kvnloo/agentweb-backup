@@ -2011,6 +2011,67 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'manage_scoring_judges',
+  definition: {
+    name: 'manage_scoring_judges',
+    description: 'Manage the judge system prompts used to evaluate chat session satisfaction. Admin only. Actions: get_default (view current default prompt), update_default (replace default prompt text), reset_default (revert to hardcoded default), list (list all custom judges), create (add a new custom judge), update (edit an existing custom judge), delete (remove a custom judge).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['get_default', 'update_default', 'reset_default', 'list', 'create', 'update', 'delete'],
+          description: 'The action to perform'
+        },
+        system_prompt: { type: 'string', description: 'The system prompt text (required for update_default, create, and update actions)' },
+        judge_id: { type: 'string', description: 'The judge ID (required for update and delete actions)' },
+        name: { type: 'string', description: 'Human-readable name for the judge (required for create, optional for update)' }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const { action, system_prompt, judge_id, name } = args;
+    switch (action) {
+      case 'get_default': {
+        const data = await mcpFetch({ method: 'GET', path: '/api/settings/scoring-judges/default-prompt', context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'update_default': {
+        if (!system_prompt) return jsonResult({ error: 'system_prompt is required for update_default' });
+        const data = await mcpFetch({ method: 'PUT', path: '/api/settings/scoring-judges/default-prompt', context: ctx(context), body: { systemPrompt: system_prompt } });
+        return jsonResult(data);
+      }
+      case 'reset_default': {
+        const data = await mcpFetch({ method: 'DELETE', path: '/api/settings/scoring-judges/default-prompt', context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'list': {
+        const data = await mcpFetch({ method: 'GET', path: '/api/settings/scoring-judges', context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'create': {
+        if (!name || !system_prompt) return jsonResult({ error: 'name and system_prompt are required for create' });
+        const data = await mcpFetch({ method: 'POST', path: '/api/settings/scoring-judges', context: ctx(context), body: { name, systemPrompt: system_prompt } });
+        return jsonResult(data);
+      }
+      case 'update': {
+        if (!judge_id) return jsonResult({ error: 'judge_id is required for update' });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context), body: { name, systemPrompt: system_prompt } });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        if (!judge_id) return jsonResult({ error: 'judge_id is required for delete' });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context) });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${action}` });
+    }
+  }
+});
+
+mcpToolRegistry.register({
   name: 'save_file',
   internal: true,
   definition: {

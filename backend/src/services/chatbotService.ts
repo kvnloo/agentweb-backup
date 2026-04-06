@@ -3172,6 +3172,7 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
 
 // Cache for Emma system context (60s TTL)
 let cachedSystemContext: { value: string; expiry: number } | null = null;
+let emmaToolsLoaded = false;
 
 // Exported for testing only — not part of the public API
 export function __resetEmmaSystemContextCache(): void {
@@ -3685,6 +3686,8 @@ export async function generateChatResponse(
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
+          'get_temp_email', 'check_temp_inbox',
+          'get_test_account', 'save_test_account', 'list_test_accounts',
         ]);
 
         // Page-aware tool injection based on the current page URL
@@ -3716,6 +3719,12 @@ export async function generateChatResponse(
           pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
         }
 
+        if (!emmaToolsLoaded) {
+          await import('../emma/tools');
+          await import('../emma/tempEmailTools');
+          await import('../emma/testAccountTools');
+          emmaToolsLoaded = true;
+        }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
 

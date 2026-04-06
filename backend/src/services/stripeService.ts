@@ -504,10 +504,15 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     updateData.stripe_subscription_id = subscriptionId;
   }
 
+  // Store the amount paid so it can be displayed in the admin Users tab
+  if (typeof invoice.amount_paid === 'number' && invoice.amount_paid > 0) {
+    updateData.subscription_amount = invoice.amount_paid;
+  }
+
   await userDb.updateUser(user.userId, updateData);
 
   console.log(
-    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}`
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}`
   );
 }
 

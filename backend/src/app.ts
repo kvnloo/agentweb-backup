@@ -64,6 +64,7 @@ import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
+import testAccountsRoutes from "./routes/testAccounts";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -255,6 +256,7 @@ app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
+app.use("/api/test-accounts", testAccountsRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
