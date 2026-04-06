@@ -3675,6 +3675,17 @@ export const agentModeController = {
         updates.variableValuesUpdatedAt = now.toISOString();
       }
 
+      // If all variable values are pre-filled during update, reset the email request flow state.
+      // This ensures the schedule uses pre-filled defaults on subsequent runs rather than
+      // sending email requests for values. Also serves as a recovery mechanism if a schedule
+      // got stuck in the email-request flow due to a previous bug.
+      if (allUpdateVariablesPrefilled) {
+        updates.variableRequestSentAt = '';
+        updates.variableRequestAccessTokenHash = '';
+        updates.variableRequestAccessTokenExpiresAt = '';
+        updates.variableRequestAccessTokenConsumedAt = '';
+      }
+
       // Only include nextRunTime in updates if it was explicitly provided
       if (shouldUpdateNextRunTime) {
         updates.nextRunTime = scheduledNextRunTime;
@@ -4294,7 +4305,10 @@ export const agentModeController = {
           // has ever been sent, the schedule can run immediately without the email flow.
           // We also require variableValuesUpdatedAt to be set to distinguish intentional
           // pre-fills from legacy data missing timestamps.
-          const prefilledWithoutRequest = !hasVariableRequestSentAt && hasVariableValuesUpdatedAt && valuesProvidedAfterLastRun;
+          // NOTE: We do NOT check valuesProvidedAfterLastRun here because default values set
+          // at config time should persist across ALL runs, not just the first run.
+          // The valuesProvidedAfterLastRun check is only relevant for the email request flow.
+          const prefilledWithoutRequest = !hasVariableRequestSentAt && hasVariableValuesUpdatedAt;
           const isVariableRequestSatisfied = schedule.variableRequestStatus === 'provided'
             && hasAllVariableValues
             && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
@@ -4407,15 +4421,19 @@ export const agentModeController = {
           // Increment concurrent run counter
           currentConcurrentRuns++;
 
-          // Check if variable values came from the email request flow vs pre-filled at creation.
-          // Pre-filled values persist across runs; email-flow values are cleared after each run.
+          // Only clear variable values if they were submitted via the email request flow
+          // (i.e. the user clicked the email link and submitted values — access token was consumed).
+          // If the token was never consumed, the values were set at config time or via admin update
+          // and should persist across all runs as permanent defaults.
           const hadVariableRequestFlow = typeof schedule.variableRequestSentAt === 'string' && schedule.variableRequestSentAt.length > 0;
+          const accessTokenWasConsumed = typeof schedule.variableRequestAccessTokenConsumedAt === 'string' && schedule.variableRequestAccessTokenConsumedAt.length > 0;
+          const shouldClearVariablesAfterRun = hadVariableRequestFlow && accessTokenWasConsumed;
 
           // Start the scheduled chat run asynchronously (don't await)
           runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
-            if (scheduleVariables.length > 0 && hadVariableRequestFlow) {
+            if (scheduleVariables.length > 0 && shouldClearVariablesAfterRun) {
               try {
                 await scheduleDb.updateSchedule(schedule.scheduleId, {
                   variableValues: {},
@@ -4469,7 +4487,7 @@ export const agentModeController = {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
 
-            if (scheduleVariables.length > 0 && hadVariableRequestFlow) {
+            if (scheduleVariables.length > 0 && shouldClearVariablesAfterRun) {
               scheduleDb.updateSchedule(schedule.scheduleId, {
                 variableValues: {},
                 variableRequestStatus: 'pending',
