@@ -3675,10 +3675,8 @@ export const agentModeController = {
         updates.variableValuesUpdatedAt = now.toISOString();
       }
 
-      // If all variable values are pre-filled during update, reset the email request flow state.
-      // This ensures the schedule uses pre-filled defaults on subsequent runs rather than
-      // sending email requests for values. Also serves as a recovery mechanism if a schedule
-      // got stuck in the email-request flow due to a previous bug.
+      // Re-saving with all values pre-filled means the schedule should use permanent defaults,
+      // not the email request flow. Reset the flow state so subsequent runs don't wait for email.
       if (allUpdateVariablesPrefilled) {
         updates.variableRequestSentAt = '';
         updates.variableRequestAccessTokenHash = '';
@@ -4301,13 +4299,8 @@ export const agentModeController = {
             && variableValuesUpdatedAtMs >= variableRequestSentAtMs;
           const valuesProvidedAfterLastRun = !Number.isFinite(lastRunTimeMs)
             || (Number.isFinite(variableValuesUpdatedAtMs) && variableValuesUpdatedAtMs > lastRunTimeMs);
-          // If all variable values are pre-filled (e.g. from a template) and no request
-          // has ever been sent, the schedule can run immediately without the email flow.
-          // We also require variableValuesUpdatedAt to be set to distinguish intentional
-          // pre-fills from legacy data missing timestamps.
-          // NOTE: We do NOT check valuesProvidedAfterLastRun here because default values set
-          // at config time should persist across ALL runs, not just the first run.
-          // The valuesProvidedAfterLastRun check is only relevant for the email request flow.
+          // Pre-filled defaults (no email request ever sent) are valid for all runs.
+          // variableValuesUpdatedAt guards against legacy records missing timestamps.
           const prefilledWithoutRequest = !hasVariableRequestSentAt && hasVariableValuesUpdatedAt;
           const isVariableRequestSatisfied = schedule.variableRequestStatus === 'provided'
             && hasAllVariableValues
@@ -4421,13 +4414,10 @@ export const agentModeController = {
           // Increment concurrent run counter
           currentConcurrentRuns++;
 
-          // Only clear variable values if they were submitted via the email request flow
-          // (i.e. the user clicked the email link and submitted values — access token was consumed).
-          // If the token was never consumed, the values were set at config time or via admin update
-          // and should persist across all runs as permanent defaults.
-          const hadVariableRequestFlow = typeof schedule.variableRequestSentAt === 'string' && schedule.variableRequestSentAt.length > 0;
+          // Only clear variable values if the user submitted them via the email link
+          // (token consumed). Config-time defaults and admin-updated values persist forever.
           const accessTokenWasConsumed = typeof schedule.variableRequestAccessTokenConsumedAt === 'string' && schedule.variableRequestAccessTokenConsumedAt.length > 0;
-          const shouldClearVariablesAfterRun = hadVariableRequestFlow && accessTokenWasConsumed;
+          const shouldClearVariablesAfterRun = hasVariableRequestSentAt && accessTokenWasConsumed;
 
           // Start the scheduled chat run asynchronously (don't await)
           runScheduledChat(schedule, schedule.userId, false).then(async (result) => {

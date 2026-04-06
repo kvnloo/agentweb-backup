@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-06',
     changes: [
+      'Fix: Scheduled Chat Default Variable Values Now Persist Across All Runs',
+      '- Default variable values set when creating a scheduled chat (e.g. a LinkedIn account ID) were being cleared after the first run, causing the schedule to incorrectly send a variable-request email on subsequent runs',
+      '- Default values now persist permanently — the schedule uses them every run without interruption',
+      '- To recover an existing schedule affected by this bug, open it in Scheduled Chats → Agent Mode and click Update Schedule (no changes needed)',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
       'Emma Can Now Save and Reuse Test Accounts for Client Websites',
       '- Emma now remembers login credentials for websites she tests on your behalf — no more signing up from scratch every session',
       '- When testing a site, Emma checks for a saved account first; if none exists, she creates one via temp email and saves the credentials automatically',
