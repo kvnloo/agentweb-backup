@@ -11,6 +11,12 @@ import { paymentHistoryDb, PaymentHistoryRecord } from './paymentHistoryDb';
 
 dotenv.config();
 
+// Emails excluded from ALL revenue metrics (e.g. barter/debt-payoff arrangements).
+// These users get free service but are NOT customers for MRR/churn/cohort purposes.
+const EXCLUDED_EMAILS: Set<string> = new Set([
+  'childrenstorywithai@gmail.com', // StorywithAI — free service to pay off debt
+]);
+
 let _stripe: Stripe | null = null;
 
 function getStripe(): Stripe {
@@ -53,6 +59,8 @@ export interface RevenueSnapshot {
   activeSubscriptions: number;
   newSubscriptions: number;
   churnedSubscriptions: number;
+  customerChurnRate: number; // % of customers lost this month
+  revenueChurnRate: number; // % of MRR lost this month
 }
 
 export interface CohortRow {
@@ -75,7 +83,7 @@ async function fetchAllSubscriptions(): Promise<Stripe.Subscription[]> {
     const params: Stripe.SubscriptionListParams = {
       limit: 100,
       status: 'all',
-      expand: ['data.items.data.price'],
+      expand: ['data.items.data.price', 'data.customer', 'data.discounts'],
     };
     if (startingAfter) params.starting_after = startingAfter;
 
@@ -87,23 +95,46 @@ async function fetchAllSubscriptions(): Promise<Stripe.Subscription[]> {
     }
   }
 
-  return subs;
+  // Filter out excluded emails (barter/debt arrangements, not real customers)
+  return subs.filter(s => {
+    const customer = s.customer as Stripe.Customer;
+    if (customer?.email && EXCLUDED_EMAILS.has(customer.email.toLowerCase())) return false;
+    return true;
+  });
 }
 
 /**
  * Get the monthly amount for a subscription in cents.
  * Converts yearly prices to monthly equivalent.
+ * Accounts for active coupons/discounts — a 100% off coupon = $0 effective MRR.
  */
 function getMonthlyAmount(sub: Stripe.Subscription): number {
   const item = sub.items.data[0];
   if (!item?.price) return 0;
 
-  const amount = item.price.unit_amount || 0;
+  let amount = item.price.unit_amount || 0;
   const interval = item.price.recurring?.interval;
 
-  if (interval === 'year') return Math.round(amount / 12);
-  if (interval === 'month') return amount;
-  return amount; // fallback
+  if (interval === 'year') amount = Math.round(amount / 12);
+
+  // Apply active discounts if present (Stripe API uses discounts array)
+  const discounts = sub.discounts;
+  if (discounts && discounts.length > 0) {
+    for (const discount of discounts) {
+      const coupon = typeof discount === 'object' && 'coupon' in discount ? discount.coupon : null;
+      if (!coupon || typeof coupon === 'string') continue;
+      if (coupon.percent_off) {
+        amount = Math.round(amount * (1 - coupon.percent_off / 100));
+      } else if (coupon.amount_off) {
+        const monthlyDiscount = interval === 'year'
+          ? Math.round(coupon.amount_off / 12)
+          : coupon.amount_off;
+        amount = Math.max(0, amount - monthlyDiscount);
+      }
+    }
+  }
+
+  return amount;
 }
 
 function toYearMonth(ts: number): string {
@@ -191,7 +222,7 @@ export async function computeCurrentMetrics(): Promise<RevenueMetrics> {
 
 // ─── Historical snapshots ───────────────────────────────────────────────
 
-export async function computeMonthlySnapshots(months: number = 6): Promise<RevenueSnapshot[]> {
+export async function computeMonthlySnapshots(months: number = 24): Promise<RevenueSnapshot[]> {
   const subs = await fetchAllSubscriptions();
   const now = new Date();
   const snapshots: RevenueSnapshot[] = [];
@@ -203,18 +234,33 @@ export async function computeMonthlySnapshots(months: number = 6): Promise<Reven
     const monthEndTs = Math.floor(monthEnd.getTime() / 1000);
     const monthStartTs = Math.floor(targetDate.getTime() / 1000);
 
+    // Previous month for churn rate denominator
+    const prevMonthDate = new Date(targetDate.getFullYear(), targetDate.getMonth() - 1, 1);
+    const prevMonthEnd = new Date(targetDate.getFullYear(), targetDate.getMonth(), 0);
+    const prevMonthEndTs = Math.floor(prevMonthEnd.getTime() / 1000);
+    const prevMonthStartTs = Math.floor(prevMonthDate.getTime() / 1000);
+
     // Active at end of this month: created before month end, not canceled before month end
     const activeAtEnd = subs.filter(s => {
       const created = s.created;
-      if (created > monthEndTs) return false; // created after this month
-      if (s.status === 'canceled' && s.canceled_at && s.canceled_at < monthStartTs) return false; // canceled before this month
-      // If canceled during this month, still count as active-then-churned
+      if (created > monthEndTs) return false;
+      if (s.status === 'canceled' && s.canceled_at && s.canceled_at < monthStartTs) return false;
       if (s.status === 'canceled' && s.canceled_at && s.canceled_at <= monthEndTs) return false;
       return getMonthlyAmount(s) > 0 || s.status === 'trialing';
     });
 
+    // Active at end of previous month (starting base for churn calc)
+    const activeAtPrevEnd = subs.filter(s => {
+      const created = s.created;
+      if (created > prevMonthEndTs) return false;
+      if (s.status === 'canceled' && s.canceled_at && s.canceled_at < prevMonthStartTs) return false;
+      if (s.status === 'canceled' && s.canceled_at && s.canceled_at <= prevMonthEndTs) return false;
+      return getMonthlyAmount(s) > 0;
+    });
+
     const payingAtEnd = activeAtEnd.filter(s => getMonthlyAmount(s) > 0);
     const mrr = payingAtEnd.reduce((sum, s) => sum + getMonthlyAmount(s), 0);
+    const prevMrr = activeAtPrevEnd.reduce((sum, s) => sum + getMonthlyAmount(s), 0);
 
     // New this month
     const newSubs = payingAtEnd.filter(s => toYearMonth(s.created) === monthStr);
@@ -223,21 +269,31 @@ export async function computeMonthlySnapshots(months: number = 6): Promise<Reven
     // Churned this month
     const churned = subs.filter(s => {
       if (!s.canceled_at) return false;
-      return toYearMonth(s.canceled_at) === monthStr;
+      return toYearMonth(s.canceled_at) === monthStr && getMonthlyAmount(s) > 0;
     });
     const churnedMrr = churned.reduce((sum, s) => sum + getMonthlyAmount(s), 0);
+
+    // Churn rates
+    const customerChurnRate = activeAtPrevEnd.length > 0
+      ? (churned.length / activeAtPrevEnd.length) * 100
+      : 0;
+    const revenueChurnRate = prevMrr > 0
+      ? (churnedMrr / prevMrr) * 100
+      : 0;
 
     snapshots.push({
       date: monthStr,
       mrr,
       newMrr,
-      expansionMrr: 0, // requires invoice-level diffing for accuracy
+      expansionMrr: 0,
       contractionMrr: 0,
       churnedMrr,
       netNewMrr: newMrr - churnedMrr,
       activeSubscriptions: activeAtEnd.length,
       newSubscriptions: newSubs.length,
       churnedSubscriptions: churned.length,
+      customerChurnRate,
+      revenueChurnRate,
     });
   }
 
@@ -246,7 +302,7 @@ export async function computeMonthlySnapshots(months: number = 6): Promise<Reven
 
 // ─── Cohort retention ───────────────────────────────────────────────────
 
-export async function computeCohorts(months: number = 6): Promise<CohortRow[]> {
+export async function computeCohorts(months: number = 24): Promise<CohortRow[]> {
   const subs = await fetchAllSubscriptions();
   const now = new Date();
   const cohorts: CohortRow[] = [];
@@ -288,7 +344,7 @@ export async function computeCohorts(months: number = 6): Promise<CohortRow[]> {
 
 // ─── Main endpoint handler ──────────────────────────────────────────────
 
-export async function getRevenueMetrics(monthsBack: number = 6) {
+export async function getRevenueMetrics(monthsBack: number = 24) {
   const [metrics, snapshots, cohorts] = await Promise.all([
     computeCurrentMetrics(),
     computeMonthlySnapshots(monthsBack),
