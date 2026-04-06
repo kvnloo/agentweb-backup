@@ -114,6 +114,19 @@ export class SettingsService {
     }
   }
 
+  async getJsonArraySetting<T>(settingName: string, fallback: T[]): Promise<T[]> {
+    try {
+      const setting = await this.getSetting(settingName);
+      if (setting) {
+        const parsed = JSON.parse(setting.settingValue);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed as T[];
+      }
+    } catch {
+      // fall through to default
+    }
+    return fallback;
+  }
+
   async deleteSetting(settingName: string): Promise<void> {
     try {
       const params = {

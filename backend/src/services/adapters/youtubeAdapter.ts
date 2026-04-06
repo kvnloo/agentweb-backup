@@ -189,7 +189,7 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
     });
   }
 
-  async getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics> {
+  async getAccountMetrics(account: ConnectedAccount, userId?: string, _startDate?: Date, _endDate?: Date): Promise<AccountMetrics> {
     const config = account.config;
     if (!isYouTubeChannel(config)) {
       throw new Error('Account must be a YouTube channel to get metrics.');

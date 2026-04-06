@@ -217,7 +217,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
         return metrics;
     }
 
-    async getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics> {
+    async getAccountMetrics(account: ConnectedAccount, userId?: string, startDate?: Date, endDate?: Date): Promise<AccountMetrics> {
         const config = account.config;
         if (!isInstagramBusiness(config)) {
             throw new Error('This account must be connected via Instagram Direct Login to get account metrics.');
@@ -229,7 +229,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
         try {
             const [insights, userInfo] = await Promise.all([
                 withTokenRefresh(account, async (activeToken) => {
-                    return await instagramService.getInstagramUserInsights(igUserId, activeToken);
+                    return await instagramService.getInstagramUserInsights(igUserId, activeToken, startDate, endDate);
                 }, userId),
                 withTokenRefresh(account, async (activeToken) => {
                     return await instagramService.getInstagramBusinessMe(activeToken);
@@ -244,7 +244,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
 
             for (const insight of insights) {
                 if (insight.values && insight.values.length > 0) {
-                    const value = insight.values[0].value || 0;
+                    const value = insight.values.reduce((sum: number, v: any) => sum + (v.value || 0), 0);
                     switch (insight.name) {
                         case 'profile_views': profileViews = value; break;
                         case 'reach': reach = value; break;

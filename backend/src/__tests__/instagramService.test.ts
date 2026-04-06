@@ -421,5 +421,34 @@ describe('InstagramService', () => {
             );
             expect(result[0].name).toBe('profile_views');
         });
+
+        it('should include since and until params when date range is provided', async () => {
+            mockAxios.get.mockResolvedValue({ data: { data: [] } } as any);
+
+            const startDate = new Date(2025, 1, 1);  // Feb 1 2025
+            const endDate = new Date(2025, 1, 28);   // Feb 28 2025
+
+            await instagramService.getInstagramUserInsights('ig_123', 'valid_token', startDate, endDate);
+
+            expect(mockAxios.get).toHaveBeenCalledWith(
+                `${BASE_URL}/ig_123/insights`,
+                expect.objectContaining({
+                    params: expect.objectContaining({
+                        since: Math.floor(startDate.getTime() / 1000),
+                        until: Math.floor(endDate.getTime() / 1000),
+                    })
+                })
+            );
+        });
+
+        it('should NOT include since and until when no date range provided', async () => {
+            mockAxios.get.mockResolvedValue({ data: { data: [] } } as any);
+
+            await instagramService.getInstagramUserInsights('ig_123', 'valid_token');
+
+            const callParams = mockAxios.get.mock.calls[0]?.[1]?.params as Record<string, unknown> | undefined;
+            expect(callParams?.since).toBeUndefined();
+            expect(callParams?.until).toBeUndefined();
+        });
     });
 });

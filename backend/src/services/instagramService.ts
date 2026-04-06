@@ -413,15 +413,21 @@ export class InstagramService {
     /**
      * Get insights for an Instagram User
      */
-    public async getInstagramUserInsights(igUserId: string, userToken: string): Promise<any[]> {
+    public async getInstagramUserInsights(igUserId: string, userToken: string, startDate?: Date, endDate?: Date): Promise<any[]> {
         try {
             const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
             const url = `${instagramApiBaseUrl}/${igUserId}/insights`;
-            const params = {
+            const params: Record<string, any> = {
                 metric: 'reach,profile_views,website_clicks,accounts_engaged,total_interactions',
                 period: 'day',
                 access_token: userToken
             };
+
+            if (startDate && endDate) {
+                params.since = Math.floor(startDate.getTime() / 1000);
+                params.until = Math.floor(endDate.getTime() / 1000);
+            }
+
             const response = await axios.get<any>(url, { params });
             return response.data?.data || [];
         } catch (error) {

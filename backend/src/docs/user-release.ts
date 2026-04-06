@@ -9,10 +9,55 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-06',
+    changes: [
+      'Improvement: Agent Can Now Complete More Complex Tasks Without Hitting Step Limits',
+      '- Raised the maximum number of steps per session from 20 to 40, giving the agent more room to finish multi-step workflows like LinkedIn outreach, paginated searches, and bulk CRM writes',
+      '- The agent now receives step-budget reminders as it approaches the limit, prompting it to prefer batch operations and wrap up gracefully rather than stopping mid-task',
+    ],
+  },
+  {
+    date: '2026-04-05',
+    changes: [
+      'Emma Can Now Receive Emails During Automated Tasks',
+      '- Emma can generate a session-specific email address (test+...@updates.agentweb.pro) for use when signing up for services',
+      '- Emails sent to this address are automatically captured and made available to Emma mid-task',
+      '- Enables Emma to complete sign-up flows, receive verification codes, and read confirmation emails autonomously',
+    ],
+  },
+  {
+    date: '2026-04-05',
+    changes: [
+      'Admin: Chat History Time Range Now Filters by Session Start Time',
+      '- The get_chat_history tool previously returned old sessions whose metadata was recently updated (e.g. when a share link was accessed or scoring ran), causing stale sessions to appear in recent time-range queries',
+      '- Time ranges now correctly match when the session was created, not when it was last touched',
+      '- Session updatedAt timestamp now reflects the time of the last message only — metadata changes such as scoring, title edits, and share link access no longer advance it',
+    ],
+  },
+  {
+    date: '2026-04-04',
+    changes: [
+      'Admin: Alert Emails Are Now Configurable',
+      '- Oncall alert recipients and product issue email recipients can now be managed from the Admin dashboard under the new "Alert Emails" tab',
+      '- Changes take effect immediately without a redeployment',
+    ],
+  },
+  {
     date: '2026-04-03',
     changes: [
       'Error Reports Now Route Directly to the Engineering Team',
       '- Error reports submitted via the "Report an Error" button are now sent directly to the engineering team for faster triage',
+      'Fix: Emma No Longer Auto-Replies to Slack Messages',
+      '- Removed a behavior where Emma would automatically respond to any message posted in a connected Slack channel',
+      '- Emma now only replies when explicitly @mentioned in Slack',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Fix: No More Duplicate Responses When Messages Are Sent Quickly',
+      '- Sending a new message while a response is still being generated no longer causes duplicate or overlapping responses',
+      '- Messages sent while the AI is still responding are now queued and delivered automatically once the current response finishes',
     ],
   },
   {
@@ -3629,6 +3674,61 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Opus Models Now Admin-Only',
       '- Claude Opus models are no longer available for standard user accounts',
       '- Admins continue to have full access to Opus models in Agent Mode and Reports',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now See Your Browser Screen',
+      '- Emma and Agent Mode can view a screenshot of your current page when you ask for help',
+      '- Browser screenshots taken during agent tasks are displayed inline in the chat',
+      '- Screenshots are uploaded to secure storage instead of sending large image payloads',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Send and Read Slack Messages',
+      '- Emma can send messages to your Slack channel and read recent messages',
+      '- Regular users are automatically scoped to their configured channel — no need to specify it',
+      '- Admins can target any channel as before',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Connect Your Own Facebook Ad Account for Paid Social',
+      '- The "Ad Account Not Configured" screen now guides you to connect your Facebook ad account directly',
+      '- Click the new "Go to Connected Accounts" button to open Settings → Connected Accounts',
+      '- No longer requires an admin to configure the ad account on your behalf',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Configure Multiple Slack Channels Per User',
+      '- Admins can now assign multiple Slack channels to a user from the Users tab',
+      '- Emma\'s Slack tools are restricted to the user\'s configured channels',
+      '- When multiple channels are configured, users must specify which channel to use',
+      '- Single-channel users continue to work as before with no change required',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Add Logos to Landing Pages',
+      '- Ask Emma to add company logos to any landing page and she will handle it automatically',
+      '- For well-known public companies, logos are pulled from Google\'s favicon service — no uploading required',
+      '- For your own brand logo, Emma looks it up from your brand guidelines and places it on the page',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'More Accurate PDF Data Extraction',
+      '- Numbers and values in PDF tables are now correctly separated from their labels',
+      '- Fixed an issue where table columns were concatenated without spaces (e.g. "Keywords ranked73" is now "Keywords ranked 73")',
+      '- Applies to all PDF files read by Agent Mode, including uploaded reports and knowledge base files',
     ],
   },
 ];

@@ -63,6 +63,11 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing pa
 - Before your first edit, note the current commit SHA (via list_commits) so you can revert if needed.
 - When done, check_deployment once, then call report_to_user with a summary and the preview URL.
 
+## Adding images and logos
+- Always use a direct URL in <img src="..."> — never try to upload or embed binary files.
+- For public company logos: use Google's favicon service: <img src="https://www.google.com/s2/favicons?domain={domain}&sz=128" /> (e.g., domain=google.com). Works for any company domain.
+- For the user's own brand logo: the task_description will include the logo URL (from brand guidelines or an S3 link). Use that URL directly in the img tag.
+
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
@@ -405,7 +410,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
         },
         required: []
       }
-    }
+    },
   ];
 }
 

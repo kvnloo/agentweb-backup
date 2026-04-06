@@ -2,6 +2,7 @@ import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { resendService } from "../services/resendService";
 import { userDb } from "../services/db";
+import { settingsService } from "../services/settingsService";
 
 const router = express.Router();
 
@@ -99,9 +100,11 @@ router.post("/send-help-message", async (req, res) => {
 </html>
     `;
 
+    const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+
     await resendService.sendEmail({
       from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
-      to: "founders@agentweb.pro",
+      to: productIssueEmails,
       subject: emailSubject,
       html: emailHtml,
       replyTo: user.email
@@ -183,9 +186,11 @@ router.post("/report-error", async (req, res) => {
 </html>
     `;
 
+    const oncallEmails = await settingsService.getJsonArraySetting('oncall_emails', ['ruiw@agentweb.pro']);
+
     await resendService.sendEmail({
       from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
-      to: "ruiw@agentweb.pro",
+      to: oncallEmails,
       subject: emailSubject,
       html: emailHtml,
       replyTo: user.email

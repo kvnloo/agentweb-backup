@@ -1728,6 +1728,81 @@ const createBrowserCookiesTable = async () => {
   }
 };
 
+// Create Payment History table (audit trail for Stripe payment events)
+const createPaymentHistoryTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-PaymentHistory`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'timestamp', AttributeType: 'S' },
+      { AttributeName: 'stripeInvoiceId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'timestamp', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StripeInvoiceIndex',
+        KeySchema: [
+          { AttributeName: 'stripeInvoiceId', KeyType: 'HASH' },
+        ],
+        Projection: {
+          ProjectionType: 'ALL',
+        },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createTempEmailsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TempEmails`,
+    AttributeDefinitions: [
+      { AttributeName: 'emailId', AttributeType: 'S' },
+      { AttributeName: 'toAddress', AttributeType: 'S' },
+      { AttributeName: 'receivedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'emailId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'ToAddressIndex',
+        KeySchema: [
+          { AttributeName: 'toAddress', KeyType: 'HASH' },
+          { AttributeName: 'receivedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1770,6 +1845,8 @@ const main = async () => {
     await createScheduleTemplatesTable();
     await createCRMTriggersTable();
     await createCRMTriggerLogsTable();
+    await createPaymentHistoryTable();
+    await createTempEmailsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

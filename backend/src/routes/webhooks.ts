@@ -4,10 +4,11 @@ import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { fireTriggers, fireTriggersByEmailEvent } from '../services/crmTriggerService';
-import { crmDb, userDb } from '../services/db';
+import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
+import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 
 const router = express.Router();
@@ -135,6 +136,33 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
               });
             } catch (err) {
               console.error('[EmmaEmail] Failed to process:', err);
+            }
+          })();
+        }
+        // Store temp emails (test+xxxxxx@updates.agentweb.pro) for Emma to read
+        const tempPrefix = `${TEMP_EMAIL_PREFIX}+`;
+        const tempRecipients = toAddresses.filter((addr) => {
+          const bare = addr.toLowerCase().replace(/^.*<|>.*$/g, '').trim();
+          return bare.startsWith(tempPrefix) && bare.endsWith(`@${TEMP_EMAIL_DOMAIN}`);
+        });
+        if (tempRecipients.length > 0) {
+          void (async () => {
+            try {
+              const emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+              for (const recipient of tempRecipients) {
+                const bare = recipient.toLowerCase().replace(/^.*<|>.*$/g, '').trim();
+                await tempEmailDb.save({
+                  emailId: event.data.email_id,
+                  toAddress: bare,
+                  fromAddress: event.data.from,
+                  subject: event.data.subject || '',
+                  text: emailContent?.text || emailContent?.html || '',
+                  receivedAt: new Date().toISOString(),
+                });
+                console.log(`[TempEmail] Stored email ${event.data.email_id} for ${bare}`);
+              }
+            } catch (err) {
+              console.error('[TempEmail] Failed to store:', err);
             }
           })();
         }

@@ -90,7 +90,7 @@ describe('POST /api/support/report-error', () => {
 
     expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
     const emailCall = resendService.sendEmail.mock.calls[0][0];
-    expect(emailCall.to).toBe('ruiw@agentweb.pro');
+    expect(emailCall.to).toEqual(['ruiw@agentweb.pro']);
     expect(emailCall.subject).toContain('Error Report');
     expect(emailCall.html).toContain('Rate limit exceeded');
     expect(emailCall.html).toContain('RATE_LIMIT');

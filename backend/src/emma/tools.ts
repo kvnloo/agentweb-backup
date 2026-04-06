@@ -3191,20 +3191,36 @@ emmaToolRegistry.register({
   name: 'load_connected_account_metrics',
   definition: {
     name: 'load_connected_account_metrics',
-    description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement).',
+    description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement). Optionally filter by a date range using start_date and end_date. Note: YouTube metrics are always lifetime totals and are not affected by the date range.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: {
           type: 'string',
           description: 'The unique identifier (id) of the connected account to load metrics for'
+        },
+        start_date: {
+          type: 'string',
+          description: 'Optional start date for metrics in ISO 8601 format (e.g. "2024-01-01"). Both start_date and end_date must be provided together — specifying only one has no effect.'
+        },
+        end_date: {
+          type: 'string',
+          description: 'Optional end date for metrics in ISO 8601 format (e.g. "2024-01-31"). Both start_date and end_date must be provided together — specifying only one has no effect.'
         }
       },
       required: ['account_id']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id);
+    const parseDate = (val: string | undefined): Date | undefined => {
+      if (!val) return undefined;
+      const d = new Date(val);
+      if (isNaN(d.getTime())) throw new Error(`Invalid date: "${val}"`);
+      return d;
+    };
+    const startDate = parseDate(args.start_date);
+    const endDate = parseDate(args.end_date);
+    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id, startDate, endDate);
   }
 });
 
@@ -4954,7 +4970,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5286,6 +5302,10 @@ emmaToolRegistry.register({
 
     const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
 
+    // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
+    const { settingsService } = await import('../services/settingsService');
+    const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+
     for (const issue of args.issues) {
       try {
         const issueContext: Record<string, any> = {
@@ -5310,10 +5330,9 @@ emmaToolRegistry.register({
           result.notionUrl
         );
 
-        // Send support email to founders (reuses Get Support pattern)
         await resendService.sendEmail({
           from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-          to: 'founders@agentweb.pro',
+          to: productIssueEmails,
           subject: `Product Issue from ${user.email}: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">

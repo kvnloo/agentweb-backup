@@ -6,7 +6,7 @@ import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
@@ -24,6 +24,13 @@ import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+
+/**
+ * In-memory set of session IDs that are currently generating a response.
+ * Used to reject concurrent /generate requests for the same session with 409.
+ * Exported so tests can inspect and reset it.
+ */
+export const activeSessionGenerations = new Set<string>();
 
 /**
  * Returns the effective expiration date for an interactive share.
@@ -1455,6 +1462,13 @@ export async function generateSessionResponse(
     excludeTools = ['get_visual_context'];
   }
 
+  // Upload screenshot to S3 if provided (emma-sidebar sessions only)
+  let screenshotUrl: string | undefined;
+  if (pageContext?.screenshot) {
+    const result = await uploadScreenshotToS3(pageContext.screenshot, userId);
+    if (result) screenshotUrl = result.url;
+  }
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -1466,7 +1480,8 @@ export async function generateSessionResponse(
       sessionId,
       mockMode: false,
       isInteractiveShare: isInteractiveShare || false,
-      excludeTools
+      excludeTools,
+      screenshotUrl
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -1781,6 +1796,18 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Reject concurrent requests for the same session (synchronous check before any await)
+      if (activeSessionGenerations.has(sessionId)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+      activeSessionGenerations.add(sessionId);
+
+      try {
+
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
@@ -1869,6 +1896,9 @@ export const agentModeController = {
         ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+      } finally {
+        activeSessionGenerations.delete(sessionId);
+      }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
 

@@ -144,6 +144,100 @@ describe('DynamoDB pagination in chatbotService', () => {
     });
   });
 
+  describe('getRecentSessionsPage with time range', () => {
+    it('should exclude sessions whose createdAt is outside the time range (updatedAt leak bug)', async () => {
+      // A session created a week ago but with updatedAt bumped into the range (e.g., by scoring)
+      const oldSession = {
+        sessionId: 'old-session',
+        adminListPartition: 'all',
+        createdAt: '2026-03-29T03:00:00.000Z',
+        updatedAt: '2026-04-05T03:34:58.926Z',
+        title: 'LinkedIn Profile Visit',
+      };
+      // A normal session created within the range
+      const newSession = {
+        sessionId: 'new-session',
+        adminListPartition: 'all',
+        createdAt: '2026-04-05T10:00:00.000Z',
+        updatedAt: '2026-04-05T10:01:00.000Z',
+        title: 'Daily Task',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [newSession, oldSession],
+      });
+
+      const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions).toHaveLength(1);
+      expect(result.sessions[0].sessionId).toBe('new-session');
+    });
+
+    it('should include sessions whose createdAt is within the time range', async () => {
+      const session1 = {
+        sessionId: 'sess-1',
+        adminListPartition: 'all',
+        createdAt: '2026-04-04T10:00:00.000Z',
+        updatedAt: '2026-04-04T10:01:00.000Z',
+        title: 'Session 1',
+      };
+      const session2 = {
+        sessionId: 'sess-2',
+        adminListPartition: 'all',
+        createdAt: '2026-04-05T09:00:00.000Z',
+        updatedAt: '2026-04-05T09:01:00.000Z',
+        title: 'Session 2',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [session2, session1],
+      });
+
+      const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions).toHaveLength(2);
+    });
+
+    it('should handle sessions without createdAt by including them', async () => {
+      const sessionNoDate = {
+        sessionId: 'legacy-session',
+        adminListPartition: 'all',
+        updatedAt: '2026-04-05T10:00:00.000Z',
+        title: 'Legacy Session',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [sessionNoDate],
+      });
+
+      const timeRange = { startTime: '2026-04-05T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions).toHaveLength(1);
+    });
+
+    it('should filter out sessions created before startTime', async () => {
+      const tooOld = {
+        sessionId: 'too-old',
+        adminListPartition: 'all',
+        createdAt: '2026-04-03T23:59:59.000Z',
+        updatedAt: '2026-04-05T10:00:00.000Z',
+        title: 'Too Old',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [tooOld],
+      });
+
+      const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions).toHaveLength(0);
+    });
+  });
+
   describe('getMessageCountFromMessagesTable', () => {
     it('should sum counts across multiple DynamoDB pages', async () => {
       // Page 1: count of 50, has more

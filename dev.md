@@ -1,3 +1,131 @@
+# April 6, 2026: Investigation — Claude Code Source Analysis (Agent Architecture Patterns)
+
+## Background
+
+Anthropic's Claude Code CLI source was recently deobfuscated and analyzed by the community (~386K–500K lines, ~1,900 files). Two primary analysis repositories surfaced:
+- `github.com/chat2dev/ClaudeCodeAnalysis` — 7-part architectural breakdown
+- `github.com/luzhenqian/Claude-Harness` — 31-article deep-dive series
+
+Investigated what patterns could be borrowed into AgentWeb's agent infrastructure (`agentModeService.ts`, `toolRegistry.ts`, Emma pipeline).
+
+## Key Findings
+
+### 1. Tiered Context Compaction (three layers, zero-cost first two)
+
+Claude Code uses a three-layer compaction strategy triggered before context overflow:
+
+- **Layer 1 (free)**: Replace old `tool_result` content with `[result cleared]` placeholders. No LLM call — the model has already acted on these results.
+- **Layer 2 (free)**: Use a pre-built "session memory" object maintained in the background after each turn (key decisions, completed actions, open questions). No extra API call — the summary is ready when needed.
+- **Layer 3 (LLM call)**: Full summarization via a forked agent with an `<analysis>`/`<summary>` prompt structure. Strips reasoning from the stored output.
+
+**Circuit breaker**: After 3 consecutive compaction failures, auto-compaction is disabled for the session. This was added after a production incident where 1,279 sessions experienced 50–3,272 consecutive failures, wasting ~250K API calls/day.
+
+### 2. Hybrid Token Counting
+
+Rather than re-estimating the full message history every turn (slow) or using pure heuristics (inaccurate), Claude Code uses the last API response's `usage.prompt_tokens` as an anchor and only estimates deltas for new messages (~4 chars/token). Four pressure thresholds: warning → auto-compact → blocking → effective-window.
+
+AgentWeb already captures `response.usage` at `agentModeService.ts:1429-1445` — this data is available to implement the same pattern without any API changes.
+
+### 3. Tool Safety Metadata + Smart Concurrency
+
+Each tool declares `isConcurrencySafe(input)`, `isReadOnly(input)`, and optional `isDestructive(input)` at the type level. The `StreamingToolExecutor` runs read-only tools in parallel and serializes write tools. Critically, `isConcurrencySafe` accepts the actual input (same tool can be safe or unsafe depending on what it's operating on).
+
+AgentWeb's `ToolRegistry` currently has no such metadata — `AgentTool` is `{name, definition, execute}` only. Tools already run in parallel (`agentModeService.ts:1503-1505`) but with no write-safety guarantee.
+
+### 4. Tool Pair Integrity on Context Trim
+
+When pruning old messages, Claude Code enforces that a `tool_use` (assistant message) is never left without its matching `tool_result`. An orphaned `tool_use` causes certain LLMs (especially Claude-family) to return an API error. The function `adjustIndexToPreserveAPIInvariants` enforces this.
+
+AgentWeb's `trimToolMessagesForContext` (`agentModeService.ts:13144`) only trims `tool` role messages — it does not check or remove the paired assistant `tool_calls` block. This is a latent correctness issue for very long sessions.
+
+### 5. Analysis-Output XML Separation in LLM Prompts
+
+For complex structured outputs, Claude Code prompts include `<analysis>` (reasoning, gets stripped) and `<summary>` (output, gets stored) tags. The analysis block gets stripped before storing — the model reasons without the reasoning eating into future context budget. This reliably improves quality for structured generation (work plans, summaries, reports).
+
+### 6. Max-Tokens Recovery Message
+
+Claude Code's continuation injection explicitly bans preamble:
+> *"Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."*
+
+AgentWeb's current version (`agentModeService.ts:1463`) says *"Please continue exactly where you left off"* — allows the model to start with an apology and restatement before resuming.
+
+### 7. Error Withholding Pattern
+
+Recoverable errors (`max_output_tokens`, `prompt_too_long`, media-size) are withheld from the caller while recovery is attempted. The error is only surfaced if all recovery strategies fail. This prevents SDK consumers from terminating sessions on transient errors.
+
+AgentWeb has basic max-tokens continuation (3x) and backup model fallback, but `prompt_too_long` has no recovery path — it propagates immediately to the user.
+
+## Current AgentWeb Gaps vs. Claude Code
+
+| Area | AgentWeb Current | Claude Code Pattern |
+|------|-----------------|---------------------|
+| Context compaction | `trimToolMessagesForContext` (crude truncation) | 3-layer tiered strategy with circuit breaker |
+| Token awareness | None | Hybrid counting + 4 pressure thresholds |
+| Tool safety metadata | None (`AgentTool` has no `isReadOnly`) | `isConcurrencySafe`, `isReadOnly`, `isDestructive` per-tool |
+| Tool pair integrity | Not enforced | `adjustIndexToPreserveAPIInvariants` |
+| Prompt quality | Direct prompts | `<analysis>`/`<output>` separation for structured generation |
+| Recovery message | Allows preamble | Explicitly bans apology/recap |
+| `prompt_too_long` | Propagates immediately | Reactive compaction + retry |
+
+## Decision
+
+**No immediate adoption** — AgentWeb sessions are not yet long enough to make context compaction a user-visible problem. No urgent need to invest the engineering time.
+
+**Future work signal**: If any of the following happen, revisit these patterns:
+
+- Long agent sessions (>50 turns) start failing or degrading in quality
+- Context window errors appear in production logs (`prompt_too_long` / 400 errors)
+- Users report agents "forgetting" earlier context in long sessions
+- We add sub-agent / coordinator-worker orchestration (then tool safety metadata becomes critical)
+
+**Prioritized if/when adopted** (easiest wins first):
+1. Fix max-tokens recovery message (1-liner, `agentModeService.ts:1463`)
+2. Tool pair integrity in `trimToolMessagesForContext` (prevents latent API errors)
+3. `<analysis>`/`<output>` separation in work plan / GTM plan generation
+4. `isReadOnly` / `isDestructive` metadata on `AgentTool` interface
+5. Token pressure thresholds using existing `response.usage` data
+6. Full tiered context compaction (largest investment, highest long-session impact)
+
+---
+
+# April 4, 2026: Investigation — Axios Supply Chain Attack (AWS Security Alert)
+
+## Background
+
+Received an AWS Security email warning that our organization "may have been the target of potentially inappropriate activity" related to malicious axios npm package versions `1.14.1` and `0.30.4`, published March 30–31, 2026 via a hijacked maintainer account.
+
+AWS recommended checking for network connections to `142.11.206.73:8000` during March 31, 5:15–8:15 PM PDT, rotating credentials on affected hosts, and auditing CloudTrail.
+
+## Investigation
+
+### Axios versions in our lock files
+
+| Component | Resolved axios version | Status |
+|---|---|---|
+| backend | 1.9.0 | Safe |
+| partner-portal | 1.11.0 | Safe |
+| customer-portal | 1.11.0 | Safe |
+| agent-engine | Python only — no axios | Not applicable |
+
+The `1.14.1` hits that appeared in the lock file grep were for `tslib` (a TypeScript utility), not axios.
+
+### Why we were never exposed
+
+- **`npm ci` everywhere**: CI pipeline and cloud-dev test env both use `npm ci`, which installs exact lock file versions — no semver range resolution occurs.
+- **Lock files were clean during the attack window**: Confirmed via `git show 32c1b508:backend/package-lock.json` — backend had axios `1.9.0` as of the March 31 commit. No package-lock.json changes landed during March 30–31.
+- **EB deploys bundle the lock file**: The zip artifact includes `package-lock.json`, so EB also installs only locked versions.
+- **Agent engine is Python**: No axios dependency at all.
+
+### AWS Health Dashboard
+
+Checked the Affected Resources tab — no resources listed. This confirms the alert was a false alarm. AWS sent these notifications broadly to any account that uses axios as a dependency, as a precautionary measure.
+
+## Conclusion
+
+No compromise. No credential rotation needed. No affected hosts.
+
+The `package.json` semver ranges (`^1.9.0`, `^1.7.9`) would theoretically allow resolving to `1.14.1` under a bare `npm install`, but since all install paths use `npm ci` the lock file versions were always used. The malicious versions were removed from npm shortly after discovery. Low-priority housekeeping: update lock files to pin axios past `1.14.1` when convenient.
+
 # March 29, 2026: Investigation — Sonnet 4.6 vs Opus 4.6 Cost & Quality Comparison for Agent Mode
 
 ## Problem
@@ -1333,6 +1461,45 @@ On a heavy-context session, Opus is ~24% slower per LLM call — a smaller gap t
 **Files changed:**
 - `backend/src/services/agentModeService.ts` — timing logs + parallel tool execution
 - `backend/src/__tests__/agentModeService.llmTiming.test.ts` — 10 tests (timing instrumentation + parallel execution)
+
+---
+
+# April 5, 2026: Do Parallel Tool Calls Consume More Tokens?
+
+**Question:** When the LLM returns multiple tool calls in a single response (parallel), does that consume more tokens compared to making them one at a time (sequential)?
+
+**Context:** Investigated a production session (`ce0f5737`) — "Daily Slack Check — All Channels". The agent made 1 `slack_list_channels` call followed by **65 `slack_get_recent_messages` calls** that all appeared grouped after Emma's final response in the share UI. This raised the question of whether those parallel calls came from the same LLM response and how they compare to sequential calls in terms of token cost.
+
+**How parallel tool calls work in our backend:**
+
+When a Gemini/Claude/GPT model returns a response with multiple `tool_calls` in one API response (e.g., 30 channel fetch requests at once), `agentModeService.ts` collects all of them in a single iteration and executes them concurrently via `Promise.all()` (see `agentModeService.ts:1502–1571`). This means **all N tool calls come from the same LLM API response** — the model generated all N tool-call JSON blocks in one shot.
+
+**Token breakdown — parallel vs sequential for N tools:**
+
+| | Parallel (what we do) | Sequential (hypothetical) |
+|---|---|---|
+| LLM API calls | 1 call returns all N requests | N calls, one per tool |
+| Input tokens | Sent **once** | Resent + grows each round |
+| Output tokens | More per call (N tool JSONs in one response) | Less per call, but N× calls |
+| **Total tokens** | **Much lower** | **Much higher** (context accumulates N×) |
+
+**Concrete example (the investigated session):**
+
+The session made 30 `slack_get_recent_messages` calls in parallel from a single LLM response. Compared to doing them one at a time:
+
+- **Parallel (actual):** 1 LLM call × (context + 30 tool-call outputs) + 1 final synthesis call
+- **Sequential (hypothetical):** 30 LLM calls where each input = prior context + all prior tool results accumulated
+
+For 30 channels, the sequential approach would have sent the full conversation context ~30 extra times, each iteration slightly larger. Parallel avoids that entirely — the context is sent once and the model generates all 30 requests in a single output.
+
+**Answer:** Yes, the single LLM response that generates N parallel tool calls has **more output tokens** than a response with 1 tool call (it has to emit N tool-call JSON blocks). But the **total token cost across the conversation is dramatically lower** than sequential, because you avoid resending the full growing context N times. For the 30-channel session, parallel saved roughly 29× the input token cost of the mid-conversation context window.
+
+**The 65 tool calls came from 2 LLM responses:**
+1. First response: `slack_list_channels` → 1 tool call
+2. Second response: all 30 `slack_get_recent_messages` at once → 30+ tool calls in parallel
+3. Final response: synthesis/summary (no tool calls)
+
+The share UI groups all tool calls after the final assistant message, which made it look like they all came from one response — they didn't. The sequential `slack_list_channels` was its own round trip.
 
 ---
 

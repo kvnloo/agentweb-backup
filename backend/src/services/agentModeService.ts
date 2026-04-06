@@ -26,7 +26,7 @@ import type { LLMUsageData } from '../utils/llmService';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'slack_list_channels', 'slack_get_recent_messages', 'slack_send_message', 'freeze_user_account'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -34,7 +34,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -74,6 +74,54 @@ interface PDFData {
   info: any;
   metadata: any;
   version: string;
+}
+
+/**
+ * Custom pdf-parse pagerender function that preserves table structure.
+ *
+ * The default pdf-parse renderer concatenates items sharing the same exact Y
+ * coordinate without adding spaces, and doesn't sort items by X position.
+ * This causes numbers in tabular PDFs to run together or appear out of order.
+ *
+ * This renderer:
+ * 1. Sorts all text items by Y (descending = top-to-bottom) then X (ascending = left-to-right)
+ * 2. Groups items into rows using a Y-tolerance to handle slight vertical misalignments
+ * 3. Separates items on the same row with a space so numbers don't concatenate
+ */
+function pdfPageRender(pageData: any): Promise<string> {
+  return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
+    .then((textContent: any) => {
+      const Y_TOLERANCE = 3; // points — items within this vertical distance are on the same row
+
+      // Sort: top-to-bottom (higher Y first in PDF coords), left-to-right
+      const items: Array<{ str: string; x: number; y: number }> = textContent.items
+        .filter((item: any) => item.str && item.str.trim() !== '')
+        .map((item: any) => ({ str: item.str, x: item.transform[4], y: item.transform[5] }))
+        .sort((a: any, b: any) => {
+          if (Math.abs(a.y - b.y) > Y_TOLERANCE) return b.y - a.y; // top first
+          return a.x - b.x; // left first within same row
+        });
+
+      if (items.length === 0) return '';
+
+      // Group items into rows
+      const rows: string[][] = [];
+      let currentRow: string[] = [];
+      let rowY = items[0].y;
+
+      for (const item of items) {
+        if (Math.abs(item.y - rowY) <= Y_TOLERANCE) {
+          currentRow.push(item.str);
+        } else {
+          rows.push(currentRow);
+          currentRow = [item.str];
+          rowY = item.y;
+        }
+      }
+      if (currentRow.length > 0) rows.push(currentRow);
+
+      return rows.map(row => row.join(' ')).join('\n');
+    });
 }
 
 // Type for LLM model configuration
@@ -335,6 +383,7 @@ export class AgentModeService {
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
+        await import('../emma/tempEmailTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -1080,7 +1129,8 @@ export class AgentModeService {
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
-    excludeTools?: string[]
+    excludeTools?: string[],
+    screenshotUrl?: string
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -1138,7 +1188,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, isAdmin);
@@ -1184,7 +1234,7 @@ export class AgentModeService {
       _initialMessageCount = initialMessageCount;
 
       // Single loop for LLM calls and tool execution
-      let maxIterations = 20; // Prevent infinite loops
+      let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
       let skillsUpdated = false;
@@ -1212,6 +1262,16 @@ export class AgentModeService {
         }
 
         iteration++;
+
+        // Step budget awareness: inject a reminder when approaching the limit so the LLM
+        // can self-regulate (prefer batch ops, skip unnecessary pages, wrap up early).
+        const remaining = maxIterations - iteration;
+        if (remaining <= 10 && remaining > 0) {
+          const urgency = remaining <= 3
+            ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
+            : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
+          (messages as any[]).push({ role: 'user', content: urgency });
+        }
 
         // 4. Refresh Context if Skills Changed
         if (skillsUpdated) {
@@ -1523,7 +1583,8 @@ export class AgentModeService {
         const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
           const toolStart = Date.now();
           try {
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, socketEmit ? { socketEmit } : undefined);
+            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
             const toolDuration = Date.now() - toolStart;
             return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
           } catch (error) {
@@ -1538,7 +1599,27 @@ export class AgentModeService {
         for (const toolResult of toolResults) {
           if (toolResult.status === 'success') {
             const { toolCall, functionArgs, result, duration } = toolResult;
-            const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
+
+            // For playwright screenshots, upload the base64 image to S3.
+            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
+            // and makes the screenshot displayable in the frontend.
+            let processedResult = result;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
+              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
+              if (imageContent?.data) {
+                try {
+                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
+                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
+                  if (uploadResult) {
+                    processedResult = { screenshotUrl: uploadResult.url, success: true };
+                  }
+                } catch (e) {
+                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
+                }
+              }
+            }
+
+            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
 
             toolCalls.push({
               id: toolCall.id,
@@ -1551,7 +1632,15 @@ export class AgentModeService {
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
-            const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
+            // The screenshot is displayed to the user via the tool call card in the frontend.
+            // We intentionally omit the URL so the LLM doesn't embed it in markdown responses.
+            let toolContent: any;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
+              toolContent = `Screenshot captured successfully and displayed to the user.`;
+            } else {
+              toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            }
             const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
               ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
               : toolContent;
@@ -2130,7 +2219,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -2289,8 +2378,18 @@ When a user requests client onboarding or says "onboard new client" or similar:
       messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
-    // Append the current user message at the end
-    messages.push({ role: 'user', content: messageContent });
+    // Append the current user message at the end (with vision if a screenshot URL was provided)
+    if (screenshotUrl) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
+        ]
+      });
+    } else {
+      messages.push({ role: 'user', content: messageContent });
+    }
 
     return messages;
   }
@@ -2395,7 +2494,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'fathom_get_transcript',
 
     // Coding Agent (sub-agent for code editing tasks)
-    'coding_agent'
+    'coding_agent',
+
+    'slack_list_channels',
+    'slack_get_recent_messages',
+    'slack_send_message',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -2769,6 +2872,12 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
+
+    // For playwright screenshots, result has already been processed (base64 → S3 URL)
+    if (toolName === 'playwright_browser_take_screenshot') {
+      return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
+    }
+
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -12563,7 +12672,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (extension === 'pdf' || mimeType === 'application/pdf') {
       const pdfParse = require('pdf-parse');
-      const pdfData = await pdfParse(content);
+      const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
@@ -12656,7 +12765,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         const pdfParse = require('pdf-parse');
-        const pdfData = await pdfParse(content);
+        const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
@@ -13641,7 +13750,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try {
           // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer);
+          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
@@ -14658,14 +14767,94 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
         console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
+        // Publish to Payload CMS instead of Webflow
+        let payloadEndpoint = 'https://www.agentweb.pro/api/publish-post';
+        let payloadSecret: string | undefined;
+
         try {
+          const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
+          if (payloadSecretJson) {
+            const parsed = JSON.parse(payloadSecretJson);
+            payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
+            payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
+          }
+        } catch (secretErr) {
+          console.warn('AgentMode: Could not load PayloadCMS secret, falling back to Webflow:', secretErr);
+        }
+
+        if (!payloadSecret) {
+          console.warn('AgentMode: PAYLOAD_PUBLISH_SECRET not available, falling back to Webflow');
+        }
+
+        try {
+          if (payloadSecret) {
+            // Map Webflow categories to Payload categories
+            const categoryMap: Record<string, string> = {
+              'AI in Marketing': 'AI in Marketing',
+              'Founder Playbooks': 'Founder Playbooks',
+              'Growth Tips': 'Growth Tips',
+              'Thought Leadership': 'Thought Leadership',
+              'Other': 'Other',
+              'Alternatives': 'Alternatives',
+              'Listicles': 'Listicles',
+              'User Guide': 'User Guide',
+              'Case Studies': 'Case Studies',
+            };
+            const payloadCategory = categories.length > 0
+              ? (categoryMap[categories[0]] || 'Other')
+              : 'Other';
+
+            // Map author to Payload author slug
+            const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
+              : author?.toLowerCase().includes('harsha') ? 'harsha'
+              : author?.toLowerCase().includes('fangfang') ? 'fangfang'
+              : author?.toLowerCase().includes('matthew') ? 'matthew'
+              : 'emma';
+
+            const payloadResponse = await axios.post(
+              payloadEndpoint,
+              {
+                title,
+                slug,
+                summary: description,
+                bodyHtml: cleanBodyHtml,
+                category: payloadCategory,
+                author: authorSlug,
+                featuredImageUrl: heroImageUrl,
+                publishedAt: new Date().toISOString(),
+                status,
+              },
+              {
+                headers: { 'Authorization': `Bearer ${payloadSecret}` },
+                timeout: 30000,
+              }
+            );
+
+            console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
+
+            return {
+              success: true,
+              message: `Blog article published successfully to Payload CMS as ${status}`,
+              data: {
+                title,
+                slug,
+                status,
+                cmsType: 'Payload',
+                url: `/blog/${slug}`,
+                cmsResponse: payloadResponse.data,
+              }
+            };
+          }
+
+          // Fallback to Webflow if no Payload secret
           const response = await axios.post(
             endpoint,
             cmsItemData,
             { headers }
           );
 
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}`);
+          console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
 
           // Sanitize response to remove large content fields before sending to LLM
           const responseData = response.data as any;
@@ -14675,7 +14864,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
           if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
             const sanitizedFieldData = { ...sanitizedResponse.fieldData };
-            // Remove large content fields that aren't needed by the LLM
             delete sanitizedFieldData['post-body'];
             delete sanitizedFieldData['body'];
             sanitizedResponse.fieldData = sanitizedFieldData;
@@ -18610,7 +18798,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Load metrics for connected account helper
-  async loadConnectedAccountMetrics(userId: string, accountId: string): Promise<any> {
+  async loadConnectedAccountMetrics(userId: string, accountId: string, startDate?: Date, endDate?: Date): Promise<any> {
     try {
       const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
@@ -18627,7 +18815,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         const adapter = socialPlatformService.getAdapter(account.platform);
 
-        const metrics = await adapter.getAccountMetrics(account);
+        const metrics = await adapter.getAccountMetrics(account, userId, startDate, endDate);
 
         return {
           success: true,

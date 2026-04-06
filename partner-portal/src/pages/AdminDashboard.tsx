@@ -56,6 +56,9 @@ import McpServersTab from "../components/admin/McpServersTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
+import RevenueTab from "../components/admin/RevenueTab";
+import FunnelTab from "../components/admin/FunnelTab";
+import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -216,7 +219,8 @@ interface User {
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
-  slackChannel?: string; // Default Slack channel for this user
+  slackChannel?: string; // @deprecated — use slackChannels
+  slackChannels?: string[]; // Slack channels configured for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -670,6 +674,9 @@ export default function AdminDashboard() {
     'emma-settings': 15,
     'scoring-judges': 16,
     'crm': 17,
+    'revenue': 18,
+    'funnel': 19,
+    'alert-emails': 18,
   };
   
   // Get initial tab value from URL or default to Users
@@ -751,7 +758,8 @@ export default function AdminDashboard() {
   const [emailSenderEditLoading, setEmailSenderEditLoading] = useState(false);
   const [slackChannelDialogOpen, setSlackChannelDialogOpen] = useState(false);
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
-  const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
+  const [currentSlackChannels, setCurrentSlackChannels] = useState<string[]>([]);
+  const [slackChannelInputText, setSlackChannelInputText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
   const [adminSlackChannel, setAdminSlackChannel] = useState("");
   const [adminSlackChannelInput, setAdminSlackChannelInput] = useState("");
@@ -2097,36 +2105,30 @@ export default function AdminDashboard() {
 
   const handleSaveSlackChannel = async () => {
     if (!editingSlackChannelUserId) return;
-    
+
     try {
       setSlackChannelEditLoading(true);
-      
+
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSlackChannelUserId}/slack-channel`),
-        { 
-          slackChannel: currentSlackChannelText.trim() || null
-        },
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
+        { slackChannels: currentSlackChannels },
+        { headers: { Authorization: `Bearer ${token}` } }
       );
 
       if (response.status === 200) {
         // Update the user in the local state without reloading
-        setUsers((prevUsers: User[]) => 
-          prevUsers.map((user: User) => 
-            user.userId === editingSlackChannelUserId 
-              ? { 
-                  ...user, 
-                  slackChannel: response.data.slackChannel
-                }
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === editingSlackChannelUserId
+              ? { ...user, slackChannels: response.data.slackChannels ?? [] }
               : user
           )
         );
-        setSuccess("Slack channel updated successfully!");
+        setSuccess("Slack channels updated successfully!");
         setSlackChannelDialogOpen(false);
         setEditingSlackChannelUserId(null);
-        setCurrentSlackChannelText("");
+        setCurrentSlackChannels([]);
+        setSlackChannelInputText("");
       }
     } catch (error: any) {
       console.error("Error updating slack channel:", error);
@@ -2708,6 +2710,9 @@ export default function AdminDashboard() {
             <Tab label="Emma Chat Settings" {...a11yProps(15)} />
             <Tab label="Scoring Judges" {...a11yProps(16)} />
             <Tab label="CRM" {...a11yProps(17)} />
+            <Tab label="Revenue" {...a11yProps(18)} />
+            <Tab label="Funnel" {...a11yProps(19)} />
+            <Tab label="Alert Emails" {...a11yProps(18)} />
           </Tabs>
         </Box>
 
@@ -3856,10 +3861,22 @@ export default function AdminDashboard() {
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Slack Channel</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                                    <Typography variant="body2">{user.slackChannel || "—"}</Typography>
-                                    <IconButton size="small" onClick={() => { setEditingSlackChannelUserId(user.userId); setCurrentSlackChannelText(user.slackChannel || ""); setSlackChannelDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  <Typography variant="caption" color="text.secondary">Slack Channels</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                                    <Typography variant="body2">
+                                      {(user.slackChannels && user.slackChannels.length > 0)
+                                        ? user.slackChannels.join(", ")
+                                        : (user.slackChannel || "—")}
+                                    </Typography>
+                                    <IconButton size="small" onClick={() => {
+                                      setEditingSlackChannelUserId(user.userId);
+                                      const channels = user.slackChannels && user.slackChannels.length > 0
+                                        ? user.slackChannels
+                                        : user.slackChannel ? [user.slackChannel] : [];
+                                      setCurrentSlackChannels(channels);
+                                      setSlackChannelInputText("");
+                                      setSlackChannelDialogOpen(true);
+                                    }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
@@ -5390,6 +5407,16 @@ export default function AdminDashboard() {
         <TabPanel value={tabValue} index={17}>
           <CrmTab />
         </TabPanel>
+        <TabPanel value={tabValue} index={18}>
+          <RevenueTab />
+        </TabPanel>
+        <TabPanel value={tabValue} index={19}>
+          <FunnelTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={20}>
+          <AlertEmailsTab />
+        </TabPanel>
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -6404,53 +6431,99 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Slack Channel Configuration Dialog */}
+      {/* Slack Channels Configuration Dialog */}
       <Dialog
         open={slackChannelDialogOpen}
         onClose={() => {
           setSlackChannelDialogOpen(false);
           setEditingSlackChannelUserId(null);
-          setCurrentSlackChannelText("");
+          setCurrentSlackChannels([]);
+          setSlackChannelInputText("");
         }}
         maxWidth="sm"
         fullWidth
       >
         <DialogTitle>
-          Configure Slack Channel
+          Configure Slack Channels
           <IconButton
             aria-label="close"
             onClick={() => {
               setSlackChannelDialogOpen(false);
               setEditingSlackChannelUserId(null);
-              setCurrentSlackChannelText("");
+              setCurrentSlackChannels([]);
+              setSlackChannelInputText("");
             }}
-            sx={{
-              position: 'absolute',
-              right: 8,
-              top: 8,
-            }}
+            sx={{ position: 'absolute', right: 8, top: 8 }}
           >
             <CloseIcon />
           </IconButton>
         </DialogTitle>
         <DialogContent dividers>
-          <TextField
-            autoFocus
-            fullWidth
-            label="Slack Channel ID"
-            value={currentSlackChannelText}
-            onChange={(e) => setCurrentSlackChannelText(e.target.value)}
-            placeholder="C1234567890"
-            helperText="Enter the Slack channel ID where this user's approval requests should be sent. Leave empty to disable account-level Slack channel restriction."
-            disabled={slackChannelEditLoading}
-          />
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+              Configured channels (agent tools are restricted to these):
+            </Typography>
+            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minHeight: 32 }}>
+              {currentSlackChannels.length === 0 && (
+                <Typography variant="body2" color="text.disabled">No channels configured</Typography>
+              )}
+              {currentSlackChannels.map((ch) => (
+                <Chip
+                  key={ch}
+                  label={ch}
+                  size="small"
+                  onDelete={() => setCurrentSlackChannels((prev) => prev.filter((c) => c !== ch))}
+                  disabled={slackChannelEditLoading}
+                />
+              ))}
+            </Box>
+          </Box>
+          <Box sx={{ display: "flex", gap: 1 }}>
+            <TextField
+              autoFocus
+              fullWidth
+              size="small"
+              label="Add Slack Channel ID"
+              value={slackChannelInputText}
+              onChange={(e) => setSlackChannelInputText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  const val = slackChannelInputText.trim();
+                  if (val && !currentSlackChannels.includes(val)) {
+                    setCurrentSlackChannels((prev) => [...prev, val]);
+                  }
+                  setSlackChannelInputText("");
+                }
+              }}
+              placeholder="C1234567890"
+              helperText="Enter a channel ID and press Enter or click Add"
+              disabled={slackChannelEditLoading}
+            />
+            <Button
+              variant="outlined"
+              size="small"
+              sx={{ mt: 0, mb: "auto", height: 40, whiteSpace: "nowrap" }}
+              disabled={slackChannelEditLoading || !slackChannelInputText.trim()}
+              onClick={() => {
+                const val = slackChannelInputText.trim();
+                if (val && !currentSlackChannels.includes(val)) {
+                  setCurrentSlackChannels((prev) => [...prev, val]);
+                }
+                setSlackChannelInputText("");
+              }}
+            >
+              Add
+            </Button>
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button
             onClick={() => {
               setSlackChannelDialogOpen(false);
               setEditingSlackChannelUserId(null);
-              setCurrentSlackChannelText("");
+              setCurrentSlackChannels([]);
+              setSlackChannelInputText("");
             }}
             disabled={slackChannelEditLoading}
           >
