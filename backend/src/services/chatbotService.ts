@@ -3172,6 +3172,7 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
 
 // Cache for Emma system context (60s TTL)
 let cachedSystemContext: { value: string; expiry: number } | null = null;
+let emmaToolsLoaded = false;
 
 // Exported for testing only — not part of the public API
 export function __resetEmmaSystemContextCache(): void {
@@ -3718,12 +3719,14 @@ export async function generateChatResponse(
           pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
         }
 
+        if (!emmaToolsLoaded) {
+          await import('../emma/tools');
+          await import('../emma/tempEmailTools');
+          await import('../emma/testAccountTools');
+          emmaToolsLoaded = true;
+        }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
-        // Ensure Emma tool files are loaded (side-effect imports populate the registry)
-        await import('../emma/tools');
-        await import('../emma/tempEmailTools');
-        await import('../emma/testAccountTools');
 
         for (const toolName of toolsToInclude) {
           // First try emmaToolRegistry (Emma-specific tools), then fall back to mcpToolRegistry

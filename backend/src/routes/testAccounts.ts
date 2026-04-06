@@ -6,12 +6,16 @@ const router = express.Router();
 
 router.use(authenticateToken);
 
+function extractDomain(siteUrl: string): string {
+  const url = siteUrl.startsWith('http') ? siteUrl : `https://${siteUrl}`;
+  return new URL(url).hostname.replace(/^www\./, '');
+}
+
 // GET /api/test-accounts — list all test accounts for the authenticated user
 router.get('/', async (req, res) => {
   try {
     const userId = (req as any).user.userId;
     const accounts = await testAccountsDb.getByUserId(userId);
-    // Mask passwords in list view
     const masked = accounts.map((a) => ({ ...a, password: '••••••••' }));
     res.json({ accounts: masked });
   } catch (error: any) {
@@ -23,9 +27,8 @@ router.get('/', async (req, res) => {
 router.get('/:accountId', async (req, res) => {
   try {
     const userId = (req as any).user.userId;
-    const accounts = await testAccountsDb.getByUserId(userId);
-    const account = accounts.find((a) => a.accountId === req.params.accountId);
-    if (!account) return res.status(404).json({ error: 'Test account not found' });
+    const account = await testAccountsDb.getById(req.params.accountId);
+    if (!account || account.userId !== userId) return res.status(404).json({ error: 'Test account not found' });
     res.json({ account });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch test account' });
@@ -50,7 +53,7 @@ router.post('/', async (req, res) => {
 
     let domain: string;
     try {
-      domain = new URL(siteUrl.startsWith('http') ? siteUrl : `https://${siteUrl}`).hostname.replace(/^www\./, '');
+      domain = extractDomain(siteUrl);
     } catch {
       return res.status(400).json({ error: 'siteUrl must be a valid URL' });
     }
@@ -73,10 +76,8 @@ router.post('/', async (req, res) => {
 router.put('/:accountId', async (req, res) => {
   try {
     const userId = (req as any).user.userId;
-    // Verify ownership
-    const accounts = await testAccountsDb.getByUserId(userId);
-    const existing = accounts.find((a) => a.accountId === req.params.accountId);
-    if (!existing) return res.status(404).json({ error: 'Test account not found' });
+    const existing = await testAccountsDb.getById(req.params.accountId);
+    if (!existing || existing.userId !== userId) return res.status(404).json({ error: 'Test account not found' });
 
     const { email, password, notes, siteUrl } = req.body;
     const updates: any = {};
@@ -96,10 +97,8 @@ router.put('/:accountId', async (req, res) => {
 router.delete('/:accountId', async (req, res) => {
   try {
     const userId = (req as any).user.userId;
-    // Verify ownership
-    const accounts = await testAccountsDb.getByUserId(userId);
-    const existing = accounts.find((a) => a.accountId === req.params.accountId);
-    if (!existing) return res.status(404).json({ error: 'Test account not found' });
+    const existing = await testAccountsDb.getById(req.params.accountId);
+    if (!existing || existing.userId !== userId) return res.status(404).json({ error: 'Test account not found' });
 
     await testAccountsDb.delete(req.params.accountId);
     res.json({ success: true });

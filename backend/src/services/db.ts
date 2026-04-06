@@ -5601,6 +5601,19 @@ export const testAccountsDb = {
     }
   },
 
+  async getById(accountId: string): Promise<TestAccount | undefined> {
+    try {
+      const result = await dynamodb.get({
+        TableName: TEST_ACCOUNTS_TABLE,
+        Key: { accountId },
+      }).promise();
+      return result.Item as TestAccount | undefined;
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.getById');
+      throw error;
+    }
+  },
+
   async getByDomain(userId: string, domain: string): Promise<TestAccount[]> {
     try {
       const result = await dynamodb.query({

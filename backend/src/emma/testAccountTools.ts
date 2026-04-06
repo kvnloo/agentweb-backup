@@ -1,6 +1,15 @@
 import { emmaToolRegistry } from './registry';
 import { testAccountsDb } from '../services/db';
 
+function extractDomain(siteUrl: string): string {
+  try {
+    const url = siteUrl.startsWith('http') ? siteUrl : `https://${siteUrl}`;
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return siteUrl.toLowerCase().replace(/^www\./, '');
+  }
+}
+
 emmaToolRegistry.register({
   name: 'get_test_account',
   definition: {
@@ -26,14 +35,7 @@ emmaToolRegistry.register({
     if (!userId) throw new Error('Authentication required: no user context');
     if (!args.site_url) throw new Error('site_url is required');
 
-    let domain: string;
-    try {
-      const url = args.site_url.startsWith('http') ? args.site_url : `https://${args.site_url}`;
-      domain = new URL(url).hostname.replace(/^www\./, '');
-    } catch {
-      domain = args.site_url.toLowerCase().replace(/^www\./, '');
-    }
-
+    const domain = extractDomain(args.site_url);
     const accounts = await testAccountsDb.getByDomain(userId, domain);
     if (accounts.length === 0) {
       return {
@@ -43,7 +45,6 @@ emmaToolRegistry.register({
       };
     }
 
-    // Return the most recently created account
     const account = accounts[0];
     return {
       found: true,
@@ -85,11 +86,6 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Optional notes about this account (e.g. "created via temp email on signup page").',
         },
-        source: {
-          type: 'string',
-          enum: ['manual', 'auto-created'],
-          description: 'How this account was created. Use "auto-created" when Emma signed up for it.',
-        },
       },
       required: ['site_url', 'email', 'password'],
     },
@@ -101,18 +97,10 @@ emmaToolRegistry.register({
     if (!args.email) throw new Error('email is required');
     if (!args.password) throw new Error('password is required');
 
-    let domain: string;
-    try {
-      const url = args.site_url.startsWith('http') ? args.site_url : `https://${args.site_url}`;
-      domain = new URL(url).hostname.replace(/^www\./, '');
-    } catch {
-      domain = args.site_url.toLowerCase().replace(/^www\./, '');
-    }
-
-    // Check if account already exists for this domain
+    const domain = extractDomain(args.site_url);
     const existing = await testAccountsDb.getByDomain(userId, domain);
     if (existing.length > 0) {
-      const updated = await testAccountsDb.update(existing[0].accountId, {
+      await testAccountsDb.update(existing[0].accountId, {
         email: args.email,
         password: args.password,
         siteUrl: args.site_url,
@@ -133,7 +121,7 @@ emmaToolRegistry.register({
       email: args.email,
       password: args.password,
       notes: args.notes,
-      source: (args.source as 'manual' | 'auto-created') ?? 'auto-created',
+      source: 'auto-created',
     });
 
     return {
