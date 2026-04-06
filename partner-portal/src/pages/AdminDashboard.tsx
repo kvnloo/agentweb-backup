@@ -3624,7 +3624,7 @@ export default function AdminDashboard() {
                   </TableCell>
                   <TableCell>Payment</TableCell>
                   <TableCell>
-                    <UserSortLabel property="chatSessionCount" label="Sessions" />
+                    <UserSortLabel property="createdAt" label="Created" />
                   </TableCell>
                   <TableCell>
                     <UserSortLabel property="lastLoginTime" label="Last Active" />
@@ -3715,15 +3715,10 @@ export default function AdminDashboard() {
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
                         </TableCell>
-                        <TableCell onClick={(e) => e.stopPropagation()}>
-                          <Chip
-                            label={user.chatSessionCount || 0}
-                            size="small"
-                            color={(user.chatSessionCount ?? 0) > 0 ? "primary" : "default"}
-                            variant="outlined"
-                            sx={{ cursor: (user.chatSessionCount ?? 0) > 0 ? "pointer" : undefined }}
-                            onClick={() => {}}
-                          />
+                        <TableCell>
+                          <Typography variant="body2" color="text.secondary">
+                            {user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}
+                          </Typography>
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
