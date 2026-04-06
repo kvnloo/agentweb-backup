@@ -1234,7 +1234,7 @@ export class AgentModeService {
       _initialMessageCount = initialMessageCount;
 
       // Single loop for LLM calls and tool execution
-      let maxIterations = 20; // Prevent infinite loops
+      let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
       let skillsUpdated = false;
@@ -1262,6 +1262,16 @@ export class AgentModeService {
         }
 
         iteration++;
+
+        // Step budget awareness: inject a reminder when approaching the limit so the LLM
+        // can self-regulate (prefer batch ops, skip unnecessary pages, wrap up early).
+        const remaining = maxIterations - iteration;
+        if (remaining <= 10 && remaining > 0) {
+          const urgency = remaining <= 3
+            ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
+            : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
+          (messages as any[]).push({ role: 'user', content: urgency });
+        }
 
         // 4. Refresh Context if Skills Changed
         if (skillsUpdated) {
