@@ -19045,8 +19045,78 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'send-message': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-message');
           if (!message) throw new Error('message is required for send-message action');
+
+          // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
+          const { list_id: sendListId, lead_id: sendLeadId } = args;
+          if (sendListId && sendLeadId) {
+            const { crmDb } = await import('./db');
+            const lead = await crmDb.getLeadById(sendListId, sendLeadId);
+            if (lead) {
+              const syncAt = (lead as any).linkedinMessageSyncAt as string | undefined;
+              const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+              if (!syncAt || syncAt < oneDayAgo) {
+                return {
+                  success: false,
+                  error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
+                  requiresSync: true,
+                };
+              }
+            }
+          }
+
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
           return { success: true, data: messageResponse };
+        }
+
+        case 'update-conversation-history': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for update-conversation-history');
+          const { list_id, lead_id } = args;
+          if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
+
+          // Resolve the Unipile attendee/provider ID for this contact
+          const providerId = isUrl
+            ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
+            : target;
+
+          // Load the lead to get the normalized LinkedIn URL used as the storage key
+          const { crmDb } = await import('./db');
+          const lead = await crmDb.getLeadById(list_id, lead_id);
+          if (!lead) throw new Error(`Lead ${lead_id} not found in list ${list_id}`);
+          const leadLinkedIn = ((lead as any).linkedin as string | undefined)?.toLowerCase();
+          if (!leadLinkedIn) throw new Error('Lead has no LinkedIn URL — add a LinkedIn profile URL to this lead first');
+
+          // Fetch all messages with this contact from Unipile
+          const messages = await linkedInOutreachService.getMessagesWithContact(providerId);
+
+          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp
+          const { emailEventsDb } = await import('./emailEventsDb');
+          const emailDomain = `linkedin-${list_id}`;
+
+          const syncAt = new Date().toISOString();
+          await Promise.all([
+            ...messages.map(msg => emailEventsDb.addLinkedInMessageEvent({
+              eventId: `linkedin_msg_${msg.id}`,
+              emailDomain,
+              leadEmail: leadLinkedIn,
+              eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',
+              text: msg.text ?? null,
+              timestamp: msg.timestamp,
+              senderId: msg.sender_id,
+              messageProviderId: msg.provider_id,
+            })),
+            crmDb.updateLeadLinkedInSyncAt(list_id, lead_id, syncAt),
+          ]);
+          const totalSynced = messages.length;
+
+          console.log(`[AgentMode] update-conversation-history: synced ${totalSynced} messages for lead ${lead_id}`);
+          return {
+            success: true,
+            data: {
+              synced: totalSynced,
+              syncedAt: syncAt,
+              message: `Synced ${totalSynced} messages for this LinkedIn contact. Conversation history is now up to date in the CRM.`,
+            },
+          };
         }
 
         case 'get-company': {

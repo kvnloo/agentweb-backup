@@ -177,11 +177,12 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
-- send-message: Send a direct message. Requires profile_url or provider_id. message required.
+- send-message: Send a direct message. Requires profile_url or provider_id. message required. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+- update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 
-For target person identification (send-invite, send-message, get-profile), pass EITHER:
+For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
 - provider_id: the Unipile provider_id directly if you already have it`,
     inputSchema: {
@@ -189,7 +190,7 @@ For target person identification (send-invite, send-message, get-profile), pass 
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'update-conversation-history'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -198,15 +199,23 @@ For target person identification (send-invite, send-message, get-profile), pass 
         },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message. Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id.'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url.'
         },
         message: {
           type: 'string',
           description: 'Message content. Required for send-message; recommended for send-invite.'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate.'
         },
         keywords: {
           type: 'string',
@@ -244,7 +253,7 @@ For target person identification (send-invite, send-message, get-profile), pass 
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    const targetActions = ['send-invite', 'send-message', 'get-profile'];
+    const targetActions = ['send-invite', 'send-message', 'get-profile', 'update-conversation-history'];
     if (targetActions.includes(args.action)) {
       if (!args.profile_url && !args.provider_id) {
         return { success: false, message: 'Either profile_url or provider_id is required.' };
