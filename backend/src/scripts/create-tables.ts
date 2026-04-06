@@ -1845,6 +1845,7 @@ const main = async () => {
     await createScheduleTemplatesTable();
     await createPaymentHistoryTable();
     await createTempEmailsTable();
+    await createTestAccountsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -1966,6 +1967,54 @@ const createScheduleTemplatesTable = async () => {
         KeySchema: [
           { AttributeName: 'visibility', KeyType: 'HASH' },
           { AttributeName: 'category', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Test Accounts table (per-user saved credentials for testing client websites)
+const createTestAccountsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TestAccounts`,
+    AttributeDefinitions: [
+      { AttributeName: 'accountId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'domain', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'accountId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        // Look up all accounts for a user, sorted by creation time
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        // Look up accounts for a user by domain (for get-or-create flow)
+        IndexName: 'UserIdDomainIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'domain', KeyType: 'RANGE' },
         ],
         Projection: { ProjectionType: 'ALL' },
       },
