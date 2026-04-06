@@ -384,6 +384,7 @@ export class AgentModeService {
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
         await import('../emma/tempEmailTools');
+        await import('../emma/testAccountTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {

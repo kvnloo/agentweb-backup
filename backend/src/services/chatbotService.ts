@@ -3685,6 +3685,8 @@ export async function generateChatResponse(
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
+          'get_temp_email', 'check_temp_inbox',
+          'get_test_account', 'save_test_account', 'list_test_accounts',
         ]);
 
         // Page-aware tool injection based on the current page URL
@@ -3718,6 +3720,10 @@ export async function generateChatResponse(
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
+        // Ensure Emma tool files are loaded (side-effect imports populate the registry)
+        await import('../emma/tools');
+        await import('../emma/tempEmailTools');
+        await import('../emma/testAccountTools');
 
         for (const toolName of toolsToInclude) {
           // First try emmaToolRegistry (Emma-specific tools), then fall back to mcpToolRegistry
