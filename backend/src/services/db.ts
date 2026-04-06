@@ -102,6 +102,7 @@ export interface User {
     brandData: {
       brandName: string;
       tagline: string;
+      domain?: string;
       primaryColor: string;
       primaryColorEnd: string;
       secondaryColor: string;
