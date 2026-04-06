@@ -13,10 +13,21 @@ import {
   TableHead,
   TableRow,
   Grid,
+  IconButton,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  ToggleButton,
+  ToggleButtonGroup,
+  Tooltip,
 } from '@mui/material';
 import {
   TrendingUp as TrendingUpIcon,
   TrendingDown as TrendingDownIcon,
+  OpenInFull as ExpandIcon,
+  Close as CloseIcon,
+  BarChart as ChartIcon,
+  TableChart as TableIcon,
 } from '@mui/icons-material';
 import axios from 'axios';
 import { Chart, ChartConfiguration, registerables } from 'chart.js';
@@ -191,11 +202,77 @@ function MrrTrendChart({ snapshots }: { snapshots: RevenueSnapshot[] }) {
   }, [snapshots]);
 
   return (
-    <Paper sx={{ p: 3, mb: 2, height: 350 }}>
-      <Box sx={{ position: 'relative', height: '100%' }}>
-        <canvas ref={chartRef} />
-      </Box>
-    </Paper>
+    <Box sx={{ position: 'relative', height: '100%' }}>
+      <canvas ref={chartRef} />
+    </Box>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Historical Table View (month-by-month MRR, churn, subs)
+// ---------------------------------------------------------------------------
+function HistoricalTable({ snapshots }: { snapshots: RevenueSnapshot[] }) {
+  // Show newest first for quick scanning
+  const reversed = [...snapshots].reverse();
+
+  return (
+    <TableContainer sx={{ maxHeight: 400 }}>
+      <Table size="small" stickyHeader>
+        <TableHead>
+          <TableRow>
+            <TableCell sx={{ fontWeight: 600 }}>Month</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="right">MRR</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="right">New MRR</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="right">Churned MRR</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="right">Net New</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="center">Active Subs</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="center">New Subs</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="center">Churned</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="right">Cust. Churn %</TableCell>
+            <TableCell sx={{ fontWeight: 600 }} align="right">Rev. Churn %</TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {reversed.map((s) => (
+            <TableRow key={s.date} hover>
+              <TableCell sx={{ fontWeight: 500 }}>{s.date}</TableCell>
+              <TableCell align="right">{formatCentsExact(s.mrr)}</TableCell>
+              <TableCell align="right" sx={{ color: 'success.main' }}>
+                +{formatCentsExact(s.newMrr)}
+              </TableCell>
+              <TableCell align="right" sx={{ color: 'error.main' }}>
+                -{formatCentsExact(s.churnedMrr)}
+              </TableCell>
+              <TableCell
+                align="right"
+                sx={{ color: s.netNewMrr >= 0 ? 'success.main' : 'error.main', fontWeight: 600 }}
+              >
+                {s.netNewMrr >= 0 ? '+' : ''}{formatCentsExact(s.netNewMrr)}
+              </TableCell>
+              <TableCell align="center">{s.activeSubscriptions}</TableCell>
+              <TableCell align="center" sx={{ color: 'success.main' }}>
+                +{s.newSubscriptions}
+              </TableCell>
+              <TableCell align="center" sx={{ color: s.churnedSubscriptions > 0 ? 'error.main' : undefined }}>
+                {s.churnedSubscriptions > 0 ? `-${s.churnedSubscriptions}` : '0'}
+              </TableCell>
+              <TableCell
+                align="right"
+                sx={{ color: s.customerChurnRate > 5 ? 'error.main' : s.customerChurnRate > 3 ? 'warning.main' : 'success.main' }}
+              >
+                {formatPercent(s.customerChurnRate)}
+              </TableCell>
+              <TableCell
+                align="right"
+                sx={{ color: s.revenueChurnRate > 5 ? 'error.main' : s.revenueChurnRate > 3 ? 'warning.main' : 'success.main' }}
+              >
+                {formatPercent(s.revenueChurnRate)}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </TableContainer>
   );
 }
 
@@ -244,7 +321,15 @@ function RevenueBreakdown({ snapshot }: { snapshot: RevenueSnapshot }) {
 // ---------------------------------------------------------------------------
 // Cohort Retention Table
 // ---------------------------------------------------------------------------
-function CohortRetentionTable({ cohorts }: { cohorts: CohortRow[] }) {
+function CohortRetentionTable({
+  cohorts,
+  onExpand,
+  compact,
+}: {
+  cohorts: CohortRow[];
+  onExpand?: () => void;
+  compact?: boolean;
+}) {
   if (cohorts.length === 0) return null;
 
   const maxMonths = Math.max(...cohorts.map((c) => c.retention.length));
@@ -257,16 +342,28 @@ function CohortRetentionTable({ cohorts }: { cohorts: CohortRow[] }) {
 
   return (
     <Paper sx={{ p: 3, mb: 2 }}>
-      <Typography variant="h6" sx={{ mb: 2 }}>
-        Cohort Retention
-      </Typography>
-      <TableContainer>
-        <Table size="small">
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+        <Typography variant="h6">
+          Cohort Retention ({cohorts.length} months)
+        </Typography>
+        {onExpand && (
+          <Tooltip title="Expand full view">
+            <IconButton size="small" onClick={onExpand}>
+              <ExpandIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        )}
+      </Box>
+      <TableContainer sx={compact ? { maxHeight: 400, overflow: 'auto' } : undefined}>
+        <Table size="small" stickyHeader>
           <TableHead>
             <TableRow>
               <TableCell sx={{ fontWeight: 600 }}>Cohort</TableCell>
               <TableCell sx={{ fontWeight: 600 }} align="center">
                 Users
+              </TableCell>
+              <TableCell sx={{ fontWeight: 600 }} align="right">
+                MRR
               </TableCell>
               {Array.from({ length: maxMonths }, (_, i) => (
                 <TableCell key={i} sx={{ fontWeight: 600 }} align="center">
@@ -278,8 +375,11 @@ function CohortRetentionTable({ cohorts }: { cohorts: CohortRow[] }) {
           <TableBody>
             {cohorts.map((cohort) => (
               <TableRow key={cohort.cohortMonth}>
-                <TableCell sx={{ fontWeight: 500 }}>{cohort.cohortMonth}</TableCell>
+                <TableCell sx={{ fontWeight: 500, whiteSpace: 'nowrap' }}>{cohort.cohortMonth}</TableCell>
                 <TableCell align="center">{cohort.startingCount}</TableCell>
+                <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                  {formatCentsExact(cohort.startingMrr)}
+                </TableCell>
                 {Array.from({ length: maxMonths }, (_, i) => {
                   const val = cohort.retention[i];
                   if (val == null) return <TableCell key={i} />;
@@ -314,6 +414,8 @@ export default function RevenueTab() {
   const [data, setData] = useState<RevenueData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [cohortExpanded, setCohortExpanded] = useState(false);
+  const [trendView, setTrendView] = useState<'chart' | 'table'>('chart');
 
   useEffect(() => {
     if (!token) return;
@@ -322,7 +424,7 @@ export default function RevenueTab() {
       try {
         setLoading(true);
         setError('');
-        const res = await axios.get(buildApiUrl('/api/admin/revenue-metrics'), {
+        const res = await axios.get(buildApiUrl('/api/admin/revenue-metrics?months=24'), {
           headers: { Authorization: `Bearer ${token}` },
         });
         setData(res.data);
@@ -431,10 +533,36 @@ export default function RevenueTab() {
         </Box>
       </Paper>
 
-      {/* MRR Trend Chart */}
-      {snapshots.length > 0 && <MrrTrendChart snapshots={snapshots} />}
+      {/* MRR Trend — Chart or Table toggle */}
+      {snapshots.length > 0 && (
+        <Paper sx={{ p: 3, mb: 2 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+            <Typography variant="h6">MRR Trend</Typography>
+            <ToggleButtonGroup
+              value={trendView}
+              exclusive
+              onChange={(_, v) => { if (v) setTrendView(v); }}
+              size="small"
+            >
+              <ToggleButton value="chart">
+                <Tooltip title="Chart view"><ChartIcon fontSize="small" /></Tooltip>
+              </ToggleButton>
+              <ToggleButton value="table">
+                <Tooltip title="Table view"><TableIcon fontSize="small" /></Tooltip>
+              </ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+          {trendView === 'chart' ? (
+            <Box sx={{ height: 300 }}>
+              <MrrTrendChart snapshots={snapshots} />
+            </Box>
+          ) : (
+            <HistoricalTable snapshots={snapshots} />
+          )}
+        </Paper>
+      )}
 
-      {/* Revenue Breakdown + Cohort side by side on larger screens */}
+      {/* Revenue Breakdown + Cohort */}
       <Grid container spacing={2}>
         {latestSnapshot && (
           <Grid item xs={12} md={cohorts.length > 0 ? 5 : 12}>
@@ -443,10 +571,33 @@ export default function RevenueTab() {
         )}
         {cohorts.length > 0 && (
           <Grid item xs={12} md={latestSnapshot ? 7 : 12}>
-            <CohortRetentionTable cohorts={cohorts} />
+            <CohortRetentionTable
+              cohorts={cohorts}
+              compact
+              onExpand={() => setCohortExpanded(true)}
+            />
           </Grid>
         )}
       </Grid>
+
+      {/* Cohort Expanded Modal */}
+      <Dialog
+        open={cohortExpanded}
+        onClose={() => setCohortExpanded(false)}
+        maxWidth={false}
+        fullWidth
+        PaperProps={{ sx: { maxWidth: '95vw', maxHeight: '90vh' } }}
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          Cohort Retention — Full View
+          <IconButton onClick={() => setCohortExpanded(false)} size="small">
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent>
+          <CohortRetentionTable cohorts={cohorts} />
+        </DialogContent>
+      </Dialog>
     </Box>
   );
 }
