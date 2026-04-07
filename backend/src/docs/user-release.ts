@@ -18,23 +18,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
-    date: '2026-04-06',
+    date: '2026-04-07',
     changes: [
-      'LinkedIn Outreach: Conversation History Sync',
-      '- Added update-conversation-history action to the LinkedIn outreach tool — fetches the full message thread with a contact from LinkedIn via Unipile and persists it to the lead\'s CRM engagement feed',
-      '- Messages now appear in the lead\'s engagement activity timeline (sent and received), going back to the first message',
-      '- Re-syncing is fully idempotent: running the action again on the same contact never creates duplicate entries',
-      '- When sending a LinkedIn message to a CRM lead (with list_id + lead_id provided), the agent now enforces that conversation history was synced within the last 24 hours — stale context is blocked with a clear instruction to sync first',
-    ],
-  },
-  {
-    date: '2026-04-06',
-    changes: [
-      'Set Up Website Scanning Directly from Brand Guidelines',
-      '- Added a Website Domain field to Brand Guidelines so you can record your domain without waiting for an admin to configure SEO domains',
-      '- A new "Setup Website Scan" button opens Emma pre-loaded with a message to create a recurring website scan schedule',
-      '- Emma checks whether a scan schedule already exists before creating a new one',
-      '- The scan focuses on issues observable directly from the site: broken links, missing meta tags, layout problems, slow load times, and unclear copy',
+      'Self-Serve CMS Configuration for Blog Publishing',
+      '- You can now connect your own WordPress, Webflow, or Basehub CMS directly from the Research Reports page — no admin setup required',
+      '- Click "CMS Setup" on the Research Reports page to enter your credentials and start publishing blog posts from generated reports',
+      '- Supports WordPress (application password), Webflow (API token + site/collection IDs), and Basehub (token + collection ID)',
+      '- Admin-configured CMS credentials continue to work as before; user-configured credentials take priority when set',
     ],
   },
   {
