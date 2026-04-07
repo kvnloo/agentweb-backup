@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-07',
+    changes: [
+      'ClickUp: OAuth Login Now Supported',
+      '- You can now connect your ClickUp account via OAuth ("Connect with ClickUp" button) in addition to the existing Personal API Token option',
+      '- OAuth provides a more secure and user-friendly connection flow — no need to copy and paste tokens',
+      '- Both connection methods are supported; choose whichever works best for your setup',
+    ],
+  },
+  {
     date: '2026-04-06',
     changes: [
       'LinkedIn Outreach: Conversation History Sync',
