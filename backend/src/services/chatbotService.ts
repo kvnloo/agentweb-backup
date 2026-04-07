@@ -237,6 +237,11 @@ export interface ChatSession {
     evaluatedMessageIndex: number;
     judgeName: string;
   }>;
+  sessionSummary?: {
+    summary: string;        // LLM-generated summary of what was achieved
+    evaluatedAt: string;    // ISO timestamp
+    evaluatedMessageIndex: number; // messageCount at time of evaluation (for cache invalidation)
+  };
   gtmWorkItem?: {
     planId: string;
     phaseId: string;
@@ -2061,6 +2066,26 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session satisfaction score:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionSummary(
+    sessionId: string,
+    sessionSummary: NonNullable<ChatSession["sessionSummary"]>
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET sessionSummary = :summary",
+      ExpressionAttributeValues: {
+        ":summary": sessionSummary,
+      },
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error updating session summary:", error);
       throw error;
     }
   }

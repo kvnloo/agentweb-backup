@@ -1,8 +1,9 @@
-import { chatbotDb } from './chatbotService';
+import { chatbotDb, ChatSession } from './chatbotService';
 import { userDb, crmDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { agentModeService } from './agentModeService';
 import { getAccountsByUserId } from './connectedAccountsDb';
+import { summarizeSessionIfNeeded } from './sessionSummaryService';
 
 const TIME_RANGE_DAYS: Record<string, number> = {
   '1d': 1,
@@ -28,9 +29,20 @@ const PUBLISH_TOOLS = new Set([
   'post_on_connected_account',
 ]);
 
+// Max sessions to summarize per call to bound latency
+const MAX_SESSIONS_TO_SUMMARIZE = 20;
+
+export interface SessionSummaryEntry {
+  sessionId: string;
+  title?: string;
+  createdAt: string;
+  summary: string;
+}
+
 export interface AccountSummary {
   period: string;
   sessions: number;
+  session_summaries: SessionSummaryEntry[];
   assets: {
     images: number;
     videos: number;
@@ -115,11 +127,13 @@ export async function getAccountSummary(
     }
   }
 
+  const sessionSummaries = await getSessionSummaries(sessions);
   const periodLabel = `Last ${days} day${days > 1 ? 's' : ''}`;
 
   return {
     period: periodLabel,
     sessions: sessions.length,
+    session_summaries: sessionSummaries,
     assets: {
       images,
       videos,
@@ -136,6 +150,56 @@ export async function getAccountSummary(
       social_media: socialMetrics,
     },
   };
+}
+
+async function getSessionSummaries(sessions: ChatSession[]): Promise<SessionSummaryEntry[]> {
+  // Sort newest-first, cap at max to summarize
+  const toSummarize = [...sessions]
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .slice(0, MAX_SESSIONS_TO_SUMMARIZE);
+
+  // For sessions that need summarization, fetch their messages first
+  const sessionsWithMessages = await Promise.all(
+    toSummarize.map(async (session) => {
+      const messageCount = session.messageCount ?? 0;
+      // Skip fetching messages if cached summary is already up-to-date
+      if (
+        session.sessionSummary &&
+        session.sessionSummary.evaluatedMessageIndex >= messageCount
+      ) {
+        return session;
+      }
+      // Load messages from the messages table
+      try {
+        const messages = await chatbotDb.getMessagesFromIndex(session.sessionId, 0);
+        return { ...session, messages };
+      } catch {
+        return session;
+      }
+    })
+  );
+
+  // Generate summaries in parallel (summarizeSessionIfNeeded handles caching)
+  const summaryResults = await Promise.all(
+    sessionsWithMessages.map(async (session) => {
+      try {
+        const newSummary = await summarizeSessionIfNeeded(session);
+        const summary = newSummary ?? session.sessionSummary;
+        if (!summary) return null;
+        return {
+          sessionId: session.sessionId,
+          title: session.title,
+          createdAt: session.createdAt,
+          summary: summary.summary,
+        } as SessionSummaryEntry;
+      } catch (error) {
+        console.error(`accountSummary: Error summarizing session ${session.sessionId}:`, error);
+        return null;
+      }
+    })
+  );
+
+  return summaryResults.filter((s): s is SessionSummaryEntry => s !== null);
 }
 
 async function getLeadsAdded(userId: string, startDate: Date): Promise<number> {

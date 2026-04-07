@@ -384,7 +384,7 @@ mcpToolRegistry.register({
   name: 'test_scheduled_chat',
   definition: {
     name: 'test_scheduled_chat',
-    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule.',
+    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.',
     inputSchema: {
       type: 'object',
       properties: {

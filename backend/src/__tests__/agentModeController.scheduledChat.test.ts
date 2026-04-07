@@ -101,7 +101,7 @@ import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getAllowedFunctionCalls, getAllowedSkills } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
@@ -186,23 +186,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           { name: 'analyze_competitors', arguments: {} },
         ],
       };
-      
+
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      // Test through the testScheduledChat endpoint
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
-
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -223,25 +212,15 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         content: 'Here are some general business tips.',
         toolCalls: [{ name: 'get_marketing_tips', arguments: {} }], // Missing analyze_competitors
       };
-      
+
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(incompleteResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called 20 times (maxTries = 20)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
@@ -279,22 +258,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called 4 times (stopped after success)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(4);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -343,22 +312,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called 20 times (all attempts)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
@@ -379,24 +338,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         requiredFunctionCalls: [],
       };
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      mockScheduleDb.getScheduleById.mockResolvedValue(simpleSchedule);
-      
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(simpleSchedule, mockUserId, true);
 
       // Should succeed immediately since no criteria to meet
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -425,22 +372,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         });
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called 20 times (error on attempt 2, but continued)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
@@ -453,21 +390,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should handle critical errors that stop execution', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('Critical database error'));
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // After the fix, runScheduledChat returns an error result instead of throwing
-      // testScheduledChat just calls res.json(result) without res.status()
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           status: 'failure',
           passed: false,
@@ -483,17 +409,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should create correct session title for test vs production', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should create session with pageIdentifier including scheduleId
       expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
@@ -515,23 +431,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         emailCampaignTaskId: 'campaign-task-123',
       };
 
-      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithCampaignId);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         ...mockResponse,
         content: 'Here are some marketing strategy and tips for your business.',
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(scheduleWithCampaignId, mockUserId, true);
 
       // Should create session with emailCampaignTaskId from schedule
       expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
@@ -553,23 +458,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         emailCampaignTaskId: null,
       };
 
-      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithoutCampaignId);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         ...mockResponse,
         content: 'Here are some marketing strategy and tips for your business.',
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(scheduleWithoutCampaignId, mockUserId, true);
 
       // Should create session with undefined emailCampaignTaskId
       expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
@@ -588,17 +482,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should save run result to database', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should save result to database
       expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
@@ -672,6 +556,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
+      // testScheduledChat returns immediately with pending status; wait for background run
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'pending' })
+      );
+
+      // Wait for background run to complete and email to be sent
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
         ['user@example.com', 'admin@example.com'],
         'Test Schedule',
@@ -711,6 +603,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
+      // Wait for background run to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
     });
 
@@ -738,6 +633,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       } as unknown as Response;
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Wait for background run to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
     });
@@ -770,6 +668,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       } as unknown as Response;
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Wait for background run to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
     });
@@ -805,14 +706,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should still return the test result, not an error
+      // Should return pending status immediately (not an error)
       expect(mockRes.json).toHaveBeenCalledWith(
-        expect.objectContaining({
-          scheduleId: mockScheduleId,
-          passed: true,
-        })
+        expect.objectContaining({ status: 'pending' })
       );
       expect(mockRes.status).not.toHaveBeenCalledWith(500);
+
+      // Wait for background run and email attempt to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
     });
   });
 
@@ -2117,33 +2018,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         );
       });
 
-      it('should reject creating schedule without email notifications (no variables)', async () => {
+      it('should default to user email when creating variable schedule without email notifications', async () => {
         const mockReq = {
-          user: { userId: mockUserId },
-          body: {
-            scheduleName: 'Simple Schedule',
-            startingMessage: 'Give me a marketing summary',
-            scheduleFrequency: 'daily',
-            emailNotifications: [],
-          },
-        } as unknown as Request;
-
-        const mockRes = {
-          json: jest.fn(),
-          status: jest.fn().mockReturnThis(),
-        } as unknown as Response;
-
-        await agentModeController.createScheduledChat(mockReq, mockRes);
-
-        expect(mockRes.status).toHaveBeenCalledWith(400);
-        expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'At least one email notification is required for scheduled chats'
-        });
-      });
-
-      it('should reject creating schedule without email notifications (with variables)', async () => {
-        const mockReq = {
-          user: { userId: mockUserId },
+          user: { userId: mockUserId, email: 'owner@example.com' },
           body: {
             scheduleName: 'Variable Schedule',
             startingMessage: 'Summarize {{company_name}}',
@@ -2159,10 +2036,13 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         await agentModeController.createScheduledChat(mockReq, mockRes);
 
-        expect(mockRes.status).toHaveBeenCalledWith(400);
-        expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'At least one email notification is required for scheduled chats'
-        });
+        // No longer rejects — falls back to user's own email
+        expect(mockRes.status).not.toHaveBeenCalledWith(400);
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.objectContaining({
+            emailNotifications: ['owner@example.com'],
+          })
+        );
       });
     });
 
@@ -2508,8 +2388,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const { mockReq, mockRes } = makeReqRes();
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should NOT send error email — wildcard means all tools are allowed
       expect(mockEmailService.sendScheduledChatErrorEmail).not.toHaveBeenCalled();
@@ -2518,7 +2397,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
 
       // Response should indicate success, not subscription failure
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           status: 'success',
         })
@@ -2529,15 +2408,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Override the mock to return a restricted set missing 'analyze_competitors'
       mockedGetAllowedFunctionCalls.mockResolvedValueOnce(['get_marketing_tips', 'create_work_plan']);
 
-      // Set up schedule with email notifications
-      mockScheduleDb.getScheduleById.mockResolvedValueOnce({
+      // Use a schedule with email notifications
+      const scheduleWithEmails = {
         ...baseSchedule,
         requiredFunctionCalls: ['get_marketing_tips', 'analyze_competitors'],
         emailNotifications: ['test@example.com'],
-      });
+      };
 
-      const { mockReq, mockRes } = makeReqRes();
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(scheduleWithEmails, mockUserId, true);
 
       // Should send error email because analyze_competitors is not allowed
       expect(mockEmailService.sendScheduledChatErrorEmail).toHaveBeenCalledWith(
@@ -2554,8 +2432,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat when subscription returns empty array', async () => {
       mockedGetAllowedFunctionCalls.mockResolvedValueOnce([]);
 
-      const { mockReq, mockRes } = makeReqRes();
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       expect(mockEmailService.sendScheduledChatErrorEmail).toHaveBeenCalled();
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
@@ -2582,16 +2459,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should install only skills containing required tools
       expect(mockAgentModeService.installSkills).toHaveBeenCalledWith(
@@ -2623,16 +2491,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should only install the allowed skill
       const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
@@ -2646,7 +2505,6 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         requiredFunctionCalls: [],
         keywords: [],
       };
-      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleNoFunctions);
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         ...mockResponse,
@@ -2654,16 +2512,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         toolCalls: [],
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(scheduleNoFunctions, mockUserId, true);
 
       expect(mockAgentModeService.installSkills).not.toHaveBeenCalled();
     });
@@ -2686,16 +2535,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
       expect(installedIds).toContain('marketing-skill');
@@ -2715,16 +2555,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should still run the chat despite auto-install failure
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
@@ -2753,19 +2584,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should succeed on second attempt since both functions were called across attempts
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           status: 'success',
           passed: true,
@@ -2775,6 +2597,92 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
       // Should have needed exactly 2 attempts
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('createScheduledChat - email normalization for variables', () => {
+    const mockCreateSchedule = jest.fn();
+
+    beforeEach(() => {
+      mockScheduleDb.createSchedule = mockCreateSchedule;
+      mockCreateSchedule.mockClear();
+    });
+
+    it('should default to user email when variables present but no emailNotifications provided', async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'owner@example.com' },
+        body: {
+          scheduleName: 'SEO Scan',
+          startingMessage: 'Scan {{website}} for SEO issues',
+          scheduleFrequency: 'weekly',
+          // No emailNotifications provided
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: ['owner@example.com'],
+        })
+      );
+    });
+
+    it('should normalize emailNotifications string to array when variables present', async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'owner@example.com' },
+        body: {
+          scheduleName: 'SEO Scan',
+          startingMessage: 'Scan {{website}} for SEO issues',
+          scheduleFrequency: 'weekly',
+          emailNotifications: 'user@rankai.ai', // string, not array
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: ['user@rankai.ai'],
+        })
+      );
+    });
+
+    it('should not require email when all variable values are pre-filled', async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'owner@example.com' },
+        body: {
+          scheduleName: 'SEO Scan',
+          startingMessage: 'Scan {{website}} for SEO issues',
+          scheduleFrequency: 'weekly',
+          variableValues: { website: 'rankai.ai' },
+          // No emailNotifications
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: [], // pre-filled vars → no email needed
+          variableValues: { website: 'rankai.ai' },
+        })
+      );
     });
   });
 });

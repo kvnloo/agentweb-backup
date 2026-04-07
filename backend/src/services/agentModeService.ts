@@ -31,10 +31,16 @@ const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
+
+// Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
+// to retrieve specific fields from the original payload without needing the full text in context.
+const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
-import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -424,6 +430,34 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
     }
+
+    this.toolRegistry.register({
+      name: 'search_tool_response',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'search_tool_response',
+          description: 'Search a large tool response that was stored in S3 because it exceeded the context size limit. When a previous tool result shows "[Full response stored at S3 key: ...]", use this tool with that key to find specific fields or values (e.g. destination URLs, link_url, creative details) in the full response.',
+          parameters: {
+            type: 'object',
+            properties: {
+              s3_key: {
+                type: 'string',
+                description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
+              },
+              query: {
+                type: 'string',
+                description: 'The text or field name to search for (e.g. "link_url", "destination_url", "website")'
+              }
+            },
+            required: ['s3_key', 'query']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        return this.executeSearchToolResponse(args);
+      }
+    });
   }
 
   async getDefaultModel(): Promise<string> {
@@ -1668,6 +1702,24 @@ export class AgentModeService {
             } else {
               toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
             }
+
+            if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
+              try {
+                const uploadResult = await uploadFileToS3WithPath(
+                  toolContent,
+                  `${toolCall.id}.txt`,
+                  'text/plain',
+                  `tool-responses/${sessionId}`
+                );
+                if (uploadResult.success && uploadResult.key) {
+                  const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
+                  toolContent = header + toolContent;
+                }
+              } catch (e) {
+                console.error('AgentMode: Failed to save large tool response to S3:', e);
+              }
+            }
+
             const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
               ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
               : toolContent;
@@ -2908,6 +2960,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
     }
 
+    if (toolName === 'search_tool_response') {
+      return result;
+    }
+
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -3127,6 +3183,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
         branch: actualResult.branch,
         previewUrl: actualResult.previewUrl,
         error: actualResult.error,
+      };
+    }
+
+    // For report_product_issues, preserve success/message/results so the sidebar can show status
+    if (toolName === 'report_product_issues') {
+      return {
+        success: result?.success ?? false,
+        message: result?.message,
+        results: result?.results,
       };
     }
 
@@ -4121,6 +4186,49 @@ When a user requests client onboarding or says "onboard new client" or similar:
     } catch (error) {
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
+    }
+  }
+
+  private async executeSearchToolResponse(args: { s3_key: string; query: string }): Promise<any> {
+    const { s3_key, query } = args;
+    if (!s3_key || !query) {
+      return { success: false, message: 'Both s3_key and query are required' };
+    }
+
+    try {
+      const content = await getS3ObjectAsString(s3_key);
+      if (!content) {
+        return { success: false, message: 'Empty response from S3' };
+      }
+
+      const queryLower = query.toLowerCase();
+      const contentLower = content.toLowerCase();
+      const CONTEXT_WINDOW = 300;
+      const MAX_MATCHES = 20;
+      const matches: Array<{ offset: number; context: string }> = [];
+
+      let searchPos = 0;
+      while (searchPos < contentLower.length && matches.length < MAX_MATCHES) {
+        const matchIdx = contentLower.indexOf(queryLower, searchPos);
+        if (matchIdx === -1) break;
+        const start = Math.max(0, matchIdx - CONTEXT_WINDOW);
+        const end = Math.min(content.length, matchIdx + query.length + CONTEXT_WINDOW);
+        matches.push({ offset: matchIdx, context: content.slice(start, end) });
+        searchPos = matchIdx + queryLower.length;
+      }
+
+      return {
+        success: true,
+        query,
+        total_matches: matches.length,
+        total_size: content.length,
+        matches,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: `Failed to search tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
     }
   }
 
@@ -13206,6 +13314,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Tools whose results are allowed a higher truncation limit (e.g. market strategy data)
   private static readonly LARGE_TOOL_RESULT_LIMIT: Record<string, number> = {
     'read_market_strategy': 50000,
+    'search_tool_response': 20000,
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {

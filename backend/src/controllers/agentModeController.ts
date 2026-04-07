@@ -18,6 +18,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
+import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { DynamoDB } from 'aws-sdk';
@@ -849,7 +850,8 @@ export async function runVerifiedChat(
 export async function runScheduledChat(
   schedule: any,
   userId: string,
-  isTest: boolean = false
+  isTest: boolean = false,
+  preGeneratedRunId?: string
 ): Promise<{
   scheduleId: string;
   runId: string;
@@ -1052,7 +1054,7 @@ export async function runScheduledChat(
 
     const finalResult = {
       scheduleId: schedule.scheduleId,
-      runId: require('uuid').v4(),
+      runId: preGeneratedRunId || require('uuid').v4(),
       status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
       passed: result.success,
       actualResponse: result.content,
@@ -1145,7 +1147,7 @@ export async function runScheduledChat(
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
       scheduleId: schedule.scheduleId,
-      runId: require('uuid').v4(),
+      runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
       passed: false,
       actualResponse: `Error during execution: ${errorMessage}`,
@@ -3467,7 +3469,7 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctionCalls: requiredFunctionCalls || [],
         functionCallMinCalls: functionCallMinCalls || {},
-        emailNotifications: emailNotifications || [],
+        emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         status: 'active',
         nextRunTime: scheduledNextRunTime,
@@ -3498,14 +3500,14 @@ export const agentModeController = {
         });
       }
 
-      // At least one email notification is always required for scheduled chats
-      if (!Array.isArray(emailNotifications) || emailNotifications.length === 0) {
-        return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
-      }
-
+      // When variables are present but unfilled, fall back to user's own email so LLMs
+      // don't need to know this requirement.
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
-
+      const normalizedEmails = normalizeEmailList(emailNotifications);
+      scheduledChat.emailNotifications = (normalizedVariables.length > 0 && !allVariablesPrefilled && normalizedEmails.length === 0)
+        ? [user.email]
+        : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -4070,29 +4072,40 @@ export const agentModeController = {
         });
       }
 
-      // Run the scheduled chat as a test
-      const result = await runScheduledChat(schedule, user.userId, true);
-
-      // Send notification email if requested
+      // Generate runId upfront so the agent can poll for this specific result
+      const runId = require('uuid').v4();
       const { sendNotificationEmail } = req.body || {};
-      if (sendNotificationEmail && result.sessionId) {
-        try {
-          const emailNotifications = schedule.emailNotifications || [];
-          if (emailNotifications.length > 0) {
-            await emailService.sendScheduledChatResultEmail(
-              emailNotifications,
-              schedule.scheduleName,
-              result,
-              schedule.scheduleId,
-              result.summary
-            );
-          }
-        } catch (emailError) {
-          console.error('AgentMode: Failed to send test notification email:', emailError);
-        }
-      }
 
-      res.json(result);
+      // Fire-and-forget: run in background so the HTTP request doesn't time out
+      // for complex tasks that take many minutes (e.g. scraping 13+ web pages).
+      // The agent should poll get_scheduled_chat_test_history to see the result.
+      const backgroundRun = async () => {
+        const result = await runScheduledChat(schedule, user.userId, true, runId);
+
+        if (sendNotificationEmail && result.sessionId) {
+          try {
+            const emailNotifications = schedule.emailNotifications || [];
+            if (emailNotifications.length > 0) {
+              await emailService.sendScheduledChatResultEmail(
+                emailNotifications,
+                schedule.scheduleName,
+                result,
+                schedule.scheduleId,
+                result.summary
+              );
+            }
+          } catch (emailError) {
+            console.error('AgentMode: Failed to send test notification email:', emailError);
+          }
+        }
+      };
+      backgroundRun().catch(err => console.error('AgentMode: Background test run error:', err));
+
+      res.json({
+        runId,
+        status: 'pending',
+        message: 'Test run started in background. Poll get_scheduled_chat_test_history to check results.'
+      });
 
     } catch (error) {
       console.error('AgentMode: Test scheduled chat error:', error);
@@ -5753,11 +5766,14 @@ export const agentModeController = {
       }
 
       const missingVars = templateVars.filter((v: any) => !normalizedVariableValues[v.name]);
-      const emails = overrideEmails || template.emailNotifications || [];
 
-      if (templateVars.length > 0 && missingVars.length > 0 && (!Array.isArray(emails) || emails.length === 0)) {
-        return res.status(400).json({ error: 'Email notifications are required when template has variables (unless all variable values are pre-filled)' });
-      }
+      const overrideEmailsList = normalizeEmailList(overrideEmails);
+      const baseEmails = overrideEmailsList.length > 0
+        ? overrideEmailsList
+        : normalizeEmailList(template.emailNotifications);
+      const emails = (templateVars.length > 0 && missingVars.length > 0 && baseEmails.length === 0)
+        ? [user.email]
+        : baseEmails;
 
       const scheduleId = uuidv4();
       const scheduledChat: any = {

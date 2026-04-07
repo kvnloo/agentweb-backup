@@ -11,19 +11,37 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-07',
     changes: [
-      'Meta Ads: Destination URL Audit Now Supported',
-      '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
-      '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
-      '- Ask Emma to "list my Meta ad creatives and show destination URLs" to see all landing page URLs across your ads',
+      'Account Summary Now Shows Per-Session AI Highlights',
+      '- When you ask Emma for an account summary, each session in the time range is now summarized by AI (gemini-3.1-flash-lite-preview)',
+      '- Summaries describe what was accomplished in each session in 1-2 sentences (e.g. "Conducted a technical audit of taskflow.io and scheduled weekly scans")',
+      '- Summaries are cached on each session and only regenerated when new messages are added, so repeat requests are fast',
+      '- The existing aggregate metrics (sessions, leads, assets, email, social media) are still included alongside the new highlights',
     ],
   },
   {
     date: '2026-04-07',
     changes: [
-      'Scheduled Chats Now Require at Least One Email Notification',
-      '- Creating or updating a scheduled chat now requires at least one email address in the Email Notifications field',
-      '- This ensures you always receive run results, error alerts, and variable request emails from your scheduled sessions',
-      '- The form will show an error and disable the submit button until an email is provided',
+      'Fix: Emma Now Reliably Creates Scheduled Chats',
+      '- Fixed an issue where Emma would repeatedly attempt (and fail) to create a scheduled chat when the starting message contained a {{variable}} placeholder',
+      '- Emma now correctly sets up the schedule on the first attempt, even when the AI omits or mis-formats the email notifications field',
+      '- If no notification email is provided, the schedule defaults to sending run summaries to your account email',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Fix: Issue Reports Now Show Confirmation and Notion Link in Emma',
+      '- When you ask Emma to report a product issue, the tool badge now shows "Issue reported ✓" instead of the raw tool name',
+      '- Clicking the badge shows the issue title, success status, and a direct "View in Notion" link to the created ticket',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Meta Ads: Destination URL Audit Now Supported',
+      '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
+      '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
+      '- Ask Emma to "list my Meta ad creatives and show destination URLs" to see all landing page URLs across your ads',
     ],
   },
   {
@@ -3837,6 +3855,23 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Added a "Resync Payments" button to the Users tab toolbar to backfill subscription amounts from Stripe',
       '- Fetches the latest paid invoice for each user and updates the displayed amount',
       '- Shows a summary of how many users were updated, skipped, or errored',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Scheduled Chat Test Runs No Longer Time Out',
+      '- Testing a scheduled chat now starts immediately and runs in the background',
+      '- Previously, complex tasks (e.g. scraping many pages and generating reports) would fail with a timeout error',
+      '- Test results appear in the run history when complete — no need to wait on the page',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Fixed: Work Plans Edit Dialog No Longer Crashes',
+      '- The edit dialog in Settings → Work Plans now opens correctly without crashing the page',
+      '- Previously, opening the edit dialog caused an error that broke the entire Work Plans tab',
     ],
   },
 ];

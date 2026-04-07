@@ -214,6 +214,52 @@ describe('AgentModeService - extractMinimalToolResult', () => {
     });
   });
 
+  describe('report_product_issues result extraction', () => {
+    it('should preserve success, message, and results on success', () => {
+      const result = {
+        success: true,
+        message: 'All 1 issue(s) reported.',
+        results: [{ title: 'Bug X', success: true, notionUrl: 'https://notion.so/123' }],
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'report_product_issues');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        message: 'All 1 issue(s) reported.',
+        results: [{ title: 'Bug X', success: true, notionUrl: 'https://notion.so/123' }],
+      });
+    });
+
+    it('should preserve success false and results on failure', () => {
+      const result = {
+        success: false,
+        message: '0 of 1 issue(s) reported.',
+        results: [{ title: 'Bug Y', success: false }],
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'report_product_issues');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        message: '0 of 1 issue(s) reported.',
+        results: [{ title: 'Bug Y', success: false }],
+      });
+    });
+
+    it('should default success to false when result has no success field', () => {
+      const result = { message: 'Something happened' };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'report_product_issues');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        message: 'Something happened',
+        results: undefined,
+      });
+    });
+  });
+
   describe('task creation result extraction', () => {
     it('should extract taskId and executionId from MCP-wrapped create_task_from_template result', () => {
       const wrappedResult = {
