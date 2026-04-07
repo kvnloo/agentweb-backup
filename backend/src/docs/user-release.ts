@@ -11,6 +11,24 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-07',
     changes: [
+      'Scheduled Chats Now Require at Least One Email Notification',
+      '- Creating or updating a scheduled chat now requires at least one email address in the Email Notifications field',
+      '- This ensures you always receive run results, error alerts, and variable request emails from your scheduled sessions',
+      '- The form will show an error and disable the submit button until an email is provided',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Scheduled Chat: AI-Generated Run Summary in Title and Email',
+      '- Each scheduled chat run now generates a 2-3 word summary of what was achieved (e.g. "Blog Post Published", "Greeting Delivered")',
+      '- The summary appears in the session title in the chat sidebar so you can quickly see what each run accomplished',
+      '- The summary is also included in the notification email subject line for at-a-glance visibility',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
       'ClickUp: OAuth Login Now Supported',
       '- You can now connect your ClickUp account via OAuth ("Connect with ClickUp" button) in addition to the existing Personal API Token option',
       '- OAuth provides a more secure and user-friendly connection flow — no need to copy and paste tokens',

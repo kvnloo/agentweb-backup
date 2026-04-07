@@ -263,7 +263,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           actualResponse: 'Final response with strategy details.',
           passed: true,
         }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
 
@@ -316,7 +317,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           actualResponse: 'Response not available. View the conversation to see the full response.',
           passed: true,
         }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
 
@@ -363,7 +365,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
         expect.objectContaining({
           actualResponse: 'Stored response from error case',
         }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
   });

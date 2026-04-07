@@ -676,7 +676,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         ['user@example.com', 'admin@example.com'],
         'Test Schedule',
         expect.objectContaining({ sessionId: 'test-session-123' }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
 
@@ -1884,7 +1885,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             keywords: [],
             requiredFunctionCalls: [],
             functionCallMinCalls: {},
-            emailNotifications: [],
+            emailNotifications: ['test@example.com'],
           },
         } as unknown as Request;
 
@@ -1912,7 +1913,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             keywords: [],
             requiredFunctionCalls: [],
             functionCallMinCalls: {},
-            emailNotifications: [],
+            emailNotifications: ['test@example.com'],
             runCount: 5,
           },
         } as unknown as Request;
@@ -1976,7 +1977,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             keywords: [],
             requiredFunctionCalls: [],
             functionCallMinCalls: {},
-            emailNotifications: [],
+            emailNotifications: ['test@example.com'],
           },
         } as unknown as Request;
 
@@ -2065,7 +2066,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             keywords: [],
             requiredFunctionCalls: [],
             functionCallMinCalls: {},
-            emailNotifications: [],
+            emailNotifications: ['test@example.com'],
           },
         } as unknown as Request;
 
@@ -2116,7 +2117,31 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         );
       });
 
-      it('should reject creating variable schedule without email notifications', async () => {
+      it('should reject creating schedule without email notifications (no variables)', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Simple Schedule',
+            startingMessage: 'Give me a marketing summary',
+            scheduleFrequency: 'daily',
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith({
+          error: 'At least one email notification is required for scheduled chats'
+        });
+      });
+
+      it('should reject creating schedule without email notifications (with variables)', async () => {
         const mockReq = {
           user: { userId: mockUserId },
           body: {
@@ -2136,7 +2161,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         expect(mockRes.status).toHaveBeenCalledWith(400);
         expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)'
+          error: 'At least one email notification is required for scheduled chats'
         });
       });
     });
@@ -2153,7 +2178,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             keywords: [],
             requiredFunctionCalls: [],
             functionCallMinCalls: {},
-            emailNotifications: [],
+            emailNotifications: ['test@example.com'],
             runCount: 10,
           },
         } as unknown as Request;
@@ -2184,7 +2209,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             keywords: [],
             requiredFunctionCalls: [],
             functionCallMinCalls: {},
-            emailNotifications: [],
+            emailNotifications: ['test@example.com'],
             runCount: -1,
           },
         } as unknown as Request;
@@ -2231,7 +2256,40 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         );
       });
 
-      it('should reject updating variable schedule without email notifications', async () => {
+      it('should reject updating schedule without email notifications (no variables)', async () => {
+        mockScheduleDb.getScheduleById.mockResolvedValue({
+          scheduleId: mockScheduleId,
+          userId: mockUserId,
+          status: 'active',
+          nextRunTime: '2025-01-15T09:00:00.000Z',
+          emailNotifications: [],
+        } as any);
+
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Give me a marketing summary',
+            scheduleFrequency: 'daily',
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith({
+          error: 'At least one email notification is required for scheduled chats'
+        });
+      });
+
+      it('should reject updating schedule without email notifications (with variables)', async () => {
         mockScheduleDb.getScheduleById.mockResolvedValue({
           scheduleId: mockScheduleId,
           userId: mockUserId,
@@ -2260,7 +2318,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         expect(mockRes.status).toHaveBeenCalledWith(400);
         expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)'
+          error: 'At least one email notification is required for scheduled chats'
         });
       });
     });

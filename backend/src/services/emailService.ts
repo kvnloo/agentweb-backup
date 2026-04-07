@@ -947,7 +947,8 @@ Schedule ID: ${scheduleId}
       attempt: number;
       createdAt: string;
     },
-    scheduleId: string
+    scheduleId: string,
+    summary?: string
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -965,7 +966,6 @@ Schedule ID: ${scheduleId}
       }
       
       const statusColor = result.passed ? '#28a745' : '#dc3545';
-      const statusText = result.passed ? 'PASSED' : 'FAILED';
       const statusIcon = result.passed ? '✅' : '❌';
       
       const currentDate = new Date().toLocaleDateString('en-US', { 
@@ -1088,7 +1088,7 @@ This is an automated email from your scheduled chat.
 Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
-      const subject = `${statusIcon} Scheduled Chat: ${scheduleName} - ${statusText}`;
+      const subject = `${statusIcon} Scheduled Chat: ${scheduleName}${summary ? ` — ${summary}` : ''}`;
       
       // Normalize to array for consistent handling
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
