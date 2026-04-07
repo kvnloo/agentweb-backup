@@ -194,6 +194,14 @@ describe('secretsManager', () => {
       await expect(getLinkedInAdsSecrets()).rejects.toThrow('Failed to fetch LinkedIn Ads credentials');
     });
 
+    it('throws when secret string is whitespace', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockResolvedValue({ SecretString: '   ' });
+
+      const { getLinkedInAdsSecrets } = require('../utils/secretsManager');
+      await expect(getLinkedInAdsSecrets()).rejects.toThrow('Failed to fetch LinkedIn Ads credentials');
+    });
+
     it('throws when clientId is missing', async () => {
       process.env.NODE_ENV = 'development';
       mockGetSecretValue.mockResolvedValue({
