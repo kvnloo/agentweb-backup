@@ -26,11 +26,13 @@ if (!STATE_SECRET) {
   throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
 }
 
-interface StatePayload { userId: string; nonce: string; }
+interface StatePayload { userId: string; nonce: string; frontendUrl?: string; }
 
-const generateState = (userId: string): string => {
+const generateState = (userId: string, frontendUrl?: string): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  return jwt.sign({ userId, nonce } as StatePayload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  const payload: StatePayload = { userId, nonce };
+  if (frontendUrl) payload.frontendUrl = frontendUrl;
+  return jwt.sign(payload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
 };
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
@@ -38,6 +40,16 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
     const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
     if (decoded.userId !== userId) return null;
     return decoded;
+  } catch {
+    return null;
+  }
+};
+
+// Decode state without verifying signature — used only to extract frontendUrl for redirect
+const decodeStateFrontendUrl = (state: string): string | null => {
+  try {
+    const decoded = jwt.decode(state) as StatePayload | null;
+    return decoded?.frontendUrl || null;
   } catch {
     return null;
   }
@@ -76,7 +88,9 @@ const retrieveTokenSession = (sessionId: string, userId: string): string | null 
 router.get('/init', authenticateToken, async (req: any, res) => {
   try {
     const config = await getClickUpConfig();
-    const state = generateState(req.user.userId);
+    // Frontend may pass its own origin so the callback redirect goes to the right host
+    const frontendUrl = (req.query.frontend_url as string) || process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const state = generateState(req.user.userId, frontendUrl);
 
     const params = new URLSearchParams({
       client_id: config.clientId,
@@ -98,7 +112,11 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 // ============================================
 router.get('/callback', (req, res) => {
   const { code, state, error } = req.query;
-  const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+  // Prefer the frontendUrl encoded in the state JWT (set by /init), fall back to env var
+  const frontendUrl =
+    (typeof state === 'string' && decodeStateFrontendUrl(state)) ||
+    process.env.CUSTOMER_FRONTEND_URL ||
+    'http://localhost:5174';
 
   if (error) {
     return res.redirect(`${frontendUrl}/oauth/clickup/callback?error=clickup_access_denied&details=${error}`);
