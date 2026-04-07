@@ -637,6 +637,14 @@ emmaToolRegistry.register({
     name: 'call_linkedin_marketing_api',
     description: `Manage LinkedIn Ads entities via the Marketing Developer Platform API. Requires account_id from list_connected_accounts(platform='linkedin_ads').
 
+INTERNAL TERMINOLOGY MAPPING (never mention API names in responses):
+  User says "campaign"  →  use entity_type = CAMPAIGN_GROUP
+  User says "ad set"    →  use entity_type = CAMPAIGN
+  User says "ad"        →  use entity_type = CREATIVE
+The words CAMPAIGN_GROUP, CAMPAIGN, CREATIVE must NEVER appear in your response to the user. These are internal API values only.
+Always say "Campaign", "Ad Set", "Ad" — nothing else.
+FORBIDDEN (never say these): "campaign group", "creative", "ad set (campaign)", "ads (creatives)", "campaigns (campaign groups)"
+
 ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
@@ -688,9 +696,9 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
     Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
 
-  JOBS AD (campaign type: SPONSORED_UPDATES, format: JOB_POSTING — uses DYNAMIC campaign):
+  JOBS AD (campaign type: DYNAMIC, campaign format: JOBS):
     CREATIVE/CREATE_DYNAMIC (format=JOBS, headline, button_label, campaign_id)
-    Campaign must use type=DYNAMIC. objective should be JOB_APPLICANTS.
+    Campaign must use type=DYNAMIC. Do NOT set objectiveType — it is not supported for JOBS campaigns in LinkedIn API v202603+.
 
   SPOTLIGHT AD (campaign type: DYNAMIC):
     ⚠️ logo_urn is REQUIRED for SPOTLIGHT — LinkedIn mandates it if the company page has no logo. Upload first with MEDIA/UPLOAD_IMAGE.
@@ -708,7 +716,7 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     CREATIVE/CREATE (vast_tag_url, campaign_id) — no upload needed; video served by Innovid or approved vendor.
 
 REQUIRED PARAMS PER ENTITY + ACTION:
-  CAMPAIGN_GROUP CREATE: name, status (ACTIVE|DRAFT only — LinkedIn does NOT allow PAUSED on creation; if user wants paused, create as ACTIVE then UPDATE to PAUSED), run_schedule_start (epoch ms — ask the user when the campaign group should start), totalBudget.amount + totalBudget.currencyCode
+  CAMPAIGN_GROUP CREATE: name, status (ACTIVE|DRAFT only — LinkedIn does NOT allow PAUSED on creation; if user wants paused, create as DRAFT then UPDATE to PAUSED), run_schedule_start (epoch ms — ask the user when the campaign group should start), totalBudget.amount + totalBudget.currencyCode
   CAMPAIGN CREATE: ⚠️ ALWAYS ask before creating: "What type of ads will run in this campaign?" Then set type accordingly:
     type: SPONSORED_UPDATES (image, video, carousel, article, document, event, VAST) | TEXT_AD | SPONSORED_INMAILS (message/conversation) | DYNAMIC (jobs, spotlight, follower)
     format: ⚠️ REQUIRED for DYNAMIC, VIDEO, and CAROUSEL ads.
@@ -718,7 +726,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
       - If type=SPONSORED_UPDATES for event ads: format=SPONSORED_UPDATE_EVENT
       - For single image / article / document: omit format (defaults to STANDARD_UPDATE).
     Campaign type is immutable after creation.
-    Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS|JOB_APPLICANTS), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
+    Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS — omit entirely for DYNAMIC/JOBS campaigns), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
     targeting_include format: array of { "facet_urn": "urn:li:adTargetingFacet:locations", "values": ["urn:li:geo:103644278"] }
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
   CAMPAIGN UPDATE: campaign_id + fields to update
@@ -770,7 +778,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
             campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE.' },
             // Campaign
-            objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS, JOB_APPLICANTS).' },
+            objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS). Omit entirely for DYNAMIC campaigns with format=JOBS.' },
             costType: { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },
             unitCost: { type: 'object', description: '{ amount: "10.00", currencyCode: "USD" }' },
             totalBudget: { type: 'object', description: '{ amount: "1000.00", currencyCode: "USD" }' },
@@ -901,8 +909,16 @@ emmaToolRegistry.register({
     description: `Fetch LinkedIn Ads performance analytics (impressions, clicks, spend, conversions, etc.).
 Analytics are synchronous — results return immediately, no polling needed.
 
-PIVOT OPTIONS (what dimension to group by):
-  CAMPAIGN, CAMPAIGN_GROUP, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
+INTERNAL TERMINOLOGY MAPPING (never mention API names in responses):
+  User says "campaign"  →  use pivot = CAMPAIGN_GROUP
+  User says "ad set"    →  use pivot = CAMPAIGN
+  User says "ad"        →  use pivot = CREATIVE
+The words CAMPAIGN_GROUP, CAMPAIGN, CREATIVE must NEVER appear in your response to the user. These are internal API values only.
+Always say "Campaign", "Ad Set", "Ad" — nothing else.
+FORBIDDEN (never say these): "campaign group", "creative", "ad set (campaign)", "ads (creatives)", "campaigns (campaign groups)"
+
+PIVOT OPTIONS:
+  CAMPAIGN_GROUP, CAMPAIGN, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
   MEMBER_INDUSTRY, MEMBER_SENIORITY, MEMBER_JOB_FUNCTION, MEMBER_COUNTRY_V2,
   MEMBER_REGION_V2, PLACEMENT_NAME, IMPRESSION_DEVICE_TYPE
 
@@ -940,15 +956,20 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
           items: { type: 'string' },
           description: 'Metrics to return. Common: impressions, clicks, costInLocalCurrency, totalEngagements.'
         },
+        campaign_groups: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of campaign group URNs (or numeric IDs) to filter by. Use this to get insights for a specific user-facing "Campaign".'
+        },
         campaigns: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional list of campaign URNs to filter by.'
+          description: 'Optional list of campaign URNs (or numeric IDs) to filter by. Use this to get insights for a specific user-facing "Ad Set".'
         },
         creatives: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional list of creative URNs to filter by.'
+          description: 'Optional list of creative URNs (or numeric IDs) to filter by. Use this to get insights for a specific user-facing "Ad".'
         }
       },
       required: ['account_id', 'pivot', 'dateRange']
@@ -963,6 +984,7 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
         dateRange: args.dateRange,
         timeGranularity: args.timeGranularity,
         fields: args.fields,
+        campaign_groups: args.campaign_groups,
         campaigns: args.campaigns,
         creatives: args.creatives,
       }

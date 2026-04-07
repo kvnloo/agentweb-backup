@@ -19406,7 +19406,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CAMPAIGN_GROUP': {
         if (action === 'LIST') {
-          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
           return { success: true, campaignGroups: result.data?.elements || [] };
         }
@@ -19498,16 +19498,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       case 'TARGETING': {
         if (action === 'LIST_FACETS') {
           const result = await linkedInAdsService.listTargetingFacets(accessToken);
+          if (!result.success) throw new Error(result.error || 'Failed to list targeting facets');
           return { success: true, facets: result.data?.elements || [] };
         }
         if (action === 'SEARCH') {
           if (!params.facet) throw new Error('SEARCH requires facet');
           const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+          if (!result.success) throw new Error(result.error || 'Failed to search targeting entities');
           return { success: true, entities: result.data?.elements || [] };
         }
         if (action === 'ESTIMATE_REACH') {
           if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
           const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
           return { success: true, audienceCount: result.data };
         }
         throw new Error(`Unknown action "${action}" for TARGETING`);
@@ -19595,17 +19598,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         if (action === 'INIT_IMAGE_UPLOAD') {
           const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
           const result = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          if (!result.success) throw new Error(result.error || 'Failed to initialize image upload');
           return { success: true, uploadInstructions: result.data };
         }
         if (action === 'INIT_VIDEO_UPLOAD') {
           if (!params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires file_size');
           const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
           const result = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, params.file_size);
+          if (!result.success) throw new Error(result.error || 'Failed to initialize video upload');
           return { success: true, uploadInstructions: result.data };
         }
         if (action === 'FINALIZE_VIDEO') {
           if (!params.video_urn) throw new Error('FINALIZE_VIDEO requires video_urn');
           const result = await linkedInAdsService.finalizeVideoUpload(accessToken, params.video_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to finalize video upload');
           return { success: true, result: result.data };
         }
         throw new Error(`Unknown action "${action}" for MEDIA`);
@@ -19674,6 +19680,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } };
       timeGranularity?: string;
       fields?: string[];
+      campaign_groups?: string[];
       campaigns?: string[];
       adGroups?: string[];
       creatives?: string[];
@@ -19681,16 +19688,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   ): Promise<any> {
     console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
 
-    const { accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+    const { accountId: resolvedAccountId, accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
 
     const result = await linkedInAdsService.getAdAnalytics(
       accessToken,
+      resolvedAccountId,
       params.pivot,
       params.timeGranularity || 'ALL',
       params.dateRange,
       params.fields || ['impressions', 'clicks', 'costInLocalCurrency'],
-      { campaign_ids: params.campaigns, creative_ids: params.creatives }
+      { campaign_group_ids: params.campaign_groups, campaign_ids: params.campaigns, creative_ids: params.creatives }
     );
+    if (!result.success) {
+      throw new Error(result.error || 'LinkedIn Ads API request failed');
+    }
     return { success: true, analytics: result.data?.elements || result.data };
   }
 
