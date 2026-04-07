@@ -64,6 +64,7 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
           startingMessage: 'Hello',
           scheduleFrequency: 'daily',
           nextRunTime: customRunTime,
+          emailNotifications: ['test@example.com'],
         },
       } as unknown as Request;
 
@@ -98,6 +99,7 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
           scheduleName: 'Test Schedule',
           startingMessage: 'Hello',
           scheduleFrequency: 'daily',
+          emailNotifications: ['test@example.com'],
         },
       } as unknown as Request;
 
@@ -129,6 +131,7 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
       nextRunTime: '2026-01-20T09:00:00.000Z',
       scheduleName: 'Original',
       startingMessage: 'Hello',
+      emailNotifications: ['test@example.com'],
     };
 
     beforeEach(() => {

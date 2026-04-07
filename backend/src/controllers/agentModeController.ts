@@ -3498,12 +3498,13 @@ export const agentModeController = {
         });
       }
 
-      // Email is only required when variables exist but not all are pre-filled
+      // At least one email notification is always required for scheduled chats
+      if (!Array.isArray(emailNotifications) || emailNotifications.length === 0) {
+        return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
+      }
+
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
-      if (normalizedVariables.length > 0 && !allVariablesPrefilled && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
-      }
 
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
@@ -3676,12 +3677,13 @@ export const agentModeController = {
         }
       });
 
-      // Email is only required when variables exist but not all are pre-filled
+      // At least one email notification is always required for scheduled chats
+      if (effectiveEmailNotifications.length === 0) {
+        return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
+      }
+
       const allUpdateVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
-      if (normalizedVariables.length > 0 && !allUpdateVariablesPrefilled && effectiveEmailNotifications.length === 0) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
-      }
 
       updates.variableValues = normalizedVariableValues;
       updates.variableRequestStatus = normalizedVariables.length > 0
