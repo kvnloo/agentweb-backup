@@ -173,7 +173,7 @@ describe('listCampaigns', () => {
   it('includes campaignGroup filter when provided', async () => {
     await svc.listCampaigns(ACCESS_TOKEN, ACCOUNT_ID, { campaign_group_id: 'cg-99' });
     const call = mockAxiosFn.mock.calls[0][0];
-    expect(call.url).toContain('urn:li:sponsoredCampaignGroup:cg-99');
+    expect(call.url).toContain('urn%3Ali%3AsponsoredCampaignGroup%3Acg-99');
   });
 });
 
@@ -696,6 +696,7 @@ describe('getAdAnalytics', () => {
   it('builds analytics query with pivot and date range', async () => {
     await svc.getAdAnalytics(
       ACCESS_TOKEN,
+      '502840441',
       'CAMPAIGN',
       'ALL',
       { start: { year: 2024, month: 1, day: 1 }, end: { year: 2024, month: 12, day: 31 } },
@@ -705,13 +706,15 @@ describe('getAdAnalytics', () => {
     expect(call.url).toContain('q=analytics');
     expect(call.url).toContain('pivot=CAMPAIGN');
     expect(call.url).toContain('timeGranularity=ALL');
-    expect(call.url).toContain('dateRange.start.year=2024');
-    expect(call.url).toContain('fields=impressions%2Cclicks');
+    expect(call.url).toContain('dateRange=(start:');
+    expect(call.url).toContain('fields=impressions,clicks');
+    expect(call.url).toContain('sponsoredAccount');
   });
 
   it('includes campaign filters when provided', async () => {
     await svc.getAdAnalytics(
       ACCESS_TOKEN,
+      '502840441',
       'CAMPAIGN',
       'DAILY',
       { start: { year: 2024, month: 1, day: 1 }, end: { year: 2024, month: 1, day: 31 } },

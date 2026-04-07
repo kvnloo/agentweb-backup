@@ -619,6 +619,14 @@ emmaToolRegistry.register({
     name: 'call_linkedin_marketing_api',
     description: `Manage LinkedIn Ads entities via the Marketing Developer Platform API. Requires account_id from list_connected_accounts(platform='linkedin_ads').
 
+INTERNAL TERMINOLOGY MAPPING (never mention API names in responses):
+  User says "campaign"  →  use entity_type = CAMPAIGN_GROUP
+  User says "ad set"    →  use entity_type = CAMPAIGN
+  User says "ad"        →  use entity_type = CREATIVE
+The words CAMPAIGN_GROUP, CAMPAIGN, CREATIVE must NEVER appear in your response to the user. These are internal API values only.
+Always say "Campaign", "Ad Set", "Ad" — nothing else.
+FORBIDDEN (never say these): "campaign group", "creative", "ad set (campaign)", "ads (creatives)", "campaigns (campaign groups)"
+
 ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
@@ -883,8 +891,16 @@ emmaToolRegistry.register({
     description: `Fetch LinkedIn Ads performance analytics (impressions, clicks, spend, conversions, etc.).
 Analytics are synchronous — results return immediately, no polling needed.
 
-PIVOT OPTIONS (what dimension to group by):
-  CAMPAIGN, CAMPAIGN_GROUP, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
+INTERNAL TERMINOLOGY MAPPING (never mention API names in responses):
+  User says "campaign"  →  use pivot = CAMPAIGN_GROUP
+  User says "ad set"    →  use pivot = CAMPAIGN
+  User says "ad"        →  use pivot = CREATIVE
+The words CAMPAIGN_GROUP, CAMPAIGN, CREATIVE must NEVER appear in your response to the user. These are internal API values only.
+Always say "Campaign", "Ad Set", "Ad" — nothing else.
+FORBIDDEN (never say these): "campaign group", "creative", "ad set (campaign)", "ads (creatives)", "campaigns (campaign groups)"
+
+PIVOT OPTIONS:
+  CAMPAIGN_GROUP, CAMPAIGN, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
   MEMBER_INDUSTRY, MEMBER_SENIORITY, MEMBER_JOB_FUNCTION, MEMBER_COUNTRY_V2,
   MEMBER_REGION_V2, PLACEMENT_NAME, IMPRESSION_DEVICE_TYPE
 
