@@ -91,6 +91,14 @@ export async function getS3ObjectMetadata(key: string, bucket: string = DEFAULT_
   return s3.headObject({ Bucket: bucket, Key: key }).promise();
 }
 
+/**
+ * Download an S3 object and return its content as a UTF-8 string.
+ */
+export async function getS3ObjectAsString(key: string, bucket: string = DEFAULT_BUCKET): Promise<string> {
+  const result = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+  return result.Body?.toString('utf-8') || '';
+}
+
 export interface S3UploadResult {
   success: boolean;
   url?: string;
