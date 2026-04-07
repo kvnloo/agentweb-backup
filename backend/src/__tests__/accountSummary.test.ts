@@ -43,11 +43,18 @@ import { userDb, crmDb } from '../services/db';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { agentModeService } from '../services/agentModeService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
+import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getSessionsWithoutMessages: jest.fn(),
+    getMessagesFromIndex: jest.fn().mockResolvedValue([]),
+    updateSessionSummary: jest.fn().mockResolvedValue(undefined),
   },
+}));
+
+jest.mock('../services/sessionSummaryService', () => ({
+  summarizeSessionIfNeeded: jest.fn().mockResolvedValue(null),
 }));
 
 jest.mock('../services/db', () => ({
@@ -74,6 +81,8 @@ jest.mock('../services/connectedAccountsDb', () => ({
 const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
 
 const mockGetSessions = chatbotDb.getSessionsWithoutMessages as jest.Mock;
+const mockGetMessagesFromIndex = chatbotDb.getMessagesFromIndex as jest.Mock;
+const mockSummarizeSessionIfNeeded = summarizeSessionIfNeeded as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
 const mockGetLeads = crmDb.getLeadsByListId as jest.Mock;
@@ -96,6 +105,8 @@ describe('getAccountSummary', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetSessions.mockResolvedValue([]);
+    mockGetMessagesFromIndex.mockResolvedValue([]);
+    mockSummarizeSessionIfNeeded.mockResolvedValue(null);
     mockGetUserById.mockResolvedValue(null);
     mockGetLeadLists.mockResolvedValue([]);
     mockGetLeads.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
@@ -491,6 +502,123 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.posts_published).toBe(0);
     expect(result.results.social_media.impressions).toBe(0);
     expect(result.results.social_media.engagements).toBe(0);
+  });
+
+  // --- Session Summaries ---
+
+  test('returns empty session_summaries when no sessions exist', async () => {
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.session_summaries).toEqual([]);
+  });
+
+  test('returns cached summary without fetching messages when up-to-date', async () => {
+    mockGetSessions.mockResolvedValue([
+      makeSession({
+        sessionId: 'sess-1',
+        title: 'LinkedIn campaign',
+        createdAt: daysAgo(2),
+        messageCount: 4,
+        sessionSummary: {
+          summary: 'Published 3 LinkedIn posts.',
+          evaluatedAt: daysAgo(1),
+          evaluatedMessageIndex: 4,
+        },
+      }),
+    ]);
+    mockSummarizeSessionIfNeeded.mockResolvedValue(null); // null = already up-to-date
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.session_summaries).toHaveLength(1);
+    expect(result.session_summaries[0].summary).toBe('Published 3 LinkedIn posts.');
+    expect(result.session_summaries[0].sessionId).toBe('sess-1');
+    expect(result.session_summaries[0].title).toBe('LinkedIn campaign');
+    // messages should not be fetched since cache is fresh
+    expect(mockGetMessagesFromIndex).not.toHaveBeenCalled();
+  });
+
+  test('fetches messages and regenerates summary when session has new messages', async () => {
+    const session = makeSession({
+      sessionId: 'sess-stale',
+      createdAt: daysAgo(2),
+      messageCount: 8,
+      sessionSummary: {
+        summary: 'Old summary.',
+        evaluatedAt: daysAgo(3),
+        evaluatedMessageIndex: 4, // stale: 4 < 8
+      },
+    });
+    mockGetSessions.mockResolvedValue([session]);
+    mockGetMessagesFromIndex.mockResolvedValue([
+      { role: 'user', content: 'Create blog post', messageIndex: 0 },
+      { role: 'assistant', content: 'Done.', messageIndex: 1 },
+    ]);
+    mockSummarizeSessionIfNeeded.mockResolvedValue({
+      summary: 'Wrote and published a blog post.',
+      evaluatedAt: new Date().toISOString(),
+      evaluatedMessageIndex: 8,
+    });
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(mockGetMessagesFromIndex).toHaveBeenCalledWith('sess-stale', 0);
+    expect(result.session_summaries[0].summary).toBe('Wrote and published a blog post.');
+  });
+
+  test('fetches messages for session with no prior summary', async () => {
+    const session = makeSession({
+      sessionId: 'sess-new',
+      createdAt: daysAgo(1),
+      messageCount: 6,
+      // no sessionSummary
+    });
+    mockGetSessions.mockResolvedValue([session]);
+    mockSummarizeSessionIfNeeded.mockResolvedValue({
+      summary: 'Generated a market research report.',
+      evaluatedAt: new Date().toISOString(),
+      evaluatedMessageIndex: 6,
+    });
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(mockGetMessagesFromIndex).toHaveBeenCalledWith('sess-new', 0);
+    expect(result.session_summaries[0].summary).toBe('Generated a market research report.');
+  });
+
+  test('omits session from summaries if both new summary and cached summary are null', async () => {
+    mockGetSessions.mockResolvedValue([
+      makeSession({ createdAt: daysAgo(2), messageCount: 0 }),
+    ]);
+    mockSummarizeSessionIfNeeded.mockResolvedValue(null);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.session_summaries).toHaveLength(0);
+  });
+
+  test('omits session from summaries if summarization throws', async () => {
+    mockGetSessions.mockResolvedValue([
+      makeSession({ createdAt: daysAgo(2), messageCount: 4 }),
+    ]);
+    mockSummarizeSessionIfNeeded.mockRejectedValue(new Error('LLM error'));
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.session_summaries).toHaveLength(0);
+  });
+
+  test('returns sessions sorted newest-first in session_summaries', async () => {
+    mockGetSessions.mockResolvedValue([
+      makeSession({ sessionId: 'old', createdAt: daysAgo(5), messageCount: 2, sessionSummary: { summary: 'Old.', evaluatedAt: daysAgo(1), evaluatedMessageIndex: 2 } }),
+      makeSession({ sessionId: 'new', createdAt: daysAgo(1), messageCount: 2, sessionSummary: { summary: 'New.', evaluatedAt: daysAgo(0), evaluatedMessageIndex: 2 } }),
+      makeSession({ sessionId: 'mid', createdAt: daysAgo(3), messageCount: 2, sessionSummary: { summary: 'Mid.', evaluatedAt: daysAgo(1), evaluatedMessageIndex: 2 } }),
+    ]);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    const ids = result.session_summaries.map((s) => s.sessionId);
+    expect(ids).toEqual(['new', 'mid', 'old']);
   });
 
   test('queries all connected accounts without token validity check', async () => {
