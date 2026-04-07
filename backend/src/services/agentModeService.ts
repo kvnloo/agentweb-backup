@@ -9356,6 +9356,35 @@ Format the response as JSON with this structure:
   }
 
   /**
+   * Generate a 2-3 word summary of what was achieved in a scheduled chat run.
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost summarization.
+   * Returns null if generation fails (caller should keep existing title).
+   */
+  async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
+    try {
+      const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
+        {
+          role: 'system',
+          content: `You are a task summarizer. Given a user's request and the agent's response, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). Return ONLY the summary, nothing else.`
+        },
+        {
+          role: 'user',
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nResult: ${response.slice(0, 500)}`
+        }
+      ], {
+        max_completion_tokens: 20,
+        temperature: 0.3,
+      });
+
+      const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
+      return summary || null;
+    } catch (error) {
+      console.error('AgentMode: Failed to generate scheduled chat summary:', error);
+      return null;
+    }
+  }
+
+  /**
    * Triage a Slack message to determine if it requires handling (e.g. a client question).
    * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
    * Returns true if the message needs to be handled, false otherwise.

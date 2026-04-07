@@ -865,9 +865,11 @@ export async function runScheduledChat(
   sessionId: string;
   attempt: number;
   createdAt: string;
+  summary?: string;
 }> {
   const now = new Date();
   let sessionId: string = '';
+  let generatedSummary: string | undefined;
 
   try {
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -1017,6 +1019,18 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel
     });
 
+    // Generate a 2-3 word summary and update the session title
+    try {
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
+      if (summary) {
+        generatedSummary = summary;
+        const summaryTitle = `${sessionTitle} — ${summary}`;
+        await chatbotDb.updateSessionTitle(sessionId, summaryTitle);
+      }
+    } catch (err) {
+      console.error('AgentMode: Failed to update session title with summary:', err);
+    }
+
     // Convert result to scheduled chat format
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
@@ -1051,7 +1065,8 @@ export async function runScheduledChat(
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId,
       attempt: result.attempts,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      summary: generatedSummary
     };
 
     // Save the result to database (without actualResponse to save space)
@@ -3776,7 +3791,8 @@ export const agentModeController = {
                   emailNotifications,
                   scheduleToRun.scheduleName,
                   result,
-                  scheduleToRun.scheduleId
+                  scheduleToRun.scheduleId,
+                  result.summary
                 );
               }
             } catch (emailError) {
@@ -3944,7 +3960,8 @@ export const agentModeController = {
                 emailNotifications,
                 scheduleToRun.scheduleName,
                 result,
-                scheduleToRun.scheduleId
+                scheduleToRun.scheduleId,
+                result.summary
               );
             }
           } catch (emailError) {
@@ -4064,7 +4081,8 @@ export const agentModeController = {
               emailNotifications,
               schedule.scheduleName,
               result,
-              schedule.scheduleId
+              schedule.scheduleId,
+              result.summary
             );
           }
         } catch (emailError) {
@@ -4246,11 +4264,14 @@ export const agentModeController = {
         createdAt: record.createdAt || new Date().toISOString(),
       };
 
+      const runSummary: string | undefined = record.summary;
+
       await emailService.sendScheduledChatResultEmail(
         [toEmail],
         schedule.scheduleName,
         resultForEmail,
-        schedule.scheduleId
+        schedule.scheduleId,
+        runSummary
       );
 
       res.json({ success: true });
@@ -4462,7 +4483,8 @@ export const agentModeController = {
                       emailNotifications,
                       schedule.scheduleName,
                       result,
-                      schedule.scheduleId
+                      schedule.scheduleId,
+                      result.summary
                     );
                   }
                 } else {
