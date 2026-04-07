@@ -227,7 +227,7 @@ describe('callLinkedInMarketingApi — AD_ACCOUNT', () => {
 describe('callLinkedInMarketingApi — CAMPAIGN_GROUP', () => {
   it('LIST calls listCampaignGroups', async () => {
     const result = await service.callLinkedInMarketingApi(USER_ID, 'CAMPAIGN_GROUP', 'LIST', ACCOUNT_ID);
-    expect(linkedInAdsService.listCampaignGroups).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID);
+    expect(linkedInAdsService.listCampaignGroups).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID, {});
     expect(result.success).toBe(true);
   });
 
