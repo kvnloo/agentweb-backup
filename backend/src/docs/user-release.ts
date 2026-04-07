@@ -3839,4 +3839,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Shows a summary of how many users were updated, skipped, or errored',
     ],
   },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Scheduled Chat Test Runs No Longer Time Out',
+      '- Testing a scheduled chat now starts immediately and runs in the background',
+      '- Previously, complex tasks (e.g. scraping many pages and generating reports) would fail with a timeout error',
+      '- Test results appear in the run history when complete — no need to wait on the page',
+    ],
+  },
 ];
