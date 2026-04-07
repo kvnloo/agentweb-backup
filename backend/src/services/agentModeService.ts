@@ -1226,6 +1226,29 @@ export class AgentModeService {
 
       messages.push(...marketingMessages);
 
+      // Cross-message loop detection: when the user repeats the same message multiple times
+      // without providing requested information, stop asking and use available context tools.
+      const LOOP_DETECTION_THRESHOLD = 3;
+      const recentUserHistory = sessionHistory
+        .filter(m => m.role === 'user')
+        .slice(-LOOP_DETECTION_THRESHOLD);
+      const normalizedCurrent = messageContent.trim().toLowerCase();
+      const consecutiveIdentical = recentUserHistory.filter(
+        m => (m.content || '').trim().toLowerCase() === normalizedCurrent
+      ).length;
+
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+        messages.push({
+          role: 'user',
+          content: `[SYSTEM OVERRIDE - ANTI-LOOP TRIGGERED] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+1. STOP asking for that information immediately — do not repeat it again under any circumstances
+2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
+3. If those tools provide enough context, proceed with the task using that information
+4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
+5. Never block on missing user-provided details — always find a way to make progress`
+        });
+      }
+
       let content = '';
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
@@ -2054,6 +2077,8 @@ Save the chart image URLs from the response.
 - **Proactive information gathering**: Search for market data, trends, and context to provide more informed recommendations
 - **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
 - Ask clarifying questions only after you've searched for available information
+- **Brand context first**: Before asking the user for business details (company name, website, goals, target market, brand voice, etc.), ALWAYS call read_brand_guidelines and read_market_strategy first. These tools frequently contain exactly the information you need. Only ask the user if these tools return nothing useful.
+- **Never ask twice**: If you've already asked for a piece of information in this conversation and the user has not provided it, do NOT ask again. Instead, proceed using whatever context is available from brand guidelines, market strategy, or reasonable defaults.
 - **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
 - **Web automation task confirmation required**: Before calling 'create_task_from_template', explain what the browser automation task will do and confirm with the user (these tasks take time and cannot be cancelled). This does NOT apply to direct-execution tools like linkedin_outreach or post_on_connected_account.
 - **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
