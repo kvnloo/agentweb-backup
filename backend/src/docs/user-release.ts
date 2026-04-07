@@ -21,19 +21,27 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-07',
     changes: [
-      'Meta Ads: Destination URL Audit Now Supported',
-      '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
-      '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
-      '- Ask Emma to "list my Meta ad creatives and show destination URLs" to see all landing page URLs across your ads',
+      'Fix: Emma Now Reliably Creates Scheduled Chats',
+      '- Fixed an issue where Emma would repeatedly attempt (and fail) to create a scheduled chat when the starting message contained a {{variable}} placeholder',
+      '- Emma now correctly sets up the schedule on the first attempt, even when the AI omits or mis-formats the email notifications field',
+      '- If no notification email is provided, the schedule defaults to sending run summaries to your account email',
     ],
   },
   {
     date: '2026-04-07',
     changes: [
-      'Scheduled Chats Now Require at Least One Email Notification',
-      '- Creating or updating a scheduled chat now requires at least one email address in the Email Notifications field',
-      '- This ensures you always receive run results, error alerts, and variable request emails from your scheduled sessions',
-      '- The form will show an error and disable the submit button until an email is provided',
+      'Fix: Issue Reports Now Show Confirmation and Notion Link in Emma',
+      '- When you ask Emma to report a product issue, the tool badge now shows "Issue reported ✓" instead of the raw tool name',
+      '- Clicking the badge shows the issue title, success status, and a direct "View in Notion" link to the created ticket',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Meta Ads: Destination URL Audit Now Supported',
+      '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
+      '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
+      '- Ask Emma to "list my Meta ad creatives and show destination URLs" to see all landing page URLs across your ads',
     ],
   },
   {

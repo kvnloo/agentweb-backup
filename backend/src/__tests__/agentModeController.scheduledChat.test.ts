@@ -2018,33 +2018,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         );
       });
 
-      it('should reject creating schedule without email notifications (no variables)', async () => {
+      it('should default to user email when creating variable schedule without email notifications', async () => {
         const mockReq = {
-          user: { userId: mockUserId },
-          body: {
-            scheduleName: 'Simple Schedule',
-            startingMessage: 'Give me a marketing summary',
-            scheduleFrequency: 'daily',
-            emailNotifications: [],
-          },
-        } as unknown as Request;
-
-        const mockRes = {
-          json: jest.fn(),
-          status: jest.fn().mockReturnThis(),
-        } as unknown as Response;
-
-        await agentModeController.createScheduledChat(mockReq, mockRes);
-
-        expect(mockRes.status).toHaveBeenCalledWith(400);
-        expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'At least one email notification is required for scheduled chats'
-        });
-      });
-
-      it('should reject creating schedule without email notifications (with variables)', async () => {
-        const mockReq = {
-          user: { userId: mockUserId },
+          user: { userId: mockUserId, email: 'owner@example.com' },
           body: {
             scheduleName: 'Variable Schedule',
             startingMessage: 'Summarize {{company_name}}',
@@ -2060,10 +2036,13 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         await agentModeController.createScheduledChat(mockReq, mockRes);
 
-        expect(mockRes.status).toHaveBeenCalledWith(400);
-        expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'At least one email notification is required for scheduled chats'
-        });
+        // No longer rejects — falls back to user's own email
+        expect(mockRes.status).not.toHaveBeenCalledWith(400);
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.objectContaining({
+            emailNotifications: ['owner@example.com'],
+          })
+        );
       });
     });
 
@@ -2618,6 +2597,92 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
       // Should have needed exactly 2 attempts
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('createScheduledChat - email normalization for variables', () => {
+    const mockCreateSchedule = jest.fn();
+
+    beforeEach(() => {
+      mockScheduleDb.createSchedule = mockCreateSchedule;
+      mockCreateSchedule.mockClear();
+    });
+
+    it('should default to user email when variables present but no emailNotifications provided', async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'owner@example.com' },
+        body: {
+          scheduleName: 'SEO Scan',
+          startingMessage: 'Scan {{website}} for SEO issues',
+          scheduleFrequency: 'weekly',
+          // No emailNotifications provided
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: ['owner@example.com'],
+        })
+      );
+    });
+
+    it('should normalize emailNotifications string to array when variables present', async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'owner@example.com' },
+        body: {
+          scheduleName: 'SEO Scan',
+          startingMessage: 'Scan {{website}} for SEO issues',
+          scheduleFrequency: 'weekly',
+          emailNotifications: 'user@rankai.ai', // string, not array
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: ['user@rankai.ai'],
+        })
+      );
+    });
+
+    it('should not require email when all variable values are pre-filled', async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'owner@example.com' },
+        body: {
+          scheduleName: 'SEO Scan',
+          startingMessage: 'Scan {{website}} for SEO issues',
+          scheduleFrequency: 'weekly',
+          variableValues: { website: 'rankai.ai' },
+          // No emailNotifications
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: [], // pre-filled vars → no email needed
+          variableValues: { website: 'rankai.ai' },
+        })
+      );
     });
   });
 });

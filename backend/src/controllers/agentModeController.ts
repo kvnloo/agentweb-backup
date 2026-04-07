@@ -18,6 +18,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
+import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { DynamoDB } from 'aws-sdk';
@@ -3468,7 +3469,7 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctionCalls: requiredFunctionCalls || [],
         functionCallMinCalls: functionCallMinCalls || {},
-        emailNotifications: emailNotifications || [],
+        emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         status: 'active',
         nextRunTime: scheduledNextRunTime,
@@ -3499,14 +3500,14 @@ export const agentModeController = {
         });
       }
 
-      // At least one email notification is always required for scheduled chats
-      if (!Array.isArray(emailNotifications) || emailNotifications.length === 0) {
-        return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
-      }
-
+      // When variables are present but unfilled, fall back to user's own email so LLMs
+      // don't need to know this requirement.
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
-
+      const normalizedEmails = normalizeEmailList(emailNotifications);
+      scheduledChat.emailNotifications = (normalizedVariables.length > 0 && !allVariablesPrefilled && normalizedEmails.length === 0)
+        ? [user.email]
+        : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -5765,11 +5766,14 @@ export const agentModeController = {
       }
 
       const missingVars = templateVars.filter((v: any) => !normalizedVariableValues[v.name]);
-      const emails = overrideEmails || template.emailNotifications || [];
 
-      if (templateVars.length > 0 && missingVars.length > 0 && (!Array.isArray(emails) || emails.length === 0)) {
-        return res.status(400).json({ error: 'Email notifications are required when template has variables (unless all variable values are pre-filled)' });
-      }
+      const overrideEmailsList = normalizeEmailList(overrideEmails);
+      const baseEmails = overrideEmailsList.length > 0
+        ? overrideEmailsList
+        : normalizeEmailList(template.emailNotifications);
+      const emails = (templateVars.length > 0 && missingVars.length > 0 && baseEmails.length === 0)
+        ? [user.email]
+        : baseEmails;
 
       const scheduleId = uuidv4();
       const scheduledChat: any = {

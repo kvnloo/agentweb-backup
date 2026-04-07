@@ -3130,6 +3130,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
       };
     }
 
+    // For report_product_issues, preserve success/message/results so the sidebar can show status
+    if (toolName === 'report_product_issues') {
+      return {
+        success: result?.success ?? false,
+        message: result?.message,
+        results: result?.results,
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
