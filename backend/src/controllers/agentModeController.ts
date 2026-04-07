@@ -3469,7 +3469,7 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctionCalls: requiredFunctionCalls || [],
         functionCallMinCalls: functionCallMinCalls || {},
-        emailNotifications: [] as string[], // will be set after variable normalization
+        emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         status: 'active',
         nextRunTime: scheduledNextRunTime,
@@ -3505,11 +3505,9 @@ export const agentModeController = {
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
       const normalizedEmails = normalizeEmailList(emailNotifications);
-      const effectiveEmails = (normalizedVariables.length > 0 && !allVariablesPrefilled && normalizedEmails.length === 0)
+      scheduledChat.emailNotifications = (normalizedVariables.length > 0 && !allVariablesPrefilled && normalizedEmails.length === 0)
         ? [user.email]
         : normalizedEmails;
-
-      scheduledChat.emailNotifications = effectiveEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -5769,21 +5767,10 @@ export const agentModeController = {
 
       const missingVars = templateVars.filter((v: any) => !normalizedVariableValues[v.name]);
 
-      // Normalize overrideEmails: accept string or array
-      const rawOverrideEmails = overrideEmails;
-      const normalizedOverrideEmails: string[] = Array.isArray(rawOverrideEmails)
-        ? rawOverrideEmails
-        : (typeof rawOverrideEmails === 'string' && rawOverrideEmails.trim().length > 0)
-          ? [rawOverrideEmails.trim()]
-          : [];
-      const templateEmails: string[] = Array.isArray(template.emailNotifications)
-        ? template.emailNotifications
-        : (typeof template.emailNotifications === 'string' && (template.emailNotifications as string).trim().length > 0)
-          ? [(template.emailNotifications as string).trim()]
-          : [];
-      const baseEmails = normalizedOverrideEmails.length > 0 ? normalizedOverrideEmails : templateEmails;
-
-      // When variables are unfilled and no email is configured, fall back to the user's own email
+      const overrideEmailsList = normalizeEmailList(overrideEmails);
+      const baseEmails = overrideEmailsList.length > 0
+        ? overrideEmailsList
+        : normalizeEmailList(template.emailNotifications);
       const emails = (templateVars.length > 0 && missingVars.length > 0 && baseEmails.length === 0)
         ? [user.email]
         : baseEmails;
