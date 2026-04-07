@@ -105,10 +105,51 @@ export async function refreshAccessToken(
   return { access_token, refresh_token, expires_in };
 }
 
+// ─── Pagination helper ────────────────────────────────────────────────────────
+
+/**
+ * Fetch all pages from a LinkedIn cursor-based paginated endpoint (v202401+).
+ *
+ * Used for q=search endpoints (pageSize up to 1000) and q=criteria endpoints
+ * (pageSize up to 100). Loops until metadata.nextPageToken is absent.
+ *
+ * @param baseUrl     - Full path + existing query string (no pageSize/pageToken)
+ * @param accessToken - Bearer token
+ * @param pageSize    - Items per page: 1000 for q=search, 100 for q=criteria
+ * @param extraHeaders - Optional extra request headers (e.g. X-RestLi-Method)
+ */
+async function fetchAllPages(
+  baseUrl: string,
+  accessToken: string,
+  pageSize: number,
+  extraHeaders?: Record<string, string>
+): Promise<LinkedInAdsApiResult> {
+  const allElements: any[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    const tokenParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+    const url = `${baseUrl}${sep}pageSize=${pageSize}${tokenParam}`;
+
+    const result = await makeRequest('GET', url, accessToken, undefined, extraHeaders);
+    if (!result.success) return result;
+
+    allElements.push(...(result.data?.elements ?? []));
+    pageToken = result.data?.metadata?.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  return { success: true, data: { elements: allElements } };
+}
+
 // ─── Ad Account ───────────────────────────────────────────────────────────────
 
 export async function listAdAccounts(accessToken: string): Promise<LinkedInAdsApiResult> {
-  return makeRequest('GET', '/rest/adAccounts?q=search&search=(type:(values:List(BUSINESS,ENTERPRISE)))', accessToken);
+  return fetchAllPages(
+    '/rest/adAccounts?q=search&search=(type:(values:List(BUSINESS,ENTERPRISE)))',
+    accessToken,
+    1000
+  );
 }
 
 // ─── Campaign Group ───────────────────────────────────────────────────────────
@@ -121,10 +162,10 @@ export async function listCampaignGroups(
   const statusFilter = params.status
     ? `(status:(values:List(${params.status})))`
     : `(status:(values:List(ACTIVE,PAUSED,DRAFT,ARCHIVED)))`;
-  return makeRequest(
-    'GET',
+  return fetchAllPages(
     `/rest/adAccounts/${adAccountId}/adCampaignGroups?q=search&search=${statusFilter}`,
-    accessToken
+    accessToken,
+    1000
   );
 }
 
@@ -208,7 +249,7 @@ export async function listCampaigns(
     const statuses = params.status || 'ACTIVE,PAUSED,DRAFT,ARCHIVED';
     path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(status:(values:List(${statuses})))`;
   }
-  return makeRequest('GET', path, accessToken);
+  return fetchAllPages(path, accessToken, 1000);
 }
 
 /**
@@ -486,11 +527,11 @@ export async function listCreatives(
 ): Promise<LinkedInAdsApiResult> {
   const rawId = campaignId.startsWith('urn:li:sponsoredCampaign:') ? campaignId : `urn:li:sponsoredCampaign:${campaignId}`;
   const campaignUrn = encodeURIComponent(rawId);
-  return makeRequest(
-    'GET',
+  // q=criteria uses cursor-based pagination with max pageSize=100 (v202603 docs)
+  return fetchAllPages(
     `/rest/adAccounts/${adAccountId}/creatives?q=criteria&campaigns=List(${campaignUrn})`,
     accessToken,
-    undefined,
+    100,
     { 'X-RestLi-Method': 'FINDER' }
   );
 }
