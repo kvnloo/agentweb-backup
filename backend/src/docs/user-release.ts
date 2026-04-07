@@ -3848,4 +3848,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Test results appear in the run history when complete — no need to wait on the page',
     ],
   },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Fixed: Work Plans Edit Dialog No Longer Crashes',
+      '- The edit dialog in Settings → Work Plans now opens correctly without crashing the page',
+      '- Previously, opening the edit dialog caused an error that broke the entire Work Plans tab',
+    ],
+  },
 ];
