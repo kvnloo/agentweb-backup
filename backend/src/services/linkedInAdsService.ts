@@ -133,8 +133,9 @@ export async function createCampaignGroup(
   adAccountId: string,
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
-  // LinkedIn does not allow creating a campaign group with PAUSED status — must be ACTIVE or DRAFT
-  const status = params.status === 'PAUSED' ? 'ACTIVE' : (params.status || 'ACTIVE');
+  // LinkedIn does not allow creating a campaign group with PAUSED status — must be ACTIVE or DRAFT.
+  // Map PAUSED → DRAFT so the caller can then UPDATE to PAUSED after creation.
+  const status = params.status === 'PAUSED' ? 'DRAFT' : (params.status || 'ACTIVE');
 
   const body: Record<string, any> = {
     account: `urn:li:sponsoredAccount:${adAccountId}`,

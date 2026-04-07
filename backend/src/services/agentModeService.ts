@@ -19243,7 +19243,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CAMPAIGN_GROUP': {
         if (action === 'LIST') {
-          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
           return { success: true, campaignGroups: result.data?.elements || [] };
         }
@@ -19517,6 +19517,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } };
       timeGranularity?: string;
       fields?: string[];
+      campaign_groups?: string[];
       campaigns?: string[];
       adGroups?: string[];
       creatives?: string[];
@@ -19533,7 +19534,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       params.timeGranularity || 'ALL',
       params.dateRange,
       params.fields || ['impressions', 'clicks', 'costInLocalCurrency'],
-      { campaign_ids: params.campaigns, creative_ids: params.creatives }
+      { campaign_group_ids: params.campaign_groups, campaign_ids: params.campaigns, creative_ids: params.creatives }
     );
     if (!result.success) {
       throw new Error(result.error || 'LinkedIn Ads API request failed');
