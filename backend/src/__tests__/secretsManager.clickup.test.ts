@@ -2,6 +2,7 @@
  * Tests for getClickUpCredentials in secretsManager.ts
  * Covers: happy path, production env, empty secret, missing fields, error propagation
  */
+export {};
 
 const mockGetSecretValue = jest.fn();
 
