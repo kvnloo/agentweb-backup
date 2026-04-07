@@ -40,7 +40,7 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
-import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -431,7 +431,6 @@ export class AgentModeService {
       console.error('AgentMode: Error registering tools to instance:', error);
     }
 
-    // Register built-in infrastructure tools
     this.toolRegistry.register({
       name: 'search_tool_response',
       definition: {
@@ -1704,9 +1703,6 @@ export class AgentModeService {
               toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
             }
 
-            // For large tool responses, save the full content to S3 so the LLM can search it later
-            // via search_tool_response. This solves the issue where context-trimming reduces old
-            // tool results to 200 chars, losing field values like destination URLs.
             if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
               try {
                 const uploadResult = await uploadFileToS3WithPath(
@@ -2964,7 +2960,6 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
     }
 
-    // search_tool_response returns match data — pass through as-is
     if (toolName === 'search_tool_response') {
       return result;
     }
@@ -4194,27 +4189,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  /**
-   * Search a large tool response that was stored in S3.
-   * Returns up to 20 matches with surrounding context (300 chars each side).
-   */
   private async executeSearchToolResponse(args: { s3_key: string; query: string }): Promise<any> {
     const { s3_key, query } = args;
     if (!s3_key || !query) {
       return { success: false, message: 'Both s3_key and query are required' };
     }
 
-    const AWS = require('aws-sdk');
-    const s3 = new AWS.S3({
-      region: process.env.AWS_REGION || 'us-west-2',
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    });
-    const bucket = process.env.AWS_S3_BUCKET || 'agentweb-user-files';
-
     try {
-      const s3Result = await s3.getObject({ Bucket: bucket, Key: s3_key }).promise();
-      const content: string = s3Result.Body?.toString('utf-8') || '';
+      const content = await getS3ObjectAsString(s3_key);
       if (!content) {
         return { success: false, message: 'Empty response from S3' };
       }
