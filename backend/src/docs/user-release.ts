@@ -9,6 +9,122 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-07',
+    changes: [
+      'ClickUp: OAuth Login Now Supported',
+      '- You can now connect your ClickUp account via OAuth ("Connect with ClickUp" button) in addition to the existing Personal API Token option',
+      '- OAuth provides a more secure and user-friendly connection flow — no need to copy and paste tokens',
+      '- Both connection methods are supported; choose whichever works best for your setup',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Self-Serve CMS Configuration for Blog Publishing',
+      '- You can now connect your own WordPress, Webflow, or Basehub CMS directly from the Research Reports page — no admin setup required',
+      '- Click "CMS Setup" on the Research Reports page to enter your credentials and start publishing blog posts from generated reports',
+      '- Supports WordPress (application password), Webflow (API token + site/collection IDs), and Basehub (token + collection ID)',
+      '- Admin-configured CMS credentials continue to work as before; user-configured credentials take priority when set',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Scheduled Tasks Now Respect Your Stated Volume Limits',
+      '- Fixed an issue where scheduled automation tasks (e.g. LinkedIn connection requests) would batch in small groups and pause for confirmation, even when a specific volume was requested',
+      '- Scheduled sessions are fully automated — the agent now executes the full stated quantity in a single run without stopping to ask "should I continue?"',
+      '- Confirmation prompts are now scoped to web browser automation tasks only (create_task_from_template), not to direct actions like sending invitations or posting',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Admin: New Tool to Manage Judge System Prompts From Chat',
+      '- Added manage_scoring_judges admin tool to Emma agent mode, allowing admins to view, update, reset, and manage custom judge system prompts directly from the chat interface',
+      '- Supports 7 actions: get_default, update_default, reset_default, list, create, update, delete',
+      '- Enables quick fixes to scoring behavior (e.g. adding rules for correct-but-flagged sessions) without navigating to the admin settings UI',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Fix: Scheduled Chat Default Variable Values Now Persist Across All Runs',
+      '- Default variable values set when creating a scheduled chat (e.g. a LinkedIn account ID) were being cleared after the first run, causing the schedule to incorrectly send a variable-request email on subsequent runs',
+      '- Default values now persist permanently — the schedule uses them every run without interruption',
+      '- To recover an existing schedule affected by this bug, open it in Scheduled Chats → Agent Mode and click Update Schedule (no changes needed)',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Emma Can Now Save and Reuse Test Accounts for Client Websites',
+      '- Emma now remembers login credentials for websites she tests on your behalf — no more signing up from scratch every session',
+      '- When testing a site, Emma checks for a saved account first; if none exists, she creates one via temp email and saves the credentials automatically',
+      '- You can manage test accounts from Settings → Test Accounts: add, edit, or delete credentials for any site',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Improvement: Agent Can Now Complete More Complex Tasks Without Hitting Step Limits',
+      '- Raised the maximum number of steps per session from 20 to 40, giving the agent more room to finish multi-step workflows like LinkedIn outreach, paginated searches, and bulk CRM writes',
+      '- The agent now receives step-budget reminders as it approaches the limit, prompting it to prefer batch operations and wrap up gracefully rather than stopping mid-task',
+    ],
+  },
+  {
+    date: '2026-04-05',
+    changes: [
+      'Emma Can Now Receive Emails During Automated Tasks',
+      '- Emma can generate a session-specific email address (test+...@updates.agentweb.pro) for use when signing up for services',
+      '- Emails sent to this address are automatically captured and made available to Emma mid-task',
+      '- Enables Emma to complete sign-up flows, receive verification codes, and read confirmation emails autonomously',
+    ],
+  },
+  {
+    date: '2026-04-05',
+    changes: [
+      'Admin: Chat History Time Range Now Filters by Session Start Time',
+      '- The get_chat_history tool previously returned old sessions whose metadata was recently updated (e.g. when a share link was accessed or scoring ran), causing stale sessions to appear in recent time-range queries',
+      '- Time ranges now correctly match when the session was created, not when it was last touched',
+      '- Session updatedAt timestamp now reflects the time of the last message only — metadata changes such as scoring, title edits, and share link access no longer advance it',
+    ],
+  },
+  {
+    date: '2026-04-04',
+    changes: [
+      'Admin: Alert Emails Are Now Configurable',
+      '- Oncall alert recipients and product issue email recipients can now be managed from the Admin dashboard under the new "Alert Emails" tab',
+      '- Changes take effect immediately without a redeployment',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Error Reports Now Route Directly to the Engineering Team',
+      '- Error reports submitted via the "Report an Error" button are now sent directly to the engineering team for faster triage',
+      'Fix: Emma No Longer Auto-Replies to Slack Messages',
+      '- Removed a behavior where Emma would automatically respond to any message posted in a connected Slack channel',
+      '- Emma now only replies when explicitly @mentioned in Slack',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Fix: No More Duplicate Responses When Messages Are Sent Quickly',
+      '- Sending a new message while a response is still being generated no longer causes duplicate or overlapping responses',
+      '- Messages sent while the AI is still responding are now queued and delivered automatically once the current response finishes',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Fix: Custom Domain URL Now Shows Correctly on Landing Pages',
+      '- Fixed an issue where landing pages created before domain linking was introduced did not display their custom domain URL',
+      '- The landing page list now automatically looks up and fills in the custom domain for any page that has a linked Vercel project',
+      '- Subdomain creation no longer fails if the landing page record update encounters a transient error',
+    ],
+  },
+  {
     date: '2026-04-02',
     changes: [
       'Settings: Each Tab Now Has Its Own URL',
@@ -3577,6 +3693,114 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Copy Button Fix in Agent Mode',
       '- Fixed copy buttons in Agent Mode chat that required precise clicking to activate',
+    ],
+  },
+  {
+    date: '2026-04-02',
+    changes: [
+      'Token Usage History Now Tracked Per User',
+      '- Previous months\' token usage is now archived automatically on monthly reset',
+      '- Up to 24 months of history stored per user',
+      '- Admins can view per-user token usage history in the Admin Dashboard',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Paid Social Now Works with Connected Meta Ad Accounts',
+      '- The Paid Social dashboard now uses your connected Meta ad account when no legacy ad account is configured',
+      '- Ad performance data, campaigns, and ad sets are fetched using the access token from the connected account',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Clearer Message When Admin Tools Are Blocked in Shared Sessions',
+      '- Admin tools (e.g. manage skills, work plans) are restricted to your own session for security reasons',
+      '- If an admin tool is invoked during a shared session, the agent now explains you can use it in your own Agent Mode session',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Client List Now Includes Sign-Up Date',
+      '- The list_all_clients agent tool now returns a signup_time field for each client',
+      '- Enables the AI agent to report when each account was created during health assessments',
+      'Opus Models Now Admin-Only',
+      '- Claude Opus models are no longer available for standard user accounts',
+      '- Admins continue to have full access to Opus models in Agent Mode and Reports',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Emma Now Analyzes Images and Videos When Asked to "Read" Them',
+      '- Asking Emma to "read" an image now triggers visual analysis instead of a text extraction error',
+      '- Asking Emma to "read" a video now triggers video analysis using Gemini',
+      '- Emma correctly routes image files to describe_image and video files to describe_video automatically',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now See Your Browser Screen',
+      '- Emma and Agent Mode can view a screenshot of your current page when you ask for help',
+      '- Browser screenshots taken during agent tasks are displayed inline in the chat',
+      '- Screenshots are uploaded to secure storage instead of sending large image payloads',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Send and Read Slack Messages',
+      '- Emma can send messages to your Slack channel and read recent messages',
+      '- Regular users are automatically scoped to their configured channel — no need to specify it',
+      '- Admins can target any channel as before',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Connect Your Own Facebook Ad Account for Paid Social',
+      '- The "Ad Account Not Configured" screen now guides you to connect your Facebook ad account directly',
+      '- Click the new "Go to Connected Accounts" button to open Settings → Connected Accounts',
+      '- No longer requires an admin to configure the ad account on your behalf',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Configure Multiple Slack Channels Per User',
+      '- Admins can now assign multiple Slack channels to a user from the Users tab',
+      '- Emma\'s Slack tools are restricted to the user\'s configured channels',
+      '- When multiple channels are configured, users must specify which channel to use',
+      '- Single-channel users continue to work as before with no change required',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'Emma Can Now Add Logos to Landing Pages',
+      '- Ask Emma to add company logos to any landing page and she will handle it automatically',
+      '- For well-known public companies, logos are pulled from Google\'s favicon service — no uploading required',
+      '- For your own brand logo, Emma looks it up from your brand guidelines and places it on the page',
+    ],
+  },
+  {
+    date: '2026-04-03',
+    changes: [
+      'More Accurate PDF Data Extraction',
+      '- Numbers and values in PDF tables are now correctly separated from their labels',
+      '- Fixed an issue where table columns were concatenated without spaces (e.g. "Keywords ranked73" is now "Keywords ranked 73")',
+      '- Applies to all PDF files read by Agent Mode, including uploaded reports and knowledge base files',
+    ],
+  },
+  {
+    date: '2026-04-06',
+    changes: [
+      'Admin Users Tab Now Shows Subscription Amount',
+      '- The Users tab in the admin dashboard now displays the monthly charge amount next to each user\'s payment status',
+      '- Amounts are recorded automatically from Stripe invoices on each successful payment',
     ],
   },
 ];

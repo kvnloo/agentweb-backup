@@ -278,7 +278,7 @@ describe('InstagramAdapter', () => {
             // Mock token refresh success
             mockInstagramService.getInstagramUserInsights.mockRejectedValueOnce(new Error('Instagram access token expired or invalid'));
             mockInstagramService.refreshLongLivedToken.mockResolvedValueOnce({ access_token: 'new_token_1', expires_in: 3600 });
-            
+
             mockInstagramService.getInstagramUserInsights.mockResolvedValueOnce([
                 { name: 'profile_views', values: [{ value: 100 }] },
                 { name: 'reach', values: [{ value: 500 }] },
@@ -313,6 +313,42 @@ describe('InstagramAdapter', () => {
                     profileViews: 100
                 }
             });
+        });
+
+        it('should sum all daily values across date range, not just the first', async () => {
+            mockInstagramService.getInstagramUserInsights.mockResolvedValueOnce([
+                { name: 'reach', values: [{ value: 100 }, { value: 200 }, { value: 300 }] },
+                { name: 'profile_views', values: [{ value: 10 }, { value: 20 }] },
+                { name: 'website_clicks', values: [{ value: 5 }, { value: 5 }] },
+                { name: 'accounts_engaged', values: [{ value: 50 }, { value: 50 }] },
+                { name: 'total_interactions', values: [{ value: 30 }, { value: 40 }] }
+            ] as any);
+
+            mockInstagramService.getInstagramBusinessMe.mockResolvedValueOnce({ followers_count: 500 } as any);
+
+            const result = await adapter.getAccountMetrics(mockValidAccount, 'user_123');
+
+            expect(result.shareStatistics[0].totalShareStatistics.impressionCount).toBe(600); // 100+200+300
+            expect(result.pageViews[0].views).toBe(30); // 10+20
+            expect(result.extendedMetrics.websiteClicks).toBe(10); // 5+5
+            expect(result.extendedMetrics.totalInteractions).toBe(70); // 30+40
+        });
+
+        it('should pass date range to getInstagramUserInsights', async () => {
+            mockInstagramService.getInstagramUserInsights.mockResolvedValueOnce([]);
+            mockInstagramService.getInstagramBusinessMe.mockResolvedValueOnce({ followers_count: 0 } as any);
+
+            const startDate = new Date(2025, 1, 1);
+            const endDate = new Date(2025, 1, 28);
+
+            await adapter.getAccountMetrics(mockValidAccount, 'user_123', startDate, endDate);
+
+            expect(mockInstagramService.getInstagramUserInsights).toHaveBeenCalledWith(
+                expect.any(String),
+                expect.any(String),
+                startDate,
+                endDate
+            );
         });
     });
 

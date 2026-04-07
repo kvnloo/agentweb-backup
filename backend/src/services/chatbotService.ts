@@ -16,7 +16,7 @@ import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { isTransientLLMError } from '../utils/agentModeErrors';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -636,17 +636,19 @@ export class ChatbotDB {
   }
 
   /**
-   * Atomically increment messageCount on the session record.
-   * Used for asset cache invalidation tracking.
+   * Atomically increment messageCount on the session record and update updatedAt.
+   * updatedAt is ONLY updated here so it reflects the true last-message time,
+   * not background metadata changes (scoring, title edits, share link access, etc.).
    */
   private async incrementMessageCount(sessionId: string, count: number): Promise<void> {
     try {
       await dynamodb.update({
         TableName: this.tableName,
         Key: { sessionId },
-        UpdateExpression: 'ADD messageCount :count',
+        UpdateExpression: 'ADD messageCount :count SET updatedAt = :updatedAt',
         ExpressionAttributeValues: {
           ':count': count,
+          ':updatedAt': new Date().toISOString(),
         },
       }).promise();
     } catch (error) {
@@ -1907,17 +1909,14 @@ export class ChatbotDB {
   }
 
   async archiveSession(sessionId: string): Promise<void> {
-    const timestamp = new Date().toISOString();
-    
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET archived = :archived, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":archived": true,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
     };
@@ -1960,11 +1959,10 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET pageContent = :pageContent, contextChunks = :contextChunks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+        "SET pageContent = :pageContent, contextChunks = :contextChunks, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":pageContent": pageContent,
         ":contextChunks": contextChunks,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -1995,18 +1993,14 @@ export class ChatbotDB {
     sessionId: string,
     slackThread: { channel: string; threadTs: string }
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET slackThread = :slackThread, updatedAt = :updatedAt",
+      UpdateExpression: "SET slackThread = :slackThread",
       ExpressionAttributeValues: {
         ":slackThread": slackThread,
-        ":updatedAt": timestamp,
       },
       ReturnValues: "ALL_NEW",
     };
@@ -2024,18 +2018,14 @@ export class ChatbotDB {
     sessionId: string,
     title: string
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET title = :title, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET title = :title, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":title": title,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2121,18 +2111,14 @@ export class ChatbotDB {
     sessionId: string,
     portalType: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
       sessionId,
       },
-      UpdateExpression:
-        "SET portalType = :portalType, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET portalType = :portalType, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":portalType": portalType,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2151,18 +2137,14 @@ export class ChatbotDB {
     sessionId: string,
     selectedStartupId: string
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET selectedStartupId = :selectedStartupId, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET selectedStartupId = :selectedStartupId, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":selectedStartupId": selectedStartupId,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2181,17 +2163,14 @@ export class ChatbotDB {
     sessionId: string,
     shareMetadata: { isShared: boolean; sharedAt?: string; expiresAt?: string }
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET shareMetadata = :shareMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET shareMetadata = :shareMetadata, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":shareMetadata": shareMetadata,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2210,8 +2189,6 @@ export class ChatbotDB {
     sessionId: string,
     newUserId: string
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     // First, get the session to verify it exists
     const session = await this.getChatSession(sessionId);
     if (!session) {
@@ -2224,10 +2201,9 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET userId = :userId, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET userId = :userId, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":userId": newUserId,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2246,17 +2222,14 @@ export class ChatbotDB {
     sessionId: string,
     interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string; expiresAt?: string }
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":interactiveShareMetadata": interactiveShareMetadata,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2294,15 +2267,12 @@ export class ChatbotDB {
       }>;
     }
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: { sessionId },
-      UpdateExpression: "SET resultEndpointMetadata = :resultEndpointMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET resultEndpointMetadata = :resultEndpointMetadata, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":resultEndpointMetadata": resultEndpointMetadata,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2360,10 +2330,9 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET workPlan = :workPlan, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET workPlan = :workPlan, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":workPlan": validatedWorkPlan,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2382,18 +2351,14 @@ export class ChatbotDB {
     sessionId: string,
     gtmWorkItem: { planId: string; phaseId: string; workItemId: string }
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET gtmWorkItem = :gtmWorkItem, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET gtmWorkItem = :gtmWorkItem, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":gtmWorkItem": gtmWorkItem,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2412,18 +2377,14 @@ export class ChatbotDB {
     sessionId: string,
     llmModel: string
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET llmModel = :llmModel, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2443,15 +2404,13 @@ export class ChatbotDB {
     error: string,
     errorStack?: string
   ): Promise<void> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
       UpdateExpression:
-        "SET #error = :error, #errorStack = :errorStack, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+        "SET #error = :error, #errorStack = :errorStack, adminListPartition = :adminListPartition",
       ExpressionAttributeNames: {
         "#error": "error",
         "#errorStack": "errorStack",
@@ -2459,7 +2418,6 @@ export class ChatbotDB {
       ExpressionAttributeValues: {
         ":error": error,
         ":errorStack": errorStack || null,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
     };
@@ -2476,18 +2434,14 @@ export class ChatbotDB {
     sessionId: string,
     feedbacks: Record<string, MessageFeedback>
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET feedbacks = :feedbacks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET feedbacks = :feedbacks, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":feedbacks": feedbacks,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2506,15 +2460,12 @@ export class ChatbotDB {
     sessionId: string,
     publishStatuses: Record<string, string>
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: { sessionId },
-      UpdateExpression: "SET publishStatuses = :publishStatuses, updatedAt = :updatedAt",
+      UpdateExpression: "SET publishStatuses = :publishStatuses",
       ExpressionAttributeValues: {
         ":publishStatuses": publishStatuses,
-        ":updatedAt": timestamp,
       },
       ReturnValues: "ALL_NEW" as const,
     };
@@ -2536,18 +2487,14 @@ export class ChatbotDB {
       lastOutboundEmailId?: string;
     }
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET emailMetadata = :emailMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET emailMetadata = :emailMetadata, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":emailMetadata": metadata,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2566,8 +2513,6 @@ export class ChatbotDB {
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     // Get current session to retrieve existing calledFunctions
     const session = await this.getChatSession(sessionId);
     if (!session) {
@@ -2587,10 +2532,9 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": updatedCounts,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2609,8 +2553,6 @@ export class ChatbotDB {
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     // Get current session to retrieve existing failedFunctions
     const session = await this.getChatSession(sessionId);
     if (!session) {
@@ -2630,10 +2572,9 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET failedFunctions = :failedFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET failedFunctions = :failedFunctions, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":failedFunctions": updatedCounts,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2652,8 +2593,6 @@ export class ChatbotDB {
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     // Get current session to retrieve existing calledFunctions
     const session = await this.getChatSession(sessionId);
     if (!session) {
@@ -2673,10 +2612,9 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": updatedCounts,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2695,17 +2633,14 @@ export class ChatbotDB {
     sessionId: string,
     calledFunctions: Record<string, number>
   ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": calledFunctions,
-        ":updatedAt": timestamp,
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -2830,9 +2765,16 @@ export class ChatbotDB {
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
+        // Filter by createdAt to exclude sessions that were created outside the time range
+        // but had their updatedAt bumped into the range (e.g., by satisfaction scoring).
+        const filtered = accumulated.filter((s) => {
+          if (!s.createdAt) return true;
+          return s.createdAt >= timeRange.startTime && s.createdAt <= timeRange.endTime;
+        });
+
         return {
-          sessions: accumulated.slice(0, limit),
-          lastEvaluatedKey: accumulated.length > limit ? undefined : undefined,
+          sessions: filtered.slice(0, limit),
+          lastEvaluatedKey: undefined,
         };
       } catch (error) {
         console.error("Error getting chat sessions by time range:", error);
@@ -3230,6 +3172,7 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
 
 // Cache for Emma system context (60s TTL)
 let cachedSystemContext: { value: string; expiry: number } | null = null;
+let emmaToolsLoaded = false;
 
 // Exported for testing only — not part of the public API
 export function __resetEmmaSystemContextCache(): void {
@@ -3566,36 +3509,14 @@ export async function generateChatResponse(
     const timestamp = new Date().toISOString();
 
     // Upload screenshot to S3 if provided
-    let uploadedScreenshotUrl = screenshot;
+    let uploadedScreenshotUrl: string | undefined = screenshot?.startsWith('data:image') ? undefined : screenshot;
     let attachments: any[] | undefined;
-    
+
     if (screenshot && screenshot.startsWith('data:image')) {
-      try {
-        const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, "");
-        const buffer = Buffer.from(base64Data, 'base64');
-        const uploadResult = await uploadFileToS3(
-          buffer,
-          `screenshot-${Date.now()}.jpg`,
-          userId || 'anonymous',
-          'image/jpeg'
-        );
-        if (uploadResult.success && uploadResult.url) {
-          uploadedScreenshotUrl = uploadResult.url;
-          attachments = [{
-            url: uploadResult.url,
-            filename: 'screenshot.jpg',
-            size: buffer.length,
-            mimetype: 'image/jpeg',
-            uploadedAt: timestamp
-          }];
-        } else {
-          // Upload did not return a URL — don't send raw base64 to the LLM
-          uploadedScreenshotUrl = undefined;
-        }
-      } catch (err) {
-        console.error('Failed to upload screenshot to S3:', err);
-        // Don't send raw base64 to the LLM on upload failure
-        uploadedScreenshotUrl = undefined;
+      const result = await uploadScreenshotToS3(screenshot, userId || 'anonymous');
+      if (result) {
+        uploadedScreenshotUrl = result.url;
+        attachments = [{ ...result.attachment, uploadedAt: timestamp }];
       }
     }
 
@@ -3643,7 +3564,7 @@ export async function generateChatResponse(
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
       if (lastUserIdx >= 0) {
         (messages[lastUserIdx] as any).content = [
-          { type: 'text', text: messages[lastUserIdx].content },
+          { type: 'text', text: `${messages[lastUserIdx].content}\n\n[Page screenshot captured. URL: ${uploadedScreenshotUrl}]` },
           { type: 'image_url', image_url: { url: uploadedScreenshotUrl, detail: 'low' } }
         ];
       }
@@ -3765,6 +3686,8 @@ export async function generateChatResponse(
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
+          'get_temp_email', 'check_temp_inbox',
+          'get_test_account', 'save_test_account', 'list_test_accounts',
         ]);
 
         // Page-aware tool injection based on the current page URL
@@ -3796,6 +3719,12 @@ export async function generateChatResponse(
           pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
         }
 
+        if (!emmaToolsLoaded) {
+          await import('../emma/tools');
+          await import('../emma/tempEmailTools');
+          await import('../emma/testAccountTools');
+          emmaToolsLoaded = true;
+        }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
 

@@ -45,6 +45,10 @@ jest.mock("../services/waitlistDb", () => ({
   },
 }));
 
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: {},
+}));
+
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -199,6 +203,7 @@ describe("Admin CRM sync routes", () => {
       settingValue: JSON.stringify({
         listId: "list-1",
         lastSyncAt: "2026-02-10T00:00:00.000Z",
+        autoSync: true,
       }),
     } as any);
     mockCrmDb.getLeadListById.mockResolvedValue({
@@ -244,6 +249,10 @@ describe("Admin CRM sync routes", () => {
       expect.arrayContaining([
         expect.objectContaining({
           email: "new@example.com",
+          customFields: expect.objectContaining({
+            brandGuidelinesCompletedAt: "",
+            chatSessionCount: 0
+          })
         }),
       ])
     );
@@ -252,6 +261,12 @@ describe("Admin CRM sync routes", () => {
     expect(res.body.errorCount).toBe(0);
     expect(typeof res.body.lastSyncAt).toBe("string");
     expect(mockSettingsService.setSetting).toHaveBeenCalledTimes(1);
+    expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+      "admin_crm_sync_users",
+      expect.stringContaining('"autoSync":true'),
+      expect.any(String),
+      expect.any(String)
+    );
   });
 
   it("POST /api/admin/crm-sync/:source/start does not update lastSyncAt when sync has errors", async () => {

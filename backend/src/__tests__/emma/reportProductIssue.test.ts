@@ -200,7 +200,7 @@ describe('report_product_issues tool', () => {
 
     expect(mockResendSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: 'founders@agentweb.pro',
+        to: ['founders@agentweb.pro'],
         subject: expect.stringContaining('Product Issue from customer@example.com'),
         replyTo: 'customer@example.com',
       })

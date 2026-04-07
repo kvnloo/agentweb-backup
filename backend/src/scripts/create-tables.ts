@@ -1728,6 +1728,81 @@ const createBrowserCookiesTable = async () => {
   }
 };
 
+// Create Payment History table (audit trail for Stripe payment events)
+const createPaymentHistoryTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-PaymentHistory`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'timestamp', AttributeType: 'S' },
+      { AttributeName: 'stripeInvoiceId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'timestamp', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StripeInvoiceIndex',
+        KeySchema: [
+          { AttributeName: 'stripeInvoiceId', KeyType: 'HASH' },
+        ],
+        Projection: {
+          ProjectionType: 'ALL',
+        },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createTempEmailsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TempEmails`,
+    AttributeDefinitions: [
+      { AttributeName: 'emailId', AttributeType: 'S' },
+      { AttributeName: 'toAddress', AttributeType: 'S' },
+      { AttributeName: 'receivedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'emailId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'ToAddressIndex',
+        KeySchema: [
+          { AttributeName: 'toAddress', KeyType: 'HASH' },
+          { AttributeName: 'receivedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1768,6 +1843,9 @@ const main = async () => {
     await createBrowserCookiesTable();
     await createOrganizationsTable();
     await createScheduleTemplatesTable();
+    await createPaymentHistoryTable();
+    await createTempEmailsTable();
+    await createTestAccountsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -1889,6 +1967,54 @@ const createScheduleTemplatesTable = async () => {
         KeySchema: [
           { AttributeName: 'visibility', KeyType: 'HASH' },
           { AttributeName: 'category', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Test Accounts table (per-user saved credentials for testing client websites)
+const createTestAccountsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TestAccounts`,
+    AttributeDefinitions: [
+      { AttributeName: 'accountId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'domain', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'accountId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        // Look up all accounts for a user, sorted by creation time
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        // Look up accounts for a user by domain (for get-or-create flow)
+        IndexName: 'UserIdDomainIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'domain', KeyType: 'RANGE' },
         ],
         Projection: { ProjectionType: 'ALL' },
       },

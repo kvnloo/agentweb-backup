@@ -177,11 +177,12 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
-- send-message: Send a direct message. Requires profile_url or provider_id. message required.
+- send-message: Send a direct message. Requires profile_url or provider_id. message required. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+- update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 
-For target person identification (send-invite, send-message, get-profile), pass EITHER:
+For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
 - provider_id: the Unipile provider_id directly if you already have it`,
     inputSchema: {
@@ -189,7 +190,7 @@ For target person identification (send-invite, send-message, get-profile), pass 
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'update-conversation-history'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -198,15 +199,23 @@ For target person identification (send-invite, send-message, get-profile), pass 
         },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message. Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id.'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url.'
         },
         message: {
           type: 'string',
           description: 'Message content. Required for send-message; recommended for send-invite.'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate.'
         },
         keywords: {
           type: 'string',
@@ -244,7 +253,7 @@ For target person identification (send-invite, send-message, get-profile), pass 
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    const targetActions = ['send-invite', 'send-message', 'get-profile'];
+    const targetActions = ['send-invite', 'send-message', 'get-profile', 'update-conversation-history'];
     if (targetActions.includes(args.action)) {
       if (!args.profile_url && !args.provider_id) {
         return { success: false, message: 'Either profile_url or provider_id is required.' };
@@ -3207,20 +3216,36 @@ emmaToolRegistry.register({
   name: 'load_connected_account_metrics',
   definition: {
     name: 'load_connected_account_metrics',
-    description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement).',
+    description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement). Optionally filter by a date range using start_date and end_date. Note: YouTube metrics are always lifetime totals and are not affected by the date range.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: {
           type: 'string',
           description: 'The unique identifier (id) of the connected account to load metrics for'
+        },
+        start_date: {
+          type: 'string',
+          description: 'Optional start date for metrics in ISO 8601 format (e.g. "2024-01-01"). Both start_date and end_date must be provided together — specifying only one has no effect.'
+        },
+        end_date: {
+          type: 'string',
+          description: 'Optional end date for metrics in ISO 8601 format (e.g. "2024-01-31"). Both start_date and end_date must be provided together — specifying only one has no effect.'
         }
       },
       required: ['account_id']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id);
+    const parseDate = (val: string | undefined): Date | undefined => {
+      if (!val) return undefined;
+      const d = new Date(val);
+      if (isNaN(d.getTime())) throw new Error(`Invalid date: "${val}"`);
+      return d;
+    };
+    const startDate = parseDate(args.start_date);
+    const endDate = parseDate(args.end_date);
+    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id, startDate, endDate);
   }
 });
 
@@ -3594,7 +3619,7 @@ emmaToolRegistry.register({
   name: "describe_image",
   definition: {
     name: "describe_image",
-    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image or when you need to understand visual content.',
+    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files.',
     inputSchema: {
       type: "object",
       properties: {
@@ -3620,7 +3645,7 @@ emmaToolRegistry.register({
   name: "describe_video",
   definition: {
     name: "describe_video",
-    description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video or when you need to understand video content.',
+    description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video, asks to "read" a video, or when you need to understand video content (mp4, mov, avi, webm, mkv, etc.). Always prefer this over read_file_content for video files.',
     inputSchema: {
       type: "object",
       properties: {
@@ -4042,7 +4067,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Returns the raw text content for analysis.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -4949,7 +4974,13 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'read_user_guide_structure',
+  'update_user_guide_block',
+  'append_to_user_guide',
+  'delete_user_guide_block',
   'get_pr_digest',
+  'freeze_user_account',
+  'manage_scoring_judges',
 ];
 
 for (const toolName of bridgedToolNames) {
@@ -4970,7 +5001,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5302,6 +5333,10 @@ emmaToolRegistry.register({
 
     const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
 
+    // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
+    const { settingsService } = await import('../services/settingsService');
+    const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+
     for (const issue of args.issues) {
       try {
         const issueContext: Record<string, any> = {
@@ -5326,10 +5361,9 @@ emmaToolRegistry.register({
           result.notionUrl
         );
 
-        // Send support email to founders (reuses Get Support pattern)
         await resendService.sendEmail({
           from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-          to: 'founders@agentweb.pro',
+          to: productIssueEmails,
           subject: `Product Issue from ${user.email}: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">

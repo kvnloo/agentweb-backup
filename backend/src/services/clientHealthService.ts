@@ -57,6 +57,9 @@ interface ClientSummary {
   has_lander: boolean;
   has_crm: boolean;
   last_activity: string | null;
+  signup_time: string | null;
+  token_usage_current?: { month: string; totalTokens: number; totalCost: number } | null;
+  token_usage_history?: Array<{ month: string; totalTokens: number; totalCost: number }>;
 }
 
 /**
@@ -364,6 +367,11 @@ export async function listAllClients(callerUserId: string): Promise<any> {
           has_lander: hasLander,
           has_crm: hasCrm,
           last_activity: user.lastLoginTime || null,
+          signup_time: user.createdAt || null,
+          token_usage_current: user.tokenUsage
+            ? { month: user.tokenUsage.month, totalTokens: user.tokenUsage.totalTokens, totalCost: user.tokenUsage.totalCost }
+            : null,
+          token_usage_history: user.tokenUsageHistory || [],
         };
       })
     );

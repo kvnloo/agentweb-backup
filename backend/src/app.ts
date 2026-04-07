@@ -64,6 +64,7 @@ import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
+import testAccountsRoutes from "./routes/testAccounts";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -85,7 +86,10 @@ const app = express();
 setupMcpServer(app);
 
 // Initialize MCP OAuth 2.1 routes (well-known, register, authorize, token)
-setupMcpOAuth(app);
+// NOTE: setupMcpOAuth used to be called here, before the CORS middleware and
+// body parsers. That broke browser-driven OAuth consent because the MCP OAuth
+// routes were never wrapped in CORS headers and had to register their own
+// per-route body parsers. Moved below, after the global CORS and body parsers.
 
 // CORS configuration
 const corsOptions = {
@@ -177,6 +181,13 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
 
+// MCP OAuth 2.1 routes. Registered AFTER the CORS middleware and body parsers
+// so the consent page (served from the customer portal origin) can POST to
+// /oauth/authorize/decision without being blocked, and so the decision +
+// token endpoints inherit the global JSON + urlencoded body parsers instead
+// of re-registering their own.
+setupMcpOAuth(app);
+
 // Create a new router for file-related routes
 const fileRoutes = express.Router();
 fileRoutes.get("/content", authenticateToken, getFileContent);
@@ -245,6 +256,7 @@ app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
+app.use("/api/test-accounts", testAccountsRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);

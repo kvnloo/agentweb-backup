@@ -4,6 +4,9 @@ import {
   LinkedInPost,
   LinkedInAclResponse,
   LinkedInFollowerStatistics,
+  LinkedInFollowerGainStatistics,
+  LinkedInFollowerStatisticsResult,
+  AggregatedMetrics,
   LinkedInPageStatistics,
   LinkedInShareStatistics,
   LinkedInPaginatedResponse
@@ -310,15 +313,18 @@ export class LinkedInService {
    * Analytics: Get follower statistics for an organization
    * Note: LinkedIn requires URL-encoded URNs and FINDER header
    */
-  async getFollowerStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInFollowerStatistics[]> {
+  async getFollowerStatistics(accessToken: string, organizationUrn: string, startDate?: Date, endDate?: Date): Promise<LinkedInFollowerStatisticsResult> {
     return this.safeRequest(async () => {
-
-
       const encodedUrn = encodeURIComponent(organizationUrn);
-      const queryString = `q=organizationalEntity&organizationalEntity=${encodedUrn}`;
+      let queryString = `q=organizationalEntity&organizationalEntity=${encodedUrn}`;
 
+      if (startDate && endDate) {
+        const start = startDate.getTime();
+        const end = endDate.getTime();
+        queryString += `&timeIntervals=(timeRange:(start:${start},end:${end}),timeGranularityType:DAY)`;
+      }
 
-      const response = await this.client.get<{ elements: LinkedInFollowerStatistics[] }>(
+      const response = await this.client.get<{ elements: LinkedInFollowerStatisticsResult }>(
         `/rest/organizationalEntityFollowerStatistics?${queryString}`,
         {
           headers: {
@@ -338,13 +344,16 @@ export class LinkedInService {
    * Analytics: Get page statistics for an organization urn:li:organization:{PAGE_URN_ID}
    * Note: LinkedIn requires URL-encoded URNs and FINDER header
    */
-  async getPageStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInPageStatistics[]> {
+  async getPageStatistics(accessToken: string, organizationUrn: string, startDate?: Date, endDate?: Date): Promise<LinkedInPageStatistics[]> {
     return this.safeRequest(async () => {
-
-
       const encodedUrn = encodeURIComponent(organizationUrn);
-      const queryString = `q=organization&organization=${encodedUrn}`;
+      let queryString = `q=organization&organization=${encodedUrn}`;
 
+      if (startDate && endDate) {
+        const start = startDate.getTime();
+        const end = endDate.getTime();
+        queryString += `&timeIntervals=(timeRange:(start:${start},end:${end}),timeGranularityType:DAY)`;
+      }
 
       const response = await this.client.get<{ elements: LinkedInPageStatistics[] }>(
         `/rest/organizationPageStatistics?${queryString}`,
@@ -367,10 +376,11 @@ export class LinkedInService {
   async getShareStatistics(
     accessToken: string,
     organizationUrn: string,
-    shareUrns?: string[]
+    shareUrns?: string[],
+    startDate?: Date,
+    endDate?: Date
   ): Promise<LinkedInShareStatistics[]> {
     return this.safeRequest(async () => {
-
 
       // Build URL manually to ensure proper encoding
       const encodedOrgUrn = encodeURIComponent(organizationUrn);
@@ -381,7 +391,11 @@ export class LinkedInService {
         queryString += `&shares=List(${encodedShares})`;
       }
 
-
+      if (startDate && endDate) {
+        const start = startDate.getTime();
+        const end = endDate.getTime();
+        queryString += `&timeIntervals=(timeRange:(start:${start},end:${end}),timeGranularityType:DAY)`;
+      }
 
       const response = await this.client.get<{ elements: LinkedInShareStatistics[] }>(
         `/rest/organizationalEntityShareStatistics?${queryString}`,
@@ -392,7 +406,6 @@ export class LinkedInService {
           }
         }
       );
-
 
       return response.data.elements;
     });
@@ -889,15 +902,23 @@ export class LinkedInService {
   /**
    * Aggregated Analytics: Get follower, page, and share statistics for an organization
    */
-  async getAggregatedMetrics(accessToken: string, organizationUrn: string): Promise<any> {
-    const [followerStats, pageStats, shareStats] = await Promise.all([
-      this.getFollowerStatistics(accessToken, organizationUrn),
-      this.getPageStatistics(accessToken, organizationUrn),
-      this.getShareStatistics(accessToken, organizationUrn)
+  async getAggregatedMetrics(accessToken: string, organizationUrn: string, startDate?: Date, endDate?: Date): Promise<AggregatedMetrics> {
+    const [followerCount, followerStats, pageStats, shareStats] = await Promise.all([
+      this.getOrganizationFollowerCount(accessToken, organizationUrn),
+      this.getFollowerStatistics(accessToken, organizationUrn, startDate, endDate),
+      this.getPageStatistics(accessToken, organizationUrn, startDate, endDate),
+      this.getShareStatistics(accessToken, organizationUrn, undefined, startDate, endDate)
     ]);
 
+    const isGainResult = (stats: LinkedInFollowerStatisticsResult): stats is LinkedInFollowerGainStatistics[] =>
+      stats.length > 0 && 'followerGains' in stats[0];
+
+    const isGain = isGainResult(followerStats);
+
     return {
-      followerStatistics: followerStats,
+      totalFollowerCount: followerCount,
+      followerStatistics: isGain ? [] : followerStats as LinkedInFollowerStatistics[],
+      followerGains: isGain ? followerStats : undefined,
       pageStatistics: pageStats,
       shareStatistics: shareStats
     };

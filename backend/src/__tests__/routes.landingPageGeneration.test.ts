@@ -58,6 +58,12 @@ jest.mock("../services/db", () => ({
   },
 }));
 
+// Mock customDomainService
+const mockListDomainsForPages = jest.fn();
+jest.mock("../services/customDomainService", () => ({
+  listDomains: (...args: any[]) => mockListDomainsForPages(...args),
+}));
+
 // Mock the v0Service module (service-level mock for route tests)
 const mockGenerateLandingPage = jest.fn();
 const mockDeployLandingPage = jest.fn();
@@ -97,6 +103,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockGetUserById.mockResolvedValue(null);
   mockListLandingPages.mockResolvedValue([]);
+  mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
   _resetRateLimitState();
 });
@@ -426,6 +433,76 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.pages).toHaveLength(2);
+  });
+
+  it("FAIL: page with vercelProjectId but no customDomainUrl → enriched from AW-CustomDomains", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://mysite.agentwebforms.com");
+  });
+
+  it("FAIL: multiple domains for same project → uses most recent one", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "old.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
+      { id: "dom-2", domain: "new.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://new.agentwebforms.com");
+  });
+
+  it("FAIL: page already has customDomainUrl → not overwritten by domain lookup", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", customDomainUrl: "https://existing.agentwebforms.com", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "other.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://existing.agentwebforms.com");
+  });
+
+  it("FAIL: domain lookup fails → still returns pages without crash", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockRejectedValueOnce(new Error("DynamoDB error"));
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages).toHaveLength(1);
+    expect(res.body.pages[0].customDomainUrl).toBeUndefined();
+  });
+
+  it("FAIL: page with no vercelProjectId → customDomainUrl not populated", async () => {
+    mockListLandingPages.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", status: "draft" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBeUndefined();
   });
 });
 

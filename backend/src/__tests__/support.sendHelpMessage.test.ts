@@ -57,7 +57,7 @@ describe('POST /api/support/send-help-message', () => {
     expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
     expect(resendService.sendEmail).toHaveBeenCalledWith({
       from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-      to: 'founders@agentweb.pro',
+      to: ['founders@agentweb.pro'],
       subject: 'Help Request from customer@example.com',
       html: expect.stringContaining('I need help with my account'),
       replyTo: 'customer@example.com',

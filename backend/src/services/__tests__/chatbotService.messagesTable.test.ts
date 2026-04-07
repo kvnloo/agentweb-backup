@@ -158,8 +158,8 @@ describe('ChatbotDB - Messages Table', () => {
 
       // Verify messageCount was set during migration for asset cache tracking
       expect(mockDocClient.update).toHaveBeenCalledWith(expect.objectContaining({
-        UpdateExpression: 'ADD messageCount :count',
-        ExpressionAttributeValues: { ':count': 2 },
+        UpdateExpression: 'ADD messageCount :count SET updatedAt = :updatedAt',
+        ExpressionAttributeValues: expect.objectContaining({ ':count': 2 }),
       }));
 
       // Verify result has messages from session (migrated)
@@ -321,7 +321,7 @@ describe('ChatbotDB - Messages Table', () => {
       // Verify session table was only updated for messageCount increment (not messages)
       expect(mockDocClient.update).toHaveBeenCalledTimes(1);
       expect(mockDocClient.update).toHaveBeenCalledWith(expect.objectContaining({
-        UpdateExpression: 'ADD messageCount :count',
+        UpdateExpression: 'ADD messageCount :count SET updatedAt = :updatedAt',
       }));
 
       // Verify result includes the new message
@@ -451,7 +451,7 @@ describe('ChatbotDB - Messages Table', () => {
       // Verify session table was only updated for messageCount increment (not messages)
       expect(mockDocClient.update).toHaveBeenCalledTimes(1);
       expect(mockDocClient.update).toHaveBeenCalledWith(expect.objectContaining({
-        UpdateExpression: 'ADD messageCount :count',
+        UpdateExpression: 'ADD messageCount :count SET updatedAt = :updatedAt',
       }));
 
       // Verify result includes the new messages

@@ -266,7 +266,15 @@ router.get('/connected-account-posts', async (req: Request, res: Response) => {
 router.get('/connected-account-metrics', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.loadConnectedAccountMetrics(userId(req), req.query.account_id as string);
+    const parseDate = (val: string | undefined): Date | undefined => {
+      if (!val) return undefined;
+      const d = new Date(val);
+      if (isNaN(d.getTime())) throw new Error(`Invalid date: "${val}"`);
+      return d;
+    };
+    const startDate = parseDate(req.query.start_date as string | undefined);
+    const endDate = parseDate(req.query.end_date as string | undefined);
+    const result = await svc.loadConnectedAccountMetrics(userId(req), req.query.account_id as string, startDate, endDate);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

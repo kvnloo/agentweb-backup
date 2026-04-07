@@ -499,6 +499,8 @@ async function processQueue() {
     lastPromptTime = new Date();
 
     try {
+      await updateNotionStatus(notionPageId, "In progress");
+
       // Fetch and download any attachments from the Notion page
       const attachments = await fetchNotionAttachments(notionPageId);
       const downloadedPaths = await downloadAttachments(attachments);
@@ -508,12 +510,21 @@ async function processQueue() {
         enrichedPrompt += `\n\nIMPORTANT: The following screenshot/image attachments from the Notion page have been downloaded. You MUST use the Read tool to view each image file BEFORE starting any work — these contain critical visual context for the task:\n${downloadedPaths.map((p) => `- ${p}`).join("\n")}`;
       }
 
+      // Prepend conversation history so Claude has context even after a session reset
+      const conversationLog = readConversationLog();
+      if (conversationLog.trim()) {
+        enrichedPrompt = `=== Previous conversation context (for continuity) ===\n${conversationLog.trim()}\n\n=== Current request ===\n${enrichedPrompt}`;
+      }
+
       const output = await runClaude(enrichedPrompt);
       lastResponseTime = new Date();
 
       // Check for retry directive: [RELAY_RETRY_AFTER:<seconds>]
       const retryMatch = output.match(/\[RELAY_RETRY_AFTER:(\d+)\]/);
       const cleanedOutput = output.replace(/\[RELAY_RETRY_AFTER:\d+\]/g, "").trim();
+
+      // Persist this turn so future sessions have context
+      appendToConversationLog(prompt, cleanedOutput);
 
       // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
       const truncated = cleanedOutput.length > 10000
@@ -541,10 +552,15 @@ async function processQueue() {
         }, delaySec * 1000);
       }
 
-      // If this was a deploy prompt, set status to Done to trigger teardown
-      if (prompt === "Prep for deploy") {
-        const isProduction = (process.env.NODE_ENV || "") === "production";
-        await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+      // Update status when Claude is done (not waiting for retry)
+      if (!retryMatch) {
+        if (prompt === "Prep for deploy") {
+          // Deploy prompt triggers teardown via Done status
+          const isProduction = (process.env.NODE_ENV || "") === "production";
+          await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+        } else {
+          await updateNotionStatus(notionPageId, "In Review");
+        }
       }
     } catch (err) {
       console.error(`[relay] Error processing prompt:`, err);
@@ -592,6 +608,43 @@ function stripAnsiAndControlCodes(text) {
 
 const COST_FILE = "/home/ec2-user/agentweb/.claude-total-cost";
 
+// ---------------------------------------------------------------------------
+// Conversation log — persists Q&A turns across sessions so Claude has context
+// even after a session reset (--continue doesn't reliably restore history)
+// ---------------------------------------------------------------------------
+const CONVERSATION_LOG_FILE = "/home/ec2-user/agentweb/.claude-conversation-log";
+const MAX_CONVERSATION_LOG_CHARS = 15000; // ~4k tokens, well within context window
+const MAX_RESPONSE_IN_LOG_CHARS = 1500;   // keep responses concise in the log
+
+function readConversationLog() {
+  try {
+    return fs.readFileSync(CONVERSATION_LOG_FILE, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+function appendToConversationLog(prompt, response) {
+  try {
+    const existing = readConversationLog();
+    const truncatedResponse = response.length > MAX_RESPONSE_IN_LOG_CHARS
+      ? response.slice(0, MAX_RESPONSE_IN_LOG_CHARS) + "...(truncated)"
+      : response;
+    const entry = `\n[User]: ${prompt.slice(0, 500)}\n[Claude]: ${truncatedResponse}\n`;
+    let updated = existing + entry;
+    // Trim oldest entries if log grows too large
+    if (updated.length > MAX_CONVERSATION_LOG_CHARS) {
+      updated = updated.slice(updated.length - MAX_CONVERSATION_LOG_CHARS);
+      // Snap to the start of the first complete turn to avoid cutting mid-entry
+      const firstTurn = updated.indexOf("\n[User]:");
+      if (firstTurn > 0) updated = updated.slice(firstTurn);
+    }
+    fs.writeFileSync(CONVERSATION_LOG_FILE, updated);
+  } catch (err) {
+    console.error("[relay] Failed to write conversation log:", err);
+  }
+}
+
 function formatUsageLine(data) {
   try {
     const cost = data.total_cost_usd || 0;
@@ -632,13 +685,21 @@ function formatUsageLine(data) {
   }
 }
 
+const SESSION_ID_FILE = "/home/ec2-user/agentweb/.claude-session-id";
+
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
     // Escape single quotes in prompt for shell
     const escaped = prompt.replace(/'/g, "'\\''");
+    // Use --resume <id> to continue the exact same session; fall back to --continue
+    let resumeFlag = "--continue";
+    try {
+      const sessionId = fs.readFileSync(SESSION_ID_FILE, "utf-8").trim();
+      if (sessionId) resumeFlag = `--resume ${sessionId}`;
+    } catch {}
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
@@ -657,6 +718,10 @@ function runClaude(prompt) {
       // Try to parse JSON output for result text + usage
       try {
         const data = JSON.parse(stdout);
+        // Persist session ID so future relay calls resume the same session
+        if (data.session_id) {
+          try { fs.writeFileSync(SESSION_ID_FILE, data.session_id, "utf-8"); } catch {}
+        }
         let text = data.result || "(no output)";
         const usageLine = formatUsageLine(data);
         if (usageLine) text += `\n\n---\n${usageLine}`;

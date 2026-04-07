@@ -145,6 +145,7 @@ router.post(
         keyMessages,
         brandName,
         tagline,
+        domain,
         brandValues,
         targetAudience,
         brandPersonality,
@@ -301,6 +302,7 @@ router.post(
           // Only update fields that are provided, preserve existing data for missing fields
           brandName: brandName !== undefined ? brandName : (existingBrandGuidelines?.brandData?.brandName || ""),
           tagline: tagline !== undefined ? tagline : (existingBrandGuidelines?.brandData?.tagline || ""),
+          domain: domain !== undefined ? domain : (existingBrandGuidelines?.brandData?.domain || ""),
           primaryColor: primaryColor !== undefined ? primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
           primaryColorEnd: primaryColorEnd !== undefined ? primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
           secondaryColor: secondaryColor !== undefined ? secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),

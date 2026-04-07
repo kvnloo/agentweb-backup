@@ -6,6 +6,51 @@ import {
   getThreadReplies,
   postSlackMessage,
 } from '../services/slackService';
+import { userDb } from '../services/db';
+
+const NO_SLACK_CHANNEL_ERROR = 'No Slack channel is configured for your account. Ask your admin to set one up.';
+const NO_CHANNEL_SPECIFIED_ERROR = 'You have multiple Slack channels configured. Specify which channel to use via channel_id or channel_name.';
+
+// Returns the list of allowed channel IDs for a non-admin user (supports slackChannels array + legacy slackChannel).
+function getUserAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string }): string[] {
+  if (user.slackChannels && user.slackChannels.length > 0) return user.slackChannels;
+  if (user.slackChannel) return [user.slackChannel];
+  return [];
+}
+
+// Returns the channel ID to use for a tool call.
+// Regular users are scoped to their configured slackChannels; admins can target any channel.
+async function resolveChannelForUser(
+  args: { channel_id?: string; channel_name?: string },
+  context: { userId?: string }
+): Promise<{ id: string } | { error: string }> {
+  if (context.userId) {
+    const user = await userDb.getUserById(context.userId);
+    if (!user?.isAdmin) {
+      const allowed = getUserAllowedChannels(user ?? {});
+      if (allowed.length === 0) {
+        return { error: NO_SLACK_CHANNEL_ERROR };
+      }
+      if (allowed.length === 1) {
+        // Single channel — use it automatically
+        return { id: allowed[0] };
+      }
+      // Multiple channels — require the caller to specify one
+      if (!args.channel_id && !args.channel_name) {
+        return { error: NO_CHANNEL_SPECIFIED_ERROR };
+      }
+      const resolved = await resolveChannelId(args.channel_id, args.channel_name);
+      if ('error' in resolved) return resolved;
+      if (!allowed.includes(resolved.id)) {
+        return { error: `Channel is not in your configured Slack channels. Allowed channels: ${allowed.join(', ')}.` };
+      }
+      return resolved;
+    }
+  }
+
+  // Admin (or no userId context): resolve from args as before
+  return resolveChannelId(args.channel_id, args.channel_name);
+}
 
 // conversations.replies includes the parent as the first item; skip it to return only replies.
 function formatReplies(messages: SlackMessage[]): Array<{ ts: string; author: string; text: string }> {
@@ -31,13 +76,37 @@ emmaToolRegistry.register({
     name: 'slack_list_channels',
     description:
       'List all Slack channels the bot is a member of. Use this to discover available channels ' +
-      'before fetching messages or sending a message.',
+      'before fetching messages or sending a message. ' +
+      'For non-admin users, returns only the channels configured for their account.',
     inputSchema: {
       type: 'object',
       properties: {},
     },
   },
-  execute: async () => {
+  execute: async (args: any, context: any = {}) => {
+    if (context.userId) {
+      const user = await userDb.getUserById(context.userId);
+      if (!user?.isAdmin) {
+        const allowed = getUserAllowedChannels(user ?? {});
+        if (allowed.length === 0) {
+          return { success: false, error: NO_SLACK_CHANNEL_ERROR };
+        }
+        // Fetch all channels once and filter to the user's allowed set
+        const allChannels = await getSlackChannels();
+        const filtered = allChannels.filter((c) => allowed.includes(c.id));
+        // For any channel ID not found in Slack API response, return a stub so the list is complete
+        const foundIds = new Set(filtered.map((c) => c.id));
+        const stubs = allowed
+          .filter((id) => !foundIds.has(id))
+          .map((id) => ({ id, name: id, display_name: id, is_private: false }));
+        const channels = [
+          ...filtered.map((c) => ({ id: c.id, name: c.name, display_name: c.displayName, is_private: c.isPrivate })),
+          ...stubs,
+        ];
+        return { success: true, count: channels.length, channels };
+      }
+    }
+
     const channels = await getSlackChannels();
     return {
       success: true,
@@ -63,18 +132,20 @@ emmaToolRegistry.register({
       'thread replies are included automatically so you can see the full conversation in one call. ' +
       'If you only know the channel name (e.g. #sales), call this with channel_name and omit channel_id; ' +
       'if you already have the channel ID use channel_id directly. ' +
-      'Filter by time using since_hours (e.g. 24 = last 24 hours) or provide explicit oldest/latest Unix timestamps.',
+      'Filter by time using since_hours (e.g. 24 = last 24 hours) or provide explicit oldest/latest Unix timestamps. ' +
+      'For non-admin users with a single channel, channel_id and channel_name are optional — messages are fetched from their configured channel. ' +
+      'For non-admin users with multiple channels, channel_id or channel_name is required to specify which channel.',
     inputSchema: {
       type: 'object',
       properties: {
         channel_id: {
           type: 'string',
-          description: 'Slack channel ID (e.g. C012AB3CD). Use this or channel_name, not both.',
+          description: 'Slack channel ID (e.g. C012AB3CD). Use this or channel_name, not both. Ignored for non-admin users.',
         },
         channel_name: {
           type: 'string',
           description:
-            'Channel name without the # prefix (e.g. "sales"). Used to look up the channel ID automatically.',
+            'Channel name without the # prefix (e.g. "sales"). Used to look up the channel ID automatically. Ignored for non-admin users.',
         },
         since_hours: {
           type: 'number',
@@ -91,8 +162,8 @@ emmaToolRegistry.register({
       },
     },
   },
-  execute: async (args: any) => {
-    const resolved = await resolveChannelId(args.channel_id, args.channel_name);
+  execute: async (args: any, context: any = {}) => {
+    const resolved = await resolveChannelForUser(args, context);
     if ('error' in resolved) return { success: false, error: resolved.error };
 
     let oldest: string | undefined = args.oldest;
@@ -195,18 +266,20 @@ emmaToolRegistry.register({
     description:
       'Send a message to a Slack channel, or reply to an existing thread. ' +
       'Use this to respond to clients or team members on behalf of the user. ' +
-      'Always confirm with the user before sending unless they have explicitly asked you to send.',
+      'Always confirm with the user before sending unless they have explicitly asked you to send. ' +
+      'For non-admin users with a single channel, messages are automatically sent to their configured channel. ' +
+      'For non-admin users with multiple channels, channel_id or channel_name is required.',
     inputSchema: {
       type: 'object',
       properties: {
         channel_id: {
           type: 'string',
-          description: 'Slack channel ID (e.g. C012AB3CD). Use this or channel_name, not both.',
+          description: 'Slack channel ID (e.g. C012AB3CD). Use this or channel_name, not both. Ignored for non-admin users.',
         },
         channel_name: {
           type: 'string',
           description:
-            'Channel name without the # prefix (e.g. "sales"). Used to look up the channel ID automatically.',
+            'Channel name without the # prefix (e.g. "sales"). Used to look up the channel ID automatically. Ignored for non-admin users.',
         },
         text: {
           type: 'string',
@@ -222,12 +295,12 @@ emmaToolRegistry.register({
       required: ['text'],
     },
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context: any = {}) => {
     if (!args.text?.trim()) {
       return { success: false, error: 'Message text cannot be empty.' };
     }
 
-    const resolved = await resolveChannelId(args.channel_id, args.channel_name);
+    const resolved = await resolveChannelForUser(args, context);
     if ('error' in resolved) return { success: false, error: resolved.error };
 
     const result = await postSlackMessage(resolved.id, args.text.trim(), args.thread_ts);

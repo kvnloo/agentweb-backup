@@ -35,12 +35,14 @@ interface User {
   stripe_subscription_id?: string;
   subscription_status?: string; // active, trialing, past_due, canceled, canceling
   has_payment_method?: boolean;
+  subscription_amount?: number; // Most recent invoice amount paid, in cents
   current_period_end?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
-  slackChannel?: string; // Default Slack channel for this user
+  slackChannel?: string; // @deprecated — use slackChannels
+  slackChannels?: string[]; // Slack channels configured for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -55,6 +57,11 @@ interface User {
     totalCost: number;
     resetDate: string;
   };
+  tokenUsageHistory?: Array<{
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+  }>;
   tokenAllowanceBonus?: number;
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders

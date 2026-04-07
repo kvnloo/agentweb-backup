@@ -113,6 +113,29 @@ export interface LinkedInFollowerStatistics {
   }>;
 }
 
+export interface FollowerGains {
+  organicFollowerGain: number;
+  paidFollowerGain: number;
+}
+
+export interface LinkedInFollowerGainStatistics {
+  organizationalEntity: string;
+  timeRange?: { start: number; end: number };
+  followerGains: FollowerGains;
+}
+
+export type LinkedInFollowerStatisticsResult =
+  | LinkedInFollowerStatistics[]
+  | LinkedInFollowerGainStatistics[];
+
+export interface AggregatedMetrics {
+  totalFollowerCount: number;
+  followerStatistics: LinkedInFollowerStatistics[];
+  followerGains?: LinkedInFollowerGainStatistics[];
+  pageStatistics: any[];
+  shareStatistics: any[];
+}
+
 export interface PageViewMetric {
   pageViews: number;
   uniquePageViews?: number;

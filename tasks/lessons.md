@@ -95,11 +95,18 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Fix:** After stop/start, run `aws ec2 describe-instances --instance-ids <id> --query 'Reservations[0].Instances[0].PublicIpAddress'` to get the new IP
   - **Date:** 2026-04-01
 
-### Claude tmux Session Doesn't Auto-Restart After Stop/Start
-- **Lesson:** The Claude tmux session is started by user-data at launch time only — it does NOT restart on stop/start
+### ALL Cloud Env Services Don't Auto-Restart After Stop/Start
+- **Lesson:** ALL 5 tmux services are started by user-data at first boot only — NONE restart on stop/start
   - **Why:** cloud-init user-data only runs once (at first boot). Stop/start only re-runs lightweight cloud-init phases (config/final), not the full user-data script.
-  - **Fix:** After stop/start, SSH in and manually restart: `tmux new-session -d -s claude /home/ec2-user/agentweb/.claude-run.sh`
-  - **Date:** 2026-04-01
+  - **Services:** `backend`, `partner-portal`, `customer-portal`, `test-env-access`, `claude` — all 5 must be manually started
+  - **Also:** The public IP changes on stop/start — must update `.env`, `.env.local` files AND Notion page IP field
+  - **Fix after stop/start:**
+    1. Get new IP: `aws ec2 describe-instances --instance-ids <id> --query 'Reservations[0].Instances[0].PublicIpAddress'`
+    2. Update `.env` files with new IP (use sudo for `.env.local` files, they're root-owned)
+    3. Start all 5 sessions: backend, partner-portal, customer-portal, test-env-access, claude
+    4. Update Notion Public IP field
+  - **Monitoring service:** `test-env-access` is the one that polls Notion for new comments and re-triggers Claude. If it's not running, new comments won't be processed.
+  - **Date:** 2026-04-02
 
 ## Code Patterns
 

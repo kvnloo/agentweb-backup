@@ -327,6 +327,38 @@ class EmailEventsDb {
     return event !== null;
   }
 
+  /**
+   * Upsert a LinkedIn message as an engagement event.
+   * Uses 'linkedin_msg_{messageId}' as eventId for idempotent upserts.
+   * emailDomain should be 'linkedin-{listId}', leadEmail should be the normalized LinkedIn profile URL.
+   */
+  async addLinkedInMessageEvent(params: {
+    eventId: string;
+    emailDomain: string;
+    leadEmail: string;
+    eventType: 'linkedin.message.sent' | 'linkedin.message.received';
+    text: string | null;
+    timestamp: string;
+    senderId: string;
+    messageProviderId: string;
+  }): Promise<void> {
+    const item = {
+      eventId: params.eventId,
+      emailId: params.messageProviderId,
+      emailDomain: params.emailDomain,
+      eventType: params.eventType,
+      createdAt: params.timestamp,
+      processedAt: new Date().toISOString(),
+      leadEmail: params.leadEmail,
+      data: {
+        text: params.text,
+        sender_id: params.senderId,
+      } as any,
+    };
+
+    await dynamodb.put({ TableName: TABLE_NAME, Item: item }).promise();
+  }
+
 }
 
 export const emailEventsDb = new EmailEventsDb();

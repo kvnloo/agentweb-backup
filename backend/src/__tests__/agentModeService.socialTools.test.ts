@@ -383,7 +383,7 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:organization:123456'
       );
 
-      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(mockLinkedInAccount);
+      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(mockLinkedInAccount, 'user-123', undefined, undefined);
       expect(result.success).toBe(true);
       expect(result.metrics).toBeDefined();
       expect(result.metrics.followers).toBeDefined();
