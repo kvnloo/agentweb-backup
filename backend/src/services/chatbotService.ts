@@ -3120,7 +3120,8 @@ Always call the read tool first before updating to get current values.
 
 **Books:** **list_books**, **create_book**, **update_book_content**
 
-**Email Templates:** **list_html_templates**, **create_html_from_template**, **update_html_file**
+**Templates (Email & Landing Pages):** **list_html_templates**, **create_html_from_template**, **update_html_file**
+- Templates are reusable for both email campaigns and landing pages — do not treat them as email-only.
 
 **Visual Context:**
 - **get_visual_context**: Call this when you need to SEE the page visually (colors, layout, design). A screenshot will be captured and sent in the follow-up message.

@@ -1959,6 +1959,7 @@ export class AgentModeService {
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
+ - **Templates (Email & Landing Pages)**: Templates are reusable for both email campaigns and landing pages — do not treat them as email-only.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
 - **Meta Ads Campaigns and Metrics**:
@@ -17085,11 +17086,11 @@ Please generate a complete, professional HTML document that properly formats and
       const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
 
       // Build system prompt for HTML template creation
-      const systemPrompt = `You are an expert web developer and HTML email template designer. Your task is to create or enhance an HTML email template based on the provided HTML content and instructions.
+      const systemPrompt = `You are an expert web developer and HTML template designer. Your task is to create or enhance an HTML template (for use as an email or landing page) based on the provided HTML content and instructions.
 
 Requirements:
-- Create a well-formatted, professional HTML email template
-- Ensure the HTML is valid and follows email best practices (inline styles, table-based layouts if needed)
+- Create a well-formatted, professional HTML template suitable for use as an email or landing page
+- Ensure the HTML is valid and follows best practices appropriate to the template type (inline styles for email; standard CSS for landing pages)
 - Make the template reusable by identifying dynamic content that should be replaced with variables
 - Use the {{variable_name}} syntax for all dynamic placeholders (e.g., {{user_name}}, {{company_name}})
 
@@ -17117,16 +17118,16 @@ REQUIRED: You MUST include ALL THREE (_1, _2, _n) for EACH property in repeating
 FORBIDDEN: Do NOT use _3, _4, _5, etc. Only _1, _2, and _n are valid.
 
 Other Requirements:
-- Ensure the template is responsive and works well across email clients
-- Include appropriate styling that works in email contexts (inline CSS preferred)
+- Ensure the template is responsive
+- Include appropriate styling that fits the template type (inline CSS for email; standard CSS for landing pages)
 - Keep the original intent and structure but enhance as needed based on instructions
 - Make sure all images use absolute URLs
 - Ensure proper HTML structure with appropriate tags
 
-The HTML template should be production-ready, well-formatted, and suitable for use as an email template.`;
+The HTML template should be production-ready, well-formatted, and suitable for use as an email or landing page template.`;
 
       // Build user prompt
-      const userPrompt = `Create an email template with the following details:
+      const userPrompt = `Create a template with the following details:
 
 Template Name: ${templateName}
 Subject Line: ${subject}
@@ -17138,17 +17139,17 @@ Additional Instructions:
 ${additionalInstructions || 'None - please process the HTML and identify appropriate variables for dynamic content.'}
 
 Please:
-1. Process the HTML content and enhance it for email template usage
+1. Process the HTML content and enhance it for template usage (email or landing page)
 2. Identify dynamic content and replace with {{variable_name}} placeholders
 3. For repeating sections, use the REQUIRED three-part pattern: {{items_1_property}}, {{items_2_property}}, {{items_n_property}}
    - MUST include all three: _1, _2, and _n
    - Do NOT use _3, _4, _5, etc.
-4. Ensure email compatibility (inline styles, proper structure)
+4. Ensure appropriate compatibility (inline styles for email; standard CSS for landing pages)
 5. Keep the subject line and enhance it with variables if needed
 6. Return ONLY the final HTML content (no explanations)`;
 
       // Generate enhanced HTML template using LLMService
-      console.log('AgentMode: Generating HTML email template with Claude model');
+      console.log('AgentMode: Generating HTML template with Claude model');
       const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {

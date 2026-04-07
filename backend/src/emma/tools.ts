@@ -4202,7 +4202,7 @@ emmaToolRegistry.register({
         },
         subject: {
           type: "string",
-          description: "Email subject line (only required for email templates). Can include variables like {{user_name}}"
+          description: "Email subject line (only required for email templates; omit for landing page templates). Can include variables like {{user_name}}"
         },
         additional_instructions: {
           type: "string",
