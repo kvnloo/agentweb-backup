@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -100,6 +100,15 @@ export const INTEGRATION_CONFIG = {
     authorizationUrl: 'https://fathom.video/external/v1/oauth2/authorize',
     tokenUrl: 'https://api.fathom.ai/external/v1/oauth2/token',
     scopes: ['public_api'],
+  },
+
+  clickup: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/clickup/callback`,
+    authorizationUrl: 'https://app.clickup.com/api',
+    tokenUrl: 'https://api.clickup.com/api/v2/oauth/token',
+    // ClickUp OAuth grants access to all workspaces the user has access to;
+    // no explicit scopes are required in the authorization request.
+    scopes: [] as string[],
   },
 
   linkedinAds: {
@@ -318,6 +327,40 @@ export async function getMetaConfig(flow?: MetaFlowType): Promise<MetaConfig> {
     tokenUrl: flowCfg.tokenUrl,
     apiBaseUrl: flowCfg.apiBaseUrl
   };
+}
+
+// ClickUp configuration interface
+export interface ClickUpOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  authorizationUrl: string;
+  tokenUrl: string;
+}
+
+let cachedClickUpConfig: ClickUpOAuthConfig | null = null;
+let clickupConfigCacheExpiresAt = 0;
+const CLICKUP_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Returns ClickUp OAuth configuration.
+ * Credentials are fetched from AWS Secrets Manager (dev/AgentWeb/ClickUp or prod/...).
+ * Result is cached for 5 minutes to avoid per-request Secrets Manager calls.
+ */
+export async function getClickUpConfig(): Promise<ClickUpOAuthConfig> {
+  if (cachedClickUpConfig && Date.now() < clickupConfigCacheExpiresAt) {
+    return cachedClickUpConfig;
+  }
+  const credentials = await getClickUpCredentials();
+  cachedClickUpConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.clickup.redirectUri,
+    authorizationUrl: INTEGRATION_CONFIG.clickup.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.clickup.tokenUrl,
+  };
+  clickupConfigCacheExpiresAt = Date.now() + CLICKUP_CONFIG_CACHE_TTL_MS;
+  return cachedClickUpConfig;
 }
 
 // Fathom configuration interface
