@@ -348,7 +348,16 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_ENGAGEMENT → POST_ENGAGEMENT, PAGE_LIKES
   OUTCOME_SALES     → OFFSITE_CONVERSIONS, VALUE
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
-  OUTCOME_APP_PROMOTION → APP_INSTALLS`,
+  OUTCOME_APP_PROMOTION → APP_INSTALLS
+
+GETTING DESTINATION URLS:
+  Destination URLs are NOT returned by AD LIST — they live inside the ad creative's object_story_spec.
+  To get destination URLs:
+    1. Use AD_CREATIVE LIST → returns object_story_spec for all creatives in the account.
+       Extract link from: image creative → object_story_spec.link_data.link
+                          video creative → object_story_spec.video_data.call_to_action.value.link
+                          carousel       → object_story_spec.link_data.child_attachments[].link
+    2. Or cross-reference: AD LIST (to get creative_id per ad) → AD_CREATIVE LIST (to match creative_id → object_story_spec)`,
     inputSchema: {
       type: "object",
       properties: {
