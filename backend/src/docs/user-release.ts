@@ -3803,4 +3803,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Amounts are recorded automatically from Stripe invoices on each successful payment',
     ],
   },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Resync Payments Button in Admin Users Tab',
+      '- Added a "Resync Payments" button to the Users tab toolbar to backfill subscription amounts from Stripe',
+      '- Fetches the latest paid invoice for each user and updates the displayed amount',
+      '- Shows a summary of how many users were updated, skipped, or errored',
+    ],
+  },
 ];

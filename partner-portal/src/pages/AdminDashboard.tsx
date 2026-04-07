@@ -750,6 +750,7 @@ export default function AdminDashboard() {
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
   const [editingStripeCustomerIdUserId, setEditingStripeCustomerIdUserId] = useState<string | null>(null);
   const [currentStripeCustomerIdText, setCurrentStripeCustomerIdText] = useState("");
+  const [resyncPaymentsLoading, setResyncPaymentsLoading] = useState(false);
   const [stripeCustomerIdEditLoading, setStripeCustomerIdEditLoading] = useState(false);
   const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
   const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
@@ -2015,6 +2016,23 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update ad account");
     } finally {
       setAdAccountEditLoading(false);
+    }
+  };
+
+  const handleResyncPayments = async () => {
+    try {
+      setResyncPaymentsLoading(true);
+      const response = await axios.post(
+        buildApiUrl("/api/admin/resync-subscription-amounts"),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const { checked, updated, skipped, errors } = response.data;
+      setSuccess(`Payments resynced: ${updated} updated, ${skipped} skipped, ${errors} errors (${checked} total checked)`);
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to resync payments");
+    } finally {
+      setResyncPaymentsLoading(false);
     }
   };
 
@@ -3594,6 +3612,9 @@ export default function AdminDashboard() {
               </Button>
             )}
             <Box sx={{ flexGrow: 1 }} />
+            <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
+              Resync Payments
+            </Button>
             <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
               Sync to CRM
             </Button>
