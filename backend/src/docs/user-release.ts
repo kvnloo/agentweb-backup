@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-07',
     changes: [
+      'Account Summary Now Shows Per-Session AI Highlights',
+      '- When you ask Emma for an account summary, each session in the time range is now summarized by AI (gemini-3.1-flash-lite-preview)',
+      '- Summaries describe what was accomplished in each session in 1-2 sentences (e.g. "Conducted a technical audit of taskflow.io and scheduled weekly scans")',
+      '- Summaries are cached on each session and only regenerated when new messages are added, so repeat requests are fast',
+      '- The existing aggregate metrics (sessions, leads, assets, email, social media) are still included alongside the new highlights',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
       'Meta Ads: Destination URL Audit Now Supported',
       '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
       '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
