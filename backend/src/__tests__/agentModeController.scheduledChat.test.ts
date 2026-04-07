@@ -676,7 +676,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         ['user@example.com', 'admin@example.com'],
         'Test Schedule',
         expect.objectContaining({ sessionId: 'test-session-123' }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
 
