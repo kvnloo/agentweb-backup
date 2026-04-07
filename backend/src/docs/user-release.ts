@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-07',
     changes: [
+      'Meta Ads: Destination URL Audit Now Supported',
+      '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
+      '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
+      '- Ask Emma to "list my Meta ad creatives and show destination URLs" to see all landing page URLs across your ads',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
       'Scheduled Chats Now Require at Least One Email Notification',
       '- Creating or updating a scheduled chat now requires at least one email address in the Email Notifications field',
       '- This ensures you always receive run results, error alerts, and variable request emails from your scheduled sessions',
