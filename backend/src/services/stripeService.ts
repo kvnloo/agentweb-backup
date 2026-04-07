@@ -887,3 +887,64 @@ export async function reconcileAllStripeUsers(): Promise<{
   console.log(`[STRIPE RECONCILE] Done: checked=${summary.checked}, fixed=${summary.fixed}, errors=${summary.errors}`);
   return summary;
 }
+
+// ─── Subscription Amount Resync ───────────────────────────────────────────────
+
+/**
+ * Sync subscription_amount for all paying users by fetching their latest
+ * paid invoice from Stripe. Can be triggered on demand from the admin UI.
+ */
+export async function resyncAllSubscriptionAmounts(): Promise<{
+  checked: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+}> {
+  const stripe = getStripeOrThrow();
+  const summary = { checked: 0, updated: 0, skipped: 0, errors: 0 };
+
+  // Exclude empty strings — attribute_exists matches "" which causes Stripe errors
+  const users = await userDb.scanWithFilter(
+    'attribute_exists(stripe_customer_id) AND stripe_customer_id <> :empty',
+    { ':empty': '' },
+  );
+
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
+    summary.checked++;
+
+    // Rate limit: 100ms pause every 10 users
+    if (i > 0 && i % 10 === 0) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    try {
+      const invoices = await stripe.invoices.list({
+        customer: user.stripe_customer_id,
+        status: 'paid',
+        limit: 1,
+      });
+
+      const latestPaid = invoices.data[0];
+      if (!latestPaid || typeof latestPaid.amount_paid !== 'number' || latestPaid.amount_paid <= 0) {
+        summary.skipped++;
+        continue;
+      }
+
+      if (user.subscription_amount === latestPaid.amount_paid) {
+        summary.skipped++;
+        continue;
+      }
+
+      await userDb.updateUser(user.userId, { subscription_amount: latestPaid.amount_paid });
+      summary.updated++;
+      console.log(`[STRIPE RESYNC] ${user.email}: subscription_amount = ${latestPaid.amount_paid}`);
+    } catch (err: any) {
+      summary.errors++;
+      console.error(`[STRIPE RESYNC] Error for ${user.email}:`, err.message);
+    }
+  }
+
+  console.log(`[STRIPE RESYNC] Done: checked=${summary.checked}, updated=${summary.updated}, skipped=${summary.skipped}, errors=${summary.errors}`);
+  return summary;
+}
