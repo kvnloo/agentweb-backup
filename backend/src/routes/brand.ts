@@ -61,30 +61,26 @@ async function uploadBrandFile(
 // Get user's brand guidelines
 router.get("/guidelines", authenticateToken, async (req, res) => {
   try {
-    const userId = (req as AuthenticatedRequest).user?.userId;
+    const email = (req as AuthenticatedRequest).user?.email;
 
-    if (!userId) {
-      return res.status(401).json({ error: "User ID not provided" });
+    if (!email) {
+      return res.status(401).json({ error: "User email not provided" });
     }
 
+    // Use primary key (email) with ConsistentRead to avoid GSI eventual consistency issues
     const result = await dynamodb
-      .query({
+      .get({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        IndexName: "UserIdIndex",
-        KeyConditionExpression: "userId = :userId",
-        ExpressionAttributeValues: {
-          ":userId": userId,
-        },
+        Key: { email },
+        ConsistentRead: true,
       })
       .promise();
 
-    const users = result.Items || [];
+    const user = result.Item;
 
-    if (users.length === 0) {
+    if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
-
-    const user = users[0];
 
     // If user is in an org, always read brand guidelines from the org (not the user)
     let brandGuidelines = user.brandGuidelines;
@@ -233,23 +229,37 @@ router.post(
         `[BRAND DEBUG] Fetching existing user data from: ${TABLE_PREFIX}AW-Users`
       );
 
+      const userEmail = (req as AuthenticatedRequest).user?.email;
+      if (!userEmail) {
+        return res.status(401).json({ error: "User email not provided" });
+      }
+
+      // Use primary key (email) with ConsistentRead to avoid GSI eventual consistency issues
+      // that could cause recently uploaded attachments (e.g. logos) to be lost when saving.
       const userResult = await dynamodb
-        .query({
+        .get({
           TableName: `${TABLE_PREFIX}AW-Users`,
-          IndexName: "UserIdIndex",
-          KeyConditionExpression: "userId = :userId",
-          ExpressionAttributeValues: {
-            ":userId": userId,
-          },
+          Key: { email: userEmail },
+          ConsistentRead: true,
         })
         .promise();
 
-      if (!userResult.Items || userResult.Items.length === 0) {
+      if (!userResult.Item) {
         return res.status(404).json({ error: "User not found" });
       }
 
-      const user = userResult.Items[0];
-      const existingBrandGuidelines = user.brandGuidelines;
+      const user = userResult.Item;
+
+      // For org users, read existing brand guidelines from the org record (not the user record).
+      // Brand guidelines for org members are stored at the org level, so reading from the user
+      // record would cause existing org-level attachments (like logos) to be lost when saving.
+      let existingBrandGuidelines = user.brandGuidelines;
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org?.brandGuidelines) {
+          existingBrandGuidelines = org.brandGuidelines;
+        }
+      }
 
       // Parse keyMessages if it's a string; preserve existing if not provided
       let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
@@ -396,17 +406,31 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { key } = req.params;
+    // URL fallback for legacy assets that have no key field
+    const urlFallback = req.query.url as string | undefined;
 
     console.log(
-      `[BRAND DEBUG] DELETE asset request for user: ${userId}, key: ${key}`
+      `[BRAND DEBUG] DELETE asset request for user: ${userId}, key: ${key}, urlFallback: ${urlFallback}`
     );
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
-    // Get current user
-    const user = await userDb.getUserById(userId);
+    // Get current user via primary key with ConsistentRead to avoid GSI eventual consistency
+    // issues that could cause recently uploaded attachments to be lost.
+    const deleteUserEmail = (req as AuthenticatedRequest).user?.email;
+    if (!deleteUserEmail) {
+      return res.status(401).json({ error: "User email not provided" });
+    }
+    const deleteUserResult = await dynamodb
+      .get({
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        Key: { email: deleteUserEmail },
+        ConsistentRead: true,
+      })
+      .promise();
+    const user = deleteUserResult.Item;
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
@@ -431,9 +455,28 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Brand guidelines not found" });
     }
 
-    // Remove the asset from attachments
+    // Determine S3 key for deletion. For legacy assets without a key field,
+    // extract the S3 key from the asset URL as a fallback.
+    const isValidKey = key && key !== "undefined";
+    let s3Key: string | undefined = isValidKey ? key : undefined;
+    if (!s3Key && urlFallback) {
+      const bucketPrefix = `https://${process.env.AWS_S3_BUCKET || "agentweb-user-files"}.s3.us-west-2.amazonaws.com/`;
+      if (urlFallback.startsWith(bucketPrefix)) {
+        s3Key = urlFallback.slice(bucketPrefix.length);
+      }
+    }
+
+    // Remove the asset from attachments.
+    // For keyless legacy assets, match by URL instead of key.
     const updatedAttachments = (brandGuidelines.attachments || []).filter(
-      (attachment: any) => attachment.key !== key
+      (attachment: any) => {
+        if (isValidKey) {
+          return attachment.key !== key;
+        } else if (urlFallback) {
+          return attachment.url !== urlFallback;
+        }
+        return true; // Can't identify, keep all
+      }
     );
 
     console.log(
@@ -443,16 +486,18 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     );
 
     // Delete from S3
-    try {
-      await s3
-        .deleteObject({
-          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
-          Key: decodeURIComponent(key),
-        })
-        .promise();
-    } catch (s3Error) {
-      console.warn("Failed to delete from S3:", s3Error);
-      // Continue with database update even if S3 deletion fails
+    if (s3Key) {
+      try {
+        await s3
+          .deleteObject({
+            Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+            Key: s3Key,
+          })
+          .promise();
+      } catch (s3Error) {
+        console.warn("Failed to delete from S3:", s3Error);
+        // Continue with database update even if S3 deletion fails
+      }
     }
 
     // Update brand guidelines
