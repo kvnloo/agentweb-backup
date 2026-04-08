@@ -15,6 +15,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma was sometimes using the blog article tool when asked to create reports, summaries, or analyses — resulting in files named "blog-*.html" for non-blog content',
       '- Emma now clearly distinguishes: "blog article" → blog tool with hero image; "report / summary / analysis / audit" → HTML document tool',
       '- Asking for a "weekly performance report", "account summary", or "GTM audit" will now correctly produce a clean HTML document, not a blog post',
+      'Fix: Emma Sidebar Chat Session Persists Across Page Visits',
+      '- Fixed an issue where the Emma sidebar would show an empty conversation after visiting other pages, even though the original chat history existed',
+      '- The sidebar now correctly restores your previous conversation when you return to a page, regardless of which other pages you\'ve visited in between',
+      'Fix: Scheduled Chat Email Notifications Always Populated',
+      '- Emma no longer shows an error when creating a schedule without specifying an email address',
+      '- If no email is provided, results are sent to your account email by default',
+      '- When an admin sets up a schedule via delegate access, results are sent to the admin\'s email instead of the customer\'s email',
     ],
   },
   {
