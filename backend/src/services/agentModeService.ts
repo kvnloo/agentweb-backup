@@ -2057,8 +2057,8 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, ClickUp tasks (with attachments), and Foreplay ad library (saved ads and boards). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
-- **Foreplay Ad Library**: When creating new ads or looking for ad inspiration, search the knowledge base for Foreplay ads. Foreplay boards and swipefile ads appear as knowledge base entries with identifiers like "foreplay-board:BOARD_ID" and "foreplay-swipefile". Read individual ads to get full ad copy, headlines, CTAs, formats, and video transcriptions that can serve as seed ads.
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Foreplay Ad Library**: When the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads, use 'search_ads_knowledge_base'. This searches only the user's Foreplay swipefile and boards. Use this for ad-specific queries (e.g. "find video ads from competitors", "show me carousel ads in our swipefile"). Do NOT use search_knowledge_base for Foreplay ad searches.
 - **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
@@ -3404,6 +3404,20 @@ When a user requests client onboarding or says "onboard new client" or similar:
             }
           ],
           totalResults: 2
+        };
+
+      case 'search_ads_knowledge_base':
+        return {
+          success: true,
+          message: `Found 2 mock Foreplay ads matching "${args.query}"`,
+          query: args.query,
+          results: [
+            {
+              content: `# Mock Video Ad\n\n**Brand:** Acme Corp\n**Format:** video\n**Platform:** facebook\n\n## Headline\nBest Product Ever\n\n## Description\nThis is a mock Foreplay ad result for "${args.query}".`,
+              source: 'foreplay-swipefile/Acme Corp/Mock Video Ad'
+            }
+          ],
+          totalResults: 1
         };
 
       case 'list_knowledge_base_files':
@@ -12378,72 +12392,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
-      // Search Foreplay ads (swipefile + boards — name/description/headline match)
-      if (userId) {
-        try {
-          const foreplayToken = await getForeplayAccessToken(userId);
-          if (foreplayToken) {
-            const queryLower = query.toLowerCase();
-            let foreplayResultCount = 0;
-
-            // Search swipefile ads
-            try {
-              const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
-              for (const ad of swipeResult.ads) {
-                if (foreplayResultCount >= limitedMaxResults) break;
-                const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
-                const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
-                const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
-                const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
-                if (nameMatch || descMatch || headlineMatch || brandMatch) {
-                  const content = formatForeplayAdAsMarkdown(ad);
-                  results.push({
-                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
-                    source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
-                  });
-                  foreplayResultCount++;
-                }
-              }
-            } catch (swipeErr) {
-              console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
-            }
-
-            // Search board ads
-            try {
-              const boards = await listForeplayBoards(foreplayToken);
-              for (const board of boards) {
-                if (foreplayResultCount >= limitedMaxResults) break;
-                try {
-                  const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
-                  for (const ad of boardAds) {
-                    if (foreplayResultCount >= limitedMaxResults) break;
-                    const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
-                    const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
-                    const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
-                    const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
-                    if (nameMatch || descMatch || headlineMatch || brandMatch) {
-                      const content = formatForeplayAdAsMarkdown(ad);
-                      results.push({
-                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
-                        source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
-                      });
-                      foreplayResultCount++;
-                    }
-                  }
-                } catch (boardErr) {
-                  console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
-                }
-              }
-            } catch (boardsErr) {
-              console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
-            }
-          }
-        } catch (foreplayError) {
-          console.log('AgentMode: Error searching Foreplay ads:', foreplayError);
-          // Don't fail the whole search if Foreplay search fails
-        }
-      }
-
       if (results.length === 0) {
         return {
           success: true,
@@ -12466,6 +12414,107 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search the knowledge base. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Search Foreplay ads only (swipefile + boards). Use this tool when the query is ads-related.
+  public async searchForeplayAds(query: string, maxResults: number = 5, userId?: string): Promise<any> {
+    try {
+      if (!userId) {
+        return { success: false, message: 'User ID required to search Foreplay ads.', results: [], totalResults: 0 };
+      }
+
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return {
+          success: false,
+          message: 'No Foreplay account connected. Connect your Foreplay account in Knowledge Base settings.',
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      const limitedMaxResults = Math.min(maxResults, 10);
+      const queryLower = query.toLowerCase();
+      const results: Array<{ content: string; source: string }> = [];
+      let foreplayResultCount = 0;
+
+      // Search swipefile ads
+      try {
+        const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+        for (const ad of swipeResult.ads) {
+          if (foreplayResultCount >= limitedMaxResults) break;
+          const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+          const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+          const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+          const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+          if (nameMatch || descMatch || headlineMatch || brandMatch) {
+            const content = formatForeplayAdAsMarkdown(ad);
+            results.push({
+              content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+              source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+            });
+            foreplayResultCount++;
+          }
+        }
+      } catch (swipeErr) {
+        console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+      }
+
+      // Search board ads
+      try {
+        const boards = await listForeplayBoards(foreplayToken);
+        for (const board of boards) {
+          if (foreplayResultCount >= limitedMaxResults) break;
+          try {
+            const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+            for (const ad of boardAds) {
+              if (foreplayResultCount >= limitedMaxResults) break;
+              const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+              const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+              const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+              const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+              if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                const content = formatForeplayAdAsMarkdown(ad);
+                results.push({
+                  content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                  source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                });
+                foreplayResultCount++;
+              }
+            }
+          } catch (boardErr) {
+            console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
+          }
+        }
+      } catch (boardsErr) {
+        console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+      }
+
+      if (results.length === 0) {
+        return {
+          success: true,
+          message: `No Foreplay ads found matching "${query}"`,
+          query,
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      return {
+        success: true,
+        message: `Found ${results.length} Foreplay ads matching "${query}"`,
+        query,
+        results,
+        totalResults: results.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching Foreplay ads:', error);
+      return {
+        success: false,
+        message: 'Failed to search Foreplay ads. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
