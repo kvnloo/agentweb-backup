@@ -1,3 +1,42 @@
+# April 8, 2026: Investigation — Lead Tech Stack Enrichment Options
+
+## Context
+
+Investigated options for enriching CRM leads to discover what software products/services lead businesses use — both customer-facing integrations and back-office tools.
+
+## Current Enrichment Capabilities
+
+- `crmEnrichmentService.ts` — web search (via agentModeService.searchWeb) + Gemini LLM extraction. Custom instructions + output fields. 20 parallel workers.
+- ICP matching — OpenAI analysis of lead fields vs. user-defined ICPs.
+- LinkedIn profile enrichment via Unipile integration.
+- Existing guidance hint for `tech_stack` fields uses LLM inference from search results.
+
+## Options Evaluated
+
+**Option A: Pre-built "Tech Stack" enrichment template** — Add preset instruction + output fields to existing enrich-web flow. Zero new infrastructure. Misses back-office tools not in public web results.
+
+**Option B: BuiltWith API** — REST API ($295/mo or $0.12/lookup), scans domains for frontend/web technologies. High accuracy for analytics, CDN, ecommerce, email marketing, payment processors. Doesn't cover internal back-office tools (Salesforce, payroll, etc.).
+
+**Option C: Apollo.io Enrichment API** — `/organizations/enrich?domain=` returns `technology_names` array scraped from job postings and LinkedIn. Free tier 50/day. Best for back-office tools (Salesforce, NetSuite, Jira, AWS). Less accurate for smaller/newer companies.
+
+**Option D: Job Posting Analysis via LLM** — Add second web search per lead targeting LinkedIn/Indeed job listings. "Experience with X required" reveals tech stack. Zero extra cost; only works for actively hiring companies.
+
+**Option E: Browser automation (agent engine)** — Playwright scrapes company websites, integrations/partners pages, footer badges. Most thorough, ~30–60s per lead.
+
+## Decision (final)
+
+**Implement Option D (LLM + web search) via existing `CrmEnrichmentService`** — reuses the same LLM + Google Search pipeline already powering "Enrich with Web". The route uses a tech-stack-specific instruction that targets job postings ("Experience with X required"), integrations/apps pages, and partner badges.
+
+- Route: `POST /api/crm/lists/:listId/leads/enrich-tech-stack` (in `crm.ts`)
+- Service: `CrmEnrichmentService` with `sources: ['web_search']` and `TECH_STACK_INSTRUCTION` preset
+- UI: "Discover Tech Stack" in CRM dropdown, dedicated dialog with LLM preview (2 sample leads enriched at preview time) + progress bar
+- Fields: `tech_stack_analytics`, `tech_stack_cms`, `tech_stack_marketing`, `tech_stack_infrastructure`, `tech_stack_integrations`
+- Zero extra cost; 20 parallel workers; ~2–5s per lead
+
+**Note:** `builtWithService.ts` was created as an intermediate attempt (puppeteer scraping `builtwith.com`) but abandoned after BuiltWith captcha blocked automated access. The file remains in the repo but is no longer used by the route.
+
+---
+
 # April 8, 2026: Investigation — Who Started Running Ads for Waldium Account
 
 ## Background

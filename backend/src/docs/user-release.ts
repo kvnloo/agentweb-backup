@@ -19,6 +19,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-08',
     changes: [
+      'CRM: Discover Tech Stack for Your Leads',
+      '- New "Discover Tech Stack" action in the CRM lead list — Emma searches job postings and integration pages to identify what software each lead\'s company uses',
+      '- Populates five fields: Analytics, CMS, Marketing tools, Infrastructure, and Integrations (e.g. "Google Analytics", "Shopify", "HubSpot", "AWS", "Stripe")',
+      '- Preview mode shows counts and sample results from 2 leads before committing to a full scan',
+      '- Already-enriched leads are skipped automatically; use "Re-scan" to refresh existing results',
+      '- Available in the list actions menu and as a bulk action when leads are selected',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
       'Fix: Agent Mode No Longer Times Out on Long Active Sessions',
       '- Fixed a false timeout that could occur during long Agent Mode sessions (e.g. 100+ message conversations)',
       '- Previously, a hard 45-minute timer would kill an in-progress generation even if the agent was actively working and making progress',
