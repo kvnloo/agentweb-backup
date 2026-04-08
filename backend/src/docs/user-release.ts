@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-08',
     changes: [
+      'Fix: Emma No Longer Confuses Blog Articles with Reports',
+      '- Emma was sometimes using the blog article tool when asked to create reports, summaries, or analyses — resulting in files named "blog-*.html" for non-blog content',
+      '- Emma now clearly distinguishes: "blog article" → blog tool with hero image; "report / summary / analysis / audit" → HTML document tool',
+      '- Asking for a "weekly performance report", "account summary", or "GTM audit" will now correctly produce a clean HTML document, not a blog post',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
       'Deprecation: Legacy Web Automation Task Tools',
       '- The \'create_task_from_template\', \'list_task_templates\', and \'create_task_from_prompt\' tools are now deprecated in favor of Emma\'s direct Playwright browser control',
       '- Emma will now use her built-in browser tools (browser_navigate, browser_click, browser_type, etc.) for web automation instead of delegating to the background agent engine',
