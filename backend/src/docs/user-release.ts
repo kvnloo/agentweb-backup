@@ -3972,4 +3972,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Foreplay results are now cached for 5 minutes to prevent repeated API calls within the same session',
     ],
   },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fixed: Deleting a Brand Guide Document No Longer Removes Your Logos',
+      '- Deleting a brand guide PDF from the Brand Guidelines page now correctly removes only that document — logos and secondary logos are preserved',
+      '- Fixed a data consistency issue where logos uploaded just before saving or deleting could be silently lost due to a stale database read',
+    ],
+  },
 ];
