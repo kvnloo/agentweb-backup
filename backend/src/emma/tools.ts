@@ -3861,6 +3861,32 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: "search_ads_knowledge_base",
+  definition: {
+    name: "search_ads_knowledge_base",
+    description: "Search the user's Foreplay ad library (swipefile + boards) for ads matching the query. Use this tool when the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads by brand, headline, or description. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search query (e.g. brand name, headline keyword, ad type)"
+        },
+        max_results: {
+          type: "number",
+          description: "Max results to return (default 5)",
+          default: 5
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
