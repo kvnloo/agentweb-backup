@@ -2021,16 +2021,12 @@ export class AgentModeService {
       - Do NOT start executing until all required skills are installed
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
 
-## Task Creation Approach
-- **IMPORTANT**: Always confirm with the user before calling 'create_task_from_template' or 'create_task_from_prompt', as these web automation tasks can take several minutes and cannot be cancelled once started. This confirmation requirement applies ONLY to these two tools — do NOT ask for confirmation before using other tools such as linkedin_outreach, post_on_connected_account, add_leads_to_list, or any other direct-execution tool.
-- **Confirmation required for web automation only**: Explain what the browser automation task will do and get explicit approval before creating it.
-- **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
-- **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
-- Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
-- Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
-- Example: {"site_url": "example.com", "business_area": "e-commerce"}
-- Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: [DEPRECATED: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.]
+## Web Automation Approach
+- **Preferred Method**: Use the 'browser_*' Playwright tools (browser_navigate, browser_click, browser_type, browser_snapshot, etc.) for any web automation task — browsing, form filling, scraping, logging in, etc. These tools give Emma direct, real-time browser control and are faster and more flexible than the legacy agent engine.
+- **[DEPRECATED] Legacy Template Tasks**: 'create_task_from_template' and 'list_task_templates' are legacy tools that delegate to a background agent engine (takes several minutes, cannot be cancelled). Only use these if the task genuinely cannot be done with direct browser control — for example, if a specific template exists that adds significant value beyond what direct browsing can achieve.
+- **[DEPRECATED] Fallback Method**: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.
+- **Confirmation required for legacy template tasks only**: If you must use 'create_task_from_template', always confirm with the user first — explain what the task will do, that it takes several minutes, and that it cannot be cancelled once started. This does NOT apply to direct browser_* tools.
+- **[DEPRECATED] Image Generation via task**: 'create_image_task_from_prompt' is deprecated — use 'generate_image' instead.
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
@@ -2132,12 +2128,11 @@ Save the chart image URLs from the response.
 - **Brand context first**: Before asking the user for business details (company name, website, goals, target market, brand voice, etc.), ALWAYS call read_brand_guidelines and read_market_strategy first. These tools frequently contain exactly the information you need. Only ask the user if these tools return nothing useful.
 - **Never ask twice**: If you've already asked for a piece of information in this conversation and the user has not provided it, do NOT ask again. Instead, proceed using whatever context is available from brand guidelines, market strategy, or reasonable defaults.
 - **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
-- **Web automation task confirmation required**: Before calling 'create_task_from_template', explain what the browser automation task will do and confirm with the user (these tasks take time and cannot be cancelled). This does NOT apply to direct-execution tools like linkedin_outreach or post_on_connected_account.
-- **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
+- **[DEPRECATED] Legacy task confirmation required**: If you must use 'create_task_from_template', explain what the task will do and confirm with the user first (these tasks take time and cannot be cancelled). For direct browser_* tools, no confirmation is needed — just proceed.
+- **Prefer direct browser tools**: For any web browsing or automation, use browser_navigate, browser_click, browser_type, etc. directly — do not use create_task_from_template unless there is a strong reason.
 - Provide clear explanations of what you're doing and what information you've found
 - Keep responses concise but informative
-- Always confirm web automation task creation and provide relevant details
-- When using templates, explain which template was selected and why
+- When using legacy templates, explain which template was selected and why
 - When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
 - Focus on actionable insights and strategic guidance based on current data and conversation context
 - If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
