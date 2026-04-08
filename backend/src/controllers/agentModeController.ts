@@ -3414,7 +3414,12 @@ export const agentModeController = {
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
-        return res.status(400).json({ error: 'Missing required fields' });
+        const missing = [
+          !scheduleName && 'scheduleName',
+          !startingMessage && 'startingMessage',
+          !scheduleFrequency && 'scheduleFrequency',
+        ].filter(Boolean).join(', ');
+        return res.status(400).json({ error: `Missing required fields: ${missing}` });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency
