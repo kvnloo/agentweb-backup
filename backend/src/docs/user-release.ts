@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-08',
     changes: [
+      'Admin: Work Plan Categories',
+      '- Work plans can now be assigned a category (Paid Ads, Strategy, Content, or Other)',
+      '- Category is shown as a column in the work plans table and can be set when creating or editing a plan',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
       'Fix: Agent Mode No Longer Times Out on Long Active Sessions',
       '- Fixed a false timeout that could occur during long Agent Mode sessions (e.g. 100+ message conversations)',
       '- Previously, a hard 45-minute timer would kill an in-progress generation even if the agent was actively working and making progress',
