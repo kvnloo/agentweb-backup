@@ -1316,7 +1316,8 @@ export async function generateSessionResponse(
   llmModel: string,
   attachments?: any[],
   isInteractiveShare?: boolean,
-  pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string }
+  pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
+  isDelegatedAccess?: boolean
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -1498,6 +1499,7 @@ export async function generateSessionResponse(
       sessionId,
       mockMode: false,
       isInteractiveShare: isInteractiveShare || false,
+      isDelegatedAccess,
       excludeTools,
       screenshotUrl
     },
@@ -1854,6 +1856,10 @@ export const agentModeController = {
         ? { currentUrl, structuredContext, screenshot }
         : undefined;
 
+      // Check if this request is from admin delegated access (per-request, from JWT)
+      const authReqForGenerate = req as any;
+      const isDelegatedAccessForMessage = authReqForGenerate.delegateInfo?.isDelegated === true;
+
       // Generate AI response using common function
       const response = await generateSessionResponse(
         sessionId,
@@ -1862,7 +1868,8 @@ export const agentModeController = {
         modelToUse,
         attachments,
         undefined, // isInteractiveShare
-        pageContext
+        pageContext,
+        isDelegatedAccessForMessage
       );
 
       // Clear progress store after completion (keep connections open for future messages)

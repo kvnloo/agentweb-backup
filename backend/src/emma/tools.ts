@@ -138,11 +138,12 @@ emmaToolRegistry.register({
       });
     }
 
-    // Add __admin_tools__ virtual skill for admin users only
+    // Add __admin_tools__ virtual skill for admin users or admin delegated access
     try {
       const { userDb } = await import('../services/db');
       const currentUser = await userDb.getUserById(userId);
-      if (currentUser?.isAdmin === true) {
+      const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
+      if (hasAdminAccess) {
         const { agentModeService } = await import('../services/agentModeService');
         const adminToolNamesList = agentModeService.getAdminToolNames();
         availableSkills.push({
