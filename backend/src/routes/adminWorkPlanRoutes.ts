@@ -52,7 +52,7 @@ router.get("/:planId", async (req, res) => {
 // Create work plan (admin can set any visibility)
 router.post("/", async (req, res) => {
   try {
-    const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, visibility } = req.body;
+    const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, category, visibility } = req.body;
 
     if (!title || !steps || !Array.isArray(steps) || steps.length === 0) {
       return res.status(400).json({ message: "Title and at least one step are required" });
@@ -76,6 +76,7 @@ router.post("/", async (req, res) => {
       showLoginSignup: showLoginSignup || 'after_plan_completed',
       showInAgentMode: showInAgentMode !== false,
       defaultModel,
+      category,
       visibility: visibility || 'system',
       isBuiltIn: true,
     });
@@ -93,7 +94,7 @@ router.put("/:planId", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(req.params.planId);
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
-    const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, visibility } = req.body;
+    const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, category, visibility } = req.body;
     const normalizedSteps = steps !== undefined ? steps.map((s: any, i: number) => ({
       stepCount: s.stepCount || i + 1,
       title: s.title || `Step ${i + 1}`,
@@ -112,6 +113,7 @@ router.put("/:planId", async (req, res) => {
       ...(showLoginSignup !== undefined && { showLoginSignup }),
       ...(showInAgentMode !== undefined && { showInAgentMode }),
       ...(defaultModel !== undefined && { defaultModel }),
+      ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
     };
     await workPlanService.updateWorkPlan(updated);

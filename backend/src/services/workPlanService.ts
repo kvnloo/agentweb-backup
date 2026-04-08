@@ -36,6 +36,7 @@ export interface WorkPlan {
   showLoginSignup?: string;
   showInAgentMode?: boolean;
   defaultModel?: string;
+  category?: string;
   steps: WorkPlanStep[];
   ownerId?: string;
   visibility: WorkPlanVisibility;
