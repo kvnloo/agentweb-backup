@@ -3874,4 +3874,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Previously, opening the edit dialog caused an error that broke the entire Work Plans tab',
     ],
   },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Foreplay Ad Library Now Has Its Own Dedicated Tool',
+      '- Foreplay ads are no longer searched automatically every time you use the knowledge base',
+      '- A new "search_ads_knowledge_base" tool lets Emma search your Foreplay swipefile and boards only when you explicitly ask for ad inspiration or competitor research',
+      '- Reduces unnecessary Foreplay API credit usage from unrelated knowledge base queries',
+      '- Foreplay results are now cached for 5 minutes to prevent repeated API calls within the same session',
+    ],
+  },
 ];
