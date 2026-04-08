@@ -3501,13 +3501,19 @@ export const agentModeController = {
         });
       }
 
-      // When no email is provided, fall back to user's own email so LLMs don't need to
-      // know this requirement. Exception: variables are present and all pre-filled (silent run).
+      // When no email is provided, fall back to the requester's email so LLMs don't need to
+      // know this requirement. On delegate access use the admin's email (the person setting
+      // up the schedule), not the target account's email.
+      // Exception: variables are present and all pre-filled (silent run).
+      const authReqForEmail = req as AuthenticatedRequest;
+      const fallbackEmail = authReqForEmail.delegateInfo?.isDelegated
+        ? authReqForEmail.delegateInfo.adminEmail
+        : user.email;
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
       const normalizedEmails = normalizeEmailList(emailNotifications);
-      const shouldUseUserEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
-      scheduledChat.emailNotifications = shouldUseUserEmail ? [user.email] : normalizedEmails;
+      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
+      scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0

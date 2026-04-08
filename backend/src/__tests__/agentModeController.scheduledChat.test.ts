@@ -2734,5 +2734,35 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         })
       );
     });
+
+    it('should use admin email as fallback on delegate access', async () => {
+      const mockReq = {
+        user: { userId: 'customer-456', email: 'customer@example.com' },
+        delegateInfo: {
+          adminUserId: mockUserId,
+          adminEmail: 'admin@example.com',
+          isDelegated: true,
+        },
+        body: {
+          scheduleName: 'Website Scan',
+          startingMessage: 'Scan https://example.com for issues',
+          scheduleFrequency: 'weekly',
+          // No emailNotifications
+        },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).not.toHaveBeenCalledWith(400);
+      expect(mockCreateSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailNotifications: ['admin@example.com'],
+        })
+      );
+    });
   });
 });
