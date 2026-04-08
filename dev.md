@@ -1,3 +1,68 @@
+# April 8, 2026: Investigation — Who Started Running Ads for Waldium Account
+
+## Background
+
+User `amrutha@structuredlabs.com` (Waldium) has active Meta Ads campaigns and a recurring 48-hour performance check-in schedule running in their account. Rui (admin) did not recall initiating these, raising a question about which actions were taken by the admin vs. the user, and surfacing a broader gap: the platform has no comprehensive audit trail for actions taken via admin delegate access.
+
+## Investigation
+
+**User ID:** `1a9a40c5-5ec0-41de-996f-cee3b82fa74e`
+
+Queried `AW-ChatSessions` (UserIdIndex GSI) and `AW-TaskSchedules` for this user. Found ~90 sessions spanning Dec 2025–Apr 2026.
+
+### Session Attribution Summary
+
+| Date | Session | Title | Initiated By | Notes |
+|------|---------|-------|--------------|-------|
+| Jan 7, 2026 | `37429d16` | Emotional Facebook Ad for Waldium DevRel Backlog | **User** (no delegate) | Ad creative only, no Meta Ads API |
+| Feb 15–20 | `e13847b4` | AI Assistants Recommend Competitors Facebook Ad | **matthew@agentweb.pro** (delegate) | Ad creative only |
+| Feb 15–Mar 25 | `3cccd7e3` | Waldium Multi-ICP AI Ad Video Generation Plan | **matthew@agentweb.pro** (delegate) | Ad video creation |
+| **Mar 17** | `dc3b404d` | Meta Ads Multi-Campaign Performance Report | **ruiw@agentweb.pro** (delegate) | **First Meta Ads API session.** 58 msgs. Called `call_meta_ads_insights_api` x10, `call_meta_marketing_api` x1, `manage_scheduled_chat` x3. Created the recurring "Multi-Campaign Performance Report" schedule (every 3 days). |
+| Mar 17 | `762ad27b` | Test: Waldium Meta Ads — Multi-Campaign Performance Report | Automated (scheduled) | First automated run of the above schedule |
+| **Mar 31–Apr 2** | `d0a87f37` | Meta Ads Status Check – Running vs Paused Campaigns | **ruiw@agentweb.pro** (delegate) | 47 msgs, interactive. Called `call_meta_marketing_api` x4. Checked/changed campaign statuses, ran performance audit, helped with custom audience uploads. Judge score 5/5. |
+| **Apr 2–6** | `3fcc89e8` | Meta Campaigns Schedule Lookup | **ruiw@agentweb.pro** (delegate) | 62 msgs, interactive. Set up the "Landing Page Lead Magnets - 48hr Check-in" monitoring schedule (every 2 days). Judge score 5/5. |
+
+### Active Schedules
+
+| Schedule ID | Created | Frequency | Status | Description |
+|-------------|---------|-----------|--------|-------------|
+| `135c535c` | Mar 17 | Every 3 days | Active | Waldium Meta Ads Multi-Campaign Performance Report |
+| `77289d04` | Apr 6 | Every 2 days | Paused | Landing Page Lead Magnets - 48hr Check-in (campaign ID: 6865354788715, account: 883347640787043) |
+| `623db84f` | Apr 7 | Daily | Active | Website Scan - waldium.com |
+
+### Findings
+
+1. **Admin (Rui, `ruiw@agentweb.pro`) initiated all Meta Ads API usage** via delegate access, starting March 17. The user (amrutha) never directly triggered Meta Ads API calls — her own sessions were limited to ad content creation (images, copy) in Jan–Feb.
+
+2. **Rui does not recall these sessions.** The `delegateInfo` field records which admin account was used but not who was physically at the keyboard, nor what the original prompt was.
+
+3. **The "Landing Page Lead Magnets" campaign (ID: 6865354788715) was pre-existing** in Meta Ads Manager — the monitoring schedule was set up to watch it, not to launch it.
+
+4. **Root cause of the attribution gap:**
+   - `AW-ChatSessions.startingMessage` is null for most sessions — original prompts are not persisted
+   - `AW-TaskSchedules.createdBy` is null — no record of who created a schedule
+   - Session messages are archived/cleared; only `calledFunctions` counts and judge scores survive
+   - No dedicated admin action log exists
+
+## Audit Gap Options Evaluated
+
+Four options were considered:
+
+- **Option A** — Persist `startingMessage` + add `createdByAdminEmail` to schedules (1–2 days, low effort)
+- **Option B** — New `AW-AdminActions` table logging every delegate action (3–5 days)
+- **Option C** — Email account owner when admin takes high-impact actions via delegate (2–3 days)
+- **Option D** — Session message retention policy / compact session summaries (5–7 days)
+
+## Decision
+
+**No ad-hoc tracking added now.** These gaps are real but any point solution (e.g. logging just schedule creation, or just delegate sessions) would be incomplete and create a false sense of coverage.
+
+The right fix is a **comprehensive user activity tracking solution** that covers all action types (sessions, schedules, task executions, config changes) across both user and admin-delegate contexts, with a queryable admin UI. That work should be scoped and prioritized as a standalone initiative rather than bolted on per-investigation.
+
+**Until that exists:** When investigating admin delegate sessions, use `delegateInfo` on `AW-ChatSessions` + `calledFunctions` counts + judge scores as the best available signal.
+
+---
+
 # April 6, 2026: Investigation — Claude Code Source Analysis (Agent Architecture Patterns)
 
 ## Background
