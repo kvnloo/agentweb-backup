@@ -406,9 +406,11 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { key } = req.params;
+    // URL fallback for legacy assets that have no key field
+    const urlFallback = req.query.url as string | undefined;
 
     console.log(
-      `[BRAND DEBUG] DELETE asset request for user: ${userId}, key: ${key}`
+      `[BRAND DEBUG] DELETE asset request for user: ${userId}, key: ${key}, urlFallback: ${urlFallback}`
     );
 
     if (!userId) {
@@ -453,9 +455,28 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Brand guidelines not found" });
     }
 
-    // Remove the asset from attachments
+    // Determine S3 key for deletion. For legacy assets without a key field,
+    // extract the S3 key from the asset URL as a fallback.
+    const isValidKey = key && key !== "undefined";
+    let s3Key: string | undefined = isValidKey ? key : undefined;
+    if (!s3Key && urlFallback) {
+      const bucketPrefix = `https://${process.env.AWS_S3_BUCKET || "agentweb-user-files"}.s3.us-west-2.amazonaws.com/`;
+      if (urlFallback.startsWith(bucketPrefix)) {
+        s3Key = urlFallback.slice(bucketPrefix.length);
+      }
+    }
+
+    // Remove the asset from attachments.
+    // For keyless legacy assets, match by URL instead of key.
     const updatedAttachments = (brandGuidelines.attachments || []).filter(
-      (attachment: any) => attachment.key !== key
+      (attachment: any) => {
+        if (isValidKey) {
+          return attachment.key !== key;
+        } else if (urlFallback) {
+          return attachment.url !== urlFallback;
+        }
+        return true; // Can't identify, keep all
+      }
     );
 
     console.log(
@@ -465,16 +486,18 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     );
 
     // Delete from S3
-    try {
-      await s3
-        .deleteObject({
-          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
-          Key: decodeURIComponent(key),
-        })
-        .promise();
-    } catch (s3Error) {
-      console.warn("Failed to delete from S3:", s3Error);
-      // Continue with database update even if S3 deletion fails
+    if (s3Key) {
+      try {
+        await s3
+          .deleteObject({
+            Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+            Key: s3Key,
+          })
+          .promise();
+      } catch (s3Error) {
+        console.warn("Failed to delete from S3:", s3Error);
+        // Continue with database update even if S3 deletion fails
+      }
     }
 
     // Update brand guidelines
