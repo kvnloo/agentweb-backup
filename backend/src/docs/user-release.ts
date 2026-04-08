@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-08',
     changes: [
+      'Fix: Agent Mode No Longer Times Out on Long Active Sessions',
+      '- Fixed a false timeout that could occur during long Agent Mode sessions (e.g. 100+ message conversations)',
+      '- Previously, a hard 45-minute timer would kill an in-progress generation even if the agent was actively working and making progress',
+      '- The timer now resets on each progress update, so it only fires after 45 minutes of true inactivity — not total elapsed time',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
       'Fix: Emma No Longer Confuses Blog Articles with Reports',
       '- Emma was sometimes using the blog article tool when asked to create reports, summaries, or analyses — resulting in files named "blog-*.html" for non-blog content',
       '- Emma now clearly distinguishes: "blog article" → blog tool with hero image; "report / summary / analysis / audit" → HTML document tool',
