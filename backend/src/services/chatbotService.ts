@@ -1540,7 +1540,8 @@ export class ChatbotDB {
     portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar",
     limit?: number,
     sortDescending: boolean = true,
-    lastEvaluatedKey?: string
+    lastEvaluatedKey?: string,
+    pageIdentifier?: string
   ): Promise<{ sessions: ChatSession[], lastEvaluatedKey?: any }> {
     console.log(
       `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
@@ -1555,10 +1556,18 @@ export class ChatbotDB {
       },
     };
 
-    // Add portal type filter if specified
+    // Build filter expression
+    const filterParts: string[] = [];
     if (portalType) {
-      params.FilterExpression = 'portalType = :portalType';
+      filterParts.push('portalType = :portalType');
       params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+    if (pageIdentifier) {
+      filterParts.push('pageIdentifier = :pageIdentifier');
+      params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
+    }
+    if (filterParts.length > 0) {
+      params.FilterExpression = filterParts.join(' AND ');
     }
 
     // Add limit if specified

@@ -73,6 +73,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         50,
         true,
+        undefined,
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
@@ -90,9 +91,9 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
       };
       (chatbotDb.getUserSessions as jest.Mock).mockResolvedValue(mockResult);
 
-      const req = mockRequest({ 
+      const req = mockRequest({
         limit: '25',
-        lastEvaluatedKey 
+        lastEvaluatedKey
       });
       const res = mockResponse();
 
@@ -103,7 +104,8 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         25,
         true,
-        lastEvaluatedKey
+        lastEvaluatedKey,
+        undefined
       );
       expect(res.json).toHaveBeenCalledWith({
         sessions: mockSessions,
@@ -129,6 +131,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         100, // Should be capped at 100
         true,
+        undefined,
         undefined
       );
     });
@@ -150,6 +153,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         50, // Default limit
         true,
+        undefined,
         undefined
       );
     });
@@ -267,7 +271,30 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         50, // Should fall back to default
         true,
+        undefined,
         undefined
+      );
+    });
+
+    it('should pass pageIdentifier to getUserSessions when provided', async () => {
+      const mockResult = {
+        sessions: mockSessions,
+        lastEvaluatedKey: null
+      };
+      (chatbotDb.getUserSessions as jest.Mock).mockResolvedValue(mockResult);
+
+      const req = mockRequest({ limit: '1', portalType: 'emma-sidebar', pageIdentifier: 'dashboard' });
+      const res = mockResponse();
+
+      await agentModeController.getSessions(req, res);
+
+      expect(chatbotDb.getUserSessions).toHaveBeenCalledWith(
+        'user-123',
+        'emma-sidebar',
+        1,
+        true,
+        undefined,
+        'dashboard'
       );
     });
   });
