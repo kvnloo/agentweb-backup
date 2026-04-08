@@ -3381,7 +3381,7 @@ emmaToolRegistry.register({
   name: 'list_task_templates',
   definition: {
     name: 'list_task_templates',
-    description: 'List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this to find the right template before creating a task with create_task_from_template.',
+    description: '[DEPRECATED] List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this only if you need to use create_task_from_template for a task that cannot be done via direct browser control.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -3398,7 +3398,7 @@ emmaToolRegistry.register({
   name: 'create_task_from_template',
   definition: {
     name: 'create_task_from_template',
-    description: 'Create a web automation task using a specific template. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.',
+    description: '[DEPRECATED] Create a web automation task using a specific template. Only use this for tasks that cannot be accomplished via direct browser control with Playwright browser tools. If you need to do web automation (browsing, clicking, filling forms, scraping), prefer using the browser_* Playwright tools directly instead. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.',
     inputSchema: {
       type: 'object',
       properties: {

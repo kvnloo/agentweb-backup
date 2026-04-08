@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-08',
+    changes: [
+      'Deprecation: Legacy Web Automation Task Tools',
+      '- The \'create_task_from_template\', \'list_task_templates\', and \'create_task_from_prompt\' tools are now deprecated in favor of Emma\'s direct Playwright browser control',
+      '- Emma will now use her built-in browser tools (browser_navigate, browser_click, browser_type, etc.) for web automation instead of delegating to the background agent engine',
+      '- Direct browser control is faster, more flexible, and gives real-time results compared to the legacy background task approach',
+      '- Existing scheduled tasks using templates continue to work — only new requests from Emma are redirected to direct browser control',
+    ],
+  },
+  {
     date: '2026-04-07',
     changes: [
       'Account Summary Now Shows Per-Session AI Highlights',

@@ -40,10 +40,9 @@ describe('AgentModeService - Tool Descriptions', () => {
       );
 
       expect(createTaskFromTemplate).toBeDefined();
+      expect(createTaskFromTemplate?.function?.description).toContain('[DEPRECATED]');
       expect(createTaskFromTemplate?.function?.description).toContain('web automation task');
-      expect(createTaskFromTemplate?.function?.description).toBe(
-        'Create a web automation task using a specific template. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.'
-      );
+      expect(createTaskFromTemplate?.function?.description).toContain('browser_* Playwright tools');
     });
 
     it('should clearly indicate create_task_from_prompt creates web automation tasks', () => {
