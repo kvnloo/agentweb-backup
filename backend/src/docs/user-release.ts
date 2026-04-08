@@ -3922,6 +3922,23 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-08',
     changes: [
+      'Fixed: "Start Test Run" No Longer Shows a False Failure',
+      '- Clicking "Start Test Run" on a schedule now correctly shows a confirmation that the test has started',
+      '- Previously, the button always showed "Test Failed — Unknown error" even though the test was actually running in the background',
+      '- Results still appear in the run history when the test completes',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Creates Schedules More Reliably',
+      '- Emma now provides clearer self-correction when creating a scheduled chat — reducing the number of retries before a schedule is successfully created',
+      '- If a required field is missing, Emma receives a specific error message identifying which fields to add, so she can fix the issue in the next attempt',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
       'Foreplay Ad Library Now Has Its Own Dedicated Tool',
       '- Foreplay ads are no longer searched automatically every time you use the knowledge base',
       '- A new "search_ads_knowledge_base" tool lets Emma search your Foreplay swipefile and boards only when you explicitly ask for ad inspiration or competitor research',
