@@ -3887,6 +3887,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-08',
     changes: [
+      'CRM: See When Each Lead Was Added or Updated',
+      '- Two new optional columns in your leads table: "Date Added" and "Last Updated"',
+      '- Enable them via the Configure Fields button (gear icon) next to your leads list',
+      '- Timestamps display as relative time (e.g. "12d ago") with the exact date on hover',
+      '- Both columns are sortable — click the header to sort by newest or oldest',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
       'Foreplay Ad Library Now Has Its Own Dedicated Tool',
       '- Foreplay ads are no longer searched automatically every time you use the knowledge base',
       '- A new "search_ads_knowledge_base" tool lets Emma search your Foreplay swipefile and boards only when you explicitly ask for ad inspiration or competitor research',
