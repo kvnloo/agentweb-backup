@@ -3190,3 +3190,46 @@ The prompt caching optimization was deployed on Mar 25. Comparing per-session co
 - Post-caching (Mar 25–27, 693 sessions): $542.86 → $0.78/session avg
 
 **~74% reduction in avg cost per session.** Even accounting for session mix variation, caching is clearly delivering significant savings. The projected monthly cost of $6,081 already reflects the post-caching rates; without caching it would have been ~$16K+/month
+
+## Meta Ad Spending Limit Investigation (2026-04-08)
+
+### Context
+
+Investigated options for controlling Meta ad spend to prevent overspending when the agent creates/modifies ad campaigns on behalf of users.
+
+### Current State
+
+- **Budget guardrails exist in `agentModeService.ts`** (hardcoded): daily budget max $5,000, lifetime max $50,000 per ad set
+- **No user-configurable spending cap** — limits are hardcoded safety rails only
+- Meta ad account config stored in `AW-Users` → `connected_accounts[]` (no spending cap field)
+- Primary spend control is currently via Ramp virtual credit card with a hard limit set per card
+
+### Options Evaluated
+
+**Option A: App-level advisory cap per connected account**
+- Store a `spendingCap` field in DynamoDB alongside each Meta ad account config
+- Before creating/updating ad sets, query Meta Insights API for current month spend
+- Reject if projected spend would exceed cap; show spend vs cap in Settings UI
+- Pros: User-configurable, visible in UI, works alongside card limit
+- Cons: Relies on Meta's reported spend (slight lag), doesn't hard-stop if Meta overbills
+
+**Option B: Meta's native Account Spending Limit (ASL)**
+- Meta's Marketing API supports `spend_cap` on the ad account (`/act_{id}?fields=spend_cap`)
+- Surface this in Settings so users can set/update it via our UI
+- Meta natively enforces it — pauses all ads when limit is hit
+- Pros: Hard stop enforced by Meta, no lag, most reliable
+- Cons: Requires manual reset after billing cycle, another API call surface
+
+**Option C: Combined A + B**
+- App-level soft cap (advisory, warns before creating) + Meta-level hard cap (ultimate backstop)
+
+**Option D: Per-session budget envelope**
+- User sets a max spend for the current agent session; agent tracks total allocated across ad sets
+- Pros: Very simple, no schema changes, no Meta API calls
+- Cons: Doesn't account for existing scheduled spend, resets each session
+
+### Decision
+
+**Continue using Ramp virtual card approach for now.** Each Meta ad account is funded via a Ramp virtual credit card with a hard spending limit configured on the card. This provides a reliable, externally-enforced hard stop without any additional code complexity. Revisit in-app controls (Option A or B) if:
+- We manage ad accounts for customers where card-per-account isn't practical
+- Users request the ability to self-configure limits without admin intervention
