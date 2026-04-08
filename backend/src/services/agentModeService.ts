@@ -458,6 +458,36 @@ export class AgentModeService {
         return this.executeSearchToolResponse(args);
       }
     });
+
+    this.toolRegistry.register({
+      name: 'wait_seconds',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'wait_seconds',
+          description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
+          parameters: {
+            type: 'object',
+            properties: {
+              seconds: {
+                type: 'number',
+                description: 'Number of seconds to wait (max 300)'
+              },
+              reason: {
+                type: 'string',
+                description: 'Brief explanation of what you are waiting for (shown to the user)'
+              }
+            },
+            required: ['seconds', 'reason']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
+        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
+      }
+    });
   }
 
   async getDefaultModel(): Promise<string> {
@@ -1640,21 +1670,44 @@ export class AgentModeService {
           }
         }
 
-        // Phase 2: Execute all prepared tools in parallel
-        const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
-          const toolStart = Date.now();
-          try {
-            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
-            const toolDuration = Date.now() - toolStart;
-            return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
-          } catch (error) {
-            const toolDuration = Date.now() - toolStart;
-            return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
-          }
-        });
+        // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
+        // Sequential is required when wait_seconds is in the batch so the wait happens
+        // in the correct order relative to the tools before/after it.
+        const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
 
-        const toolResults = await Promise.all(toolPromises);
+        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
+
+        if (hasWaitTool) {
+          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools
+          toolResults = [];
+          for (const { toolCall, functionArgs } of preparedCalls) {
+            const toolStart = Date.now();
+            try {
+              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolDuration = Date.now() - toolStart;
+              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
+            } catch (error) {
+              const toolDuration = Date.now() - toolStart;
+              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration });
+            }
+          }
+        } else {
+          // Parallel execution (default)
+          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
+            const toolStart = Date.now();
+            try {
+              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolDuration = Date.now() - toolStart;
+              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
+            } catch (error) {
+              const toolDuration = Date.now() - toolStart;
+              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
+            }
+          });
+          toolResults = await Promise.all(toolPromises);
+        }
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -2112,6 +2165,13 @@ Save the chart image URLs from the response.
       - content_description: Brief section-specific instructions. **IMPORTANT**: If this section should include charts from Step 2, add to content_description: "Include the following chart image: ![Chart Title](chart_url_from_step_2)" for each relevant chart.
       - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
       - imagine: false (stick to research facts, don't invent details)
+
+## Waiting for Results
+- Use wait_seconds when you need to pause before checking a result — e.g. waiting for a LinkedIn post to propagate, an email to land, a page to update, or any async operation to settle
+- **Pattern**: call the action tool, then wait_seconds, then call the check/verify tool — all in the same turn. The batch will execute sequentially in order.
+- **Max wait**: 300 seconds (5 minutes) per call. For longer waits, chain multiple wait+check turns or tell the user to ask you again later.
+- **Always tell the user** what you are waiting for and why before calling wait_seconds
+- **Do not over-wait**: use the shortest reasonable delay. Typical values: 5–15s for page propagation, 30–60s for email/notification delivery, 120–300s for async processing.
 
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
@@ -2576,6 +2636,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'slack_list_channels',
     'slack_get_recent_messages',
     'slack_send_message',
+
+    // Timing
+    'wait_seconds',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
