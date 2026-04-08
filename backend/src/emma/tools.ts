@@ -1556,7 +1556,7 @@ emmaToolRegistry.register({
   name: 'create_blog_article',
   definition: {
     name: 'create_blog_article',
-    description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3. The final title will be generated from the drafts.',
+    description: 'Create a blog article intended for CMS publishing (Basehub, Webflow, etc.). Generates article content, a hero image, and a blog-styled HTML file. Use ONLY for blog posts — NOT for reports, summaries, analyses, audits, or other documents. For non-blog HTML documents, use create_html_file instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4225,7 +4225,7 @@ emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
-    description: "Create a well-formatted HTML file from a title, content draft, and format requirements.",
+    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead.",
     inputSchema: {
       type: "object",
       properties: {
