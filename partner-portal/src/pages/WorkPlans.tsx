@@ -52,6 +52,8 @@ interface WorkPlanStep {
   requiredFunctionCalls?: string[];
 }
 
+const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
+
 interface WorkPlan {
   planId: string;
   title: string;
@@ -66,6 +68,7 @@ interface WorkPlan {
   requireLogin?: boolean;
   showLoginSignup?: string;
   defaultModel?: string;
+  category?: string;
   reviewFeedback?: string;
   createdAt: string;
   updatedAt: string;
@@ -104,6 +107,7 @@ export default function WorkPlans() {
   const [requireLogin, setRequireLogin] = useState(false);
   const [visibility, setVisibility] = useState("system");
   const [defaultModel, setDefaultModel] = useState("");
+  const [category, setCategory] = useState("");
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
 
   // Reject dialog
@@ -180,6 +184,7 @@ export default function WorkPlans() {
     setRequireLogin(false);
     setVisibility("system");
     setDefaultModel("");
+    setCategory("");
     setDialogOpen(true);
   };
 
@@ -194,6 +199,7 @@ export default function WorkPlans() {
     setRequireLogin(plan.requireLogin || false);
     setVisibility(plan.visibility);
     setDefaultModel(plan.defaultModel || "");
+    setCategory(plan.category || "");
     setDialogOpen(true);
   };
 
@@ -215,6 +221,7 @@ export default function WorkPlans() {
         steps: validSteps.map((s, i) => ({ ...s, stepCount: i + 1 })),
         showInAgentMode, autocomplete, requireLogin, visibility,
         ...(defaultModel && { defaultModel }),
+        ...(category && { category }),
       };
       if (editingPlan) {
         await axios.put(buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`), body, {
@@ -417,6 +424,7 @@ export default function WorkPlans() {
             <TableRow>
               <TableCell width={40} />
               <TableCell>Title</TableCell>
+              <TableCell>Category</TableCell>
               <TableCell>Steps</TableCell>
               <TableCell>Visibility</TableCell>
               <TableCell>Model</TableCell>
@@ -428,7 +436,7 @@ export default function WorkPlans() {
           <TableBody>
             {plans.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={8} align="center" sx={{ py: 4 }}>
+                <TableCell colSpan={9} align="center" sx={{ py: 4 }}>
                   <Typography color="text.secondary">No work plans yet. Create one to get started.</Typography>
                 </TableCell>
               </TableRow>
@@ -447,6 +455,13 @@ export default function WorkPlans() {
                         <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
                           {plan.description.length > 80 ? plan.description.substring(0, 80) + "..." : plan.description}
                         </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {plan.category ? (
+                        <Chip label={plan.category} size="small" variant="outlined" />
+                      ) : (
+                        <Typography variant="caption" color="text.disabled">—</Typography>
                       )}
                     </TableCell>
                     <TableCell>{plan.steps?.length || 0}</TableCell>
@@ -484,7 +499,7 @@ export default function WorkPlans() {
                     </TableCell>
                   </TableRow>
                   <TableRow key={`${plan.planId}-expand`}>
-                    <TableCell colSpan={8} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
+                    <TableCell colSpan={9} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
                       <Collapse in={expandedId === plan.planId}>
                         <Box sx={{ p: 2, bgcolor: "grey.50" }}>
                           {plan.welcomeMessage && (
@@ -542,6 +557,15 @@ export default function WorkPlans() {
                   <MenuItem value="system">System</MenuItem>
                   <MenuItem value="public">Public</MenuItem>
                   <MenuItem value="private">Private</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 160 }}>
+                <InputLabel>Category (Optional)</InputLabel>
+                <Select value={category} label="Category (Optional)" onChange={(e) => setCategory(e.target.value)}>
+                  <MenuItem value=""><em>None</em></MenuItem>
+                  {PLAN_CATEGORIES.map((c) => (
+                    <MenuItem key={c} value={c}>{c}</MenuItem>
+                  ))}
                 </Select>
               </FormControl>
               <FormControl size="small" sx={{ minWidth: 220 }}>
