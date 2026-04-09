@@ -11,6 +11,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Removed Discord Community Link',
+      '- The Discord channel link has been removed from the sidebar, chat support panel, and error messages',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'Work Plan Thumbnails',
       '- Work plans now display AI-generated thumbnail images on the plans selection screen',
       '- Each card shows the thumbnail on the right side alongside the plan title, description, and step count',
