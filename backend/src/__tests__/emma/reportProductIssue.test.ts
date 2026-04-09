@@ -5,15 +5,15 @@ jest.mock('../../services/notionService', () => ({
   createOncallItem: jest.fn(),
 }));
 
-jest.mock('nodemailer', () => ({
-  createTransport: jest.fn(() => ({
-    sendMail: jest.fn().mockResolvedValue({ messageId: 'test' }),
-  })),
-}));
-
 jest.mock('../../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock('../../services/settingsService', () => ({
+  settingsService: {
+    getJsonArraySetting: jest.fn().mockResolvedValue(['founders@agentweb.pro']),
   },
 }));
 
@@ -63,7 +63,6 @@ import { emmaToolRegistry } from '../../emma/registry';
 import { createOncallItem } from '../../services/notionService';
 import { resendService } from '../../services/resendService';
 import { userDb } from '../../services/db';
-import { emailService } from '../../services/emailService';
 
 const mockCreateOncallItem = createOncallItem as jest.MockedFunction<typeof createOncallItem>;
 const mockGetUserById = userDb.getUserById as jest.MockedFunction<typeof userDb.getUserById>;
@@ -92,8 +91,6 @@ describe('report_product_issues tool', () => {
       email: 'customer@example.com',
       displayName: 'Test Customer',
     } as any);
-    // Spy on sendOncallAlert
-    jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
   });
 
   it('should throw if no userId in context', async () => {
@@ -112,7 +109,7 @@ describe('report_product_issues tool', () => {
     )).rejects.toThrow('User not found');
   });
 
-  it('should create Notion item with Oncall and Customer Reported tags for a single issue', async () => {
+  it('should create Notion item with Customer Reported tag for a single issue', async () => {
     const result = await toolExecute(
       { issues: [{ title: 'Login fails', description: 'Cannot log in on mobile', priority: 'High', pageUrl: 'https://app.example.com/login' }] },
       { userId: 'user-123', sessionId: 'sess-456' }
@@ -127,8 +124,10 @@ describe('report_product_issues tool', () => {
       description: 'Cannot log in on mobile',
       additionalTags: ['Customer Reported'],
       context: {
+        'User Name': 'Test Customer',
         'User Email': 'customer@example.com',
         'User ID': 'user-123',
+        'Priority': 'High',
         'Page URL': 'https://app.example.com/login',
         'Session ID': 'sess-456',
       },
@@ -153,7 +152,6 @@ describe('report_product_issues tool', () => {
     expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, notionUrl: 'https://notion.so/p1' });
     expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, notionUrl: 'https://notion.so/p2' });
     expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
-    expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(2);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
   });
 
@@ -178,21 +176,7 @@ describe('report_product_issues tool', () => {
     expect(result.message).toContain('1 of 2');
   });
 
-  it('should send oncall alert email with Notion URL (no duplicate creation)', async () => {
-    await toolExecute(
-      { issues: [{ title: 'Bug', description: 'Desc' }] },
-      { userId: 'user-123' }
-    );
-
-    expect(emailService.sendOncallAlert).toHaveBeenCalledWith(
-      'Customer Report: Bug',
-      'Desc',
-      expect.objectContaining({ 'User Email': 'customer@example.com' }),
-      'https://notion.so/notionpageid' // notionUrl passed to skip duplicate
-    );
-  });
-
-  it('should send support email to founders', async () => {
+  it('should send resend email to founders with Notion URL and user details', async () => {
     await toolExecute(
       { issues: [{ title: 'Bug', description: 'Desc', pageUrl: 'https://app.example.com/page' }] },
       { userId: 'user-123' }
@@ -201,10 +185,20 @@ describe('report_product_issues tool', () => {
     expect(mockResendSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         to: ['founders@agentweb.pro'],
-        subject: expect.stringContaining('Product Issue from customer@example.com'),
+        subject: 'Product Issue from customer@example.com: Bug',
         replyTo: 'customer@example.com',
+        html: expect.stringContaining('https://notion.so/notionpageid'),
       })
     );
+  });
+
+  it('should send only one email per issue (no oncall alert duplicate)', async () => {
+    await toolExecute(
+      { issues: [{ title: 'Bug', description: 'Desc' }] },
+      { userId: 'user-123' }
+    );
+
+    expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
   });
 
   it('should handle missing pageUrl and sessionId gracefully', async () => {
@@ -216,6 +210,7 @@ describe('report_product_issues tool', () => {
     expect(mockCreateOncallItem).toHaveBeenCalledWith(
       expect.objectContaining({
         context: expect.objectContaining({
+          'Priority': 'Medium',
           'Page URL': 'N/A',
           'Session ID': 'N/A',
         }),
