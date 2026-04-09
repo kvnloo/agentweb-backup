@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { getAccessToken, getUsage, listBoards, getBoardAds, getAllBoardAds, getSwipefileAds, searchDiscoveryAds, getAd, formatAdAsMarkdown, ForeplayAd } from '../services/foreplayService';
+import { getAccessToken, getUsage, listBoards, getBoardAds, getAllBoardAds, getSwipefileAds, searchDiscoveryAds, getAd, formatAdAsMarkdown, clearForeplayCacheForToken, ForeplayAd } from '../services/foreplayService';
 
 jest.mock('axios');
 const mockAxiosGet = axios.get as jest.Mock;
@@ -19,6 +19,9 @@ jest.mock('../utils/crypto', () => ({
 describe('foreplayService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Clear in-memory cache so each test starts with a clean slate
+    clearForeplayCacheForToken('fp_token');
+    clearForeplayCacheForToken('fp_test_token');
   });
 
   describe('getAccessToken', () => {

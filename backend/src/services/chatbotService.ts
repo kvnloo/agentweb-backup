@@ -1540,7 +1540,8 @@ export class ChatbotDB {
     portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar",
     limit?: number,
     sortDescending: boolean = true,
-    lastEvaluatedKey?: string
+    lastEvaluatedKey?: string,
+    pageIdentifier?: string
   ): Promise<{ sessions: ChatSession[], lastEvaluatedKey?: any }> {
     console.log(
       `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
@@ -1555,10 +1556,18 @@ export class ChatbotDB {
       },
     };
 
-    // Add portal type filter if specified
+    // Build filter expression
+    const filterParts: string[] = [];
     if (portalType) {
-      params.FilterExpression = 'portalType = :portalType';
+      filterParts.push('portalType = :portalType');
       params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+    if (pageIdentifier) {
+      filterParts.push('pageIdentifier = :pageIdentifier');
+      params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
+    }
+    if (filterParts.length > 0) {
+      params.FilterExpression = filterParts.join(' AND ');
     }
 
     // Add limit if specified
@@ -3146,6 +3155,13 @@ Always call the read tool first before updating to get current values.
 **Books:** **list_books**, **create_book**, **update_book_content**
 
 **Email Templates:** **list_html_templates**, **create_html_from_template**, **update_html_file**
+
+**Scheduled Chats:**
+- **list_scheduled_chats**: List all scheduled chats set up for the user.
+- **manage_scheduled_chat**: Create, update, toggle (pause/resume), or delete a scheduled chat. Use this to automate recurring tasks — e.g. weekly competitive scans, daily SEO monitoring, or periodic outreach campaigns. Use list_scheduled_chats first to check for duplicates.
+- **test_scheduled_chat**: Trigger a one-time test run of a scheduled chat.
+- **get_scheduled_chat_test_history**: Get the test run history for a scheduled chat.
+Always use list_scheduled_chats first before creating a new schedule to check if one already exists.
 
 **Visual Context:**
 - **get_visual_context**: Call this when you need to SEE the page visually (colors, layout, design). A screenshot will be captured and sent in the follow-up message.

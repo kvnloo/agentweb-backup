@@ -9,6 +9,60 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-08',
+    changes: [
+      'Admin: Work Plan Categories',
+      '- Work plans can now be assigned a category (Paid Ads, Strategy, Content, or Other)',
+      '- Category is shown as a column in the work plans table and can be set when creating or editing a plan',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'CRM: Discover Tech Stack for Your Leads',
+      '- New "Discover Tech Stack" action in the CRM lead list — Emma searches job postings and integration pages to identify what software each lead\'s company uses',
+      '- Populates five fields: Analytics, CMS, Marketing tools, Infrastructure, and Integrations (e.g. "Google Analytics", "Shopify", "HubSpot", "AWS", "Stripe")',
+      '- Preview mode shows counts and sample results from 2 leads before committing to a full scan',
+      '- Already-enriched leads are skipped automatically; use "Re-scan" to refresh existing results',
+      '- Available in the list actions menu and as a bulk action when leads are selected',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fix: Agent Mode No Longer Times Out on Long Active Sessions',
+      '- Fixed a false timeout that could occur during long Agent Mode sessions (e.g. 100+ message conversations)',
+      '- Previously, a hard 45-minute timer would kill an in-progress generation even if the agent was actively working and making progress',
+      '- The timer now resets on each progress update, so it only fires after 45 minutes of true inactivity — not total elapsed time',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fix: Emma No Longer Confuses Blog Articles with Reports',
+      '- Emma was sometimes using the blog article tool when asked to create reports, summaries, or analyses — resulting in files named "blog-*.html" for non-blog content',
+      '- Emma now clearly distinguishes: "blog article" → blog tool with hero image; "report / summary / analysis / audit" → HTML document tool',
+      '- Asking for a "weekly performance report", "account summary", or "GTM audit" will now correctly produce a clean HTML document, not a blog post',
+      'Fix: Emma Sidebar Chat Session Persists Across Page Visits',
+      '- Fixed an issue where the Emma sidebar would show an empty conversation after visiting other pages, even though the original chat history existed',
+      '- The sidebar now correctly restores your previous conversation when you return to a page, regardless of which other pages you\'ve visited in between',
+      'Fix: Scheduled Chat Email Notifications Always Populated',
+      '- Emma no longer shows an error when creating a schedule without specifying an email address',
+      '- If no email is provided, results are sent to your account email by default',
+      '- When an admin sets up a schedule via delegate access, results are sent to the admin\'s email instead of the customer\'s email',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Deprecation: Legacy Web Automation Task Tools',
+      '- The \'create_task_from_template\', \'list_task_templates\', and \'create_task_from_prompt\' tools are now deprecated in favor of Emma\'s direct Playwright browser control',
+      '- Emma will now use her built-in browser tools (browser_navigate, browser_click, browser_type, etc.) for web automation instead of delegating to the background agent engine',
+      '- Direct browser control is faster, more flexible, and gives real-time results compared to the legacy background task approach',
+      '- Existing scheduled tasks using templates continue to work — only new requests from Emma are redirected to direct browser control',
+    ],
+  },
+  {
     date: '2026-04-07',
     changes: [
       'Account Summary Now Shows Per-Session AI Highlights',
@@ -3872,6 +3926,78 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: Work Plans Edit Dialog No Longer Crashes',
       '- The edit dialog in Settings → Work Plans now opens correctly without crashing the page',
       '- Previously, opening the edit dialog caused an error that broke the entire Work Plans tab',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'CRM: See When Each Lead Was Added or Updated',
+      '- Two new optional columns in your leads table: "Date Added" and "Last Updated"',
+      '- Enable them via the Configure Fields button (gear icon) next to your leads list',
+      '- Timestamps display as relative time (e.g. "12d ago") with the exact date on hover',
+      '- Both columns are sortable — click the header to sort by newest or oldest',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Can Now Wait and Check Results',
+      '- Emma can pause for a set number of seconds before checking on something — useful when waiting for a post to publish, an email to arrive, or any async result to become available',
+      '- When waiting, Emma will tell you what she\'s waiting for and why',
+      '- Use cases: "post this to LinkedIn then check if it published", "send this email and wait for a reply", "submit this form and verify the confirmation page appears"',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fixed: "Start Test Run" No Longer Shows a False Failure',
+      '- Clicking "Start Test Run" on a schedule now correctly shows a confirmation that the test has started',
+      '- Previously, the button always showed "Test Failed — Unknown error" even though the test was actually running in the background',
+      '- Results still appear in the run history when the test completes',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Creates Schedules More Reliably',
+      '- Emma now provides clearer self-correction when creating a scheduled chat — reducing the number of retries before a schedule is successfully created',
+      '- If a required field is missing, Emma receives a specific error message identifying which fields to add, so she can fix the issue in the next attempt',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Now Knows She Can Create Scheduled Chats',
+      '- Emma will now proactively offer to set up recurring schedules when you ask for automated or recurring tasks',
+      '- Previously, Emma would say she couldn\'t create schedules even though the capability was available — you had to remind her',
+      '- Example: ask Emma to "run a weekly brand guidelines review every Monday" and she\'ll set it up directly',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
+      'Automatic Error Reporting to Oncall',
+      '- When a backend operation fails in a user-facing way (such as a schedule manual run failing), the system automatically creates a Notion oncall item tagged "UI Error"',
+      '- Frontend errors (unhandled promise rejections, JavaScript crashes) are also captured and routed to oncall',
+      '- Duplicate errors within 30 minutes are deduplicated — repeated failures from the same user clicking multiple times will only create one oncall item',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Foreplay Ad Library Now Has Its Own Dedicated Tool',
+      '- Foreplay ads are no longer searched automatically every time you use the knowledge base',
+      '- A new "search_ads_knowledge_base" tool lets Emma search your Foreplay swipefile and boards only when you explicitly ask for ad inspiration or competitor research',
+      '- Reduces unnecessary Foreplay API credit usage from unrelated knowledge base queries',
+      '- Foreplay results are now cached for 5 minutes to prevent repeated API calls within the same session',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fixed: Deleting a Brand Guide Document No Longer Removes Your Logos',
+      '- Deleting a brand guide PDF from the Brand Guidelines page now correctly removes only that document — logos and secondary logos are preserved',
+      '- Fixed a data consistency issue where logos uploaded just before saving or deleting could be silently lost due to a stale database read',
     ],
   },
 ];

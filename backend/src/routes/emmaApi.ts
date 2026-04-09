@@ -70,6 +70,16 @@ router.post('/search-knowledge-base', async (req: Request, res: Response) => {
   }
 });
 
+router.post('/search-ads-knowledge-base', async (req: Request, res: Response) => {
+  try {
+    const svc = await getAgentModeService();
+    const result = await svc.searchForeplayAds(req.body.query, req.body.max_results || 5, userId(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.post('/read-knowledge-base-files', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();

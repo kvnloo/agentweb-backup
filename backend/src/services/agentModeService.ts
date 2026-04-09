@@ -458,6 +458,36 @@ export class AgentModeService {
         return this.executeSearchToolResponse(args);
       }
     });
+
+    this.toolRegistry.register({
+      name: 'wait_seconds',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'wait_seconds',
+          description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
+          parameters: {
+            type: 'object',
+            properties: {
+              seconds: {
+                type: 'number',
+                description: 'Number of seconds to wait (max 300)'
+              },
+              reason: {
+                type: 'string',
+                description: 'Brief explanation of what you are waiting for (shown to the user)'
+              }
+            },
+            required: ['seconds', 'reason']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
+        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
+      }
+    });
   }
 
   async getDefaultModel(): Promise<string> {
@@ -1640,21 +1670,44 @@ export class AgentModeService {
           }
         }
 
-        // Phase 2: Execute all prepared tools in parallel
-        const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
-          const toolStart = Date.now();
-          try {
-            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
-            const toolDuration = Date.now() - toolStart;
-            return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
-          } catch (error) {
-            const toolDuration = Date.now() - toolStart;
-            return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
-          }
-        });
+        // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
+        // Sequential is required when wait_seconds is in the batch so the wait happens
+        // in the correct order relative to the tools before/after it.
+        const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
 
-        const toolResults = await Promise.all(toolPromises);
+        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
+
+        if (hasWaitTool) {
+          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools
+          toolResults = [];
+          for (const { toolCall, functionArgs } of preparedCalls) {
+            const toolStart = Date.now();
+            try {
+              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolDuration = Date.now() - toolStart;
+              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
+            } catch (error) {
+              const toolDuration = Date.now() - toolStart;
+              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration });
+            }
+          }
+        } else {
+          // Parallel execution (default)
+          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
+            const toolStart = Date.now();
+            try {
+              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolDuration = Date.now() - toolStart;
+              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
+            } catch (error) {
+              const toolDuration = Date.now() - toolStart;
+              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
+            }
+          });
+          toolResults = await Promise.all(toolPromises);
+        }
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -2021,21 +2074,20 @@ export class AgentModeService {
       - Do NOT start executing until all required skills are installed
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
 
-## Task Creation Approach
-- **IMPORTANT**: Always confirm with the user before calling 'create_task_from_template' or 'create_task_from_prompt', as these web automation tasks can take several minutes and cannot be cancelled once started. This confirmation requirement applies ONLY to these two tools — do NOT ask for confirmation before using other tools such as linkedin_outreach, post_on_connected_account, add_leads_to_list, or any other direct-execution tool.
-- **Confirmation required for web automation only**: Explain what the browser automation task will do and get explicit approval before creating it.
-- **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
-- **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
-- Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
-- Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
-- Example: {"site_url": "example.com", "business_area": "e-commerce"}
-- Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: [DEPRECATED: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.]
+## Web Automation Approach
+- **Preferred Method**: Use the 'browser_*' Playwright tools (browser_navigate, browser_click, browser_type, browser_snapshot, etc.) for any web automation task — browsing, form filling, scraping, logging in, etc. These tools give Emma direct, real-time browser control and are faster and more flexible than the legacy agent engine.
+- **[DEPRECATED] Legacy Template Tasks**: 'create_task_from_template' and 'list_task_templates' are legacy tools that delegate to a background agent engine (takes several minutes, cannot be cancelled). Only use these if the task genuinely cannot be done with direct browser control — for example, if a specific template exists that adds significant value beyond what direct browsing can achieve.
+- **[DEPRECATED] Fallback Method**: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.
+- **Confirmation required for legacy template tasks only**: If you must use 'create_task_from_template', always confirm with the user first — explain what the task will do, that it takes several minutes, and that it cannot be cancelled once started. This does NOT apply to direct browser_* tools.
+- **[DEPRECATED] Image Generation via task**: 'create_image_task_from_prompt' is deprecated — use 'generate_image' instead.
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
- - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
-   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
+ - **Blog Articles vs HTML Reports — choose carefully**:
+   - **Blog Articles** → use 'create_blog_article': ONLY for blog posts intended for publishing to a CMS (Basehub, Webflow). Generates a hero image and blog-styled HTML. Do NOT use for reports, summaries, analyses, or audits.
+   - **Reports, Summaries, Analyses, Audits** → use 'create_html_file': For any HTML document that is NOT a blog post — e.g. weekly performance reports, account summaries, GTM audits, competitive analyses, executive summaries, and similar structured documents. Never use create_blog_article for these.
+   - **Decision rule**: If the user says "report", "summary", "analysis", "audit", "document", or anything that is not clearly a blog post → use 'create_html_file'. Only use 'create_blog_article' when the user explicitly asks for a "blog article", "blog post", or content for their website blog.
+   - **When to use deep_research:true on create_blog_article**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
 - **Meta Ads Campaigns and Metrics**:
 - Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
 - Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data for selected campaigns
@@ -2057,8 +2109,8 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, ClickUp tasks (with attachments), and Foreplay ad library (saved ads and boards). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
-- **Foreplay Ad Library**: When creating new ads or looking for ad inspiration, search the knowledge base for Foreplay ads. Foreplay boards and swipefile ads appear as knowledge base entries with identifiers like "foreplay-board:BOARD_ID" and "foreplay-swipefile". Read individual ads to get full ad copy, headlines, CTAs, formats, and video transcriptions that can serve as seed ads.
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Foreplay Ad Library**: When the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads, use 'search_ads_knowledge_base'. This searches only the user's Foreplay swipefile and boards. Use this for ad-specific queries (e.g. "find video ads from competitors", "show me carousel ads in our swipefile"). Do NOT use search_knowledge_base for Foreplay ad searches.
 - **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
@@ -2117,6 +2169,13 @@ Save the chart image URLs from the response.
       - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
       - imagine: false (stick to research facts, don't invent details)
 
+## Waiting for Results
+- Use wait_seconds when you need to pause before checking a result — e.g. waiting for a LinkedIn post to propagate, an email to land, a page to update, or any async operation to settle
+- **Pattern**: call the action tool, then wait_seconds, then call the check/verify tool — all in the same turn. The batch will execute sequentially in order.
+- **Max wait**: 300 seconds (5 minutes) per call. For longer waits, chain multiple wait+check turns or tell the user to ask you again later.
+- **Always tell the user** what you are waiting for and why before calling wait_seconds
+- **Do not over-wait**: use the shortest reasonable delay. Typical values: 5–15s for page propagation, 30–60s for email/notification delivery, 120–300s for async processing.
+
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
 - The tool call results will include the current status of any running tasks
@@ -2132,12 +2191,11 @@ Save the chart image URLs from the response.
 - **Brand context first**: Before asking the user for business details (company name, website, goals, target market, brand voice, etc.), ALWAYS call read_brand_guidelines and read_market_strategy first. These tools frequently contain exactly the information you need. Only ask the user if these tools return nothing useful.
 - **Never ask twice**: If you've already asked for a piece of information in this conversation and the user has not provided it, do NOT ask again. Instead, proceed using whatever context is available from brand guidelines, market strategy, or reasonable defaults.
 - **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
-- **Web automation task confirmation required**: Before calling 'create_task_from_template', explain what the browser automation task will do and confirm with the user (these tasks take time and cannot be cancelled). This does NOT apply to direct-execution tools like linkedin_outreach or post_on_connected_account.
-- **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
+- **[DEPRECATED] Legacy task confirmation required**: If you must use 'create_task_from_template', explain what the task will do and confirm with the user first (these tasks take time and cannot be cancelled). For direct browser_* tools, no confirmation is needed — just proceed.
+- **Prefer direct browser tools**: For any web browsing or automation, use browser_navigate, browser_click, browser_type, etc. directly — do not use create_task_from_template unless there is a strong reason.
 - Provide clear explanations of what you're doing and what information you've found
 - Keep responses concise but informative
-- Always confirm web automation task creation and provide relevant details
-- When using templates, explain which template was selected and why
+- When using legacy templates, explain which template was selected and why
 - When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
 - Focus on actionable insights and strategic guidance based on current data and conversation context
 - If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
@@ -2581,6 +2639,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'slack_list_channels',
     'slack_get_recent_messages',
     'slack_send_message',
+
+    // Timing
+    'wait_seconds',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -3404,6 +3465,20 @@ When a user requests client onboarding or says "onboard new client" or similar:
             }
           ],
           totalResults: 2
+        };
+
+      case 'search_ads_knowledge_base':
+        return {
+          success: true,
+          message: `Found 2 mock Foreplay ads matching "${args.query}"`,
+          query: args.query,
+          results: [
+            {
+              content: `# Mock Video Ad\n\n**Brand:** Acme Corp\n**Format:** video\n**Platform:** facebook\n\n## Headline\nBest Product Ever\n\n## Description\nThis is a mock Foreplay ad result for "${args.query}".`,
+              source: 'foreplay-swipefile/Acme Corp/Mock Video Ad'
+            }
+          ],
+          totalResults: 1
         };
 
       case 'list_knowledge_base_files':
@@ -12378,72 +12453,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
-      // Search Foreplay ads (swipefile + boards — name/description/headline match)
-      if (userId) {
-        try {
-          const foreplayToken = await getForeplayAccessToken(userId);
-          if (foreplayToken) {
-            const queryLower = query.toLowerCase();
-            let foreplayResultCount = 0;
-
-            // Search swipefile ads
-            try {
-              const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
-              for (const ad of swipeResult.ads) {
-                if (foreplayResultCount >= limitedMaxResults) break;
-                const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
-                const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
-                const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
-                const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
-                if (nameMatch || descMatch || headlineMatch || brandMatch) {
-                  const content = formatForeplayAdAsMarkdown(ad);
-                  results.push({
-                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
-                    source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
-                  });
-                  foreplayResultCount++;
-                }
-              }
-            } catch (swipeErr) {
-              console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
-            }
-
-            // Search board ads
-            try {
-              const boards = await listForeplayBoards(foreplayToken);
-              for (const board of boards) {
-                if (foreplayResultCount >= limitedMaxResults) break;
-                try {
-                  const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
-                  for (const ad of boardAds) {
-                    if (foreplayResultCount >= limitedMaxResults) break;
-                    const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
-                    const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
-                    const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
-                    const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
-                    if (nameMatch || descMatch || headlineMatch || brandMatch) {
-                      const content = formatForeplayAdAsMarkdown(ad);
-                      results.push({
-                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
-                        source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
-                      });
-                      foreplayResultCount++;
-                    }
-                  }
-                } catch (boardErr) {
-                  console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
-                }
-              }
-            } catch (boardsErr) {
-              console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
-            }
-          }
-        } catch (foreplayError) {
-          console.log('AgentMode: Error searching Foreplay ads:', foreplayError);
-          // Don't fail the whole search if Foreplay search fails
-        }
-      }
-
       if (results.length === 0) {
         return {
           success: true,
@@ -12466,6 +12475,107 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search the knowledge base. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Search Foreplay ads only (swipefile + boards). Use this tool when the query is ads-related.
+  public async searchForeplayAds(query: string, maxResults: number = 5, userId?: string): Promise<any> {
+    try {
+      if (!userId) {
+        return { success: false, message: 'User ID required to search Foreplay ads.', results: [], totalResults: 0 };
+      }
+
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return {
+          success: false,
+          message: 'No Foreplay account connected. Connect your Foreplay account in Knowledge Base settings.',
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      const limitedMaxResults = Math.min(maxResults, 10);
+      const queryLower = query.toLowerCase();
+      const results: Array<{ content: string; source: string }> = [];
+      let foreplayResultCount = 0;
+
+      // Search swipefile ads
+      try {
+        const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+        for (const ad of swipeResult.ads) {
+          if (foreplayResultCount >= limitedMaxResults) break;
+          const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+          const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+          const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+          const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+          if (nameMatch || descMatch || headlineMatch || brandMatch) {
+            const content = formatForeplayAdAsMarkdown(ad);
+            results.push({
+              content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+              source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+            });
+            foreplayResultCount++;
+          }
+        }
+      } catch (swipeErr) {
+        console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+      }
+
+      // Search board ads
+      try {
+        const boards = await listForeplayBoards(foreplayToken);
+        for (const board of boards) {
+          if (foreplayResultCount >= limitedMaxResults) break;
+          try {
+            const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+            for (const ad of boardAds) {
+              if (foreplayResultCount >= limitedMaxResults) break;
+              const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+              const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+              const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+              const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+              if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                const content = formatForeplayAdAsMarkdown(ad);
+                results.push({
+                  content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                  source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                });
+                foreplayResultCount++;
+              }
+            }
+          } catch (boardErr) {
+            console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
+          }
+        }
+      } catch (boardsErr) {
+        console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+      }
+
+      if (results.length === 0) {
+        return {
+          success: true,
+          message: `No Foreplay ads found matching "${query}"`,
+          query,
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      return {
+        success: true,
+        message: `Found ${results.length} Foreplay ads matching "${query}"`,
+        query,
+        results,
+        totalResults: results.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching Foreplay ads:', error);
+      return {
+        success: false,
+        message: 'Failed to search Foreplay ads. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }

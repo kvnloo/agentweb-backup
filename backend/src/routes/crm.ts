@@ -2287,6 +2287,101 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
   }
 });
 
+const TECH_STACK_INSTRUCTION = `Research what software tools, platforms, and services this company uses across their tech stack. Search for: (1) their job postings mentioning required tools/technologies, (2) their website's integrations, apps, or plugins page, (3) any public case studies, partner badges, or technology partnership listings.
+For each category, list the specific tool names found (comma-separated), for example "Google Analytics, Mixpanel". If nothing is found for a category, return "Unknown".
+- tech_stack_analytics: Analytics and visitor-tracking tools (e.g. Google Analytics, Mixpanel, Heap, Segment)
+- tech_stack_cms: CMS or e-commerce platform (e.g. WordPress, Shopify, Webflow, Magento)
+- tech_stack_marketing: Marketing automation, email, and CRM tools (e.g. HubSpot, Klaviyo, Mailchimp, Marketo)
+- tech_stack_infrastructure: Hosting, CDN, and cloud infrastructure (e.g. AWS, Cloudflare, Netlify, Azure)
+- tech_stack_integrations: Other notable integrations and tools (e.g. Stripe, Zendesk, Intercom, Zapier)`;
+
+const TECH_STACK_OUTPUT_FIELDS = [
+  'tech_stack_analytics',
+  'tech_stack_cms',
+  'tech_stack_marketing',
+  'tech_stack_infrastructure',
+  'tech_stack_integrations',
+];
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-tech-stack
+ * @desc Discover tech stack for leads via LLM + web search (job postings, integration pages)
+ * @access Private
+ * @query mode - "preview" (default) or "enrich"
+ */
+router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const mode = (req.query.mode as string || 'preview').toLowerCase();
+    const forceEnrich = req.body.forceEnrich === true;
+    const socketId = typeof req.body.socketId === 'string' ? req.body.socketId : undefined;
+    const leadIds: string[] | undefined = Array.isArray(req.body.leadIds) ? req.body.leadIds : undefined;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    const spec = {
+      listId,
+      userId,
+      instruction: TECH_STACK_INSTRUCTION,
+      outputFields: TECH_STACK_OUTPUT_FIELDS,
+      sources: ['web_search' as const],
+      forceOverwrite: forceEnrich,
+      leadIds,
+    };
+
+    if (mode === 'preview') {
+      const result = await service.preview(spec);
+      const sampleResults = result.samples.map(s => ({
+        leadId: s.leadId,
+        leadName: [s.lead.firstName, s.lead.lastName].filter(Boolean).join(' ') || s.lead.company || s.lead.email || s.leadId,
+        fieldResults: s.enrichedFields,
+      }));
+      return res.json({
+        success: true,
+        totalLeads: result.totalLeads,
+        leadsToProcess: result.leadsToProcess,
+        alreadyEnrichedCount: result.alreadyEnriched,
+        sampleResults,
+      });
+    }
+
+    if (mode === 'enrich') {
+      const result = await service.execute(spec, socketId, {
+        progressEvent: 'crm-tech-stack-progress',
+        completeEvent: 'crm-tech-stack-complete',
+      });
+      return res.json({
+        success: true,
+        message: result.failedCount > 0
+          ? `Completed: ${result.processedCount} enriched, ${result.failedCount} failed`
+          : `Successfully enriched ${result.processedCount} leads`,
+        processedCount: result.processedCount,
+        failedCount: result.failedCount,
+        nodomainCount: 0,
+      });
+    }
+
+    return res.status(400).json({ message: 'Invalid mode. Use "preview" or "enrich"' });
+  } catch (error: any) {
+    console.error('[CRM] enrich-tech-stack error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to enrich tech stack' });
+  }
+});
+
 /**
  * @route GET /api/crm/lists/:listId/leads/:leadId/engagements
  * @desc Get engagements for a lead

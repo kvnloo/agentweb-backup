@@ -1655,9 +1655,10 @@ export const agentModeController = {
       const lastEvaluatedKey = req.query.lastEvaluatedKey as string;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 100); // Max 100 per request
       const portalType = (req.query.portalType as string) === 'emma-sidebar' ? 'emma-sidebar' as const : 'agent' as const;
+      const pageIdentifier = req.query.pageIdentifier as string | undefined;
 
       // Get sessions with pagination
-      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey);
+      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier);
 
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSessions = result.sessions.map(session => ({
@@ -3413,7 +3414,12 @@ export const agentModeController = {
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
-        return res.status(400).json({ error: 'Missing required fields' });
+        const missing = [
+          !scheduleName && 'scheduleName',
+          !startingMessage && 'startingMessage',
+          !scheduleFrequency && 'scheduleFrequency',
+        ].filter(Boolean).join(', ');
+        return res.status(400).json({ error: `Missing required fields: ${missing}` });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency
@@ -3500,14 +3506,19 @@ export const agentModeController = {
         });
       }
 
-      // When variables are present but unfilled, fall back to user's own email so LLMs
-      // don't need to know this requirement.
+      // When no email is provided, fall back to the requester's email so LLMs don't need to
+      // know this requirement. On delegate access use the admin's email (the person setting
+      // up the schedule), not the target account's email.
+      // Exception: variables are present and all pre-filled (silent run).
+      const authReqForEmail = req as AuthenticatedRequest;
+      const fallbackEmail = authReqForEmail.delegateInfo?.isDelegated
+        ? authReqForEmail.delegateInfo.adminEmail
+        : user.email;
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
       const normalizedEmails = normalizeEmailList(emailNotifications);
-      scheduledChat.emailNotifications = (normalizedVariables.length > 0 && !allVariablesPrefilled && normalizedEmails.length === 0)
-        ? [user.email]
-        : normalizedEmails;
+      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
+      scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -4099,7 +4110,20 @@ export const agentModeController = {
           }
         }
       };
-      backgroundRun().catch(err => console.error('AgentMode: Background test run error:', err));
+      backgroundRun().catch(err => {
+        console.error('AgentMode: Background test run error:', err);
+        const { reportUIError } = require('../utils/errorReporter');
+        reportUIError({
+          operation: 'schedule-manual-run',
+          errorMessage: err?.message || String(err),
+          userId: user.userId,
+          context: {
+            'Schedule ID': scheduleId,
+            'Schedule Name': schedule.scheduleName || 'unknown',
+            'Run ID': runId,
+          },
+        }).catch((reportErr: Error) => console.error('errorReporter failed:', reportErr));
+      });
 
       res.json({
         runId,
