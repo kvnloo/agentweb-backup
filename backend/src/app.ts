@@ -303,4 +303,20 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "healthy" });
 });
 
+// Global error handler — catches unhandled errors from all routes and reports them to Notion
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error("Unhandled route error:", err);
+  const { reportUIError } = require("./utils/errorReporter");
+  reportUIError({
+    operation: `${req.method} ${req.path}`,
+    errorMessage: err.message || String(err),
+    userId: (req as any).user?.userId,
+    context: { Path: req.path, Method: req.method },
+  }).catch((reportErr: Error) => console.error("errorReporter failed:", reportErr));
+  if (!res.headersSent) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 export default app;

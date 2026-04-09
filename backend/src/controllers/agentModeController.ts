@@ -4110,7 +4110,20 @@ export const agentModeController = {
           }
         }
       };
-      backgroundRun().catch(err => console.error('AgentMode: Background test run error:', err));
+      backgroundRun().catch(err => {
+        console.error('AgentMode: Background test run error:', err);
+        const { reportUIError } = require('../utils/errorReporter');
+        reportUIError({
+          operation: 'schedule-manual-run',
+          errorMessage: err?.message || String(err),
+          userId: user.userId,
+          context: {
+            'Schedule ID': scheduleId,
+            'Schedule Name': schedule.scheduleName || 'unknown',
+            'Run ID': runId,
+          },
+        }).catch((reportErr: Error) => console.error('errorReporter failed:', reportErr));
+      });
 
       res.json({
         runId,
