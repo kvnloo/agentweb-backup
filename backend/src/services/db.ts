@@ -1430,8 +1430,8 @@ export const taskDb = {
 
       // Check attachment limit
       const currentAttachments = task.attachments || [];
-      if (currentAttachments.length >= 5) {
-        throw new Error("Maximum number of attachments (5) reached");
+      if (currentAttachments.length >= 10) {
+        throw new Error("Maximum number of attachments (10) reached");
       }
 
       // Generate a random token (32 characters)

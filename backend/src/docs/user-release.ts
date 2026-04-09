@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Increased File Attachment Limit to 10',
+      '- You can now attach up to 10 files per message or task (previously limited to 5)',
+      '- Applies to Agent Mode, Task Details, Books, Videos, Images, and Research Reports',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'Removed Discord Community Link',
       '- The Discord channel link has been removed from the sidebar, chat support panel, and error messages',
     ],
