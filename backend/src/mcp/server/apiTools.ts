@@ -15,7 +15,7 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function ctx(context: any) {
-  return { userId: context?.userId, agentUserId: context?.agentUserId };
+  return { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
 }
 
 function jsonResult(data: unknown) {
