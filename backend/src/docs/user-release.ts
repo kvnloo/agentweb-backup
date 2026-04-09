@@ -3974,6 +3974,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-09',
+    changes: [
+      'Automatic Error Reporting to Oncall',
+      '- When a backend operation fails in a user-facing way (such as a schedule manual run failing), the system automatically creates a Notion oncall item tagged "UI Error"',
+      '- Frontend errors (unhandled promise rejections, JavaScript crashes) are also captured and routed to oncall',
+      '- Duplicate errors within 30 minutes are deduplicated — repeated failures from the same user clicking multiple times will only create one oncall item',
+    ],
+  },
+  {
     date: '2026-04-08',
     changes: [
       'Foreplay Ad Library Now Has Its Own Dedicated Tool',
