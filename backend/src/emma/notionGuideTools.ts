@@ -147,11 +147,16 @@ If neither parameter is provided, blocks are appended to the very end of the pag
         afterBlockId = args.insertAfterBlockId;
       }
 
-      const result = await appendBlocks(parentId, args.blocks, afterBlockId);
+      const blocks = typeof args.blocks === 'string' ? JSON.parse(args.blocks) : args.blocks;
+      if (!Array.isArray(blocks)) {
+        return { success: false, message: 'blocks must be an array of {type, text} objects' };
+      }
+
+      const result = await appendBlocks(parentId, blocks, afterBlockId);
       const location = afterBlockId
         ? `after block ${afterBlockId}`
         : 'at the end of the page';
-      return { success: true, message: `Appended ${args.blocks.length} block(s) successfully (${location}).`, result };
+      return { success: true, message: `Appended ${blocks.length} block(s) successfully (${location}).`, result };
     } catch (error: any) {
       return { success: false, message: `Failed to append blocks: ${error.message}` };
     }
