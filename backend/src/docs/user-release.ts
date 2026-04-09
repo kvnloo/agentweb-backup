@@ -4053,6 +4053,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Website Scan Now Suggests How to Fix Each Issue',
+      '- When setting up a website scan from Brand Guidelines, the recurring scan will now include a suggested fix step for each issue found',
+      '- Previously, the scan only reported problems — now it also tells you what action to take to resolve each one',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'Fixed: Scheduled Chat Result Emails Now Render Formatted Content',
       '- AI responses in scheduled chat result emails now display with proper formatting — headings, bold text, bullet lists, and code snippets render correctly',
       '- Previously, raw markdown syntax (e.g., **bold**, ### headers) appeared as literal characters in the email body',
