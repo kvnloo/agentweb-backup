@@ -1697,8 +1697,11 @@ export class AgentModeService {
           for (const { toolCall, functionArgs } of preparedCalls) {
             const toolStart = Date.now();
             try {
-              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolOptions: Record<string, any> = {};
+              if (socketEmit) toolOptions.socketEmit = socketEmit;
+              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
+              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
               const toolDuration = Date.now() - toolStart;
               toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
             } catch (error) {
@@ -1711,8 +1714,11 @@ export class AgentModeService {
           const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
             const toolStart = Date.now();
             try {
-              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolOptions: Record<string, any> = {};
+              if (socketEmit) toolOptions.socketEmit = socketEmit;
+              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
+              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
               const toolDuration = Date.now() - toolStart;
               return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
             } catch (error) {
@@ -2846,7 +2852,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     return skills;
   }
 
-  public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
+  public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
         skillService.getSkillsAvailableToUser(userId),
@@ -2873,7 +2879,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
       const validSkillIds = skillIds.filter(id => {
         const skill = publishedSkills.find(s => s.skillId === id);
         const isOwnSkill = skill && skill.ownerId === userId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || skill) &&
+        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
           (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
       });
 
