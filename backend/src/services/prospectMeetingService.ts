@@ -110,14 +110,28 @@ function getTemporalStatus(
 function classifyMeetingStatus(
   temporalStatus: 'past' | 'upcoming' | 'canceled',
   speakerAnalysis: { total: number; hasExternalSpeaker: boolean } | undefined,
+  /**
+   * Fallback signal from the Fathom listing response. When the transcript is
+   * unavailable (common for fresh recordings where `GET /recordings/:id/transcript`
+   * returns empty), we still know from the calendar invitees whether the
+   * meeting had any external attendees. If the prospect was invited AND a
+   * recording exists in the matching window, treat it as `talked` rather than
+   * silently falling through to `no-show`.
+   */
+  fathomHasExternalInvitees?: boolean,
 ): 'talked' | 'no-show' | 'upcoming' | 'canceled' {
   if (temporalStatus === 'canceled') return 'canceled';
   if (temporalStatus === 'upcoming') return 'upcoming';
 
-  // Past event — check if an external person actually spoke
+  // Past event — transcript speaker diarization is the strongest signal.
   if (speakerAnalysis?.hasExternalSpeaker) return 'talked';
 
-  // Only internal speakers, no recording, or no external speaker = no-show
+  // Fallback: transcript unavailable but Fathom says the recording had
+  // external invitees. A recording only exists if someone joined the call,
+  // so this is a reliable signal that a conversation happened.
+  if (!speakerAnalysis && fathomHasExternalInvitees) return 'talked';
+
+  // Only internal speakers, no recording, or no external signal = no-show
   return 'no-show';
 }
 
@@ -253,11 +267,26 @@ interface FathomRecordingMatch {
   url: string;
   startTime: string; // recording start time (ISO)
   endTime: string;
+  /**
+   * Fathom listing response flag derived from `calendar_invitees_domains_type`.
+   * True when the meeting had at least one external invitee. Used as a
+   * fallback signal when transcript speaker diarization is unavailable.
+   */
+  hasExternalInvitees: boolean;
 }
+
+/** Safety cap on Fathom pagination — 20 pages × 10/page = 200 recordings. */
+export const FATHOM_MAX_PAGES = 20;
 
 /**
  * Fetch Fathom meetings/recordings in a date range.
- * Returns an array of recordings with their start times for ±15min matching.
+ *
+ * Fathom's `/v1/meetings` endpoint paginates with `next_cursor` (default page
+ * size of 10). This function follows the cursor until exhausted or until
+ * FATHOM_MAX_PAGES is reached, so that a customer with 70+ recordings in the
+ * last 30 days does not silently lose all but the first 10.
+ *
+ * Returns an array of recordings with their start times for ±15 min matching.
  */
 async function getFathomRecordings(
   userId: string,
@@ -265,39 +294,60 @@ async function getFathomRecordings(
   endDate: string,
 ): Promise<FathomRecordingMatch[]> {
   const recordings: FathomRecordingMatch[] = [];
+  const accessToken = await getFathomAccessToken(userId);
+  if (!accessToken) return recordings;
+
+  let cursor: string | undefined;
+  let pageCount = 0;
 
   try {
-    const accessToken = await getFathomAccessToken(userId);
-    if (!accessToken) return recordings;
-
-    const params = new URLSearchParams({
-      created_after: startDate,
-      created_before: endDate,
-    });
-
-    const response = await axios.get(`${FATHOM_API_BASE}/meetings?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      timeout: 10000,
-    });
-
-    const rawData = response.data as any;
-    const meetingsArray = Array.isArray(rawData) ? rawData
-      : Array.isArray(rawData?.items) ? rawData.items
-      : Array.isArray(rawData?.calls) ? rawData.calls
-      : Array.isArray(rawData?.meetings) ? rawData.meetings
-      : [];
-
-    for (const m of meetingsArray) {
-      const startTime = m.scheduled_start_time || m.recording_start_time || m.created_at;
-      if (!startTime) continue;
-
-      recordings.push({
-        recordingId: m.recording_id,
-        title: m.title || m.meeting_title || '',
-        url: m.url || m.share_url || '',
-        startTime,
-        endTime: m.recording_end_time || '',
+    do {
+      const params = new URLSearchParams({
+        created_after: startDate,
+        created_before: endDate,
       });
+      if (cursor) params.set('cursor', cursor);
+
+      const response = await axios.get(
+        `${FATHOM_API_BASE}/meetings?${params.toString()}`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+          timeout: 10000,
+        },
+      );
+
+      const rawData = response.data as any;
+      const meetingsArray = Array.isArray(rawData) ? rawData
+        : Array.isArray(rawData?.items) ? rawData.items
+        : Array.isArray(rawData?.calls) ? rawData.calls
+        : Array.isArray(rawData?.meetings) ? rawData.meetings
+        : [];
+
+      for (const m of meetingsArray) {
+        const startTime = m.scheduled_start_time || m.recording_start_time || m.created_at;
+        if (!startTime) continue;
+
+        recordings.push({
+          recordingId: m.recording_id,
+          title: m.title || m.meeting_title || '',
+          url: m.url || m.share_url || '',
+          startTime,
+          endTime: m.recording_end_time || '',
+          hasExternalInvitees: m.calendar_invitees_domains_type === 'one_or_more_external',
+        });
+      }
+
+      cursor = typeof rawData?.next_cursor === 'string' && rawData.next_cursor.length > 0
+        ? rawData.next_cursor
+        : undefined;
+      pageCount++;
+    } while (cursor && pageCount < FATHOM_MAX_PAGES);
+
+    if (cursor) {
+      console.warn(
+        `[ProspectMeeting] Hit FATHOM_MAX_PAGES (${FATHOM_MAX_PAGES}) — truncating Fathom recordings. ` +
+        `Fetched ${recordings.length} records so far.`,
+      );
     }
   } catch (err: any) {
     console.warn('[ProspectMeeting] Fathom fetch failed (non-fatal):', err?.message);
@@ -305,6 +355,14 @@ async function getFathomRecordings(
 
   return recordings;
 }
+
+// Exported for test harness so we can exercise pagination + the fallback
+// classification path without going through the full calendar flow.
+export const __test__ = {
+  getFathomRecordings,
+  classifyMeetingStatus,
+  findMatchingRecording,
+};
 
 /**
  * Match a calendar event to a Fathom recording by time window (±15 minutes).
@@ -534,10 +592,15 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
     const meetings: ProspectMeeting[] = [];
     let noShows = 0;
     let talked = 0;
+    let externalEvents = 0;
+    let pastExternal = 0;
+    let matched = 0;
+    let transcriptOk = 0;
 
     for (const event of currentEvents) {
       const externalAttendees = getExternalAttendees(event.attendees);
       if (externalAttendees.length === 0) continue; // internal-only meeting
+      externalEvents++;
 
       const temporalStatus = getTemporalStatus(event.end, event.status);
 
@@ -545,17 +608,26 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
       let speakerAnalysis: { total: number; hasExternalSpeaker: boolean } | undefined;
       let recordingUrl: string | undefined;
       let recordingId: number | undefined;
+      let matchedRecordingHasExternalInvitees = false;
 
       if (temporalStatus === 'past') {
+        pastExternal++;
         const recording = findMatchingRecording(event.start, fathomRecordings);
         if (recording) {
+          matched++;
           recordingUrl = recording.url;
           recordingId = recording.recordingId;
+          matchedRecordingHasExternalInvitees = recording.hasExternalInvitees;
           speakerAnalysis = await analyzeSpeakers(userId, recording.recordingId);
+          if (speakerAnalysis) transcriptOk++;
         }
       }
 
-      const status = classifyMeetingStatus(temporalStatus, speakerAnalysis);
+      const status = classifyMeetingStatus(
+        temporalStatus,
+        speakerAnalysis,
+        matchedRecordingHasExternalInvitees,
+      );
       if (status === 'no-show' || status === 'canceled') noShows++;
       if (status === 'talked') talked++;
 
@@ -594,12 +666,24 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
 
         const recording = findMatchingRecording(event.start, previousRecordings);
         const sa = recording ? await analyzeSpeakers(userId, recording.recordingId) : undefined;
-        const prevStatus = classifyMeetingStatus(temporalStatus, sa);
+        const prevStatus = classifyMeetingStatus(
+          temporalStatus,
+          sa,
+          recording?.hasExternalInvitees,
+        );
         if (prevStatus === 'talked') previousPeriodMeetings++;
       }
     } catch {
       // Non-fatal — comparison data is optional
     }
+
+    const fathomExternal = fathomRecordings.filter(r => r.hasExternalInvitees).length;
+    console.info(
+      `[ProspectMeeting] period=${period} events=${currentEvents.length} ` +
+      `externalEvents=${externalEvents} pastExternal=${pastExternal} ` +
+      `fathomRecordings=${fathomRecordings.length} fathomExternal=${fathomExternal} ` +
+      `matched=${matched} transcriptOk=${transcriptOk} talked=${talked} noShows=${noShows}`,
+    );
 
     return {
       totalMeetings: talked,
