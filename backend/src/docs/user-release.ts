@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Improved Work Plan Title Display',
+      '- Work plan titles on the new session screen now display in a cleaner, more readable format',
+      '- Underscores are replaced with spaces, and only the first word is capitalized — making titles easier to scan at a glance',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'Increased File Attachment Limit to 10',
       '- You can now attach up to 10 files per message or task (previously limited to 5)',
       '- Applies to Agent Mode, Task Details, Books, Videos, Images, and Research Reports',
