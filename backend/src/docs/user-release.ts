@@ -3983,6 +3983,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Emma Now Updates the User Guide Reliably',
+      '- Fixed a bug where Emma would silently insert user guide content at the wrong position (end of page instead of where requested)',
+      '- Emma can now insert content after a specific section using the correct Notion API positioning — content lands exactly where you ask for it',
+      '- Fixed a secondary issue where the blocks parameter could be misinterpreted as a JSON string, causing the update to fail entirely',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'Automatic Error Reporting to Oncall',
       '- When a backend operation fails in a user-facing way (such as a schedule manual run failing), the system automatically creates a Notion oncall item tagged "UI Error"',
       '- Frontend errors (unhandled promise rejections, JavaScript crashes) are also captured and routed to oncall',
