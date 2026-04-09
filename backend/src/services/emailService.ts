@@ -1,5 +1,6 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
+import { marked } from 'marked';
 import { resendService } from './resendService';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
@@ -995,7 +996,7 @@ Schedule ID: ${scheduleId}
             .criteria-item h4 { margin: 0 0 8px 0; color: #495057; }
             .matches { color: #28a745; font-weight: bold; }
             .misses { color: #dc3545; font-weight: bold; }
-            .response { background-color: #f8f9fa; padding: 15px; border-radius: 4px; border-left: 4px solid #1976d2; white-space: pre-wrap; word-wrap: break-word; }
+            .response { background-color: #f8f9fa; padding: 15px; border-radius: 4px; border-left: 4px solid #1976d2; word-wrap: break-word; }
             .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
             .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
             .button:hover { background-color: #1565c0; }
@@ -1042,7 +1043,7 @@ Schedule ID: ${scheduleId}
               
               <div class="section">
                 <h3>💬 AI Response</h3>
-                <div class="response">${result.actualResponse}</div>
+                <div class="response">${marked(result.actualResponse)}</div>
               </div>
               
               <div class="section">
