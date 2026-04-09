@@ -21,6 +21,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Agent Mode: Work Plan Categories',
+      '- Work plans in Agent Mode now show their category (e.g. Strategy, Paid Ads, Content)',
+      '- Filter chips above the plan grid let you quickly narrow to plans in a specific category',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'New AI Model: GPT-5.4 Available in Agent Mode',
       '- GPT-5.4 (via Azure OpenAI) is now available as a model option in Agent Mode',
       '- Select it from the model dropdown when starting or switching models in a chat session',
