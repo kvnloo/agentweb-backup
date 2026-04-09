@@ -133,9 +133,22 @@ export class GenerateMarketingResponseWorkerService {
       }
 
       if (message.type === 'progress' && message.requestId) {
-        const pending = this.pendingRequests.get(message.requestId);
-        if (pending?.onProgress) {
-          pending.onProgress(message.progress);
+        const reqId = message.requestId;
+        const pending = this.pendingRequests.get(reqId);
+        if (pending) {
+          // Reset the inactivity timeout on each progress update so long-running
+          // sessions don't get killed while they're still making progress.
+          clearTimeout(pending.timeout);
+          pending.timeout = setTimeout(() => {
+            const p = this.pendingRequests.get(reqId);
+            if (p) {
+              this.pendingRequests.delete(reqId);
+              p.reject(new Error('generateMarketingResponse worker timed out after 45 minutes of inactivity'));
+            }
+          }, 45 * 60 * 1000);
+          if (pending.onProgress) {
+            pending.onProgress(message.progress);
+          }
         }
         return;
       }

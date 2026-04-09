@@ -173,7 +173,7 @@ describe('listCampaigns', () => {
   it('includes campaignGroup filter when provided', async () => {
     await svc.listCampaigns(ACCESS_TOKEN, ACCOUNT_ID, { campaign_group_id: 'cg-99' });
     const call = mockAxiosFn.mock.calls[0][0];
-    expect(call.url).toContain('urn:li:sponsoredCampaignGroup:cg-99');
+    expect(call.url).toContain('urn%3Ali%3AsponsoredCampaignGroup%3Acg-99');
   });
 });
 
@@ -696,6 +696,7 @@ describe('getAdAnalytics', () => {
   it('builds analytics query with pivot and date range', async () => {
     await svc.getAdAnalytics(
       ACCESS_TOKEN,
+      '502840441',
       'CAMPAIGN',
       'ALL',
       { start: { year: 2024, month: 1, day: 1 }, end: { year: 2024, month: 12, day: 31 } },
@@ -705,13 +706,15 @@ describe('getAdAnalytics', () => {
     expect(call.url).toContain('q=analytics');
     expect(call.url).toContain('pivot=CAMPAIGN');
     expect(call.url).toContain('timeGranularity=ALL');
-    expect(call.url).toContain('dateRange.start.year=2024');
-    expect(call.url).toContain('fields=impressions%2Cclicks');
+    expect(call.url).toContain('dateRange=(start:');
+    expect(call.url).toContain('fields=impressions,clicks');
+    expect(call.url).toContain('sponsoredAccount');
   });
 
   it('includes campaign filters when provided', async () => {
     await svc.getAdAnalytics(
       ACCESS_TOKEN,
+      '502840441',
       'CAMPAIGN',
       'DAILY',
       { start: { year: 2024, month: 1, day: 1 }, end: { year: 2024, month: 1, day: 31 } },
@@ -721,5 +724,200 @@ describe('getAdAnalytics', () => {
     const call = mockAxiosFn.mock.calls[0][0];
     expect(call.url).toContain('sponsoredCampaign');
     expect(call.url).toContain('camp-1');
+  });
+
+  it('includes campaignGroups filter when campaign_group_ids provided', async () => {
+    await svc.getAdAnalytics(
+      ACCESS_TOKEN,
+      '502840441',
+      'CAMPAIGN_GROUP',
+      'ALL',
+      { start: { year: 2024, month: 1, day: 1 }, end: { year: 2024, month: 12, day: 31 } },
+      ['impressions'],
+      { campaign_group_ids: ['cg-1', 'cg-2'] }
+    );
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.url).toContain('campaignGroups=List(');
+    expect(call.url).toContain('sponsoredCampaignGroup');
+  });
+
+  it('makes only a single API call (no pagination for analytics)', async () => {
+    await svc.getAdAnalytics(
+      ACCESS_TOKEN,
+      '502840441',
+      'CAMPAIGN',
+      'ALL',
+      { start: { year: 2024, month: 1, day: 1 }, end: { year: 2024, month: 12, day: 31 } },
+      ['impressions']
+    );
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Pagination behaviour (fetchAllPages helper) ───────────────────────────────
+
+describe('pagination — listAdAccounts', () => {
+  it('sends pageSize=1000 on the first request', async () => {
+    await svc.listAdAccounts(ACCESS_TOKEN);
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('pageSize=1000');
+  });
+
+  it('returns all elements from a single page', async () => {
+    mockAxiosFn.mockResolvedValueOnce({
+      data: { elements: [{ id: 'acc-1' }, { id: 'acc-2' }], metadata: {} },
+      status: 200,
+    });
+    const result = await svc.listAdAccounts(ACCESS_TOKEN);
+    expect(result.success).toBe(true);
+    expect(result.data.elements).toHaveLength(2);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('fetches subsequent pages when nextPageToken is present', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({
+        data: { elements: [{ id: 'acc-1' }], metadata: { nextPageToken: 'tok-1' } },
+        status: 200,
+      })
+      .mockResolvedValueOnce({
+        data: { elements: [{ id: 'acc-2' }], metadata: {} },
+        status: 200,
+      });
+    const result = await svc.listAdAccounts(ACCESS_TOKEN);
+    expect(result.success).toBe(true);
+    expect(result.data.elements).toHaveLength(2);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+    const secondUrl: string = mockAxiosFn.mock.calls[1][0].url;
+    expect(secondUrl).toContain('pageToken=tok-1');
+  });
+
+  it('stops fetching when nextPageToken is null', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({
+        data: { elements: [{ id: 'acc-1' }], metadata: { nextPageToken: 'tok-1' } },
+        status: 200,
+      })
+      .mockResolvedValueOnce({
+        data: { elements: [{ id: 'acc-2' }], metadata: { nextPageToken: null } },
+        status: 200,
+      });
+    const result = await svc.listAdAccounts(ACCESS_TOKEN);
+    expect(result.data.elements).toHaveLength(2);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns error immediately if a page request fails', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({
+        data: { elements: [{ id: 'acc-1' }], metadata: { nextPageToken: 'tok-1' } },
+        status: 200,
+      })
+      .mockRejectedValueOnce({
+        response: { status: 429, data: { message: 'Rate limited' } },
+      });
+    const result = await svc.listAdAccounts(ACCESS_TOKEN);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(429);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('pagination — listCampaignGroups', () => {
+  it('sends pageSize=1000', async () => {
+    await svc.listCampaignGroups(ACCESS_TOKEN, ACCOUNT_ID);
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('pageSize=1000');
+  });
+
+  it('accumulates elements across multiple pages', async () => {
+    const page1 = Array.from({ length: 3 }, (_, i) => ({ id: `cg-${i}` }));
+    const page2 = Array.from({ length: 2 }, (_, i) => ({ id: `cg-${i + 3}` }));
+    mockAxiosFn
+      .mockResolvedValueOnce({ data: { elements: page1, metadata: { nextPageToken: 'tok-cg' } }, status: 200 })
+      .mockResolvedValueOnce({ data: { elements: page2, metadata: {} }, status: 200 });
+
+    const result = await svc.listCampaignGroups(ACCESS_TOKEN, ACCOUNT_ID);
+    expect(result.data.elements).toHaveLength(5);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('applies status filter in search param', async () => {
+    await svc.listCampaignGroups(ACCESS_TOKEN, ACCOUNT_ID, { status: 'ACTIVE' });
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('ACTIVE');
+  });
+});
+
+describe('pagination — listCampaigns', () => {
+  it('sends pageSize=1000', async () => {
+    await svc.listCampaigns(ACCESS_TOKEN, ACCOUNT_ID);
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('pageSize=1000');
+  });
+
+  it('accumulates elements across multiple pages', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'c-1' }], metadata: { nextPageToken: 'tok-c' } }, status: 200 })
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'c-2' }, { id: 'c-3' }], metadata: {} }, status: 200 });
+
+    const result = await svc.listCampaigns(ACCESS_TOKEN, ACCOUNT_ID);
+    expect(result.data.elements).toHaveLength(3);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+    const secondUrl: string = mockAxiosFn.mock.calls[1][0].url;
+    expect(secondUrl).toContain('pageToken=tok-c');
+  });
+
+  it('returns error if a mid-pagination request fails', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'c-1' }], metadata: { nextPageToken: 'tok-c' } }, status: 200 })
+      .mockRejectedValueOnce({ response: { status: 500, data: { message: 'Server error' } } });
+
+    const result = await svc.listCampaigns(ACCESS_TOKEN, ACCOUNT_ID);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(500);
+  });
+});
+
+describe('pagination — listCreatives', () => {
+  it('sends pageSize=100 (not 1000) per v202603 docs', async () => {
+    await svc.listCreatives(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1');
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('pageSize=100');
+    expect(url).not.toContain('pageSize=1000');
+  });
+
+  it('sends X-RestLi-Method: FINDER header on every page request', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'cr-1' }], metadata: { nextPageToken: 'tok-cr' } }, status: 200 })
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'cr-2' }], metadata: {} }, status: 200 });
+
+    await svc.listCreatives(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1');
+    for (const call of mockAxiosFn.mock.calls) {
+      expect(call[0].headers['X-RestLi-Method']).toBe('FINDER');
+    }
+  });
+
+  it('accumulates elements across multiple pages', async () => {
+    mockAxiosFn
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'cr-1' }], metadata: { nextPageToken: 'tok-cr' } }, status: 200 })
+      .mockResolvedValueOnce({ data: { elements: [{ id: 'cr-2' }], metadata: {} }, status: 200 });
+
+    const result = await svc.listCreatives(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1');
+    expect(result.data.elements).toHaveLength(2);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('encodes numeric campaign ID as full URN in URL', async () => {
+    await svc.listCreatives(ACCESS_TOKEN, ACCOUNT_ID, '99999');
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('urn%3Ali%3AsponsoredCampaign%3A99999');
+  });
+
+  it('accepts full URN campaign ID without double-prefixing', async () => {
+    await svc.listCreatives(ACCESS_TOKEN, ACCOUNT_ID, 'urn:li:sponsoredCampaign:99999');
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('urn%3Ali%3AsponsoredCampaign%3A99999');
+    expect(url).not.toContain('sponsoredCampaign%3Aurn');
   });
 });

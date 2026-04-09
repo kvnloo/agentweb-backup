@@ -520,6 +520,37 @@ export async function getFathomCredentials(): Promise<FathomCredentials> {
   }
 }
 
+export interface ClickUpCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+export async function getClickUpCredentials(): Promise<ClickUpCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/ClickUp'
+      : 'dev/AgentWeb/ClickUp';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('ClickUp credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as ClickUpCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('ClickUp credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching ClickUp credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch ClickUp credentials from Secrets Manager');
+  }
+}
+
 export interface StripeCredentials {
   secretKey: string;
   publishableKey: string;

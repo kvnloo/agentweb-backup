@@ -91,7 +91,7 @@ import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, userDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { uploadFileToS3 } from '../utils/s3Utils';
-import { agentModeController, runVerifiedChat } from '../controllers/agentModeController';
+import { agentModeController, runVerifiedChat, runScheduledChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -454,20 +454,7 @@ describe('Scheduled Chat Variable Types', () => {
         nextRunTime: new Date().toISOString(),
       };
 
-      // We test through the test endpoint since runScheduledChat is not exported
-      const req = {
-        user: { userId: mockUserId, email: 'test@example.com' },
-        params: { scheduleId: schedule.scheduleId },
-      } as unknown as Request;
-
-      const res = {
-        status: jest.fn().mockReturnThis(),
-        json: jest.fn(),
-      } as unknown as Response;
-
-      mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
-
-      await agentModeController.testScheduledChat(req, res);
+      await runScheduledChat(schedule, mockUserId, true);
 
       // Verify the worker was called with the starting message having the file link
       expect(mockWorkerService.runInWorker).toHaveBeenCalled();
@@ -514,19 +501,7 @@ describe('Scheduled Chat Variable Types', () => {
         nextRunTime: new Date().toISOString(),
       };
 
-      const req = {
-        user: { userId: mockUserId, email: 'test@example.com' },
-        params: { scheduleId: schedule.scheduleId },
-      } as unknown as Request;
-
-      const res = {
-        status: jest.fn().mockReturnThis(),
-        json: jest.fn(),
-      } as unknown as Response;
-
-      mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
-
-      await agentModeController.testScheduledChat(req, res);
+      await runScheduledChat(schedule, mockUserId, true);
 
       expect(mockWorkerService.runInWorker).toHaveBeenCalled();
       const callParams = mockWorkerService.runInWorker.mock.calls[0][0];

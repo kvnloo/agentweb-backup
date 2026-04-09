@@ -30,6 +30,12 @@ jest.mock('../utils/crypto', () => ({
 // Mock axios
 jest.mock('axios');
 
+// Mock integrations config for OAuth
+const mockGetClickUpConfig = jest.fn();
+jest.mock('../config/integrations', () => ({
+  getClickUpConfig: (...args: any[]) => mockGetClickUpConfig(...args),
+}));
+
 // Mock auth middleware to authenticate all requests
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
@@ -41,6 +47,7 @@ jest.mock('../middleware/auth', () => ({
 // Import modules after mocks are set up
 import clickupAuthRouter from '../routes/clickupAuth';
 import axios from 'axios';
+import jwt from 'jsonwebtoken';
 
 // Create test app
 const createTestApp = (): Application => {
@@ -50,9 +57,18 @@ const createTestApp = (): Application => {
   return app;
 };
 
+const CLICKUP_CONFIG_MOCK = {
+  clientId: 'test-client-id',
+  clientSecret: 'test-client-secret',
+  redirectUri: 'http://localhost:3001/api/oauth/clickup/callback',
+  authorizationUrl: 'https://app.clickup.com/api',
+  tokenUrl: 'https://api.clickup.com/api/v2/oauth/token',
+};
+
 describe('ClickUp Auth Routes', () => {
   let app: Application;
   const mockAxiosGet = axios.get as jest.Mock;
+  const mockAxiosPost = axios.post as jest.Mock;
 
   beforeAll(() => {
     app = createTestApp();
@@ -60,6 +76,7 @@ describe('ClickUp Auth Routes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetClickUpConfig.mockResolvedValue(CLICKUP_CONFIG_MOCK);
   });
 
   // ============================================
@@ -682,6 +699,262 @@ describe('ClickUp Auth Routes', () => {
         .expect(500);
 
       expect(response.body.error).toBe('Failed to disconnect ClickUp');
+    });
+  });
+
+  // ============================================
+  // GET /init — OAuth flow
+  // ============================================
+  describe('GET /api/oauth/clickup/init', () => {
+    it('should return authorization URL with required params', async () => {
+      const response = await request(app)
+        .get('/api/oauth/clickup/init')
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.url).toContain('https://app.clickup.com/api');
+      expect(response.body.url).toContain('client_id=test-client-id');
+      expect(response.body.url).toContain('response_type=code');
+      expect(response.body.url).toContain('state=');
+    });
+
+    it('should include a valid JWT state param', async () => {
+      const response = await request(app)
+        .get('/api/oauth/clickup/init')
+        .expect(200);
+
+      const url = new URL(response.body.url);
+      const state = url.searchParams.get('state');
+      expect(state).toBeTruthy();
+
+      const decoded = jwt.verify(state!, 'test-jwt-secret-for-testing') as any;
+      expect(decoded.userId).toBe('test-user-id');
+      expect(decoded.nonce).toBeTruthy();
+    });
+
+    it('should return 500 if getClickUpConfig fails', async () => {
+      mockGetClickUpConfig.mockRejectedValue(new Error('Secrets Manager unavailable'));
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/init')
+        .expect(500);
+
+      expect(response.body.error).toBe('Failed to initialize ClickUp OAuth');
+    });
+  });
+
+  // ============================================
+  // GET /callback — OAuth redirect
+  // ============================================
+  describe('GET /api/oauth/clickup/callback', () => {
+    it('should redirect to frontend callback with code and state', async () => {
+      const response = await request(app)
+        .get('/api/oauth/clickup/callback?code=auth-code-123&state=state-token')
+        .expect(302);
+
+      expect(response.headers.location).toContain('/oauth/clickup/callback');
+      expect(response.headers.location).toContain('code=auth-code-123');
+      expect(response.headers.location).toContain('state=state-token');
+    });
+
+    it('should redirect with error if ClickUp returns error', async () => {
+      const response = await request(app)
+        .get('/api/oauth/clickup/callback?error=access_denied')
+        .expect(302);
+
+      expect(response.headers.location).toContain('error=clickup_access_denied');
+    });
+
+    it('should redirect with error if no code provided', async () => {
+      const response = await request(app)
+        .get('/api/oauth/clickup/callback?state=some-state')
+        .expect(302);
+
+      expect(response.headers.location).toContain('error=no_code_provided');
+    });
+  });
+
+  // ============================================
+  // POST /finalize — Exchange code for token
+  // ============================================
+  describe('POST /api/oauth/clickup/finalize', () => {
+    const generateValidState = () =>
+      jwt.sign({ userId: 'test-user-id', nonce: 'abc123' }, 'test-jwt-secret-for-testing', { expiresIn: '15m' });
+
+    it('should return 400 if code is missing', async () => {
+      const state = generateValidState();
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ state })
+        .expect(400);
+
+      expect(response.body.error).toBe('Invalid or missing OAuth code');
+    });
+
+    it('should return 400 if state is missing', async () => {
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'auth-code' })
+        .expect(400);
+
+      expect(response.body.error).toBe('Invalid or missing state parameter');
+    });
+
+    it('should return 403 if state is invalid', async () => {
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'auth-code', state: 'tampered-state' })
+        .expect(403);
+
+      expect(response.body.error).toContain('CSRF protection');
+    });
+
+    it('should return 403 if state userId does not match', async () => {
+      const wrongUserState = jwt.sign(
+        { userId: 'different-user', nonce: 'abc' },
+        'test-jwt-secret-for-testing',
+        { expiresIn: '15m' }
+      );
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'auth-code', state: wrongUserState })
+        .expect(403);
+
+      expect(response.body.error).toContain('CSRF protection');
+    });
+
+    it('should exchange code for token and return tokenSessionId', async () => {
+      const state = generateValidState();
+      mockAxiosPost.mockResolvedValue({ data: { access_token: 'cu_oauth_token_123' } });
+
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'auth-code-123', state })
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.tokenSessionId).toBeTruthy();
+      expect(typeof response.body.tokenSessionId).toBe('string');
+    });
+
+    it('should return 500 if ClickUp token exchange fails', async () => {
+      const state = generateValidState();
+      mockAxiosPost.mockRejectedValue(new Error('Token exchange failed'));
+
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'bad-code', state })
+        .expect(500);
+
+      expect(response.body.error).toBe('Failed to finalize ClickUp connection');
+    });
+
+    it('should return 500 if ClickUp returns no access_token', async () => {
+      const state = generateValidState();
+      mockAxiosPost.mockResolvedValue({ data: {} });
+
+      const response = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'auth-code', state })
+        .expect(500);
+
+      expect(response.body.error).toBe('No access token received from ClickUp');
+    });
+  });
+
+  // ============================================
+  // POST /connect — Persist OAuth token
+  // ============================================
+  describe('POST /api/oauth/clickup/connect', () => {
+    const getTokenSessionId = async (): Promise<string> => {
+      const state = jwt.sign(
+        { userId: 'test-user-id', nonce: 'xyz' },
+        'test-jwt-secret-for-testing',
+        { expiresIn: '15m' }
+      );
+      mockAxiosPost.mockResolvedValueOnce({ data: { access_token: 'cu_oauth_access_token' } });
+      const finalizeRes = await request(app)
+        .post('/api/oauth/clickup/finalize')
+        .send({ code: 'valid-code', state });
+      return finalizeRes.body.tokenSessionId;
+    };
+
+    it('should return 400 if tokenSessionId is missing', async () => {
+      const response = await request(app)
+        .post('/api/oauth/clickup/connect')
+        .send({})
+        .expect(400);
+
+      expect(response.body.error).toBe('Missing tokenSessionId');
+    });
+
+    it('should return 401 if tokenSessionId is invalid', async () => {
+      const response = await request(app)
+        .post('/api/oauth/clickup/connect')
+        .send({ tokenSessionId: 'nonexistent-session' })
+        .expect(401);
+
+      expect(response.body.error).toContain('Invalid or expired token session');
+    });
+
+    it('should store OAuth token and return workspaces on success', async () => {
+      const tokenSessionId = await getTokenSessionId();
+
+      mockAxiosGet.mockResolvedValue({
+        data: { teams: [{ id: 'ws-1', name: 'My Workspace', avatar: null }] },
+      });
+      mockEncryptPassword.mockReturnValue('encrypted-oauth-token');
+      mockGetUserById.mockResolvedValue({ userId: 'test-user-id', secrets: { other: 'val' } });
+      mockUpdateUser.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/oauth/clickup/connect')
+        .send({ tokenSessionId })
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.workspaces).toEqual([{ id: 'ws-1', name: 'My Workspace', avatar: null }]);
+
+      expect(mockEncryptPassword).toHaveBeenCalledWith('cu_oauth_access_token', 'test-user-id');
+      expect(mockUpdateUser).toHaveBeenCalledWith('test-user-id', {
+        secrets: { other: 'val', clickup_access_token: 'encrypted-oauth-token' },
+      });
+    });
+
+    it('should be one-time use — second call with same session fails', async () => {
+      const tokenSessionId = await getTokenSessionId();
+
+      mockAxiosGet.mockResolvedValue({ data: { teams: [] } });
+      mockEncryptPassword.mockReturnValue('enc');
+      mockGetUserById.mockResolvedValue({ userId: 'test-user-id', secrets: {} });
+      mockUpdateUser.mockResolvedValue(undefined);
+
+      // First call succeeds
+      await request(app)
+        .post('/api/oauth/clickup/connect')
+        .send({ tokenSessionId })
+        .expect(200);
+
+      // Second call with same session ID fails
+      const response = await request(app)
+        .post('/api/oauth/clickup/connect')
+        .send({ tokenSessionId })
+        .expect(401);
+
+      expect(response.body.error).toContain('Invalid or expired token session');
+    });
+
+    it('should return 500 if workspace fetch fails during connect', async () => {
+      const tokenSessionId = await getTokenSessionId();
+
+      mockAxiosGet.mockRejectedValue(new Error('ClickUp API error'));
+
+      const response = await request(app)
+        .post('/api/oauth/clickup/connect')
+        .send({ tokenSessionId })
+        .expect(500);
+
+      expect(response.body.error).toBe('Failed to connect ClickUp account');
     });
   });
 });

@@ -9,9 +9,34 @@
  * - POST /oauth/token                             (token exchange + refresh)
  */
 
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { mcpOAuthService } from './oauthService';
 import { authenticateToken } from '../../middleware/auth';
+
+/**
+ * Middleware: accept the user's JWT either from the Authorization header
+ * (standard API client path) or from a `jwt` field on the request body
+ * (browser form POST path — the consent page submits an HTML form so it
+ * can follow the cross-origin 302 redirect, and form POSTs can't set
+ * custom headers). Copies the body value into req.headers.authorization
+ * so the existing authenticateToken middleware Just Works downstream.
+ */
+function authFromBodyOrHeader(req: Request, res: Response, next: NextFunction) {
+  if (!req.headers.authorization && req.body?.jwt) {
+    req.headers.authorization = `Bearer ${req.body.jwt}`;
+  }
+  return authenticateToken(req, res, next);
+}
+
+/**
+ * Normalize the `approved` field across JSON (boolean) and form POST
+ * (string "true"/"false") payloads. Form POSTs coerce everything to
+ * strings, so a naive `if (!approved)` would treat the string "false" as
+ * truthy.
+ */
+function isApproved(value: unknown): boolean {
+  return value === true || value === 'true';
+}
 
 export function setupMcpOAuth(app: express.Express) {
   // ─── Well-Known Metadata (RFC 8414) ─────────────────────────────────────
@@ -35,8 +60,10 @@ export function setupMcpOAuth(app: express.Express) {
   });
 
   // ─── Dynamic Client Registration (RFC 7591) ────────────────────────────
+  // Body parser is applied globally in app.ts (express.json + urlencoded)
+  // so we don't need a per-route parser here any more.
 
-  app.post('/oauth/register', express.json(), async (req: Request, res: Response) => {
+  app.post('/oauth/register', async (req: Request, res: Response) => {
     const { redirect_uris, client_name, grant_types, response_types, token_endpoint_auth_method, scope } = req.body;
 
     if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
@@ -145,8 +172,12 @@ export function setupMcpOAuth(app: express.Express) {
   });
 
   // ─── Consent Decision (from frontend consent page) ─────────────────────
+  // Accepts BOTH application/json (API clients) and
+  // application/x-www-form-urlencoded (browser form POST from the consent
+  // page). Body parsing is applied globally in app.ts. JWT can come from
+  // the Authorization header OR from a `jwt` field on the form body.
 
-  app.post('/oauth/authorize/decision', express.json(), authenticateToken, async (req: Request, res: Response) => {
+  app.post('/oauth/authorize/decision', authFromBodyOrHeader, async (req: Request, res: Response) => {
     const {
       client_id,
       redirect_uri,
@@ -157,7 +188,7 @@ export function setupMcpOAuth(app: express.Express) {
       approved,
     } = req.body;
 
-    if (!approved) {
+    if (!isApproved(approved)) {
       const errorUrl = new URL(redirect_uri);
       errorUrl.searchParams.set('error', 'access_denied');
       if (state) errorUrl.searchParams.set('state', state);
@@ -188,7 +219,7 @@ export function setupMcpOAuth(app: express.Express) {
 
   // ─── Token Endpoint ─────────────────────────────────────────────────────
 
-  app.post('/oauth/token', express.urlencoded({ extended: true }), async (req: Request, res: Response) => {
+  app.post('/oauth/token', async (req: Request, res: Response) => {
     const { grant_type } = req.body;
 
     res.setHeader('Cache-Control', 'no-store');

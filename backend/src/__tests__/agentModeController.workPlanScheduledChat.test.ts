@@ -77,7 +77,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -162,7 +162,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -174,21 +174,11 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         return Promise.resolve(responseWithWorkPlan);
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called multiple times (work plan not completed)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
+
       // Check that retry messages focus on work plan steps
       const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // First call uses starting message
@@ -199,7 +189,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         expect(calls[i][0].messageContent).toContain('set_work_plan_status');
       }
 
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure', // Work plan not completed
@@ -226,7 +216,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -239,19 +229,9 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
-
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -332,17 +312,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // First call uses starting message
@@ -371,7 +341,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -379,17 +349,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // Second call should remind to complete pending steps
@@ -399,7 +359,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
     it('should work normally when no work plan exists', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
-      
+
       const successfulResponse = {
         ...mockResponse,
         content: 'Here are some marketing strategy and tips for your business.',
@@ -411,19 +371,9 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
-
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -452,7 +402,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -465,19 +415,9 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
-
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -504,7 +444,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -514,22 +454,12 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should retry because requirements not met
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
@@ -595,17 +525,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // First call uses starting message
@@ -629,7 +549,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -642,20 +562,10 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Empty steps array means work plan is completed (all steps completed)
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -681,7 +591,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
-      
+
       const responseWithWorkPlan = {
         ...mockResponse,
         workPlan,
@@ -694,20 +604,10 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // All steps skipped means work plan is completed
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',

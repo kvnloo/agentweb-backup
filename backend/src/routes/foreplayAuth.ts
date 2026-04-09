@@ -2,7 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { encryptPassword } from '../utils/crypto';
-import { getAccessToken, getUsage, listBoards, getBoardAds, getSwipefileAds, getAd } from '../services/foreplayService';
+import { getAccessToken, getUsage, listBoards, getBoardAds, getSwipefileAds, getAd, clearForeplayCacheForToken } from '../services/foreplayService';
 
 const router = express.Router();
 
@@ -169,6 +169,9 @@ router.post('/disconnect', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
+    // Get decrypted token before deleting so we can clear the cache
+    const tokenToClear = await getAccessToken(userId);
+
     const user = await userDb.getUserById(userId);
     const existingSecrets = (user?.secrets as Record<string, string>) || {};
 
@@ -176,6 +179,8 @@ router.post('/disconnect', authenticateToken, async (req: any, res) => {
     const { foreplay_api_token, ...remainingSecrets } = existingSecrets;
 
     await userDb.updateUser(userId, { secrets: remainingSecrets });
+
+    if (tokenToClear) clearForeplayCacheForToken(tokenToClear);
 
     console.log(`[Foreplay Disconnect] Token removed for user ${userId}`);
 

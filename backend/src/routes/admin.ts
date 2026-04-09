@@ -20,6 +20,7 @@ import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
+import { resyncAllSubscriptionAmounts } from "../services/stripeService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
@@ -4697,6 +4698,18 @@ router.get("/funnel-metrics", async (req, res) => {
   } catch (error: any) {
     console.error("Error fetching funnel metrics:", error.message);
     res.status(500).json({ message: "Failed to fetch funnel metrics" });
+  }
+});
+
+// ─── Resync Subscription Amounts ─────────────────────────────────────────────
+
+router.post("/resync-subscription-amounts", async (req, res) => {
+  try {
+    const result = await resyncAllSubscriptionAmounts();
+    res.json(result);
+  } catch (error: any) {
+    console.error("Error resyncing subscription amounts:", error.message);
+    res.status(500).json({ message: "Failed to resync subscription amounts" });
   }
 });
 

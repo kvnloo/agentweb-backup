@@ -102,6 +102,7 @@ export interface User {
     brandData: {
       brandName: string;
       tagline: string;
+      domain?: string;
       primaryColor: string;
       primaryColorEnd: string;
       secondaryColor: string;
@@ -173,6 +174,7 @@ export interface User {
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
+  subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
     | 'meta' | 'twitter' | 'instagram';
@@ -4549,6 +4551,19 @@ export const crmDb = {
     }
   },
 
+  async updateLeadLinkedInSyncAt(listId: string, leadId: string, syncAt: string): Promise<void> {
+    const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { listId, leadId },
+      UpdateExpression: 'SET linkedinMessageSyncAt = :syncAt, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':syncAt': syncAt,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }).promise();
+  },
+
   async addLeadEngagement(listId: string, leadId: string, engagement: {
     eventType: string;
     eventData: any;
@@ -5543,6 +5558,136 @@ export const tempEmailDb = {
     } catch (error) {
       handleDynamoDbError(error, "tempEmailDb.getByAddress");
       return [];
+    }
+  },
+};
+
+// ─── Test Accounts ────────────────────────────────────────────────────────────
+
+const TEST_ACCOUNTS_TABLE = `${TABLE_PREFIX}AW-TestAccounts`;
+
+export interface TestAccount {
+  accountId: string;
+  userId: string;
+  domain: string;
+  siteUrl: string;
+  email: string;
+  password: string;
+  notes?: string;
+  source: 'manual' | 'auto-created';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const testAccountsDb = {
+  async create(
+    userId: string,
+    data: { domain: string; siteUrl: string; email: string; password: string; notes?: string; source?: 'manual' | 'auto-created' }
+  ): Promise<TestAccount> {
+    const { ulid } = await import('ulid');
+    const now = new Date().toISOString();
+    const item: TestAccount = {
+      accountId: ulid(),
+      userId,
+      domain: data.domain.toLowerCase(),
+      siteUrl: data.siteUrl,
+      email: data.email,
+      password: data.password,
+      notes: data.notes,
+      source: data.source ?? 'manual',
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (!item.notes) delete item.notes;
+    try {
+      await dynamodb.put({ TableName: TEST_ACCOUNTS_TABLE, Item: item }).promise();
+      return item;
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.create');
+      throw error;
+    }
+  },
+
+  async getByUserId(userId: string): Promise<TestAccount[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: TEST_ACCOUNTS_TABLE,
+        IndexName: 'UserIdIndex',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+        ScanIndexForward: false,
+      }).promise();
+      return (result.Items || []) as TestAccount[];
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.getByUserId');
+      throw error;
+    }
+  },
+
+  async getById(accountId: string): Promise<TestAccount | undefined> {
+    try {
+      const result = await dynamodb.get({
+        TableName: TEST_ACCOUNTS_TABLE,
+        Key: { accountId },
+      }).promise();
+      return result.Item as TestAccount | undefined;
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.getById');
+      throw error;
+    }
+  },
+
+  async getByDomain(userId: string, domain: string): Promise<TestAccount[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: TEST_ACCOUNTS_TABLE,
+        IndexName: 'UserIdDomainIndex',
+        KeyConditionExpression: 'userId = :userId AND #domain = :domain',
+        ExpressionAttributeNames: { '#domain': 'domain' },
+        ExpressionAttributeValues: { ':userId': userId, ':domain': domain.toLowerCase() },
+      }).promise();
+      return (result.Items || []) as TestAccount[];
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.getByDomain');
+      throw error;
+    }
+  },
+
+  async update(
+    accountId: string,
+    updates: Partial<Pick<TestAccount, 'email' | 'password' | 'notes' | 'siteUrl'>>
+  ): Promise<TestAccount | undefined> {
+    const expressions: string[] = ['#updatedAt = :updatedAt'];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':updatedAt': new Date().toISOString() };
+
+    if (updates.email !== undefined) { expressions.push('#email = :email'); names['#email'] = 'email'; values[':email'] = updates.email; }
+    if (updates.password !== undefined) { expressions.push('#password = :password'); names['#password'] = 'password'; values[':password'] = updates.password; }
+    if (updates.siteUrl !== undefined) { expressions.push('#siteUrl = :siteUrl'); names['#siteUrl'] = 'siteUrl'; values[':siteUrl'] = updates.siteUrl; }
+    if (updates.notes !== undefined) { expressions.push('#notes = :notes'); names['#notes'] = 'notes'; values[':notes'] = updates.notes; }
+
+    try {
+      const result = await dynamodb.update({
+        TableName: TEST_ACCOUNTS_TABLE,
+        Key: { accountId },
+        UpdateExpression: `SET ${expressions.join(', ')}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ReturnValues: 'ALL_NEW',
+      }).promise();
+      return result.Attributes as TestAccount | undefined;
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.update');
+      throw error;
+    }
+  },
+
+  async delete(accountId: string): Promise<void> {
+    try {
+      await dynamodb.delete({ TableName: TEST_ACCOUNTS_TABLE, Key: { accountId } }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'testAccountsDb.delete');
+      throw error;
     }
   },
 };

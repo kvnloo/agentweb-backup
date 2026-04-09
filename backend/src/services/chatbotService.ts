@@ -237,6 +237,11 @@ export interface ChatSession {
     evaluatedMessageIndex: number;
     judgeName: string;
   }>;
+  sessionSummary?: {
+    summary: string;        // LLM-generated summary of what was achieved
+    evaluatedAt: string;    // ISO timestamp
+    evaluatedMessageIndex: number; // messageCount at time of evaluation (for cache invalidation)
+  };
   gtmWorkItem?: {
     planId: string;
     phaseId: string;
@@ -1535,7 +1540,8 @@ export class ChatbotDB {
     portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar",
     limit?: number,
     sortDescending: boolean = true,
-    lastEvaluatedKey?: string
+    lastEvaluatedKey?: string,
+    pageIdentifier?: string
   ): Promise<{ sessions: ChatSession[], lastEvaluatedKey?: any }> {
     console.log(
       `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
@@ -1550,10 +1556,18 @@ export class ChatbotDB {
       },
     };
 
-    // Add portal type filter if specified
+    // Build filter expression
+    const filterParts: string[] = [];
     if (portalType) {
-      params.FilterExpression = 'portalType = :portalType';
+      filterParts.push('portalType = :portalType');
       params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+    if (pageIdentifier) {
+      filterParts.push('pageIdentifier = :pageIdentifier');
+      params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
+    }
+    if (filterParts.length > 0) {
+      params.FilterExpression = filterParts.join(' AND ');
     }
 
     // Add limit if specified
@@ -2061,6 +2075,26 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session satisfaction score:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionSummary(
+    sessionId: string,
+    sessionSummary: NonNullable<ChatSession["sessionSummary"]>
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET sessionSummary = :summary",
+      ExpressionAttributeValues: {
+        ":summary": sessionSummary,
+      },
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error updating session summary:", error);
       throw error;
     }
   }
@@ -3122,6 +3156,13 @@ Always call the read tool first before updating to get current values.
 
 **Email Templates:** **list_html_templates**, **create_html_from_template**, **update_html_file**
 
+**Scheduled Chats:**
+- **list_scheduled_chats**: List all scheduled chats set up for the user.
+- **manage_scheduled_chat**: Create, update, toggle (pause/resume), or delete a scheduled chat. Use this to automate recurring tasks — e.g. weekly competitive scans, daily SEO monitoring, or periodic outreach campaigns. Use list_scheduled_chats first to check for duplicates.
+- **test_scheduled_chat**: Trigger a one-time test run of a scheduled chat.
+- **get_scheduled_chat_test_history**: Get the test run history for a scheduled chat.
+Always use list_scheduled_chats first before creating a new schedule to check if one already exists.
+
 **Visual Context:**
 - **get_visual_context**: Call this when you need to SEE the page visually (colors, layout, design). A screenshot will be captured and sent in the follow-up message.
 
@@ -3172,6 +3213,7 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
 
 // Cache for Emma system context (60s TTL)
 let cachedSystemContext: { value: string; expiry: number } | null = null;
+let emmaToolsLoaded = false;
 
 // Exported for testing only — not part of the public API
 export function __resetEmmaSystemContextCache(): void {
@@ -3685,6 +3727,8 @@ export async function generateChatResponse(
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
+          'get_temp_email', 'check_temp_inbox',
+          'get_test_account', 'save_test_account', 'list_test_accounts',
         ]);
 
         // Page-aware tool injection based on the current page URL
@@ -3716,6 +3760,12 @@ export async function generateChatResponse(
           pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
         }
 
+        if (!emmaToolsLoaded) {
+          await import('../emma/tools');
+          await import('../emma/tempEmailTools');
+          await import('../emma/testAccountTools');
+          emmaToolsLoaded = true;
+        }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
 

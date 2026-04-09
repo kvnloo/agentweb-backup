@@ -703,6 +703,7 @@ export default function AdminDashboard() {
   const [userFilterStatus, setUserFilterStatus] = useState<"active" | "inactive" | "all">("active");
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
+  const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
@@ -749,6 +750,7 @@ export default function AdminDashboard() {
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
   const [editingStripeCustomerIdUserId, setEditingStripeCustomerIdUserId] = useState<string | null>(null);
   const [currentStripeCustomerIdText, setCurrentStripeCustomerIdText] = useState("");
+  const [resyncPaymentsLoading, setResyncPaymentsLoading] = useState(false);
   const [stripeCustomerIdEditLoading, setStripeCustomerIdEditLoading] = useState(false);
   const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
   const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
@@ -1472,6 +1474,12 @@ export default function AdminDashboard() {
       if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
       if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
       if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status)) return false;
+      // Has-usage filter — match the display logic: current-month tokens only
+      if (userFilterHasUsage) {
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        const used = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalTokens || 0) : 0;
+        if (used <= 0) return false;
+      }
       return true;
     });
     return filtered.sort((a, b) => {
@@ -1488,7 +1496,7 @@ export default function AdminDashboard() {
         ? aStr.localeCompare(bStr)
         : bStr.localeCompare(aStr);
     });
-  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid]);
+  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid, userFilterHasUsage]);
 
   const handleUserSort = (property: keyof User) => {
     const isAsc = usersOrderBy === property && usersOrder === "asc";
@@ -2008,6 +2016,23 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update ad account");
     } finally {
       setAdAccountEditLoading(false);
+    }
+  };
+
+  const handleResyncPayments = async () => {
+    try {
+      setResyncPaymentsLoading(true);
+      const response = await axios.post(
+        buildApiUrl("/api/admin/resync-subscription-amounts"),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const { checked, updated, skipped, errors } = response.data;
+      setSuccess(`Payments resynced: ${updated} updated, ${skipped} skipped, ${errors} errors (${checked} total checked)`);
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to resync payments");
+    } finally {
+      setResyncPaymentsLoading(false);
     }
   };
 
@@ -3570,12 +3595,26 @@ export default function AdminDashboard() {
                 <MenuItem value="unpaid">Not Paying</MenuItem>
               </Select>
             </FormControl>
-            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all") && (
-              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={userFilterHasUsage}
+                  onChange={(e) => setUserFilterHasUsage(e.target.checked)}
+                />
+              }
+              label={<Typography variant="body2">Has usage</Typography>}
+              sx={{ ml: 0 }}
+            />
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage) && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); }}>
                 Clear
               </Button>
             )}
             <Box sx={{ flexGrow: 1 }} />
+            <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
+              Resync Payments
+            </Button>
             <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
               Sync to CRM
             </Button>
@@ -3624,7 +3663,7 @@ export default function AdminDashboard() {
                   </TableCell>
                   <TableCell>Payment</TableCell>
                   <TableCell>
-                    <UserSortLabel property="chatSessionCount" label="Sessions" />
+                    <UserSortLabel property="createdAt" label="Created" />
                   </TableCell>
                   <TableCell>
                     <UserSortLabel property="lastLoginTime" label="Last Active" />
@@ -3696,6 +3735,7 @@ export default function AdminDashboard() {
                           <Chip label={tier} size="small" color={tierColor} variant={tierVariant} sx={{ fontWeight: 500, minWidth: 60 }} />
                         </TableCell>
                         <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
                           {paymentStatus === "paying" && (
                             <Chip icon={<CreditCardIcon />} label="Paid" size="small" color="success" variant="outlined" sx={{ fontWeight: 500 }} />
                           )}
@@ -3714,16 +3754,17 @@ export default function AdminDashboard() {
                           {paymentStatus === "free" && (
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
+                          {user.subscription_amount != null && user.subscription_amount > 0 && (
+                            <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
+                              ${(user.subscription_amount / 100).toFixed(0)}/mo
+                            </Typography>
+                          )}
+                          </Box>
                         </TableCell>
-                        <TableCell onClick={(e) => e.stopPropagation()}>
-                          <Chip
-                            label={user.chatSessionCount || 0}
-                            size="small"
-                            color={(user.chatSessionCount ?? 0) > 0 ? "primary" : "default"}
-                            variant="outlined"
-                            sx={{ cursor: (user.chatSessionCount ?? 0) > 0 ? "pointer" : undefined }}
-                            onClick={() => {}}
-                          />
+                        <TableCell>
+                          <Typography variant="body2" color="text.secondary">
+                            {user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}
+                          </Typography>
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>

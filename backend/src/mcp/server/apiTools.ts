@@ -293,22 +293,22 @@ mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete".',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, schedule_frequency, and at least one email_notifications address are REQUIRED — do not call with action "create" unless you have all four. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['create', 'update', 'toggle', 'delete'], description: 'CRUD action' },
         schedule_id: { type: 'string', description: 'Schedule ID (required for update/toggle/delete)' },
-        schedule_name: { type: 'string', description: 'Schedule name (create/update)' },
-        starting_message: { type: 'string', description: 'The prompt/message to run on each execution (create/update)' },
-        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
+        schedule_name: { type: 'string', description: 'Schedule name (REQUIRED for create, optional for update)' },
+        starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update)' },
+        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)' },
         frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
         next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
         required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update)' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
-        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (create/update)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (REQUIRED for create — must include at least one; optional for update but must be non-empty if provided)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
@@ -384,7 +384,7 @@ mcpToolRegistry.register({
   name: 'test_scheduled_chat',
   definition: {
     name: 'test_scheduled_chat',
-    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule.',
+    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2007,6 +2007,67 @@ mcpToolRegistry.register({
       : `/api/admin/users/${args.user_id}/reactivate`;
     const data = await mcpFetch({ method: 'POST', path, context: ctx(context) });
     return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'manage_scoring_judges',
+  definition: {
+    name: 'manage_scoring_judges',
+    description: 'Manage the judge system prompts used to evaluate chat session satisfaction. Admin only. Actions: get_default (view current default prompt), update_default (replace default prompt text), reset_default (revert to hardcoded default), list (list all custom judges), create (add a new custom judge), update (edit an existing custom judge), delete (remove a custom judge).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['get_default', 'update_default', 'reset_default', 'list', 'create', 'update', 'delete'],
+          description: 'The action to perform'
+        },
+        system_prompt: { type: 'string', description: 'The system prompt text (required for update_default, create, and update actions)' },
+        judge_id: { type: 'string', description: 'The judge ID (required for update and delete actions)' },
+        name: { type: 'string', description: 'Human-readable name for the judge (required for create, optional for update)' }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const { action, system_prompt, judge_id, name } = args;
+    switch (action) {
+      case 'get_default': {
+        const data = await mcpFetch({ method: 'GET', path: '/api/settings/scoring-judges/default-prompt', context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'update_default': {
+        if (!system_prompt) return jsonResult({ error: 'system_prompt is required for update_default' });
+        const data = await mcpFetch({ method: 'PUT', path: '/api/settings/scoring-judges/default-prompt', context: ctx(context), body: { systemPrompt: system_prompt } });
+        return jsonResult(data);
+      }
+      case 'reset_default': {
+        const data = await mcpFetch({ method: 'DELETE', path: '/api/settings/scoring-judges/default-prompt', context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'list': {
+        const data = await mcpFetch({ method: 'GET', path: '/api/settings/scoring-judges', context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'create': {
+        if (!name || !system_prompt) return jsonResult({ error: 'name and system_prompt are required for create' });
+        const data = await mcpFetch({ method: 'POST', path: '/api/settings/scoring-judges', context: ctx(context), body: { name, systemPrompt: system_prompt } });
+        return jsonResult(data);
+      }
+      case 'update': {
+        if (!judge_id) return jsonResult({ error: 'judge_id is required for update' });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context), body: { name, systemPrompt: system_prompt } });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        if (!judge_id) return jsonResult({ error: 'judge_id is required for delete' });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context) });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${action}` });
+    }
   }
 });
 

@@ -58,6 +58,29 @@ export interface ForeplayUsage {
   plan: string;
 }
 
+// ─── In-memory cache ─────────────────────────────────────────────────────────
+// Keys are the decrypted API token (unique per user). TTL 5 minutes.
+
+const FOREPLAY_CACHE_TTL_MS = 5 * 60 * 1000;
+
+const boardsCache = new Map<string, { data: ForeplayBoard[]; expiresAt: number }>();
+const boardAdsCache = new Map<string, { data: ForeplayAd[]; expiresAt: number }>();
+const swipefileCache = new Map<string, { data: { ads: ForeplayAd[]; cursor?: string }; expiresAt: number }>();
+
+/**
+ * Clear all cached Foreplay data for a given API token.
+ * Call this when a user disconnects their Foreplay account.
+ */
+export function clearForeplayCacheForToken(token: string): void {
+  boardsCache.delete(token);
+  for (const key of boardAdsCache.keys()) {
+    if (key.startsWith(`${token}:`)) boardAdsCache.delete(key);
+  }
+  for (const key of swipefileCache.keys()) {
+    if (key.startsWith(`${token}:`)) swipefileCache.delete(key);
+  }
+}
+
 /**
  * Get the decrypted Foreplay API token for a user.
  * Returns null if no token is stored or decryption fails.
@@ -149,15 +172,20 @@ export async function getUsage(token: string): Promise<ForeplayUsage> {
  * List user's boards (collections).
  */
 export async function listBoards(token: string): Promise<ForeplayBoard[]> {
+  const cached = boardsCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+
   const response = await axios.get<any>(`${FOREPLAY_API}/api/boards`, {
     headers: authHeaders(token),
   });
   const boards = response.data?.data || response.data || [];
-  return (Array.isArray(boards) ? boards : []).map((b: any) => ({
+  const result = (Array.isArray(boards) ? boards : []).map((b: any) => ({
     id: b.id || b._id || '',
     name: b.name || '',
     description: b.description || undefined,
   }));
+  boardsCache.set(token, { data: result, expiresAt: Date.now() + FOREPLAY_CACHE_TTL_MS });
+  return result;
 }
 
 /**
@@ -187,6 +215,10 @@ export async function getBoardAds(
  * Get all ads in a board (auto-paginate).
  */
 export async function getAllBoardAds(token: string, boardId: string): Promise<ForeplayAd[]> {
+  const cacheKey = `${token}:${boardId}`;
+  const cached = boardAdsCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+
   const allAds: ForeplayAd[] = [];
   let cursor: string | undefined;
   do {
@@ -194,16 +226,24 @@ export async function getAllBoardAds(token: string, boardId: string): Promise<Fo
     allAds.push(...result.ads);
     cursor = result.cursor;
   } while (cursor);
+  boardAdsCache.set(cacheKey, { data: allAds, expiresAt: Date.now() + FOREPLAY_CACHE_TTL_MS });
   return allAds;
 }
 
 /**
  * Get user's personal swipefile ads (paginated with cursor).
+ * First-page results (no cursor) are cached for 5 minutes.
  */
 export async function getSwipefileAds(
   token: string,
   options: { limit?: number; cursor?: string } = {}
 ): Promise<{ ads: ForeplayAd[]; cursor?: string }> {
+  const cacheKey = `${token}:swipefile:${options.limit ?? 'default'}`;
+  if (!options.cursor) {
+    const cached = swipefileCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+  }
+
   const params: Record<string, string> = {};
   if (options.limit) params.limit = String(options.limit);
   if (options.cursor) params.cursor = options.cursor;
@@ -215,7 +255,12 @@ export async function getSwipefileAds(
   const data = response.data;
   const ads = (data?.data || []).map(mapAd);
   const nextCursor = data?.metadata?.cursor || undefined;
-  return { ads, cursor: nextCursor };
+  const result = { ads, cursor: nextCursor };
+
+  if (!options.cursor) {
+    swipefileCache.set(cacheKey, { data: result, expiresAt: Date.now() + FOREPLAY_CACHE_TTL_MS });
+  }
+  return result;
 }
 
 /**

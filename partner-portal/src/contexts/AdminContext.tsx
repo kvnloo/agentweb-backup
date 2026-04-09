@@ -35,6 +35,7 @@ interface User {
   stripe_subscription_id?: string;
   subscription_status?: string; // active, trialing, past_due, canceled, canceling
   has_payment_method?: boolean;
+  subscription_amount?: number; // Most recent invoice amount paid, in cents
   current_period_end?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain

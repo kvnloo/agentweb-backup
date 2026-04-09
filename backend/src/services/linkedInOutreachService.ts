@@ -251,7 +251,7 @@ export class LinkedInOutreachService {
    * @param isUrl   - true if target is a profile URL; false if it is already a provider_id.
    * @param account_id - Required when isUrl is true.
    */
-  private async resolveProviderId(target: string, isUrl: boolean, account_id: string): Promise<string> {
+  async resolveProviderId(target: string, isUrl: boolean, account_id: string): Promise<string> {
     if (isUrl) {
       this.log(`Resolving LinkedIn URL to provider_id`, { target, account_id });
       const profile = await this.getLinkedInProfile(target, account_id);
@@ -529,6 +529,41 @@ export class LinkedInOutreachService {
     } catch (error: any) {
       return this.handleError(error, 'cancelInvitation');
     }
+  }
+
+  /**
+   * Fetch all messages exchanged with a specific LinkedIn contact (by their Unipile attendee/provider ID).
+   * Paginates up to 10 pages (1000 messages). Filters out system events.
+   */
+  async getMessagesWithContact(
+    attendeeId: string,
+    opts?: { after?: string }
+  ): Promise<Array<{ id: string; provider_id: string; text: string | null; is_sender: 0 | 1; is_event: 0 | 1; sender_id: string; timestamp: string }>> {
+    const MAX_PAGES = 10;
+    const messages: any[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    const client = await this.getClient();
+
+    do {
+      const params: any = { attendee_id: attendeeId, limit: 100 };
+      if (cursor) params.cursor = cursor;
+      else if (opts?.after) params.after = opts.after;
+
+      const result = await client.messaging.getAllMessagesFromAttendee(params);
+
+      if (result?.items) {
+        for (const msg of result.items) {
+          if (msg.is_event === 1) continue;
+          messages.push(msg);
+        }
+      }
+
+      cursor = (result as any)?.cursor ?? undefined;
+      pages++;
+    } while (cursor && pages < MAX_PAGES);
+
+    return messages;
   }
 
   /**

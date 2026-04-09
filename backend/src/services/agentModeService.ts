@@ -26,15 +26,21 @@ import type { LLMUsageData } from '../utils/llmService';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
+
+// Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
+// to retrieve specific fields from the original payload without needing the full text in context.
+const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
-import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
@@ -142,6 +148,9 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -384,6 +393,7 @@ export class AgentModeService {
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
         await import('../emma/tempEmailTools');
+        await import('../emma/testAccountTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -420,6 +430,64 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
     }
+
+    this.toolRegistry.register({
+      name: 'search_tool_response',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'search_tool_response',
+          description: 'Search a large tool response that was stored in S3 because it exceeded the context size limit. When a previous tool result shows "[Full response stored at S3 key: ...]", use this tool with that key to find specific fields or values (e.g. destination URLs, link_url, creative details) in the full response.',
+          parameters: {
+            type: 'object',
+            properties: {
+              s3_key: {
+                type: 'string',
+                description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
+              },
+              query: {
+                type: 'string',
+                description: 'The text or field name to search for (e.g. "link_url", "destination_url", "website")'
+              }
+            },
+            required: ['s3_key', 'query']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        return this.executeSearchToolResponse(args);
+      }
+    });
+
+    this.toolRegistry.register({
+      name: 'wait_seconds',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'wait_seconds',
+          description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
+          parameters: {
+            type: 'object',
+            properties: {
+              seconds: {
+                type: 'number',
+                description: 'Number of seconds to wait (max 300)'
+              },
+              reason: {
+                type: 'string',
+                description: 'Brief explanation of what you are waiting for (shown to the user)'
+              }
+            },
+            required: ['seconds', 'reason']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
+        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
+      }
+    });
   }
 
   async getDefaultModel(): Promise<string> {
@@ -1222,6 +1290,29 @@ export class AgentModeService {
 
       messages.push(...marketingMessages);
 
+      // Cross-message loop detection: when the user repeats the same message multiple times
+      // without providing requested information, stop asking and use available context tools.
+      const LOOP_DETECTION_THRESHOLD = 3;
+      const recentUserHistory = sessionHistory
+        .filter(m => m.role === 'user')
+        .slice(-LOOP_DETECTION_THRESHOLD);
+      const normalizedCurrent = messageContent.trim().toLowerCase();
+      const consecutiveIdentical = recentUserHistory.filter(
+        m => (m.content || '').trim().toLowerCase() === normalizedCurrent
+      ).length;
+
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+        messages.push({
+          role: 'user',
+          content: `[SYSTEM OVERRIDE - ANTI-LOOP TRIGGERED] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+1. STOP asking for that information immediately — do not repeat it again under any circumstances
+2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
+3. If those tools provide enough context, proceed with the task using that information
+4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
+5. Never block on missing user-provided details — always find a way to make progress`
+        });
+      }
+
       let content = '';
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
@@ -1579,21 +1670,44 @@ export class AgentModeService {
           }
         }
 
-        // Phase 2: Execute all prepared tools in parallel
-        const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
-          const toolStart = Date.now();
-          try {
-            const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
-            const toolDuration = Date.now() - toolStart;
-            return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
-          } catch (error) {
-            const toolDuration = Date.now() - toolStart;
-            return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
-          }
-        });
+        // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
+        // Sequential is required when wait_seconds is in the batch so the wait happens
+        // in the correct order relative to the tools before/after it.
+        const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
 
-        const toolResults = await Promise.all(toolPromises);
+        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
+
+        if (hasWaitTool) {
+          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools
+          toolResults = [];
+          for (const { toolCall, functionArgs } of preparedCalls) {
+            const toolStart = Date.now();
+            try {
+              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolDuration = Date.now() - toolStart;
+              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
+            } catch (error) {
+              const toolDuration = Date.now() - toolStart;
+              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration });
+            }
+          }
+        } else {
+          // Parallel execution (default)
+          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
+            const toolStart = Date.now();
+            try {
+              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolDuration = Date.now() - toolStart;
+              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
+            } catch (error) {
+              const toolDuration = Date.now() - toolStart;
+              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
+            }
+          });
+          toolResults = await Promise.all(toolPromises);
+        }
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -1641,6 +1755,24 @@ export class AgentModeService {
             } else {
               toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
             }
+
+            if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
+              try {
+                const uploadResult = await uploadFileToS3WithPath(
+                  toolContent,
+                  `${toolCall.id}.txt`,
+                  'text/plain',
+                  `tool-responses/${sessionId}`
+                );
+                if (uploadResult.success && uploadResult.key) {
+                  const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
+                  toolContent = header + toolContent;
+                }
+              } catch (e) {
+                console.error('AgentMode: Failed to save large tool response to S3:', e);
+              }
+            }
+
             const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
               ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
               : toolContent;
@@ -1915,6 +2047,7 @@ export class AgentModeService {
       * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
+      * **Respect User-Defined Volume**: When the user specifies a quantity or range (e.g. "send 30-40 connection requests", "post 5 times", "add 100 leads"), that is the target for the entire session. Execute the full stated volume without splitting into sub-batches or pausing for per-batch confirmation.
 
       ## Account Memory
       You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
@@ -1941,21 +2074,20 @@ export class AgentModeService {
       - Do NOT start executing until all required skills are installed
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
 
-## Task Creation Approach
-- **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
-- **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
-- **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
-- **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
-- Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
-- Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
-- Example: {"site_url": "example.com", "business_area": "e-commerce"}
-- Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: [DEPRECATED: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.]
+## Web Automation Approach
+- **Preferred Method**: Use the 'browser_*' Playwright tools (browser_navigate, browser_click, browser_type, browser_snapshot, etc.) for any web automation task — browsing, form filling, scraping, logging in, etc. These tools give Emma direct, real-time browser control and are faster and more flexible than the legacy agent engine.
+- **[DEPRECATED] Legacy Template Tasks**: 'create_task_from_template' and 'list_task_templates' are legacy tools that delegate to a background agent engine (takes several minutes, cannot be cancelled). Only use these if the task genuinely cannot be done with direct browser control — for example, if a specific template exists that adds significant value beyond what direct browsing can achieve.
+- **[DEPRECATED] Fallback Method**: 'create_task_from_prompt' is deprecated — web automation via agent engine is being phased out. Do not use this tool.
+- **Confirmation required for legacy template tasks only**: If you must use 'create_task_from_template', always confirm with the user first — explain what the task will do, that it takes several minutes, and that it cannot be cancelled once started. This does NOT apply to direct browser_* tools.
+- **[DEPRECATED] Image Generation via task**: 'create_image_task_from_prompt' is deprecated — use 'generate_image' instead.
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
- - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
-   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
+ - **Blog Articles vs HTML Reports — choose carefully**:
+   - **Blog Articles** → use 'create_blog_article': ONLY for blog posts intended for publishing to a CMS (Basehub, Webflow). Generates a hero image and blog-styled HTML. Do NOT use for reports, summaries, analyses, or audits.
+   - **Reports, Summaries, Analyses, Audits** → use 'create_html_file': For any HTML document that is NOT a blog post — e.g. weekly performance reports, account summaries, GTM audits, competitive analyses, executive summaries, and similar structured documents. Never use create_blog_article for these.
+   - **Decision rule**: If the user says "report", "summary", "analysis", "audit", "document", or anything that is not clearly a blog post → use 'create_html_file'. Only use 'create_blog_article' when the user explicitly asks for a "blog article", "blog post", or content for their website blog.
+   - **When to use deep_research:true on create_blog_article**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
 - **Meta Ads Campaigns and Metrics**:
 - Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
 - Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data for selected campaigns
@@ -1977,8 +2109,8 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, ClickUp tasks (with attachments), and Foreplay ad library (saved ads and boards). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
-- **Foreplay Ad Library**: When creating new ads or looking for ad inspiration, search the knowledge base for Foreplay ads. Foreplay boards and swipefile ads appear as knowledge base entries with identifiers like "foreplay-board:BOARD_ID" and "foreplay-swipefile". Read individual ads to get full ad copy, headlines, CTAs, formats, and video transcriptions that can serve as seed ads.
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Foreplay Ad Library**: When the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads, use 'search_ads_knowledge_base'. This searches only the user's Foreplay swipefile and boards. Use this for ad-specific queries (e.g. "find video ads from competitors", "show me carousel ads in our swipefile"). Do NOT use search_knowledge_base for Foreplay ad searches.
 - **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
@@ -2037,6 +2169,13 @@ Save the chart image URLs from the response.
       - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
       - imagine: false (stick to research facts, don't invent details)
 
+## Waiting for Results
+- Use wait_seconds when you need to pause before checking a result — e.g. waiting for a LinkedIn post to propagate, an email to land, a page to update, or any async operation to settle
+- **Pattern**: call the action tool, then wait_seconds, then call the check/verify tool — all in the same turn. The batch will execute sequentially in order.
+- **Max wait**: 300 seconds (5 minutes) per call. For longer waits, chain multiple wait+check turns or tell the user to ask you again later.
+- **Always tell the user** what you are waiting for and why before calling wait_seconds
+- **Do not over-wait**: use the shortest reasonable delay. Typical values: 5–15s for page propagation, 30–60s for email/notification delivery, 120–300s for async processing.
+
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
 - The tool call results will include the current status of any running tasks
@@ -2049,13 +2188,14 @@ Save the chart image URLs from the response.
 - **Proactive information gathering**: Search for market data, trends, and context to provide more informed recommendations
 - **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
 - Ask clarifying questions only after you've searched for available information
+- **Brand context first**: Before asking the user for business details (company name, website, goals, target market, brand voice, etc.), ALWAYS call read_brand_guidelines and read_market_strategy first. These tools frequently contain exactly the information you need. Only ask the user if these tools return nothing useful.
+- **Never ask twice**: If you've already asked for a piece of information in this conversation and the user has not provided it, do NOT ask again. Instead, proceed using whatever context is available from brand guidelines, market strategy, or reasonable defaults.
 - **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
-- **Task confirmation required**: Always explain what a task will do and ask for confirmation before creating it (tasks take time to complete)
-- **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
+- **[DEPRECATED] Legacy task confirmation required**: If you must use 'create_task_from_template', explain what the task will do and confirm with the user first (these tasks take time and cannot be cancelled). For direct browser_* tools, no confirmation is needed — just proceed.
+- **Prefer direct browser tools**: For any web browsing or automation, use browser_navigate, browser_click, browser_type, etc. directly — do not use create_task_from_template unless there is a strong reason.
 - Provide clear explanations of what you're doing and what information you've found
 - Keep responses concise but informative
-- Always confirm task creation and provide relevant details
-- When using templates, explain which template was selected and why
+- When using legacy templates, explain which template was selected and why
 - When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
 - Focus on actionable insights and strategic guidance based on current data and conversation context
 - If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
@@ -2499,6 +2639,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'slack_list_channels',
     'slack_get_recent_messages',
     'slack_send_message',
+
+    // Timing
+    'wait_seconds',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -2878,6 +3021,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
     }
 
+    if (toolName === 'search_tool_response') {
+      return result;
+    }
+
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -3100,6 +3247,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
       };
     }
 
+    // For report_product_issues, preserve success/message/results so the sidebar can show status
+    if (toolName === 'report_product_issues') {
+      return {
+        success: result?.success ?? false,
+        message: result?.message,
+        results: result?.results,
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
@@ -3309,6 +3465,20 @@ When a user requests client onboarding or says "onboard new client" or similar:
             }
           ],
           totalResults: 2
+        };
+
+      case 'search_ads_knowledge_base':
+        return {
+          success: true,
+          message: `Found 2 mock Foreplay ads matching "${args.query}"`,
+          query: args.query,
+          results: [
+            {
+              content: `# Mock Video Ad\n\n**Brand:** Acme Corp\n**Format:** video\n**Platform:** facebook\n\n## Headline\nBest Product Ever\n\n## Description\nThis is a mock Foreplay ad result for "${args.query}".`,
+              source: 'foreplay-swipefile/Acme Corp/Mock Video Ad'
+            }
+          ],
+          totalResults: 1
         };
 
       case 'list_knowledge_base_files':
@@ -4094,6 +4264,49 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  private async executeSearchToolResponse(args: { s3_key: string; query: string }): Promise<any> {
+    const { s3_key, query } = args;
+    if (!s3_key || !query) {
+      return { success: false, message: 'Both s3_key and query are required' };
+    }
+
+    try {
+      const content = await getS3ObjectAsString(s3_key);
+      if (!content) {
+        return { success: false, message: 'Empty response from S3' };
+      }
+
+      const queryLower = query.toLowerCase();
+      const contentLower = content.toLowerCase();
+      const CONTEXT_WINDOW = 300;
+      const MAX_MATCHES = 20;
+      const matches: Array<{ offset: number; context: string }> = [];
+
+      let searchPos = 0;
+      while (searchPos < contentLower.length && matches.length < MAX_MATCHES) {
+        const matchIdx = contentLower.indexOf(queryLower, searchPos);
+        if (matchIdx === -1) break;
+        const start = Math.max(0, matchIdx - CONTEXT_WINDOW);
+        const end = Math.min(content.length, matchIdx + query.length + CONTEXT_WINDOW);
+        matches.push({ offset: matchIdx, context: content.slice(start, end) });
+        searchPos = matchIdx + queryLower.length;
+      }
+
+      return {
+        success: true,
+        query,
+        total_matches: matches.length,
+        total_size: content.length,
+        matches,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: `Failed to search tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
+    }
+  }
+
   public async describeImage(llmModel: string, imageUrl: string, prompt?: string): Promise<any> {
     try {
       if (!imageUrl) {
@@ -4176,15 +4389,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      // Reject image files — the LLM should use describe_image instead
-      const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.tif', '.ico', '.heic', '.heif', '.avif'];
       try {
         const parsedUrl = new URL(videoFileUrl);
-        const ext = path.extname(parsedUrl.pathname).toLowerCase();
-        if (imageExtensions.includes(ext)) {
+        const ext = path.extname(parsedUrl.pathname).toLowerCase().replace(/^\./, '');
+        if (IMAGE_EXTENSIONS.has(ext)) {
           return {
             success: false,
-            message: `This appears to be an image file (${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+            message: `This appears to be an image file (.${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
           };
         }
       } catch {
@@ -9328,6 +9539,35 @@ Format the response as JSON with this structure:
   }
 
   /**
+   * Generate a 2-3 word summary of what was achieved in a scheduled chat run.
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost summarization.
+   * Returns null if generation fails (caller should keep existing title).
+   */
+  async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
+    try {
+      const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
+        {
+          role: 'system',
+          content: `You are a task summarizer. Given a user's request and the agent's response, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). Return ONLY the summary, nothing else.`
+        },
+        {
+          role: 'user',
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nResult: ${response.slice(0, 500)}`
+        }
+      ], {
+        max_completion_tokens: 20,
+        temperature: 0.3,
+      });
+
+      const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
+      return summary || null;
+    } catch (error) {
+      console.error('AgentMode: Failed to generate scheduled chat summary:', error);
+      return null;
+    }
+  }
+
+  /**
    * Triage a Slack message to determine if it requires handling (e.g. a client question).
    * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
    * Returns true if the message needs to be handled, false otherwise.
@@ -12213,72 +12453,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
-      // Search Foreplay ads (swipefile + boards — name/description/headline match)
-      if (userId) {
-        try {
-          const foreplayToken = await getForeplayAccessToken(userId);
-          if (foreplayToken) {
-            const queryLower = query.toLowerCase();
-            let foreplayResultCount = 0;
-
-            // Search swipefile ads
-            try {
-              const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
-              for (const ad of swipeResult.ads) {
-                if (foreplayResultCount >= limitedMaxResults) break;
-                const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
-                const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
-                const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
-                const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
-                if (nameMatch || descMatch || headlineMatch || brandMatch) {
-                  const content = formatForeplayAdAsMarkdown(ad);
-                  results.push({
-                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
-                    source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
-                  });
-                  foreplayResultCount++;
-                }
-              }
-            } catch (swipeErr) {
-              console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
-            }
-
-            // Search board ads
-            try {
-              const boards = await listForeplayBoards(foreplayToken);
-              for (const board of boards) {
-                if (foreplayResultCount >= limitedMaxResults) break;
-                try {
-                  const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
-                  for (const ad of boardAds) {
-                    if (foreplayResultCount >= limitedMaxResults) break;
-                    const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
-                    const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
-                    const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
-                    const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
-                    if (nameMatch || descMatch || headlineMatch || brandMatch) {
-                      const content = formatForeplayAdAsMarkdown(ad);
-                      results.push({
-                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
-                        source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
-                      });
-                      foreplayResultCount++;
-                    }
-                  }
-                } catch (boardErr) {
-                  console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
-                }
-              }
-            } catch (boardsErr) {
-              console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
-            }
-          }
-        } catch (foreplayError) {
-          console.log('AgentMode: Error searching Foreplay ads:', foreplayError);
-          // Don't fail the whole search if Foreplay search fails
-        }
-      }
-
       if (results.length === 0) {
         return {
           success: true,
@@ -12301,6 +12475,107 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search the knowledge base. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Search Foreplay ads only (swipefile + boards). Use this tool when the query is ads-related.
+  public async searchForeplayAds(query: string, maxResults: number = 5, userId?: string): Promise<any> {
+    try {
+      if (!userId) {
+        return { success: false, message: 'User ID required to search Foreplay ads.', results: [], totalResults: 0 };
+      }
+
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return {
+          success: false,
+          message: 'No Foreplay account connected. Connect your Foreplay account in Knowledge Base settings.',
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      const limitedMaxResults = Math.min(maxResults, 10);
+      const queryLower = query.toLowerCase();
+      const results: Array<{ content: string; source: string }> = [];
+      let foreplayResultCount = 0;
+
+      // Search swipefile ads
+      try {
+        const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+        for (const ad of swipeResult.ads) {
+          if (foreplayResultCount >= limitedMaxResults) break;
+          const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+          const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+          const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+          const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+          if (nameMatch || descMatch || headlineMatch || brandMatch) {
+            const content = formatForeplayAdAsMarkdown(ad);
+            results.push({
+              content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+              source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+            });
+            foreplayResultCount++;
+          }
+        }
+      } catch (swipeErr) {
+        console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+      }
+
+      // Search board ads
+      try {
+        const boards = await listForeplayBoards(foreplayToken);
+        for (const board of boards) {
+          if (foreplayResultCount >= limitedMaxResults) break;
+          try {
+            const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+            for (const ad of boardAds) {
+              if (foreplayResultCount >= limitedMaxResults) break;
+              const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+              const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+              const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+              const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+              if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                const content = formatForeplayAdAsMarkdown(ad);
+                results.push({
+                  content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                  source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                });
+                foreplayResultCount++;
+              }
+            }
+          } catch (boardErr) {
+            console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
+          }
+        }
+      } catch (boardsErr) {
+        console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+      }
+
+      if (results.length === 0) {
+        return {
+          success: true,
+          message: `No Foreplay ads found matching "${query}"`,
+          query,
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      return {
+        success: true,
+        message: `Found ${results.length} Foreplay ads matching "${query}"`,
+        query,
+        results,
+        totalResults: results.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching Foreplay ads:', error);
+      return {
+        success: false,
+        message: 'Failed to search Foreplay ads. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -13149,6 +13424,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Tools whose results are allowed a higher truncation limit (e.g. market strategy data)
   private static readonly LARGE_TOOL_RESULT_LIMIT: Record<string, number> = {
     'read_market_strategy': 50000,
+    'search_tool_response': 20000,
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
@@ -13726,6 +14002,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Determine file type from URL
       const urlPath = new URL(fileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
+
+      if (IMAGE_EXTENSIONS.has(extension)) {
+        return {
+          success: false,
+          message: `This is an image file (.${extension}). Use the describe_image tool to analyze its visual content instead.`,
+          error: 'Image files must be analyzed with describe_image, not read_file_content'
+        };
+      }
+
+      if (VIDEO_EXTENSIONS.has(extension)) {
+        return {
+          success: false,
+          message: `This is a video file (.${extension}). Use the describe_video tool to analyze its content instead.`,
+          error: 'Video files must be analyzed with describe_video, not read_file_content'
+        };
+      }
 
       // Fetch the file content
       const response = await axios.get(fileUrl, {
@@ -19026,8 +19318,78 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'send-message': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-message');
           if (!message) throw new Error('message is required for send-message action');
+
+          // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
+          const { list_id: sendListId, lead_id: sendLeadId } = args;
+          if (sendListId && sendLeadId) {
+            const { crmDb } = await import('./db');
+            const lead = await crmDb.getLeadById(sendListId, sendLeadId);
+            if (lead) {
+              const syncAt = (lead as any).linkedinMessageSyncAt as string | undefined;
+              const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+              if (!syncAt || syncAt < oneDayAgo) {
+                return {
+                  success: false,
+                  error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
+                  requiresSync: true,
+                };
+              }
+            }
+          }
+
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
           return { success: true, data: messageResponse };
+        }
+
+        case 'update-conversation-history': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for update-conversation-history');
+          const { list_id, lead_id } = args;
+          if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
+
+          // Resolve the Unipile attendee/provider ID for this contact
+          const providerId = isUrl
+            ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
+            : target;
+
+          // Load the lead to get the normalized LinkedIn URL used as the storage key
+          const { crmDb } = await import('./db');
+          const lead = await crmDb.getLeadById(list_id, lead_id);
+          if (!lead) throw new Error(`Lead ${lead_id} not found in list ${list_id}`);
+          const leadLinkedIn = ((lead as any).linkedin as string | undefined)?.toLowerCase();
+          if (!leadLinkedIn) throw new Error('Lead has no LinkedIn URL — add a LinkedIn profile URL to this lead first');
+
+          // Fetch all messages with this contact from Unipile
+          const messages = await linkedInOutreachService.getMessagesWithContact(providerId);
+
+          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp
+          const { emailEventsDb } = await import('./emailEventsDb');
+          const emailDomain = `linkedin-${list_id}`;
+
+          const syncAt = new Date().toISOString();
+          await Promise.all([
+            ...messages.map(msg => emailEventsDb.addLinkedInMessageEvent({
+              eventId: `linkedin_msg_${msg.id}`,
+              emailDomain,
+              leadEmail: leadLinkedIn,
+              eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',
+              text: msg.text ?? null,
+              timestamp: msg.timestamp,
+              senderId: msg.sender_id,
+              messageProviderId: msg.provider_id,
+            })),
+            crmDb.updateLeadLinkedInSyncAt(list_id, lead_id, syncAt),
+          ]);
+          const totalSynced = messages.length;
+
+          console.log(`[AgentMode] update-conversation-history: synced ${totalSynced} messages for lead ${lead_id}`);
+          return {
+            success: true,
+            data: {
+              synced: totalSynced,
+              syncedAt: syncAt,
+              message: `Synced ${totalSynced} messages for this LinkedIn contact. Conversation history is now up to date in the CRM.`,
+            },
+          };
         }
 
         case 'get-company': {
@@ -19154,7 +19516,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CAMPAIGN_GROUP': {
         if (action === 'LIST') {
-          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
           return { success: true, campaignGroups: result.data?.elements || [] };
         }
@@ -19246,16 +19608,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       case 'TARGETING': {
         if (action === 'LIST_FACETS') {
           const result = await linkedInAdsService.listTargetingFacets(accessToken);
+          if (!result.success) throw new Error(result.error || 'Failed to list targeting facets');
           return { success: true, facets: result.data?.elements || [] };
         }
         if (action === 'SEARCH') {
           if (!params.facet) throw new Error('SEARCH requires facet');
           const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+          if (!result.success) throw new Error(result.error || 'Failed to search targeting entities');
           return { success: true, entities: result.data?.elements || [] };
         }
         if (action === 'ESTIMATE_REACH') {
           if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
           const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
           return { success: true, audienceCount: result.data };
         }
         throw new Error(`Unknown action "${action}" for TARGETING`);
@@ -19343,17 +19708,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         if (action === 'INIT_IMAGE_UPLOAD') {
           const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
           const result = await linkedInAdsService.initializeImageUpload(accessToken, ownerUrn);
+          if (!result.success) throw new Error(result.error || 'Failed to initialize image upload');
           return { success: true, uploadInstructions: result.data };
         }
         if (action === 'INIT_VIDEO_UPLOAD') {
           if (!params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires file_size');
           const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
           const result = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, params.file_size);
+          if (!result.success) throw new Error(result.error || 'Failed to initialize video upload');
           return { success: true, uploadInstructions: result.data };
         }
         if (action === 'FINALIZE_VIDEO') {
           if (!params.video_urn) throw new Error('FINALIZE_VIDEO requires video_urn');
           const result = await linkedInAdsService.finalizeVideoUpload(accessToken, params.video_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to finalize video upload');
           return { success: true, result: result.data };
         }
         throw new Error(`Unknown action "${action}" for MEDIA`);
@@ -19422,6 +19790,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } };
       timeGranularity?: string;
       fields?: string[];
+      campaign_groups?: string[];
       campaigns?: string[];
       adGroups?: string[];
       creatives?: string[];
@@ -19429,16 +19798,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   ): Promise<any> {
     console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
 
-    const { accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+    const { accountId: resolvedAccountId, accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
 
     const result = await linkedInAdsService.getAdAnalytics(
       accessToken,
+      resolvedAccountId,
       params.pivot,
       params.timeGranularity || 'ALL',
       params.dateRange,
       params.fields || ['impressions', 'clicks', 'costInLocalCurrency'],
-      { campaign_ids: params.campaigns, creative_ids: params.creatives }
+      { campaign_group_ids: params.campaign_groups, campaign_ids: params.campaigns, creative_ids: params.creatives }
     );
+    if (!result.success) {
+      throw new Error(result.error || 'LinkedIn Ads API request failed');
+    }
     return { success: true, analytics: result.data?.elements || result.data };
   }
 

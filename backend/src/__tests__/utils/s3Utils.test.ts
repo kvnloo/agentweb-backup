@@ -28,6 +28,8 @@ import {
   isS3Url,
   getS3ObjectStream,
   getS3ObjectMetadata,
+  getS3ObjectAsString,
+  uploadScreenshotToS3,
 } from '../../utils/s3Utils';
 
 describe('s3Utils', () => {
@@ -506,6 +508,77 @@ describe('s3Utils', () => {
       await getS3ObjectMetadata('file.txt');
 
       expect(mockHeadObject).toHaveBeenCalledWith({ Bucket: 'agentweb-user-files', Key: 'file.txt' });
+    });
+  });
+
+  describe('getS3ObjectAsString', () => {
+    it('should return string content from S3 object', async () => {
+      mockGetObject.mockReturnValue({
+        promise: () => Promise.resolve({ Body: Buffer.from('hello world') }),
+      });
+
+      const result = await getS3ObjectAsString('path/to/file.txt', 'test-bucket');
+
+      expect(mockGetObject).toHaveBeenCalledWith({ Bucket: 'test-bucket', Key: 'path/to/file.txt' });
+      expect(result).toBe('hello world');
+    });
+
+    it('should return empty string when Body is undefined', async () => {
+      mockGetObject.mockReturnValue({
+        promise: () => Promise.resolve({ Body: undefined }),
+      });
+
+      const result = await getS3ObjectAsString('path/to/file.txt', 'test-bucket');
+
+      expect(result).toBe('');
+    });
+
+    it('should use default bucket when none specified', async () => {
+      delete process.env.AWS_S3_BUCKET;
+      mockGetObject.mockReturnValue({
+        promise: () => Promise.resolve({ Body: Buffer.from('content') }),
+      });
+
+      await getS3ObjectAsString('file.txt');
+
+      expect(mockGetObject).toHaveBeenCalledWith({ Bucket: 'agentweb-user-files', Key: 'file.txt' });
+    });
+  });
+
+  describe('uploadScreenshotToS3', () => {
+    it('should upload a valid base64 screenshot and return result', async () => {
+      mockUploadPromise.mockResolvedValue({
+        Location: 'https://s3.amazonaws.com/test-bucket/users/user-1/screenshot-123.jpg',
+        Key: 'users/user-1/screenshot-123.jpg',
+      });
+
+      const result = await uploadScreenshotToS3('data:image/png;base64,abc123', 'user-1');
+
+      expect(result).not.toBeNull();
+      expect(result!.url).toBeDefined();
+    });
+
+    it('should return null for non-image data URI', async () => {
+      const result = await uploadScreenshotToS3('data:text/plain;base64,abc', 'user-1');
+
+      expect(result).toBeNull();
+      expect(mockUpload).not.toHaveBeenCalled();
+    });
+
+    it('should return null when upload fails', async () => {
+      mockUploadPromise.mockResolvedValue({ Location: undefined, Key: undefined });
+
+      const result = await uploadScreenshotToS3('data:image/png;base64,abc123', 'user-1');
+
+      expect(result).toBeNull();
+    });
+
+    it('should return null and log error when upload throws', async () => {
+      mockUploadPromise.mockRejectedValue(new Error('Network error'));
+
+      const result = await uploadScreenshotToS3('data:image/png;base64,abc123', 'user-1');
+
+      expect(result).toBeNull();
     });
   });
 });
