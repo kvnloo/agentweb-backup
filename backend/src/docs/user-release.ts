@@ -26,6 +26,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-09',
+    changes: [
+      'Fix: Slack Channel Monitoring and Suggested Replies Restored',
+      '- When a client posts a message in their connected Slack channel (without @mentioning Emma), the system now analyzes it and emails founders@agentweb.pro with a suggested reply',
+      '- Extended to also monitor Slack thread replies — messages in threads not started by an @Emma mention are also analyzed and emailed as suggested replies',
+      '- Emma stays silent in Slack for monitored messages; the email lets you decide how to respond',
+      '- Thread replies to monitored conversations continue the same session for context, rather than creating a fresh one each time',
+    ],
+  },
+  {
     date: '2026-04-08',
     changes: [
       'Admin: Work Plan Categories',

@@ -30,6 +30,134 @@ function userMatchesChannel(u: any, channel: string): boolean {
 }
 
 /**
+ * Helper: handles the full slack triggered session flow for non-Emma messages.
+ * Triages message, creates session, generates Emma response, emails founders.
+ * Does NOT post to Slack — email only, so the team can decide how to respond.
+ * @param ts For top-level messages: the message's own ts. For thread replies: the thread_ts (root).
+ */
+async function handleSlackTriggeredSession(params: {
+  text: string;
+  slackUserId: string;
+  channel: string;
+  ts: string;
+}) {
+  const { text, slackUserId, channel, ts } = params;
+  try {
+    const { userDb } = await import('../services/db');
+    const { chatbotDb } = await import('../services/chatbotService');
+    const { agentModeService } = await import('../services/agentModeService');
+    const { settingsService } = await import('../services/settingsService');
+
+    // Normalize Slack formatting
+    const rawMessage = text
+      .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
+      .replace(/<mailto:([^|>]+)>/g, '$1')
+      .trim();
+
+    if (!rawMessage) return;
+
+    // Look up user by slackChannel field (with cache)
+    const mappingKey = `slack_channel_mapping_${channel}`;
+    let user = null;
+
+    const cachedMapping = await settingsService.getSetting(mappingKey);
+    if (cachedMapping?.settingValue) {
+      user = await userDb.getUserById(cachedMapping.settingValue);
+    }
+
+    if (!user) {
+      const allUsers = await userDb.getAllUsers();
+      user = allUsers.find((u: any) => userMatchesChannel(u, channel));
+      if (user) {
+        await settingsService.setSetting(
+          mappingKey,
+          user.userId,
+          `Slack channel to userId mapping for channel ${channel}`,
+          'system'
+        );
+      }
+    }
+
+    if (!user) {
+      console.log(`📨 [slack-triggered] channel ${channel} not connected to any user, ignoring`);
+      return;
+    }
+
+    // Triage: does this message need handling?
+    console.log(`📨 [slack-triggered] user found (${user.email}), starting triage...`);
+    const needsHandling = await agentModeService.triageSlackMessage(rawMessage);
+    if (!needsHandling) {
+      console.log(`📨 [slack-triggered] triage: skipping message in channel ${channel}`);
+      return;
+    }
+
+    console.log(`📨 [slack-triggered] triage passed, creating session for user ${user.userId}`);
+
+    const displayName = await getSlackUserDisplayName(slackUserId);
+    const userMessage = `${displayName}: ${rawMessage}`;
+
+    const session = await chatbotDb.createChatSession(
+      user.userId,
+      undefined,
+      'agent',
+      'slack-triggered',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'regular'
+    );
+
+    const sessionTitle = rawMessage.length > 50 ? rawMessage.substring(0, 47) + '...' : rawMessage;
+    await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
+
+    // Save thread-to-session mapping so thread replies continue the session
+    const threadMappingKey = `slack_thread_${channel}_${ts}`;
+    await settingsService.setSetting(
+      threadMappingKey,
+      JSON.stringify({ sessionId: session.sessionId, userId: user.userId, type: 'triggered' }),
+      `Slack thread to session mapping`,
+      'system'
+    );
+    await chatbotDb.updateSessionSlackThread(session.sessionId, { channel, threadTs: ts });
+
+    // Generate Emma's response
+    const { generateSessionResponse } = await import('../controllers/agentModeController');
+    const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+    let emmaResponse = '';
+    try {
+      const result = await generateSessionResponse(session.sessionId, userMessage, user.userId, llmModel);
+      emmaResponse = result.content;
+    } catch (genError) {
+      console.error('❌ Error generating Emma response for slack triggered session:', genError);
+      emmaResponse = '(Emma was unable to generate a response for this message.)';
+    }
+
+    // Resolve channel name
+    let channelName = channel;
+    try {
+      const { WebClient } = await import('@slack/web-api');
+      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+      const info = await slackClient.conversations.info({ channel });
+      channelName = (info.channel as any)?.name || channel;
+    } catch { /* non-blocking */ }
+
+    await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
+      sessionId: session.sessionId,
+      userEmail: user.email,
+      channelName,
+      originalMessage: rawMessage,
+      emmaResponse,
+      receivedAt: new Date().toISOString(),
+    });
+
+    console.log(`✅ [slack-triggered] session handled: ${session.sessionId}`);
+  } catch (error) {
+    console.error('❌ Error in handleSlackTriggeredSession:', error);
+  }
+}
+
+/**
  * Helper: handles the shared post-session-creation flow for Slack sessions.
  * Sets title, associates thread, saves mapping, generates response, posts to Slack.
  */
@@ -486,7 +614,18 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
         }
       }
 
-      // Handle message events in threads (follow-up messages to Emma sessions)
+      // Handle top-level message events in user-connected Slack channels (slack triggered session)
+      // Filter: plain message, NOT a thread reply, NOT a bot message, NOT a message_changed/deleted event
+      if (event.type === 'message' && !event.thread_ts && !event.bot_id && !event.subtype) {
+        const { text, user: slackUserId, channel, ts } = event;
+        if (text) {
+          console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
+          // Fire-and-forget: triage + session + email
+          handleSlackTriggeredSession({ text, slackUserId, channel, ts });
+        }
+      }
+
+      // Handle message events in threads (follow-up messages to Emma sessions, or non-Emma threads)
       // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
       if (event.type === 'message' && event.thread_ts && !event.bot_id && !event.subtype) {
         const { text, user: slackUserId, channel, thread_ts: threadTs, files } = event;
@@ -496,88 +635,122 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
         const mapping = await settingsService.getSetting(threadMappingKey);
 
         if (mapping?.settingValue) {
-          console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
-
           try {
-            const { sessionId, userId } = JSON.parse(mapping.settingValue);
-            const { chatbotDb } = await import('../services/chatbotService');
-            const { generateSessionResponse } = await import('../controllers/agentModeController');
-            const { agentModeService } = await import('../services/agentModeService');
+            const parsed = JSON.parse(mapping.settingValue);
+            const { sessionId, userId } = parsed;
+            const isTriggered = parsed.type === 'triggered';
 
-            // Get session to verify it exists
-            const session = await chatbotDb.getChatSession(sessionId);
-            if (!session) {
-              console.log('❌ Session not found for Slack thread:', sessionId);
-              return;
-            }
+            if (isTriggered) {
+              // Monitored (email-only) session — continue it and send email, do NOT post to Slack
+              if (text) {
+                console.log('📨 Thread reply in monitored session (email-only):', { channel, threadTs, slackUserId });
+                const { chatbotDb } = await import('../services/chatbotService');
+                const { generateSessionResponse } = await import('../controllers/agentModeController');
+                const { agentModeService } = await import('../services/agentModeService');
+                const { userDb } = await import('../services/db');
 
-            // Get the Slack user's display name
-            const displayName = await getSlackUserDisplayName(slackUserId);
+                const session = await chatbotDb.getChatSession(sessionId);
+                if (!session) {
+                  console.log('❌ Session not found for monitored Slack thread:', sessionId);
+                  return;
+                }
 
-            // Format message with username prefix
-            const formattedMessage = `${displayName}: ${text || ''}`.trim();
+                const displayName = await getSlackUserDisplayName(slackUserId);
+                const formattedMessage = `${displayName}: ${text}`.trim();
 
-            // Handle file attachments from Slack
-            const attachments: any[] = [];
-            if (files && files.length > 0) {
-              for (const file of files) {
+                const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+                let emmaResponse = '';
                 try {
-                  const fileBuffer = await downloadSlackFile(file.url_private);
-                  // Upload to S3 for the session
-                  const { uploadFileToS3 } = await import('../utils/s3Utils');
-                  const uploadResult = await uploadFileToS3(
-                    fileBuffer,
-                    file.name || 'attachment',
-                    userId,
-                    file.mimetype || 'application/octet-stream'
-                  );
-                  if (!uploadResult.success || !uploadResult.url) {
-                    console.error('❌ Failed to upload Slack file to S3');
-                    continue;
+                  const result = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel);
+                  emmaResponse = result.content;
+                } catch (genError) {
+                  console.error('❌ Error generating response for monitored thread:', genError);
+                  emmaResponse = '(Emma was unable to generate a response for this message.)';
+                }
+
+                let channelName = channel;
+                try {
+                  const { WebClient } = await import('@slack/web-api');
+                  const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+                  const info = await slackClient.conversations.info({ channel });
+                  channelName = (info.channel as any)?.name || channel;
+                } catch { /* non-blocking */ }
+
+                const user = await userDb.getUserById(userId);
+                await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
+                  sessionId,
+                  userEmail: user?.email || userId,
+                  channelName,
+                  originalMessage: text,
+                  emmaResponse,
+                  receivedAt: new Date().toISOString(),
+                });
+              }
+            } else {
+              // Emma @mention session — existing behavior: post response directly to Slack
+              console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
+              const { chatbotDb } = await import('../services/chatbotService');
+              const { generateSessionResponse } = await import('../controllers/agentModeController');
+              const { agentModeService } = await import('../services/agentModeService');
+
+              const session = await chatbotDb.getChatSession(sessionId);
+              if (!session) {
+                console.log('❌ Session not found for Slack thread:', sessionId);
+                return;
+              }
+
+              const displayName = await getSlackUserDisplayName(slackUserId);
+              const formattedMessage = `${displayName}: ${text || ''}`.trim();
+
+              const attachments: any[] = [];
+              if (files && files.length > 0) {
+                for (const file of files) {
+                  try {
+                    const fileBuffer = await downloadSlackFile(file.url_private);
+                    const { uploadFileToS3 } = await import('../utils/s3Utils');
+                    const uploadResult = await uploadFileToS3(
+                      fileBuffer,
+                      file.name || 'attachment',
+                      userId,
+                      file.mimetype || 'application/octet-stream'
+                    );
+                    if (!uploadResult.success || !uploadResult.url) {
+                      console.error('❌ Failed to upload Slack file to S3');
+                      continue;
+                    }
+                    attachments.push({
+                      url: uploadResult.url,
+                      filename: file.name || 'attachment',
+                      size: file.size,
+                      mimetype: file.mimetype || 'application/octet-stream',
+                    });
+                  } catch (fileError) {
+                    console.error('❌ Error downloading Slack file:', fileError);
                   }
-                  attachments.push({
-                    url: uploadResult.url,
-                    filename: file.name || 'attachment',
-                    size: file.size,
-                    mimetype: file.mimetype || 'application/octet-stream',
-                  });
-                } catch (fileError) {
-                  console.error('❌ Error downloading Slack file:', fileError);
                 }
               }
-            }
 
-            // Post thinking message
-            const thinkingTs = await postThinkingMessage(channel, threadTs);
+              const thinkingTs = await postThinkingMessage(channel, threadTs);
+              const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
-            const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-
-            try {
-              const response = await generateSessionResponse(
-                sessionId,
-                formattedMessage,
-                userId,
-                llmModel,
-                attachments
-              );
-
-              if (thinkingTs) {
-                await deleteSlackMessage(channel, thinkingTs);
+              try {
+                const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
+                if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
+                if (response.content) await postThreadResponse(channel, threadTs, response.content);
+              } catch (genError) {
+                console.error('❌ Error generating thread response:', genError);
+                if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
+                await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
               }
-
-              if (response.content) {
-                await postThreadResponse(channel, threadTs, response.content);
-              }
-            } catch (genError) {
-              console.error('❌ Error generating thread response:', genError);
-              if (thinkingTs) {
-                await deleteSlackMessage(channel, thinkingTs);
-              }
-              await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
             }
           } catch (parseError) {
             console.error('❌ Error processing thread reply:', parseError);
           }
+        } else if (text) {
+          // Thread not mapped to anything — treat as a new monitored conversation.
+          // Pass thread_ts as ts so subsequent replies in this thread continue the same session.
+          console.log('📨 Thread reply in untracked thread, triggering monitoring:', { channel, threadTs, slackUserId });
+          handleSlackTriggeredSession({ text, slackUserId, channel, ts: threadTs });
         }
       }
 
