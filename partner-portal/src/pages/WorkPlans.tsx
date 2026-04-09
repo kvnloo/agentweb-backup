@@ -72,6 +72,9 @@ interface WorkPlan {
   reviewFeedback?: string;
   createdAt: string;
   updatedAt: string;
+  thumbnail_url?: string;
+  thumbnail_source?: 'ai' | 'upload' | 'none';
+  thumbnail_alt_text?: string;
 }
 
 const visibilityColor = (v: string) => {
@@ -124,6 +127,12 @@ export default function WorkPlans() {
 
   // Available function calls for autocomplete
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<string[]>([]);
+
+  // Thumbnail state (edit mode only)
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | undefined>(undefined);
+  const [thumbnailSource, setThumbnailSource] = useState<string>("none");
+  const [thumbnailLoading, setThumbnailLoading] = useState(false);
+  const [thumbnailError, setThumbnailError] = useState("");
 
   const fetchPlans = useCallback(async () => {
     try {
@@ -185,6 +194,9 @@ export default function WorkPlans() {
     setVisibility("system");
     setDefaultModel("");
     setCategory("");
+    setThumbnailUrl(undefined);
+    setThumbnailSource("none");
+    setThumbnailError("");
     setDialogOpen(true);
   };
 
@@ -200,7 +212,80 @@ export default function WorkPlans() {
     setVisibility(plan.visibility);
     setDefaultModel(plan.defaultModel || "");
     setCategory(plan.category || "");
+    setThumbnailUrl(plan.thumbnail_url);
+    setThumbnailSource(plan.thumbnail_source || "none");
+    setThumbnailError("");
     setDialogOpen(true);
+  };
+
+  const handleThumbnailGenerate = async () => {
+    if (!editingPlan) return;
+    setThumbnailLoading(true);
+    setThumbnailError("");
+    try {
+      const res = await axios.post(
+        buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}/thumbnail/generate`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      setThumbnailUrl(res.data.thumbnail_url);
+      setThumbnailSource(res.data.thumbnail_source || "ai");
+    } catch (err: any) {
+      setThumbnailError(err.response?.data?.message || "Failed to generate thumbnail");
+    } finally {
+      setThumbnailLoading(false);
+    }
+  };
+
+  const handleThumbnailUpload = async (file: File) => {
+    if (!editingPlan) return;
+
+    // Client-side validation
+    const accepted = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
+    if (!accepted.includes(file.type)) {
+      setThumbnailError("Unsupported format. Use JPG, PNG, or WebP.");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setThumbnailError("File exceeds 2 MB limit.");
+      return;
+    }
+
+    setThumbnailLoading(true);
+    setThumbnailError("");
+    try {
+      const formData = new FormData();
+      formData.append("thumbnail", file);
+      const res = await axios.post(
+        buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}/thumbnail/upload`),
+        formData,
+        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "multipart/form-data" } },
+      );
+      setThumbnailUrl(res.data.thumbnail_url);
+      setThumbnailSource(res.data.thumbnail_source || "upload");
+    } catch (err: any) {
+      setThumbnailError(err.response?.data?.message || "Failed to upload thumbnail");
+    } finally {
+      setThumbnailLoading(false);
+    }
+  };
+
+  const handleThumbnailRemove = async () => {
+    if (!editingPlan) return;
+    setThumbnailLoading(true);
+    setThumbnailError("");
+    try {
+      const res = await axios.delete(
+        buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}/thumbnail`),
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      setThumbnailUrl(res.data.thumbnail_url);
+      setThumbnailSource(res.data.thumbnail_source || "none");
+    } catch (err: any) {
+      setThumbnailError(err.response?.data?.message || "Failed to remove thumbnail");
+    } finally {
+      setThumbnailLoading(false);
+    }
   };
 
   const handleSave = async () => {
@@ -423,6 +508,7 @@ export default function WorkPlans() {
           <TableHead>
             <TableRow>
               <TableCell width={40} />
+              <TableCell width={56}>Thumb</TableCell>
               <TableCell>Title</TableCell>
               <TableCell>Category</TableCell>
               <TableCell>Steps</TableCell>
@@ -436,7 +522,7 @@ export default function WorkPlans() {
           <TableBody>
             {plans.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={9} align="center" sx={{ py: 4 }}>
+                <TableCell colSpan={10} align="center" sx={{ py: 4 }}>
                   <Typography color="text.secondary">No work plans yet. Create one to get started.</Typography>
                 </TableCell>
               </TableRow>
@@ -448,6 +534,27 @@ export default function WorkPlans() {
                       <IconButton size="small">
                         {expandedId === plan.planId ? <ExpandLessIcon /> : <ExpandMoreIcon />}
                       </IconButton>
+                    </TableCell>
+                    <TableCell sx={{ p: 0.5 }}>
+                      {plan.thumbnail_url ? (
+                        <Box
+                          component="img"
+                          src={plan.thumbnail_url}
+                          alt=""
+                          sx={{ width: 40, height: 40, borderRadius: 1, objectFit: "cover", display: "block" }}
+                        />
+                      ) : (
+                        <Box
+                          sx={{
+                            width: 40, height: 40, borderRadius: 1,
+                            bgcolor: "grey.200", display: "flex", alignItems: "center", justifyContent: "center",
+                          }}
+                        >
+                          <Typography variant="caption" color="text.disabled" fontWeight="bold">
+                            {plan.title.charAt(0).toUpperCase()}
+                          </Typography>
+                        </Box>
+                      )}
                     </TableCell>
                     <TableCell>
                       <Typography variant="body2" fontWeight="medium">{plan.title}</Typography>
@@ -499,7 +606,7 @@ export default function WorkPlans() {
                     </TableCell>
                   </TableRow>
                   <TableRow key={`${plan.planId}-expand`}>
-                    <TableCell colSpan={9} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
+                    <TableCell colSpan={10} sx={{ p: 0, border: expandedId === plan.planId ? undefined : "none" }}>
                       <Collapse in={expandedId === plan.planId}>
                         <Box sx={{ p: 2, bgcolor: "grey.50" }}>
                           {plan.welcomeMessage && (
@@ -649,6 +756,111 @@ export default function WorkPlans() {
               ))}
             </Box>
           </Stack>
+
+            {editingPlan && (
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>Thumbnail</Typography>
+                {thumbnailError && (
+                  <Alert severity="error" sx={{ mb: 1 }} onClose={() => setThumbnailError("")}>
+                    {thumbnailError}
+                  </Alert>
+                )}
+                <Box sx={{ display: "flex", gap: 2, alignItems: "flex-start", flexWrap: "wrap" }}>
+                  {/* Preview */}
+                  <Box
+                    sx={{
+                      width: 120,
+                      height: 120,
+                      borderRadius: 1,
+                      border: "1px solid",
+                      borderColor: "divider",
+                      overflow: "hidden",
+                      flexShrink: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      bgcolor: "grey.100",
+                      position: "relative",
+                    }}
+                  >
+                    {thumbnailLoading ? (
+                      <CircularProgress size={32} />
+                    ) : thumbnailUrl ? (
+                      <Box
+                        component="img"
+                        src={thumbnailUrl}
+                        alt="Thumbnail preview"
+                        sx={{ width: "100%", height: "100%", objectFit: "cover" }}
+                      />
+                    ) : (
+                      <Typography variant="h4" color="text.disabled">
+                        {title.charAt(0).toUpperCase()}
+                      </Typography>
+                    )}
+                  </Box>
+
+                  {/* Actions */}
+                  <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={thumbnailLoading}
+                      onClick={handleThumbnailGenerate}
+                    >
+                      {thumbnailSource === "none" ? "Generate with AI" : "Regenerate with AI"}
+                    </Button>
+
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      component="label"
+                      disabled={thumbnailLoading}
+                    >
+                      Upload Custom Image
+                      <input
+                        type="file"
+                        hidden
+                        accept="image/jpeg,image/png,image/webp"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) handleThumbnailUpload(file);
+                          e.target.value = "";
+                        }}
+                      />
+                    </Button>
+
+                    {thumbnailUrl && (
+                      <Button
+                        size="small"
+                        variant="text"
+                        color="error"
+                        disabled={thumbnailLoading}
+                        onClick={handleThumbnailRemove}
+                      >
+                        Remove
+                      </Button>
+                    )}
+
+                    {thumbnailSource && thumbnailSource !== "none" && (
+                      <Typography variant="caption" color="text.secondary">
+                        Source: {thumbnailSource === "ai" ? "AI generated" : "Custom upload"}
+                      </Typography>
+                    )}
+                  </Box>
+                </Box>
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: "block" }}>
+                  Accepted: JPG, PNG, WebP · Max 2 MB · Square or vertical (not landscape)
+                </Typography>
+              </Box>
+            )}
+
+            {!editingPlan && (
+              <Box sx={{ p: 1.5, bgcolor: "info.light", borderRadius: 1, opacity: 0.85 }}>
+                <Typography variant="caption" color="info.dark">
+                  A thumbnail will be automatically generated with AI after the work plan is created.
+                </Typography>
+              </Box>
+            )}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>

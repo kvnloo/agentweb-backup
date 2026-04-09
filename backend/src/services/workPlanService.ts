@@ -44,6 +44,9 @@ export interface WorkPlan {
   createdAt: string;
   updatedAt: string;
   reviewFeedback?: string;
+  thumbnail_url?: string;
+  thumbnail_source?: 'ai' | 'upload' | 'none';
+  thumbnail_alt_text?: string;
 }
 
 export class WorkPlanService {

@@ -4808,6 +4808,8 @@ export const agentModeController = {
         defaultModel: p.defaultModel,
         steps: p.steps,
         visibility: p.visibility,
+        thumbnail_url: p.thumbnail_url,
+        thumbnail_alt_text: p.thumbnail_alt_text,
       });
 
       // Put private plans first, then public — deduplicate by title so user's
