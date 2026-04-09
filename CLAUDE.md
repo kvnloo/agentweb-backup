@@ -403,7 +403,7 @@ Uses browser-use library with Playwright:
   - Deploys are triggered by file changes in `backend/` or `partner-portal/`
 - `.github/workflows/deploy.yml` - Deploys to production at safe times only
   - **Manual trigger:** Use GitHub Actions UI to manually trigger deployment (Actions tab → Deploy → Run workflow)
-  - **Scheduled trigger:** Automatically runs daily at 7:00 AM UTC (11:00 PM PST) to deploy any merged changes
+  - **Scheduled trigger:** Automatically runs daily at 2:00 AM UTC (6:00 PM PST) to deploy any merged changes
   - Detects changes via path filters and only deploys components with actual changes
   - Separate jobs for backend and partner-portal (agentweb repo) and customer portal (separate repo)
   - Version labels: `<component>-<YYYYMMDD>-scheduled` or `<component>-<YYYYMMDD>-manual`
@@ -432,7 +432,7 @@ Uses browser-use library with Playwright:
 6. The workflow will detect changes and deploy only components with actual changes
 
 **Option 2: Scheduled Deployment (automatic)**
-- Deployments automatically run daily at 7:00 AM UTC (11:00 PM PST)
+- Deployments automatically run daily at 2:00 AM UTC (6:00 PM PST)
 - Only deploys components with changes merged since the last deployment
 - Check the Actions tab to monitor deployment status
 
