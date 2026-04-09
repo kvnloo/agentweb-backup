@@ -240,6 +240,12 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         token_expires_at: Date.now() + tokens.expires_in * 1000,
+        // Populate BOTH fields. Historical bug: the granted scopes were only
+        // written to `granted_scopes`, but the generic `BaseOAuthConfig.scopes`
+        // field stayed empty, so any code path that looked at
+        // `connected_accounts[].config.scopes` saw `[]` and concluded the
+        // calendar scope wasn't granted even when it was.
+        scopes: tokens.granted_scopes,
         granted_scopes: tokens.granted_scopes,
       },
     });

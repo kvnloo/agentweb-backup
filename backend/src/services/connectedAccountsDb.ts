@@ -104,6 +104,29 @@ export interface GmailConfig extends BaseOAuthConfig {
 }
 
 /**
+ * Google Calendar scope URL. Kept in this file because both gmailAuth and
+ * prospectMeetingService need to check for it when diagnosing "why is
+ * Calendar returning 403".
+ */
+export const GOOGLE_CALENDAR_READONLY_SCOPE =
+  'https://www.googleapis.com/auth/calendar.readonly';
+
+/**
+ * Helper: has the user actually granted the calendar.readonly scope on their
+ * Gmail connection? Reads BOTH the modern `granted_scopes` field (populated
+ * by gmailAuth /connect) and the legacy `BaseOAuthConfig.scopes` field, so
+ * records written before the scopes-persistence fix still work.
+ */
+export const hasGmailCalendarScope = (config: GmailConfig | undefined | null): boolean => {
+  if (!config) return false;
+  const all = [
+    ...(config.granted_scopes || []),
+    ...(config.scopes || []),
+  ];
+  return all.some(s => s.includes('calendar.readonly') || s.includes('calendar'));
+};
+
+/**
  * YouTube OAuth configuration
  */
 export interface YouTubeConfig extends BaseOAuthConfig {
