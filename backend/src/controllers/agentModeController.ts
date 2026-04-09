@@ -4806,6 +4806,7 @@ export const agentModeController = {
         showLoginSignup: p.showLoginSignup || 'after_plan_completed',
         showInAgentMode: p.showInAgentMode !== false,
         defaultModel: p.defaultModel,
+        category: p.category,
         steps: p.steps,
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
