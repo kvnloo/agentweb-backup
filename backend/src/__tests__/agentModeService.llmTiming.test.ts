@@ -170,7 +170,7 @@ describe('AgentModeService - LLM Timing Metadata', () => {
       });
 
       jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(async () => {
-        await new Promise(resolve => setTimeout(resolve, 10));
+        await new Promise(resolve => setTimeout(resolve, 20));
         return { success: true };
       });
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
