@@ -110,6 +110,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['anthropic.claude-opus-4-6-v1'].client).toBeNull();
     });
 
+    it('should include gpt-5.4 in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('gpt-5.4');
+    });
+
+    it('should have temperature support enabled for gpt-5.4', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(true);
+    });
+
+    it('should have a non-null client for gpt-5.4 (Azure client created eagerly)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5.4'].client).not.toBeNull();
+    });
+
     it('should include Gemini 3.1 Pro Preview in the supported models', async () => {
       const models = await agentModeService.getSupportedModels();
       expect(models).toContain('gemini-3.1-pro-preview');

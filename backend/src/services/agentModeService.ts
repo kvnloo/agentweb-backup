@@ -977,6 +977,7 @@ export class AgentModeService {
     // List openai models - create client dynamically for each deployment
     'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false },
+    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true },
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
