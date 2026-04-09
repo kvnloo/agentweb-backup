@@ -98,7 +98,7 @@ import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -149,7 +149,6 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       requiredFunctionCalls: ['search_web'],
       userId: mockUserId,
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
 
     const publishedSkills = [
       { skillId: 'web-skill', name: 'Web', toolNames: ['search_web'] },
@@ -164,12 +163,7 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       responseMessages: [],
     });
 
-    const mockReq = {
-      user: { userId: mockUserId },
-      params: { scheduleId: mockScheduleId },
-    } as unknown as Request;
-
-    await agentModeController.testScheduledChat(mockReq, mockRes);
+    await runScheduledChat(schedule, mockUserId, true);
 
     const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0]?.[0] || [];
     expect(installedIds).not.toContain('__admin_tools__');
@@ -184,7 +178,6 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       requiredFunctionCalls: [],
       userId: mockUserId,
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
 
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
       content: 'Hello!',
@@ -194,12 +187,7 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       responseMessages: [],
     });
 
-    const mockReq = {
-      user: { userId: mockUserId },
-      params: { scheduleId: mockScheduleId },
-    } as unknown as Request;
-
-    await agentModeController.testScheduledChat(mockReq, mockRes);
+    await runScheduledChat(schedule, mockUserId, true);
 
     expect(mockAgentModeService.installSkills).not.toHaveBeenCalled();
   });
@@ -213,7 +201,6 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       requiredFunctionCalls: ['some_custom_tool'],
       userId: mockUserId,
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
 
     // No published skills have this tool
     mockedSkillService.getPublishedSkills.mockResolvedValue([]);
@@ -226,12 +213,7 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       responseMessages: [],
     });
 
-    const mockReq = {
-      user: { userId: mockUserId },
-      params: { scheduleId: mockScheduleId },
-    } as unknown as Request;
-
-    await agentModeController.testScheduledChat(mockReq, mockRes);
+    await runScheduledChat(schedule, mockUserId, true);
 
     const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
     expect(installedIds).toContain('__other_skills__');
@@ -249,7 +231,6 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       requiredFunctionCalls: ['get_chat_history'],
       userId: mockUserId,
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
 
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
       content: 'Here is the chat history.',
@@ -259,12 +240,7 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       responseMessages: [],
     });
 
-    const mockReq = {
-      user: { userId: mockUserId },
-      params: { scheduleId: mockScheduleId },
-    } as unknown as Request;
-
-    await agentModeController.testScheduledChat(mockReq, mockRes);
+    await runScheduledChat(schedule, mockUserId, true);
 
     expect(mockAgentModeService.installSkills).toHaveBeenCalled();
     const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
@@ -280,7 +256,6 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       requiredFunctionCalls: ['list_skills', 'analyze_competitors'],
       userId: mockUserId,
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
 
     const publishedSkills = [
       { skillId: 'research-skill', name: 'Research', toolNames: ['analyze_competitors'] },
@@ -298,12 +273,7 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       responseMessages: [],
     });
 
-    const mockReq = {
-      user: { userId: mockUserId },
-      params: { scheduleId: mockScheduleId },
-    } as unknown as Request;
-
-    await agentModeController.testScheduledChat(mockReq, mockRes);
+    await runScheduledChat(schedule, mockUserId, true);
 
     expect(mockAgentModeService.installSkills).toHaveBeenCalled();
     const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
@@ -320,7 +290,6 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       requiredFunctionCalls: ['manage_predefined_work_plan'],
       userId: mockUserId,
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(schedule);
 
     // No published skills
     mockedSkillService.getPublishedSkills.mockResolvedValue([]);
@@ -333,12 +302,7 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       responseMessages: [],
     });
 
-    const mockReq = {
-      user: { userId: mockUserId },
-      params: { scheduleId: mockScheduleId },
-    } as unknown as Request;
-
-    await agentModeController.testScheduledChat(mockReq, mockRes);
+    await runScheduledChat(schedule, mockUserId, true);
 
     expect(mockAgentModeService.installSkills).toHaveBeenCalled();
     const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];

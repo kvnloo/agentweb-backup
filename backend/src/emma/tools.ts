@@ -348,7 +348,16 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_ENGAGEMENT → POST_ENGAGEMENT, PAGE_LIKES
   OUTCOME_SALES     → OFFSITE_CONVERSIONS, VALUE
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
-  OUTCOME_APP_PROMOTION → APP_INSTALLS`,
+  OUTCOME_APP_PROMOTION → APP_INSTALLS
+
+GETTING DESTINATION URLS:
+  Destination URLs are NOT returned by AD LIST — they live inside the ad creative's object_story_spec.
+  To get destination URLs:
+    1. Use AD_CREATIVE LIST → returns object_story_spec for all creatives in the account.
+       Extract link from: image creative → object_story_spec.link_data.link
+                          video creative → object_story_spec.video_data.call_to_action.value.link
+                          carousel       → object_story_spec.link_data.child_attachments[].link
+    2. Or cross-reference: AD LIST (to get creative_id per ad) → AD_CREATIVE LIST (to match creative_id → object_story_spec)`,
     inputSchema: {
       type: "object",
       properties: {
@@ -628,6 +637,14 @@ emmaToolRegistry.register({
     name: 'call_linkedin_marketing_api',
     description: `Manage LinkedIn Ads entities via the Marketing Developer Platform API. Requires account_id from list_connected_accounts(platform='linkedin_ads').
 
+INTERNAL TERMINOLOGY MAPPING (never mention API names in responses):
+  User says "campaign"  →  use entity_type = CAMPAIGN_GROUP
+  User says "ad set"    →  use entity_type = CAMPAIGN
+  User says "ad"        →  use entity_type = CREATIVE
+The words CAMPAIGN_GROUP, CAMPAIGN, CREATIVE must NEVER appear in your response to the user. These are internal API values only.
+Always say "Campaign", "Ad Set", "Ad" — nothing else.
+FORBIDDEN (never say these): "campaign group", "creative", "ad set (campaign)", "ads (creatives)", "campaigns (campaign groups)"
+
 ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
@@ -679,9 +696,9 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
     Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
 
-  JOBS AD (campaign type: SPONSORED_UPDATES, format: JOB_POSTING — uses DYNAMIC campaign):
+  JOBS AD (campaign type: DYNAMIC, campaign format: JOBS):
     CREATIVE/CREATE_DYNAMIC (format=JOBS, headline, button_label, campaign_id)
-    Campaign must use type=DYNAMIC. objective should be JOB_APPLICANTS.
+    Campaign must use type=DYNAMIC. Do NOT set objectiveType — it is not supported for JOBS campaigns in LinkedIn API v202603+.
 
   SPOTLIGHT AD (campaign type: DYNAMIC):
     ⚠️ logo_urn is REQUIRED for SPOTLIGHT — LinkedIn mandates it if the company page has no logo. Upload first with MEDIA/UPLOAD_IMAGE.
@@ -699,7 +716,7 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     CREATIVE/CREATE (vast_tag_url, campaign_id) — no upload needed; video served by Innovid or approved vendor.
 
 REQUIRED PARAMS PER ENTITY + ACTION:
-  CAMPAIGN_GROUP CREATE: name, status (ACTIVE|DRAFT only — LinkedIn does NOT allow PAUSED on creation; if user wants paused, create as ACTIVE then UPDATE to PAUSED), run_schedule_start (epoch ms — ask the user when the campaign group should start), totalBudget.amount + totalBudget.currencyCode
+  CAMPAIGN_GROUP CREATE: name, status (ACTIVE|DRAFT only — LinkedIn does NOT allow PAUSED on creation; if user wants paused, create as DRAFT then UPDATE to PAUSED), run_schedule_start (epoch ms — ask the user when the campaign group should start), totalBudget.amount + totalBudget.currencyCode
   CAMPAIGN CREATE: ⚠️ ALWAYS ask before creating: "What type of ads will run in this campaign?" Then set type accordingly:
     type: SPONSORED_UPDATES (image, video, carousel, article, document, event, VAST) | TEXT_AD | SPONSORED_INMAILS (message/conversation) | DYNAMIC (jobs, spotlight, follower)
     format: ⚠️ REQUIRED for DYNAMIC, VIDEO, and CAROUSEL ads.
@@ -709,7 +726,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
       - If type=SPONSORED_UPDATES for event ads: format=SPONSORED_UPDATE_EVENT
       - For single image / article / document: omit format (defaults to STANDARD_UPDATE).
     Campaign type is immutable after creation.
-    Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS|JOB_APPLICANTS), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
+    Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS — omit entirely for DYNAMIC/JOBS campaigns), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
     targeting_include format: array of { "facet_urn": "urn:li:adTargetingFacet:locations", "values": ["urn:li:geo:103644278"] }
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
   CAMPAIGN UPDATE: campaign_id + fields to update
@@ -761,7 +778,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
             campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE.' },
             // Campaign
-            objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS, JOB_APPLICANTS).' },
+            objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS). Omit entirely for DYNAMIC campaigns with format=JOBS.' },
             costType: { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },
             unitCost: { type: 'object', description: '{ amount: "10.00", currencyCode: "USD" }' },
             totalBudget: { type: 'object', description: '{ amount: "1000.00", currencyCode: "USD" }' },
@@ -892,8 +909,16 @@ emmaToolRegistry.register({
     description: `Fetch LinkedIn Ads performance analytics (impressions, clicks, spend, conversions, etc.).
 Analytics are synchronous — results return immediately, no polling needed.
 
-PIVOT OPTIONS (what dimension to group by):
-  CAMPAIGN, CAMPAIGN_GROUP, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
+INTERNAL TERMINOLOGY MAPPING (never mention API names in responses):
+  User says "campaign"  →  use pivot = CAMPAIGN_GROUP
+  User says "ad set"    →  use pivot = CAMPAIGN
+  User says "ad"        →  use pivot = CREATIVE
+The words CAMPAIGN_GROUP, CAMPAIGN, CREATIVE must NEVER appear in your response to the user. These are internal API values only.
+Always say "Campaign", "Ad Set", "Ad" — nothing else.
+FORBIDDEN (never say these): "campaign group", "creative", "ad set (campaign)", "ads (creatives)", "campaigns (campaign groups)"
+
+PIVOT OPTIONS:
+  CAMPAIGN_GROUP, CAMPAIGN, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
   MEMBER_INDUSTRY, MEMBER_SENIORITY, MEMBER_JOB_FUNCTION, MEMBER_COUNTRY_V2,
   MEMBER_REGION_V2, PLACEMENT_NAME, IMPRESSION_DEVICE_TYPE
 
@@ -931,15 +956,20 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
           items: { type: 'string' },
           description: 'Metrics to return. Common: impressions, clicks, costInLocalCurrency, totalEngagements.'
         },
+        campaign_groups: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of campaign group URNs (or numeric IDs) to filter by. Use this to get insights for a specific user-facing "Campaign".'
+        },
         campaigns: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional list of campaign URNs to filter by.'
+          description: 'Optional list of campaign URNs (or numeric IDs) to filter by. Use this to get insights for a specific user-facing "Ad Set".'
         },
         creatives: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional list of creative URNs to filter by.'
+          description: 'Optional list of creative URNs (or numeric IDs) to filter by. Use this to get insights for a specific user-facing "Ad".'
         }
       },
       required: ['account_id', 'pivot', 'dateRange']
@@ -954,6 +984,7 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
         dateRange: args.dateRange,
         timeGranularity: args.timeGranularity,
         fields: args.fields,
+        campaign_groups: args.campaign_groups,
         campaigns: args.campaigns,
         creatives: args.creatives,
       }
@@ -1525,7 +1556,7 @@ emmaToolRegistry.register({
   name: 'create_blog_article',
   definition: {
     name: 'create_blog_article',
-    description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3. The final title will be generated from the drafts.',
+    description: 'Create a blog article intended for CMS publishing (Basehub, Webflow, etc.). Generates article content, a hero image, and a blog-styled HTML file. Use ONLY for blog posts — NOT for reports, summaries, analyses, audits, or other documents. For non-blog HTML documents, use create_html_file instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3350,7 +3381,7 @@ emmaToolRegistry.register({
   name: 'list_task_templates',
   definition: {
     name: 'list_task_templates',
-    description: 'List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this to find the right template before creating a task with create_task_from_template.',
+    description: '[DEPRECATED] List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this only if you need to use create_task_from_template for a task that cannot be done via direct browser control.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -3367,7 +3398,7 @@ emmaToolRegistry.register({
   name: 'create_task_from_template',
   definition: {
     name: 'create_task_from_template',
-    description: 'Create a web automation task using a specific template. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.',
+    description: '[DEPRECATED] Create a web automation task using a specific template. Only use this for tasks that cannot be accomplished via direct browser control with Playwright browser tools. If you need to do web automation (browsing, clicking, filling forms, scraping), prefer using the browser_* Playwright tools directly instead. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3830,6 +3861,32 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: "search_ads_knowledge_base",
+  definition: {
+    name: "search_ads_knowledge_base",
+    description: "Search the user's Foreplay ad library (swipefile + boards) for ads matching the query. Use this tool when the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads by brand, headline, or description. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search query (e.g. brand name, headline keyword, ad type)"
+        },
+        max_results: {
+          type: "number",
+          description: "Max results to return (default 5)",
+          default: 5
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
@@ -4168,7 +4225,7 @@ emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
-    description: "Create a well-formatted HTML file from a title, content draft, and format requirements.",
+    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead.",
     inputSchema: {
       type: "object",
       properties: {

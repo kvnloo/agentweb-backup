@@ -82,7 +82,7 @@ import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -150,30 +150,20 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
         content: 'Here are some marketing strategy and tips for your business.',
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Verify that addRunResult was called
       expect(mockScheduleDb.addRunResult).toHaveBeenCalled();
-      
+
       // Get the arguments passed to addRunResult
       const addRunResultCalls = mockScheduleDb.addRunResult.mock.calls;
       expect(addRunResultCalls.length).toBeGreaterThan(0);
-      
+
       const savedResult = addRunResultCalls[0][1];
-      
+
       // Verify actualResponse is NOT in the saved result
       expect(savedResult).not.toHaveProperty('actualResponse');
-      
+
       // Verify other fields are present
       expect(savedResult).toHaveProperty('scheduleId', mockScheduleId);
       expect(savedResult).toHaveProperty('sessionId', mockSessionId);
@@ -188,22 +178,10 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
         content: responseContent,
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Verify the response includes actualResponse
-      expect(mockRes.json).toHaveBeenCalled();
-      const responseData = (mockRes.json as jest.Mock).mock.calls[0][0];
-      expect(responseData).toHaveProperty('actualResponse', responseContent);
+      expect(result).toHaveProperty('actualResponse', responseContent);
     });
   });
 
@@ -263,7 +241,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           actualResponse: 'Final response with strategy details.',
           passed: true,
         }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
 
@@ -316,7 +295,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           actualResponse: 'Response not available. View the conversation to see the full response.',
           passed: true,
         }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
 
@@ -363,7 +343,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
         expect.objectContaining({
           actualResponse: 'Stored response from error case',
         }),
-        mockScheduleId
+        mockScheduleId,
+        undefined
       );
     });
   });

@@ -29,26 +29,47 @@ const s3 = new AWS.S3({
 });
 
 // Function to get BaseHub configuration from Secrets Manager
-export async function getBaseHubConfig(): Promise<{
+export async function getBaseHubConfig(userId?: string): Promise<{
   apiUrl: string;
   token: string;
   postsCollectionId: string;
   imageComponentId: string;
 }> {
+  // Check AW-Settings for user-configured Basehub credentials first
+  if (userId) {
+    try {
+      const { settingsService } = await import('../services/settingsService');
+      const setting = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+      if (setting) {
+        const userConfig = JSON.parse(setting.settingValue);
+        if (userConfig.token && userConfig.postsCollectionId) {
+          return {
+            apiUrl: userConfig.apiUrl || 'https://api.basehub.com/graphql',
+            token: userConfig.token,
+            postsCollectionId: userConfig.postsCollectionId,
+            imageComponentId: userConfig.imageComponentId || "AAzuzbz0jSbfwGJYvtMu3",
+          };
+        }
+      }
+    } catch (settingsError) {
+      console.log(`No AW-Settings Basehub config for user ${userId}, falling back to Secrets Manager`);
+    }
+  }
+
   try {
-    const secretName = process.env.NODE_ENV === "development" 
-      ? "dev/AgentWeb/BaseHub" 
+    const secretName = process.env.NODE_ENV === "development"
+      ? "dev/AgentWeb/BaseHub"
       : "prod/AgentWeb/BaseHub";
-    
+
     const { getSecret } = await import("../utils/secretsManager");
     const configJson = await getSecret(secretName);
-    
+
     const config = JSON.parse(configJson);
-    
+
     if (!config.apiUrl || !config.token || !config.postsCollectionId) {
       throw new Error("BaseHub configuration missing required fields");
     }
-    
+
     return {
       apiUrl: config.apiUrl,
       token: config.token,
@@ -1072,7 +1093,7 @@ export const getCmsConfig = async (req: AuthRequest, res: Response) => {
     }
 
     // Fallback: check Secrets Manager for admin-configured credentials
-    if (cmsType === 'WordPress' || cmsType === 'Webflow') {
+    if (cmsType === 'WordPress' || cmsType === 'Webflow' || cmsType === 'Basehub') {
       try {
         let config: Record<string, any> = {};
         if (cmsType === 'WordPress') {
@@ -1090,6 +1111,14 @@ export const getCmsConfig = async (req: AuthRequest, res: Response) => {
             siteId: wfConfig.siteId,
             collectionId: wfConfig.collectionId,
             categories: wfConfig.categories,
+          };
+        } else if (cmsType === 'Basehub') {
+          const bhConfig = await getBaseHubConfig();
+          config = {
+            apiUrl: bhConfig.apiUrl,
+            token: maskSecret(bhConfig.token),
+            postsCollectionId: bhConfig.postsCollectionId,
+            imageComponentId: bhConfig.imageComponentId,
           };
         }
         return res.status(200).json({ success: true, cmsType, config, source: 'admin' });
@@ -1187,6 +1216,33 @@ export const saveCmsConfig = async (req: AuthRequest, res: Response) => {
         return res.status(400).json({
           message: `Webflow config missing required fields: ${missing.join(', ')}`,
         });
+      }
+    } else if (cmsType === 'Basehub') {
+      const missing: string[] = [];
+      if (!configData.token) {
+        // Check existing config for partial update
+        const { settingsService } = await import('../services/settingsService');
+        const existing = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+        if (existing) {
+          const existingConfig = JSON.parse(existing.settingValue);
+          if (existingConfig.token) {
+            configData.token = existingConfig.token;
+          } else {
+            missing.push('token');
+          }
+        } else {
+          missing.push('token');
+        }
+      }
+      if (!configData.postsCollectionId) missing.push('postsCollectionId');
+      if (missing.length > 0) {
+        return res.status(400).json({
+          message: `Basehub config missing required fields: ${missing.join(', ')}`,
+        });
+      }
+      // Default apiUrl if not provided
+      if (!configData.apiUrl) {
+        configData.apiUrl = 'https://api.basehub.com/graphql';
       }
     }
 
@@ -1802,7 +1858,7 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
       publishedField = "publishedToWebflow";
     } else if (cmsType === "Basehub") {
       // Publish to BaseHub (existing logic)
-      const { apiUrl, token, postsCollectionId, imageComponentId } = await getBaseHubConfig();
+      const { apiUrl, token, postsCollectionId, imageComponentId } = await getBaseHubConfig(userId);
 
       if (!token) {
         return res.status(500).json({

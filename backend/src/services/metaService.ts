@@ -581,7 +581,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'body', 'title', 'image_url', 'thumbnail_url', 'object_type'];
+      const fields = ['id', 'name', 'status', 'body', 'title', 'image_url', 'thumbnail_url', 'object_type', 'link_url', 'object_story_spec', 'url_tags'];
       this.log(`Listing ad creatives for account: ${adAccountId}`, { fields });
       const creatives = await account.getAdCreatives(fields);
       return creatives.map((c: any) => c._data);
@@ -768,7 +768,7 @@ export class MetaService {
       const creative = new AdCreative(creativeId);
       const fields = [
         'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
-        'object_type', 'object_story_spec', 'url_tags'
+        'object_type', 'link_url', 'object_story_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
       const result = await creative.get(fields);

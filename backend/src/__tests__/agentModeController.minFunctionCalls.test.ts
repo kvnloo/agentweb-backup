@@ -73,7 +73,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -154,19 +154,9 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
-
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -223,22 +213,12 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // The function should be called multiple times due to retry logic
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure', // Will fail because the logic doesn't work as expected in test
@@ -297,24 +277,14 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Check that we have captured messages
       expect(capturedMessages.length).toBeGreaterThan(0);
-      
+
       // Check that at least one message contains the reminder text
-      const hasReminderMessage = capturedMessages.some(msg => 
-        msg.includes('Please try again. Make sure to') || 
+      const hasReminderMessage = capturedMessages.some(msg =>
+        msg.includes('Please try again. Make sure to') ||
         msg.includes('get_marketing_tips') ||
         msg.includes('more time')
       );
@@ -336,22 +306,12 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(incompleteResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called 20 times (maxTries = 20)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
@@ -386,19 +346,9 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
+      const result = await runScheduledChat(scheduleWithoutMinCalls, mockUserId, true);
 
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
-
-      expect(mockRes.json).toHaveBeenCalledWith(
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'success',
@@ -439,22 +389,12 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         }
       });
 
-      const mockReq = {
-        user: { userId: mockUserId },
-        params: { scheduleId: mockScheduleId },
-      } as unknown as Request;
-
-      const mockRes = {
-        json: jest.fn(),
-        status: jest.fn().mockReturnThis(),
-      } as unknown as Response;
-
-      await agentModeController.testScheduledChat(mockReq, mockRes);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
       // Should have been called 20 times (all attempts)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
-      
-      expect(mockRes.json).toHaveBeenCalledWith(
+
+      expect(result).toEqual(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',

@@ -105,10 +105,51 @@ export async function refreshAccessToken(
   return { access_token, refresh_token, expires_in };
 }
 
+// ─── Pagination helper ────────────────────────────────────────────────────────
+
+/**
+ * Fetch all pages from a LinkedIn cursor-based paginated endpoint (v202401+).
+ *
+ * Used for q=search endpoints (pageSize up to 1000) and q=criteria endpoints
+ * (pageSize up to 100). Loops until metadata.nextPageToken is absent.
+ *
+ * @param baseUrl     - Full path + existing query string (no pageSize/pageToken)
+ * @param accessToken - Bearer token
+ * @param pageSize    - Items per page: 1000 for q=search, 100 for q=criteria
+ * @param extraHeaders - Optional extra request headers (e.g. X-RestLi-Method)
+ */
+async function fetchAllPages(
+  baseUrl: string,
+  accessToken: string,
+  pageSize: number,
+  extraHeaders?: Record<string, string>
+): Promise<LinkedInAdsApiResult> {
+  const allElements: any[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    const tokenParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+    const url = `${baseUrl}${sep}pageSize=${pageSize}${tokenParam}`;
+
+    const result = await makeRequest('GET', url, accessToken, undefined, extraHeaders);
+    if (!result.success) return result;
+
+    allElements.push(...(result.data?.elements ?? []));
+    pageToken = result.data?.metadata?.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  return { success: true, data: { elements: allElements } };
+}
+
 // ─── Ad Account ───────────────────────────────────────────────────────────────
 
 export async function listAdAccounts(accessToken: string): Promise<LinkedInAdsApiResult> {
-  return makeRequest('GET', '/rest/adAccounts?q=search&search=(type:(values:List(BUSINESS,ENTERPRISE)))', accessToken);
+  return fetchAllPages(
+    '/rest/adAccounts?q=search&search=(type:(values:List(BUSINESS,ENTERPRISE)))',
+    accessToken,
+    1000
+  );
 }
 
 // ─── Campaign Group ───────────────────────────────────────────────────────────
@@ -121,10 +162,10 @@ export async function listCampaignGroups(
   const statusFilter = params.status
     ? `(status:(values:List(${params.status})))`
     : `(status:(values:List(ACTIVE,PAUSED,DRAFT,ARCHIVED)))`;
-  return makeRequest(
-    'GET',
+  return fetchAllPages(
     `/rest/adAccounts/${adAccountId}/adCampaignGroups?q=search&search=${statusFilter}`,
-    accessToken
+    accessToken,
+    1000
   );
 }
 
@@ -133,8 +174,9 @@ export async function createCampaignGroup(
   adAccountId: string,
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
-  // LinkedIn does not allow creating a campaign group with PAUSED status — must be ACTIVE or DRAFT
-  const status = params.status === 'PAUSED' ? 'ACTIVE' : (params.status || 'ACTIVE');
+  // LinkedIn does not allow creating a campaign group with PAUSED status — must be ACTIVE or DRAFT.
+  // Map PAUSED → DRAFT so the caller can then UPDATE to PAUSED after creation.
+  const status = params.status === 'PAUSED' ? 'DRAFT' : (params.status || 'ACTIVE');
 
   const body: Record<string, any> = {
     account: `urn:li:sponsoredAccount:${adAccountId}`,
@@ -200,12 +242,14 @@ export async function listCampaigns(
   // When filtering by status only, use the status filter.
   let path: string;
   if (params.campaign_group_id) {
-    path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(campaignGroup:(values:List(urn:li:sponsoredCampaignGroup:${params.campaign_group_id})))`;
+    const rawId = String(params.campaign_group_id);
+    const groupUrn = rawId.startsWith('urn:li:') ? rawId : `urn:li:sponsoredCampaignGroup:${rawId}`;
+    path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(campaignGroup:(values:List(${encodeURIComponent(groupUrn)})))`;
   } else {
     const statuses = params.status || 'ACTIVE,PAUSED,DRAFT,ARCHIVED';
     path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(status:(values:List(${statuses})))`;
   }
-  return makeRequest('GET', path, accessToken);
+  return fetchAllPages(path, accessToken, 1000);
 }
 
 /**
@@ -483,11 +527,11 @@ export async function listCreatives(
 ): Promise<LinkedInAdsApiResult> {
   const rawId = campaignId.startsWith('urn:li:sponsoredCampaign:') ? campaignId : `urn:li:sponsoredCampaign:${campaignId}`;
   const campaignUrn = encodeURIComponent(rawId);
-  return makeRequest(
-    'GET',
+  // q=criteria uses cursor-based pagination with max pageSize=100 (v202603 docs)
+  return fetchAllPages(
     `/rest/adAccounts/${adAccountId}/creatives?q=criteria&campaigns=List(${campaignUrn})`,
     accessToken,
-    undefined,
+    100,
     { 'X-RestLi-Method': 'FINDER' }
   );
 }
@@ -742,6 +786,7 @@ export async function getAudienceCount(
 /**
  * Fetch ad analytics. LinkedIn analytics is synchronous (no polling needed).
  *
+ * @param sponsorAccountId - LinkedIn Ads numeric account ID (required facet for all requests)
  * @param pivot - CAMPAIGN_GROUP | CAMPAIGN | CREATIVE | MEMBER_JOB_TITLE | etc.
  * @param timeGranularity - DAILY | MONTHLY | YEARLY | ALL
  * @param dateRange - { start: { year, month, day }, end: { year, month, day } }
@@ -750,42 +795,50 @@ export async function getAudienceCount(
  */
 export async function getAdAnalytics(
   accessToken: string,
+  sponsorAccountId: string,
   pivot: string,
   timeGranularity: string,
   dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } },
   fields: string[],
   filters: { campaign_group_ids?: string[]; campaign_ids?: string[]; creative_ids?: string[] } = {}
 ): Promise<LinkedInAdsApiResult> {
-  const params = new URLSearchParams({
-    q: 'analytics',
-    pivot,
-    timeGranularity,
-    'dateRange.start.year': String(dateRange.start.year),
-    'dateRange.start.month': String(dateRange.start.month),
-    'dateRange.start.day': String(dateRange.start.day),
-    'dateRange.end.year': String(dateRange.end.year),
-    'dateRange.end.month': String(dateRange.end.month),
-    'dateRange.end.day': String(dateRange.end.day),
-    fields: fields.join(','),
-  });
+  // LinkedIn RestLI requires dateRange as an encoded object, not flat dot-notation keys.
+  // fields must not be URL-encoded (commas must stay literal).
+  const { start, end } = dateRange;
+  const dateRangeParam = `dateRange=(start:(year:${start.year},month:${start.month},day:${start.day}),end:(year:${end.year},month:${end.month},day:${end.day}))`;
+  const fieldsParam = `fields=${fields.join(',')}`;
 
-  if (filters.campaign_group_ids) {
-    filters.campaign_group_ids.forEach((id, i) => {
-      params.append(`pivotValues[${i}]`, `urn:li:sponsoredCampaignGroup:${id}`);
-    });
+  // LinkedIn requires at least one facet filter. accounts= is always included.
+  const accountUrn = sponsorAccountId.startsWith('urn:li:') ? sponsorAccountId : `urn:li:sponsoredAccount:${sponsorAccountId}`;
+  const parts: string[] = [
+    `q=analytics`,
+    `pivot=${encodeURIComponent(pivot)}`,
+    `timeGranularity=${encodeURIComponent(timeGranularity)}`,
+    dateRangeParam,
+    `accounts=List(${encodeURIComponent(accountUrn)})`,
+    fieldsParam,
+  ];
+
+  // RestLI array syntax: param=List(urn%3Ali%3A...,urn%3Ali%3A...)
+  // Per LinkedIn docs, URNs inside List() must be URL-encoded.
+  // Guard against callers passing full URNs vs bare numeric IDs.
+  const toUrn = (prefix: string, id: string) =>
+    id.startsWith('urn:li:') ? id : `${prefix}:${id}`;
+  const encodeUrns = (prefix: string, ids: string[]) =>
+    ids.map(id => encodeURIComponent(toUrn(prefix, id))).join(',');
+
+  if (filters.campaign_group_ids?.length) {
+    // Docs: filter by campaign group uses "campaignGroups" param, not "pivotValues"
+    parts.push(`campaignGroups=List(${encodeUrns('urn:li:sponsoredCampaignGroup', filters.campaign_group_ids)})`);
   }
-  if (filters.campaign_ids) {
-    filters.campaign_ids.forEach((id, i) => {
-      params.append(`campaigns[${i}]`, `urn:li:sponsoredCampaign:${id}`);
-    });
+  if (filters.campaign_ids?.length) {
+    parts.push(`campaigns=List(${encodeUrns('urn:li:sponsoredCampaign', filters.campaign_ids)})`);
   }
-  if (filters.creative_ids) {
-    filters.creative_ids.forEach((id, i) => {
-      params.append(`creatives[${i}]`, `urn:li:sponsoredCreative:${id}`);
-    });
+  if (filters.creative_ids?.length) {
+    parts.push(`creatives=List(${encodeUrns('urn:li:sponsoredCreative', filters.creative_ids)})`);
   }
 
-  return makeRequest('GET', `/rest/adAnalytics?${params.toString()}`, accessToken);
+  return makeRequest('GET', `/rest/adAnalytics?${parts.join('&')}`, accessToken);
 }
 
 // ─── InMail (Message Ad) ──────────────────────────────────────────────────────

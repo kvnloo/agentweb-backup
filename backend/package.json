@@ -9,7 +9,7 @@
     "test": "node --max-old-space-size=4096 node_modules/.bin/jest --maxWorkers=2 --forceExit",
     "test:watch": "jest --watch",
     "test:coverage": "node --max-old-space-size=4096 node_modules/.bin/jest --coverage --maxWorkers=2 --forceExit",
-    "create-tables": "ts-node scripts/create-tables.ts",
+    "create-tables": "ts-node src/scripts/create-tables.ts",
     "create-admin": "ts-node src/scripts/create-admin.ts",
     "test:mcp-race": "ts-node src/scripts/test-mcp-race-condition.ts",
     "mcp:inspector": "PORT=5180 npx @modelcontextprotocol/inspector --transport sse --server-url http://localhost:3001/mcp/server",

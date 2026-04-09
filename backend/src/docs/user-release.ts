@@ -9,6 +9,105 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-08',
+    changes: [
+      'Admin: Work Plan Categories',
+      '- Work plans can now be assigned a category (Paid Ads, Strategy, Content, or Other)',
+      '- Category is shown as a column in the work plans table and can be set when creating or editing a plan',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'CRM: Discover Tech Stack for Your Leads',
+      '- New "Discover Tech Stack" action in the CRM lead list — Emma searches job postings and integration pages to identify what software each lead\'s company uses',
+      '- Populates five fields: Analytics, CMS, Marketing tools, Infrastructure, and Integrations (e.g. "Google Analytics", "Shopify", "HubSpot", "AWS", "Stripe")',
+      '- Preview mode shows counts and sample results from 2 leads before committing to a full scan',
+      '- Already-enriched leads are skipped automatically; use "Re-scan" to refresh existing results',
+      '- Available in the list actions menu and as a bulk action when leads are selected',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fix: Agent Mode No Longer Times Out on Long Active Sessions',
+      '- Fixed a false timeout that could occur during long Agent Mode sessions (e.g. 100+ message conversations)',
+      '- Previously, a hard 45-minute timer would kill an in-progress generation even if the agent was actively working and making progress',
+      '- The timer now resets on each progress update, so it only fires after 45 minutes of true inactivity — not total elapsed time',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fix: Emma No Longer Confuses Blog Articles with Reports',
+      '- Emma was sometimes using the blog article tool when asked to create reports, summaries, or analyses — resulting in files named "blog-*.html" for non-blog content',
+      '- Emma now clearly distinguishes: "blog article" → blog tool with hero image; "report / summary / analysis / audit" → HTML document tool',
+      '- Asking for a "weekly performance report", "account summary", or "GTM audit" will now correctly produce a clean HTML document, not a blog post',
+      'Fix: Emma Sidebar Chat Session Persists Across Page Visits',
+      '- Fixed an issue where the Emma sidebar would show an empty conversation after visiting other pages, even though the original chat history existed',
+      '- The sidebar now correctly restores your previous conversation when you return to a page, regardless of which other pages you\'ve visited in between',
+      'Fix: Scheduled Chat Email Notifications Always Populated',
+      '- Emma no longer shows an error when creating a schedule without specifying an email address',
+      '- If no email is provided, results are sent to your account email by default',
+      '- When an admin sets up a schedule via delegate access, results are sent to the admin\'s email instead of the customer\'s email',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Deprecation: Legacy Web Automation Task Tools',
+      '- The \'create_task_from_template\', \'list_task_templates\', and \'create_task_from_prompt\' tools are now deprecated in favor of Emma\'s direct Playwright browser control',
+      '- Emma will now use her built-in browser tools (browser_navigate, browser_click, browser_type, etc.) for web automation instead of delegating to the background agent engine',
+      '- Direct browser control is faster, more flexible, and gives real-time results compared to the legacy background task approach',
+      '- Existing scheduled tasks using templates continue to work — only new requests from Emma are redirected to direct browser control',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Account Summary Now Shows Per-Session AI Highlights',
+      '- When you ask Emma for an account summary, each session in the time range is now summarized by AI (gemini-3.1-flash-lite-preview)',
+      '- Summaries describe what was accomplished in each session in 1-2 sentences (e.g. "Conducted a technical audit of taskflow.io and scheduled weekly scans")',
+      '- Summaries are cached on each session and only regenerated when new messages are added, so repeat requests are fast',
+      '- The existing aggregate metrics (sessions, leads, assets, email, social media) are still included alongside the new highlights',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Fix: Emma Now Reliably Creates Scheduled Chats',
+      '- Fixed an issue where Emma would repeatedly attempt (and fail) to create a scheduled chat when the starting message contained a {{variable}} placeholder',
+      '- Emma now correctly sets up the schedule on the first attempt, even when the AI omits or mis-formats the email notifications field',
+      '- If no notification email is provided, the schedule defaults to sending run summaries to your account email',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Fix: Issue Reports Now Show Confirmation and Notion Link in Emma',
+      '- When you ask Emma to report a product issue, the tool badge now shows "Issue reported ✓" instead of the raw tool name',
+      '- Clicking the badge shows the issue title, success status, and a direct "View in Notion" link to the created ticket',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Meta Ads: Destination URL Audit Now Supported',
+      '- Emma can now retrieve destination URLs for your Meta ads when asked to audit or list them',
+      '- Previously, destination URLs were not accessible via the API; Emma can now extract them from ad creatives',
+      '- Ask Emma to "list my Meta ad creatives and show destination URLs" to see all landing page URLs across your ads',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Scheduled Chat: AI-Generated Run Summary in Title and Email',
+      '- Each scheduled chat run now generates a 2-3 word summary of what was achieved (e.g. "Blog Post Published", "Greeting Delivered")',
+      '- The summary appears in the session title in the chat sidebar so you can quickly see what each run accomplished',
+      '- The summary is also included in the notification email subject line for at-a-glance visibility',
+    ],
+  },
+  {
     date: '2026-04-07',
     changes: [
       'ClickUp: OAuth Login Now Supported',
@@ -18,23 +117,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
-    date: '2026-04-06',
+    date: '2026-04-07',
     changes: [
-      'LinkedIn Outreach: Conversation History Sync',
-      '- Added update-conversation-history action to the LinkedIn outreach tool — fetches the full message thread with a contact from LinkedIn via Unipile and persists it to the lead\'s CRM engagement feed',
-      '- Messages now appear in the lead\'s engagement activity timeline (sent and received), going back to the first message',
-      '- Re-syncing is fully idempotent: running the action again on the same contact never creates duplicate entries',
-      '- When sending a LinkedIn message to a CRM lead (with list_id + lead_id provided), the agent now enforces that conversation history was synced within the last 24 hours — stale context is blocked with a clear instruction to sync first',
-    ],
-  },
-  {
-    date: '2026-04-06',
-    changes: [
-      'Set Up Website Scanning Directly from Brand Guidelines',
-      '- Added a Website Domain field to Brand Guidelines so you can record your domain without waiting for an admin to configure SEO domains',
-      '- A new "Setup Website Scan" button opens Emma pre-loaded with a message to create a recurring website scan schedule',
-      '- Emma checks whether a scan schedule already exists before creating a new one',
-      '- The scan focuses on issues observable directly from the site: broken links, missing meta tags, layout problems, slow load times, and unclear copy',
+      'Self-Serve CMS Configuration for Blog Publishing',
+      '- You can now connect your own WordPress, Webflow, or Basehub CMS directly from the Research Reports page — no admin setup required',
+      '- Click "CMS Setup" on the Research Reports page to enter your credentials and start publishing blog posts from generated reports',
+      '- Supports WordPress (application password), Webflow (API token + site/collection IDs), and Basehub (token + collection ID)',
+      '- Admin-configured CMS credentials continue to work as before; user-configured credentials take priority when set',
     ],
   },
   {
@@ -3811,6 +3900,104 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Admin Users Tab Now Shows Subscription Amount',
       '- The Users tab in the admin dashboard now displays the monthly charge amount next to each user\'s payment status',
       '- Amounts are recorded automatically from Stripe invoices on each successful payment',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Resync Payments Button in Admin Users Tab',
+      '- Added a "Resync Payments" button to the Users tab toolbar to backfill subscription amounts from Stripe',
+      '- Fetches the latest paid invoice for each user and updates the displayed amount',
+      '- Shows a summary of how many users were updated, skipped, or errored',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Scheduled Chat Test Runs No Longer Time Out',
+      '- Testing a scheduled chat now starts immediately and runs in the background',
+      '- Previously, complex tasks (e.g. scraping many pages and generating reports) would fail with a timeout error',
+      '- Test results appear in the run history when complete — no need to wait on the page',
+    ],
+  },
+  {
+    date: '2026-04-07',
+    changes: [
+      'Fixed: Work Plans Edit Dialog No Longer Crashes',
+      '- The edit dialog in Settings → Work Plans now opens correctly without crashing the page',
+      '- Previously, opening the edit dialog caused an error that broke the entire Work Plans tab',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'CRM: See When Each Lead Was Added or Updated',
+      '- Two new optional columns in your leads table: "Date Added" and "Last Updated"',
+      '- Enable them via the Configure Fields button (gear icon) next to your leads list',
+      '- Timestamps display as relative time (e.g. "12d ago") with the exact date on hover',
+      '- Both columns are sortable — click the header to sort by newest or oldest',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Can Now Wait and Check Results',
+      '- Emma can pause for a set number of seconds before checking on something — useful when waiting for a post to publish, an email to arrive, or any async result to become available',
+      '- When waiting, Emma will tell you what she\'s waiting for and why',
+      '- Use cases: "post this to LinkedIn then check if it published", "send this email and wait for a reply", "submit this form and verify the confirmation page appears"',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fixed: "Start Test Run" No Longer Shows a False Failure',
+      '- Clicking "Start Test Run" on a schedule now correctly shows a confirmation that the test has started',
+      '- Previously, the button always showed "Test Failed — Unknown error" even though the test was actually running in the background',
+      '- Results still appear in the run history when the test completes',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Creates Schedules More Reliably',
+      '- Emma now provides clearer self-correction when creating a scheduled chat — reducing the number of retries before a schedule is successfully created',
+      '- If a required field is missing, Emma receives a specific error message identifying which fields to add, so she can fix the issue in the next attempt',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Emma Now Knows She Can Create Scheduled Chats',
+      '- Emma will now proactively offer to set up recurring schedules when you ask for automated or recurring tasks',
+      '- Previously, Emma would say she couldn\'t create schedules even though the capability was available — you had to remind her',
+      '- Example: ask Emma to "run a weekly brand guidelines review every Monday" and she\'ll set it up directly',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
+      'Automatic Error Reporting to Oncall',
+      '- When a backend operation fails in a user-facing way (such as a schedule manual run failing), the system automatically creates a Notion oncall item tagged "UI Error"',
+      '- Frontend errors (unhandled promise rejections, JavaScript crashes) are also captured and routed to oncall',
+      '- Duplicate errors within 30 minutes are deduplicated — repeated failures from the same user clicking multiple times will only create one oncall item',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Foreplay Ad Library Now Has Its Own Dedicated Tool',
+      '- Foreplay ads are no longer searched automatically every time you use the knowledge base',
+      '- A new "search_ads_knowledge_base" tool lets Emma search your Foreplay swipefile and boards only when you explicitly ask for ad inspiration or competitor research',
+      '- Reduces unnecessary Foreplay API credit usage from unrelated knowledge base queries',
+      '- Foreplay results are now cached for 5 minutes to prevent repeated API calls within the same session',
+    ],
+  },
+  {
+    date: '2026-04-08',
+    changes: [
+      'Fixed: Deleting a Brand Guide Document No Longer Removes Your Logos',
+      '- Deleting a brand guide PDF from the Brand Guidelines page now correctly removes only that document — logos and secondary logos are preserved',
+      '- Fixed a data consistency issue where logos uploaded just before saving or deleting could be silently lost due to a stale database read',
     ],
   },
 ];

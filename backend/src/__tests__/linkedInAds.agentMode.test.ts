@@ -227,7 +227,7 @@ describe('callLinkedInMarketingApi — AD_ACCOUNT', () => {
 describe('callLinkedInMarketingApi — CAMPAIGN_GROUP', () => {
   it('LIST calls listCampaignGroups', async () => {
     const result = await service.callLinkedInMarketingApi(USER_ID, 'CAMPAIGN_GROUP', 'LIST', ACCOUNT_ID);
-    expect(linkedInAdsService.listCampaignGroups).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID);
+    expect(linkedInAdsService.listCampaignGroups).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID, {});
     expect(result.success).toBe(true);
   });
 
@@ -601,6 +601,7 @@ describe('callLinkedInAdsInsightsApi', () => {
     });
     expect(linkedInAdsService.getAdAnalytics).toHaveBeenCalledWith(
       ACCESS_TOKEN,
+      ACCOUNT_ID,
       'CAMPAIGN',
       'MONTHLY',
       dateRange,
@@ -615,6 +616,7 @@ describe('callLinkedInAdsInsightsApi', () => {
     await service.callLinkedInAdsInsightsApi(USER_ID, ACCOUNT_ID, { pivot: 'CAMPAIGN', dateRange });
     expect(linkedInAdsService.getAdAnalytics).toHaveBeenCalledWith(
       ACCESS_TOKEN,
+      ACCOUNT_ID,
       'CAMPAIGN',
       'ALL',
       dateRange,
@@ -626,7 +628,7 @@ describe('callLinkedInAdsInsightsApi', () => {
   it('defaults fields when not provided', async () => {
     await service.callLinkedInAdsInsightsApi(USER_ID, ACCOUNT_ID, { pivot: 'CAMPAIGN', dateRange });
     const call = (linkedInAdsService.getAdAnalytics as jest.Mock).mock.calls[0];
-    expect(call[4]).toContain('impressions');
+    expect(call[5]).toContain('impressions');
   });
 
   it('returns analytics from service', async () => {

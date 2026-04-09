@@ -266,7 +266,8 @@ describe('Agent Mode Controller - Daily Digest', () => {
           actualResponse: 'Test response 1',
           sessionId: 'session-1'
         }),
-        'schedule-123'
+        'schedule-123',
+        undefined
       );
       expect(mockRes.json).toHaveBeenCalledWith({ success: true });
     });

@@ -18,6 +18,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
+import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { DynamoDB } from 'aws-sdk';
@@ -849,7 +850,8 @@ export async function runVerifiedChat(
 export async function runScheduledChat(
   schedule: any,
   userId: string,
-  isTest: boolean = false
+  isTest: boolean = false,
+  preGeneratedRunId?: string
 ): Promise<{
   scheduleId: string;
   runId: string;
@@ -865,9 +867,11 @@ export async function runScheduledChat(
   sessionId: string;
   attempt: number;
   createdAt: string;
+  summary?: string;
 }> {
   const now = new Date();
   let sessionId: string = '';
+  let generatedSummary: string | undefined;
 
   try {
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -1017,6 +1021,18 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel
     });
 
+    // Generate a 2-3 word summary and update the session title
+    try {
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
+      if (summary) {
+        generatedSummary = summary;
+        const summaryTitle = `${sessionTitle} — ${summary}`;
+        await chatbotDb.updateSessionTitle(sessionId, summaryTitle);
+      }
+    } catch (err) {
+      console.error('AgentMode: Failed to update session title with summary:', err);
+    }
+
     // Convert result to scheduled chat format
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
@@ -1038,7 +1054,7 @@ export async function runScheduledChat(
 
     const finalResult = {
       scheduleId: schedule.scheduleId,
-      runId: require('uuid').v4(),
+      runId: preGeneratedRunId || require('uuid').v4(),
       status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
       passed: result.success,
       actualResponse: result.content,
@@ -1051,7 +1067,8 @@ export async function runScheduledChat(
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId,
       attempt: result.attempts,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      summary: generatedSummary
     };
 
     // Save the result to database (without actualResponse to save space)
@@ -1130,7 +1147,7 @@ export async function runScheduledChat(
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
       scheduleId: schedule.scheduleId,
-      runId: require('uuid').v4(),
+      runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
       passed: false,
       actualResponse: `Error during execution: ${errorMessage}`,
@@ -1638,9 +1655,10 @@ export const agentModeController = {
       const lastEvaluatedKey = req.query.lastEvaluatedKey as string;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 100); // Max 100 per request
       const portalType = (req.query.portalType as string) === 'emma-sidebar' ? 'emma-sidebar' as const : 'agent' as const;
+      const pageIdentifier = req.query.pageIdentifier as string | undefined;
 
       // Get sessions with pagination
-      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey);
+      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier);
 
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSessions = result.sessions.map(session => ({
@@ -3396,7 +3414,12 @@ export const agentModeController = {
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
-        return res.status(400).json({ error: 'Missing required fields' });
+        const missing = [
+          !scheduleName && 'scheduleName',
+          !startingMessage && 'startingMessage',
+          !scheduleFrequency && 'scheduleFrequency',
+        ].filter(Boolean).join(', ');
+        return res.status(400).json({ error: `Missing required fields: ${missing}` });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency
@@ -3452,7 +3475,7 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctionCalls: requiredFunctionCalls || [],
         functionCallMinCalls: functionCallMinCalls || {},
-        emailNotifications: emailNotifications || [],
+        emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         status: 'active',
         nextRunTime: scheduledNextRunTime,
@@ -3483,13 +3506,19 @@ export const agentModeController = {
         });
       }
 
-      // Email is only required when variables exist but not all are pre-filled
+      // When no email is provided, fall back to the requester's email so LLMs don't need to
+      // know this requirement. On delegate access use the admin's email (the person setting
+      // up the schedule), not the target account's email.
+      // Exception: variables are present and all pre-filled (silent run).
+      const authReqForEmail = req as AuthenticatedRequest;
+      const fallbackEmail = authReqForEmail.delegateInfo?.isDelegated
+        ? authReqForEmail.delegateInfo.adminEmail
+        : user.email;
       const allVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
-      if (normalizedVariables.length > 0 && !allVariablesPrefilled && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
-      }
-
+      const normalizedEmails = normalizeEmailList(emailNotifications);
+      const shouldUseFallbackEmail = normalizedEmails.length === 0 && !allVariablesPrefilled;
+      scheduledChat.emailNotifications = shouldUseFallbackEmail ? [fallbackEmail] : normalizedEmails;
       scheduledChat.variables = normalizedVariables;
       scheduledChat.variableValues = normalizedVariableValues;
       scheduledChat.variableRequestStatus = normalizedVariables.length > 0
@@ -3661,12 +3690,13 @@ export const agentModeController = {
         }
       });
 
-      // Email is only required when variables exist but not all are pre-filled
+      // At least one email notification is always required for scheduled chats
+      if (effectiveEmailNotifications.length === 0) {
+        return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
+      }
+
       const allUpdateVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
-      if (normalizedVariables.length > 0 && !allUpdateVariablesPrefilled && effectiveEmailNotifications.length === 0) {
-        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)' });
-      }
 
       updates.variableValues = normalizedVariableValues;
       updates.variableRequestStatus = normalizedVariables.length > 0
@@ -3776,7 +3806,8 @@ export const agentModeController = {
                   emailNotifications,
                   scheduleToRun.scheduleName,
                   result,
-                  scheduleToRun.scheduleId
+                  scheduleToRun.scheduleId,
+                  result.summary
                 );
               }
             } catch (emailError) {
@@ -3944,7 +3975,8 @@ export const agentModeController = {
                 emailNotifications,
                 scheduleToRun.scheduleName,
                 result,
-                scheduleToRun.scheduleId
+                scheduleToRun.scheduleId,
+                result.summary
               );
             }
           } catch (emailError) {
@@ -4051,28 +4083,53 @@ export const agentModeController = {
         });
       }
 
-      // Run the scheduled chat as a test
-      const result = await runScheduledChat(schedule, user.userId, true);
-
-      // Send notification email if requested
+      // Generate runId upfront so the agent can poll for this specific result
+      const runId = require('uuid').v4();
       const { sendNotificationEmail } = req.body || {};
-      if (sendNotificationEmail && result.sessionId) {
-        try {
-          const emailNotifications = schedule.emailNotifications || [];
-          if (emailNotifications.length > 0) {
-            await emailService.sendScheduledChatResultEmail(
-              emailNotifications,
-              schedule.scheduleName,
-              result,
-              schedule.scheduleId
-            );
-          }
-        } catch (emailError) {
-          console.error('AgentMode: Failed to send test notification email:', emailError);
-        }
-      }
 
-      res.json(result);
+      // Fire-and-forget: run in background so the HTTP request doesn't time out
+      // for complex tasks that take many minutes (e.g. scraping 13+ web pages).
+      // The agent should poll get_scheduled_chat_test_history to see the result.
+      const backgroundRun = async () => {
+        const result = await runScheduledChat(schedule, user.userId, true, runId);
+
+        if (sendNotificationEmail && result.sessionId) {
+          try {
+            const emailNotifications = schedule.emailNotifications || [];
+            if (emailNotifications.length > 0) {
+              await emailService.sendScheduledChatResultEmail(
+                emailNotifications,
+                schedule.scheduleName,
+                result,
+                schedule.scheduleId,
+                result.summary
+              );
+            }
+          } catch (emailError) {
+            console.error('AgentMode: Failed to send test notification email:', emailError);
+          }
+        }
+      };
+      backgroundRun().catch(err => {
+        console.error('AgentMode: Background test run error:', err);
+        const { reportUIError } = require('../utils/errorReporter');
+        reportUIError({
+          operation: 'schedule-manual-run',
+          errorMessage: err?.message || String(err),
+          userId: user.userId,
+          context: {
+            'Schedule ID': scheduleId,
+            'Schedule Name': schedule.scheduleName || 'unknown',
+            'Run ID': runId,
+          },
+        }).catch((reportErr: Error) => console.error('errorReporter failed:', reportErr));
+      });
+
+      res.json({
+        runId,
+        status: 'pending',
+        message: 'Test run started in background. Poll get_scheduled_chat_test_history to check results.'
+      });
 
     } catch (error) {
       console.error('AgentMode: Test scheduled chat error:', error);
@@ -4246,11 +4303,14 @@ export const agentModeController = {
         createdAt: record.createdAt || new Date().toISOString(),
       };
 
+      const runSummary: string | undefined = record.summary;
+
       await emailService.sendScheduledChatResultEmail(
         [toEmail],
         schedule.scheduleName,
         resultForEmail,
-        schedule.scheduleId
+        schedule.scheduleId,
+        runSummary
       );
 
       res.json({ success: true });
@@ -4462,7 +4522,8 @@ export const agentModeController = {
                       emailNotifications,
                       schedule.scheduleName,
                       result,
-                      schedule.scheduleId
+                      schedule.scheduleId,
+                      result.summary
                     );
                   }
                 } else {
@@ -5729,11 +5790,14 @@ export const agentModeController = {
       }
 
       const missingVars = templateVars.filter((v: any) => !normalizedVariableValues[v.name]);
-      const emails = overrideEmails || template.emailNotifications || [];
 
-      if (templateVars.length > 0 && missingVars.length > 0 && (!Array.isArray(emails) || emails.length === 0)) {
-        return res.status(400).json({ error: 'Email notifications are required when template has variables (unless all variable values are pre-filled)' });
-      }
+      const overrideEmailsList = normalizeEmailList(overrideEmails);
+      const baseEmails = overrideEmailsList.length > 0
+        ? overrideEmailsList
+        : normalizeEmailList(template.emailNotifications);
+      const emails = (templateVars.length > 0 && missingVars.length > 0 && baseEmails.length === 0)
+        ? [user.email]
+        : baseEmails;
 
       const scheduleId = uuidv4();
       const scheduledChat: any = {
