@@ -4036,6 +4036,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-09',
+    changes: [
+      'Fixed: Scheduled Chat Result Emails Now Render Formatted Content',
+      '- AI responses in scheduled chat result emails now display with proper formatting — headings, bold text, bullet lists, and code snippets render correctly',
+      '- Previously, raw markdown syntax (e.g., **bold**, ### headers) appeared as literal characters in the email body',
+    ],
+  },
+  {
     date: '2026-04-08',
     changes: [
       'Foreplay Ad Library Now Has Its Own Dedicated Tool',

@@ -18,6 +18,10 @@ module.exports = {
   },
   testPathIgnorePatterns: ['/node_modules/', '/__tests__/e2e/'],
   transformIgnorePatterns: ['/node_modules/(?!@projectwallace/)'],
+  moduleNameMapper: {
+    // marked v16 is ESM-only; redirect to manual mock so Jest (CJS mode) can load it
+    '^marked$': '<rootDir>/__mocks__/marked.ts',
+  },
   collectCoverageFrom: [
     'src/utils/**/*.ts',
     '!src/**/*.d.ts',
