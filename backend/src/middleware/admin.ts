@@ -16,7 +16,7 @@ export const isAdmin = async (req: AuthRequest, res: Response, next: NextFunctio
     }
 
     // Trust req.user.isAdmin — already resolved by authenticateToken (from JWT or DB).
-    if (!req.user?.isAdmin) {
+    if (!(req.user as any)?.isAdmin) {
       return res.status(403).json({ message: 'Access denied. Admin privileges required.' });
     }
 
