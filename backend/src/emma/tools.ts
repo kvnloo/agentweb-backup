@@ -80,7 +80,7 @@ emmaToolRegistry.register({
     if (!context?.sessionId) {
       throw new Error("Missing session context");
     }
-    return await agentModeService.installSkills(args.skillIds, userId, context.sessionId);
+    return await agentModeService.installSkills(args.skillIds, userId, context.sessionId, context.isDelegatedAccess === true);
   }
 });
 

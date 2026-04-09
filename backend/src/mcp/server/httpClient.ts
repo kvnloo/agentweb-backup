@@ -67,7 +67,7 @@ const SELF_CALL_TOKEN_TTL = 600; // seconds — must outlast slow operations lik
 export function generateSelfCallToken(user: UserRecord): string {
   const secret = process.env.JWT_SECRET || 'your-secret-key';
   return jwt.sign(
-    { userId: user.userId, email: user.email, isAdmin: user.isAdmin },
+    { userId: user.userId, email: user.email, isAdmin: user.isAdmin, _svc: true },
     secret,
     { expiresIn: SELF_CALL_TOKEN_TTL }
   );
