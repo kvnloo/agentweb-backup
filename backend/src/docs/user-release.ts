@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-09',
+    changes: [
+      'New AI Model: GPT-5.4 Available in Agent Mode',
+      '- GPT-5.4 (via Azure OpenAI) is now available as a model option in Agent Mode',
+      '- Select it from the model dropdown when starting or switching models in a chat session',
+    ],
+  },
+  {
     date: '2026-04-08',
     changes: [
       'Admin: Work Plan Categories',
