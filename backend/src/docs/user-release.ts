@@ -4060,6 +4060,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-09',
     changes: [
+      'Admin: User Activity History Now Visible in User Details',
+      '- Admins can now expand any user row in the Users tab to see that user\'s last 30 days of chat sessions',
+      '- Each session shows the timestamp, title, and whether it was created via admin delegate access (flagged with an "admin" badge)',
+      '- "Last Active" column now reflects when a user last created a session, not just their last login — making it accurate for daily/weekly/monthly active user tracking',
+      '- Sessions created by admins accessing a user account via delegate access do not update the user\'s "Last Active" time',
+    ],
+  },
+  {
+    date: '2026-04-09',
+    changes: [
       'Automatic Error Reporting to Oncall',
       '- When a backend operation fails in a user-facing way (such as a schedule manual run failing), the system automatically creates a Notion oncall item tagged "UI Error"',
       '- Frontend errors (unhandled promise rejections, JavaScript crashes) are also captured and routed to oncall',
