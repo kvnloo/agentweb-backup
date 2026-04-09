@@ -35,7 +35,11 @@ jest.mock('../config/integrations', () => ({
 }));
 
 jest.mock('axios');
-const mockedAxios = axios as jest.Mocked<typeof axios>;
+// Cast to `any` so partial response mocks (just `{ data: ... }`) don't need
+// the full AxiosXHR shape (status/statusText/headers/config) — the service
+// only reads `.data`, so the extra fields would be dead weight.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedAxios = axios as any;
 
 // Import AFTER mocks so the service picks up mocked modules.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
