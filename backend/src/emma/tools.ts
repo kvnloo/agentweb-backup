@@ -5359,7 +5359,6 @@ emmaToolRegistry.register({
   execute: async (args: any, context: any) => {
     // Lazy imports to avoid pulling in heavy dependencies at module load time
     const { createOncallItem } = await import('../services/notionService');
-    const { emailService } = await import('../services/emailService');
     const { resendService } = await import('../services/resendService');
 
     const userId = context?.userId;
@@ -5381,8 +5380,10 @@ emmaToolRegistry.register({
     for (const issue of args.issues) {
       try {
         const issueContext: Record<string, any> = {
+          'User Name': user.displayName || user.email,
           'User Email': user.email,
           'User ID': userId,
+          'Priority': issue.priority || 'Medium',
           'Page URL': issue.pageUrl || 'N/A',
           'Session ID': context?.sessionId || 'N/A',
         };
@@ -5393,14 +5394,6 @@ emmaToolRegistry.register({
           additionalTags: ['Customer Reported'],
           context: issueContext,
         });
-
-        // Send slim oncall alert email with the Notion URL (skips duplicate Notion creation)
-        await emailService.sendOncallAlert(
-          `Customer Report: ${issue.title}`,
-          issue.description,
-          issueContext,
-          result.notionUrl
-        );
 
         await resendService.sendEmail({
           from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
