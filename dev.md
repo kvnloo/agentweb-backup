@@ -102,6 +102,62 @@ The right fix is a **comprehensive user activity tracking solution** that covers
 
 ---
 
+# April 9, 2026: Investigation — Emma Taking Irrelevant Actions (CRM/Lead Creation During Website Scan)
+
+## Context
+
+Reported session: `f3e85582-8f82-4c62-a9d3-a37692e94088`
+Schedule: `f6418b77-81a1-4dad-9c1f-6d77adff2c6e` ("Design4Space Website Scan")
+User: `1f32123d-23b3-456e-81cd-52bae8bb5851`
+
+A scheduled website scan session where Emma was observed creating a lead list and adding a contact to CRM — actions completely unrelated to the task.
+
+## What Happened
+
+The schedule's starting message was:
+> "Visit and scan the website https://www.design4space.com.sg/. Report issues that are directly observable from the site..."
+
+Emma completed the scan correctly (Playwright browser tools). The user then sent a follow-up in the same session:
+> "write a short message to inform Connie about the results and suggested changes"
+
+Emma's response to this follow-up:
+1. Installed "CRM & Lead Management" skill (via `install_skills`)
+2. Called `get_lead_lists` — checked for existing lead lists
+3. Called `create_lead_list` — created a new list "Website Audit Contacts"
+4. Called `add_leads_to_list` — added Connie as a CRM contact
+5. Called `get_leads` + `update_email_draft_for_lead` — created a full email campaign draft
+
+The user wanted a short text message to copy/paste. Emma instead built a full CRM workflow.
+
+In addition, `install_skills` was called 3 times total across the session (Browser automation, CRM & Lead Management, other_skills), reflecting the same pattern: Emma installs whatever skill it thinks it needs, even when the requested output is plain text.
+
+## Root Cause
+
+Emma's system prompt instructs it to "analyze every request, identify all required skills/tools, and install them before executing." There is no rule saying: if the output is text, just write it — don't create data records.
+
+When Emma saw "write a message to Connie," it interpreted this as needing CRM infrastructure (find the contact, draft a personalized email template, save to campaign). The system prompt actively encourages this kind of over-tooling via the Analyze-Install-Execute protocol.
+
+### Relevant System Prompt Location
+
+`backend/src/services/agentModeService.ts` — `getMarketingSystemPrompt()` method (~line 2046), the `## Critical Rules` section. This is where tool usage rules live.
+
+## Fix Considered
+
+Adding two Critical Rules to the system prompt:
+- **Minimum Necessary Tools**: Only install skills when the output genuinely cannot be produced without them. "Write a message" = write text, no tools needed.
+- **No Unsolicited Data Creation**: Never create persistent records (lead lists, contacts, GTM plans, campaigns) unless the user explicitly asks.
+
+## Decision
+
+**No action taken.** The fix direction is correct but the impact of modifying Emma's core system prompt is unclear. The Analyze-Install-Execute protocol is central to Emma's behavior across many workflows; adding blanket "don't use tools" rules could break legitimate flows where CRM or campaign tools are genuinely needed. The risk/reward tradeoff is uncertain without more testing.
+
+**Longer-term options to consider:**
+1. Add the two Critical Rules above and A/B test against a sample of real sessions
+2. For scheduled chat sessions specifically, inject a stricter constraint in the schedule context (already injected at `agentModeController.ts:1403`) — e.g. "Only use tools required to complete the stated task. Do not install additional skills or create new records."
+3. Add a session-level "allowed tool categories" config on the schedule definition, so the schedule creator can restrict which skill categories Emma can use at runtime
+
+---
+
 # April 6, 2026: Investigation — Claude Code Source Analysis (Agent Architecture Patterns)
 
 ## Background
