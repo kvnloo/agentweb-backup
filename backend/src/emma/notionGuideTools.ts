@@ -5,6 +5,7 @@ import {
   updateBlock,
   appendBlocks,
   deleteBlock,
+  getBlock,
 } from '../services/notionService';
 
 // Available to all users — Emma uses this to answer user guide questions
@@ -89,13 +90,20 @@ emmaToolRegistry.register({
   name: 'append_to_user_guide',
   definition: {
     name: 'append_to_user_guide',
-    description: 'Append new blocks to the user guide page or to a specific parent block. Use this to add new sections, paragraphs, or list items. Each block needs a type (heading_2, heading_3, paragraph, bulleted_list_item) and text.',
+    description: `Append new blocks to the user guide page. Each block needs a type (heading_2, heading_3, paragraph, bulleted_list_item) and text.
+
+To insert blocks at a specific location in the page (not just the end), use insertAfterBlockId:
+- insertAfterBlockId: the ID of an existing block — new blocks will be inserted immediately after it as siblings.
+  Example: to insert after the CRM section divider, pass the divider's block ID here.
+
+Do NOT use parentBlockId to point at a heading or paragraph block — those don't support children and will fail.
+If neither parameter is provided, blocks are appended to the very end of the page.`,
     inputSchema: {
       type: 'object',
       properties: {
-        parentBlockId: {
+        insertAfterBlockId: {
           type: 'string',
-          description: 'Optional parent block ID to append under. If omitted, appends to the end of the page.',
+          description: 'Insert new blocks immediately after this existing block (as siblings). Use this to place content mid-page rather than at the end. Obtain the block ID from read_user_guide_structure.',
         },
         blocks: {
           type: 'array',
@@ -124,9 +132,26 @@ emmaToolRegistry.register({
     try {
       const { getNotionCredentials } = await import('../services/notionService');
       const { userGuidePageId } = await getNotionCredentials();
-      const parentId = args.parentBlockId || userGuidePageId;
-      const result = await appendBlocks(parentId, args.blocks);
-      return { success: true, message: `Appended ${args.blocks.length} block(s) successfully.`, result };
+
+      let parentId = userGuidePageId;
+      let afterBlockId: string | undefined;
+
+      if (args.insertAfterBlockId) {
+        // Fetch the target block to determine its parent
+        const targetBlock = await getBlock(args.insertAfterBlockId);
+        const parent = targetBlock?.parent;
+        if (!parent) {
+          return { success: false, message: `Could not determine parent of block ${args.insertAfterBlockId}` };
+        }
+        parentId = parent.page_id || parent.block_id || userGuidePageId;
+        afterBlockId = args.insertAfterBlockId;
+      }
+
+      const result = await appendBlocks(parentId, args.blocks, afterBlockId);
+      const location = afterBlockId
+        ? `after block ${afterBlockId}`
+        : 'at the end of the page';
+      return { success: true, message: `Appended ${args.blocks.length} block(s) successfully (${location}).`, result };
     } catch (error: any) {
       return { success: false, message: `Failed to append blocks: ${error.message}` };
     }

@@ -181,7 +181,7 @@ export async function updateBlock(blockId: string, newText: string): Promise<any
   });
 }
 
-export async function appendBlocks(parentId: string, blocks: Array<{ type: string; text: string }>): Promise<any> {
+export async function appendBlocks(parentId: string, blocks: Array<{ type: string; text: string }>, afterBlockId?: string): Promise<any> {
   const children = blocks.map(b => {
     const richText = toRichTextArray(b.text);
     if (b.type === 'heading_2') {
@@ -213,10 +213,19 @@ export async function appendBlocks(parentId: string, blocks: Array<{ type: strin
     };
   });
 
+  const body: Record<string, unknown> = { children };
+  if (afterBlockId) {
+    body.after = afterBlockId;
+  }
+
   return notionFetch(`/blocks/${parentId}/children`, {
     method: 'PATCH',
-    body: JSON.stringify({ children }),
+    body: JSON.stringify(body),
   });
+}
+
+export async function getBlock(blockId: string): Promise<any> {
+  return notionFetch(`/blocks/${blockId}`);
 }
 
 export async function deleteBlock(blockId: string): Promise<any> {
