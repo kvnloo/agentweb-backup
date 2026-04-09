@@ -3125,9 +3125,7 @@ Example of good formatting:
 <li>Click <strong>Create</strong> to save</li>
 </ul>
 
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${
-  process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
-}" target="_blank">Discord community</a>`;
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
 const emmaSystemMessage = `You are Emma Chat, a helpful 24/7 support assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
 
@@ -3207,9 +3205,7 @@ Example of good formatting:
 <li>"Emma, what are the key performance metrics for my current email campaign?"</li>
 </ul>
 
-Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="${
-  process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
-}" target="_blank">Discord community</a>`;
+Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user contact support.`;
 
 // Cache for Emma system context (60s TTL)
 let cachedSystemContext: { value: string; expiry: number } | null = null;
@@ -3269,9 +3265,7 @@ Important formatting rules:
 6. Use proper HTML5 semantic elements
 7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
 
-Be helpful, concise, and accurate. Focus on actionable growth marketing advice. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${
-  process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
-}" target="_blank">Discord community</a>`;
+Be helpful, concise, and accurate. Focus on actionable growth marketing advice. If you don't know the answer, suggest the user contact support.`;
 
 
 // Helper function to calculate token cost
