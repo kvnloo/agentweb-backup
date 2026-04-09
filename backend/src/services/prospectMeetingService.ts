@@ -362,6 +362,7 @@ export const __test__ = {
   getFathomRecordings,
   classifyMeetingStatus,
   findMatchingRecording,
+  analyzeSpeakers,
 };
 
 /**
@@ -442,6 +443,18 @@ async function analyzeSpeakers(
       if (turn.speaker) {
         speakers.add(turn.speaker);
       }
+    }
+
+    // Treat an empty transcript (HTTP 200 with `{ transcript: [] }`) the same
+    // as a 404 — Fathom returns this shape for fresh recordings that haven't
+    // been diarized yet. Returning `undefined` lets `classifyMeetingStatus`
+    // fall through to the calendar-invitees fallback instead of silently
+    // bucketing the meeting as `no-show`.
+    if (speakers.size === 0) {
+      console.info(
+        `[ProspectMeeting] Empty transcript for recording ${recordingId} (not yet diarized)`,
+      );
+      return undefined;
     }
 
     const hasExternalSpeaker = Array.from(speakers).some(s => !isInternalSpeaker(s));
@@ -619,7 +632,11 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
           recordingId = recording.recordingId;
           matchedRecordingHasExternalInvitees = recording.hasExternalInvitees;
           speakerAnalysis = await analyzeSpeakers(userId, recording.recordingId);
-          if (speakerAnalysis) transcriptOk++;
+          // Only count as "transcript ok" when we actually got diarized speaker
+          // data — an empty transcript already returns `undefined` from
+          // analyzeSpeakers, but guard on `total > 0` defensively so the
+          // CloudWatch signal stays accurate if that invariant ever loosens.
+          if (speakerAnalysis && speakerAnalysis.total > 0) transcriptOk++;
         }
       }
 

@@ -197,4 +197,55 @@ describe('prospectMeetingService — Fathom pagination + fallback', () => {
       expect(result).toBe('canceled');
     });
   });
+
+  describe('analyzeSpeakers empty-transcript handling', () => {
+    const { analyzeSpeakers, classifyMeetingStatus } = __test__;
+
+    it('returns undefined when Fathom responds 200 with an empty transcript', async () => {
+      // Fresh recording — Fathom returns HTTP 200 but the transcript array is
+      // empty because diarization hasn't run yet. Must be treated as "unknown"
+      // (undefined), NOT as `{ total: 0, hasExternalSpeaker: false }`, so the
+      // calendar-invitees fallback in classifyMeetingStatus can fire.
+      mockedAxios.get.mockResolvedValueOnce({ data: { transcript: [] } });
+
+      const result = await analyzeSpeakers('user-1', 12345);
+      expect(result).toBeUndefined();
+    });
+
+    it('end-to-end: empty transcript + external invitees → "talked"', async () => {
+      // This is the exact bug the PR was supposed to fix: a fresh recording
+      // with no diarized transcript yet, but Fathom's listing confirms the
+      // meeting had external invitees. Previously this bucketed as no-show.
+      mockedAxios.get.mockResolvedValueOnce({ data: { transcript: [] } });
+
+      const speakerAnalysis = await analyzeSpeakers('user-1', 12345);
+      const status = classifyMeetingStatus(
+        'past',
+        speakerAnalysis,
+        true, // fathomHasExternalInvitees
+      );
+
+      expect(speakerAnalysis).toBeUndefined();
+      expect(status).toBe('talked');
+    });
+
+    it('still returns a populated analysis when the transcript has speakers', async () => {
+      mockedAxios.get.mockResolvedValueOnce({
+        data: {
+          transcript: [
+            { speaker: 'Harsha Vankayalapati' },
+            { speaker: 'Jane Prospect' },
+            { speaker: 'Harsha Vankayalapati' },
+          ],
+        },
+      });
+
+      const result = await analyzeSpeakers('user-1', 12345);
+      expect(result).toBeDefined();
+      expect(result!.total).toBe(2);
+      // Note: hasExternalSpeaker depends on isInternalSpeaker heuristics;
+      // the key assertion is that total > 0 so the fallback path is skipped.
+      expect(result!.total).toBeGreaterThan(0);
+    });
+  });
 });
