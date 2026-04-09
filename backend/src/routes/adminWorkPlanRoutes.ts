@@ -1,5 +1,16 @@
 import express from "express";
+import multer from "multer";
+import sharp from "sharp";
 import { workPlanService } from "../services/workPlanService";
+import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
+
+const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
+const THUMBNAIL_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+
+const thumbnailUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: THUMBNAIL_MAX_BYTES },
+});
 
 const router = express.Router();
 
@@ -80,6 +91,10 @@ router.post("/", async (req, res) => {
       visibility: visibility || 'system',
       isBuiltIn: true,
     });
+
+    workPlanThumbnailService.generateAIThumbnail(plan).catch((err) =>
+      console.error(`[AdminWorkPlans] Auto thumbnail generation failed for ${plan.planId}:`, err)
+    );
 
     res.status(201).json(plan);
   } catch (error) {
@@ -188,6 +203,83 @@ router.post("/sync", async (req, res) => {
   } catch (error) {
     console.error("Error syncing work plan:", error);
     res.status(500).json({ message: "Failed to sync work plan" });
+  }
+});
+
+// ── Thumbnail endpoints ────────────────────────────────────────────────────
+
+// Trigger AI thumbnail generation for a work plan
+router.post("/:planId/thumbnail/generate", async (req, res) => {
+  try {
+    const plan = await workPlanService.getWorkPlan(req.params.planId);
+    if (!plan) return res.status(404).json({ message: "Work plan not found" });
+
+    const updated = await workPlanThumbnailService.generateAIThumbnail(plan);
+    res.json(updated);
+  } catch (error) {
+    console.error("Error generating thumbnail:", error);
+    res.status(500).json({ message: "Failed to generate thumbnail" });
+  }
+});
+
+// Upload a custom thumbnail image (multipart/form-data, field name: "thumbnail")
+router.post(
+  "/:planId/thumbnail/upload",
+  thumbnailUpload.single("thumbnail"),
+  async (req, res) => {
+    try {
+      const plan = await workPlanService.getWorkPlan(req.params.planId);
+      if (!plan) return res.status(404).json({ message: "Work plan not found" });
+
+      if (!req.file) {
+        return res.status(400).json({ message: "No file uploaded" });
+      }
+
+      const { mimetype, buffer } = req.file;
+
+      if (!THUMBNAIL_ACCEPTED_TYPES.has(mimetype)) {
+        return res.status(400).json({
+          message: "Unsupported file format. Accepted: JPG, PNG, WebP",
+        });
+      }
+
+      const metadata = await sharp(buffer).metadata();
+      const { width = 0, height = 0 } = metadata;
+      if (width > height) {
+        return res.status(400).json({
+          message:
+            "Landscape images are not accepted. Please use a square (1:1) or vertical (3:4) image.",
+        });
+      }
+
+      const updated = await workPlanThumbnailService.uploadCustomThumbnail(
+        plan,
+        buffer,
+        mimetype,
+      );
+      res.json(updated);
+    } catch (error: any) {
+      // multer file-size limit throws a specific error
+      if (error.code === "LIMIT_FILE_SIZE") {
+        return res.status(400).json({ message: "File exceeds 2 MB limit" });
+      }
+      console.error("Error uploading thumbnail:", error);
+      res.status(500).json({ message: "Failed to upload thumbnail" });
+    }
+  },
+);
+
+// Remove current thumbnail and revert to AI-generated (or placeholder if generation fails)
+router.delete("/:planId/thumbnail", async (req, res) => {
+  try {
+    const plan = await workPlanService.getWorkPlan(req.params.planId);
+    if (!plan) return res.status(404).json({ message: "Work plan not found" });
+
+    const updated = await workPlanThumbnailService.removeThumbnail(plan);
+    res.json(updated);
+  } catch (error) {
+    console.error("Error removing thumbnail:", error);
+    res.status(500).json({ message: "Failed to remove thumbnail" });
   }
 });
 
