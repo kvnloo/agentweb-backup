@@ -436,9 +436,11 @@ async function fetchUserAndSubscriptionData(
         churnedUsers++;
       }
 
-      const tokenMonth = user.tokenUsage?.month;
-      const tokenCount = user.tokenUsage?.totalTokens || 0;
-      if (tokenMonth === currentMonth && tokenCount > 0) {
+      // Prefer lastActiveAt (set on session creation, non-delegated) over token usage for active user count.
+      // lastActiveAt is more accurate — it reflects real user interactions regardless of token consumption.
+      // Fall back to tokenUsage for users who were active before lastActiveAt was introduced.
+      const lastActive = user.lastActiveAt || (user.tokenUsage?.month === currentMonth && user.tokenUsage?.totalTokens > 0 ? new Date().toISOString() : null);
+      if (lastActive && new Date(lastActive) >= periodStart) {
         activeUsers++;
       }
     }

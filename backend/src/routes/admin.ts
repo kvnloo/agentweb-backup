@@ -4701,6 +4701,19 @@ router.get("/funnel-metrics", async (req, res) => {
   }
 });
 
+// ─── User Activities ──────────────────────────────────────────────────────────
+
+router.get("/users/:userId/activities", isAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const sessions = await userDb.getUserChatSessions(userId, 30);
+    res.json({ sessions });
+  } catch (error: any) {
+    console.error("Error fetching user activities:", error.message);
+    res.status(500).json({ message: "Failed to fetch user activities" });
+  }
+});
+
 // ─── Resync Subscription Amounts ─────────────────────────────────────────────
 
 router.post("/resync-subscription-amounts", async (req, res) => {
