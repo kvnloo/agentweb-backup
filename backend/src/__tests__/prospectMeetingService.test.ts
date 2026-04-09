@@ -43,7 +43,11 @@ const mockedAxios = axios as any;
 
 // Import AFTER mocks so the service picks up mocked modules.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { __test__, FATHOM_MAX_PAGES } = require('../services/prospectMeetingService');
+const {
+  __test__,
+  FATHOM_MAX_PAGES,
+  __calendarErrorInternals__,
+} = require('../services/prospectMeetingService');
 
 describe('prospectMeetingService — Fathom pagination + fallback', () => {
   beforeEach(() => {
@@ -227,6 +231,79 @@ describe('prospectMeetingService — Fathom pagination + fallback', () => {
 
       expect(speakerAnalysis).toBeUndefined();
       expect(status).toBe('talked');
+    });
+
+    it('classifyCalendarError: SERVICE_DISABLED is recognized from error status', () => {
+      const err = {
+        response: {
+          status: 403,
+          data: {
+            error: {
+              status: 'PERMISSION_DENIED',
+              message: 'Google Calendar API has not been used in project 123 before or it is disabled.',
+              errors: [{ reason: 'accessNotConfigured' }],
+            },
+          },
+        },
+      };
+      expect(__calendarErrorInternals__.classifyCalendarError(err)).toBe('service_disabled');
+    });
+
+    it('classifyCalendarError: quotaExceeded is recognized', () => {
+      const err = {
+        response: {
+          status: 403,
+          data: { error: { errors: [{ reason: 'quotaExceeded' }] } },
+        },
+      };
+      expect(__calendarErrorInternals__.classifyCalendarError(err)).toBe('quota_exceeded');
+    });
+
+    it('classifyCalendarError: insufficientPermissions is distinct from scope_not_granted', () => {
+      const err = {
+        response: {
+          status: 403,
+          data: { error: { errors: [{ reason: 'insufficientPermissions' }] } },
+        },
+      };
+      expect(__calendarErrorInternals__.classifyCalendarError(err)).toBe('insufficient_permissions');
+    });
+
+    it('classifyCalendarError: generic 403 with scope mention → scope_not_granted', () => {
+      const err = {
+        response: {
+          status: 403,
+          data: { error: { message: 'Request had insufficient authentication scopes.' } },
+        },
+      };
+      expect(__calendarErrorInternals__.classifyCalendarError(err)).toBe('scope_not_granted');
+    });
+
+    it('classifyCalendarError: unrecognized 403 → forbidden_unknown', () => {
+      const err = {
+        response: { status: 403, data: { error: { message: 'something weird' } } },
+      };
+      expect(__calendarErrorInternals__.classifyCalendarError(err)).toBe('forbidden_unknown');
+    });
+
+    it('classifyCalendarError: non-403 errors → unknown', () => {
+      expect(__calendarErrorInternals__.classifyCalendarError({ code: 500 })).toBe('unknown');
+      expect(__calendarErrorInternals__.classifyCalendarError(new Error('ETIMEDOUT'))).toBe('unknown');
+    });
+
+    it('describeCalendarError returns a message for every classification', () => {
+      for (const err of [
+        'service_disabled',
+        'scope_not_granted',
+        'insufficient_permissions',
+        'quota_exceeded',
+        'forbidden_unknown',
+        'unknown',
+      ]) {
+        const msg = __calendarErrorInternals__.describeCalendarError(err);
+        expect(typeof msg).toBe('string');
+        expect(msg.length).toBeGreaterThan(10);
+      }
     });
 
     it('still returns a populated analysis when the transcript has speakers', async () => {

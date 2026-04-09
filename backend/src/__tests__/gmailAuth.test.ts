@@ -22,21 +22,14 @@ jest.mock('../config/integrations', () => ({
 }));
 
 jest.mock('../services/connectedAccountsDb', () => ({
-  createAccount: jest.fn().mockResolvedValue({
-    platform: 'gmail',
-    account_id: 'test@example.com',
-    account_name: 'Test User',
-    config: {
-      account_type: 'gmail',
-      email: 'test@example.com',
-      access_token: 'access-token',
-      refresh_token: 'refresh-token',
-      token_expires_at: Date.now() + 3600000,
-      granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'],
-    },
+  createAccount: jest.fn(async (_userId, platform, input) => ({
+    platform,
+    account_id: input.account_id,
+    account_name: input.account_name,
+    config: input.config,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
-  }),
+  })),
 }));
 
 jest.mock('../middleware/auth', () => ({
@@ -233,6 +226,68 @@ describe('Gmail OAuth Routes', () => {
         .post('/api/oauth/gmail/connect')
         .send({ tokenSessionId: 'nonexistent-session' });
       expect(res.status).toBe(401);
+    });
+
+    it('persists granted scopes to BOTH config.scopes AND config.granted_scopes', async () => {
+      // Regression test for the silent-scopes-drop bug: gmail /connect
+      // previously populated `granted_scopes` but left the generic
+      // `BaseOAuthConfig.scopes` field as `[]`, which made every downstream
+      // reader that looked at `.scopes` think calendar wasn't granted.
+      const scope = [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/calendar.readonly',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile',
+      ].join(' ');
+
+      axios.post.mockResolvedValueOnce({
+        data: {
+          access_token: 'google-access-token',
+          refresh_token: 'google-refresh-token',
+          expires_in: 3600,
+          scope,
+          token_type: 'Bearer',
+        },
+      });
+      axios.get.mockResolvedValueOnce({
+        data: {
+          id: '12345',
+          email: 'test@gmail.com',
+          name: 'Test User',
+          picture: 'https://example.com/photo.jpg',
+          verified_email: true,
+        },
+      });
+
+      // Drive /finalize to prime a real tokenSession.
+      const state = generateValidState('user-123');
+      const finalizeRes = await request(app)
+        .post('/api/oauth/gmail/finalize')
+        .send({ code: 'valid-code', state });
+      expect(finalizeRes.status).toBe(200);
+      const { tokenSessionId } = finalizeRes.body;
+      expect(tokenSessionId).toBeDefined();
+
+      // Now hit /connect — the mock createAccount echoes the input config back
+      // so we can assert on exactly what got persisted.
+      const connectRes = await request(app)
+        .post('/api/oauth/gmail/connect')
+        .send({ tokenSessionId });
+
+      expect(connectRes.status).toBe(200);
+      const savedConfig = connectRes.body.account.config;
+      expect(savedConfig.granted_scopes).toEqual(
+        expect.arrayContaining([
+          'https://www.googleapis.com/auth/gmail.readonly',
+          'https://www.googleapis.com/auth/calendar.readonly',
+        ]),
+      );
+      // The critical assertion: BaseOAuthConfig.scopes must also be populated,
+      // not left empty as it was before the fix.
+      expect(savedConfig.scopes).toEqual(savedConfig.granted_scopes);
+      expect(Array.isArray(savedConfig.scopes)).toBe(true);
+      expect(savedConfig.scopes.length).toBeGreaterThan(0);
     });
   });
 });
