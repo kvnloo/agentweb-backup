@@ -175,5 +175,31 @@ describe('notionService', () => {
       expect(body.children[0].heading_3.rich_text).toHaveLength(1);
       expect(body.children[1].paragraph.rich_text).toHaveLength(1);
     });
+
+    it('should NOT include after field when afterBlockId is omitted', async () => {
+      mockFetch.mockResolvedValueOnce({
+        json: () => Promise.resolve({ object: 'list', results: [] }),
+        status: 200,
+      });
+
+      await appendBlocks('page-123', [{ type: 'paragraph', text: 'Hello' }]);
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.after).toBeUndefined();
+      expect(body.children).toHaveLength(1);
+    });
+
+    it('should include after field when afterBlockId is provided', async () => {
+      mockFetch.mockResolvedValueOnce({
+        json: () => Promise.resolve({ object: 'list', results: [] }),
+        status: 200,
+      });
+
+      await appendBlocks('page-123', [{ type: 'paragraph', text: 'Hello' }], 'block-after-id');
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.after).toBe('block-after-id');
+      expect(body.children).toHaveLength(1);
+    });
   });
 });
