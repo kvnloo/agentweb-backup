@@ -15,7 +15,7 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function ctx(context: any) {
-  return { userId: context?.userId, agentUserId: context?.agentUserId };
+  return { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
 }
 
 function jsonResult(data: unknown) {
@@ -1482,7 +1482,7 @@ mcpToolRegistry.register({
     }
     if (!context?.sessionId) throw new Error('Missing session context');
     const { agentModeService } = await import('../../services/agentModeService');
-    return await agentModeService.installSkills(args.skillIds, userId, context.sessionId);
+    return await agentModeService.installSkills(args.skillIds, userId, context.sessionId, context.isDelegatedAccess === true);
   }
 });
 

@@ -109,8 +109,9 @@ io.on('connection', (socket: Socket) => {
         throw new Error('No authentication token provided');
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
-      const userId = decoded.userId;
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
+      const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
+      const isDelegatedAdmin = !!decoded.delegateAccess;
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(userId);
@@ -127,7 +128,7 @@ io.on('connection', (socket: Socket) => {
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id }
+        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin }
       );
 
       // Send response back to the client

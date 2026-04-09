@@ -3527,6 +3527,8 @@ export interface ChatResponseOptions {
   model?: string;
   socketId?: string;
   onToolStart?: (toolName: string) => void;
+  /** True when the current message is from an admin via delegated access. Admin tools should be available. */
+  isDelegatedAdmin?: boolean;
 }
 
 // Update generateChatResponse to use platform knowledge base when needed
@@ -3545,6 +3547,7 @@ export async function generateChatResponse(
     model,
     socketId,
     onToolStart,
+    isDelegatedAdmin,
   } = options;
   try {
     const timestamp = new Date().toISOString();
@@ -3760,6 +3763,12 @@ export async function generateChatResponse(
           pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
         }
 
+        // Add admin tools when message is from admin delegated access
+        if (isDelegatedAdmin) {
+          const adminToolNames = agentModeService.getAdminToolNames();
+          adminToolNames.forEach(t => toolsToInclude.add(t));
+        }
+
         if (!emmaToolsLoaded) {
           await import('../emma/tools');
           await import('../emma/tempEmailTools');
@@ -3926,7 +3935,10 @@ export async function generateChatResponse(
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
           onToolStart?.(toolCall.function.name);
           if (!agentModeService) throw new Error("AgentModeService not initialized");
-          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, socketId ? { socketId } : undefined);
+          const extraContext: Record<string, any> = {};
+          if (socketId) extraContext.socketId = socketId;
+          if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
+          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs, result });
           const toolContent = typeof result === 'string' ? result : JSON.stringify(result);

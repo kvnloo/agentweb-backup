@@ -26,7 +26,7 @@ interface UserRecord {
 interface McpFetchOptions {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string;
-  context: { userId?: string; agentUserId?: string };
+  context: { userId?: string; agentUserId?: string; isDelegatedAccess?: boolean };
   body?: Record<string, unknown>;
   queryParams?: Record<string, string>;
   /** Override the default 5-minute timeout (in ms). Use for long-running calls like v0 generation. */
@@ -67,7 +67,7 @@ const SELF_CALL_TOKEN_TTL = 600; // seconds — must outlast slow operations lik
 export function generateSelfCallToken(user: UserRecord): string {
   const secret = process.env.JWT_SECRET || 'your-secret-key';
   return jwt.sign(
-    { userId: user.userId, email: user.email, isAdmin: user.isAdmin },
+    { userId: user.userId, email: user.email, isAdmin: user.isAdmin, _svc: true },
     secret,
     { expiresIn: SELF_CALL_TOKEN_TTL }
   );
@@ -89,7 +89,10 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   }
 
   const user = await lookupUser(userId);
-  const token = generateSelfCallToken(user);
+  // When called via admin delegated access, mint the token with isAdmin:true so
+  // admin REST routes (requireAdmin middleware) accept the self-call.
+  const tokenUser = context.isDelegatedAccess ? { ...user, isAdmin: true } : user;
+  const token = generateSelfCallToken(tokenUser);
 
   // Build URL with query params
   let url = `${getBaseUrl()}${path}`;

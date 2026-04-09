@@ -1,32 +1,22 @@
-import { Request, Response, NextFunction } from 'express';
+import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../types/express';
-import { userDb } from '../services/db';
 
 export const isAdmin = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    console.log('Admin middleware - checking user:', req.user);
     const userId = req.user?.userId;
     if (!userId) {
-      console.log('Admin middleware - no userId found');
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Delegated sessions must not get admin powers, even if target user is an admin.
-    // When an admin delegates to another admin, the session should only operate as
-    // the target user — not inherit admin privileges.
+    // Delegated sessions (admin accessing as another user) must not get admin powers.
+    // Self-call tokens (_svc: true, from mcpFetch) do NOT set delegateInfo, so they
+    // pass through this check and are evaluated on req.user.isAdmin below.
     if ((req as any).delegateInfo?.isDelegated) {
-      console.log('Admin middleware - blocked: delegated session cannot use admin routes');
       return res.status(403).json({ message: 'Access denied. Delegated sessions cannot access admin routes.' });
     }
 
-    const user = await userDb.getUserById(userId);
-    console.log('Admin middleware - user found:', { userId, isAdmin: user?.isAdmin });
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    if (!user.isAdmin) {
+    // Trust req.user.isAdmin — already resolved by authenticateToken (from JWT or DB).
+    if (!(req.user as any)?.isAdmin) {
       return res.status(403).json({ message: 'Access denied. Admin privileges required.' });
     }
 

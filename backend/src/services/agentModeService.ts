@@ -1199,7 +1199,8 @@ export class AgentModeService {
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
     excludeTools?: string[],
-    screenshotUrl?: string
+    screenshotUrl?: string,
+    isDelegatedAccess: boolean = false
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -1238,6 +1239,9 @@ export class AgentModeService {
       }
 
       const isAdmin = currentUser?.isAdmin === true;
+      // Admin tools are available to real admins OR to messages arriving via admin delegated access.
+      // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
+      const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
@@ -1260,7 +1264,7 @@ export class AgentModeService {
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, isAdmin);
+      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
       const messages: any[] = [
@@ -1268,6 +1272,14 @@ export class AgentModeService {
       ];
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
+
+      // Inject admin delegation notice so the LLM knows admin tools are available via delegation
+      if (isDelegatedAccess && !isAdmin) {
+        messages.push({
+          role: 'system',
+          content: '⚠️ ADMIN DELEGATED ACCESS: Admin tools are available in this session because an admin is viewing this account. Admin tools can be installed and used in this session.'
+        });
+      }
 
       // Inject account memory context (cross-session knowledge)
       try {
@@ -1384,7 +1396,7 @@ export class AgentModeService {
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
             // Rebuild available skills (excluding newly associated ones, filtered by subscription)
-            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, isAdmin);
+            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
             // Update messages using helper — track length change to keep initialMessageCount accurate
             const preUpdateLen = messages.length;
@@ -1623,11 +1635,12 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
-            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions
-            if ((!isAdmin || isInteractiveShare) && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
+            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions.
+            // hasAdminAccess is true for real admins or admin delegated access (never for iShare).
+            if (!hasAdminAccess && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
               const errorMsg = isInteractiveShare
                 ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
-                : `Tool "${toolCall.function.name}" is restricted to admin users only.`;
+                : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
                 role: 'tool',
@@ -1684,8 +1697,11 @@ export class AgentModeService {
           for (const { toolCall, functionArgs } of preparedCalls) {
             const toolStart = Date.now();
             try {
-              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolOptions: Record<string, any> = {};
+              if (socketEmit) toolOptions.socketEmit = socketEmit;
+              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
+              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
               const toolDuration = Date.now() - toolStart;
               toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
             } catch (error) {
@@ -1698,8 +1714,11 @@ export class AgentModeService {
           const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
             const toolStart = Date.now();
             try {
-              const toolOptions = socketEmit || screenshotUrl ? { ...(socketEmit ? { socketEmit } : {}), ...(screenshotUrl ? { screenshotUrl } : {}) } : undefined;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, toolOptions);
+              const toolOptions: Record<string, any> = {};
+              if (socketEmit) toolOptions.socketEmit = socketEmit;
+              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
+              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
               const toolDuration = Date.now() - toolStart;
               return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
             } catch (error) {
@@ -2833,7 +2852,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     return skills;
   }
 
-  public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
+  public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
         skillService.getSkillsAvailableToUser(userId),
@@ -2860,7 +2879,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
       const validSkillIds = skillIds.filter(id => {
         const skill = publishedSkills.find(s => s.skillId === id);
         const isOwnSkill = skill && skill.ownerId === userId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || skill) &&
+        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
           (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
       });
 

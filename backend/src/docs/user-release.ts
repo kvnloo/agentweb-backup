@@ -17,6 +17,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-09',
+    changes: [
+      'Admin: Admin Tools Available via Delegated Access in Agent Mode',
+      '- When an admin accesses a customer account via "Access Portal" (delegated access), Agent Mode now grants access to admin tools (work plans, skills management, client health, etc.)',
+      '- An amber "Admin tools available (delegated access)" indicator appears above the Agent Mode chat input to confirm the elevated access',
+      '- Direct logins by the customer and anonymous iShare sessions are unaffected — admin tools remain unavailable in those contexts',
+    ],
+  },
+  {
     date: '2026-04-08',
     changes: [
       'Admin: Work Plan Categories',

@@ -38,7 +38,7 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 const SG_ID = process.env.SG_ID || "";
 const AWS_REGION = process.env.AWS_REGION || "us-west-2";
-const SG_PORTS = [22, 3001, 5173, 5174]; // ports to open per verified IP
+const SG_PORTS = [22, 3001, 5173, 5174, 5175]; // ports to open per verified IP
 const ec2 = SG_ID ? new EC2Client({ region: AWS_REGION }) : null;
 
 // Use /app/data volume in Docker, fallback to local file for dev
