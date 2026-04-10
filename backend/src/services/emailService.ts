@@ -1437,9 +1437,13 @@ View Session: ${sessionUrl}`;
     context?: Record<string, any>,
     notionUrl?: string
   ) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV] Suppressed oncall alert: ${subject}`);
+      return;
+    }
     try {
       const oncallEmails = await getAlertEmails('oncall_emails', ['ruiw@agentweb.pro']);
-      const env = process.env.NODE_ENV || 'unknown';
+      const env: string = process.env.NODE_ENV || 'unknown';
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
       // Attempt to create a Notion oncall item if no URL was provided

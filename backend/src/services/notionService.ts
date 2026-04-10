@@ -249,6 +249,10 @@ export interface CreateOncallItemResult {
 }
 
 export async function createOncallItem(params: CreateOncallItemParams): Promise<CreateOncallItemResult> {
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`[DEV] Suppressed Notion oncall item: ${params.title}`);
+    return { pageId: '', notionUrl: '' };
+  }
   const { apiToken } = await getNotionCredentials();
   const databaseId = await getSprintTasksDatabaseId();
   const { title, description, additionalTags = [], context } = params;
