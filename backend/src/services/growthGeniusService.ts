@@ -92,23 +92,26 @@ Remember: You're here to help startups and businesses grow through smart marketi
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
       console.log('GrowthGenius: Generating session title for message:', userMessage);
-      
-            const response = await this.openai.chat.completions.create({
+
+      const response = await this.openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         messages: [
-          { 
-            role: 'system', 
-            content: `You are a session title generator. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main topic or question. Return ONLY the title, nothing else.`
+          {
+            role: 'system',
+            content: `Generate a session title (max 60 characters) based on the user's message. Output ONLY the title text — no quotes, no punctuation at the end, no explanation.`
           },
-          { role: 'user', content: userMessage }
+          { role: 'user', content: userMessage.slice(0, 500) }
         ],
-        max_completion_tokens: 100
+        max_completion_tokens: 20
       });
 
-      const title = response.choices[0]?.message?.content?.trim();
+      const raw = response.choices[0]?.message?.content?.trim() || '';
+      // Extract first line, strip markdown, hard-truncate to 60 chars
+      const firstLine = raw.split('\n')[0].replace(/[*_`#[\]]/g, '').trim();
+      const title = firstLine.slice(0, 60) || 'Unknown topic';
       console.log('GrowthGenius: Generated title:', title);
-      
-      return title || 'Unknown topic';
+
+      return title;
     } catch (error) {
       console.error('GrowthGenius: Failed to generate session title:', error);
       return 'Unknown topic';

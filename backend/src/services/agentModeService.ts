@@ -9493,16 +9493,42 @@ Format the response as JSON with this structure:
       const response = await this.callLLM(defaultModel, [
         {
           role: 'system',
-          content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
+          content: `Return ONLY a JSON object: {"title": "..."}.
+Create a concise task title (3-8 words, max 60 chars) that names what the user wants to accomplish.
+Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch Ad Images".
+Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
-        { role: 'user', content: userMessage }
-      ], {
-        max_completion_tokens: 100
-      });
+        { role: 'user', content: userMessage.slice(0, 500) }
+      ], { response_format: { type: 'json_object' } });
+      // response_format: json_object forces Gemini/GPT to output valid JSON.
+      // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
+      // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
+      // output when the input alone exceeds the cap.
 
-      const title = response.choices[0]?.message?.content?.trim();
+      const raw = response.choices[0]?.message?.content?.trim() || '';
 
-      return title || 'Marketing Task';
+      // Reject titles that look like AI commentary rather than task names.
+      // Gemini sometimes generates {"title": "I notice that..."} or {"title": "It seems..."}.
+      const looksLikeCommentary = (t: string) =>
+        /^(I |It |This |There |The |Based |Note|Please|Sorry|Unable)/i.test(t.trim());
+
+      // Try full JSON parse first
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed.title === 'string' && parsed.title.trim() && !looksLikeCommentary(parsed.title)) {
+          return parsed.title.trim().slice(0, 60);
+        }
+      } catch {
+        // JSON parse failed (e.g. truncated). Try to extract the title value with a regex.
+        const match = raw.match(/"title"\s*:\s*"([^"]{3,})"/);
+        if (match && !looksLikeCommentary(match[1])) return match[1].slice(0, 60);
+
+        // Last resort: first non-JSON line, stripped of markdown symbols
+        const firstLine = raw.split('\n')[0].replace(/[{}"'*_`#[\]:]/g, '').trim();
+        if (firstLine.length >= 3 && !looksLikeCommentary(firstLine)) return firstLine.slice(0, 60);
+      }
+
+      return 'Marketing Task';
     } catch (error) {
       console.error('AgentMode: Failed to generate session title:', error);
       return 'Marketing Task';
