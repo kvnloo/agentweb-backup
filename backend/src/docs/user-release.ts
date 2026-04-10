@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-10',
     changes: [
+      'Chat History Search in Agent Mode',
+      '- A search bar now appears at the top of the Chat History sidebar in Agent Mode',
+      '- Typing filters your chats instantly — matches titles case-insensitively across Active, Archived, and Scheduled sections',
+      '- Searches your full chat history (up to 1,000 sessions), not just the most recently loaded ones',
+      '- Clearing the search restores the full session list',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
       'Jump to Slack from Shared Chat Sessions',
       '- When viewing a shared Emma chat session that originated from Slack, a "View in Slack" link now appears in the header',
       '- Clicking it takes you directly to the original Slack thread — no more hunting through channels',
