@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import axios from "axios";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
@@ -92,6 +93,16 @@ const TABLE_PREFIX =
   process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
 
+export interface LandingPageIntegration {
+  provider: string;      // e.g. "luma"
+  label: string;         // e.g. "Luma API Key"
+  envVarName: string;    // e.g. "LUMA_API_KEY" — injected as Vercel env var
+  encryptedApiKey: string;
+  vercelEnvId?: string;  // Vercel env var record ID (for updates)
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface GeneratedLandingPage {
   id: string;
   userId: string;
@@ -108,6 +119,7 @@ export interface GeneratedLandingPage {
   iterations: number;
   errorMessage?: string;
   leadListId?: string;
+  integrations?: LandingPageIntegration[];
   templateHtml?: string;
   isRootPage?: boolean;
   slug?: string;
@@ -186,7 +198,8 @@ export function buildBrandEnrichedPrompt(
   userPrompt: string,
   brand: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  integrationEnvVars?: Array<{ label: string; envVarName: string }>
 ): string {
   const parts: string[] = [];
 
@@ -248,6 +261,18 @@ export function buildBrandEnrichedPrompt(
       `   The form should collect: email (required), firstName, lastName, company, phone.\n` +
       `   Show a success message after submission. Show an error message on failure.\n` +
       `3. NEVER put absolute backend URLs (like ${apiBase}) in any client-side .tsx file. Only the server-side API route should know the backend URL.`
+    );
+  }
+
+  if (integrationEnvVars && integrationEnvVars.length > 0) {
+    const envLines = integrationEnvVars
+      .map((e) => `  - process.env.${e.envVarName}  (${e.label})`)
+      .join("\n");
+    parts.push(
+      `\n\nINTEGRATION API KEYS (server-side only):\n` +
+      `The following environment variables are available in process.env on the Next.js server:\n${envLines}\n` +
+      `To use these integrations, create Next.js API routes (e.g. app/api/luma/route.ts) that call the third-party API server-side.\n` +
+      `NEVER expose these env var values in any client-side .tsx component — they must only be read inside API route handlers.`
     );
   }
 
@@ -1445,6 +1470,228 @@ async function createGitHubRepoAndPush(
   console.log(`[V0 SERVICE] Pushed ${files.length} files to ${repoFullName}`);
 
   return { githubRepoUrl, repoFullName };
+}
+
+// ---------------------------------------------------------------------------
+// Integration key encryption (AES-256-CBC keyed from JWT_SECRET)
+// ---------------------------------------------------------------------------
+
+function getEncryptionKey(): Buffer {
+  const secret = process.env.JWT_SECRET || "fallback-insecure-key";
+  return crypto.createHash("sha256").update(secret).digest();
+}
+
+export function encryptIntegrationKey(plaintext: string): string {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-cbc", getEncryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return iv.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+export function decryptIntegrationKey(encryptedValue: string): string {
+  const [ivHex, encHex] = encryptedValue.split(":");
+  if (!ivHex || !encHex) throw new Error("Invalid encrypted value format");
+  const iv = Buffer.from(ivHex, "hex");
+  const decipher = crypto.createDecipheriv("aes-256-cbc", getEncryptionKey(), iv);
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(encHex, "hex")),
+    decipher.final(),
+  ]);
+  return decrypted.toString("utf8");
+}
+
+/** Mask an API key for display — shows provider prefix + last 4 chars. */
+export function maskApiKey(plaintext: string): string {
+  if (plaintext.length <= 8) return "****";
+  return plaintext.slice(0, 4) + "****" + plaintext.slice(-4);
+}
+
+// ---------------------------------------------------------------------------
+// Vercel environment variable management
+// ---------------------------------------------------------------------------
+
+/**
+ * Create or update a Vercel env var on a project.
+ * Returns the Vercel env var record ID (for future updates/deletes).
+ */
+export async function upsertVercelEnvVar(
+  vercelProjectId: string,
+  key: string,
+  value: string,
+  existingEnvId?: string
+): Promise<string> {
+  const vercelToken = await getVercelToken();
+  const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
+
+  if (existingEnvId) {
+    await axios.patch(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}/env/${existingEnvId}`,
+      { value, target: ["production", "preview", "development"] },
+      { headers, timeout: VERCEL_API_TIMEOUT_MS }
+    );
+    console.log(`[V0 SERVICE] Updated Vercel env var ${key} on ${vercelProjectId}`);
+    return existingEnvId;
+  }
+
+  const res = await axios.post<{ id: string }>(
+    `https://api.vercel.com/v9/projects/${vercelProjectId}/env`,
+    { key, value, type: "encrypted", target: ["production", "preview", "development"] },
+    { headers, timeout: VERCEL_API_TIMEOUT_MS }
+  );
+  console.log(`[V0 SERVICE] Created Vercel env var ${key} on ${vercelProjectId}, id=${res.data.id}`);
+  return res.data.id;
+}
+
+export async function deleteVercelEnvVar(
+  vercelProjectId: string,
+  envId: string
+): Promise<void> {
+  const vercelToken = await getVercelToken();
+  await axios.delete(
+    `https://api.vercel.com/v9/projects/${vercelProjectId}/env/${envId}`,
+    { headers: { Authorization: `Bearer ${vercelToken}` }, timeout: VERCEL_API_TIMEOUT_MS }
+  );
+  console.log(`[V0 SERVICE] Deleted Vercel env var ${envId} from ${vercelProjectId}`);
+}
+
+// ---------------------------------------------------------------------------
+// Landing page integration management
+// ---------------------------------------------------------------------------
+
+export interface IntegrationInput {
+  provider: string;   // e.g. "luma"
+  label: string;      // e.g. "Luma API Key"
+  envVarName: string; // e.g. "LUMA_API_KEY"
+  apiKey: string;     // plaintext — encrypted before storage
+}
+
+/**
+ * Save integration API keys for a landing page.
+ * Encrypts each key with JWT_SECRET, injects as Vercel env vars, and triggers a redeploy.
+ * Existing integrations for the same provider are updated; new ones are appended.
+ */
+export async function saveLandingPageIntegrations(
+  id: string,
+  userId: string,
+  inputs: IntegrationInput[]
+): Promise<GeneratedLandingPage> {
+  const page = await getLandingPage(id, userId);
+  if (!page) throw new Error("Landing page not found");
+
+  const now = new Date().toISOString();
+  const existing = page.integrations || [];
+
+  const updated = [...existing];
+
+  for (const input of inputs) {
+    const encrypted = encryptIntegrationKey(input.apiKey);
+    const idx = updated.findIndex((i) => i.provider === input.provider);
+
+    let vercelEnvId: string | undefined;
+
+    if (page.vercelProjectId) {
+      const existingEnvId = idx >= 0 ? updated[idx].vercelEnvId : undefined;
+      vercelEnvId = await upsertVercelEnvVar(
+        page.vercelProjectId,
+        input.envVarName,
+        input.apiKey,
+        existingEnvId
+      );
+    }
+
+    const record: LandingPageIntegration = {
+      provider: input.provider,
+      label: input.label,
+      envVarName: input.envVarName,
+      encryptedApiKey: encrypted,
+      vercelEnvId,
+      createdAt: idx >= 0 ? updated[idx].createdAt : now,
+      updatedAt: now,
+    };
+
+    if (idx >= 0) {
+      updated[idx] = record;
+    } else {
+      updated.push(record);
+    }
+  }
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET integrations = :integrations, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":integrations": updated,
+        ":updatedAt": now,
+      },
+    })
+    .promise();
+
+  // Redeploy so the new env vars take effect on the live site
+  if (page.vercelProjectId && page.githubRepoUrl) {
+    const repoFullName = page.githubRepoUrl
+      .replace("https://github.com/", "")
+      .replace(/\/$/, "");
+    try {
+      await triggerVercelDeployment(page.vercelProjectId, repoFullName);
+    } catch (err: any) {
+      console.warn(`[V0 SERVICE] Redeploy after integration save failed (non-fatal): ${err.message}`);
+    }
+  }
+
+  return { ...page, integrations: updated, updatedAt: now };
+}
+
+/**
+ * Delete a single integration from a landing page.
+ * Removes the Vercel env var and purges the record from DynamoDB.
+ */
+export async function deleteLandingPageIntegration(
+  id: string,
+  userId: string,
+  provider: string
+): Promise<GeneratedLandingPage> {
+  const page = await getLandingPage(id, userId);
+  if (!page) throw new Error("Landing page not found");
+
+  const existing = page.integrations || [];
+  const target = existing.find((i) => i.provider === provider);
+  if (!target) throw new Error(`Integration '${provider}' not found`);
+
+  if (page.vercelProjectId && target.vercelEnvId) {
+    try {
+      await deleteVercelEnvVar(page.vercelProjectId, target.vercelEnvId);
+    } catch (err: any) {
+      console.warn(`[V0 SERVICE] Could not delete Vercel env var (non-fatal): ${err.message}`);
+    }
+  }
+
+  const updated = existing.filter((i) => i.provider !== provider);
+  const now = new Date().toISOString();
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET integrations = :integrations, updatedAt = :updatedAt",
+      ExpressionAttributeValues: { ":integrations": updated, ":updatedAt": now },
+    })
+    .promise();
+
+  // Redeploy so the removed env var is no longer present
+  if (page.vercelProjectId && page.githubRepoUrl) {
+    const repoFullName = page.githubRepoUrl
+      .replace("https://github.com/", "")
+      .replace(/\/$/, "");
+    try {
+      await triggerVercelDeployment(page.vercelProjectId, repoFullName);
+    } catch (err: any) {
+      console.warn(`[V0 SERVICE] Redeploy after integration delete failed (non-fatal): ${err.message}`);
+    }
+  }
+
+  return { ...page, integrations: updated, updatedAt: now };
 }
 
 /**

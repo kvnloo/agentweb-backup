@@ -82,16 +82,19 @@ jest.mock("v0-sdk", () => ({
 const mockAxiosGet = jest.fn();
 const mockAxiosPost = jest.fn();
 const mockAxiosPatch = jest.fn();
+const mockAxiosDelete = jest.fn();
 jest.mock("axios", () => ({
   __esModule: true,
   default: {
     get: (...args: any[]) => mockAxiosGet(...args),
     post: (...args: any[]) => mockAxiosPost(...args),
     patch: (...args: any[]) => mockAxiosPatch(...args),
+    delete: (...args: any[]) => mockAxiosDelete(...args),
   },
   get: (...args: any[]) => mockAxiosGet(...args),
   post: (...args: any[]) => mockAxiosPost(...args),
   patch: (...args: any[]) => mockAxiosPatch(...args),
+  delete: (...args: any[]) => mockAxiosDelete(...args),
 }));
 
 // Mock uuid
@@ -128,6 +131,11 @@ import {
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
+  encryptIntegrationKey,
+  decryptIntegrationKey,
+  maskApiKey,
+  saveLandingPageIntegrations,
+  deleteLandingPageIntegration,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -1130,5 +1138,208 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
     const prompt = mockChatsCreate.mock.calls[0][0].message;
     expect(prompt).toContain("DESIGN INSPIRATION");
     expect(mockGetSetting).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// encryptIntegrationKey / decryptIntegrationKey / maskApiKey
+// =============================================================================
+describe("v0Service - integration key helpers", () => {
+  it("FAIL: decryptIntegrationKey with invalid format throws", () => {
+    expect(() => decryptIntegrationKey("not-a-valid-format")).toThrow();
+  });
+
+  it("FAIL: decryptIntegrationKey with empty string throws", () => {
+    expect(() => decryptIntegrationKey("")).toThrow();
+  });
+
+  it("FAIL: maskApiKey with very short key returns ****", () => {
+    expect(maskApiKey("abc")).toBe("****");
+  });
+
+  it("SUCCESS: encrypt → decrypt round-trip preserves plaintext", () => {
+    const original = "luma-abc123xyz";
+    const encrypted = encryptIntegrationKey(original);
+    expect(encrypted).not.toBe(original);
+    expect(encrypted).toContain(":");
+    const decrypted = decryptIntegrationKey(encrypted);
+    expect(decrypted).toBe(original);
+  });
+
+  it("SUCCESS: two encryptions of the same value produce different ciphertexts (random IV)", () => {
+    const original = "my-secret-key";
+    const enc1 = encryptIntegrationKey(original);
+    const enc2 = encryptIntegrationKey(original);
+    expect(enc1).not.toBe(enc2);
+    expect(decryptIntegrationKey(enc1)).toBe(original);
+    expect(decryptIntegrationKey(enc2)).toBe(original);
+  });
+
+  it("SUCCESS: maskApiKey shows first 4 and last 4 chars", () => {
+    const masked = maskApiKey("luma-abc123xyz9876");
+    expect(masked).toBe("luma****9876");
+  });
+});
+
+// =============================================================================
+// saveLandingPageIntegrations
+// =============================================================================
+describe("v0Service - saveLandingPageIntegrations", () => {
+  const basePage = {
+    id: "page-1",
+    userId: "user-1",
+    name: "Test Page",
+    prompt: "test",
+    status: "deployed",
+    iterations: 0,
+    vercelProjectId: "vpid-1",
+    githubRepoUrl: "https://github.com/AgentWebPro/lp-test",
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-01T00:00:00.000Z",
+  };
+
+  it("FAIL: page not found → throws", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: null }) });
+    await expect(
+      saveLandingPageIntegrations("nonexistent", "user-1", [
+        { provider: "luma", label: "Luma", envVarName: "LUMA_API_KEY", apiKey: "luma-test" },
+      ])
+    ).rejects.toThrow("not found");
+  });
+
+  it("FAIL: wrong userId → throws not found", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: { ...basePage, userId: "other-user" } }),
+    });
+    await expect(
+      saveLandingPageIntegrations("page-1", "user-1", [
+        { provider: "luma", label: "Luma", envVarName: "LUMA_API_KEY", apiKey: "luma-test" },
+      ])
+    ).rejects.toThrow("not found");
+  });
+
+  it("SUCCESS: creates Vercel env var and saves encrypted key to DynamoDB", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: basePage }) });
+    mockAxiosPost.mockResolvedValueOnce({ data: { id: "env-id-1" } }); // Vercel env var create
+    mockAxiosPost.mockResolvedValueOnce({}); // GitHub repo info (for redeploy)
+    mockAxiosGet.mockResolvedValueOnce({ data: { id: 12345 } }); // GitHub repo ID
+    mockUpdate.mockReturnValue({ promise: () => Promise.resolve() });
+
+    const result = await saveLandingPageIntegrations("page-1", "user-1", [
+      { provider: "luma", label: "Luma API Key", envVarName: "LUMA_API_KEY", apiKey: "luma-secret123" },
+    ]);
+
+    // DynamoDB update was called
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const updateCall = mockUpdate.mock.calls[0][0];
+    expect(updateCall.UpdateExpression).toContain("integrations");
+
+    // Integration stored with encrypted key
+    const [savedIntegration] = updateCall.ExpressionAttributeValues[":integrations"];
+    expect(savedIntegration.provider).toBe("luma");
+    expect(savedIntegration.envVarName).toBe("LUMA_API_KEY");
+    expect(savedIntegration.encryptedApiKey).not.toBe("luma-secret123");
+    expect(decryptIntegrationKey(savedIntegration.encryptedApiKey)).toBe("luma-secret123");
+    expect(savedIntegration.vercelEnvId).toBe("env-id-1");
+
+    // Result has the integration
+    expect(result.integrations).toHaveLength(1);
+    expect(result.integrations![0].provider).toBe("luma");
+  });
+
+  it("SUCCESS: updating existing integration calls PATCH on Vercel env var", async () => {
+    const existingIntegration = {
+      provider: "luma",
+      label: "Luma API Key",
+      envVarName: "LUMA_API_KEY",
+      encryptedApiKey: encryptIntegrationKey("old-key"),
+      vercelEnvId: "existing-env-id",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      updatedAt: "2025-01-01T00:00:00.000Z",
+    };
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: { ...basePage, integrations: [existingIntegration] } }),
+    });
+    mockAxiosPatch.mockResolvedValueOnce({ data: {} }); // Vercel env var update
+    mockAxiosGet.mockResolvedValueOnce({ data: { id: 12345 } }); // GitHub repo ID for redeploy
+    mockAxiosPost.mockResolvedValueOnce({}); // Vercel redeploy trigger
+    mockUpdate.mockReturnValue({ promise: () => Promise.resolve() });
+
+    await saveLandingPageIntegrations("page-1", "user-1", [
+      { provider: "luma", label: "Luma API Key", envVarName: "LUMA_API_KEY", apiKey: "new-key-456" },
+    ]);
+
+    // PATCH was called (update, not create)
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      expect.stringContaining("existing-env-id"),
+      expect.objectContaining({ value: "new-key-456" }),
+      expect.any(Object)
+    );
+    expect(mockAxiosPost).not.toHaveBeenCalledWith(
+      expect.stringContaining("/env"),
+      expect.any(Object),
+      expect.any(Object)
+    );
+  });
+});
+
+// =============================================================================
+// deleteLandingPageIntegration
+// =============================================================================
+describe("v0Service - deleteLandingPageIntegration", () => {
+  const pageWithIntegration = {
+    id: "page-1",
+    userId: "user-1",
+    name: "Test Page",
+    prompt: "test",
+    status: "deployed",
+    iterations: 0,
+    vercelProjectId: "vpid-1",
+    githubRepoUrl: "https://github.com/AgentWebPro/lp-test",
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-01T00:00:00.000Z",
+    integrations: [
+      {
+        provider: "luma",
+        label: "Luma API Key",
+        envVarName: "LUMA_API_KEY",
+        encryptedApiKey: encryptIntegrationKey("luma-key"),
+        vercelEnvId: "env-id-1",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        updatedAt: "2025-01-01T00:00:00.000Z",
+      },
+    ],
+  };
+
+  it("FAIL: page not found → throws", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: null }) });
+    await expect(
+      deleteLandingPageIntegration("nonexistent", "user-1", "luma")
+    ).rejects.toThrow("not found");
+  });
+
+  it("FAIL: integration provider not found → throws", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: pageWithIntegration }),
+    });
+    await expect(
+      deleteLandingPageIntegration("page-1", "user-1", "stripe")
+    ).rejects.toThrow("Integration 'stripe' not found");
+  });
+
+  it("SUCCESS: deletes Vercel env var and removes from DynamoDB", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: pageWithIntegration }) });
+    mockAxiosDelete.mockResolvedValueOnce({}); // Vercel env var delete
+    mockAxiosGet.mockResolvedValueOnce({ data: { id: 12345 } }); // GitHub repo ID
+    mockAxiosPost.mockResolvedValueOnce({}); // Vercel redeploy trigger
+    mockUpdate.mockReturnValue({ promise: () => Promise.resolve() });
+
+    const result = await deleteLandingPageIntegration("page-1", "user-1", "luma");
+
+    expect(mockAxiosDelete).toHaveBeenCalledWith(
+      expect.stringContaining("env-id-1"),
+      expect.any(Object)
+    );
+    expect(result.integrations).toHaveLength(0);
   });
 });

@@ -16,6 +16,11 @@ import {
   triggerVercelDeployment,
   resolveVercelProjectId,
   extractTemplateOutline,
+  saveLandingPageIntegrations,
+  deleteLandingPageIntegration,
+  maskApiKey,
+  decryptIntegrationKey,
+  IntegrationInput,
 } from "../services/v0Service";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
@@ -1098,5 +1103,132 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
     res.status(500).json({ error: error.message || "Failed to get preview URL" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Integration API key management
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/integrations
+ * Returns the page's integrations with masked key values (safe for the UI).
+ */
+router.get("/generated/:id/integrations", authenticateToken, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+
+    const integrations = (page.integrations || []).map((i) => ({
+      provider: i.provider,
+      label: i.label,
+      envVarName: i.envVarName,
+      maskedKey: maskApiKey(decryptIntegrationKey(i.encryptedApiKey)),
+      vercelEnvId: i.vercelEnvId,
+      createdAt: i.createdAt,
+      updatedAt: i.updatedAt,
+    }));
+
+    res.json({ integrations });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error fetching integrations:", error);
+    res.status(500).json({ error: error.message || "Failed to fetch integrations" });
+  }
+});
+
+/**
+ * PUT /api/landing-pages/v0/generated/:id/integrations
+ * Save (create or update) one or more integration API keys.
+ * Encrypts keys, injects them as Vercel env vars, and triggers a redeploy.
+ *
+ * Body: { integrations: Array<{ provider, label, envVarName, apiKey }> }
+ */
+router.put("/generated/:id/integrations", authenticateToken, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { integrations } = req.body as { integrations: IntegrationInput[] };
+    if (!Array.isArray(integrations) || integrations.length === 0) {
+      return res.status(400).json({ error: "integrations must be a non-empty array" });
+    }
+
+    // Validate each entry
+    for (const item of integrations) {
+      if (!item.provider || typeof item.provider !== "string") {
+        return res.status(400).json({ error: "Each integration requires a provider" });
+      }
+      if (!item.envVarName || !/^[A-Z][A-Z0-9_]*$/.test(item.envVarName)) {
+        return res.status(400).json({
+          error: `Invalid envVarName '${item.envVarName}' — must be uppercase with underscores`,
+        });
+      }
+      if (!item.apiKey || typeof item.apiKey !== "string" || item.apiKey.trim().length === 0) {
+        return res.status(400).json({ error: `apiKey is required for provider '${item.provider}'` });
+      }
+      if (item.apiKey.length > 500) {
+        return res.status(400).json({ error: "apiKey is too long (max 500 chars)" });
+      }
+    }
+
+    const updated = await saveLandingPageIntegrations(req.params.id, userId, integrations);
+
+    // Return masked integrations (never return the plaintext or encrypted key)
+    const masked = (updated.integrations || []).map((i) => ({
+      provider: i.provider,
+      label: i.label,
+      envVarName: i.envVarName,
+      maskedKey: maskApiKey(decryptIntegrationKey(i.encryptedApiKey)),
+      vercelEnvId: i.vercelEnvId,
+      createdAt: i.createdAt,
+      updatedAt: i.updatedAt,
+    }));
+
+    res.json({ integrations: masked });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error saving integrations:", error);
+    res.status(500).json({ error: error.message || "Failed to save integrations" });
+  }
+});
+
+/**
+ * DELETE /api/landing-pages/v0/generated/:id/integrations/:provider
+ * Remove a single integration by provider slug.
+ * Deletes the Vercel env var and triggers a redeploy.
+ */
+router.delete(
+  "/generated/:id/integrations/:provider",
+  authenticateToken,
+  async (req, res: Response) => {
+    try {
+      const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+      if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+      const { provider } = req.params;
+      if (!provider || typeof provider !== "string") {
+        return res.status(400).json({ error: "provider is required" });
+      }
+
+      const updated = await deleteLandingPageIntegration(req.params.id, userId, provider);
+
+      const masked = (updated.integrations || []).map((i) => ({
+        provider: i.provider,
+        label: i.label,
+        envVarName: i.envVarName,
+        maskedKey: maskApiKey(decryptIntegrationKey(i.encryptedApiKey)),
+        vercelEnvId: i.vercelEnvId,
+        createdAt: i.createdAt,
+        updatedAt: i.updatedAt,
+      }));
+
+      res.json({ integrations: masked });
+    } catch (error: any) {
+      console.error("[LP GENERATION] Error deleting integration:", error);
+      const status = error.message?.includes("not found") ? 404 : 500;
+      res.status(status).json({ error: error.message || "Failed to delete integration" });
+    }
+  }
+);
 
 export default router;
