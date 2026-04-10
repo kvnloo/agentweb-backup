@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-10',
     changes: [
+      'Fix: Get Support Now Shows All Premium Slack Channels',
+      '- The Get Support modal now reliably shows premium Slack channel links for all accounts',
+      '- If multiple Slack channels are configured, each one is shown as a separate link',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
       'Fix: Slack Sessions Now Correctly Track AI Model',
       '- Sessions created from Slack (both @Emma mentions and auto-triggered messages) now correctly record which AI model was used',
       '- This fixes a gap where Slack-initiated sessions appeared without a model in the admin session list',
