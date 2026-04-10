@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-10',
     changes: [
+      'Jump to Slack from Shared Chat Sessions',
+      '- When viewing a shared Emma chat session that originated from Slack, a "View in Slack" link now appears in the header',
+      '- Clicking it takes you directly to the original Slack thread — no more hunting through channels',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
       'Emma: Better Guidance When Analytics Tools Are Not Configured',
       '- Emma now provides actionable setup instructions when analytics tools (Google Analytics, Search Console, Microsoft Clarity, Meta Ads) are not yet configured',
       '- Instead of a generic error, Emma searches the user guide and shares step-by-step setup instructions',
