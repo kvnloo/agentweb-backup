@@ -17,6 +17,7 @@ export const register = async (req: Request, res: Response) => {
       password,
       roles: reqRoles,
       displayName: reqDisplayName,
+      utm,
     } = req.body;
 
     if (!email || !password) {
@@ -85,6 +86,13 @@ export const register = async (req: Request, res: Response) => {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
+      ...(utm && typeof utm === 'object' && {
+        utmSource: utm.utm_source,
+        utmMedium: utm.utm_medium,
+        utmCampaign: utm.utm_campaign,
+        utmContent: utm.utm_content,
+        utmTerm: utm.utm_term,
+      }),
     });
 
     // Auto-sync new user to CRM lead list (fire-and-forget)
