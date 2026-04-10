@@ -9,6 +9,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-10',
+    changes: [
+      'Ad Video Creation: New 4-Step Guided Wizard',
+      '- The "Create Ad Video" button now opens a step-by-step wizard instead of a single form',
+      '- Step 1: Choose your platform (TikTok, Instagram, LinkedIn, YouTube) — each shows the correct aspect ratio and duration',
+      '- Step 2: Pick from 3 AI-generated video concepts, each using a different storytelling framework (Problem-Agitate-Solution, Before/After, Social Proof)',
+      '- Step 3: Optionally set start and end frames — choose from existing images, upload your own, or generate with AI',
+      '- Step 4: Review your selections and generate — the approved concept is passed directly to the video AI for a more focused result',
+      '- AI frame generation is now brand-aware: fetches your brand guidelines and logo, uses Claude to craft a cinematic prompt, and composites your logo into the frame when available',
+    ],
+  },
+  {
     date: '2026-04-09',
     changes: [
       'Improved Work Plan Title Display',
