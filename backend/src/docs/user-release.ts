@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-10',
     changes: [
+      'Fixed: Slack "Send Message" Now Gives a Clear Error When Bot Isn\'t in the Channel',
+      '- If the Slack bot hasn\'t been invited to the configured channel, you now see a clear message explaining what to do — "invite the bot using /invite @AgentWeb in Slack" — instead of a confusing raw API error',
+      '- Fixed an issue in the admin panel where typing a channel ID and clicking Save without pressing Enter would silently discard the input, leaving the user with no channels configured',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
       'Chat History Search in Agent Mode',
       '- A search bar now appears at the top of the Chat History sidebar in Agent Mode',
       '- Typing filters your chats instantly — matches titles case-insensitively across Active, Archived, and Scheduled sections',
