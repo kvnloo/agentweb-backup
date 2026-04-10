@@ -74,6 +74,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         50,
         true,
         undefined,
+        undefined,
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
@@ -105,6 +106,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         25,
         true,
         lastEvaluatedKey,
+        undefined,
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
@@ -114,7 +116,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
       });
     });
 
-    it('should enforce maximum limit of 100', async () => {
+    it('should enforce maximum limit of 1000', async () => {
       const mockResult = {
         sessions: mockSessions,
         lastEvaluatedKey: null
@@ -129,8 +131,9 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
       expect(chatbotDb.getUserSessions).toHaveBeenCalledWith(
         'user-123',
         'agent',
-        100, // Should be capped at 100
+        200, // Max is 1000, so 200 passes through uncapped
         true,
+        undefined,
         undefined,
         undefined
       );
@@ -153,6 +156,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         50, // Default limit
         true,
+        undefined,
         undefined,
         undefined
       );
@@ -272,6 +276,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         50, // Should fall back to default
         true,
         undefined,
+        undefined,
         undefined
       );
     });
@@ -294,7 +299,8 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         1,
         true,
         undefined,
-        'dashboard'
+        'dashboard',
+        undefined
       );
     });
   });
