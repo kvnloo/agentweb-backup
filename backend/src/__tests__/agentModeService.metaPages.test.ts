@@ -129,7 +129,7 @@ describe('AgentModeService - Meta Pages', () => {
       const result = await agentModeService.listMetaPages('user123');
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Meta ad account not connected');
+      expect(result.message).toContain('Meta Ads account is not connected');
     });
 
     it('should handle metaService errors', async () => {

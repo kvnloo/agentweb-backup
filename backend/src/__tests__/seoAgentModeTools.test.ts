@@ -145,7 +145,7 @@ describe('SEO Agent Mode Tools', () => {
 
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
-      expect(result.message).toContain('No SEO domains configured');
+      expect(result.message).toContain('Google Search Console is not configured');
     });
 
     it('should return helpful message when user has no seoDomains field', async () => {
@@ -155,7 +155,7 @@ describe('SEO Agent Mode Tools', () => {
 
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
-      expect(result.message).toContain('No SEO domains configured');
+      expect(result.message).toContain('Google Search Console is not configured');
     });
 
     it('should return error when user not found', async () => {
@@ -295,7 +295,7 @@ describe('SEO Agent Mode Tools', () => {
 
       const tool = emmaToolRegistry.getTool('get_website_analytics');
       const result = await tool!.execute({}, { userId: 'test-user' });
-      expect(result.message).toContain('No Google Analytics Property ID configured');
+      expect(result.message).toContain('Google Analytics (GA4) is not configured');
     });
 
     it('should return error when user not found', async () => {
@@ -488,7 +488,7 @@ describe('SEO Agent Mode Tools', () => {
 
       const tool = emmaToolRegistry.getTool('get_clarity_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
-      expect(result.message).toContain('No Microsoft Clarity projects configured');
+      expect(result.message).toContain('Microsoft Clarity is not configured');
     });
 
     it('should return info for all configured Clarity projects', async () => {

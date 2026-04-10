@@ -9747,7 +9747,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (fbAccounts.length === 0) {
       console.error(`[AgentMode] No valid Meta connected account found for user ${userId}`);
-      throw new Error('Meta ad account not connected. Please connect your Facebook account in settings.');
+      throw new Error('Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.');
     }
 
     // 2. Handle specific account selection if accountId is provided

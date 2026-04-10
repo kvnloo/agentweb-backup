@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-10',
     changes: [
+      'Emma: Better Guidance When Analytics Tools Are Not Configured',
+      '- Emma now provides actionable setup instructions when analytics tools (Google Analytics, Search Console, Microsoft Clarity, Meta Ads) are not yet configured',
+      '- Instead of a generic error, Emma searches the user guide and shares step-by-step setup instructions',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
       'Fix: Get Support Now Shows All Premium Slack Channels',
       '- The Get Support modal now reliably shows premium Slack channel links for all accounts',
       '- If multiple Slack channels are configured, each one is shown as a separate link',
