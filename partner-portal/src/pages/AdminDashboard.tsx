@@ -2137,9 +2137,16 @@ export default function AdminDashboard() {
     try {
       setSlackChannelEditLoading(true);
 
+      // If admin typed a channel ID in the input field but didn't click Add, include it automatically
+      const pendingInput = slackChannelInputText.trim();
+      const channelsToSave =
+        pendingInput && !currentSlackChannels.includes(pendingInput)
+          ? [...currentSlackChannels, pendingInput]
+          : currentSlackChannels;
+
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSlackChannelUserId}/slack-channel`),
-        { slackChannels: currentSlackChannels },
+        { slackChannels: channelsToSave },
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
