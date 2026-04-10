@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-10',
+    changes: [
+      'Fix: Slack Sessions Now Correctly Track AI Model',
+      '- Sessions created from Slack (both @Emma mentions and auto-triggered messages) now correctly record which AI model was used',
+      '- This fixes a gap where Slack-initiated sessions appeared without a model in the admin session list',
+    ],
+  },
+  {
     date: '2026-04-09',
     changes: [
       'Improved Work Plan Title Display',
