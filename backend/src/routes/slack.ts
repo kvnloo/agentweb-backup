@@ -124,6 +124,9 @@ async function handleSlackTriggeredSession(params: {
     // Generate Emma's response
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+    if (!session.llmModel) {
+      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
+    }
     let emmaResponse = '';
     try {
       const result = await generateSessionResponse(session.sessionId, userMessage, user.userId, llmModel);
@@ -234,6 +237,9 @@ async function handleSlackSessionResponse(params: {
   const { agentModeService } = await import('../services/agentModeService');
 
   const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+  if (!session.llmModel) {
+    await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
+  }
 
   try {
     const response = await generateSessionResponse(
