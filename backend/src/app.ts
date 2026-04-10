@@ -66,6 +66,7 @@ import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import testAccountsRoutes from "./routes/testAccounts";
+import videosRoutes from "./routes/videos";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -220,6 +221,7 @@ app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);
 app.use("/api/meta/v2", metaV2Routes);
 app.use("/api/blog", blogRoutes);
+app.use("/api/videos", videosRoutes);
 app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
