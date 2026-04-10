@@ -17,6 +17,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-10',
+    changes: [
+      'Fixed Session Titles for Images, Reports, and Videos',
+      '- Session titles in Agent Mode chat history now display a concise, descriptive name instead of a fragment of the AI response',
+      '- This fix applies to sessions created from the Images, Reports, and Videos pages, as well as regular Agent Mode chats',
+    ],
+  },
+  {
     date: '2026-04-09',
     changes: [
       'Improved Work Plan Title Display',
