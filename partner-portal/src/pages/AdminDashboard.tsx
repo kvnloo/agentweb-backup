@@ -203,6 +203,7 @@ interface User {
   isActive: boolean;
   createdAt: string;
   lastLoginTime?: string;
+  lastActiveAt?: string;
   supportNote?: string;
   role?: "partner" | "customer" | "free"; // For single role from API
   roles?: ("partner" | "customer" | "free")[];
@@ -705,6 +706,8 @@ export default function AdminDashboard() {
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
+  const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
+  const [userActivitiesLoading, setUserActivitiesLoading] = useState<Record<string, boolean>>({});
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
@@ -1422,7 +1425,7 @@ export default function AdminDashboard() {
       case "createdAt":
         return user.createdAt ? new Date(user.createdAt).getTime() : 0;
       case "lastLoginTime":
-        return user.lastLoginTime ? new Date(user.lastLoginTime).getTime() : 0;
+        return (user.lastActiveAt || user.lastLoginTime) ? new Date(user.lastActiveAt || user.lastLoginTime!).getTime() : 0;
       case "chatSessionCount":
         return user.chatSessionCount ?? 0;
       case "taskCount":
@@ -3696,8 +3699,9 @@ export default function AdminDashboard() {
                       : user.subscription_status === "active" ? "paying"
                       : user.stripe_customer_id && !user.subscription_status ? "bounced"
                       : "free";
-                    const lastSeen = user.lastLoginTime ? (() => {
-                      const d = new Date(user.lastLoginTime!);
+                    const lastActiveTimestamp = user.lastActiveAt || user.lastLoginTime;
+                    const lastSeen = lastActiveTimestamp ? (() => {
+                      const d = new Date(lastActiveTimestamp);
                       const now = new Date();
                       const diffH = Math.floor((now.getTime() - d.getTime()) / 3600000);
                       if (diffH < 1) return "Just now";
@@ -3714,7 +3718,17 @@ export default function AdminDashboard() {
                       <TableRow
                         hover
                         sx={{ cursor: "pointer", "& td": { py: 1.5, borderBottom: isExpanded ? "none" : undefined } }}
-                        onClick={() => setExpandedUserId(isExpanded ? null : user.userId)}
+                        onClick={() => {
+                          const nextExpanded = isExpanded ? null : user.userId;
+                          setExpandedUserId(nextExpanded);
+                          if (nextExpanded && userActivities[nextExpanded] === undefined) {
+                            setUserActivitiesLoading(prev => ({ ...prev, [nextExpanded]: true }));
+                            axios.get(buildApiUrl(`/api/admin/users/${nextExpanded}/activities`), { headers: { Authorization: `Bearer ${token}` } })
+                              .then(res => setUserActivities(prev => ({ ...prev, [nextExpanded]: res.data.sessions })))
+                              .catch(() => setUserActivities(prev => ({ ...prev, [nextExpanded]: [] })))
+                              .finally(() => setUserActivitiesLoading(prev => ({ ...prev, [nextExpanded]: false })));
+                          }
+                        }}
                       >
                         <TableCell sx={{ p: 0.5, width: 32 }}>
                           <IconButton size="small" sx={{ p: 0.25 }}>
@@ -4031,6 +4045,43 @@ export default function AdminDashboard() {
                                     )}
                                     {!user.isAdmin && (
                                       <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleOpenUserDeleteConfirm(user.userId)}>Delete</Button>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                {/* Activities — last 30 days of chat sessions */}
+                                <Grid item xs={12}>
+                                  <Typography variant="caption" color="text.secondary">Activities (last 30 days)</Typography>
+                                  <Box sx={{ mt: 0.5 }}>
+                                    {userActivitiesLoading[user.userId] ? (
+                                      <CircularProgress size={16} />
+                                    ) : (userActivities[user.userId] || []).length === 0 ? (
+                                      <Typography variant="body2" color="text.disabled">No sessions in the last 30 days</Typography>
+                                    ) : (
+                                      <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
+                                        <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5 }}>
+                                          {(userActivities[user.userId] || []).length} session{(userActivities[user.userId] || []).length !== 1 ? "s" : ""}
+                                        </Typography>
+                                        {(userActivities[user.userId] || []).slice(0, 10).map(session => (
+                                          <Box key={session.sessionId} sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+                                            <Typography variant="caption" color="text.secondary" sx={{ minWidth: 130 }}>
+                                              {new Date(session.updatedAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                                            </Typography>
+                                            <Typography variant="body2" sx={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                              {session.title || "Untitled Session"}
+                                            </Typography>
+                                            {session.delegateInfo?.isDelegated ? (
+                                              <Chip label="admin" size="small" color="warning" variant="outlined" sx={{ height: 16, fontSize: "0.65rem", "& .MuiChip-label": { px: 0.75 } }} title={`Via delegate access by ${session.delegateInfo.adminEmail}`} />
+                                            ) : session.portalType && (
+                                              <Typography variant="caption" color="text.secondary">{session.portalType}</Typography>
+                                            )}
+                                          </Box>
+                                        ))}
+                                        {(userActivities[user.userId] || []).length > 10 && (
+                                          <Typography variant="caption" color="text.secondary">
+                                            +{(userActivities[user.userId] || []).length - 10} more
+                                          </Typography>
+                                        )}
+                                      </Box>
                                     )}
                                   </Box>
                                 </Grid>

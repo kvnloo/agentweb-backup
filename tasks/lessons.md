@@ -108,6 +108,18 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Monitoring service:** `test-env-access` is the one that polls Notion for new comments and re-triggers Claude. If it's not running, new comments won't be processed.
   - **Date:** 2026-04-02
 
+## Domain Terminology
+
+### "Tasks" = Web Automation Subagent Activities (NOT User Activities)
+- **Lesson:** In this codebase, "tasks" (`AW-Tasks`, `AW-TaskExecutions`) refer to web automation/browser automation jobs that the platform's AI agent (subagent) runs on behalf of users — NOT to user-initiated activities.
+  - **Why:** Confused "user activities" with task execution counts when designing an "Activities" feature. Task count is NOT a measure of user engagement in the traditional sense.
+  - **Domain model:**
+    - `AW-Tasks` / `AW-TaskExecutions` = web automation jobs (browser agent scraping/clicking/filling forms for the user) — subagent activities
+    - `AW-ChatSessions` = actual user interactions (the user chatting with the AI agent mode) — user activities
+    - `AW-TaskSchedules` = recurring automation schedules
+  - **Fix:** When showing "user activities" for an admin, use `AW-ChatSessions` (user chatting with AI), NOT task executions (subagent automation). Task counts in the admin UI labeled "Tasks / Workflows" represent automation setups, not user engagement sessions.
+  - **Date:** 2026-04-09
+
 ## Code Patterns
 
 ### DynamoDB Queries

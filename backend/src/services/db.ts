@@ -66,6 +66,7 @@ export interface User {
   isActive: boolean;
   createdAt: string;
   lastLoginTime?: string;
+  lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
   supportNote?: string;
   roles?: ("partner" | "customer" | "free")[];
   displayName?: string;
@@ -364,6 +365,67 @@ class UserDB {
     } while (lastEvaluatedKey);
 
     return totalCount;
+  }
+
+  async getUserChatSessions(userId: string, days: number = 30): Promise<Array<{
+    sessionId: string;
+    title: string;
+    createdAt: string;
+    updatedAt: string;
+    portalType?: string;
+    sessionType?: string;
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean };
+  }>> {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const results: Array<{
+      sessionId: string;
+      title: string;
+      createdAt: string;
+      updatedAt: string;
+      portalType?: string;
+      sessionType?: string;
+      delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean };
+    }> = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined = undefined;
+
+    do {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: CHAT_SESSIONS_TABLE,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId AND updatedAt >= :since",
+        ProjectionExpression: "sessionId, title, createdAt, updatedAt, portalType, sessionType, delegateInfo",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+          ":since": since,
+          ":archivedFalse": false,
+        },
+        FilterExpression: "(attribute_not_exists(archived) OR archived = :archivedFalse)",
+        ScanIndexForward: false,
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await this.docClient.query(params).promise();
+      for (const item of result.Items || []) {
+        results.push({
+          sessionId: item.sessionId,
+          title: item.title || "Untitled Session",
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
+          portalType: item.portalType,
+          sessionType: item.sessionType,
+          delegateInfo: item.delegateInfo,
+        });
+      }
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    // Sort by updatedAt descending (most recent first)
+    results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+    return results;
   }
 
   async createUser(

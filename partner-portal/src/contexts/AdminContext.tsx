@@ -25,6 +25,7 @@ interface User {
   isActive: boolean;
   createdAt: string;
   lastLoginTime?: string;
+  lastActiveAt?: string;
   supportNote?: string;
   roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;
