@@ -58,12 +58,24 @@ export type CalendarFetchError =
   | 'forbidden_unknown'       // 403 with an unrecognized reason
   | 'unknown';                // Non-403 error bucket
 
+/** A unique prospect (de-duped by email domain) with all their meetings rolled up */
+export interface ProspectDetail {
+  domain: string;            // e.g. "37angels.com"
+  contacts: string[];        // unique email addresses at this domain
+  meetingCount: number;       // total meetings (talked + no-show)
+  talkedCount: number;        // meetings where conversation happened
+  lastMeetingDate: string;    // most recent meeting date (ISO)
+  meetings: ProspectMeeting[]; // individual meetings for drill-down
+}
+
 export interface ProspectMeetingMetrics {
   totalMeetings: number; // prospect meetings where conversation happened (2+ speakers)
+  uniqueProspectsTalked: number; // unique company domains with at least one 'talked' meeting
   previousPeriodMeetings: number; // for comparison
   upcomingBooked: number; // future prospect meetings
   noShows: number; // past meetings with 0-1 speakers or no recording
   meetings: ProspectMeeting[]; // list of actual meetings
+  prospects: ProspectDetail[]; // de-duped by company domain, sorted by last meeting
   /**
    * When set, the Google Calendar fetch failed and the other counts should be
    * treated as "unknown, not zero". Used by the business funnel to show an
@@ -842,24 +854,54 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
       `matched=${matched} transcriptOk=${transcriptOk} talked=${talked} noShows=${noShows}`,
     );
 
+    // De-duplicate meetings by external attendee domain → unique prospects
+    const prospectMap = new Map<string, ProspectDetail>();
+    for (const m of meetings) {
+      for (const email of m.attendees) {
+        const domain = email.split('@')[1]?.toLowerCase() || 'unknown';
+        const existing = prospectMap.get(domain);
+        if (existing) {
+          existing.meetingCount++;
+          if (m.status === 'talked') existing.talkedCount++;
+          if (!existing.contacts.includes(email)) existing.contacts.push(email);
+          if (m.date > existing.lastMeetingDate) existing.lastMeetingDate = m.date;
+          existing.meetings.push(m);
+        } else {
+          prospectMap.set(domain, {
+            domain,
+            contacts: [email],
+            meetingCount: 1,
+            talkedCount: m.status === 'talked' ? 1 : 0,
+            lastMeetingDate: m.date,
+            meetings: [m],
+          });
+        }
+      }
+    }
+    const prospects = Array.from(prospectMap.values())
+      .sort((a, b) => b.lastMeetingDate.localeCompare(a.lastMeetingDate));
+    const uniqueProspectsTalked = prospects.filter(p => p.talkedCount > 0).length;
+
     return {
       totalMeetings: talked,
+      uniqueProspectsTalked,
       previousPeriodMeetings,
       upcomingBooked,
       noShows,
       meetings,
+      prospects,
       ...(calendarError && { calendarError }),
     };
   } catch (err: any) {
     console.error('[ProspectMeeting] Failed to get metrics:', err?.message);
-    // Return zeros gracefully — but preserve the classified calendar error
-    // if we already captured one so the caller can still show a banner.
     return {
       totalMeetings: 0,
+      uniqueProspectsTalked: 0,
       previousPeriodMeetings: 0,
       upcomingBooked: 0,
       noShows: 0,
       meetings: [],
+      prospects: [],
       ...(calendarError && { calendarError }),
     };
   }

@@ -8,11 +8,21 @@ import { getUnipileOutreachMetrics, UnipileOutreachMetrics } from "./unipileOutr
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
+interface SourceDetail {
+  label: string;       // e.g. "37angels.com — Alex Kimmet"
+  count: number;       // meetings with this prospect
+  talkedCount: number;
+  lastDate: string;    // ISO date of most recent meeting
+  contacts: string[];  // email addresses
+  recordingUrl?: string; // Fathom link to most recent recording
+}
+
 interface SourceBreakdown {
   name: string;
   count: number;
   status: "ok" | "error" | "unavailable";
   error?: string;
+  details?: SourceDetail[]; // expandable drill-down
 }
 
 export interface FunnelStage {
@@ -130,19 +140,38 @@ function unavailableSource(name: string): SourceBreakdown {
  * Mirrors the classifications from prospectMeetingService.CalendarFetchError.
  */
 function buildTalkedSources(meetingData: ProspectMeetingMetrics): SourceBreakdown[] {
-  if (!meetingData.calendarError) {
-    return [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
+  if (meetingData.calendarError) {
+    const err = meetingData.calendarError;
+    const message: Record<typeof err, string> = {
+      service_disabled: "Google Calendar API is disabled in the GCP project — enable it at console.cloud.google.com.",
+      scope_not_granted: "Calendar scope was not granted on the Gmail connection — reconnect Gmail and accept calendar access.",
+      insufficient_permissions: "Google token is missing calendar.readonly — reconnect Gmail to re-prompt for calendar permission.",
+      quota_exceeded: "Google Calendar API quota exceeded — retry after the rate limit resets.",
+      forbidden_unknown: "Google Calendar returned 403 with an unrecognized reason. Check CloudWatch for details.",
+      unknown: "Google Calendar fetch failed for a non-403 reason. Check CloudWatch for details.",
+    } as const;
+    return [errorSource("Google Calendar", message[err])];
   }
-  const err = meetingData.calendarError;
-  const message: Record<typeof err, string> = {
-    service_disabled: "Google Calendar API is disabled in the GCP project — enable it at console.cloud.google.com.",
-    scope_not_granted: "Calendar scope was not granted on the Gmail connection — reconnect Gmail and accept calendar access.",
-    insufficient_permissions: "Google token is missing calendar.readonly — reconnect Gmail to re-prompt for calendar permission.",
-    quota_exceeded: "Google Calendar API quota exceeded — retry after the rate limit resets.",
-    forbidden_unknown: "Google Calendar returned 403 with an unrecognized reason. Check CloudWatch for details.",
-    unknown: "Google Calendar fetch failed for a non-403 reason. Check CloudWatch for details.",
-  } as const;
-  return [errorSource("Google Calendar", message[err])];
+
+  // Build expandable detail from de-duped prospects
+  const details: SourceDetail[] = (meetingData.prospects || []).map(p => {
+    const latestMeeting = p.meetings.find(m => m.recordingUrl);
+    return {
+      label: `${p.domain} — ${p.contacts[0]?.split('@')[0] || 'unknown'}`,
+      count: p.meetingCount,
+      talkedCount: p.talkedCount,
+      lastDate: p.lastMeetingDate,
+      contacts: p.contacts,
+      ...(latestMeeting?.recordingUrl && { recordingUrl: latestMeeting.recordingUrl }),
+    };
+  });
+
+  return [{
+    name: "Google Calendar + Fathom",
+    count: meetingData.uniqueProspectsTalked ?? meetingData.totalMeetings,
+    status: "ok" as const,
+    details,
+  }];
 }
 
 function makeStage(
@@ -573,7 +602,7 @@ function buildLinkedInPipeline(
   // (e.g. 403 SERVICE_DISABLED), buildTalkedSources surfaces the classified
   // reason as an errorSource so the funnel doesn't lie with a zero.
   const talkedSources = buildTalkedSources(meetingData);
-  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
+  stages.push(makeStage("Talked", meetingData.uniqueProspectsTalked ?? meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
 
   // 6. Paid
   const paidSources = userData.status === "ok"
@@ -735,7 +764,7 @@ function buildOutboundPipeline(
   // 4. Talked — prospect meetings. Uses classified calendar error from
   // prospectMeetingService so a SERVICE_DISABLED is visible, not a silent zero.
   const talkedSources = buildTalkedSources(meetingData);
-  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, repliedCount, talkedSources));
+  stages.push(makeStage("Talked", meetingData.uniqueProspectsTalked ?? meetingData.totalMeetings, meetingData.previousPeriodMeetings, repliedCount, talkedSources));
 
   // 5. Paid
   const paidSources = userData.status === "ok"
@@ -792,7 +821,7 @@ function buildPaidAdsPipeline(
   // 4. Talked — prospect meetings. Uses classified calendar error from
   // prospectMeetingService so a SERVICE_DISABLED is visible, not a silent zero.
   const talkedSources = buildTalkedSources(meetingData);
-  stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, metaData.leads, talkedSources));
+  stages.push(makeStage("Talked", meetingData.uniqueProspectsTalked ?? meetingData.totalMeetings, meetingData.previousPeriodMeetings, metaData.leads, talkedSources));
 
   // 5. Paid
   const paidSources = userData.status === "ok"
