@@ -4133,6 +4133,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-10',
+    changes: [
+      'Landing Pages: API Key Integrations (Infrastructure Ready)',
+      '- Landing pages can now store encrypted API keys for third-party integrations (e.g. Luma, Stripe, or custom providers)',
+      '- Keys are encrypted with AES-256 and stored securely; they are injected as environment variables into your Vercel project server-side',
+      '- A redeploy is automatically triggered when a key is saved or removed',
+      '- The coding agent can now generate server-side Next.js API routes that reference these keys via process.env — keys are never exposed to the browser',
+      '- Manage keys from the "API Keys" button on any deployed landing page card',
+    ],
+  },
+  {
     date: '2026-04-08',
     changes: [
       'Foreplay Ad Library Now Has Its Own Dedicated Tool',
