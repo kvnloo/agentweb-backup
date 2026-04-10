@@ -762,7 +762,10 @@ router.post(
 
 /**
  * @route POST /api/stripe/reconcile
- * @desc Admin-only: reconcile all users' Stripe data with DynamoDB
+ * @desc Admin-only: reconcile all users' Stripe data with DynamoDB.
+ *       Should be called periodically (e.g., weekly cron or from the partner
+ *       portal admin panel) to fix any drift caused by missed webhooks.
+ *       Also useful after bulk subscription changes or Stripe migrations.
  * @access Private (admin only)
  */
 router.post(
