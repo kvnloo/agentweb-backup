@@ -9493,16 +9493,34 @@ Format the response as JSON with this structure:
       const response = await this.callLLM(defaultModel, [
         {
           role: 'system',
-          content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
+          content: `Return ONLY a JSON object in this exact format: {"title": "..."}
+The title must be max 60 characters, describing the user's marketing task. No other text.`
         },
-        { role: 'user', content: userMessage }
-      ], {
-        max_completion_tokens: 100
-      });
+        { role: 'user', content: userMessage.slice(0, 500) }
+      ]);
+      // No max_completion_tokens — the JSON structure itself constrains the output.
+      // Passing a token cap caused Gemini to treat it as a total (input+output) limit,
+      // resulting in zero output tokens when input already exceeded the cap.
 
-      const title = response.choices[0]?.message?.content?.trim();
+      const raw = response.choices[0]?.message?.content?.trim() || '';
 
-      return title || 'Marketing Task';
+      // Try full JSON parse first
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed.title === 'string' && parsed.title.trim()) {
+          return parsed.title.trim().slice(0, 60);
+        }
+      } catch {
+        // JSON parse failed (e.g. truncated). Try to extract the title value with a regex.
+        const match = raw.match(/"title"\s*:\s*"([^"]{3,})"/);
+        if (match) return match[1].slice(0, 60);
+
+        // Last resort: first non-JSON line, stripped of markdown symbols
+        const firstLine = raw.split('\n')[0].replace(/[{}"'*_`#[\]:]/g, '').trim();
+        if (firstLine.length >= 3) return firstLine.slice(0, 60);
+      }
+
+      return 'Marketing Task';
     } catch (error) {
       console.error('AgentMode: Failed to generate session title:', error);
       return 'Marketing Task';
