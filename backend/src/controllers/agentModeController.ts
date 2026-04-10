@@ -2441,7 +2441,8 @@ export const agentModeController = {
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
           supportNote: supportNote,
-          skills: sharedSkills
+          skills: sharedSkills,
+          slackThread: session.slackThread
         }
       });
     } catch (error) {
