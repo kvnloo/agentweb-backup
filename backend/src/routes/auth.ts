@@ -156,28 +156,32 @@ router.get('/slack-channel-name', authenticateToken, async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // If no Slack channel configured, return null
-    if (!user.slackChannel) {
-      return res.json({ slackChannelName: null });
+    // Collect all configured channel IDs (new array takes precedence; legacy single field as fallback)
+    const channelIds: string[] = (user.slackChannels && user.slackChannels.length > 0)
+      ? user.slackChannels
+      : (user.slackChannel ? [user.slackChannel] : []);
+
+    if (channelIds.length === 0) {
+      return res.json({ channels: [] });
     }
 
-    // Resolve Slack channel ID to name
+    // Resolve each channel ID to name and URL
     try {
       const { getSlackChannelInfo } = await import('../services/slackService');
-      const channelInfo = await getSlackChannelInfo(user.slackChannel);
-      if (channelInfo) {
-        // Generate Slack deep link (works on web and desktop app)
-        const slackUrl = `https://slack.com/app_redirect?channel=${user.slackChannel}`;
-        return res.json({
-          slackChannelName: channelInfo.name,
-          slackChannelUrl: slackUrl
-        });
-      } else {
-        return res.json({ slackChannelName: null });
-      }
+      const resolved = await Promise.all(
+        channelIds.map(async (channelId) => {
+          const channelInfo = await getSlackChannelInfo(channelId);
+          if (!channelInfo) return null;
+          return {
+            name: channelInfo.name,
+            url: `https://slack.com/app_redirect?channel=${channelId}`
+          };
+        })
+      );
+      return res.json({ channels: resolved.filter(Boolean) });
     } catch (error) {
-      console.error('Error resolving Slack channel name:', error);
-      return res.json({ slackChannelName: null });
+      console.error('Error resolving Slack channel names:', error);
+      return res.json({ channels: [] });
     }
   } catch (error) {
     console.error('Error fetching Slack channel name:', error);
