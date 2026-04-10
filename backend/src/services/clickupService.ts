@@ -269,27 +269,44 @@ export async function listFolders(accessToken: string, spaceId: string): Promise
 }
 
 /**
- * Create a new doc in a workspace. Optionally place it under a parent folder.
- * parentType: 4=folder, 5=list, 6=task, 7=workspace (default: workspace root)
+ * Create a new doc in a workspace at the workspace root.
  */
 export async function createDoc(
   accessToken: string,
   workspaceId: string,
   name: string,
-  content: string,
-  parentId?: string,
-  parentType?: number
+  content: string
 ): Promise<{ id: string; name: string }> {
-  const body: any = { name, content };
-  if (parentId) {
-    body.parent = { id: parentId, type: parentType ?? 4 };
-  }
   const response = await axios.post<{ id: string; name: string }>(
     `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs`,
-    body,
+    { name, content },
     { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
   );
   return { id: response.data.id, name: response.data.name };
+}
+
+/**
+ * Create a new page inside an existing doc.
+ * This is the correct way to place content inside a specific ClickUp doc/folder.
+ * ClickUp Docs and task-hierarchy folders are separate systems; docs can only
+ * contain pages via the pages API.
+ */
+export async function createPageInDoc(
+  accessToken: string,
+  workspaceId: string,
+  docId: string,
+  name: string,
+  content: string
+): Promise<{ id: string; name: string }> {
+  const response = await axios.post<any>(
+    `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs/${docId}/pages`,
+    { name, content },
+    { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
+  );
+  return {
+    id: response.data.id || response.data.doc_id || docId,
+    name: response.data.name || name,
+  };
 }
 
 /**

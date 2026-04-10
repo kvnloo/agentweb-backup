@@ -4303,7 +4303,7 @@ emmaToolRegistry.register({
   name: 'write_clickup_doc',
   definition: {
     name: 'write_clickup_doc',
-    description: 'Create a new document in the user\'s ClickUp workspace. Use this when the user wants to save content (research, reports, documentation) directly to ClickUp. The workspace_id can be obtained from list_knowledge_base_files (ClickUp entries have identifiers like "clickup:WORKSPACE_ID"). To place the doc in a specific folder, pass the folder_id from a "clickup-folder:FOLDER_ID" entry in list_knowledge_base_files.',
+    description: 'Create a new document in the user\'s ClickUp workspace. Use this when the user wants to save content (research, reports, documentation) directly to ClickUp. The workspace_id can be obtained from list_knowledge_base_files (ClickUp entries have identifiers like "clickup:WORKSPACE_ID"). To place content inside an existing ClickUp doc (e.g. a doc that acts as a folder/container), pass parent_doc_id using the docId from list_knowledge_base_files. NOTE: ClickUp task-hierarchy folders (clickup-folder: entries) cannot be used as doc parents — only existing doc IDs work.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4313,15 +4313,15 @@ emmaToolRegistry.register({
         },
         name: {
           type: 'string',
-          description: 'Document title'
+          description: 'Document or page title'
         },
         content: {
           type: 'string',
           description: 'Document content (markdown)'
         },
-        folder_id: {
+        parent_doc_id: {
           type: 'string',
-          description: 'Optional ClickUp folder ID to place the document in (get from list_knowledge_base_files entries like "clickup-folder:FOLDER_ID"). If omitted, the document is created at the workspace root.'
+          description: 'Optional: ID of an existing ClickUp doc to create this content inside as a page. Get the docId from list_knowledge_base_files (each file entry under a "clickup:" knowledge base has a docId). If omitted, the document is created at the workspace root.'
         }
       },
       required: ['workspace_id', 'name', 'content']
@@ -4336,7 +4336,7 @@ emmaToolRegistry.register({
       args.name,
       args.content,
       context.userId,
-      args.folder_id
+      args.parent_doc_id
     );
   }
 });

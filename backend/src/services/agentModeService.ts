@@ -7,7 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
@@ -13384,7 +13384,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
@@ -13794,7 +13794,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     name: string,
     content: string,
     userId: string,
-    folderId?: string
+    parentDocId?: string
   ): Promise<{ success: boolean; message: string; docId?: string }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
@@ -13809,12 +13809,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { success: false, message: 'Not authorized to access this ClickUp workspace' };
       }
 
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content, folderId);
+      if (parentDocId) {
+        // Create as a page inside the specified parent doc
+        const page = await createClickUpPageInDoc(clickUpToken, workspaceId, parentDocId, name, content);
+        return {
+          success: true,
+          message: `Successfully created page "${name}" inside ClickUp doc (id: ${parentDocId}) in workspace "${workspace.name}"`,
+          docId: page.id,
+        };
+      }
 
-      const locationMsg = folderId ? ` in folder (id: ${folderId})` : '';
+      // Create as a standalone doc at workspace root
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
       return {
         success: true,
-        message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"${locationMsg}`,
+        message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
         docId: doc.id,
       };
     } catch (error) {

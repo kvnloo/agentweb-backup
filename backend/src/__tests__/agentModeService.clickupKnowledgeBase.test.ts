@@ -19,6 +19,7 @@ const mockReadDocContent = jest.fn();
 const mockListTasks = jest.fn();
 const mockReadTaskContent = jest.fn();
 const mockCreateDoc = jest.fn();
+const mockCreatePageInDoc = jest.fn();
 const mockListSpaces = jest.fn();
 const mockListFolders = jest.fn();
 jest.mock('../services/clickupService', () => ({
@@ -29,6 +30,7 @@ jest.mock('../services/clickupService', () => ({
   listTasks: (...args: any[]) => mockListTasks(...args),
   readTaskContent: (...args: any[]) => mockReadTaskContent(...args),
   createDoc: (...args: any[]) => mockCreateDoc(...args),
+  createPageInDoc: (...args: any[]) => mockCreatePageInDoc(...args),
   listSpaces: (...args: any[]) => mockListSpaces(...args),
   listFolders: (...args: any[]) => mockListFolders(...args),
 }));
@@ -483,7 +485,7 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toBe('Not authorized to access this ClickUp workspace');
     });
 
-    it('should successfully create a ClickUp doc', async () => {
+    it('should successfully create a ClickUp doc at workspace root', async () => {
       mockGetAccessToken.mockResolvedValue('ck_token');
       mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
       mockCreateDoc.mockResolvedValue({ id: 'doc-new-1', name: 'New Doc' });
@@ -492,7 +494,7 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.success).toBe(true);
       expect(result.docId).toBe('doc-new-1');
       expect(result.message).toContain('New Doc');
-      expect(mockCreateDoc).toHaveBeenCalledWith('ck_token', 'ws-1', 'New Doc', '# Hello\n\nWorld', undefined);
+      expect(mockCreateDoc).toHaveBeenCalledWith('ck_token', 'ws-1', 'New Doc', '# Hello\n\nWorld');
     });
 
     it('should handle API errors gracefully', async () => {
@@ -503,16 +505,16 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toContain('Failed to create ClickUp document');
     });
 
-    it('should pass folder_id to createDoc when provided', async () => {
+    it('should create a page inside a parent doc when parent_doc_id is provided', async () => {
       mockGetAccessToken.mockResolvedValue('ck_token');
       mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
-      mockCreateDoc.mockResolvedValue({ id: 'doc-folder-1', name: 'Folder Doc' });
+      mockCreatePageInDoc.mockResolvedValue({ id: 'page-1', name: 'Page Doc' });
 
-      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'Folder Doc', 'content', 'user-123', 'folder-99');
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'Page Doc', 'content', 'user-123', 'parent-doc-99');
       expect(result.success).toBe(true);
-      expect(result.docId).toBe('doc-folder-1');
-      expect(mockCreateDoc).toHaveBeenCalledWith('ck_token', 'ws-1', 'Folder Doc', 'content', 'folder-99');
-      expect(result.message).toContain('folder-99');
+      expect(mockCreatePageInDoc).toHaveBeenCalledWith('ck_token', 'ws-1', 'parent-doc-99', 'Page Doc', 'content');
+      expect(mockCreateDoc).not.toHaveBeenCalled();
+      expect(result.message).toContain('parent-doc-99');
     });
 
   });
