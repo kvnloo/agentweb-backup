@@ -11,6 +11,16 @@ export interface ClickUpWorkspace {
   avatar?: string | null;
 }
 
+export interface ClickUpSpace {
+  id: string;
+  name: string;
+}
+
+export interface ClickUpFolder {
+  id: string;
+  name: string;
+}
+
 export interface ClickUpDoc {
   id: string;
   name: string;
@@ -231,17 +241,52 @@ export async function listTasks(accessToken: string, teamId: string): Promise<Cl
 }
 
 /**
- * Create a new doc in a workspace (at the workspace root).
+ * List all spaces in a workspace.
+ */
+export async function listSpaces(accessToken: string, workspaceId: string): Promise<ClickUpSpace[]> {
+  const response = await axios.get<{ spaces: any[] }>(
+    `${CLICKUP_API_V2}/team/${workspaceId}/space?archived=false`,
+    { headers: { Authorization: accessToken } }
+  );
+  return (response.data.spaces || []).map((space: any) => ({
+    id: space.id,
+    name: space.name,
+  }));
+}
+
+/**
+ * List all non-archived folders in a space.
+ */
+export async function listFolders(accessToken: string, spaceId: string): Promise<ClickUpFolder[]> {
+  const response = await axios.get<{ folders: any[] }>(
+    `${CLICKUP_API_V2}/space/${spaceId}/folder?archived=false`,
+    { headers: { Authorization: accessToken } }
+  );
+  return (response.data.folders || []).map((folder: any) => ({
+    id: folder.id,
+    name: folder.name,
+  }));
+}
+
+/**
+ * Create a new doc in a workspace. Optionally place it under a parent folder.
+ * parentType: 4=folder, 5=list, 6=task, 7=workspace (default: workspace root)
  */
 export async function createDoc(
   accessToken: string,
   workspaceId: string,
   name: string,
-  content: string
+  content: string,
+  parentId?: string,
+  parentType?: number
 ): Promise<{ id: string; name: string }> {
+  const body: any = { name, content };
+  if (parentId) {
+    body.parent = { id: parentId, type: parentType ?? 4 };
+  }
   const response = await axios.post<{ id: string; name: string }>(
     `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs`,
-    { name, content },
+    body,
     { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
   );
   return { id: response.data.id, name: response.data.name };

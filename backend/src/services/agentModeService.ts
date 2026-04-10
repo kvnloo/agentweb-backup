@@ -7,7 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
@@ -13219,6 +13219,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing ClickUp docs:', clickUpError);
       }
 
+      // Include ClickUp folders (spaces → folders hierarchy, for use as doc write targets)
+      try {
+        const clickUpToken = await getClickUpAccessToken(userId);
+        if (clickUpToken) {
+          const workspaces = await getClickUpWorkspaces(clickUpToken);
+          for (const workspace of workspaces) {
+            try {
+              const spaces = await listClickUpSpaces(clickUpToken, workspace.id);
+              for (const space of spaces) {
+                try {
+                  const folders = await listClickUpFolders(clickUpToken, space.id);
+                  for (const folder of folders) {
+                    knowledgeBases.push({
+                      identifier: `clickup-folder:${folder.id}`,
+                      name: `ClickUp Folder - ${workspace.name} / ${space.name} / ${folder.name}`,
+                      type: 'clickup-folder',
+                      updatedAt: undefined,
+                      files: [],
+                    });
+                  }
+                } catch (spaceErr) {
+                  console.log(`AgentMode: Error listing ClickUp folders in space ${space.name}:`, spaceErr);
+                }
+              }
+            } catch (wsErr) {
+              console.log(`AgentMode: Error listing ClickUp spaces in workspace ${workspace.name}:`, wsErr);
+            }
+          }
+        }
+      } catch (clickUpError) {
+        console.error('AgentMode: Error listing ClickUp folders:', clickUpError);
+      }
+
       // Include ClickUp tasks
       if (!options?.kb_type || options.kb_type === 'clickup-tasks') try {
         const clickUpToken = await getClickUpAccessToken(userId);
@@ -13760,7 +13793,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     workspaceId: string,
     name: string,
     content: string,
-    userId: string
+    userId: string,
+    folderId?: string
   ): Promise<{ success: boolean; message: string; docId?: string }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
@@ -13775,11 +13809,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { success: false, message: 'Not authorized to access this ClickUp workspace' };
       }
 
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content, folderId);
 
+      const locationMsg = folderId ? ` in folder (id: ${folderId})` : '';
       return {
         success: true,
-        message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
+        message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"${locationMsg}`,
         docId: doc.id,
       };
     } catch (error) {
