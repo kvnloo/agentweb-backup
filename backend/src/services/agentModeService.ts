@@ -1755,13 +1755,30 @@ export class AgentModeService {
 
             const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
 
-            toolCalls.push({
+            // Check if successful tool execution returned a "not connected" soft error
+            const softErrorMsg = processedResult?.message || processedResult?.error;
+            const isSoftFailure = processedResult?.success === false && typeof softErrorMsg === 'string';
+            const oauthInfo = isSoftFailure
+              ? AgentModeService.detectOAuthRequirement(toolCall.function.name, softErrorMsg)
+              : null;
+
+            const toolCallEntry: any = {
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs,
               result: minimalResult,
               duration
-            });
+            };
+
+            if (oauthInfo) {
+              toolCallEntry.oauthRequired = {
+                provider: oauthInfo.provider,
+                label: oauthInfo.label,
+                initPath: oauthInfo.initPath,
+              };
+            }
+
+            toolCalls.push(toolCallEntry);
 
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
@@ -1805,18 +1822,32 @@ export class AgentModeService {
             });
           } else {
             const { toolCall, functionArgs, error, duration } = toolResult;
-            toolCalls.push({
+            const errMsg = error instanceof Error ? error.message : String(error);
+
+            // Detect OAuth-related errors and attach structured metadata
+            const oauthInfo = AgentModeService.detectOAuthRequirement(toolCall.function.name, errMsg);
+
+            const toolCallEntry: any = {
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs || toolCall.function.arguments,
               error: error instanceof Error ? error.message : 'Unknown error',
               duration
-            });
+            };
+
+            if (oauthInfo) {
+              toolCallEntry.oauthRequired = {
+                provider: oauthInfo.provider,
+                label: oauthInfo.label,
+                initPath: oauthInfo.initPath,
+              };
+            }
+
+            toolCalls.push(toolCallEntry);
 
             failedCounterUpdates[toolCall.function.name] =
               (failedCounterUpdates[toolCall.function.name] || 0) + 1;
 
-            const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);
             messages.push({
               tool_call_id: toolCall.id,
@@ -12318,6 +12349,75 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
+  }
+
+  /**
+   * Detects whether a tool error is caused by a missing OAuth connection.
+   * Returns provider info + auth init path if so, null otherwise.
+   */
+  static detectOAuthRequirement(toolName: string, errorMessage: string): { provider: string; label: string; initPath: string } | null {
+    if (!errorMessage || typeof errorMessage !== 'string') return null;
+    const msg = errorMessage.toLowerCase();
+
+    // Meta / Facebook
+    if (msg.includes('meta') && (msg.includes('not connected') || msg.includes('connect your') || msg.includes('reconnect'))) {
+      return { provider: 'meta', label: 'Meta (Facebook)', initPath: '/api/oauth/meta/init?flow=ads' };
+    }
+    if (msg.includes('facebook') && (msg.includes('not connected') || msg.includes('connect your'))) {
+      return { provider: 'meta', label: 'Meta (Facebook)', initPath: '/api/oauth/meta/init?flow=ads' };
+    }
+
+    // LinkedIn Publishing
+    if (msg.includes('linkedin') && !msg.includes('ads') && !msg.includes('outreach') && (msg.includes('not connected') || msg.includes('connect your') || msg.includes('reconnect'))) {
+      return { provider: 'linkedin', label: 'LinkedIn', initPath: '/api/oauth/linkedin/init?type=personal' };
+    }
+
+    // LinkedIn Ads
+    if (msg.includes('linkedin ads') && (msg.includes('not connected') || msg.includes('connect your') || msg.includes('reconnect'))) {
+      return { provider: 'linkedin_ads', label: 'LinkedIn Ads', initPath: '/api/oauth/linkedin-ads/init' };
+    }
+
+    // LinkedIn Outreach (Unipile)
+    if (msg.includes('linkedin outreach') && (msg.includes('not connected') || msg.includes('connect') || msg.includes('reconnect'))) {
+      return { provider: 'linkedin_outreach', label: 'LinkedIn Outreach', initPath: '/api/oauth/linkedin-outreach/init' };
+    }
+
+    // Gmail
+    if (msg.includes('gmail') && (msg.includes('not connected') || msg.includes('connect your') || msg.includes('reconnect'))) {
+      return { provider: 'gmail', label: 'Gmail', initPath: '/api/oauth/gmail/init' };
+    }
+
+    // YouTube
+    if (msg.includes('youtube') && (msg.includes('not connected') || msg.includes('connect your') || msg.includes('reconnect'))) {
+      return { provider: 'youtube', label: 'YouTube', initPath: '/api/oauth/youtube/init' };
+    }
+
+    // Fathom
+    if (msg.includes('fathom') && (msg.includes('not connected') || msg.includes('connect your') || msg.includes('reconnect'))) {
+      return { provider: 'fathom', label: 'Fathom', initPath: '/api/oauth/fathom/init' };
+    }
+
+    // ClickUp
+    if (msg.includes('clickup') && (msg.includes('not connected') || msg.includes('connect'))) {
+      return { provider: 'clickup', label: 'ClickUp', initPath: '/api/oauth/clickup/init' };
+    }
+
+    // Foreplay
+    if (msg.includes('foreplay') && (msg.includes('not connected') || msg.includes('connect'))) {
+      return { provider: 'foreplay', label: 'Foreplay', initPath: '/api/oauth/foreplay/init' };
+    }
+
+    // Token expired patterns (any provider)
+    if (msg.includes('token') && msg.includes('expired') && msg.includes('reconnect')) {
+      // Try to detect the provider from the message
+      if (msg.includes('meta')) return { provider: 'meta', label: 'Meta (Facebook)', initPath: '/api/oauth/meta/init?flow=ads' };
+      if (msg.includes('linkedin ads')) return { provider: 'linkedin_ads', label: 'LinkedIn Ads', initPath: '/api/oauth/linkedin-ads/init' };
+      if (msg.includes('linkedin')) return { provider: 'linkedin', label: 'LinkedIn', initPath: '/api/oauth/linkedin/init?type=personal' };
+      if (msg.includes('gmail')) return { provider: 'gmail', label: 'Gmail', initPath: '/api/oauth/gmail/init' };
+      if (msg.includes('youtube')) return { provider: 'youtube', label: 'YouTube', initPath: '/api/oauth/youtube/init' };
+    }
+
+    return null;
   }
 
   // Knowledge base search functionality
