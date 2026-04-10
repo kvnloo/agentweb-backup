@@ -43,12 +43,45 @@ export interface ProspectMeeting {
   duration?: number; // minutes
 }
 
+/**
+ * Classification of why a Google Calendar fetch failed. Surfaced up the stack
+ * so callers (businessFunnelService → frontend) can distinguish "0 meetings"
+ * from "we couldn't even read the calendar". Prior to this the service
+ * collapsed every 403 into a bare empty array, which silently zeroed the
+ * funnel's Talked stage regardless of the actual root cause.
+ */
+export type CalendarFetchError =
+  | 'service_disabled'        // Google Calendar API not enabled in GCP project
+  | 'scope_not_granted'       // User did not grant calendar scope at OAuth time
+  | 'insufficient_permissions' // Token is valid but scope is missing / revoked
+  | 'quota_exceeded'          // Per-minute or daily quota hit
+  | 'forbidden_unknown'       // 403 with an unrecognized reason
+  | 'unknown';                // Non-403 error bucket
+
+/** A unique prospect (de-duped by email domain) with all their meetings rolled up */
+export interface ProspectDetail {
+  domain: string;            // e.g. "37angels.com"
+  contacts: string[];        // unique email addresses at this domain
+  meetingCount: number;       // total meetings (talked + no-show)
+  talkedCount: number;        // meetings where conversation happened
+  lastMeetingDate: string;    // most recent meeting date (ISO)
+  meetings: ProspectMeeting[]; // individual meetings for drill-down
+}
+
 export interface ProspectMeetingMetrics {
   totalMeetings: number; // prospect meetings where conversation happened (2+ speakers)
+  uniqueProspectsTalked: number; // unique company domains with at least one 'talked' meeting
   previousPeriodMeetings: number; // for comparison
   upcomingBooked: number; // future prospect meetings
   noShows: number; // past meetings with 0-1 speakers or no recording
   meetings: ProspectMeeting[]; // list of actual meetings
+  prospects: ProspectDetail[]; // de-duped by company domain, sorted by last meeting
+  /**
+   * When set, the Google Calendar fetch failed and the other counts should be
+   * treated as "unknown, not zero". Used by the business funnel to show an
+   * actionable banner instead of a misleading zero.
+   */
+  calendarError?: CalendarFetchError;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -58,6 +91,16 @@ const INTERNAL_DOMAINS = ['agentweb.pro'];
 
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
+
+/** Build the correct auth header for Fathom — API keys use X-API-Key, OAuth tokens use Bearer */
+function fathomAuthHeaders(token: string): Record<string, string> {
+  // API keys contain a dot separator (e.g. "Llv8xnB-...CIg.Je9mHa1...")
+  // OAuth access tokens are typically opaque strings without dots
+  if (token.includes('.') && !token.startsWith('ey')) {
+    return { 'X-API-Key': token };
+  }
+  return { Authorization: `Bearer ${token}` };
+}
 
 /** Time window (ms) for matching calendar events to Fathom recordings */
 const RECORDING_MATCH_WINDOW_MS = 15 * 60 * 1000; // ±15 minutes
@@ -110,14 +153,28 @@ function getTemporalStatus(
 function classifyMeetingStatus(
   temporalStatus: 'past' | 'upcoming' | 'canceled',
   speakerAnalysis: { total: number; hasExternalSpeaker: boolean } | undefined,
+  /**
+   * Fallback signal from the Fathom listing response. When the transcript is
+   * unavailable (common for fresh recordings where `GET /recordings/:id/transcript`
+   * returns empty), we still know from the calendar invitees whether the
+   * meeting had any external attendees. If the prospect was invited AND a
+   * recording exists in the matching window, treat it as `talked` rather than
+   * silently falling through to `no-show`.
+   */
+  fathomHasExternalInvitees?: boolean,
 ): 'talked' | 'no-show' | 'upcoming' | 'canceled' {
   if (temporalStatus === 'canceled') return 'canceled';
   if (temporalStatus === 'upcoming') return 'upcoming';
 
-  // Past event — check if an external person actually spoke
+  // Past event — transcript speaker diarization is the strongest signal.
   if (speakerAnalysis?.hasExternalSpeaker) return 'talked';
 
-  // Only internal speakers, no recording, or no external speaker = no-show
+  // Fallback: transcript unavailable but Fathom says the recording had
+  // external invitees. A recording only exists if someone joined the call,
+  // so this is a reliable signal that a conversation happened.
+  if (!speakerAnalysis && fathomHasExternalInvitees) return 'talked';
+
+  // Only internal speakers, no recording, or no external signal = no-show
   return 'no-show';
 }
 
@@ -253,11 +310,26 @@ interface FathomRecordingMatch {
   url: string;
   startTime: string; // recording start time (ISO)
   endTime: string;
+  /**
+   * Fathom listing response flag derived from `calendar_invitees_domains_type`.
+   * True when the meeting had at least one external invitee. Used as a
+   * fallback signal when transcript speaker diarization is unavailable.
+   */
+  hasExternalInvitees: boolean;
 }
+
+/** Safety cap on Fathom pagination — 20 pages × 10/page = 200 recordings. */
+export const FATHOM_MAX_PAGES = 20;
 
 /**
  * Fetch Fathom meetings/recordings in a date range.
- * Returns an array of recordings with their start times for ±15min matching.
+ *
+ * Fathom's `/v1/meetings` endpoint paginates with `next_cursor` (default page
+ * size of 10). This function follows the cursor until exhausted or until
+ * FATHOM_MAX_PAGES is reached, so that a customer with 70+ recordings in the
+ * last 30 days does not silently lose all but the first 10.
+ *
+ * Returns an array of recordings with their start times for ±15 min matching.
  */
 async function getFathomRecordings(
   userId: string,
@@ -265,39 +337,60 @@ async function getFathomRecordings(
   endDate: string,
 ): Promise<FathomRecordingMatch[]> {
   const recordings: FathomRecordingMatch[] = [];
+  const accessToken = await getFathomAccessToken(userId);
+  if (!accessToken) return recordings;
+
+  let cursor: string | undefined;
+  let pageCount = 0;
 
   try {
-    const accessToken = await getFathomAccessToken(userId);
-    if (!accessToken) return recordings;
-
-    const params = new URLSearchParams({
-      created_after: startDate,
-      created_before: endDate,
-    });
-
-    const response = await axios.get(`${FATHOM_API_BASE}/meetings?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      timeout: 10000,
-    });
-
-    const rawData = response.data as any;
-    const meetingsArray = Array.isArray(rawData) ? rawData
-      : Array.isArray(rawData?.items) ? rawData.items
-      : Array.isArray(rawData?.calls) ? rawData.calls
-      : Array.isArray(rawData?.meetings) ? rawData.meetings
-      : [];
-
-    for (const m of meetingsArray) {
-      const startTime = m.scheduled_start_time || m.recording_start_time || m.created_at;
-      if (!startTime) continue;
-
-      recordings.push({
-        recordingId: m.recording_id,
-        title: m.title || m.meeting_title || '',
-        url: m.url || m.share_url || '',
-        startTime,
-        endTime: m.recording_end_time || '',
+    do {
+      const params = new URLSearchParams({
+        created_after: startDate,
+        created_before: endDate,
       });
+      if (cursor) params.set('cursor', cursor);
+
+      const response = await axios.get(
+        `${FATHOM_API_BASE}/meetings?${params.toString()}`,
+        {
+          headers: fathomAuthHeaders(accessToken),
+          timeout: 10000,
+        },
+      );
+
+      const rawData = response.data as any;
+      const meetingsArray = Array.isArray(rawData) ? rawData
+        : Array.isArray(rawData?.items) ? rawData.items
+        : Array.isArray(rawData?.calls) ? rawData.calls
+        : Array.isArray(rawData?.meetings) ? rawData.meetings
+        : [];
+
+      for (const m of meetingsArray) {
+        const startTime = m.scheduled_start_time || m.recording_start_time || m.created_at;
+        if (!startTime) continue;
+
+        recordings.push({
+          recordingId: m.recording_id,
+          title: m.title || m.meeting_title || '',
+          url: m.url || m.share_url || '',
+          startTime,
+          endTime: m.recording_end_time || '',
+          hasExternalInvitees: m.calendar_invitees_domains_type === 'one_or_more_external',
+        });
+      }
+
+      cursor = typeof rawData?.next_cursor === 'string' && rawData.next_cursor.length > 0
+        ? rawData.next_cursor
+        : undefined;
+      pageCount++;
+    } while (cursor && pageCount < FATHOM_MAX_PAGES);
+
+    if (cursor) {
+      console.warn(
+        `[ProspectMeeting] Hit FATHOM_MAX_PAGES (${FATHOM_MAX_PAGES}) — truncating Fathom recordings. ` +
+        `Fetched ${recordings.length} records so far.`,
+      );
     }
   } catch (err: any) {
     console.warn('[ProspectMeeting] Fathom fetch failed (non-fatal):', err?.message);
@@ -305,6 +398,15 @@ async function getFathomRecordings(
 
   return recordings;
 }
+
+// Exported for test harness so we can exercise pagination + the fallback
+// classification path without going through the full calendar flow.
+export const __test__ = {
+  getFathomRecordings,
+  classifyMeetingStatus,
+  findMatchingRecording,
+  analyzeSpeakers,
+};
 
 /**
  * Match a calendar event to a Fathom recording by time window (±15 minutes).
@@ -370,7 +472,7 @@ async function analyzeSpeakers(
     const response = await axios.get(
       `${FATHOM_API_BASE}/recordings/${recordingId}/transcript`,
       {
-        headers: { Authorization: `Bearer ${accessToken}` },
+        headers: fathomAuthHeaders(accessToken),
         timeout: 10000,
       },
     );
@@ -381,9 +483,21 @@ async function analyzeSpeakers(
     // Count distinct speaker names
     const speakers = new Set<string>();
     for (const turn of transcript) {
-      if (turn.speaker) {
+      if (turn.speaker && typeof turn.speaker === 'string') {
         speakers.add(turn.speaker);
       }
+    }
+
+    // Treat an empty transcript (HTTP 200 with `{ transcript: [] }`) the same
+    // as a 404 — Fathom returns this shape for fresh recordings that haven't
+    // been diarized yet. Returning `undefined` lets `classifyMeetingStatus`
+    // fall through to the calendar-invitees fallback instead of silently
+    // bucketing the meeting as `no-show`.
+    if (speakers.size === 0) {
+      console.info(
+        `[ProspectMeeting] Empty transcript for recording ${recordingId} (not yet diarized)`,
+      );
+      return undefined;
     }
 
     const hasExternalSpeaker = Array.from(speakers).some(s => !isInternalSpeaker(s));
@@ -410,18 +524,105 @@ interface CalendarEventData {
   attendees: string[];
 }
 
+interface CalendarFetchResult {
+  events: CalendarEventData[];
+  error?: CalendarFetchError;
+}
+
+/**
+ * Classify a Google Calendar API error. Google returns 403 for a bunch of
+ * very different failure modes and the previous implementation silently
+ * collapsed them all into "empty results", which made debugging a
+ * `SERVICE_DISABLED` incident require manual DynamoDB + HTTP forensics.
+ *
+ * This reads both the Google REST error shape (`err.response.data.error`)
+ * and the googleapis SDK's wrapped shape (`err.errors[]`) so it works
+ * regardless of which path threw.
+ */
+function classifyCalendarError(err: any): CalendarFetchError {
+  const status = err?.response?.status ?? err?.code;
+  if (status !== 403) {
+    return 'unknown';
+  }
+
+  // Pull the first textual reason we can find. The googleapis SDK exposes
+  // this on `err.errors[0].reason`; the REST response uses
+  // `response.data.error.errors[0].reason`; newer Google errors surface a
+  // top-level `response.data.error.status` enum like `PERMISSION_DENIED`.
+  const reason: string | undefined =
+    err?.errors?.[0]?.reason ||
+    err?.response?.data?.error?.errors?.[0]?.reason;
+  const statusEnum: string | undefined =
+    err?.response?.data?.error?.status;
+  const message: string | undefined =
+    err?.response?.data?.error?.message || err?.message;
+
+  const haystack = `${reason || ''} ${statusEnum || ''} ${message || ''}`.toLowerCase();
+
+  if (
+    haystack.includes('accessnotconfigured') ||
+    haystack.includes('service_disabled') ||
+    haystack.includes('has not been used') ||
+    haystack.includes('is disabled')
+  ) {
+    return 'service_disabled';
+  }
+  if (haystack.includes('quota') || haystack.includes('rate_limit')) {
+    return 'quota_exceeded';
+  }
+  if (haystack.includes('insufficientpermissions') || haystack.includes('insufficient_permissions')) {
+    return 'insufficient_permissions';
+  }
+  if (
+    haystack.includes('permission_denied') ||
+    haystack.includes('forbidden') ||
+    haystack.includes('scope')
+  ) {
+    return 'scope_not_granted';
+  }
+  return 'forbidden_unknown';
+}
+
+/**
+ * Human-friendly log message per classified error — keeps CloudWatch readable
+ * while preserving enough signal to spot the next time Calendar API gets
+ * accidentally disabled in GCP.
+ */
+function describeCalendarError(error: CalendarFetchError): string {
+  switch (error) {
+    case 'service_disabled':
+      return 'Google Calendar API is disabled in the GCP project — enable it in the Google Cloud console.';
+    case 'scope_not_granted':
+      return 'Calendar scope was not granted on the Gmail OAuth connection — user needs to reconnect.';
+    case 'insufficient_permissions':
+      return 'Google token is missing the calendar.readonly scope — re-prompt the user for consent.';
+    case 'quota_exceeded':
+      return 'Google Calendar API quota exceeded — back off and retry later.';
+    case 'forbidden_unknown':
+      return 'Google Calendar returned 403 with an unrecognized reason.';
+    default:
+      return 'Google Calendar fetch failed for a non-403 reason.';
+  }
+}
+
 /**
  * Fetch calendar events from Google Calendar API for a date range.
- * Returns an empty array if calendar access is not available.
+ * Returns an `{events, error}` tuple so the caller can distinguish "no
+ * meetings" from "we could not even read the calendar". An empty `events`
+ * array WITHOUT an `error` means the calendar is genuinely empty.
  */
 async function fetchCalendarEvents(
   userId: string,
   timeMin: string,
   timeMax: string,
-): Promise<CalendarEventData[]> {
+): Promise<CalendarFetchResult> {
   try {
     const calendar = await getCalendarClient(userId);
-    if (!calendar) return [];
+    if (!calendar) {
+      // No Gmail connection at all — treat as scope-not-granted so callers
+      // know to surface a "connect your calendar" CTA rather than a zero.
+      return { events: [], error: 'scope_not_granted' };
+    }
 
     const response = await calendar.events.list({
       calendarId: 'primary',
@@ -434,7 +635,7 @@ async function fetchCalendarEvents(
 
     const events = response.data.items || [];
 
-    return events
+    const mapped = events
       .filter(event => {
         // Skip all-day events (no dateTime) — those are not meetings
         return event.start?.dateTime && event.end?.dateTime;
@@ -448,16 +649,26 @@ async function fetchCalendarEvents(
           .map(a => a.email || '')
           .filter(Boolean),
       }));
+
+    return { events: mapped };
   } catch (err: any) {
-    // 403 = calendar scope not granted — this is expected and not an error
-    if (err?.response?.status === 403 || err?.code === 403) {
-      console.info('[ProspectMeeting] Google Calendar scope not granted — returning empty results.');
-      return [];
-    }
-    console.warn('[ProspectMeeting] Calendar API error (non-fatal):', err?.message);
-    return [];
+    const error = classifyCalendarError(err);
+    // Log at warn so it's visible but non-fatal — the funnel still renders,
+    // just with the error surfaced on the Talked stage.
+    console.warn(
+      `[ProspectMeeting] Calendar fetch failed [${error}]: ${describeCalendarError(error)} ` +
+      `(raw: ${err?.response?.data?.error?.message || err?.message || 'n/a'})`,
+    );
+    return { events: [], error };
   }
 }
+
+// Exported for tests — lets __tests__ exercise the classifier without
+// having to stand up a full googleapis client.
+export const __calendarErrorInternals__ = {
+  classifyCalendarError,
+  describeCalendarError,
+};
 
 // ── Period Helpers ──────────────────────────────────────────────────────────
 
@@ -514,30 +725,45 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
   const userId = HARSHA_USER_ID;
   const { startDate, endDate, previousStartDate, previousEndDate } = getDateRanges(period);
 
+  // Track the first calendar-side error we hit so we can surface it on the
+  // return value. If the main window fetch fails, later fetches will almost
+  // certainly fail the same way — we keep going to exercise the Fathom path
+  // for CloudWatch signal but preserve the original error classification.
+  let calendarError: CalendarFetchError | undefined;
+
   try {
     // Fetch current period events and Fathom recordings in parallel
-    const [currentEvents, fathomRecordings] = await Promise.all([
+    const [currentFetch, fathomRecordings] = await Promise.all([
       fetchCalendarEvents(userId, startDate, endDate),
       getFathomRecordings(userId, startDate, endDate),
     ]);
+    const currentEvents = currentFetch.events;
+    if (currentFetch.error) calendarError = currentFetch.error;
 
     // Also fetch upcoming events (from now to 30 days ahead) for "booked" count
     const now = new Date();
     const thirtyDaysAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const upcomingEvents = await fetchCalendarEvents(
+    const upcomingFetch = await fetchCalendarEvents(
       userId,
       now.toISOString(),
       thirtyDaysAhead.toISOString(),
     );
+    const upcomingEvents = upcomingFetch.events;
+    if (!calendarError && upcomingFetch.error) calendarError = upcomingFetch.error;
 
     // Filter to prospect meetings and build results
     const meetings: ProspectMeeting[] = [];
     let noShows = 0;
     let talked = 0;
+    let externalEvents = 0;
+    let pastExternal = 0;
+    let matched = 0;
+    let transcriptOk = 0;
 
     for (const event of currentEvents) {
       const externalAttendees = getExternalAttendees(event.attendees);
       if (externalAttendees.length === 0) continue; // internal-only meeting
+      externalEvents++;
 
       const temporalStatus = getTemporalStatus(event.end, event.status);
 
@@ -545,17 +771,30 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
       let speakerAnalysis: { total: number; hasExternalSpeaker: boolean } | undefined;
       let recordingUrl: string | undefined;
       let recordingId: number | undefined;
+      let matchedRecordingHasExternalInvitees = false;
 
       if (temporalStatus === 'past') {
+        pastExternal++;
         const recording = findMatchingRecording(event.start, fathomRecordings);
         if (recording) {
+          matched++;
           recordingUrl = recording.url;
           recordingId = recording.recordingId;
+          matchedRecordingHasExternalInvitees = recording.hasExternalInvitees;
           speakerAnalysis = await analyzeSpeakers(userId, recording.recordingId);
+          // Only count as "transcript ok" when we actually got diarized speaker
+          // data — an empty transcript already returns `undefined` from
+          // analyzeSpeakers, but guard on `total > 0` defensively so the
+          // CloudWatch signal stays accurate if that invariant ever loosens.
+          if (speakerAnalysis && speakerAnalysis.total > 0) transcriptOk++;
         }
       }
 
-      const status = classifyMeetingStatus(temporalStatus, speakerAnalysis);
+      const status = classifyMeetingStatus(
+        temporalStatus,
+        speakerAnalysis,
+        matchedRecordingHasExternalInvitees,
+      );
       if (status === 'no-show' || status === 'canceled') noShows++;
       if (status === 'talked') talked++;
 
@@ -580,10 +819,12 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
     // Fetch previous period for comparison
     let previousPeriodMeetings = 0;
     try {
-      const [previousEvents, previousRecordings] = await Promise.all([
+      const [previousFetch, previousRecordings] = await Promise.all([
         fetchCalendarEvents(userId, previousStartDate, previousEndDate),
         getFathomRecordings(userId, previousStartDate, previousEndDate),
       ]);
+      if (!calendarError && previousFetch.error) calendarError = previousFetch.error;
+      const previousEvents = previousFetch.events;
 
       for (const event of previousEvents) {
         const externalAttendees = getExternalAttendees(event.attendees);
@@ -594,29 +835,74 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
 
         const recording = findMatchingRecording(event.start, previousRecordings);
         const sa = recording ? await analyzeSpeakers(userId, recording.recordingId) : undefined;
-        const prevStatus = classifyMeetingStatus(temporalStatus, sa);
+        const prevStatus = classifyMeetingStatus(
+          temporalStatus,
+          sa,
+          recording?.hasExternalInvitees,
+        );
         if (prevStatus === 'talked') previousPeriodMeetings++;
       }
     } catch {
       // Non-fatal — comparison data is optional
     }
 
+    const fathomExternal = fathomRecordings.filter(r => r.hasExternalInvitees).length;
+    console.info(
+      `[ProspectMeeting] period=${period} events=${currentEvents.length} ` +
+      `externalEvents=${externalEvents} pastExternal=${pastExternal} ` +
+      `fathomRecordings=${fathomRecordings.length} fathomExternal=${fathomExternal} ` +
+      `matched=${matched} transcriptOk=${transcriptOk} talked=${talked} noShows=${noShows}`,
+    );
+
+    // De-duplicate meetings by external attendee domain → unique prospects
+    const prospectMap = new Map<string, ProspectDetail>();
+    for (const m of meetings) {
+      for (const email of m.attendees) {
+        const domain = email.split('@')[1]?.toLowerCase() || 'unknown';
+        const existing = prospectMap.get(domain);
+        if (existing) {
+          existing.meetingCount++;
+          if (m.status === 'talked') existing.talkedCount++;
+          if (!existing.contacts.includes(email)) existing.contacts.push(email);
+          if (m.date > existing.lastMeetingDate) existing.lastMeetingDate = m.date;
+          existing.meetings.push(m);
+        } else {
+          prospectMap.set(domain, {
+            domain,
+            contacts: [email],
+            meetingCount: 1,
+            talkedCount: m.status === 'talked' ? 1 : 0,
+            lastMeetingDate: m.date,
+            meetings: [m],
+          });
+        }
+      }
+    }
+    const prospects = Array.from(prospectMap.values())
+      .sort((a, b) => b.lastMeetingDate.localeCompare(a.lastMeetingDate));
+    const uniqueProspectsTalked = prospects.filter(p => p.talkedCount > 0).length;
+
     return {
       totalMeetings: talked,
+      uniqueProspectsTalked,
       previousPeriodMeetings,
       upcomingBooked,
       noShows,
       meetings,
+      prospects,
+      ...(calendarError && { calendarError }),
     };
   } catch (err: any) {
     console.error('[ProspectMeeting] Failed to get metrics:', err?.message);
-    // Return zeros gracefully
     return {
       totalMeetings: 0,
+      uniqueProspectsTalked: 0,
       previousPeriodMeetings: 0,
       upcomingBooked: 0,
       noShows: 0,
       meetings: [],
+      prospects: [],
+      ...(calendarError && { calendarError }),
     };
   }
 }

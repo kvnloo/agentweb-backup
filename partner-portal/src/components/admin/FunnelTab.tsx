@@ -28,7 +28,10 @@ import {
   Warning as WarningIcon,
   ErrorOutline as ErrorOutlineIcon,
   Info as InfoIcon,
+  ExpandMore as ExpandMoreIcon,
+  OpenInNew as OpenInNewIcon,
 } from '@mui/icons-material';
+import { Collapse, IconButton, Link } from '@mui/material';
 import axios from 'axios';
 import { Chart, ChartConfiguration, registerables } from 'chart.js';
 import { buildApiUrl } from '../../config';
@@ -39,10 +42,20 @@ Chart.register(...registerables);
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+interface SourceDetail {
+  label: string;
+  count: number;
+  talkedCount: number;
+  lastDate: string;
+  contacts: string[];
+  recordingUrl?: string;
+}
+
 interface FunnelSource {
   name: string;
   count: number;
   status: 'ok' | 'unavailable' | 'error';
+  details?: SourceDetail[];
 }
 
 interface FunnelStage {
@@ -388,6 +401,7 @@ function FunnelBarChart({
 // Stage Detail Card
 // ---------------------------------------------------------------------------
 function StageCard({ stage }: { stage: FunnelStage }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
   const changePct = getChangePercent(stage.count, stage.previousCount);
   const isPositive = changePct >= 0;
   const isUnavailable = stage.status === 'unavailable';
@@ -454,16 +468,90 @@ function StageCard({ stage }: { stage: FunnelStage }) {
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
             Sources
           </Typography>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
             {stage.sources.map((src) => (
-              <Chip
-                key={src.name}
-                label={`${src.name}: ${formatNumber(src.count)}`}
-                size="small"
-                variant="outlined"
-                color={src.status === 'ok' ? 'default' : 'warning'}
-                sx={{ fontSize: '0.7rem', height: 22 }}
-              />
+              <Box key={src.name}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  <Chip
+                    label={`${src.name}: ${formatNumber(src.count)}`}
+                    size="small"
+                    variant="outlined"
+                    color={src.status === 'ok' ? 'default' : 'warning'}
+                    sx={{ fontSize: '0.7rem', height: 22 }}
+                  />
+                  {src.details && src.details.length > 0 && (
+                    <IconButton
+                      size="small"
+                      onClick={() => setExpanded(expanded === src.name ? null : src.name)}
+                      sx={{ p: 0.25 }}
+                    >
+                      <ExpandMoreIcon
+                        sx={{
+                          fontSize: 16,
+                          transform: expanded === src.name ? 'rotate(180deg)' : 'rotate(0deg)',
+                          transition: 'transform 0.2s',
+                        }}
+                      />
+                    </IconButton>
+                  )}
+                </Box>
+                {src.details && (
+                  <Collapse in={expanded === src.name}>
+                    <Box sx={{ mt: 1, ml: 1, maxHeight: 240, overflowY: 'auto' }}>
+                      <Table size="small" sx={{ '& td, & th': { py: 0.5, px: 1, fontSize: '0.72rem', borderBottom: '1px solid', borderColor: 'divider' } }}>
+                        <TableHead>
+                          <TableRow>
+                            <TableCell sx={{ fontWeight: 600 }}>Prospect</TableCell>
+                            <TableCell align="center" sx={{ fontWeight: 600 }}>Talked</TableCell>
+                            <TableCell align="center" sx={{ fontWeight: 600 }}>Total</TableCell>
+                            <TableCell sx={{ fontWeight: 600 }}>Last Meeting</TableCell>
+                            <TableCell />
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {src.details.map((d) => (
+                            <TableRow key={d.label} hover>
+                              <TableCell>
+                                <Typography variant="caption" sx={{ fontWeight: 500 }}>
+                                  {d.label}
+                                </Typography>
+                              </TableCell>
+                              <TableCell align="center">
+                                <Chip
+                                  label={d.talkedCount}
+                                  size="small"
+                                  color={d.talkedCount > 0 ? 'success' : 'default'}
+                                  sx={{ fontSize: '0.65rem', height: 18, minWidth: 24 }}
+                                />
+                              </TableCell>
+                              <TableCell align="center">
+                                <Typography variant="caption">{d.count}</Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="caption" color="text.secondary">
+                                  {new Date(d.lastDate).toLocaleDateString()}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                {d.recordingUrl && (
+                                  <Link
+                                    href={d.recordingUrl}
+                                    target="_blank"
+                                    rel="noopener"
+                                    sx={{ display: 'flex', alignItems: 'center' }}
+                                  >
+                                    <OpenInNewIcon sx={{ fontSize: 14 }} />
+                                  </Link>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </Box>
+                  </Collapse>
+                )}
+              </Box>
             ))}
           </Box>
         </Box>
