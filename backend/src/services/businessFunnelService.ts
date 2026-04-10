@@ -122,6 +122,29 @@ function unavailableSource(name: string): SourceBreakdown {
   return { name, count: 0, status: "unavailable" };
 }
 
+/**
+ * Build the Talked stage's source breakdown, propagating any classified
+ * calendar error so the frontend can show an actionable banner (e.g. "Calendar
+ * API is disabled — enable it in GCP console") instead of a misleading zero.
+ *
+ * Mirrors the classifications from prospectMeetingService.CalendarFetchError.
+ */
+function buildTalkedSources(meetingData: ProspectMeetingMetrics): SourceBreakdown[] {
+  if (!meetingData.calendarError) {
+    return [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
+  }
+  const err = meetingData.calendarError;
+  const message: Record<typeof err, string> = {
+    service_disabled: "Google Calendar API is disabled in the GCP project — enable it at console.cloud.google.com.",
+    scope_not_granted: "Calendar scope was not granted on the Gmail connection — reconnect Gmail and accept calendar access.",
+    insufficient_permissions: "Google token is missing calendar.readonly — reconnect Gmail to re-prompt for calendar permission.",
+    quota_exceeded: "Google Calendar API quota exceeded — retry after the rate limit resets.",
+    forbidden_unknown: "Google Calendar returned 403 with an unrecognized reason. Check CloudWatch for details.",
+    unknown: "Google Calendar fetch failed for a non-403 reason. Check CloudWatch for details.",
+  } as const;
+  return [errorSource("Google Calendar", message[err])];
+}
+
 function makeStage(
   name: string,
   count: number,
@@ -546,10 +569,10 @@ function buildLinkedInPipeline(
   // 4. Identified — unavailable (leads from LinkedIn)
   stages.push(makeStage("Identified", 0, 0, 0, [unavailableSource("LinkedIn Lead Tracking (not connected)")]));
 
-  // 5. Talked — use prospect meeting service
-  const talkedSources = meetingData.totalMeetings > 0 || meetingData.noShows > 0
-    ? [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)]
-    : [safeSource("Google Calendar + Fathom", 0)];
+  // 5. Talked — use prospect meeting service. When the calendar fetch failed
+  // (e.g. 403 SERVICE_DISABLED), buildTalkedSources surfaces the classified
+  // reason as an errorSource so the funnel doesn't lie with a zero.
+  const talkedSources = buildTalkedSources(meetingData);
   stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, 0, talkedSources));
 
   // 6. Paid
@@ -709,8 +732,9 @@ function buildOutboundPipeline(
 
   stages.push(makeStage("Replies", repliedCount, 0, contactedCount, repliesSources));
 
-  // 4. Talked — prospect meetings
-  const talkedSources = [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
+  // 4. Talked — prospect meetings. Uses classified calendar error from
+  // prospectMeetingService so a SERVICE_DISABLED is visible, not a silent zero.
+  const talkedSources = buildTalkedSources(meetingData);
   stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, repliedCount, talkedSources));
 
   // 5. Paid
@@ -765,8 +789,9 @@ function buildPaidAdsPipeline(
       : [errorSource("Meta Ads", "Failed to fetch Meta Ads data")];
   stages.push(makeStage("Leads", metaData.leads, 0, metaData.clicks, leadsSources));
 
-  // 4. Talked — prospect meetings
-  const talkedSources = [safeSource("Google Calendar + Fathom", meetingData.totalMeetings)];
+  // 4. Talked — prospect meetings. Uses classified calendar error from
+  // prospectMeetingService so a SERVICE_DISABLED is visible, not a silent zero.
+  const talkedSources = buildTalkedSources(meetingData);
   stages.push(makeStage("Talked", meetingData.totalMeetings, meetingData.previousPeriodMeetings, metaData.leads, talkedSources));
 
   // 5. Paid

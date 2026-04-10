@@ -43,12 +43,33 @@ export interface ProspectMeeting {
   duration?: number; // minutes
 }
 
+/**
+ * Classification of why a Google Calendar fetch failed. Surfaced up the stack
+ * so callers (businessFunnelService → frontend) can distinguish "0 meetings"
+ * from "we couldn't even read the calendar". Prior to this the service
+ * collapsed every 403 into a bare empty array, which silently zeroed the
+ * funnel's Talked stage regardless of the actual root cause.
+ */
+export type CalendarFetchError =
+  | 'service_disabled'        // Google Calendar API not enabled in GCP project
+  | 'scope_not_granted'       // User did not grant calendar scope at OAuth time
+  | 'insufficient_permissions' // Token is valid but scope is missing / revoked
+  | 'quota_exceeded'          // Per-minute or daily quota hit
+  | 'forbidden_unknown'       // 403 with an unrecognized reason
+  | 'unknown';                // Non-403 error bucket
+
 export interface ProspectMeetingMetrics {
   totalMeetings: number; // prospect meetings where conversation happened (2+ speakers)
   previousPeriodMeetings: number; // for comparison
   upcomingBooked: number; // future prospect meetings
   noShows: number; // past meetings with 0-1 speakers or no recording
   meetings: ProspectMeeting[]; // list of actual meetings
+  /**
+   * When set, the Google Calendar fetch failed and the other counts should be
+   * treated as "unknown, not zero". Used by the business funnel to show an
+   * actionable banner instead of a misleading zero.
+   */
+  calendarError?: CalendarFetchError;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -450,7 +471,7 @@ async function analyzeSpeakers(
     // Count distinct speaker names
     const speakers = new Set<string>();
     for (const turn of transcript) {
-      if (turn.speaker) {
+      if (turn.speaker && typeof turn.speaker === 'string') {
         speakers.add(turn.speaker);
       }
     }
@@ -491,18 +512,105 @@ interface CalendarEventData {
   attendees: string[];
 }
 
+interface CalendarFetchResult {
+  events: CalendarEventData[];
+  error?: CalendarFetchError;
+}
+
+/**
+ * Classify a Google Calendar API error. Google returns 403 for a bunch of
+ * very different failure modes and the previous implementation silently
+ * collapsed them all into "empty results", which made debugging a
+ * `SERVICE_DISABLED` incident require manual DynamoDB + HTTP forensics.
+ *
+ * This reads both the Google REST error shape (`err.response.data.error`)
+ * and the googleapis SDK's wrapped shape (`err.errors[]`) so it works
+ * regardless of which path threw.
+ */
+function classifyCalendarError(err: any): CalendarFetchError {
+  const status = err?.response?.status ?? err?.code;
+  if (status !== 403) {
+    return 'unknown';
+  }
+
+  // Pull the first textual reason we can find. The googleapis SDK exposes
+  // this on `err.errors[0].reason`; the REST response uses
+  // `response.data.error.errors[0].reason`; newer Google errors surface a
+  // top-level `response.data.error.status` enum like `PERMISSION_DENIED`.
+  const reason: string | undefined =
+    err?.errors?.[0]?.reason ||
+    err?.response?.data?.error?.errors?.[0]?.reason;
+  const statusEnum: string | undefined =
+    err?.response?.data?.error?.status;
+  const message: string | undefined =
+    err?.response?.data?.error?.message || err?.message;
+
+  const haystack = `${reason || ''} ${statusEnum || ''} ${message || ''}`.toLowerCase();
+
+  if (
+    haystack.includes('accessnotconfigured') ||
+    haystack.includes('service_disabled') ||
+    haystack.includes('has not been used') ||
+    haystack.includes('is disabled')
+  ) {
+    return 'service_disabled';
+  }
+  if (haystack.includes('quota') || haystack.includes('rate_limit')) {
+    return 'quota_exceeded';
+  }
+  if (haystack.includes('insufficientpermissions') || haystack.includes('insufficient_permissions')) {
+    return 'insufficient_permissions';
+  }
+  if (
+    haystack.includes('permission_denied') ||
+    haystack.includes('forbidden') ||
+    haystack.includes('scope')
+  ) {
+    return 'scope_not_granted';
+  }
+  return 'forbidden_unknown';
+}
+
+/**
+ * Human-friendly log message per classified error — keeps CloudWatch readable
+ * while preserving enough signal to spot the next time Calendar API gets
+ * accidentally disabled in GCP.
+ */
+function describeCalendarError(error: CalendarFetchError): string {
+  switch (error) {
+    case 'service_disabled':
+      return 'Google Calendar API is disabled in the GCP project — enable it in the Google Cloud console.';
+    case 'scope_not_granted':
+      return 'Calendar scope was not granted on the Gmail OAuth connection — user needs to reconnect.';
+    case 'insufficient_permissions':
+      return 'Google token is missing the calendar.readonly scope — re-prompt the user for consent.';
+    case 'quota_exceeded':
+      return 'Google Calendar API quota exceeded — back off and retry later.';
+    case 'forbidden_unknown':
+      return 'Google Calendar returned 403 with an unrecognized reason.';
+    default:
+      return 'Google Calendar fetch failed for a non-403 reason.';
+  }
+}
+
 /**
  * Fetch calendar events from Google Calendar API for a date range.
- * Returns an empty array if calendar access is not available.
+ * Returns an `{events, error}` tuple so the caller can distinguish "no
+ * meetings" from "we could not even read the calendar". An empty `events`
+ * array WITHOUT an `error` means the calendar is genuinely empty.
  */
 async function fetchCalendarEvents(
   userId: string,
   timeMin: string,
   timeMax: string,
-): Promise<CalendarEventData[]> {
+): Promise<CalendarFetchResult> {
   try {
     const calendar = await getCalendarClient(userId);
-    if (!calendar) return [];
+    if (!calendar) {
+      // No Gmail connection at all — treat as scope-not-granted so callers
+      // know to surface a "connect your calendar" CTA rather than a zero.
+      return { events: [], error: 'scope_not_granted' };
+    }
 
     const response = await calendar.events.list({
       calendarId: 'primary',
@@ -515,7 +623,7 @@ async function fetchCalendarEvents(
 
     const events = response.data.items || [];
 
-    return events
+    const mapped = events
       .filter(event => {
         // Skip all-day events (no dateTime) — those are not meetings
         return event.start?.dateTime && event.end?.dateTime;
@@ -529,16 +637,26 @@ async function fetchCalendarEvents(
           .map(a => a.email || '')
           .filter(Boolean),
       }));
+
+    return { events: mapped };
   } catch (err: any) {
-    // 403 = calendar scope not granted — this is expected and not an error
-    if (err?.response?.status === 403 || err?.code === 403) {
-      console.info('[ProspectMeeting] Google Calendar scope not granted — returning empty results.');
-      return [];
-    }
-    console.warn('[ProspectMeeting] Calendar API error (non-fatal):', err?.message);
-    return [];
+    const error = classifyCalendarError(err);
+    // Log at warn so it's visible but non-fatal — the funnel still renders,
+    // just with the error surfaced on the Talked stage.
+    console.warn(
+      `[ProspectMeeting] Calendar fetch failed [${error}]: ${describeCalendarError(error)} ` +
+      `(raw: ${err?.response?.data?.error?.message || err?.message || 'n/a'})`,
+    );
+    return { events: [], error };
   }
 }
+
+// Exported for tests — lets __tests__ exercise the classifier without
+// having to stand up a full googleapis client.
+export const __calendarErrorInternals__ = {
+  classifyCalendarError,
+  describeCalendarError,
+};
 
 // ── Period Helpers ──────────────────────────────────────────────────────────
 
@@ -595,21 +713,31 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
   const userId = HARSHA_USER_ID;
   const { startDate, endDate, previousStartDate, previousEndDate } = getDateRanges(period);
 
+  // Track the first calendar-side error we hit so we can surface it on the
+  // return value. If the main window fetch fails, later fetches will almost
+  // certainly fail the same way — we keep going to exercise the Fathom path
+  // for CloudWatch signal but preserve the original error classification.
+  let calendarError: CalendarFetchError | undefined;
+
   try {
     // Fetch current period events and Fathom recordings in parallel
-    const [currentEvents, fathomRecordings] = await Promise.all([
+    const [currentFetch, fathomRecordings] = await Promise.all([
       fetchCalendarEvents(userId, startDate, endDate),
       getFathomRecordings(userId, startDate, endDate),
     ]);
+    const currentEvents = currentFetch.events;
+    if (currentFetch.error) calendarError = currentFetch.error;
 
     // Also fetch upcoming events (from now to 30 days ahead) for "booked" count
     const now = new Date();
     const thirtyDaysAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const upcomingEvents = await fetchCalendarEvents(
+    const upcomingFetch = await fetchCalendarEvents(
       userId,
       now.toISOString(),
       thirtyDaysAhead.toISOString(),
     );
+    const upcomingEvents = upcomingFetch.events;
+    if (!calendarError && upcomingFetch.error) calendarError = upcomingFetch.error;
 
     // Filter to prospect meetings and build results
     const meetings: ProspectMeeting[] = [];
@@ -679,10 +807,12 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
     // Fetch previous period for comparison
     let previousPeriodMeetings = 0;
     try {
-      const [previousEvents, previousRecordings] = await Promise.all([
+      const [previousFetch, previousRecordings] = await Promise.all([
         fetchCalendarEvents(userId, previousStartDate, previousEndDate),
         getFathomRecordings(userId, previousStartDate, previousEndDate),
       ]);
+      if (!calendarError && previousFetch.error) calendarError = previousFetch.error;
+      const previousEvents = previousFetch.events;
 
       for (const event of previousEvents) {
         const externalAttendees = getExternalAttendees(event.attendees);
@@ -718,16 +848,19 @@ export async function getProspectMeetingMetrics(period: string): Promise<Prospec
       upcomingBooked,
       noShows,
       meetings,
+      ...(calendarError && { calendarError }),
     };
   } catch (err: any) {
     console.error('[ProspectMeeting] Failed to get metrics:', err?.message);
-    // Return zeros gracefully
+    // Return zeros gracefully — but preserve the classified calendar error
+    // if we already captured one so the caller can still show a banner.
     return {
       totalMeetings: 0,
       previousPeriodMeetings: 0,
       upcomingBooked: 0,
       noShows: 0,
       meetings: [],
+      ...(calendarError && { calendarError }),
     };
   }
 }
