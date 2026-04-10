@@ -9493,31 +9493,39 @@ Format the response as JSON with this structure:
       const response = await this.callLLM(defaultModel, [
         {
           role: 'system',
-          content: `Return ONLY a JSON object in this exact format: {"title": "..."}
-The title must be max 60 characters, describing the user's marketing task. No other text.`
+          content: `Return ONLY a JSON object: {"title": "..."}.
+Create a concise task title (3-8 words, max 60 chars) that names what the user wants to accomplish.
+Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch Ad Images".
+Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ]);
-      // No max_completion_tokens — the JSON structure itself constrains the output.
-      // Passing a token cap caused Gemini to treat it as a total (input+output) limit,
-      // resulting in zero output tokens when input already exceeded the cap.
+      ], { response_format: { type: 'json_object' } });
+      // response_format: json_object forces Gemini/GPT to output valid JSON.
+      // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
+      // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
+      // output when the input alone exceeds the cap.
 
       const raw = response.choices[0]?.message?.content?.trim() || '';
+
+      // Reject titles that look like AI commentary rather than task names.
+      // Gemini sometimes generates {"title": "I notice that..."} or {"title": "It seems..."}.
+      const looksLikeCommentary = (t: string) =>
+        /^(I |It |This |There |The |Based |Note|Please|Sorry|Unable)/i.test(t.trim());
 
       // Try full JSON parse first
       try {
         const parsed = JSON.parse(raw);
-        if (typeof parsed.title === 'string' && parsed.title.trim()) {
+        if (typeof parsed.title === 'string' && parsed.title.trim() && !looksLikeCommentary(parsed.title)) {
           return parsed.title.trim().slice(0, 60);
         }
       } catch {
         // JSON parse failed (e.g. truncated). Try to extract the title value with a regex.
         const match = raw.match(/"title"\s*:\s*"([^"]{3,})"/);
-        if (match) return match[1].slice(0, 60);
+        if (match && !looksLikeCommentary(match[1])) return match[1].slice(0, 60);
 
         // Last resort: first non-JSON line, stripped of markdown symbols
         const firstLine = raw.split('\n')[0].replace(/[{}"'*_`#[\]:]/g, '').trim();
-        if (firstLine.length >= 3) return firstLine.slice(0, 60);
+        if (firstLine.length >= 3 && !looksLikeCommentary(firstLine)) return firstLine.slice(0, 60);
       }
 
       return 'Marketing Task';
