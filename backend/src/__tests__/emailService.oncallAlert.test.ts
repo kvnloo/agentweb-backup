@@ -19,6 +19,8 @@ jest.mock('../services/notionService', () => ({
 import { emailService } from '../services/emailService';
 
 describe('EmailService - sendOncallAlert', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockSendMail.mockClear();
@@ -26,10 +28,19 @@ describe('EmailService - sendOncallAlert', () => {
     // Set default oncall email
     process.env.ONCALL_EMAIL_LIST = 'test@example.com,test2@example.com';
     process.env.FROM_EMAIL = 'noreply@example.com';
+    process.env.NODE_ENV = 'production';
   });
 
   afterEach(() => {
     delete process.env.ONCALL_EMAIL_LIST;
+    process.env.NODE_ENV = originalNodeEnv;
+  });
+
+  it('should suppress alert in non-production environments', async () => {
+    process.env.NODE_ENV = 'development';
+    await emailService.sendOncallAlert('Test Alert', 'Test message');
+    expect(mockCreateOncallItem).not.toHaveBeenCalled();
+    expect(mockSendMail).not.toHaveBeenCalled();
   });
 
   it('should send slim email when Notion item is created successfully', async () => {
@@ -108,7 +119,7 @@ describe('EmailService - sendOncallAlert', () => {
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
     expect(callArgs.to).toEqual(['ruiw@agentweb.pro']);
-    expect(callArgs.subject).toBe('[TEST] Test Alert');
+    expect(callArgs.subject).toBe('[PROD] Test Alert');
     expect(callArgs.text).toContain('Test Alert');
     expect(callArgs.text).toContain('This is a test alert message');
     expect(callArgs.html).toContain('Test Alert');
@@ -133,7 +144,7 @@ describe('EmailService - sendOncallAlert', () => {
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
     expect(callArgs.to).toEqual(['oncall1@example.com', 'oncall2@example.com']);
-    expect(callArgs.subject).toBe('[TEST] Critical Error');
+    expect(callArgs.subject).toBe('[PROD] Critical Error');
   });
 
   it('should handle errors gracefully without throwing', async () => {

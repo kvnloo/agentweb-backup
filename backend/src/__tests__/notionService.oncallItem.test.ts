@@ -15,8 +15,22 @@ jest.mock('../utils/secretsManager', () => ({
 import { createOncallItem, getSprintTasksDatabaseId } from '../services/notionService';
 
 describe('notionService - createOncallItem', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.NODE_ENV = 'production';
+  });
+
+  afterEach(() => {
+    process.env.NODE_ENV = originalNodeEnv;
+  });
+
+  it('should suppress alert in non-production environments', async () => {
+    process.env.NODE_ENV = 'development';
+    const result = await createOncallItem({ title: 'Test', description: 'Desc' });
+    expect(result).toEqual({ pageId: '', notionUrl: '' });
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('should create a Notion page with correct properties and return URL', async () => {
