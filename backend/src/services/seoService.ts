@@ -188,7 +188,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   }
 
   if (!user.seoDomains || user.seoDomains.length === 0) {
-    return { message: "No SEO domains configured. Please configure SEO domains in your account settings." };
+    return { message: "Google Search Console is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
 
   const accessToken = await getGoogleSearchConsoleAccessToken();
@@ -405,7 +405,7 @@ export async function fetchClarityProjectInfo(userId: string, filterProjectId?: 
 
   const clarityProjects = getClarityProjects(user);
   if (clarityProjects.length === 0) {
-    return { message: "No Microsoft Clarity projects configured. Please configure Clarity in your account settings." };
+    return { message: "Microsoft Clarity is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
 
   let projectsToReturn = clarityProjects;
@@ -468,7 +468,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
 
   const gaProperties = getGoogleAnalyticsProperties(user);
   if (gaProperties.length === 0) {
-    return { message: "No Google Analytics Property ID configured. Please configure GA4 in your account settings." };
+    return { message: "Google Analytics (GA4) is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
 
   // Filter to a specific property if requested
