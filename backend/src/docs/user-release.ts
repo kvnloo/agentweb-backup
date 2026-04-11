@@ -15,6 +15,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When Emma analyzed chat history and stored the results in S3 for large responses, field names like "sessionId" and "score" could not be found by the search tool — causing Emma to waste many attempts and sometimes report incomplete results',
       '- Root cause: the chat history data was being double-serialized (wrapped in an internal format) before S3 storage, so all JSON field names were escaped and unsearchable',
       '- Fixed: the plain JSON data is now stored directly in S3, making all fields immediately findable in a single search',
+      'Fix: Emma Now Regenerates Content When Asked',
+      '- When you ask Emma to "create the posts again", "regenerate", or "redo" content, she now calls the tool again and produces fresh output instead of repeating her analysis text',
+      '- Affected tools include social media posts, blog articles, and images',
     ],
   },
   {
