@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-11',
     changes: [
+      'Fix: Emma Now Reads Brand Guidelines Automatically Before Drafting Content',
+      '- Emma now reads your brand guidelines and market strategy at the start of any content creation task (posts, articles, emails, founder stories, etc.) without needing to be asked',
+      '- Previously, Emma sometimes drafted content without applying your brand context first, requiring you to manually ask her to re-read the guidelines',
+    ],
+  },
+  {
+    date: '2026-04-11',
+    changes: [
       'Fix: Chat History Search Now Reliably Finds Session IDs and Scores',
       '- When Emma analyzed chat history and stored the results in S3 for large responses, field names like "sessionId" and "score" could not be found by the search tool — causing Emma to waste many attempts and sometimes report incomplete results',
       '- Root cause: the chat history data was being double-serialized (wrapped in an internal format) before S3 storage, so all JSON field names were escaped and unsearchable',
