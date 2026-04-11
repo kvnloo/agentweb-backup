@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-11',
     changes: [
+      'Fix: Landing Page Logo Updates Now Reliably Provide a Preview Link',
+      '- When the assistant updates a logo (or any code) on your landing page, it now waits for the Vercel build to finish before responding — so you always get a working preview link on the first try, with no need to ask again',
+      '- Previously the assistant could return before the build completed, leaving it unable to provide the preview URL',
+    ],
+  },
+  {
+    date: '2026-04-11',
+    changes: [
       'Fix: Emma Now Reads Brand Guidelines Automatically Before Drafting Content',
       '- Emma now reads your brand guidelines and market strategy at the start of any content creation task (posts, articles, emails, founder stories, etc.) without needing to be asked',
       '- Previously, Emma sometimes drafted content without applying your brand context first, requiring you to manually ask her to re-read the guidelines',

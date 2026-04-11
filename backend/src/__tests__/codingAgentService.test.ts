@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
@@ -128,6 +128,8 @@ describe('runCodingAgent', () => {
     mockedMcpFetch.mockReset();
     mockCreate.mockReset();
     _setBedrockClientForTest(mockClient);
+    // Skip real sleep delays in all tests
+    _setSleepFnForTest(async () => {});
   });
 
   afterAll(() => {
@@ -762,6 +764,129 @@ describe('runCodingAgent', () => {
 
     const result = await runCodingAgent('edit with search/replace', mockContext);
     expect(result.success).toBe(true);
+  });
+
+  // --- check_deployment polling tests ---
+
+  const draftContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: 'draft/abc12345',
+  };
+
+  test('check_deployment polls until build ready and returns preview URL', async () => {
+    // LLM: calls check_deployment, then report_to_user with the URL it received
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'check_deployment', input: {} }],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [{
+          type: 'tool_use', id: 'tu_2', name: 'report_to_user',
+          input: { message: 'Done! Preview at https://test.vercel.app', status: 'success', preview_url: 'https://test.vercel.app' }
+        }],
+        stop_reason: 'tool_use'
+      });
+
+    // First poll: building; Second poll: success with URL
+    mockedMcpFetch
+      .mockResolvedValueOnce({ buildStatus: 'building' })
+      .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
+
+    await runCodingAgent('update logo', draftContext);
+
+    // Verify polling happened: mcpFetch called twice for check_deployment
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
+    expect(mockedMcpFetch).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      method: 'GET',
+      path: expect.stringContaining('/preview-url'),
+    }));
+  });
+
+  test('check_deployment stops immediately on success without polling', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'check_deployment', input: {} }],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user',
+          input: { message: 'Done', status: 'success', preview_url: 'https://test.vercel.app' } }],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
+
+    await runCodingAgent('update logo', draftContext);
+
+    // Success state: no retry, mcpFetch called once
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('check_deployment stops immediately on error without retrying', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'check_deployment', input: {} }],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user',
+          input: { message: 'Build failed', status: 'error' } }],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({ buildStatus: 'error', buildError: 'Module not found' });
+
+    await runCodingAgent('update logo', draftContext);
+
+    // Error state: no retry, mcpFetch called once
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('check_deployment stops immediately on not_found without retrying', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'check_deployment', input: {} }],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user',
+          input: { message: 'No deployment found', status: 'error' } }],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({ buildStatus: 'not_found' });
+
+    await runCodingAgent('update logo', draftContext);
+
+    // not_found state: no retry, mcpFetch called once
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('check_deployment times out and returns building status after max retries', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'check_deployment', input: {} }],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user',
+          input: { message: 'Build still in progress', status: 'error' } }],
+        stop_reason: 'tool_use'
+      });
+
+    // Always returns building — simulate a very slow build
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'building' });
+
+    const result = await runCodingAgent('update logo', draftContext);
+
+    // Should have polled MAX_POLL_ATTEMPTS (8) times before giving up
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(8);
+    // LLM should have received a tool result (even if building)
+    expect(result.iterations).toBeGreaterThanOrEqual(1);
   });
 });
 
