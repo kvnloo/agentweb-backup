@@ -36,6 +36,23 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
+
+/**
+ * Extracts the string content from a tool result for LLM consumption and S3 storage.
+ *
+ * Tools registered via mcpToolRegistry use jsonResult() which wraps their output in the MCP
+ * format: { content: [{ type: 'text', text: '<actual JSON>' }] }. If we store the entire
+ * wrapper via JSON.stringify(), the inner JSON becomes double-escaped in S3: field names like
+ * "sessionId" are stored as \"sessionId\", causing search_tool_response to return 0 matches.
+ *
+ * Priority: formattedContent > content[0].text (MCP inner text) > JSON.stringify fallback.
+ */
+export function extractToolContent(result: any): string {
+  if (typeof result === 'string') return result;
+  if (result?.formattedContent) return result.formattedContent;
+  if (result?.content?.[0]?.text) return result.content[0].text;
+  return JSON.stringify(result);
+}
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
@@ -1773,7 +1790,7 @@ export class AgentModeService {
             if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
               toolContent = `Screenshot captured successfully and displayed to the user.`;
             } else {
-              toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+              toolContent = extractToolContent(result);
             }
 
             if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
