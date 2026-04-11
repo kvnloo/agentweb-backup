@@ -143,13 +143,12 @@ describe('AgentModeService - Tool Descriptions', () => {
     it('should explain the skills approach for expanding capabilities', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('skill');
-      expect(systemPrompt).toContain('dynamic skill set');
+      expect(systemPrompt).toContain('modular skill system');
     });
 
     it('should provide guidance on file attachments', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-      expect(systemPrompt).toContain('Handling File Attachments');
-      expect(systemPrompt).toContain('markdown links');
+      expect(systemPrompt).toContain('File Attachments');
     });
 
     it('should include response formatting guidelines', async () => {
@@ -161,14 +160,13 @@ describe('AgentModeService - Tool Descriptions', () => {
 
     it('should emphasize proactive skill discovery', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-      // The new prompt uses the Analyze-Install-Execute protocol instead of just saying "be proactive"
-      expect(systemPrompt).toContain('Analyze-Install-Execute');
+      expect(systemPrompt).toContain('Decision Framework');
     });
 
     it('should mention Emma as the AI assistant name', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('Emma');
-      expect(systemPrompt).toContain('AI-powered marketing assistant');
+      expect(systemPrompt).toContain('AI-marketing CMO persona');
     });
   });
 

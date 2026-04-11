@@ -1655,12 +1655,13 @@ export const agentModeController = {
 
       // Parse pagination parameters
       const lastEvaluatedKey = req.query.lastEvaluatedKey as string;
-      const limit = Math.min(parseInt(req.query.limit as string) || 50, 100); // Max 100 per request
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 1000); // Max 1000 per request (search uses 1000)
       const portalType = (req.query.portalType as string) === 'emma-sidebar' ? 'emma-sidebar' as const : 'agent' as const;
       const pageIdentifier = req.query.pageIdentifier as string | undefined;
+      const search = req.query.search as string | undefined;
 
       // Get sessions with pagination
-      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier);
+      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier, search);
 
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSessions = result.sessions.map(session => ({
@@ -2441,7 +2442,8 @@ export const agentModeController = {
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
           supportNote: supportNote,
-          skills: sharedSkills
+          skills: sharedSkills,
+          slackThread: session.slackThread
         }
       });
     } catch (error) {

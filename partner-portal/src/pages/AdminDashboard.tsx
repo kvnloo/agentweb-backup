@@ -2142,9 +2142,16 @@ export default function AdminDashboard() {
     try {
       setSlackChannelEditLoading(true);
 
+      // If admin typed a channel ID in the input field but didn't click Add, include it automatically
+      const pendingInput = slackChannelInputText.trim();
+      const channelsToSave =
+        pendingInput && !currentSlackChannels.includes(pendingInput)
+          ? [...currentSlackChannels, pendingInput]
+          : currentSlackChannels;
+
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSlackChannelUserId}/slack-channel`),
-        { slackChannels: currentSlackChannels },
+        { slackChannels: channelsToSave },
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
@@ -3586,11 +3593,9 @@ export default function AdminDashboard() {
               <InputLabel>Tier</InputLabel>
               <Select value={userFilterTier} label="Tier" onChange={(e) => setUserFilterTier(e.target.value)}>
                 <MenuItem value="all">All Tiers</MenuItem>
-                <MenuItem value="Managed">Managed</MenuItem>
-                <MenuItem value="Super Premium">Super Premium</MenuItem>
-                <MenuItem value="Advanced">Advanced</MenuItem>
-                <MenuItem value="Basic">Basic</MenuItem>
-                <MenuItem value="Free">Free</MenuItem>
+                {availableSubscriptionTypes.map((t) => (
+                  <MenuItem key={t} value={t}>{t}</MenuItem>
+                ))}
                 <MenuItem value="none">No Tier</MenuItem>
               </Select>
             </FormControl>
@@ -7188,28 +7193,12 @@ const AgentModeSettings = () => {
 
   const loadSystemPrompt = async () => {
     try {
-      try {
-        // Try to get custom system prompt from settings
-        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
-        if (response.data && response.data.settingValue) {
-          setSystemPrompt(response.data.settingValue);
-          return;
-        }
-      } catch (settingsError: any) {
-        // If setting doesn't exist (404) or other error, fall back to default
-        if (settingsError.response?.status !== 404) {
-          console.error('Error loading custom system prompt:', settingsError);
-        }
-      }
-      
-      // Load default system prompt
-      const defaultResponse = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
+      // System prompt is code-controlled (backend/src/docs/agentModeSystemPrompt.ts).
+      // Always load from the code-backed endpoint — AW-Settings is no longer used.
+      const response = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
         headers: { Authorization: `Bearer ${token}` }
       });
-      setSystemPrompt(defaultResponse.data);
+      setSystemPrompt(response.data);
     } catch (error) {
       console.error('Error loading system prompt:', error);
       throw error;
@@ -8404,39 +8393,34 @@ const AgentModeSettings = () => {
             <Typography variant="h6">
               System Prompt
             </Typography>
-            <Box>
-              <Button
-                variant="outlined"
-                onClick={() => resetToDefault('systemPrompt')}
-                disabled={savingSystemPrompt}
-                sx={{ mr: 1 }}
-              >
-                Reset to Default
-              </Button>
-              <Button
-                variant="contained"
-                onClick={saveSystemPrompt}
-                disabled={savingSystemPrompt}
-              >
-                {savingSystemPrompt ? <CircularProgress size={20} /> : 'Save Changes'}
-              </Button>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, bgcolor: 'warning.light', px: 2, py: 0.75, borderRadius: 1 }}>
+              <Typography variant="body2" sx={{ fontWeight: 600, color: 'warning.dark' }}>
+                🔒 Read-only — managed in code
+              </Typography>
             </Box>
           </Box>
-          
+
+          <Box sx={{ bgcolor: 'info.light', borderRadius: 1, p: 2, mb: 2, border: '1px solid', borderColor: 'info.main' }}>
+            <Typography variant="body2" sx={{ fontWeight: 600, color: 'info.dark', mb: 0.5 }}>
+              To update the system prompt, edit the source file and open a PR:
+            </Typography>
+            <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'info.dark' }}>
+              backend/src/docs/agentModeSystemPrompt.ts
+            </Typography>
+          </Box>
+
           <TextField
             fullWidth
             multiline
             rows={15}
             value={systemPrompt}
-            onChange={(e) => setSystemPrompt(e.target.value)}
-            placeholder="Enter the system prompt for Emma..."
+            InputProps={{ readOnly: true }}
             variant="outlined"
-            sx={{ fontFamily: 'monospace' }}
+            sx={{ fontFamily: 'monospace', '& .MuiInputBase-input': { color: 'text.secondary' } }}
           />
-          
+
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            The system prompt defines Emma's behavior, capabilities, and response format. 
-            Use HTML formatting for responses. Changes will be versioned and tracked in chat history.
+            Read-only view of the active system prompt. Editing is disabled — changes must go through a PR to backend/src/docs/agentModeSystemPrompt.ts.
           </Typography>
         </CardContent>
       </Card>

@@ -368,7 +368,7 @@ describe('AgentModeService - search_knowledge_base', () => {
 
     it('should provide guidance on file attachments', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-      expect(systemPrompt).toContain('Handling File Attachments');
+      expect(systemPrompt).toContain('File Attachments');
     });
   });
 });

@@ -9,6 +9,92 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-11',
+    changes: [
+      'Fix: Emma Now Reads Brand Guidelines Automatically Before Drafting Content',
+      '- Emma now reads your brand guidelines and market strategy at the start of any content creation task (posts, articles, emails, founder stories, etc.) without needing to be asked',
+      '- Previously, Emma sometimes drafted content without applying your brand context first, requiring you to manually ask her to re-read the guidelines',
+    ],
+  },
+  {
+    date: '2026-04-11',
+    changes: [
+      'Fix: Chat History Search Now Reliably Finds Session IDs and Scores',
+      '- When Emma analyzed chat history and stored the results in S3 for large responses, field names like "sessionId" and "score" could not be found by the search tool — causing Emma to waste many attempts and sometimes report incomplete results',
+      '- Root cause: the chat history data was being double-serialized (wrapped in an internal format) before S3 storage, so all JSON field names were escaped and unsearchable',
+      '- Fixed: the plain JSON data is now stored directly in S3, making all fields immediately findable in a single search',
+      'Fix: Emma Now Regenerates Content When Asked',
+      '- When you ask Emma to "create the posts again", "regenerate", or "redo" content, she now calls the tool again and produces fresh output instead of repeating her analysis text',
+      '- Affected tools include social media posts, blog articles, and images',
+    ],
+  },
+  {
+    date: '2026-04-11',
+    changes: [
+      'Fix: Auto Engagement No Longer Posts Duplicate Replies to the Same Comment',
+      '- Resolved a race condition where multiple server instances could each schedule a reply to the same comment simultaneously, resulting in two identical replies being posted',
+      '- Now only one reply is ever scheduled per comment, regardless of how many servers are running',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Fixed: Slack "Send Message" Now Gives a Clear Error When Bot Isn\'t in the Channel',
+      '- If the Slack bot hasn\'t been invited to the configured channel, you now see a clear message explaining what to do — "invite the bot using /invite @AgentWeb in Slack" — instead of a confusing raw API error',
+      '- Fixed an issue in the admin panel where typing a channel ID and clicking Save without pressing Enter would silently discard the input, leaving the user with no channels configured',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Chat History Search in Agent Mode',
+      '- A search bar now appears at the top of the Chat History sidebar in Agent Mode',
+      '- Typing filters your chats instantly — matches titles case-insensitively across Active, Archived, and Scheduled sections',
+      '- Searches your full chat history (up to 1,000 sessions), not just the most recently loaded ones',
+      '- Clearing the search restores the full session list',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Jump to Slack from Shared Chat Sessions',
+      '- When viewing a shared Emma chat session that originated from Slack, a "View in Slack" link now appears in the header',
+      '- Clicking it takes you directly to the original Slack thread — no more hunting through channels',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Emma: Better Guidance When Analytics Tools Are Not Configured',
+      '- Emma now provides actionable setup instructions when analytics tools (Google Analytics, Search Console, Microsoft Clarity, Meta Ads) are not yet configured',
+      '- Instead of a generic error, Emma searches the user guide and shares step-by-step setup instructions',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Fix: Get Support Now Shows All Premium Slack Channels',
+      '- The Get Support modal now reliably shows premium Slack channel links for all accounts',
+      '- If multiple Slack channels are configured, each one is shown as a separate link',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Fix: Slack Sessions Now Correctly Track AI Model',
+      '- Sessions created from Slack (both @Emma mentions and auto-triggered messages) now correctly record which AI model was used',
+      '- This fixes a gap where Slack-initiated sessions appeared without a model in the admin session list',
+    ],
+  },
+  {
+    date: '2026-04-10',
+    changes: [
+      'Fixed Session Titles for Images, Reports, and Videos',
+      '- Session titles in Agent Mode chat history now display a concise, descriptive name instead of a fragment of the AI response',
+      '- This fix applies to sessions created from the Images, Reports, and Videos pages, as well as regular Agent Mode chats',
+    ],
+  },
+  {
     date: '2026-04-09',
     changes: [
       'Improved Work Plan Title Display',

@@ -99,7 +99,7 @@ describe('SocialEngagementScanner', () => {
     (LinkedInAdapter as jest.Mock).mockImplementation(() => mockAdapter);
 
     mockScheduleDb.createSchedule.mockResolvedValue(undefined as any);
-    mockTrackingDb.recordEngagement.mockResolvedValue(undefined as any);
+    mockTrackingDb.recordEngagement.mockResolvedValue(true);
     mockTrackingDb.hasEngaged.mockResolvedValue(false);
     mockTrackingDb.getCommentEngagementCountsForPost.mockResolvedValue({
       likedCount: 0,
@@ -646,6 +646,91 @@ describe('SocialEngagementScanner', () => {
     });
   });
 
+  // ─── Concurrent duplicate prevention ─────────────────────────────────────
+
+  describe('concurrent duplicate prevention', () => {
+    it('should not create schedule when recordEngagement returns false (another instance claimed it first)', async () => {
+      // Simulate another EB instance already writing the tracking record
+      mockTrackingDb.recordEngagement.mockResolvedValue(false);
+
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 1,
+        },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      // recordEngagement was called but returned false — schedule must NOT be created
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should not create schedule for comment reply when recordEngagement returns false', async () => {
+      mockTrackingDb.recordEngagement.mockResolvedValue(false);
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        {
+          userId: 'user-1',
+          connected_accounts: [
+            makeAccount({
+              account_id: 'acc-owner',
+              engagementSettings: {
+                ...makeAccount().engagementSettings,
+                enableCommentDiscovery: true,
+                commentPreferredActions: ['reply'],
+                maxCommentRepliesPerPost: 1,
+                maxCommentLikesPerPost: 0,
+                commentEngagementWindowMinutes: 1,
+              },
+            }),
+          ],
+        },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should still create schedule when recordEngagement returns true', async () => {
+      mockTrackingDb.recordEngagement.mockResolvedValue(true);
+
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 1,
+        },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ─── Self-comment filtering ───────────────────────────────────────────────
 
   describe('self-comment filtering in auto-reply', () => {
@@ -726,7 +811,7 @@ describe('SocialEngagementScanner', () => {
 
       // Track call order between recordEngagement and createSchedule
       const callOrder: string[] = [];
-      mockTrackingDb.recordEngagement.mockImplementation(async () => { callOrder.push('record'); return undefined as any; });
+      mockTrackingDb.recordEngagement.mockImplementation(async () => { callOrder.push('record'); return true; });
       mockScheduleDb.createSchedule.mockImplementation(async () => { callOrder.push('schedule'); return undefined as any; });
 
       await scanner.runScanner();

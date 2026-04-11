@@ -148,8 +148,10 @@ export class SocialEngagementScanner {
         const executionTime = new Date(Date.now() + delayMs).toISOString();
         const scheduleId = uuidv4();
 
-        // Record first — dedup guard is in place before the schedule is created
-        await socialEngagementTrackingDb.recordEngagement({
+        // Atomically claim the scheduling slot. Uses a conditional DynamoDB write so
+        // concurrent scanner instances on multiple EB hosts cannot both schedule the
+        // same action — only the first writer succeeds; the rest return false and skip.
+        const claimed = await socialEngagementTrackingDb.recordEngagement({
             userId: params.userId,
             postId: params.postId,
             commentId: params.commentId,
@@ -160,6 +162,11 @@ export class SocialEngagementScanner {
             scheduleId,
             status: 'queued',
         });
+
+        if (!claimed) {
+            console.log(`[Scanner] Dedup: "${params.actionType}" for ${params.commentId || params.postId} already claimed by another instance, skipping.`);
+            return;
+        }
 
         try {
             await scheduleDb.createSchedule({

@@ -171,7 +171,19 @@ emmaToolRegistry.register({
       oldest = (Date.now() / 1000 - args.since_hours * 3600).toFixed(6);
     }
 
-    const messages = await getRecentChannelMessages(resolved.id, oldest, args.latest);
+    let messages;
+    try {
+      messages = await getRecentChannelMessages(resolved.id, oldest, args.latest);
+    } catch (err: any) {
+      const slackCode = err?.data?.error || err?.message || String(err);
+      if (slackCode === 'channel_not_found' || slackCode === 'not_in_channel') {
+        return {
+          success: false,
+          error: `The Slack bot is not a member of channel ${resolved.id}. Please invite the bot to the channel first (e.g. run "/invite @AgentWeb" in Slack), then try again.`,
+        };
+      }
+      return { success: false, error: `Failed to fetch Slack messages: ${slackCode}` };
+    }
 
     if (messages.length === 0) {
       return { success: true, channel_id: resolved.id, messages: [], summary: 'No messages found.' };
@@ -303,14 +315,24 @@ emmaToolRegistry.register({
     const resolved = await resolveChannelForUser(args, context);
     if ('error' in resolved) return { success: false, error: resolved.error };
 
-    const result = await postSlackMessage(resolved.id, args.text.trim(), args.thread_ts);
-
-    return {
-      success: true,
-      channel_id: result.channel,
-      ts: result.ts,
-      ...(args.thread_ts ? { thread_ts: args.thread_ts } : {}),
-      message: 'Message sent successfully.',
-    };
+    try {
+      const result = await postSlackMessage(resolved.id, args.text.trim(), args.thread_ts);
+      return {
+        success: true,
+        channel_id: result.channel,
+        ts: result.ts,
+        ...(args.thread_ts ? { thread_ts: args.thread_ts } : {}),
+        message: 'Message sent successfully.',
+      };
+    } catch (err: any) {
+      const slackCode = err?.data?.error || err?.message || String(err);
+      if (slackCode === 'channel_not_found' || slackCode === 'not_in_channel') {
+        return {
+          success: false,
+          error: `The Slack bot is not a member of channel ${resolved.id}. Please invite the bot to the channel first (e.g. run "/invite @AgentWeb" in Slack), then try again.`,
+        };
+      }
+      return { success: false, error: `Failed to send Slack message: ${slackCode}` };
+    }
   },
 });

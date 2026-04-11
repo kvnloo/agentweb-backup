@@ -1550,10 +1550,11 @@ export class ChatbotDB {
     limit?: number,
     sortDescending: boolean = true,
     lastEvaluatedKey?: string,
-    pageIdentifier?: string
+    pageIdentifier?: string,
+    searchTerm?: string
   ): Promise<{ sessions: ChatSession[], lastEvaluatedKey?: any }> {
     console.log(
-      `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
+      `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}${searchTerm ? `, search: "${searchTerm}"` : ''}`
     );
 
     const params: any = {
@@ -1574,6 +1575,11 @@ export class ChatbotDB {
     if (pageIdentifier) {
       filterParts.push('pageIdentifier = :pageIdentifier');
       params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
+    }
+    if (searchTerm) {
+      filterParts.push('contains(#title, :searchTerm)');
+      params.ExpressionAttributeNames = { '#title': 'title' };
+      params.ExpressionAttributeValues[':searchTerm'] = searchTerm;
     }
     if (filterParts.length > 0) {
       params.FilterExpression = filterParts.join(' AND ');
