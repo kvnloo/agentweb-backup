@@ -645,14 +645,40 @@ async function executeTool(
 
     case 'check_deployment': {
       if (branch !== "main") {
-        // For draft branches, check the preview deployment
-        const data = await mcpFetch({
-          method: 'GET',
-          path: `${basePath}/preview-url`,
-          queryParams: { branch },
-          context: { userId: context.userId }
-        });
-        return JSON.stringify(data, null, 2);
+        // For draft branches, poll for preview deployment URL.
+        // Vercel builds triggered by PR creation take 30-120 seconds to complete,
+        // so we retry until the build finishes rather than returning "building" to the LLM.
+        const MAX_POLL_ATTEMPTS = 8;
+        const POLL_INTERVAL_MS = 15000;
+        let lastData: any = {};
+        for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
+          lastData = await mcpFetch({
+            method: 'GET',
+            path: `${basePath}/preview-url`,
+            queryParams: { branch },
+            context: { userId: context.userId }
+          });
+          // Return immediately on terminal states
+          if (
+            lastData.buildStatus === 'success' ||
+            lastData.buildStatus === 'error' ||
+            lastData.buildStatus === 'canceled' ||
+            lastData.buildStatus === 'not_found'
+          ) {
+            return JSON.stringify(lastData, null, 2);
+          }
+          // Still building — wait and retry (unless this is the last attempt)
+          if (attempt < MAX_POLL_ATTEMPTS) {
+            console.log(`[CODING AGENT] check_deployment: branch="${branch}" status="${lastData.buildStatus}" (attempt ${attempt}/${MAX_POLL_ATTEMPTS}), retrying in ${POLL_INTERVAL_MS / 1000}s...`);
+            await _sleepFn(POLL_INTERVAL_MS);
+          }
+        }
+        // Timed out — return with a note so the LLM can inform the user
+        return JSON.stringify({
+          ...lastData,
+          buildStatus: 'building',
+          note: 'Vercel build is still in progress. The preview URL will be available in 1-2 minutes.'
+        }, null, 2);
       }
       const data = await mcpFetch({
         method: 'GET',
@@ -764,6 +790,12 @@ function getBedrockClient(): AnthropicBedrock {
 // Exported for testing (allows mock injection)
 export function _setBedrockClientForTest(client: AnthropicBedrock | null): void {
   bedrockClient = client;
+}
+
+// Sleep helper — injectable for tests to skip real delays
+let _sleepFn: (ms: number) => Promise<void> = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+export function _setSleepFnForTest(fn: (ms: number) => Promise<void>): void {
+  _sleepFn = fn;
 }
 
 /**
