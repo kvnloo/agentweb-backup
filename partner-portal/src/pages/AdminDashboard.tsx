@@ -3588,11 +3588,9 @@ export default function AdminDashboard() {
               <InputLabel>Tier</InputLabel>
               <Select value={userFilterTier} label="Tier" onChange={(e) => setUserFilterTier(e.target.value)}>
                 <MenuItem value="all">All Tiers</MenuItem>
-                <MenuItem value="Managed">Managed</MenuItem>
-                <MenuItem value="Super Premium">Super Premium</MenuItem>
-                <MenuItem value="Advanced">Advanced</MenuItem>
-                <MenuItem value="Basic">Basic</MenuItem>
-                <MenuItem value="Free">Free</MenuItem>
+                {availableSubscriptionTypes.map((t) => (
+                  <MenuItem key={t} value={t}>{t}</MenuItem>
+                ))}
                 <MenuItem value="none">No Tier</MenuItem>
               </Select>
             </FormControl>
