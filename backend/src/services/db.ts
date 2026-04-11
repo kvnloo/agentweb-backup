@@ -5054,7 +5054,7 @@ export const socialEngagementTrackingDb = {
     executedAt?: string;
     generatedText?: string;    // generated comment or reply text
     reactionType?: string;     // LLM-selected reaction type
-  }) {
+  }): Promise<boolean> {
     try {
       const dedupId = tracker.commentId || tracker.postId;
       // Legacy compound types keep the old key format (no action suffix) for backward compat.
@@ -5090,11 +5090,14 @@ export const socialEngagementTrackingDb = {
           ExpressionAttributeValues: exprValues,
         }).promise();
       } else if (tracker.status === 'queued') {
-        // Use UPDATE (not PUT) so failCount is preserved across retries.
-        // A PUT would wipe failCount, resetting it to 0 on every scanner re-queue
-        // and making the 3-retry cap impossible to reach.
-        // executedAt is set now so the item appears in GSIs (DynamoDB excludes items
-        // with missing GSI sort keys, which would break the per-post cap count).
+        // Use conditional UPDATE so failCount is preserved across retries (a plain PUT
+        // would reset failCount to 0, breaking the 3-retry cap), and so concurrent
+        // scanner instances on multiple EB hosts cannot both claim the same slot.
+        //
+        // Condition: only write if the item doesn't exist yet (first scheduling) OR if
+        // it's a retryable failed item (status=failed AND failCount < maxRetries).
+        // If another instance already wrote a queued/completed record, return false so
+        // the caller skips schedule creation — preventing duplicate replies.
         const executedAt = tracker.executedAt ?? new Date().toISOString();
         const setFields = [
           '#status = :status', '#platform = :platform',
@@ -5109,16 +5112,28 @@ export const socialEngagementTrackingDb = {
           ':scheduleId': tracker.scheduleId,
           ':createdAt': new Date().toISOString(),
           ':executedAt': executedAt,
+          ':failed': 'failed',
+          ':maxRetries': SOCIAL_ENGAGEMENT_MAX_RETRIES,
         };
         if (tracker.commentId)    { setFields.push('commentId = :commentId');       exprValues[':commentId']    = tracker.commentId; }
         if (tracker.postId)       { setFields.push('postId = :postId');             exprValues[':postId']       = tracker.postId; }
-        await dynamodb.update({
-          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
-          Key: { userId: tracker.userId, postId_engagingAccountId: key },
-          UpdateExpression: `SET ${setFields.join(', ')}`,
-          ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
-          ExpressionAttributeValues: exprValues,
-        }).promise();
+        try {
+          await dynamodb.update({
+            TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+            Key: { userId: tracker.userId, postId_engagingAccountId: key },
+            UpdateExpression: `SET ${setFields.join(', ')}`,
+            ConditionExpression: 'attribute_not_exists(postId_engagingAccountId) OR (#status = :failed AND failCount < :maxRetries)',
+            ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
+            ExpressionAttributeValues: exprValues,
+          }).promise();
+        } catch (condErr: any) {
+          if (condErr.code === 'ConditionalCheckFailedException') {
+            // Item already exists as queued/completed (or max retries reached) —
+            // another instance claimed it first. Caller should skip schedule creation.
+            return false;
+          }
+          throw condErr;
+        }
       } else {
         // completed — plain PUT resets failCount intentionally on success
         await dynamodb.put({
@@ -5127,7 +5142,7 @@ export const socialEngagementTrackingDb = {
         }).promise();
       }
 
-      return tracker;
+      return true;
     } catch (error) {
       handleDynamoDbError(error, "recordEngagement");
       throw error;
