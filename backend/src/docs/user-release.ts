@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-12',
+    changes: [
+      'Fix: Account Summary Now Shows Accurate Social Post Count',
+      '- The "Assets Created" section of your daily/weekly account summary now correctly counts only social media posts (created via the social post tool or published to a connected account)',
+      '- Previously, LinkedIn outreach actions (searching people, viewing profiles, sending connection requests) were incorrectly counted as social posts, inflating the number significantly',
+      '- Blog articles published via Emma are now tracked separately as "Blogs" in the Assets Created section',
+      '- Social post counts now reflect the actual number of posts created, not the number of times the tool was called',
+    ],
+  },
+  {
     date: '2026-04-11',
     changes: [
       'Fix: Landing Page Logo Updates Now Reliably Provide a Preview Link',
