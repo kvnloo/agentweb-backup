@@ -21,6 +21,7 @@ import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { transcribeSpeech } from '../services/voiceService';
 import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
@@ -1812,7 +1813,18 @@ export const agentModeController = {
   async generateResponse(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, userMessage, llmModel, attachments, currentUrl, structuredContext, screenshot } = req.body;
+      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
+      let { userMessage } = req.body;
+
+      // If the request contains audio, transcribe it to text first
+      if (audioInput?.data && !userMessage) {
+        try {
+          userMessage = await transcribeSpeech(audioInput.data);
+        } catch (err) {
+          console.error('Voice: STT transcription failed:', err);
+          return res.status(422).json({ error: 'Failed to transcribe audio. Please try again or type your message.' });
+        }
+      }
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });

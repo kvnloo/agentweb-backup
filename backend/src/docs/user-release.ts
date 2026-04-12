@@ -11,6 +11,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-12',
     changes: [
+      'Voice Chat with Emma',
+      '- You can now talk to Emma using your microphone — click the mic icon in the Emma sidebar to enable voice mode',
+      '- Emma\'s responses are read aloud using Google Cloud Text-to-Speech (Chirp 3 HD), a high-quality conversational voice',
+      '- Your speech is transcribed via Google Cloud Speech-to-Text and sent to Emma as a message',
+      '- Voice mode requires a secure connection (HTTPS or localhost) for microphone access',
+      '- Click the mic button once to start recording, click again to stop and send; a red pulsing indicator shows when recording is active',
+      '- Click the mic-off icon at any time to return to text input mode',
+    ],
+  },
+  {
+    date: '2026-04-12',
+    changes: [
       'Fix: Account Summary Now Shows Accurate Social Post Count',
       '- The "Assets Created" section of your daily/weekly account summary now correctly counts only social media posts (created via the social post tool or published to a connected account)',
       '- Previously, LinkedIn outreach actions (searching people, viewing profiles, sending connection requests) were incorrectly counted as social posts, inflating the number significantly',
