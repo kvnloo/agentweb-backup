@@ -15,13 +15,15 @@ const TIME_RANGE_DAYS: Record<string, number> = {
 const SOCIAL_MEDIA_TOOLS = new Set([
   'create_social_media_posts',
   'post_on_connected_account',
-  'linkedin_outreach',
-  'publish_blog_article',
 ]);
 
 const REPORT_TOOLS = new Set([
   'create_blog_article',
   'perform_deep_research',
+]);
+
+const BLOG_TOOLS = new Set([
+  'publish_blog_article',
 ]);
 
 const PUBLISH_TOOLS = new Set([
@@ -48,6 +50,7 @@ export interface AccountSummary {
     videos: number;
     reports: number;
     social_posts: number;
+    blogs: number;
   };
   results: {
     published: {
@@ -94,6 +97,7 @@ export async function getAccountSummary(
   let videos = 0;
   let reports = 0;
   let socialPosts = 0;
+  let blogs = 0;
   let publishedCount = 0;
 
   for (const session of sessions) {
@@ -111,6 +115,9 @@ export async function getAccountSummary(
         }
         if (REPORT_TOOLS.has(toolName)) {
           reports += c;
+        }
+        if (BLOG_TOOLS.has(toolName)) {
+          blogs += c;
         }
         if (PUBLISH_TOOLS.has(toolName)) {
           publishedCount += c;
@@ -139,6 +146,7 @@ export async function getAccountSummary(
       videos,
       reports,
       social_posts: socialPosts,
+      blogs,
     },
     results: {
       published: {
