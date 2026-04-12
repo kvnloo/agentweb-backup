@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-12',
     changes: [
+      'Fix: Voice Mode Now Prompts for Microphone Permission Immediately',
+      '- When you enable voice mode in Emma, your browser now asks for microphone permission right away instead of waiting until you click the mic button',
+      '- If permission was previously denied, the error message now tells you to allow it in your browser settings',
+    ],
+  },
+  {
+    date: '2026-04-12',
+    changes: [
       'Voice Chat with Emma',
       '- You can now talk to Emma using your microphone — click the mic icon in the Emma sidebar to enable voice mode',
       '- Emma\'s responses are read aloud using Google Cloud Text-to-Speech (Chirp 3 HD), a high-quality conversational voice',
