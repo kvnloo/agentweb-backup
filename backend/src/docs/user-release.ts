@@ -23,6 +23,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-12',
     changes: [
+      'Fixed: Mobile Chat Input Clears After Sending and Status Stays Fresh',
+      '- On iOS, the message you typed is now immediately cleared from the chat input after you tap Send — no more leftover text sitting in the box',
+      '- When you lock your phone mid-conversation and come back, the chat now instantly reconnects and shows the latest response rather than displaying a stale "processing" status',
+    ],
+  },
+  {
+    date: '2026-04-12',
+    changes: [
       'Fix: Account Summary Now Shows Accurate Social Post Count',
       '- The "Assets Created" section of your daily/weekly account summary now correctly counts only social media posts (created via the social post tool or published to a connected account)',
       '- Previously, LinkedIn outreach actions (searching people, viewing profiles, sending connection requests) were incorrectly counted as social posts, inflating the number significantly',
