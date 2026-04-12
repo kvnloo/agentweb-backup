@@ -211,6 +211,51 @@ describe('getAccountSummary', () => {
     expect(result.results.published.count).toBe(2); // post_on_connected_account: 2
   });
 
+  test('does not count linkedin_outreach or publish_blog_article as social posts', async () => {
+    mockGetSessions.mockResolvedValue([
+      makeSession({
+        createdAt: daysAgo(2),
+        calledFunctions: {
+          'create_social_media_posts': 2,
+          'linkedin_outreach': 20, // outreach calls - NOT social posts
+          'publish_blog_article': 1, // blog article - NOT a social post
+        },
+      }),
+    ]);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    // Only create_social_media_posts should count
+    expect(result.assets.social_posts).toBe(2);
+    // publish_blog_article should count as a blog
+    expect(result.assets.blogs).toBe(1);
+    // publish_blog_article should still count toward published
+    expect(result.results.published.count).toBe(1);
+  });
+
+  test('counts publish_blog_article as blogs', async () => {
+    mockGetSessions.mockResolvedValue([
+      makeSession({
+        createdAt: daysAgo(2),
+        calledFunctions: {
+          'publish_blog_article': 3,
+          'create_social_media_posts': 5,
+        },
+      }),
+      makeSession({
+        createdAt: daysAgo(4),
+        calledFunctions: {
+          'publish_blog_article': 2,
+        },
+      }),
+    ]);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.assets.blogs).toBe(5); // 3 + 2
+    expect(result.assets.social_posts).toBe(5);
+  });
+
   test('counts blog articles and deep research as reports via calledFunctions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({

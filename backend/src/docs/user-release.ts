@@ -9,6 +9,44 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-12',
+    changes: [
+      'Voice Chat with Emma',
+      '- You can now talk to Emma using your microphone — click the mic icon in the Emma sidebar to enable voice mode',
+      '- Emma\'s responses are read aloud using Google Cloud Text-to-Speech (Chirp 3 HD), a high-quality conversational voice',
+      '- Your speech is transcribed via Google Cloud Speech-to-Text and sent to Emma as a message',
+      '- Voice mode requires a secure connection (HTTPS or localhost) for microphone access',
+      '- Click the mic button once to start recording, click again to stop and send; a red pulsing indicator shows when recording is active',
+      '- Click the mic-off icon at any time to return to text input mode',
+    ],
+  },
+  {
+    date: '2026-04-12',
+    changes: [
+      'Fixed: Mobile Chat Input Clears After Sending and Status Stays Fresh',
+      '- On iOS, the message you typed is now immediately cleared from the chat input after you tap Send — no more leftover text sitting in the box',
+      '- When you lock your phone mid-conversation and come back, the chat now instantly reconnects and shows the latest response rather than displaying a stale "processing" status',
+    ],
+  },
+  {
+    date: '2026-04-12',
+    changes: [
+      'Fix: Account Summary Now Shows Accurate Social Post Count',
+      '- The "Assets Created" section of your daily/weekly account summary now correctly counts only social media posts (created via the social post tool or published to a connected account)',
+      '- Previously, LinkedIn outreach actions (searching people, viewing profiles, sending connection requests) were incorrectly counted as social posts, inflating the number significantly',
+      '- Blog articles published via Emma are now tracked separately as "Blogs" in the Assets Created section',
+      '- Social post counts now reflect the actual number of posts created, not the number of times the tool was called',
+    ],
+  },
+  {
+    date: '2026-04-11',
+    changes: [
+      'Fix: Landing Page Logo Updates Now Reliably Provide a Preview Link',
+      '- When the assistant updates a logo (or any code) on your landing page, it now waits for the Vercel build to finish before responding — so you always get a working preview link on the first try, with no need to ask again',
+      '- Previously the assistant could return before the build completed, leaving it unable to provide the preview URL',
+    ],
+  },
+  {
     date: '2026-04-11',
     changes: [
       'Fix: Emma Now Reads Brand Guidelines Automatically Before Drafting Content',
