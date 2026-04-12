@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
+import { synthesizeSpeech } from '../services/voiceService';
 import multer from 'multer';
 import { MAX_FILE_SIZE } from '../config';
 
@@ -164,6 +165,19 @@ router.get('/session/:sessionId/progress', authenticateToken, asyncHandlerAuth(a
 // POST /api/agent-mode/session/:sessionId/stop
 // Stop generation for a session
 router.post('/session/:sessionId/stop', asyncHandlerAuth(agentModeController.stopGeneration));
+
+// POST /api/agent-mode/tts
+// Convert Emma response text to speech (Google Cloud TTS, Chirp 3 HD)
+router.post('/tts', authenticateToken, asyncHandler(async (req: Request, res: Response) => {
+  const { text } = req.body;
+  if (!text || typeof text !== 'string' || text.trim().length === 0) {
+    return res.status(400).json({ error: 'text is required' });
+  }
+  const audioBuffer = await synthesizeSpeech(text.trim());
+  res.set('Content-Type', 'audio/mpeg');
+  res.set('Content-Length', String(audioBuffer.length));
+  res.send(audioBuffer);
+}));
 
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation
