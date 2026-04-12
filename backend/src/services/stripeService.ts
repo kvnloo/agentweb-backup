@@ -205,19 +205,24 @@ export async function syncSubscriptionFromStripe(
       return null;
     }
 
-    // 2. Fetch the subscription from Stripe
+    // 2. Fetch subscriptions from Stripe and pick the most relevant one
+    //    (active > trialing > past_due > canceled), matching reconcileAllStripeUsers logic.
     const stripe = getStripeOrThrow();
     const subscriptions = await stripe.subscriptions.list({
       customer: stripeCustomerId,
       status: 'all',
-      limit: 1,
+      limit: 10,
     });
 
     if (subscriptions.data.length === 0) {
       return null;
     }
 
-    const sub = subscriptions.data[0];
+    const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2, canceled: 3 };
+    const sorted = [...subscriptions.data].sort(
+      (a, b) => (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
+    );
+    const sub = sorted[0];
 
     // 3. Check if customer has a payment method on file
     let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);

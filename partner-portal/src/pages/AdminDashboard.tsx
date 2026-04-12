@@ -243,6 +243,11 @@ interface User {
   }>;
   tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
+  utmSource?: string;
+  utmMedium?: string;
+  utmCampaign?: string;
+  utmContent?: string;
+  utmTerm?: string;
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -3945,6 +3950,14 @@ export default function AdminDashboard() {
                                     <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
                                     <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">UTM Attribution</Typography>
+                                  <Typography variant="body2">
+                                    {user.utmSource || user.utmCampaign
+                                      ? [user.utmSource && `src: ${user.utmSource}`, user.utmMedium && `med: ${user.utmMedium}`, user.utmCampaign && `camp: ${user.utmCampaign}`, user.utmContent && `ctn: ${user.utmContent}`].filter(Boolean).join(" · ")
+                                      : "—"}
+                                  </Typography>
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Secrets</Typography>

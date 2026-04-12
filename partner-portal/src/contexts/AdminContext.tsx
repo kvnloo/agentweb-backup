@@ -66,6 +66,11 @@ interface User {
   tokenAllowanceBonus?: number;
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
+  utmSource?: string;
+  utmMedium?: string;
+  utmCampaign?: string;
+  utmContent?: string;
+  utmTerm?: string;
 }
 
 interface AdminContextType {
