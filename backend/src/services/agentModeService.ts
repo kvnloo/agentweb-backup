@@ -1781,8 +1781,12 @@ export class AgentModeService {
               duration
             });
 
+            // For create_social_media_posts, count actual posts in the array (not function calls)
+            const counterIncrement = toolCall.function.name === 'create_social_media_posts'
+              ? ((functionArgs.posts as any[])?.length ?? 1)
+              : 1;
             pendingCounterUpdates[toolCall.function.name] =
-              (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
+              (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
             // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
             // The screenshot is displayed to the user via the tool call card in the frontend.
