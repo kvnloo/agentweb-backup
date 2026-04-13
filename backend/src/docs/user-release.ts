@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-13',
+    changes: [
+      'New: Email Session Results Without a Connected Email Account',
+      '- Emma can now email a session summary to any list of addresses directly, using the AgentWeb platform — no email integration required',
+      '- Simply ask Emma to "email these results to..." and she will send a formatted HTML report with your content and a link to the full session',
+      '- Previously, Emma would get stuck in a loop if asked to send email when no email integration was connected',
+    ],
+  },
+  {
     date: '2026-04-12',
     changes: [
       'Fix: Voice Mode Now Prompts for Microphone Permission Immediately',

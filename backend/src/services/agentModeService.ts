@@ -478,6 +478,54 @@ export class AgentModeService {
     });
 
     this.toolRegistry.register({
+      name: 'notify_session',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'notify_session',
+          description: 'Send an email notification with a summary of this session to a list of email addresses. Use this whenever the user asks you to email results, share a report, or notify someone about what was discussed or generated. The email includes your message formatted as HTML and a link to the full session.',
+          parameters: {
+            type: 'object',
+            properties: {
+              to: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'List of email addresses to notify'
+              },
+              message: {
+                type: 'string',
+                description: 'The content to include in the email body (markdown supported). This should be the report, summary, or results you want to share.'
+              },
+              subject: {
+                type: 'string',
+                description: 'Optional subject suffix (e.g. the report title or topic). If omitted a default subject is used.'
+              }
+            },
+            required: ['to', 'message']
+          }
+        }
+      },
+      execute: async (args: any, context: any) => {
+        const { emailService } = await import('./emailService');
+        const toList: string[] = Array.isArray(args.to) ? args.to : [args.to];
+        if (toList.length === 0) {
+          throw new Error('At least one email address is required in the "to" field.');
+        }
+        await emailService.sendSessionNotificationEmail(
+          toList,
+          context.sessionId,
+          args.message,
+          args.subject
+        );
+        return {
+          success: true,
+          sent_to: toList,
+          message: `Session notification email sent to: ${toList.join(', ')}`
+        };
+      }
+    });
+
+    this.toolRegistry.register({
       name: 'wait_seconds',
       definition: {
         type: 'function',
@@ -2400,6 +2448,9 @@ export class AgentModeService {
 
     // Timing
     'wait_seconds',
+
+    // Session Notifications (no email integration required)
+    'notify_session',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
