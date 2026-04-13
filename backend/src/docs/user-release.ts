@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-13',
     changes: [
+      'New: Engagement Personality for Auto-Engagement',
+      '- You can now set a personality for auto-generated comments and replies on the Social Posts → Engagement Settings page',
+      '- Choose from 16 preset tones: Funny, Witty, Playful, Warm, Empathetic, Inspiring, Visionary, Expert, Bold, Storytelling, Curious, Enthusiastic, Professional, Conversational, Thoughtful, and Concise',
+      '- Multiple presets can be combined (e.g. Visionary + Witty)',
+      '- A free-text "Custom style" field lets you describe any tone not covered by the presets',
+      '- Personality is saved per connected account alongside your other engagement settings',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
       'Improved: Emma Now Recognizes AgentWeb Team Members in Slack Sessions',
       '- Emma now knows all four AgentWeb team members by name and nickname: Rui Wang (CTO), Harsha Vankayalapati (CEO), Fangfang Tan (CPO), Matthew Wilmer / Matt (CMO)',
       '- When helping in a Slack thread, Emma understands she is part of the team drafting replies to external contacts — not responding to team members as if they were asking her questions directly',
