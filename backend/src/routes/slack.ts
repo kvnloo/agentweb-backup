@@ -25,6 +25,23 @@ import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 
 const router = express.Router();
 
+// Cached Emma bot user ID (fetched lazily via auth.test on first use)
+let emmaBotUserId: string | null = null;
+
+async function getEmmaBotUserId(): Promise<string | null> {
+  if (emmaBotUserId) return emmaBotUserId;
+  try {
+    const { WebClient } = await import('@slack/web-api');
+    const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+    const authResult = await slackClient.auth.test();
+    emmaBotUserId = (authResult.user_id as string) ?? null;
+    console.log('🤖 Emma bot user ID cached:', emmaBotUserId);
+  } catch (err) {
+    console.warn('⚠️ Could not fetch Emma bot user ID:', err);
+  }
+  return emmaBotUserId;
+}
+
 function userMatchesChannel(u: any, channel: string): boolean {
   return (u.slackChannels && u.slackChannels.includes(channel)) || u.slackChannel === channel;
 }
@@ -622,12 +639,21 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle top-level message events in user-connected Slack channels (slack triggered session)
       // Filter: plain message, NOT a thread reply, NOT a bot message, NOT a message_changed/deleted event
+      // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
+      // directly, so generating a "suggest" email would be redundant. Other @mentions (e.g.
+      // @john) should still go through the suggest flow.
       if (event.type === 'message' && !event.thread_ts && !event.bot_id && !event.subtype) {
         const { text, user: slackUserId, channel, ts } = event;
         if (text) {
-          console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
-          // Fire-and-forget: triage + session + email
-          handleSlackTriggeredSession({ text, slackUserId, channel, ts });
+          const botId = await getEmmaBotUserId();
+          const mentionsEmma = !!(botId && text.includes(`<@${botId}>`));
+          if (mentionsEmma) {
+            console.log('📨 Skipping slack suggest for Emma @mention (already handled by app_mention handler):', { channel, user: slackUserId });
+          } else {
+            console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
+            // Fire-and-forget: triage + session + email
+            handleSlackTriggeredSession({ text, slackUserId, channel, ts });
+          }
         }
       }
 
