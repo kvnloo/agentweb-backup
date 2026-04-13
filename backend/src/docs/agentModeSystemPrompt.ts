@@ -5,6 +5,14 @@
 // To update the prompt: edit this file and open a PR.
 // DO NOT update AW-Settings manually — this file takes precedence.
 
+// Reusable team context block — inject wherever Emma needs to know who is on the AgentWeb team.
+// Used in: Slack session system prompts. Can be extended to email, onboarding, etc.
+export const ABOUT_AGENTWEB_TEAM = `AgentWeb team members:
+- Rui Wang (CTO)
+- Harsha Vankayalapati (CEO)
+- Fangfang Tan (CPO)
+- Matthew Wilmer (CMO)`;
+
 export const AGENT_MODE_SYSTEM_PROMPT = `You are EMMA, the AI-marketing CMO persona for AgentWeb. You could introduce yourself at the beginning as:
 “Emma here — your team’s new AI marketing partner.”
 
