@@ -4740,6 +4740,10 @@ router.get("/skills/:skillId/assignments", async (req, res) => {
   }
 });
 
+// Shared validation constants for skill assignment routes
+const VALID_ASSIGNMENT_STATUSES = ['active', 'paused', 'completed', 'error'];
+const VALID_SCHEDULE_FREQUENCIES = ['daily', 'weekly', 'monthly', 'custom'];
+
 // POST /api/admin/skills/:skillId/assignments — create a new assignment
 router.post("/skills/:skillId/assignments", async (req, res) => {
   try {
@@ -4750,10 +4754,29 @@ router.post("/skills/:skillId/assignments", async (req, res) => {
       return res.status(400).json({ message: "userId is required" });
     }
 
+    const effectiveStatus = status || 'active';
+    if (!VALID_ASSIGNMENT_STATUSES.includes(effectiveStatus)) {
+      return res.status(400).json({ message: `Invalid status: ${effectiveStatus}. Must be one of: ${VALID_ASSIGNMENT_STATUSES.join(', ')}` });
+    }
+
+    if (schedule && schedule.frequency && !VALID_SCHEDULE_FREQUENCIES.includes(schedule.frequency)) {
+      return res.status(400).json({ message: `Invalid schedule frequency: ${schedule.frequency}. Must be one of: ${VALID_SCHEDULE_FREQUENCIES.join(', ')}` });
+    }
+
+    if (nextRunTime && isNaN(Date.parse(nextRunTime))) {
+      return res.status(400).json({ message: "Invalid nextRunTime: must be a valid ISO date string" });
+    }
+
+    // Check for duplicate assignment (same user + same skill)
+    const existing = await skillAssignmentDb.getAssignmentsBySkill(req.params.skillId);
+    if (existing.some((a: any) => a.userId === userId)) {
+      return res.status(409).json({ message: "User is already assigned to this skill" });
+    }
+
     const assignment = await skillAssignmentDb.createAssignment({
       skillId: req.params.skillId,
       userId,
-      status: status || 'active',
+      status: effectiveStatus,
       schedule,
       nextRunTime,
       config,
@@ -4773,6 +4796,18 @@ router.put("/skill-assignments/:assignmentId", async (req, res) => {
   try {
     const { skillAssignmentDb } = await import('../services/skillAssignmentDb');
     const { status, schedule, nextRunTime, config } = req.body;
+
+    if (status !== undefined && !VALID_ASSIGNMENT_STATUSES.includes(status)) {
+      return res.status(400).json({ message: `Invalid status: ${status}. Must be one of: ${VALID_ASSIGNMENT_STATUSES.join(', ')}` });
+    }
+
+    if (schedule && schedule.frequency && !VALID_SCHEDULE_FREQUENCIES.includes(schedule.frequency)) {
+      return res.status(400).json({ message: `Invalid schedule frequency: ${schedule.frequency}. Must be one of: ${VALID_SCHEDULE_FREQUENCIES.join(', ')}` });
+    }
+
+    if (nextRunTime !== undefined && nextRunTime !== null && isNaN(Date.parse(nextRunTime))) {
+      return res.status(400).json({ message: "Invalid nextRunTime: must be a valid ISO date string" });
+    }
 
     const existing = await skillAssignmentDb.getAssignment(req.params.assignmentId);
     if (!existing) {

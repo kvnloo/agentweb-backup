@@ -82,6 +82,7 @@ describe('GET /api/admin/skills/:skillId/assignments', () => {
 
 describe('POST /api/admin/skills/:skillId/assignments', () => {
   it('creates a new assignment', async () => {
+    mockGetAssignmentsBySkill.mockResolvedValue([]);
     mockCreateAssignment.mockResolvedValue(mockAssignment);
 
     const res = await request(app)
@@ -105,13 +106,59 @@ describe('POST /api/admin/skills/:skillId/assignments', () => {
   });
 
   it('returns 400 when invalid status is provided', async () => {
-    mockCreateAssignment.mockRejectedValue(new Error('Invalid status: bad_status'));
+    const res = await request(app)
+      .post('/api/admin/skills/skill-1/assignments')
+      .send({ userId: 'user-1', status: 'banana' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('Invalid status');
+    expect(res.body.message).toContain('banana');
+    expect(mockCreateAssignment).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when invalid schedule frequency is provided', async () => {
+    const res = await request(app)
+      .post('/api/admin/skills/skill-1/assignments')
+      .send({ userId: 'user-1', schedule: { frequency: 'every_5_seconds' } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('Invalid schedule frequency');
+    expect(mockCreateAssignment).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when invalid nextRunTime is provided', async () => {
+    const res = await request(app)
+      .post('/api/admin/skills/skill-1/assignments')
+      .send({ userId: 'user-1', nextRunTime: 'not-a-date' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('Invalid nextRunTime');
+    expect(mockCreateAssignment).not.toHaveBeenCalled();
+  });
+
+  it('returns 409 when user is already assigned to the skill', async () => {
+    mockGetAssignmentsBySkill.mockResolvedValue([mockAssignment]);
 
     const res = await request(app)
       .post('/api/admin/skills/skill-1/assignments')
-      .send({ userId: 'user-1', status: 'bad_status' });
+      .send({ userId: 'user-1' });
 
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(409);
+    expect(res.body.message).toContain('already assigned');
+    expect(mockCreateAssignment).not.toHaveBeenCalled();
+  });
+
+  it('allows assigning a different user to the same skill', async () => {
+    mockGetAssignmentsBySkill.mockResolvedValue([mockAssignment]);
+    const newAssignment = { ...mockAssignment, assignmentId: 'assign-2', userId: 'user-2' };
+    mockCreateAssignment.mockResolvedValue(newAssignment);
+
+    const res = await request(app)
+      .post('/api/admin/skills/skill-1/assignments')
+      .send({ userId: 'user-2' });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateAssignment).toHaveBeenCalled();
   });
 });
 
@@ -137,6 +184,36 @@ describe('PUT /api/admin/skill-assignments/:assignmentId', () => {
       .send({ status: 'paused' });
 
     expect(res.status).toBe(404);
+  });
+
+  it('returns 400 when invalid status is provided', async () => {
+    const res = await request(app)
+      .put('/api/admin/skill-assignments/assign-1')
+      .send({ status: 'banana' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('Invalid status');
+    expect(mockGetAssignment).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when invalid schedule frequency is provided', async () => {
+    const res = await request(app)
+      .put('/api/admin/skill-assignments/assign-1')
+      .send({ schedule: { frequency: 'every_5_seconds' } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('Invalid schedule frequency');
+    expect(mockGetAssignment).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when invalid nextRunTime is provided', async () => {
+    const res = await request(app)
+      .put('/api/admin/skill-assignments/assign-1')
+      .send({ nextRunTime: 'not-a-date' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('Invalid nextRunTime');
+    expect(mockGetAssignment).not.toHaveBeenCalled();
   });
 });
 
