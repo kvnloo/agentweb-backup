@@ -34,6 +34,13 @@ export interface EnrichmentJobSpec {
   filters?: { field: string; operator: string; value?: any }[];
   forceOverwrite?: boolean;
   leadIds?: string[];
+  /** Single web search query template with {{placeholder}} substitution.
+   *  Covers ALL web_search fields in one call. Auto-built if not provided. */
+  webSearchTemplate?: string;
+  /** LinkedIn person search query template. Auto-built if not provided. */
+  linkedinSearchTemplate?: string;
+  /** Per-field source overrides. Falls back to job-level `sources` when absent for a field. */
+  sourcesPerField?: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>;
 }
 
 interface EnrichmentPreviewResult {
@@ -59,11 +66,31 @@ interface EnrichmentExecuteResult {
 }
 
 export class CrmEnrichmentService {
-  private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<{ allLeads: any[]; leadsToProcess: any[]; alreadyEnriched: number; filteredTotal: number }> {
+  private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<{
+    allLeads: any[];
+    leadsToProcess: any[];
+    alreadyEnriched: number;
+    filteredTotal: number;
+    storedSourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>;
+    storedWebSearchTemplate: string;
+    storedLinkedinSearchTemplate: string;
+  }> {
     const list = await crmDb.getLeadListById(spec.listId);
     if (!list) {
       throw new Error('Lead list not found');
     }
+
+    // Extract stored config from the list (no extra DB call)
+    const storedSourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> =
+      list.sourcesPerField && typeof list.sourcesPerField === 'object'
+        ? (list.sourcesPerField as Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>)
+        : {};
+
+    const storedWebSearchTemplate: string =
+      typeof list.webSearchTemplate === 'string' ? list.webSearchTemplate : '';
+
+    const storedLinkedinSearchTemplate: string =
+      typeof list.linkedinSearchTemplate === 'string' ? list.linkedinSearchTemplate : '';
 
     // Load all leads with pagination
     const allLeads: any[] = [];
@@ -108,7 +135,7 @@ export class CrmEnrichmentService {
       ? filtered
       : filtered.filter(lead => !hasAllFields(lead));
 
-    return { allLeads, leadsToProcess, alreadyEnriched, filteredTotal: filtered.length };
+    return { allLeads, leadsToProcess, alreadyEnriched, filteredTotal: filtered.length, storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate };
   }
 
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
@@ -118,11 +145,82 @@ export class CrmEnrichmentService {
 
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
 
+  /**
+   * Substitute {{placeholder}} tokens in a search query template with actual lead field values.
+   * Multi-space gaps left by empty substitutions are collapsed to a single space.
+   */
+  static applySearchTemplate(template: string, lead: any): string {
+    return template
+      .replace(/\{\{firstName\}\}/g, lead.firstName || '')
+      .replace(/\{\{lastName\}\}/g, lead.lastName || '')
+      .replace(/\{\{company\}\}/g, lead.company || '')
+      .replace(/\{\{email\}\}/g, lead.email || '')
+      .replace(/\{\{emailDomain\}\}/g, lead.email ? (String(lead.email).split('@')[1] || '') : '')
+      .replace(/\{\{title\}\}/g, lead.title || '')
+      .replace(/\{\{linkedin\}\}/g, lead.linkedin || '')
+      .replace(/\{\{customFields\.(\w+)\}\}/g, (_: string, f: string) => lead.customFields?.[f] || '')
+      .trim()
+      .replace(/\s+/g, ' ');
+  }
+
+  private static buildSearchQuery(lead: any, outputFields: string[]): string {
+    const companyName = String(lead.company || '').trim();
+    const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
+    const personName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+
+    // Person-level fields: need name + company for accurate results
+    // Note: company_linkedin_url is company-level (not person-level) even though it contains "linkedin"
+    const isPersonField = outputFields.some(f => {
+      const fl = f.toLowerCase();
+      if (/company_linkedin|company.*linkedin|linkedin.*company/.test(fl)) return false;
+      return /linkedin|profile|contact|title|role|position|seniority|department/.test(fl);
+    });
+
+    if (isPersonField && personName) {
+      const companyCtx = companyName || emailDomain;
+      // Simple query — Google Custom Search API doesn't handle OR well
+      return companyCtx
+        ? `${personName} ${companyCtx} linkedin`
+        : `${personName} linkedin profile`;
+    }
+
+    // Company-level fields: use company name with targeted suffix
+    const companyTerm = companyName || emailDomain;
+    if (!companyTerm) return '';
+
+    const fieldSuffixes: [RegExp, string][] = [
+      [/tech_stack|technology|stack|tool|software|platform/, 'technology stack tools software'],
+      [/funding|invest|raised|series|venture|round/, 'funding rounds investors'],
+      [/employee|headcount|team_size|staff|workforce/, 'employees headcount size'],
+      [/revenue|arr|mrr|income|sales/, 'revenue ARR annual'],
+      [/industry|sector|vertical/, 'industry sector'],
+      [/company_linkedin|company.*linkedin|linkedin.*company/, 'linkedin company page'],
+    ];
+
+    const suffixes = new Set<string>();
+    for (const field of outputFields) {
+      const fl = field.toLowerCase();
+      for (const [pattern, suffix] of fieldSuffixes) {
+        if (pattern.test(fl)) {
+          suffixes.add(suffix);
+          break;
+        }
+      }
+    }
+
+    const suffix = suffixes.size > 0 ? Array.from(suffixes).join(' ') : 'company overview';
+    return `${companyTerm} ${suffix}`;
+  }
+
   private static buildFieldGuidance(outputFields: string[]): string {
     const lines: string[] = [];
     for (const field of outputFields) {
       const fl = field.toLowerCase();
-      if (/employee|headcount|team_size|staff|workforce/.test(fl)) {
+      if (/company_linkedin|company.*linkedin|linkedin.*company/.test(fl)) {
+        lines.push(`- "${field}": Return ONLY the official LinkedIn company page URL in the format "https://www.linkedin.com/company/<slug>" (e.g. "https://www.linkedin.com/company/acme-corp"). Search for it in the web search results. This is a company page, not a personal profile — the URL path must start with /company/. Return "Unknown" if no valid /company/ URL is found.`);
+      } else if (/linkedin/.test(fl)) {
+        lines.push(`- "${field}": Return ONLY a full linkedin.com/in/ profile URL (e.g. "https://www.linkedin.com/in/john-doe-123"). Look in "LinkedIn profile URLs found in search results" first. If a /pub/dir/ or /search/ URL appears, do NOT use it — those are directory pages, not profiles. Return "Unknown" if no valid /in/ URL is found.`);
+      } else if (/employee|headcount|team_size|staff|workforce/.test(fl)) {
         lines.push(`- "${field}": Prefer an exact number if found. A LinkedIn range (e.g. "11-50 employees") is also acceptable. If no explicit count is found, estimate a range based on how the company is described (solo/boutique → "1-10", early-stage startup → "11-50", growth-stage → "51-200", mid-market → "201-1000"). Only return "Unknown" if the company itself cannot be identified at all.`);
       } else if (/funding|invest|raised|series|venture|round/.test(fl)) {
         lines.push(`- "${field}": Look for VC rounds, grants, or angel investment mentions. If found, state the stage and amount (e.g. "Seed - $1.5M", "Series A - $8M"). If no funding info is found anywhere, return "Bootstrapped / Not publicly funded". Only return "Unknown" if the company cannot be confirmed to exist.`);
@@ -150,17 +248,43 @@ export class CrmEnrichmentService {
     let webContext = '';
     let linkedinContext = '';
 
-    // 1. Web search source
-    if (spec.sources.includes('web_search')) {
-      const companyName = String(lead.company || '').trim();
-      const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
-      const searchTerm = companyName || emailDomain;
-      if (searchTerm) {
-        const webResult = await agentModeService.searchWeb(`${searchTerm} company overview`, 5);
-        if (webResult?.success && Array.isArray(webResult.results) && webResult.results.length > 0) {
-          webContext = `\nWeb search results for "${searchTerm}":\n${JSON.stringify(webResult.results, null, 2)}`;
-        } else if (!webResult?.success) {
-          const msg = webResult?.error || webResult?.message || '';
+    // Helper: effective sources for a field — per-field override or job-level fallback
+    const effectiveSources = (field: string) =>
+      spec.sourcesPerField?.[field] ?? spec.sources;
+
+    // Which fields need LinkedIn?
+    const linkedinFields = spec.outputFields.filter(f => effectiveSources(f).includes('linkedin'));
+    const isEnrichingLinkedin = linkedinFields.some(f => /linkedin/i.test(f));
+
+    // 1. Web search source — ONE search per lead covering all web_search fields combined
+    const webSearchFields = spec.outputFields.filter(f => effectiveSources(f).includes('web_search'));
+    if (webSearchFields.length > 0) {
+      // Build one comprehensive query: use stored template if provided, otherwise auto-build
+      const template = spec.webSearchTemplate;
+      const query = template
+        ? CrmEnrichmentService.applySearchTemplate(template, lead)
+        : CrmEnrichmentService.buildSearchQuery(lead, webSearchFields);
+
+
+      if (query) {
+        let result = await agentModeService.searchWeb(query, 5);
+
+        // Fallback only when search succeeded but returned empty results
+        const primarySucceededEmpty = result?.success && (!Array.isArray(result.results) || result.results.length === 0);
+        if (primarySucceededEmpty) {
+          const personName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+          const fallbackQuery = personName
+            ? `${personName} ${lead.company || ''}`.trim()
+            : `${lead.company || lead.email?.split('@')[1] || ''} company overview`;
+          if (fallbackQuery && fallbackQuery !== query) {
+            result = await agentModeService.searchWeb(fallbackQuery, 5);
+          }
+        }
+
+        if (result?.success && Array.isArray(result.results) && result.results.length > 0) {
+          webContext = JSON.stringify(result.results, null, 2);
+        } else if (!result?.success) {
+          const msg = result?.error || result?.message || '';
           if (!msg.toLowerCase().includes('no search results found')) {
             throw Object.assign(new Error(`Web search failed: ${msg}`), { step: 'search' });
           }
@@ -168,25 +292,25 @@ export class CrmEnrichmentService {
       }
     }
 
-    // 2. LinkedIn source
-    if (spec.sources.includes('linkedin') && linkedInAccountId) {
+    // 2. LinkedIn source — only run if at least one field needs it
+    if (linkedinFields.length > 0 && linkedInAccountId) {
       try {
         const linkedinUrl = lead.linkedin ? String(lead.linkedin).trim() : '';
         const isValidLinkedInUrl = linkedinUrl && /\/in\//.test(linkedinUrl);
         let profileData: any = null;
 
-        if (isValidLinkedInUrl) {
-          // Direct profile lookup (URL contains /in/)
+        // Skip direct URL lookup when enriching linkedin fields — the URL itself may be wrong/outdated
+        if (isValidLinkedInUrl && !isEnrichingLinkedin) {
           const result = await agentModeService.linkedinOutreach(spec.userId, {
             action: 'get-profile',
             account_id: linkedInAccountId,
             profile_url: linkedinUrl,
           });
           if (result?.success) profileData = result.data;
+        } else {
         }
 
         if (!profileData) {
-          // Fall back to search by name + company
           const name = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
           const company = String(lead.company || '').trim();
           if (name && company) {
@@ -195,7 +319,8 @@ export class CrmEnrichmentService {
               account_id: linkedInAccountId,
               keywords: `${name} ${company}`,
             });
-            const topResult = searchResult?.data?.items?.[0];
+            const items = searchResult?.data?.items || [];
+            const topResult = items[0];
             if (topResult?.provider_id) {
               const profileResult = await agentModeService.linkedinOutreach(spec.userId, {
                 action: 'get-profile',
@@ -203,17 +328,32 @@ export class CrmEnrichmentService {
                 provider_id: topResult.provider_id,
               });
               if (profileResult?.success) profileData = profileResult.data;
+            } else if (topResult?.public_identifier || topResult?.public_profile_url) {
+              // Search result has enough data — use it directly without a second API call
+              profileData = topResult;
+            } else {
             }
+          } else {
           }
         }
 
         if (profileData) {
+          const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
+          const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
+          const profileUrl = profileData?.public_identifier
+            ? `https://www.linkedin.com/in/${profileData.public_identifier}`
+            : cleanUrl;
           linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
+          if (profileUrl && isEnrichingLinkedin) {
+            linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
+          }
+        } else {
         }
       } catch (err: any) {
-        console.error(`[CrmEnrichment] LinkedIn lookup failed for lead ${lead?.leadId}: ${err.message}`);
+        console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);
         // Non-fatal: continue enrichment with other sources
       }
+    } else {
     }
 
     // 3. Build lead context
@@ -223,16 +363,31 @@ export class CrmEnrichmentService {
     if (lead.email) leadContext.email = String(lead.email).trim();
     if (lead.title) leadContext.title = String(lead.title).trim();
     if (lead.company) leadContext.company = String(lead.company).trim();
-    if (lead.linkedin) leadContext.linkedin = String(lead.linkedin).trim();
+    // Exclude existing linkedin URL when enriching linkedin fields — it may be wrong/outdated
+    if (lead.linkedin && !isEnrichingLinkedin) leadContext.linkedin = String(lead.linkedin).trim();
     // Include existing custom fields for context
     if (lead.customFields && Object.keys(lead.customFields).length > 0) {
       leadContext.existingCustomFields = JSON.stringify(lead.customFields);
     }
 
+    // Extract any linkedin.com/in/ URLs directly from web search result URLs — surface them as a hint
+    if (isEnrichingLinkedin && webContext) {
+      const linkedinUrlMatches = webContext.match(/https?:\/\/[a-z]{0,3}\.?linkedin\.com\/in\/[^\s"\\]+/gi) || [];
+      if (linkedinUrlMatches.length > 0) {
+        const uniqueUrls = [...new Set(linkedinUrlMatches)];
+        webContext += `\n\nLinkedIn profile URLs found in search results (use these as candidates):\n${uniqueUrls.join('\n')}`;
+      } else {
+      }
+    }
+
+
     // 4. Build prompt and call LLM
+    // Substitute {{placeholder}} tokens in instruction with actual lead values
+    const resolvedInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
+
     const systemPrompt = `You are a data enrichment analyst.
 
-Your task: ${spec.instruction}
+Your task: ${resolvedInstruction}
 
 Return ONLY a JSON object with these exact keys: ${JSON.stringify(spec.outputFields)}
 Each value should be a string.
@@ -247,9 +402,10 @@ ${CrmEnrichmentService.buildFieldGuidance(spec.outputFields)}`;
 
     const userPrompt = `Lead context:
 ${JSON.stringify(leadContext, null, 2)}
-${webContext ? `\nWeb search results:${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}
+${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}
 
 Extract the requested fields now.`;
+
 
     // Call Gemini via the shared OpenAI-compatible client
     const geminiClient = await agentModeService.getGeminiClient();
@@ -332,6 +488,9 @@ Valid example:
     job_title: 'title',
     linkedin: 'linkedin',
     linkedin_url: 'linkedin',
+    personal_linkedin_url: 'linkedin',
+    lead_linkedin_url: 'linkedin',
+    linkedin_profile_url: 'linkedin',
     notes: 'notes',
   };
 
@@ -360,7 +519,15 @@ Valid example:
   }
 
   async preview(spec: EnrichmentJobSpec): Promise<EnrichmentPreviewResult> {
-    const { allLeads, leadsToProcess, alreadyEnriched, filteredTotal } = await this.loadAndFilterLeads(spec);
+    const { allLeads, leadsToProcess, alreadyEnriched, filteredTotal, storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate } = await this.loadAndFilterLeads(spec);
+
+    // Merge stored config — runtime spec takes precedence
+    spec = {
+      ...spec,
+      webSearchTemplate: spec.webSearchTemplate || storedWebSearchTemplate || undefined,
+      linkedinSearchTemplate: spec.linkedinSearchTemplate || storedLinkedinSearchTemplate || undefined,
+      sourcesPerField: { ...storedSourcesPerField, ...spec.sourcesPerField },
+    };
 
     // Process up to 2 samples
     const samples: EnrichmentPreviewResult['samples'] = [];
@@ -397,7 +564,15 @@ Valid example:
     const jobId = uuidv4();
     const warnings: string[] = [];
 
-    const { leadsToProcess } = await this.loadAndFilterLeads(spec);
+    const { leadsToProcess, storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate } = await this.loadAndFilterLeads(spec);
+
+    // Merge stored config — runtime spec takes precedence
+    spec = {
+      ...spec,
+      webSearchTemplate: spec.webSearchTemplate || storedWebSearchTemplate || undefined,
+      linkedinSearchTemplate: spec.linkedinSearchTemplate || storedLinkedinSearchTemplate || undefined,
+      sourcesPerField: { ...storedSourcesPerField, ...spec.sourcesPerField },
+    };
 
     if (leadsToProcess.length === 0) {
       return {
@@ -538,7 +713,36 @@ Valid example:
     };
   }
 
-  static async suggestEnrichment(goal: string): Promise<{ instruction: string; outputFields: string[] }> {
+  static async suggestEnrichment(
+    goal: string,
+    context?: {
+      listId?: string;
+      existingStandardFields?: string[];
+      existingCustomFields?: string[];
+      commonlyEmptyFields?: string[];
+    }
+  ): Promise<{
+    instruction: string;
+    outputFields: string[];
+    webSearchTemplate: string;
+    linkedinSearchTemplate: string;
+    sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>;
+    sources: ('web_search' | 'linkedin' | 'existing_data')[];
+  }> {
+    const existingFieldsSection = (() => {
+      const parts: string[] = [];
+      if (context?.existingStandardFields?.length) {
+        parts.push(`Existing standard fields on these leads: ${context.existingStandardFields.join(', ')}`);
+      }
+      if (context?.existingCustomFields?.length) {
+        parts.push(`Existing custom fields already on this list: ${context.existingCustomFields.join(', ')}`);
+      }
+      if (context?.commonlyEmptyFields?.length) {
+        parts.push(`Standard fields that are commonly EMPTY on these leads (high-value enrichment targets): ${context.commonlyEmptyFields.join(', ')}`);
+      }
+      return parts.length > 0 ? `\n${parts.join('\n')}\n` : '';
+    })();
+
     const systemPrompt = `You are a data enrichment specialist for a B2B CRM system.
 
 Given a user's enrichment goal or instruction, produce:
@@ -546,43 +750,197 @@ Given a user's enrichment goal or instruction, produce:
 1. An improved extraction instruction. Apply these rules:
    - SHORT / VAGUE input (under ~80 words, no specific criteria or definitions): rewrite it into a precise 2-4 sentence extraction instruction.
    - DETAILED input (contains specific criteria, named categories, thresholds, persona definitions, or examples): preserve the FULL content verbatim — do NOT summarize, shorten, or remove any criteria. You may lightly fix grammar or formatting, but every specific rule, definition, and threshold must remain in the output instruction exactly as given. NEVER replace specific definitions with vague phrases like "based on the provided criteria" — that loses the actual criteria.
+   - ALWAYS embed lead context using {{placeholder}} tokens in the instruction where it helps the extraction LLM understand what to look for. Available tokens: {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{emailDomain}}, {{title}}. These are substituted with the actual lead's values at runtime before the instruction is sent to the extraction LLM.
+   - Example: "Research {{company}} ({{emailDomain}}) to extract: primary industry, current employee count, main products/services offered, key market differentiators, the official LinkedIn company page URL, and the personal LinkedIn profile URL for {{firstName}} {{lastName}}."
 
 2. A list of output field names in snake_case — one field per distinct data point. Rules:
    - Numeric values (employee count, revenue, dates, amounts) → always its own separate field
    - Categorical / label values (funding stage, ICP category, industry, tier) → always its own separate field
+   - URL values (LinkedIn URLs, website URLs) → always their own separate field
    - Prose summaries (profile, description, overview) → one field
-   - Never merge different data types — "a profile including industry and employee count" → THREE fields: company_profile + industry + employee_count
+   - CRITICAL: Never merge different data types — even when a goal says "a profile that describes industry, employee size, and products", create SEPARATE fields for each distinct data point. That example → FOUR fields: company_profile + industry + employee_count + products_services
+   - Extended example — "a 3-6 sentence company profile describing industry, employee size, products, differentiators, plus company LinkedIn page and lead's personal LinkedIn" → SIX fields: company_profile, industry, employee_count, products_services, company_linkedin_url, personal_linkedin_url
    - Capture every distinct data point mentioned, including ones embedded inside a prose request (e.g. "last funding date" inside a funding description → last_funding_date field)
+   - Do NOT suggest fields that are already populated on the leads — skip those. EXCEPTION: standard fields that are listed as "commonly EMPTY" below are valid enrichment targets and MUST be included in outputFields if the goal requests them. The most important case: if the goal mentions personal LinkedIn URL, ALWAYS include "linkedin_url" in outputFields (even though "linkedin" appears in the existing standard fields list) — it is almost always empty and is the primary value to fill.
+   - CONSISTENCY RULE: if you set a linkedinSearchTemplate, you MUST include at least one output field with source ["linkedin"] — typically "linkedin_url". Never generate a linkedinSearchTemplate without a matching linkedin output field.
 
-Return ONLY valid JSON: { "instruction": "...", "outputFields": ["field1", "field2", ...] }
+3. A webSearchTemplate string — ONE search query template used for ALL web_search fields combined. Uses {{placeholder}} tokens: {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{emailDomain}}, {{title}}.
+   - Build a comprehensive query that covers ALL the web_search output fields in one shot
+   - Examples:
+     - Company profile + LinkedIn URL: "{{company}} company overview industry employees linkedin"
+     - Company fields only: "{{company}} company overview employees funding industry"
+     - Person + company fields: "{{firstName}} {{lastName}} {{company}} profile overview funding"
+     - Funding focused: "{{company}} funding rounds investors total raised"
+   - Keep it concise — 4-8 words after placeholder substitution
+
+4. A linkedinSearchTemplate string — ONE LinkedIn search query for person-level LinkedIn lookup (only set if any field needs LinkedIn). Format: "{{firstName}} {{lastName}} {{company}}"
+   - Omit (null) if no field requires LinkedIn
+
+5. A sourcesPerField object — one entry per output field, listing which sources are needed:
+   - "web_search" → most fields (company info, funding, tech stack, company LinkedIn page URL, etc.)
+   - "linkedin" → ONLY for the PERSONAL LinkedIn profile of the LEAD. Field names that use this source: linkedin_url, personal_linkedin_url, lead_linkedin_url, linkedin_profile_url. These are fetched via the LinkedIn API. Use "linkedin_url" as the preferred field name — it maps directly to the lead's standard linkedin field.
+   - "existing_data" → fields derivable from existing lead data (email_domain from email, etc.)
+   - IMPORTANT: company_linkedin_url / company_linkedin ALWAYS uses "web_search" (the company page is found via Google, not via LinkedIn API)
+   - IMPORTANT: linkedin_url / personal_linkedin_url / lead_linkedin_url ALWAYS uses "linkedin" (person's profile fetched via LinkedIn API — NOT Google)
+   - NEVER combine "web_search" + "linkedin" for the same field — choose one
+
+6. A sources array — union of all sources used across all fields.
+
+Return ONLY valid JSON:
+{
+  "instruction": "...",
+  "outputFields": ["field1", "field2"],
+  "webSearchTemplate": "{{company}} company overview employees funding",
+  "linkedinSearchTemplate": "{{firstName}} {{lastName}} {{company}}",
+  "sourcesPerField": {
+    "company_profile": ["web_search"],
+    "industry": ["web_search"],
+    "employee_count": ["web_search"],
+    "company_linkedin_url": ["web_search"],
+    "personal_linkedin_url": ["linkedin"]
+  },
+  "sources": ["web_search", "linkedin"]
+}
 No markdown, no backticks, no extra text.`;
 
-    const geminiClient = await agentModeService.getGeminiClient();
-    const completion = await geminiClient.chat.completions.create({
-      model: CrmEnrichmentService.ENRICH_MODEL,
-      temperature: 1,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: `Enrichment goal or instruction:\n${goal}` },
-      ],
-      response_format: { type: 'json_object' },
-    });
+    const userPrompt = `${existingFieldsSection}Enrichment goal or instruction:\n${goal}`;
 
-    const raw = completion.choices?.[0]?.message?.content || '';
+    const geminiClient = await agentModeService.getGeminiClient();
+
+    const fallback = {
+      instruction: goal,
+      outputFields: [] as string[],
+      webSearchTemplate: '' as string,
+      linkedinSearchTemplate: '' as string,
+      sourcesPerField: {} as Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>,
+      sources: ['web_search'] as ('web_search' | 'linkedin' | 'existing_data')[],
+    };
+
+    let raw = '';
+    try {
+      const completion = await geminiClient.chat.completions.create({
+        model: CrmEnrichmentService.ENRICH_MODEL,
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+      });
+      raw = completion.choices?.[0]?.message?.content || '';
+    } catch (err) {
+      // Retry without json_object mode
+      try {
+        const retry = await geminiClient.chat.completions.create({
+          model: CrmEnrichmentService.ENRICH_MODEL,
+          temperature: 0.2,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `${userPrompt}\n\nCRITICAL: Return ONLY a valid JSON object. No markdown, no backticks.` },
+          ],
+        });
+        raw = retry.choices?.[0]?.message?.content || '';
+        raw = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
+      } catch (retryErr) {
+        console.warn('[CrmEnrichment] suggestEnrichment: LLM call failed on retry, using fallback');
+        return fallback;
+      }
+    }
+
     let parsed: any;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      console.warn('[CrmEnrichment] suggestEnrichment: failed to parse LLM response, falling back to original goal');
-      return { instruction: goal, outputFields: [] };
+      // Last-resort: brace extraction
+      const firstBrace = raw.indexOf('{');
+      const lastBrace = raw.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        try {
+          parsed = JSON.parse(raw.slice(firstBrace, lastBrace + 1));
+        } catch {
+          console.warn('[CrmEnrichment] suggestEnrichment: failed to parse LLM response, using fallback');
+          return fallback;
+        }
+      } else {
+        console.warn('[CrmEnrichment] suggestEnrichment: no JSON found in LLM response, using fallback');
+        return fallback;
+      }
     }
 
-    return {
+    // Normalize outputFields to snake_case
+    const outputFields: string[] = Array.isArray(parsed.outputFields)
+      ? parsed.outputFields
+          .filter((f: any) => typeof f === 'string')
+          .map((f: string) => f.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, ''))
+          .filter(Boolean)
+      : [];
+
+    const webSearchTemplate: string =
+      typeof parsed.webSearchTemplate === 'string' && parsed.webSearchTemplate.trim()
+        ? parsed.webSearchTemplate.trim()
+        : '';
+
+    const linkedinSearchTemplate: string =
+      typeof parsed.linkedinSearchTemplate === 'string' && parsed.linkedinSearchTemplate.trim()
+        ? parsed.linkedinSearchTemplate.trim()
+        : '';
+
+    const validSources = new Set(['web_search', 'linkedin', 'existing_data']);
+
+    const sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> =
+      parsed.sourcesPerField && typeof parsed.sourcesPerField === 'object'
+        ? Object.fromEntries(
+            Object.entries(parsed.sourcesPerField)
+              .filter(([k, v]) => typeof k === 'string' && Array.isArray(v))
+              .map(([k, v]) => [
+                k,
+                (v as any[]).filter((s: any) => validSources.has(s)) as ('web_search' | 'linkedin' | 'existing_data')[],
+              ])
+              .filter(([, v]) => (v as any[]).length > 0)
+          )
+        : {};
+
+    // Derive job-level sources as union of all per-field sources
+    const sources: ('web_search' | 'linkedin' | 'existing_data')[] = (() => {
+      if (Object.keys(sourcesPerField).length > 0) {
+        const union = new Set<string>();
+        Object.values(sourcesPerField).forEach(arr => arr.forEach(s => union.add(s)));
+        return Array.from(union) as ('web_search' | 'linkedin' | 'existing_data')[];
+      }
+      const valid = new Set(['web_search', 'linkedin', 'existing_data']);
+      const suggested = Array.isArray(parsed.sources)
+        ? parsed.sources.filter((s: any) => valid.has(s))
+        : [];
+      return suggested.length > 0 ? suggested : ['web_search'];
+    })();
+
+    const result = {
       instruction: typeof parsed.instruction === 'string' ? parsed.instruction.trim() : goal,
-      outputFields: Array.isArray(parsed.outputFields)
-        ? parsed.outputFields.filter((f: any) => typeof f === 'string' && f.trim())
-        : [],
+      outputFields,
+      webSearchTemplate,
+      linkedinSearchTemplate,
+      sourcesPerField,
+      sources,
     };
+
+    // Auto-save config to the list
+    if (context?.listId && (result.instruction || result.outputFields.length > 0)) {
+      try {
+        await crmDb.updateSearchQueryTemplates(
+          context.listId,
+          {},  // searchQueryTemplates no longer used — kept for DB compat
+          Object.keys(sourcesPerField).length > 0 ? sourcesPerField : undefined,
+          result.instruction || undefined,
+          result.outputFields.length > 0 ? result.outputFields : undefined,
+          result.webSearchTemplate || undefined,
+          result.linkedinSearchTemplate || undefined,
+        );
+      } catch (err) {
+        console.warn('[CrmEnrichment] suggestEnrichment: failed to save config to list:', err);
+      }
+    }
+
+    return result;
   }
 
   static async enrichWebCompat(listId: string, userId: string, socketId?: string, forceEnrich = false): Promise<EnrichmentExecuteResult> {
