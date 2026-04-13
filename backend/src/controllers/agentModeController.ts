@@ -1392,6 +1392,13 @@ export async function generateSessionResponse(
             if (contextParts.length) {
               systemPrompt += `\n\n[Page UI Elements]\n${contextParts.join('\n')}`;
             }
+            // Include page-specific tool context so Emma knows which tools are relevant
+            if (parsed.availableTools?.length) {
+              systemPrompt += `\n\n[Available Tools for This Page]\nThe following tools are most relevant to the user's current page: ${parsed.availableTools.join(', ')}. Prefer these tools when responding to user requests on this page.`;
+            }
+            if (parsed.suggestedActions?.length) {
+              systemPrompt += `\n[Suggested Actions]\nCommon actions the user might want on this page:\n${parsed.suggestedActions.map((a: string) => `- ${a}`).join('\n')}`;
+            }
           } catch { /* ignore parse errors */ }
         }
       } else {
