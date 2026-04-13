@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-13',
     changes: [
+      'Fix: Slack Channel Monitoring No Longer Sends Duplicate Suggest Emails for Emma Sessions',
+      '- When a client @mentions Emma directly in Slack, Emma now responds in Slack without also sending a redundant "suggested reply" email to the team',
+      '- Messages that @mention other team members (e.g. @Rui) still go through the normal suggest flow and will trigger an email if they contain an actionable question or request',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
       'New: Work Plan Autocomplete Setting',
       '- You can now toggle Autocomplete on each of your saved work plans in Settings → Work Plans',
       '- When enabled, Emma runs through all steps automatically without pausing to ask for your approval between each step',
