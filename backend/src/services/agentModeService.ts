@@ -17349,7 +17349,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -17373,6 +17373,7 @@ Please:
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds
         })),
+        autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -17396,7 +17397,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -17407,6 +17408,11 @@ Please:
       }
 
       const workPlan = { ...session.workPlan };
+
+      // Update autocomplete if explicitly provided
+      if (autocomplete !== undefined) {
+        workPlan.autocomplete = autocomplete;
+      }
 
       // Remove steps if specified
       if (removeStepCounts && removeStepCounts.length > 0) {

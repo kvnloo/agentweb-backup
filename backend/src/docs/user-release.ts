@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-13',
     changes: [
+      'New: Work Plan Autocomplete Setting',
+      '- You can now toggle Autocomplete on each of your saved work plans in Settings → Work Plans',
+      '- When enabled, Emma runs through all steps automatically without pausing to ask for your approval between each step',
+      '- When disabled (default), Emma presents results after each step and waits for you to confirm before moving on',
+      '- You can also ask Emma to turn autocomplete on or off for the current session\'s work plan directly in chat',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
       'New: Email Session Results Without a Connected Email Account',
       '- Emma can now email a session summary to any list of addresses directly, using the AgentWeb platform — no email integration required',
       '- Simply ask Emma to "email these results to..." and she will send a formatted HTML report with your content and a link to the full session',
