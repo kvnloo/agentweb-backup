@@ -468,12 +468,17 @@ VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
       docker compose build && \
       docker compose up -d"
 
-    # Seed IP allowlist with developer's IP so the UI shows correct status
-    local dev_subnet dev_now
+    # Seed IP allowlist with developer's IP (and any EXTRA_IPS) so the UI shows correct status
+    local dev_subnet dev_now allowlist_ips
     dev_subnet="$(echo "$MY_IP" | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"
     dev_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    allowlist_ips="{\"ip\":\"$MY_IP\",\"subnet\":\"$dev_subnet\",\"email\":\"launcher\",\"addedAt\":\"$dev_now\"}"
+    for extra_ip in ${EXTRA_IPS:-}; do
+      extra_subnet="$(echo "$extra_ip" | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"
+      allowlist_ips="$allowlist_ips,{\"ip\":\"$extra_ip\",\"subnet\":\"$extra_subnet\",\"email\":\"launcher\",\"addedAt\":\"$dev_now\"}"
+    done
     log "Seeding IP allowlist with developer IP ($MY_IP)..."
-    remote "printf '%s' '{\"ips\":[{\"ip\":\"$MY_IP\",\"subnet\":\"$dev_subnet\",\"email\":\"launcher\",\"addedAt\":\"$dev_now\"}]}' | \
+    remote "printf '%s' '{\"ips\":[$allowlist_ips]}' | \
       docker compose -f /home/ec2-user/agentweb/test-env/docker-compose.yml exec -T test-env-access sh -c 'cat > /app/data/allowlist.json'"
   fi
 
