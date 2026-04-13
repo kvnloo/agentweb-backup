@@ -4726,4 +4726,91 @@ router.post("/resync-subscription-amounts", async (req, res) => {
   }
 });
 
+// ── Skill Assignment Admin Routes ─────────────────────────────────────────────
+
+// GET /api/admin/skills/:skillId/assignments — list assignments for a skill
+router.get("/skills/:skillId/assignments", async (req, res) => {
+  try {
+    const { skillAssignmentDb } = await import('../services/skillAssignmentDb');
+    const assignments = await skillAssignmentDb.getAssignmentsBySkill(req.params.skillId);
+    res.json(assignments);
+  } catch (error: any) {
+    console.error("Error fetching skill assignments:", error.message);
+    res.status(500).json({ message: "Failed to fetch skill assignments" });
+  }
+});
+
+// POST /api/admin/skills/:skillId/assignments — create a new assignment
+router.post("/skills/:skillId/assignments", async (req, res) => {
+  try {
+    const { skillAssignmentDb } = await import('../services/skillAssignmentDb');
+    const { userId, status, schedule, nextRunTime, config } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ message: "userId is required" });
+    }
+
+    const assignment = await skillAssignmentDb.createAssignment({
+      skillId: req.params.skillId,
+      userId,
+      status: status || 'active',
+      schedule,
+      nextRunTime,
+      config,
+    });
+    res.status(201).json(assignment);
+  } catch (error: any) {
+    console.error("Error creating skill assignment:", error.message);
+    if (error.message?.includes('required') || error.message?.includes('Invalid')) {
+      return res.status(400).json({ message: error.message });
+    }
+    res.status(500).json({ message: "Failed to create skill assignment" });
+  }
+});
+
+// PUT /api/admin/skill-assignments/:assignmentId — update an assignment
+router.put("/skill-assignments/:assignmentId", async (req, res) => {
+  try {
+    const { skillAssignmentDb } = await import('../services/skillAssignmentDb');
+    const { status, schedule, nextRunTime, config } = req.body;
+
+    const existing = await skillAssignmentDb.getAssignment(req.params.assignmentId);
+    if (!existing) {
+      return res.status(404).json({ message: "Assignment not found" });
+    }
+
+    const updated = await skillAssignmentDb.updateAssignment(req.params.assignmentId, {
+      ...(status !== undefined && { status }),
+      ...(schedule !== undefined && { schedule }),
+      ...(nextRunTime !== undefined && { nextRunTime }),
+      ...(config !== undefined && { config }),
+    });
+    res.json(updated);
+  } catch (error: any) {
+    console.error("Error updating skill assignment:", error.message);
+    if (error.message?.includes('Invalid')) {
+      return res.status(400).json({ message: error.message });
+    }
+    res.status(500).json({ message: "Failed to update skill assignment" });
+  }
+});
+
+// DELETE /api/admin/skill-assignments/:assignmentId — delete an assignment
+router.delete("/skill-assignments/:assignmentId", async (req, res) => {
+  try {
+    const { skillAssignmentDb } = await import('../services/skillAssignmentDb');
+
+    const existing = await skillAssignmentDb.getAssignment(req.params.assignmentId);
+    if (!existing) {
+      return res.status(404).json({ message: "Assignment not found" });
+    }
+
+    await skillAssignmentDb.deleteAssignment(req.params.assignmentId);
+    res.json({ message: "Assignment deleted" });
+  } catch (error: any) {
+    console.error("Error deleting skill assignment:", error.message);
+    res.status(500).json({ message: "Failed to delete skill assignment" });
+  }
+});
+
 export default router;
