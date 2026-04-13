@@ -1367,6 +1367,16 @@ export class AgentModeService {
         console.error('Failed to load account memories:', err);
       }
 
+      // For Slack sessions, inject team roster as an assistant acknowledgement so the model
+      // treats it as established knowledge rather than an instruction it can override.
+      const slackPageIds = ['slack-bot', 'slack-bot-admin', 'slack-triggered'];
+      if (slackPageIds.includes(currentSession?.pageIdentifier || '')) {
+        messages.push({
+          role: 'assistant',
+          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+        });
+      }
+
       messages.push(...marketingMessages);
 
       // Cross-message loop detection: when the user repeats the same message multiple times
