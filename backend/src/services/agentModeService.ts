@@ -2292,11 +2292,9 @@ export class AgentModeService {
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
       workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
 
-      // If autocomplete is enabled, add instruction to auto-complete steps; otherwise require user confirmation
+      // If autocomplete is enabled, add instruction to auto-complete steps
       if (workPlan.autocomplete) {
         workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
-      } else {
-        workPlanContent += `⚠️ CONFIRMATION REQUIRED: Execute ONE step at a time. After completing a step's work, present the results to the user and explicitly ask whether to proceed to the next step. Do NOT automatically start the next step or call set_work_plan_status to mark a step complete without first receiving explicit user approval to proceed.\n\n`;
       }
 
       workPlan.steps.forEach((step: any) => {
@@ -17351,7 +17349,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -17375,6 +17373,7 @@ Please:
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds
         })),
+        autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -17398,7 +17397,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -17409,6 +17408,11 @@ Please:
       }
 
       const workPlan = { ...session.workPlan };
+
+      // Update autocomplete if explicitly provided
+      if (autocomplete !== undefined) {
+        workPlan.autocomplete = autocomplete;
+      }
 
       // Remove steps if specified
       if (removeStepCounts && removeStepCounts.length > 0) {

@@ -4363,13 +4363,17 @@ emmaToolRegistry.register({
             },
             required: ['stepCount', 'title']
           }
+        },
+        autocomplete: {
+          type: 'boolean',
+          description: 'When true, Emma runs all steps automatically without pausing to ask the user for confirmation between steps. Defaults to false (Emma will present results after each step and wait for user approval before proceeding).'
         }
       },
       required: ['title', 'steps']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId);
+    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete);
   }
 });
 
@@ -4416,13 +4420,17 @@ emmaToolRegistry.register({
           items: {
             type: 'number'
           }
+        },
+        autocomplete: {
+          type: 'boolean',
+          description: 'Optional. Update the autocomplete setting. When true, Emma runs all steps automatically without asking for user confirmation between steps.'
         }
       },
       required: ['steps']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId);
+    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete);
   }
 });
 
