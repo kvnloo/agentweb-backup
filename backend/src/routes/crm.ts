@@ -13,6 +13,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -948,6 +949,14 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     }
 
     const lead = await crmDb.createLead(listId, leadData);
+
+    // Fire-and-forget auto-sync to external CRM
+    if (userId) {
+      externalCrmSyncService.autoSyncLead(userId, listId, lead, 'created').catch(err => {
+        console.error('Auto-sync to external CRM failed (create):', err.message);
+      });
+    }
+
     res.status(201).json(lead);
   } catch (error: any) {
     console.error('Error creating lead:', error);
@@ -1187,6 +1196,14 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     }
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
+
+    // Fire-and-forget auto-sync to external CRM
+    if (userId) {
+      externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'updated').catch(err => {
+        console.error('Auto-sync to external CRM failed (update):', err.message);
+      });
+    }
+
     res.json(updatedLead);
   } catch (error: any) {
     console.error('Error updating lead:', error);
