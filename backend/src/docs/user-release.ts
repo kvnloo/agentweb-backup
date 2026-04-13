@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-13',
     changes: [
+      'Improved: Emma Now Recognizes AgentWeb Team Members in Slack Sessions',
+      '- Emma now knows all four AgentWeb team members by name and nickname: Rui Wang (CTO), Harsha Vankayalapati (CEO), Fangfang Tan (CPO), Matthew Wilmer / Matt (CMO)',
+      '- When helping in a Slack thread, Emma understands she is part of the team drafting replies to external contacts — not responding to team members as if they were asking her questions directly',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
       'Fix: Slack Channel Monitoring No Longer Sends Duplicate Suggest Emails for Emma Sessions',
       '- When a client @mentions Emma directly in Slack, Emma now responds in Slack without also sending a redundant "suggested reply" email to the team',
       '- Messages that @mention other team members (e.g. @Rui) still go through the normal suggest flow and will trigger an email if they contain an actionable question or request',
