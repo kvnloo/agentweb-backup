@@ -275,6 +275,12 @@ export default function ImageModelsSettings() {
 
   return (
     <Box sx={{ p: 3 }}>
+      <Alert severity="warning" sx={{ mb: 3 }}>
+        <strong>Legacy feature — Web Automation Image Models</strong>
+        <br />
+        This tab manages image models for the web automation (task-based) agent engine. For configuring the default image generation API model used in Agent Mode chat sessions, use the <strong>Image API Default Model</strong> setting in the <strong>Agent Mode</strong> tab instead.
+      </Alert>
+
       {error && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>
           {error}
