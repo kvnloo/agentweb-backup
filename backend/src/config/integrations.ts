@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -100,6 +100,33 @@ export const INTEGRATION_CONFIG = {
     authorizationUrl: 'https://fathom.video/external/v1/oauth2/authorize',
     tokenUrl: 'https://api.fathom.ai/external/v1/oauth2/token',
     scopes: ['public_api'],
+  },
+
+  attio: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/attio/callback`,
+    authorizationUrl: 'https://app.attio.com/authorize',
+    tokenUrl: 'https://app.attio.com/oauth/token',
+    selfUrl: 'https://api.attio.com/v2/self',
+    scopes: [],
+  },
+
+  hubspot: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/hubspot/callback`,
+    authorizationUrl: 'https://app.hubspot.com/oauth/authorize',
+    tokenUrl: 'https://api.hubapi.com/oauth/v1/token',
+    tokenInfoUrl: 'https://api.hubapi.com/oauth/v1/access-tokens',
+    scopes: [
+      'crm.objects.contacts.read',
+      'crm.objects.contacts.write',
+      'crm.objects.deals.read',
+      'crm.objects.deals.write',
+      // 'crm.objects.companies.read',
+      // 'crm.objects.companies.write',
+      'crm.lists.read',
+      'crm.lists.write',
+      'crm.schemas.contacts.read',
+      'crm.schemas.contacts.write',
+    ],
   },
 
   clickup: {
@@ -398,4 +425,69 @@ export async function getFathomConfig(): Promise<FathomOAuthConfig> {
   };
   fathomConfigCacheExpiresAt = Date.now() + FATHOM_CONFIG_CACHE_TTL_MS;
   return cachedFathomConfig;
+}
+
+// HubSpot configuration interface
+export interface HubSpotOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  tokenInfoUrl: string;
+}
+
+let cachedHubSpotConfig: HubSpotOAuthConfig | null = null;
+let hubspotConfigCacheExpiresAt = 0;
+const HUBSPOT_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+export async function getHubSpotConfig(): Promise<HubSpotOAuthConfig> {
+  if (cachedHubSpotConfig && Date.now() < hubspotConfigCacheExpiresAt) {
+    return cachedHubSpotConfig;
+  }
+  const credentials = await getHubSpotCredentials();
+  cachedHubSpotConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.hubspot.redirectUri,
+    scopes: INTEGRATION_CONFIG.hubspot.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.hubspot.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.hubspot.tokenUrl,
+    tokenInfoUrl: INTEGRATION_CONFIG.hubspot.tokenInfoUrl,
+  };
+  hubspotConfigCacheExpiresAt = Date.now() + HUBSPOT_CONFIG_CACHE_TTL_MS;
+  return cachedHubSpotConfig;
+}
+
+export interface AttioOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  selfUrl: string;
+}
+
+let cachedAttioConfig: AttioOAuthConfig | null = null;
+let attioConfigCacheExpiresAt = 0;
+const ATTIO_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export async function getAttioConfig(): Promise<AttioOAuthConfig> {
+  if (cachedAttioConfig && Date.now() < attioConfigCacheExpiresAt) {
+    return cachedAttioConfig;
+  }
+  const credentials = await getAttioCredentials();
+  cachedAttioConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.attio.redirectUri,
+    scopes: INTEGRATION_CONFIG.attio.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.attio.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.attio.tokenUrl,
+    selfUrl: INTEGRATION_CONFIG.attio.selfUrl,
+  };
+  attioConfigCacheExpiresAt = Date.now() + ATTIO_CONFIG_CACHE_TTL_MS;
+  return cachedAttioConfig;
 }

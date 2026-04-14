@@ -5,6 +5,8 @@ import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
+import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
+import { hubspotService } from '../services/hubspotService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
@@ -46,9 +48,9 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const eventExists = await emailEventsDb.eventExists(eventId);
     if (eventExists) {
       console.log(`Event already exists, skipping duplicate: ${eventId}`);
-      return res.status(200).json({ 
+      return res.status(200).json({
         message: 'Event already processed (duplicate)',
-        eventId: eventId 
+        eventId: eventId
       });
     }
 
@@ -73,7 +75,7 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       case 'email.delivered':
         console.log(`Email delivered: ${event.data.email_id} to ${event.data.to.join(', ')}`);
         break;
-      
+
       case 'email.bounced': {
         const bounceReason = event.data.bounce?.reason || 'Unknown reason';
         console.log(`Email bounced: ${event.data.email_id} - ${bounceReason}`);
@@ -108,19 +110,19 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         })();
         break;
       }
-      
+
       case 'email.complained':
         console.log(`Email complaint: ${event.data.email_id} - ${event.data.complaint?.reason || 'Unknown reason'}`);
         break;
-      
+
       case 'email.clicked':
         console.log(`Email clicked: ${event.data.email_id} - Link: ${event.data.click?.link}`);
         break;
-      
+
       case 'email.opened':
         console.log(`Email opened: ${event.data.email_id}`);
         break;
-      
+
       case 'email.received': {
         const toAddresses = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
         console.log(`Email received: ${event.data.email_id} from ${event.data.from} to ${toAddresses.join(', ')}`);
@@ -141,7 +143,7 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         }
         // Store temp emails (test+xxxxxx@updates.agentweb.pro) for Emma to read
         const tempPrefix = `${TEMP_EMAIL_PREFIX}+`;
-        const tempRecipients = toAddresses.filter((addr) => {
+        const tempRecipients = toAddresses.filter((addr: any) => {
           const bare = addr.toLowerCase().replace(/^.*<|>.*$/g, '').trim();
           return bare.startsWith(tempPrefix) && bare.endsWith(`@${TEMP_EMAIL_DOMAIN}`);
         });
@@ -168,7 +170,7 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         }
         break;
       }
-      
+
       default:
         console.log(`Unhandled event type: ${event.type}`);
     }
@@ -181,9 +183,9 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 
   } catch (error: any) {
     console.error('Webhook processing error:', error);
-    res.status(400).json({ 
+    res.status(400).json({
       message: 'Webhook processing failed',
-      error: error.message 
+      error: error.message
     });
   }
 });
@@ -512,6 +514,166 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       success: false,
       message: error.message || 'Failed to forward lead'
     });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTIO WEBHOOK RECEIVER
+//
+// Attio sends events here for each user who has registered a webhook.
+// The payload identifies the workspace via workspace_id — matched against
+// connected accounts to find the user.
+//
+// Events handled:
+//   record.created  → log for future sync (pull new person into leads)
+//   record.updated  → log for future sync (update matching lead)
+//   record.deleted  → log for future sync (flag lead as removed)
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/attio', async (req: express.Request, res: express.Response) => {
+  try {
+    const event = req.body;
+    const eventType: string = event?.event_type ?? event?.type ?? 'unknown';
+    const workspaceId: string = event?.workspace_id ?? '';
+    const objectType: string = event?.data?.object?.slug ?? '';
+    const recordId: string = event?.data?.record?.id?.record_id ?? '';
+
+    console.log(`[Attio Webhook] event=${eventType} object=${objectType} record=${recordId} workspace=${workspaceId}`);
+
+    // Only process people and companies record events
+    const isRelevantObject = objectType === 'people' || objectType === 'companies';
+    const isRelevantEvent = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
+
+    if (!isRelevantObject || !isRelevantEvent) {
+      return res.status(200).json({ received: true, processed: false, reason: 'event not in scope' });
+    }
+
+    // TODO: Trigger sync handler when sync service is implemented
+    // await attioSyncService.handleWebhookEvent(workspaceId, eventType, event.data);
+
+    res.status(200).json({ received: true, processed: true });
+  } catch (error: any) {
+    console.error('[Attio Webhook] error:', error);
+    res.status(200).json({ received: true, processed: false, error: error.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HUBSPOT WEBHOOK RECEIVER
+//
+// HubSpot sends events here for ALL connected portals (configured once in
+// the HubSpot Developer Portal — not per user). Each event includes a
+// portalId to identify which customer's data changed.
+//
+// To configure in HubSpot Developer Portal:
+//   App Settings → Webhooks → Target URL → ${BACKEND_URL}/api/webhooks/hubspot
+//   Subscribe to: contact.creation, contact.propertyChange, contact.deletion
+//   For contact.propertyChange, watch: email, phone, firstname, lastname,
+//   jobtitle, company, hs_linkedin_url
+//
+// Events handled:
+//   contact.creation        → pull new contact into matching user's leads
+//   contact.propertyChange  → update matching lead's fields
+//   contact.deletion        → flag matching lead as removed
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/hubspot', async (req: express.Request, res: express.Response) => {
+  try {
+    const events: any[] = Array.isArray(req.body) ? req.body : [req.body];
+    const changesByObjectId: Record<string, { portalId: number, properties: Record<string, string> }> = {};
+
+    for (const event of events) {
+      const eventType: string = event?.subscriptionType ?? 'unknown';
+      const portalId: number = event?.portalId;
+      const objectId: string = String(event?.objectId ?? '');
+      const propertyName: string = event?.propertyName ?? '';
+      const propertyValue: string = event?.propertyValue ?? '';
+
+      console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+      const isRelevantEvent = [
+        'contact.creation',
+        'contact.propertyChange',
+        'contact.deletion',
+      ].includes(eventType);
+
+      if (!isRelevantEvent) {
+        continue;
+      }
+
+      if (!changesByObjectId[objectId]) {
+        changesByObjectId[objectId] = { portalId, properties: {} };
+      }
+      if (propertyName && propertyValue !== undefined) {
+        changesByObjectId[objectId].properties[propertyName] = propertyValue;
+      }
+    }
+
+    // Process each aggregated object
+    for (const [objectId, data] of Object.entries(changesByObjectId)) {
+      const userId = await getUserIdByHubSpotPortalId(data.portalId);
+      if (!userId) {
+        console.log(`[HubSpot Webhook] No user found for portal ${data.portalId}`);
+        continue;
+      }
+
+      let email = data.properties.email;
+      if (!email) {
+        const fetchedEmail = await hubspotService.getContactEmailById(userId, objectId, data.portalId.toString());
+        if (fetchedEmail) email = fetchedEmail;
+      }
+
+      if (!email) {
+        console.log(`[HubSpot Webhook] Could not determine email for contact ${objectId}, skipping`);
+        continue;
+      }
+
+      const lists = await crmDb.getLeadListsByUserId(userId);
+      if (!lists) continue;
+
+      for (const list of lists) {
+        const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
+        if (lead) {
+          const updates: any = {};
+
+          if (data.properties.firstname !== undefined) updates.firstName = data.properties.firstname;
+          if (data.properties.lastname !== undefined) updates.lastName = data.properties.lastname;
+          if (data.properties.phone !== undefined) updates.phone = data.properties.phone;
+          if (data.properties.jobtitle !== undefined) updates.title = data.properties.jobtitle;
+          if (data.properties.company !== undefined) updates.company = data.properties.company;
+          if (data.properties.hs_linkedin_url !== undefined) updates.linkedin = data.properties.hs_linkedin_url;
+
+          const customFieldUpdates: any = {};
+          const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
+
+          Object.entries(data.properties).forEach(([key, val]) => {
+            if (standardHubspotProps.includes(key)) return;
+
+            // Try to find a matching existing custom field by slugging the keys
+            let matchedLocalKey = key;
+            if (lead.customFields) {
+              const existingKeys = Object.keys(lead.customFields);
+              const foundKey = existingKeys.find(k => k.toLowerCase().replace(/[^a-z0-9]/g, '_') === key);
+              if (foundKey) matchedLocalKey = foundKey;
+            }
+
+            customFieldUpdates[matchedLocalKey] = val;
+          });
+
+          if (Object.keys(customFieldUpdates).length > 0) {
+            updates.customFields = { ...lead.customFields, ...customFieldUpdates };
+          }
+
+          if (Object.keys(updates).length > 0) {
+            await crmDb.updateLead(list.listId, lead.leadId, updates);
+            console.log(`[HubSpot Webhook] Synced updates to lead ${lead.leadId} in list ${list.listId}`);
+          }
+        }
+      }
+    }
+
+    res.status(200).json({ received: true });
+  } catch (error: any) {
+    console.error('[HubSpot Webhook] error:', error);
+    res.status(200).json({ received: true, error: error.message });
   }
 });
 

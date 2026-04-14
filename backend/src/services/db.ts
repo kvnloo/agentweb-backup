@@ -172,7 +172,7 @@ export interface User {
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
-    | 'meta' | 'twitter' | 'instagram';
+    | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'youtube' | 'clickup';
     account_id: string;
     account_name: string;
     config: {
@@ -2083,7 +2083,7 @@ export const scheduleDb = {
         },
       };
 
-            return await paginatedQuery(dynamodb, params);
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -3268,6 +3268,16 @@ export const crmDb = {
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       listType?: 'sales' | 'customers';
+      syncConfig?: {
+        platform: 'hubspot' | 'attio';
+        accountId: string;
+        direction: 'push' | 'pull' | 'bidirectional';
+        lastSyncedAt?: string;
+        syncCursor?: string;
+        externalListId?: string;      // ID of the list in HubSpot/Attio
+        externalPeopleListId?: string; // Attio people list ID
+        externalCompaniesListId?: string; // Attio companies list ID
+      } | null;
     }
   ) {
     try {
@@ -3369,6 +3379,12 @@ export const crmDb = {
         expressionAttributeNames['#listType'] = 'listType';
         updateExpressions.push('#listType = :listType');
         expressionAttributeValues[':listType'] = updates.listType;
+      }
+
+      if (updates.syncConfig !== undefined) {
+        expressionAttributeNames['#syncConfig'] = 'syncConfig';
+        updateExpressions.push('#syncConfig = :syncConfig');
+        expressionAttributeValues[':syncConfig'] = updates.syncConfig;
       }
 
       if (updateExpressions.length === 0) {
@@ -3890,6 +3906,7 @@ export const crmDb = {
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
+    attioRecordId?: string;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4079,6 +4096,11 @@ export const crmDb = {
           setExpressions.push('contactStatusNote = :csNote');
           expressionAttributeValues[':csNote'] = updates.contactStatusNote;
         }
+      }
+
+      if (updates.attioRecordId !== undefined) {
+        setExpressions.push('attioRecordId = :attioRecordId');
+        expressionAttributeValues[':attioRecordId'] = updates.attioRecordId;
       }
 
       // Always update updatedAt
@@ -5183,9 +5205,9 @@ export const socialEngagementTrackingDb = {
           ':scheduleId': tracker.scheduleId,
           ':one': 1,
         };
-        if (tracker.executedAt)    { setFields.push('executedAt = :executedAt');       exprValues[':executedAt']    = tracker.executedAt; }
+        if (tracker.executedAt) { setFields.push('executedAt = :executedAt'); exprValues[':executedAt'] = tracker.executedAt; }
         if (tracker.generatedText) { setFields.push('generatedText = :generatedText'); exprValues[':generatedText'] = tracker.generatedText; }
-        if (tracker.reactionType)  { setFields.push('reactionType = :reactionType');   exprValues[':reactionType']  = tracker.reactionType; }
+        if (tracker.reactionType) { setFields.push('reactionType = :reactionType'); exprValues[':reactionType'] = tracker.reactionType; }
 
         await dynamodb.update({
           TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,

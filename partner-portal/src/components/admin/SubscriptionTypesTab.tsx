@@ -53,6 +53,8 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'gmail', label: 'Gmail' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
+  { id: 'hubspot', label: 'HubSpot' },
+  { id: 'attio', label: 'Attio' },
 ];
 
 interface AvailableSkill {
