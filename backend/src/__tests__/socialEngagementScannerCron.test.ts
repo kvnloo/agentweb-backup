@@ -280,7 +280,7 @@ describe('SocialEngagementScanner', () => {
       });
       const engagerAccount = makeAccount({
         account_id: 'acc-engager',
-        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true, preferredActions: ['like', 'comment'] },
       });
 
       mockUserDb.scanWithFilter.mockResolvedValue([
@@ -297,6 +297,135 @@ describe('SocialEngagementScanner', () => {
       expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
         expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'comment', targetType: 'post' }) })
       );
+    });
+
+    it('should respect engager preferredActions — skip comment if engager only allows like', async () => {
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          preferredActions: ['like', 'comment'],
+          maxLikesPerPost: 1,
+          maxCommentsPerPost: 1,
+        },
+      });
+      // Engager is configured to only like, not comment
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enableAsPostEngager: true,
+          preferredActions: ['like'],
+        },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Only a like should be scheduled — the engager's own preferredActions blocks the comment
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(1);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'like', targetType: 'post' }) })
+      );
+    });
+
+    it('should deduplicate posts with identical content (LinkedIn dual-URN bug)', async () => {
+      // LinkedIn can return the same physical post under two URN formats in one listPosts call.
+      // The scanner must treat them as one post and only schedule engagement once.
+      mockAdapter.listPosts.mockResolvedValue([
+        makePost({ id: 'urn:li:share:111', commentary: 'Hello world post', createdAt: RECENT_POST_TS }),
+        makePost({ id: 'urn:li:ugcPost:222', commentary: 'Hello world post', createdAt: RECENT_POST_TS }),
+      ]);
+
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 1,
+        },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Only one schedule (for the first URN) — duplicate content is filtered out
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(1);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variableValues: expect.objectContaining({ postId: 'urn:li:share:111' }),
+        })
+      );
+    });
+
+    it('should keep both posts when they have different content', async () => {
+      mockAdapter.listPosts.mockResolvedValue([
+        makePost({ id: 'urn:li:share:111', commentary: 'First post content', createdAt: RECENT_POST_TS }),
+        makePost({ id: 'urn:li:share:222', commentary: 'Second post content', createdAt: RECENT_POST_TS }),
+      ]);
+
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 2,
+        },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Both posts are distinct — two schedules expected
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep posts without parseable content (no commentary/content field)', async () => {
+      // Posts without commentary should not be filtered out even if there are multiple
+      mockAdapter.listPosts.mockResolvedValue([
+        makePost({ id: 'urn:li:share:111', createdAt: RECENT_POST_TS }), // no commentary
+        makePost({ id: 'urn:li:share:222', createdAt: RECENT_POST_TS }), // no commentary
+      ]);
+
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 2,
+        },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Both posts kept since neither has parseable content to dedup on
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(2);
     });
 
     it('should call onActionScheduled for actions within 30-min window', async () => {
