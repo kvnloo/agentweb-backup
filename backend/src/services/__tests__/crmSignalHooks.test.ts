@@ -1,6 +1,7 @@
 import {
   onUserSignup,
   onEmmaSessionStart,
+  onStripeSubscriptionEvent,
 } from '../crmSignalHooks';
 import type { SyncInput, SyncResult } from '../contactSyncService';
 
@@ -157,5 +158,89 @@ describe('onEmmaSessionStart', () => {
     );
     expect(res).toBeNull();
     expect(fn).not.toHaveBeenCalled();
+  });
+});
+
+describe('onStripeSubscriptionEvent', () => {
+  it('maps customer.subscription.created -> payment.subscribed', async () => {
+    const { fn, calls } = makeStubSync();
+    await onStripeSubscriptionEvent(
+      {
+        eventId: 'evt_abc',
+        eventType: 'customer.subscription.created',
+        email: 'jane@acme.com',
+        stripeCustomerId: 'cus_1',
+        stripeSubscriptionId: 'sub_1',
+        status: 'active',
+        subscriptionType: 'pro',
+      },
+      { syncContact: fn, logger: silentLogger }
+    );
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(calls[0].source).toBe('stripe');
+    expect(calls[0].sourceRecordId).toBe('stripe-evt_abc');
+    expect(calls[0].eventType).toBe('payment.subscribed');
+    expect(calls[0].payload?.stripeCustomerId).toBe('cus_1');
+    expect(calls[0].payload?.status).toBe('active');
+  });
+
+  it('maps customer.subscription.deleted -> payment.canceled', async () => {
+    const { fn, calls } = makeStubSync();
+    await onStripeSubscriptionEvent(
+      { eventId: 'e2', eventType: 'customer.subscription.deleted', email: 'a@b.com' },
+      { syncContact: fn, logger: silentLogger }
+    );
+    expect(calls[0].eventType).toBe('payment.canceled');
+  });
+
+  it('maps customer.subscription.updated (past_due) -> payment.updated', async () => {
+    const { fn, calls } = makeStubSync();
+    await onStripeSubscriptionEvent(
+      {
+        eventId: 'e3',
+        eventType: 'customer.subscription.updated',
+        email: 'a@b.com',
+        status: 'past_due',
+      },
+      { syncContact: fn, logger: silentLogger }
+    );
+    expect(calls[0].eventType).toBe('payment.updated');
+    expect(calls[0].payload?.status).toBe('past_due');
+  });
+
+  it('is idempotent on the same Stripe event id (sourceRecordId)', async () => {
+    const { fn } = makeStubSync();
+    await onStripeSubscriptionEvent(
+      { eventId: 'evt_dup', eventType: 'customer.subscription.updated', email: 'a@b.com' },
+      { syncContact: fn, logger: silentLogger }
+    );
+    await onStripeSubscriptionEvent(
+      { eventId: 'evt_dup', eventType: 'customer.subscription.updated', email: 'a@b.com' },
+      { syncContact: fn, logger: silentLogger }
+    );
+    expect(fn.mock.calls[0][0].sourceRecordId).toBe(
+      fn.mock.calls[1][0].sourceRecordId
+    );
+  });
+
+  it('skips when email missing', async () => {
+    const { fn } = makeStubSync();
+    const res = await onStripeSubscriptionEvent(
+      { eventId: 'e', eventType: 'customer.subscription.updated', email: '' },
+      { syncContact: fn, logger: silentLogger }
+    );
+    expect(res).toBeNull();
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('swallows errors so webhook response is never broken', async () => {
+    const fn = jest.fn(async () => {
+      throw new Error('network');
+    });
+    const res = await onStripeSubscriptionEvent(
+      { eventId: 'e', eventType: 'customer.subscription.updated', email: 'a@b.com' },
+      { syncContact: fn, logger: silentLogger }
+    );
+    expect(res).toBeNull();
   });
 });
