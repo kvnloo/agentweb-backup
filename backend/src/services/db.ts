@@ -236,6 +236,17 @@ export interface User {
   allowedSkills?: string[];
   orgId?: string;
   orgRole?: "owner" | "member";
+  /**
+   * Attribution — forward-compatible with a future UserTouches timeline table.
+   * firstTouch is set once at signup and never mutated; lastTouch refreshes on
+   * each login where the client sends new attribution data.
+   * Top-level utmSource / utmMedium are denormalized from firstTouch for cheap
+   * channel-attribution queries without scanning the blob.
+   */
+  firstTouch?: import("../types/attribution").AttributionTouch;
+  lastTouch?: import("../types/attribution").AttributionTouch;
+  utmSource?: string;
+  utmMedium?: string;
 }
 
 export interface Organization {

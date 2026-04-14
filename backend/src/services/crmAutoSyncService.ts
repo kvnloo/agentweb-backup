@@ -44,6 +44,7 @@ export async function syncNewUserToLeadList(user: {
   createdAt?: string;
   stripe_customer_id?: string;
   subscriptionType?: string;
+  attribution?: import("../types/attribution").AttributionTouch;
 }): Promise<void> {
   try {
     const setting = await settingsService.getSetting(CRM_SYNC_SETTING_KEY);
@@ -75,6 +76,20 @@ export async function syncNewUserToLeadList(user: {
         chatSessionCount: 0,
         brandGuidelinesCompletedAt: "",
         lastActiveDate: (user.createdAt || new Date().toISOString()).split('T')[0],
+
+        // Attribution — flattened so each field is queryable/filterable in the CRM
+        ...(user.attribution?.utm?.source && { utm_source: user.attribution.utm.source }),
+        ...(user.attribution?.utm?.medium && { utm_medium: user.attribution.utm.medium }),
+        ...(user.attribution?.utm?.campaign && { utm_campaign: user.attribution.utm.campaign }),
+        ...(user.attribution?.utm?.content && { utm_content: user.attribution.utm.content }),
+        ...(user.attribution?.utm?.term && { utm_term: user.attribution.utm.term }),
+        ...(user.attribution?.clickIds?.gclid && { gclid: user.attribution.clickIds.gclid }),
+        ...(user.attribution?.clickIds?.fbclid && { fbclid: user.attribution.clickIds.fbclid }),
+        ...(user.attribution?.clickIds?.ttclid && { ttclid: user.attribution.clickIds.ttclid }),
+        ...(user.attribution?.clickIds?.liFatId && { li_fat_id: user.attribution.clickIds.liFatId }),
+        ...(user.attribution?.referrer && { referrer: user.attribution.referrer }),
+        ...(user.attribution?.landingUrl && { landing_url: user.attribution.landingUrl }),
+        ...(user.attribution?.ref && { ref: user.attribution.ref }),
       },
     };
 
