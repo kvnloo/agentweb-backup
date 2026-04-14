@@ -2026,10 +2026,11 @@ export class AgentModeService {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }
 
-      // Extract partial usage from any response messages accumulated before the error.
-      // This ensures token costs are tracked even when generation fails mid-stream.
+      // Extract all partial response messages accumulated before the error.
+      // Include ALL non-user messages (assistant + tool results), not just ones with `.usage`,
+      // so that browser tool call history is preserved when a tool call times out or crashes.
       const partialResponseMessages = _messages
-        ? _messages.slice(_initialMessageCount).filter((msg: any) => msg.role !== 'user' && msg.usage)
+        ? _messages.slice(_initialMessageCount).filter((msg: any) => msg.role !== 'user')
         : [];
 
       // Preserve original error details for upstream error classification (e.g. isContextLimitError)
