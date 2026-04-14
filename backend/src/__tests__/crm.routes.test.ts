@@ -850,6 +850,7 @@ describe('CRM Routes', () => {
       mockRequest.body = {
         instruction: 'Find company info',
         outputFields: ['company_info'],
+        sources: ['web_search', 'linkedin'],
         webSearchTemplate: '{{company}} overview',
         linkedinSearchTemplate: '{{firstName}} {{company}}',
         sourcesPerField: { company_info: ['web_search'] },
@@ -871,6 +872,7 @@ describe('CRM Routes', () => {
         ['company_info'],
         '{{company}} overview',
         '{{firstName}} {{company}}',
+        ['web_search', 'linkedin'],
       );
     });
 
@@ -889,7 +891,7 @@ describe('CRM Routes', () => {
       mockRequest.body = {
         instruction: 'Find funding data',
         outputFields: ['funding_stage'],
-        sourcesPerField: undefined,
+        sources: ['web_search'],
       };
 
       const handler = findEnrichWebPostHandler();
@@ -907,6 +909,7 @@ describe('CRM Routes', () => {
         ['funding_stage'],
         undefined,
         undefined,
+        ['web_search'],
       );
     });
   });

@@ -3452,6 +3452,7 @@ export const crmDb = {
     enrichmentOutputFields?: string[],
     webSearchTemplate?: string,
     linkedinSearchTemplate?: string,
+    enrichSources?: string[],
   ) {
     try {
       const expressionParts = ['searchQueryTemplates = :templates', 'updatedAt = :updatedAt'];
@@ -3483,6 +3484,11 @@ export const crmDb = {
       if (linkedinSearchTemplate !== undefined) {
         expressionParts.push('linkedinSearchTemplate = :linkedinSearchTemplate');
         expressionAttributeValues[':linkedinSearchTemplate'] = linkedinSearchTemplate;
+      }
+
+      if (enrichSources !== undefined) {
+        expressionParts.push('enrichSources = :enrichSources');
+        expressionAttributeValues[':enrichSources'] = enrichSources;
       }
 
       const params = {

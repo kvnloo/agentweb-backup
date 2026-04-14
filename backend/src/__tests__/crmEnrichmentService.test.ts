@@ -1251,7 +1251,7 @@ describe('CrmEnrichmentService.suggestEnrichment', () => {
 
     expect(mockCrmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
       'list_s1', {}, undefined, 'test', ['funding_stage'],
-      '{{company}} funding investors', undefined
+      '{{company}} funding investors', undefined, ['web_search']
     );
   });
 
@@ -1274,7 +1274,7 @@ describe('CrmEnrichmentService.suggestEnrichment', () => {
     expect(result.sourcesPerField).toEqual(sourcesPerField);
     expect(mockCrmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
       'list_s2', {}, sourcesPerField, 'test', ['linkedin_url', 'company_info'],
-      '{{company}} overview', '{{firstName}} {{lastName}} {{company}}'
+      '{{company}} overview', '{{firstName}} {{lastName}} {{company}}', ['linkedin', 'web_search']
     );
   });
 

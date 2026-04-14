@@ -2327,6 +2327,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       outputFields,
       webSearchTemplate,
       linkedinSearchTemplate,
+      sources,
     ).catch((err: unknown) => console.warn(`[CRM] enrich-web ${mode}: failed to save config:`, err));
 
     return res.json(responseBody);

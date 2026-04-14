@@ -934,6 +934,7 @@ No markdown, no backticks, no extra text.`;
           result.outputFields.length > 0 ? result.outputFields : undefined,
           result.webSearchTemplate || undefined,
           result.linkedinSearchTemplate || undefined,
+          result.sources.length > 0 ? result.sources : undefined,
         );
       } catch (err) {
         console.warn('[CrmEnrichment] suggestEnrichment: failed to save config to list:', err);
