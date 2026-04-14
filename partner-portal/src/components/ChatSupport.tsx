@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { useLocation } from 'react-router-dom';
 import axios from 'axios';
@@ -16,8 +16,8 @@ import { io, Socket } from 'socket.io-client';
 import { DISCORD_INVITE_URL } from '../config';
 
 interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | any[];
 }
 
 interface ChatSession {
@@ -292,10 +292,12 @@ const ChatSupport: React.FC = () => {
     }
   };
 
-  // Filter out system messages for display, but keep navigation messages
-  const displayMessages = session?.messages.filter(msg => 
-    msg.role !== 'system' || msg.content.startsWith('📍')
-  ) || [];
+  const displayMessages = useMemo(() => session?.messages.filter(msg => {
+    if (msg.role === 'system') return typeof msg.content === 'string' && msg.content.startsWith('📍');
+    if (msg.role === 'tool') return false;
+    if (msg.role === 'assistant' && typeof msg.content !== 'string') return false;
+    return true;
+  }) || [], [session?.messages]);
 
   // Create a new chat session manually
   const createNewChatSession = async () => {
@@ -675,7 +677,7 @@ const ChatSupport: React.FC = () => {
                           }
                         }}
                         dangerouslySetInnerHTML={{
-                          __html: renderChart(msg.content)
+                          __html: renderChart(typeof msg.content === 'string' ? msg.content : '')
                         }}
                       />
                     </Box>

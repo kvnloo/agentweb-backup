@@ -18,6 +18,23 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-14',
+    changes: [
+      'Improved: Emma Can Now See Client Payment Data',
+      '- When asked about clients, Emma (the in-app assistant) now includes subscription type, monthly charge, and whether a payment method is on file',
+      '- Applies to both the client list overview and individual client health assessments',
+      '- Available to admin users via the partner portal chat',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fix: Emma Tools Now Available to Admin Users on Partner Portal',
+      '- Admin users were not getting Emma\'s tool access when chatting via the partner portal due to a portal-type gate — now fixed',
+      '- Emma correctly loads admin tools (client listing, health assessments, etc.) for all admin sessions regardless of portal',
+    ],
+  },
+  {
     date: '2026-04-13',
     changes: [
       'New: Engagement Personality for Auto-Engagement',
