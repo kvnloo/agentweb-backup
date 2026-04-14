@@ -1893,6 +1893,11 @@ Returns for each client:
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
 - signup_time: account creation / sign-up timestamp
+- subscription_type: subscription tier (e.g. Free, Basic, Pro)
+- stripe_customer_id: Stripe customer ID (null if not set)
+- current_period_end: ISO date of current billing period end (null if not set)
+- has_payment_method: whether the client has a payment method on file in Stripe
+- monthly_amount_cents: most recent invoice amount in cents (e.g. 4900 = $49.00), null if not set
 
 Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
     inputSchema: {

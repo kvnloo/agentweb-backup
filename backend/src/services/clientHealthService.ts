@@ -38,6 +38,14 @@ interface CreativeVariety {
   top_creatives?: Array<{ id: string; name: string; spend_pct: number }>;
 }
 
+interface PaymentInfo {
+  subscription_type: string | null;
+  stripe_customer_id: string | null;
+  current_period_end: string | null;
+  has_payment_method: boolean;
+  monthly_amount_cents: number | null;
+}
+
 interface ClientHealthAssessment {
   client: { userId: string; email: string; displayName: string };
   ads_layer: AdsLayerHealth;
@@ -46,6 +54,7 @@ interface ClientHealthAssessment {
   creative_variety: CreativeVariety;
   status: HealthStatus;
   status_reasons: string[];
+  payment: PaymentInfo;
 }
 
 interface ClientSummary {
@@ -60,6 +69,21 @@ interface ClientSummary {
   signup_time: string | null;
   token_usage_current?: { month: string; totalTokens: number; totalCost: number } | null;
   token_usage_history?: Array<{ month: string; totalTokens: number; totalCost: number }>;
+  subscription_type: string | null;
+  stripe_customer_id: string | null;
+  current_period_end: string | null;
+  has_payment_method: boolean;
+  monthly_amount_cents: number | null;
+}
+
+function buildPaymentInfo(user: any): PaymentInfo {
+  return {
+    subscription_type: user.subscriptionType || null,
+    stripe_customer_id: user.stripe_customer_id || null,
+    current_period_end: user.current_period_end || null,
+    has_payment_method: user.has_payment_method === true,
+    monthly_amount_cents: user.subscription_amount ?? null,
+  };
 }
 
 /**
@@ -304,6 +328,7 @@ export async function assessClientHealth(
       creative_variety: creativeVariety,
       status,
       status_reasons: reasons,
+      payment: buildPaymentInfo(client),
     };
 
     return {
@@ -372,6 +397,7 @@ export async function listAllClients(callerUserId: string): Promise<any> {
             ? { month: user.tokenUsage.month, totalTokens: user.tokenUsage.totalTokens, totalCost: user.tokenUsage.totalCost }
             : null,
           token_usage_history: user.tokenUsageHistory || [],
+          ...buildPaymentInfo(user),
         };
       })
     );
