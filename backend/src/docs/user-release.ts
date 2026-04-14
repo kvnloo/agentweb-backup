@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-14',
+    changes: [
+      'Improved: PR Digest Now Supports Any Time Range',
+      '- When asking Emma to fetch PRs for "the last 7 days" or any relative time range, she now correctly queries the full period — previously she always defaulted to the past 24 hours regardless of what you asked',
+      '- A new days_ago parameter lets Emma pass the range directly (e.g. days_ago: 7) without having to compute ISO timestamps',
+      '- Explicit since/until ISO date parameters still work as before for precise date ranges',
+    ],
+  },
+  {
     date: '2026-04-13',
     changes: [
       'New: Engagement Personality for Auto-Engagement',
