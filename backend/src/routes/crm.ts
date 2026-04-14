@@ -14,6 +14,13 @@ import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { syncContact, SyncInput } from '../services/contactSyncService';
+import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
+import Stripe from 'stripe';
+
+const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const d1StripeClient = d1StripeSecretKey
+  ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
+  : null;
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -424,6 +431,105 @@ router.post('/sync', async (req: Request, res: Response) => {
     const msg = typeof error?.message === 'string' ? error.message : 'Sync failed';
     const status = /required|no email|no sourceRecordId/i.test(msg) ? 400 : 500;
     return res.status(status).json({ message: msg });
+  }
+});
+
+/**
+ * @route GET /api/crm/leads/:leadId/enrichment
+ * @desc Internal enrichment endpoint (D1) — joins AW-Users + Stripe for a
+ *       single Contact at read time. Caches per-email for 1h.
+ *       Requires ?listId=<id> because AW-Leads composite key is (listId, leadId).
+ * @access Private (owner only)
+ */
+router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { leadId } = req.params;
+    const listId = typeof req.query.listId === 'string' ? req.query.listId : '';
+    if (!listId) {
+      return res.status(400).json({ message: 'listId query parameter is required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || list.userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    const email = lead.email ? String(lead.email).toLowerCase().trim() : '';
+    if (!email) {
+      return res.json({
+        isUser: false,
+        signupDate: null,
+        subscriptionType: null,
+        stripeStatus: null,
+        mrr: 0,
+        currentPeriodEnd: null,
+        stripeCustomerId: null,
+      });
+    }
+
+    const deps: EnrichmentDeps = {
+      getUserByEmail: async (e: string) => {
+        const u = await userDb.getUserByEmail(e);
+        return u ? (u as any) : null;
+      },
+      getStripeSubscriptionForCustomer: async (customerId: string) => {
+        try {
+          if (!d1StripeClient) return null;
+          const subs = await d1StripeClient.subscriptions.list({
+            customer: customerId,
+            status: 'all',
+            limit: 10,
+          });
+          if (!subs.data || subs.data.length === 0) return null;
+          const statusPriority: Record<string, number> = {
+            active: 0, trialing: 1, past_due: 2, canceled: 3,
+          };
+          const sorted = [...subs.data].sort(
+            (a: any, b: any) =>
+              (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
+          );
+          const sub: any = sorted[0];
+          const priceId = sub.items?.data?.[0]?.price?.id;
+          const price = sub.items?.data?.[0]?.price;
+          const mrrCents = price?.unit_amount
+            ? (price.recurring?.interval === 'year'
+                ? Math.round(price.unit_amount / 12)
+                : price.unit_amount)
+            : 0;
+          const cpe = (sub as any).current_period_end;
+          const currentPeriodEnd = cpe
+            ? new Date(typeof cpe === 'number' ? cpe * 1000 : cpe).toISOString()
+            : null;
+          return {
+            id: sub.id,
+            status: sub.status,
+            currentPeriodEnd,
+            mrrCents,
+            priceId,
+          };
+        } catch (err) {
+          console.warn('[enrichment] Stripe list failed:', (err as any)?.message);
+          return null;
+        }
+      },
+    };
+
+    const result = await enrichContact(email, deps, defaultEnrichmentCache);
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/leads/:leadId/enrichment:', error);
+    return res.status(500).json({ message: error.message || 'Enrichment failed' });
   }
 });
 
