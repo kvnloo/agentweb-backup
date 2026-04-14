@@ -496,6 +496,47 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * List received connection invitations (pending requests from others).
+   */
+  async listReceivedInvitations(accountId: string, cursor?: string): Promise<any> {
+    try {
+      this.log(`Listing received invitations`, { accountId, cursor });
+      const client = await this.getClient();
+      const params: any = { account_id: accountId };
+      if (cursor) params.cursor = cursor;
+      const result = await (client as any).request.send({
+        path: ['users', 'invite', 'received'],
+        method: 'GET',
+        parameters: params,
+      });
+      this.log(`Listed received invitations successfully`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'listReceivedInvitations');
+    }
+  }
+
+  /**
+   * Accept a received connection invitation.
+   */
+  async acceptInvitation(invitationId: string, accountId: string): Promise<any> {
+    try {
+      this.log(`Accepting invitation: ${invitationId}`, { accountId });
+      const client = await this.getClient();
+      const result = await (client as any).request.send({
+        path: ['users', 'invite', 'received', invitationId],
+        method: 'POST',
+        body: { account_id: accountId },
+        headers: { 'Content-Type': 'application/json' },
+      });
+      this.log(`Successfully accepted invitation: ${invitationId}`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'acceptInvitation');
+    }
+  }
+
+  /**
    * Get a LinkedIn company profile.
    */
   async getCompanyProfile(companyId: string, accountId: string): Promise<any> {

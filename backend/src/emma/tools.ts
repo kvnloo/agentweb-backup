@@ -177,10 +177,12 @@ Actions:
 - get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
+- list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request by invitation_id (obtain from list-received-invitations).
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
@@ -191,7 +193,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'update-conversation-history'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -240,11 +242,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         invitation_id: {
           type: 'string',
-          description: 'Invitation ID for cancel-invitation action. Obtain from list-sent-invitations.'
+          description: 'Invitation ID for cancel-invitation or accept-invitation actions. Obtain from list-sent-invitations or list-received-invitations respectively.'
         },
         cursor: {
           type: 'string',
-          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations.'
+          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
         }
       },
       required: ['action', 'account_id']
