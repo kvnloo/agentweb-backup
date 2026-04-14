@@ -1,6 +1,8 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb, userDb } from '../services/db';
+import { crmDb } from '../services/db';
+import { askCrm, AskCrmLead } from '../services/askCrmService';
 import { getAccountSummary } from '../services/accountSummaryService';
 
 // Register browser cookie persistence tools
@@ -2712,6 +2714,89 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'ask_crm',
+  definition: {
+    name: 'ask_crm',
+    description: 'Answer a free-form question about the CRM (hot leads, at-risk customers, deals closing, paying customers, specific contact). Returns a structured answer with intent classification, a summary line, and a ranked list of relevant leads with citation URLs. Use this when the user asks strategic pipeline questions like "who should I reach out to today", "which deals are about to close", "who is at risk", or "is Jane at Acme paying us". For single-list browsing, prefer get_leads/search_leads.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The free-form question to answer. Examples: "Who should I reach out to today?", "Which deals are close to closing?", "Is Jane at Acme paying us?", "Who are my at-risk customers?"'
+        },
+        limit: {
+          type: 'number',
+          description: 'Max number of leads in the response list (default 10, max 25)'
+        },
+        load_limit: {
+          type: 'number',
+          description: 'Max number of leads to scan across the user\'s lists (default 500). Rarely needed — only raise if the user has tons of lists.'
+        }
+      },
+      required: ['question']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId: string | undefined = context?.userId;
+    if (!userId) {
+      return { error: 'Missing userId context. ask_crm is only available inside an authenticated Emma session.' };
+    }
+
+    const resultLimit = Math.min(Math.max(args.limit ?? 10, 1), 25);
+    const loadLimit = Math.max(args.load_limit ?? 500, 1);
+
+    // Lazy lead iteration across all of the user's lists. We flatten into the
+    // AskCrmLead shape so askCrm doesn't have to know about the underlying
+    // storage layout.
+    const loadLeadsForUser = async (uid: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
+      const lists = (await crmDb.getLeadListsByUserId(uid)) || [];
+      const out: AskCrmLead[] = [];
+      for (const list of lists as any[]) {
+        if (out.length >= opts.limit) break;
+        const remaining = opts.limit - out.length;
+        const page = await crmDb.getLeadsByListId(list.listId, Math.min(remaining, 200));
+        const items: any[] = (page && (page as any).items) || [];
+        for (const it of items) {
+          out.push({
+            leadId: it.leadId,
+            listId: it.listId,
+            email: it.email || null,
+            firstName: it.firstName || null,
+            lastName: it.lastName || null,
+            company: it.company || null,
+            title: it.title || null,
+            status: it.status || null,
+            dealValue: typeof it.dealValue === 'number' ? it.dealValue : null,
+            lifecycle: it.lifecycle || null,
+            heatScore: typeof it.heatScore === 'number' ? it.heatScore : null,
+            healthScore: typeof it.healthScore === 'number' ? it.healthScore : null,
+            isICP: typeof it.isICP === 'boolean' ? it.isICP : null,
+            lastEngagementAt: it.lastEngagementAt || null,
+            openDealStages: Array.isArray(it.openDealStages) ? it.openDealStages : null,
+            contactStatus: it.contactStatus || null,
+          });
+          if (out.length >= opts.limit) break;
+        }
+      }
+      return out;
+    };
+
+    try {
+      const answer = await askCrm(
+        String(args.question || ''),
+        userId,
+        { loadLeadsForUser },
+        { resultLimit, loadLimit }
+      );
+      return answer;
+    } catch (err: any) {
+      return { error: err?.message || 'ask_crm failed' };
+    }
   }
 });
 
