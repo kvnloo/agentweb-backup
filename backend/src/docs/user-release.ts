@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'Admin: Configurable Default Image Generation Model for Agent Mode',
+      '- Admins can now set the default image API model used by the generate_image tool in Agent Mode (Admin > Agent Mode > Image API Default Model)',
+      '- Supported models: gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, gpt-image-1, gemini-2.5-flash-image',
+      '- When no model is explicitly specified by the agent, the configured default is used instead of the hardcoded fallback',
+      '- The "Image Session Default Model" setting (formerly "Image Generation Default Model") controls the LLM used to plan/orchestrate image sessions — clarified in the UI',
+      '- The legacy "Image Models" tab (for web automation task image models) is now labelled as legacy with a redirect notice to the Agent Mode tab',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Emma Can Now Clone Meta Ads With Images',
       '- Emma can now copy an existing Meta ad into a new paused ad — including its image, ad copy, and call-to-action — with a single instruction like "Clone this ad with a new landing page URL"',
       '- Previously, Emma would get stuck when trying to clone ads because image details were not included in the ad listing; she now retrieves the full creative (image hash, story spec, body, title) in one step',
