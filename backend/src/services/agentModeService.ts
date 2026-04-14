@@ -19480,14 +19480,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-received-invitations': {
           const receivedResult = await linkedInOutreachService.listReceivedInvitations(account_id, args.cursor);
-          // Trim to essential fields — sender identity and invitation id are all the agent needs.
+          // Trim to essential fields. Unipile uses "invited_user_*" for the sender.
           if (Array.isArray(receivedResult?.items)) {
             const trimmedItems = receivedResult.items.map((item: any) => ({
               id: item.id,
-              sender_id: item.sender_id,
-              sender_public_id: item.sender_public_id,
-              sender: item.sender,
-              created_at: item.created_at,
+              invitation_text: item.invitation_text,
+              date: item.date,
+              sender_profile: item.sender_profile || null,
             }));
             return { success: true, data: { ...receivedResult, items: trimmedItems } };
           }

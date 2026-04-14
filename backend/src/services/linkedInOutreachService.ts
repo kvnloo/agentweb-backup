@@ -497,6 +497,8 @@ export class LinkedInOutreachService {
 
   /**
    * List received connection invitations (pending requests from others).
+   * Automatically enriches each item with sender profile data (name, headline, etc.)
+   * using the sender_public_id field returned by the Unipile API.
    */
   async listReceivedInvitations(accountId: string, cursor?: string): Promise<any> {
     try {
@@ -510,6 +512,44 @@ export class LinkedInOutreachService {
         parameters: params,
       });
       this.log(`Listed received invitations successfully`);
+
+      // Unipile uses "invited_user_*" fields for the sender (person who sent the invite to us).
+      // The inline fields (description, picture, public_id) are already present — no extra API call needed.
+      // Optionally fetch a full profile using invited_user_public_id for richer data.
+      if (result?.items && Array.isArray(result.items) && result.items.length > 0) {
+        const enrichedItems = await Promise.all(result.items.map(async (item: any) => {
+          const publicId = item.invited_user_public_id;
+          // Start with the inline sender data already present in the invitation item
+          const senderProfile: any = {
+            public_id: publicId || null,
+            full_name: item.invited_user || null,
+            headline: item.invited_user_description || null,
+            profile_picture_url: item.invited_user_profile_picture_url || null,
+            provider_id: item.invited_user_id || null,
+          };
+
+          // Attempt a full profile fetch for richer data (location, network_distance, etc.)
+          if (publicId) {
+            try {
+              const profile = await client.request.send({
+                method: 'GET',
+                path: ['users', publicId],
+                parameters: { account_id: accountId },
+              }) as any;
+              senderProfile.full_name = profile?.full_name || senderProfile.full_name;
+              senderProfile.headline = profile?.headline || senderProfile.headline;
+              senderProfile.location = profile?.location || null;
+              senderProfile.network_distance = profile?.network_distance || null;
+            } catch {
+              // Full profile fetch failed — inline data is still returned
+            }
+          }
+
+          return { ...item, sender_profile: senderProfile };
+        }));
+        return { ...result, items: enrichedItems };
+      }
+
       return result;
     } catch (error: any) {
       return this.handleError(error, 'listReceivedInvitations');
