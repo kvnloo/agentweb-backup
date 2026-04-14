@@ -2269,6 +2269,17 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         sourcesPerField,
       });
 
+      // Persist config so it can be restored when the dialog reopens
+      crmDb.updateSearchQueryTemplates(
+        listId,
+        {},
+        sourcesPerField,
+        instruction,
+        outputFields,
+        webSearchTemplate,
+        linkedinSearchTemplate,
+      ).catch((err: any) => console.warn('[CRM] enrich-web preview: failed to save config:', err));
+
       return res.json({
         success: true,
         totalLeads: result.totalLeads,
@@ -2294,6 +2305,17 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         linkedinSearchTemplate,
         sourcesPerField,
       }, socketId);
+
+      // Persist config so it can be restored when the dialog reopens
+      crmDb.updateSearchQueryTemplates(
+        listId,
+        {},
+        sourcesPerField,
+        instruction,
+        outputFields,
+        webSearchTemplate,
+        linkedinSearchTemplate,
+      ).catch((err: any) => console.warn('[CRM] enrich-web enrich: failed to save config:', err));
 
       return res.json({
         success: true,
