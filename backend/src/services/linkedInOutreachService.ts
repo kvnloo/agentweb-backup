@@ -513,35 +513,36 @@ export class LinkedInOutreachService {
       });
       this.log(`Listed received invitations successfully`);
 
-      // Unipile uses "invited_user_*" fields for the sender (person who sent the invite to us).
-      // The inline fields (description, picture, public_id) are already present — no extra API call needed.
-      // Optionally fetch a full profile using invited_user_public_id for richer data.
+      // In Unipile's model: "inviter" object = person who sent the invite (sender),
+      // "invited_user" string = the account holder (recipient = us).
+      // inviter has: inviter_name, inviter_description, inviter_public_identifier, inviter_profile_picture_url
       if (result?.items && Array.isArray(result.items) && result.items.length > 0) {
         const enrichedItems = await Promise.all(result.items.map(async (item: any) => {
-          const publicId = item.invited_user_public_id;
-          // Start with the inline sender data already present in the invitation item
+          const inviter = item.inviter || {};
+
           const senderProfile: any = {
-            public_id: publicId || null,
-            full_name: item.invited_user || null,
-            headline: item.invited_user_description || null,
-            profile_picture_url: item.invited_user_profile_picture_url || null,
-            provider_id: item.invited_user_id || null,
+            full_name: inviter.inviter_name || null,
+            headline: inviter.inviter_description || null,
+            profile_picture_url: inviter.inviter_profile_picture_url || null,
+            public_id: inviter.inviter_public_identifier || null,
+            provider_id: inviter.inviter_id || null,
           };
 
-          // Attempt a full profile fetch for richer data (location, network_distance, etc.)
-          if (publicId) {
+          // Optionally fetch a full profile for richer data (location, network_distance)
+          if (senderProfile.public_id) {
             try {
               const profile = await client.request.send({
                 method: 'GET',
-                path: ['users', publicId],
+                path: ['users', senderProfile.public_id],
                 parameters: { account_id: accountId },
               }) as any;
               senderProfile.full_name = profile?.full_name || senderProfile.full_name;
               senderProfile.headline = profile?.headline || senderProfile.headline;
               senderProfile.location = profile?.location || null;
               senderProfile.network_distance = profile?.network_distance || null;
+              senderProfile.profile_picture_url = profile?.profile_picture_url || senderProfile.profile_picture_url;
             } catch {
-              // Full profile fetch failed — inline data is still returned
+              // Profile fetch failed — inline data is still returned
             }
           }
 
