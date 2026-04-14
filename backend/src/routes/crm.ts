@@ -13,6 +13,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { syncContact, SyncInput } from '../services/contactSyncService';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -391,6 +392,40 @@ const fetchAllLeadsByStatusIndex = async (
 };
 
 // Lead List Routes
+
+/**
+ * @route POST /api/crm/sync
+ * @desc Unified sync endpoint — the single entry point for all inbound CRM
+ *       signals (signup, Stripe, lead_form, emma_session, fathom, manual).
+ *       Enforces idempotency, identity resolution, event logging, and score
+ *       recompute. See `contactSyncService.ts` for details.
+ * @access Private (JWT)
+ */
+router.post('/sync', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user?.userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const body = req.body as Partial<SyncInput>;
+
+    if (!body || !body.source || !body.sourceRecordId || !body.eventType || !body.identity) {
+      return res.status(400).json({
+        message:
+          'Invalid body. Required: source, sourceRecordId, eventType, identity.',
+      });
+    }
+
+    const result = await syncContact(body as SyncInput);
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error in POST /api/crm/sync:', error);
+    const msg = typeof error?.message === 'string' ? error.message : 'Sync failed';
+    const status = /required|no email|no sourceRecordId/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ message: msg });
+  }
+});
 
 /**
  * @route GET /api/crm/lists
