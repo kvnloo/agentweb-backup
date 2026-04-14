@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'New: Brand Guide Document Now Supports URLs',
+      '- In Brand Guidelines, you can now provide a URL to your brand guide document instead of uploading a file',
+      '- The upload section shows a file picker and a "Provide a URL" field side by side',
+      '- URL entries display with a link icon and open the URL in a new tab',
+      '- Emma can also update your brand guide document URL via chat',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Admin: Configurable Default Image Generation Model for Agent Mode',
       '- Admins can now set the default image API model used by the generate_image tool in Agent Mode (Admin > Agent Mode > Image API Default Model)',
       '- Supported models: gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, gpt-image-1, gemini-2.5-flash-image',
