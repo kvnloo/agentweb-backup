@@ -295,7 +295,7 @@ ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
   AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE
+  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -313,6 +313,7 @@ REQUIRED IDs PER ACTION:
   AD_SET UPDATE/DELETE    → ad_set_id required
   AD CREATE               → ad_set_id required
   AD UPDATE/DELETE        → ad_id required
+  AD COPY_AD              → ad_id (source ad to copy) required
   TARGETING SEARCH        → params.q and params.type required
 
 REQUIRED PARAMS PER ENTITY + ACTION:
@@ -320,8 +321,16 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
+  AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
   CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
   TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+
+COPY_AD WORKFLOW (clone an existing ad with optional overrides):
+  1. Use AD LIST to find the source ad and get its ad_id
+  2. Call AD COPY_AD with the source ad_id and any overrides (e.g. link_url for new landing page)
+  3. The system automatically: reads source creative → copies images (re-uploading from CDN if needed) → creates new creative → creates new ad
+  4. Returns new_ad_id and new_creative_id
+  NOTE: AD LIST now includes creative.object_story_spec so you can inspect image/video/URL details before copying.
 
 CAMPAIGN OBJECTIVES (valid values for 'objective'):
   OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
@@ -351,14 +360,12 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
   OUTCOME_APP_PROMOTION → APP_INSTALLS
 
-GETTING DESTINATION URLS:
-  Destination URLs are NOT returned by AD LIST — they live inside the ad creative's object_story_spec.
-  To get destination URLs:
-    1. Use AD_CREATIVE LIST → returns object_story_spec for all creatives in the account.
-       Extract link from: image creative → object_story_spec.link_data.link
-                          video creative → object_story_spec.video_data.call_to_action.value.link
-                          carousel       → object_story_spec.link_data.child_attachments[].link
-    2. Or cross-reference: AD LIST (to get creative_id per ad) → AD_CREATIVE LIST (to match creative_id → object_story_spec)`,
+GETTING DESTINATION URLS / CREATIVE DETAILS:
+  AD LIST now returns creative sub-fields directly (name, body, title, image_url, thumbnail_url, object_story_spec).
+  Extract link from: image creative → creative.object_story_spec.link_data.link
+                     video creative → creative.object_story_spec.video_data.call_to_action.value.link
+                     carousel       → creative.object_story_spec.link_data.child_attachments[].link
+  If you need creatives for ALL ads in the account without filtering: use AD_CREATIVE LIST.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -369,7 +376,7 @@ GETTING DESTINATION URLS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
