@@ -8076,6 +8076,22 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Normalize a brand guide asset: if the URL is not an S3-hosted file,
+      // mark it as a URL entry (filename: "url") so the frontend can display it correctly.
+      const normalizeBrandGuideAsset = (asset: any): any => {
+        if (asset?.type !== 'brandGuide') return asset;
+        const isS3Url = typeof asset.url === 'string' && asset.url.includes('.s3.') && asset.url.includes('amazonaws.com');
+        const isUrlEntry = !isS3Url;
+        if (isUrlEntry) {
+          return {
+            ...asset,
+            filename: 'url',
+            key: asset.key || `url-brandguide-${Date.now()}`,
+          };
+        }
+        return asset;
+      };
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
@@ -8083,7 +8099,8 @@ Format the response as JSON with this structure:
       if (brandAssets !== undefined) {
         if (Array.isArray(brandAssets)) {
           // Merge by type: replace assets of the same type, keep others
-          brandAssets.forEach(newAsset => {
+          brandAssets.forEach(rawAsset => {
+            const newAsset = normalizeBrandGuideAsset(rawAsset);
             const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
             if (existingIndex >= 0) {
               // Replace existing asset of the same type
@@ -8097,15 +8114,16 @@ Format the response as JSON with this structure:
           });
         } else if (typeof brandAssets === 'object' && brandAssets !== null) {
           // Single asset - merge by type
-          const existingIndex = updatedAttachments.findIndex(existing => existing.type === brandAssets.type);
+          const newAsset = normalizeBrandGuideAsset(brandAssets);
+          const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
           if (existingIndex >= 0) {
             // Replace existing asset of the same type
-            updatedAttachments[existingIndex] = brandAssets;
-            updatedAssets.push(brandAssets); // Track as updated
+            updatedAttachments[existingIndex] = newAsset;
+            updatedAssets.push(newAsset); // Track as updated
           } else {
             // Add new asset type
-            updatedAttachments.push(brandAssets);
-            updatedAssets.push(brandAssets); // Track as added
+            updatedAttachments.push(newAsset);
+            updatedAssets.push(newAsset); // Track as added
           }
         }
       }
