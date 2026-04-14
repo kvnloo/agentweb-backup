@@ -3328,3 +3328,55 @@ Investigated options for controlling Meta ad spend to prevent overspending when 
 **Continue using Ramp virtual card approach for now.** Each Meta ad account is funded via a Ramp virtual credit card with a hard spending limit configured on the card. This provides a reliable, externally-enforced hard stop without any additional code complexity. Revisit in-app controls (Option A or B) if:
 - We manage ad accounts for customers where card-per-account isn't practical
 - Users request the ability to self-configure limits without admin intervention
+
+---
+
+## 2026-04-14 — Emma Stuck on `browser_evaluate` / Lead Forwarding Fix Kept Failing
+
+**Session:** `293e43a8-d469-419e-9f0e-917b08b012f0`
+**User report:** Emma got stuck during browser-based testing while trying to fix a lead forwarding issue on a RankAI landing page.
+
+### Root Cause 1: `browser_evaluate` Hangs Indefinitely
+
+Emma was asked to "use a browser to test by yourself." She called Playwright tools sequentially and completed several steps (navigate x2, snapshot, screenshot, fill_form, click, network_requests — all recorded in `calledFunctions`). Then she called `browser_evaluate` — and the session hung.
+
+**Why it hangs:** All MCP tool calls in `backend/src/mcp/client/mcpClientService.ts:444` use a blanket timeout of `3600000ms` (1 hour). `browser_evaluate` can block indefinitely if the page context is broken, the script throws, or the browser crashes mid-execution.
+
+**How we know it's `browser_evaluate` specifically:** The `calledFunctions` counter is incremented inside the loop *after* `executeTool()` returns. A hanging call never returns, so it never gets counted. All prior tool calls are present in `calledFunctions`; `browser_evaluate` is not.
+
+**Fix recommendation:** Add a per-tool timeout override for `browser_evaluate` (e.g., 30 seconds) instead of inheriting the 1-hour blanket timeout.
+
+### Root Cause 2: Partial Conversation History Lost When a Turn Hangs
+
+When the turn is interrupted mid-execution (hung tool call, crash, timeout), the error recovery path in `agentModeService.ts:2031-2033` saves only `partialUsageMessages` — messages that have a `.usage` field (i.e., LLM completion responses).
+
+Browser tool call messages (assistant messages containing `tool_calls`, and their corresponding tool result messages) do **not** have `.usage` set. As a result, the entire browser-testing turn is lost from conversation history. The user sees the session frozen at their last message with no visible response, and there is no record of what Emma tried.
+
+**Fix recommendation:** In the error/interruption path, persist **all** partial response messages, not just those with `.usage`, so the conversation history is preserved even when a browser tool call hangs.
+
+### Root Cause 3: Lead Forwarding Fix Kept Failing (Two Attempts, Both Wrong)
+
+The `/api/webhooks/forward-lead` endpoint requirements are already met on the server side:
+- `publicAccessEnabled === true` on the lead list (already enabled)
+- CORS set to `*` on that endpoint
+
+The correct architecture (as mandated by the v0 Service pattern):
+```
+Landing page form
+  -> relative path /api/capture (Next.js API route, server-side proxy)
+  -> POST https://api.agentweb.pro/api/webhooks/forward-lead { listId, ... }
+```
+
+**Fix 1 failure:** The `coding_agent` used the wrong endpoint (`/api/lead-lists/.../leads/public`) instead of `/api/webhooks/forward-lead`.
+
+**Fix 2 failure:** The `coding_agent` used the correct endpoint but edited `components/audit-form.tsx` (the React component). However, the production site may be serving `public/landing.html` — a static HTML file that the first coding_agent had already noted was using the correct endpoint. If the production build serves the static HTML file directly, editing the React component has no effect on the live form.
+
+**Fix recommendation:** Before editing any form file, the `coding_agent` must determine which file the production landing page actually renders — the React component or the static HTML. Check the Next.js routing config and `public/` directory first to identify the correct file to edit.
+
+### Summary of Recommended Fixes
+
+| # | Location | Fix |
+|---|----------|-----|
+| 1 | `backend/src/mcp/client/mcpClientService.ts` | Add a short per-tool timeout (e.g., 30s) for `browser_evaluate` instead of the 1-hour blanket timeout |
+| 2 | `backend/src/services/agentModeService.ts` (error path ~line 2031) | Persist all partial response messages on interruption, not just messages with `.usage` |
+| 3 | `coding_agent` prompt / workflow | Detect whether the landing page uses a static HTML file or a React component before editing; check Next.js routing and `public/` directory first |
