@@ -2679,7 +2679,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency), ICP fields (icpScore, icpMatch), engagementCount, and any custom field names. All filters use AND logic.',
+    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2694,7 +2694,7 @@ emmaToolRegistry.register({
             properties: {
               field: {
                 type: 'string',
-                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency; ICP: icpScore, icpMatch; engagement: engagementCount; or any custom field name)'
+                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt; ICP: icpScore, icpMatch; engagement: engagementCount; dot-notation paths like "customFields.createdAt"; or any custom field name)'
               },
               operator: {
                 type: 'string',

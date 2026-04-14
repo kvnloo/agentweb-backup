@@ -6469,7 +6469,7 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
       const matchingLeads: any[] = [];
       let cursor: any = undefined;
 
@@ -6493,6 +6493,10 @@ export class AgentModeService {
               fieldValue = lead.engagementCount;
             } else if (standardFields.includes(field)) {
               fieldValue = lead[field];
+            } else if (field.includes('.')) {
+              // Dot-notation path (e.g. "customFields.createdAt" → lead.customFields?.createdAt)
+              const parts = field.split('.');
+              fieldValue = parts.reduce((obj: any, part: string) => obj?.[part], lead);
             } else {
               // Custom field
               fieldValue = lead.customFields?.[field];
@@ -6513,10 +6517,18 @@ export class AgentModeService {
                 return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
               case 'starts_with':
                 return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
-              case 'greater_than':
-                return Number(fieldValue) > Number(value);
-              case 'less_than':
-                return Number(fieldValue) < Number(value);
+              case 'greater_than': {
+                const numFv = Number(fieldValue);
+                const numV = Number(value);
+                if (!isNaN(numFv) && !isNaN(numV)) return numFv > numV;
+                return String(fieldValue || '') > String(value || '');
+              }
+              case 'less_than': {
+                const numFv = Number(fieldValue);
+                const numV = Number(value);
+                if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
+                return String(fieldValue || '') < String(value || '');
+              }
               default:
                 return false;
             }
@@ -6894,7 +6906,7 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion to identify leads to delete' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
 
       // Helper function to check if a lead matches all filters
       const leadMatchesFilters = (lead: any): boolean => {
@@ -6910,6 +6922,10 @@ export class AgentModeService {
             fieldValue = lead.engagementCount;
           } else if (standardFields.includes(field)) {
             fieldValue = lead[field];
+          } else if (field.includes('.')) {
+            // Dot-notation path (e.g. "customFields.createdAt" → lead.customFields?.createdAt)
+            const parts = field.split('.');
+            fieldValue = parts.reduce((obj: any, part: string) => obj?.[part], lead);
           } else {
             fieldValue = lead.customFields?.[field];
           }
@@ -6928,10 +6944,18 @@ export class AgentModeService {
               return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
             case 'starts_with':
               return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
-            case 'greater_than':
-              return Number(fieldValue) > Number(value);
-            case 'less_than':
-              return Number(fieldValue) < Number(value);
+            case 'greater_than': {
+              const numFv = Number(fieldValue);
+              const numV = Number(value);
+              if (!isNaN(numFv) && !isNaN(numV)) return numFv > numV;
+              return String(fieldValue || '') > String(value || '');
+            }
+            case 'less_than': {
+              const numFv = Number(fieldValue);
+              const numV = Number(value);
+              if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
+              return String(fieldValue || '') < String(value || '');
+            }
             default:
               return false;
           }
