@@ -9,6 +9,7 @@ import { emailService } from "../services/emailService";
 import crypto from "crypto";
 import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
+import { normalizeAttribution } from "../types/attribution";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -18,6 +19,7 @@ export const register = async (req: Request, res: Response) => {
       roles: reqRoles,
       displayName: reqDisplayName,
       utm,
+      attribution,
     } = req.body;
 
     if (!email || !password) {
@@ -82,16 +84,16 @@ export const register = async (req: Request, res: Response) => {
 
     // Set Free tier defaults for new registrations (subscription upgrades happen via Stripe checkout)
     const freeTierConfig = await getTierConfig("Free");
+    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
     await userDb.updateUser(userId, {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
-      ...(utm && typeof utm === 'object' && {
-        utmSource: utm.utm_source,
-        utmMedium: utm.utm_medium,
-        utmCampaign: utm.utm_campaign,
-        utmContent: utm.utm_content,
-        utmTerm: utm.utm_term,
+      ...(touch && {
+        firstTouch: touch,
+        lastTouch: touch,
+        ...(touch.utm?.source && { utmSource: touch.utm.source }),
+        ...(touch.utm?.medium && { utmMedium: touch.utm.medium }),
       }),
     });
 
@@ -105,6 +107,7 @@ export const register = async (req: Request, res: Response) => {
       createdAt: new Date().toISOString(),
       stripe_customer_id,
       subscriptionType: "Free",
+      attribution: touch,
     }).catch(() => {});
 
     // JWT includes roles array
@@ -133,7 +136,7 @@ export const register = async (req: Request, res: Response) => {
 
 export const login = async (req: Request, res: Response) => {
   try {
-    let { email, password } = req.body;
+    let { email, password, attribution } = req.body;
 
     if (!email || !password) {
       return res
@@ -165,10 +168,12 @@ export const login = async (req: Request, res: Response) => {
       });
     }
 
-    // Update last login time
+    // Update last login time + last-touch attribution (if client sent any)
     try {
+      const touch = normalizeAttribution(attribution);
       await userDb.updateUser(user.userId, {
-        lastLoginTime: new Date().toISOString()
+        lastLoginTime: new Date().toISOString(),
+        ...(touch && { lastTouch: touch }),
       });
     } catch (updateError) {
       console.error("Error updating last login time:", updateError);
