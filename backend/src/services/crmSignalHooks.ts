@@ -119,3 +119,85 @@ export async function onEmmaSessionStart(
     return null;
   }
 }
+
+export interface StripeSubscriptionHookInput {
+  /** Stripe event id — used as the idempotency key (sourceRecordId). */
+  eventId: string;
+  /** Stripe event type, e.g. 'customer.subscription.updated'. */
+  eventType: string;
+  /** Customer email from the subscription/customer object. */
+  email: string;
+  /** Optional richer identity if known. */
+  firstName?: string | null;
+  lastName?: string | null;
+  companyName?: string | null;
+  /** Stripe customer id, for cross-linking. */
+  stripeCustomerId?: string | null;
+  stripeSubscriptionId?: string | null;
+  status?: string | null;
+  subscriptionType?: string | null;
+  mrr?: number | null;
+  currentPeriodEnd?: string | null;
+  payload?: Record<string, unknown>;
+}
+
+function mapStripeEventType(eventType: string): import('./contactEventsDb').ContactEventType {
+  switch (eventType) {
+    case 'customer.subscription.created':
+    case 'checkout.session.completed':
+      return 'payment.subscribed';
+    case 'customer.subscription.deleted':
+      return 'payment.canceled';
+    case 'customer.subscription.updated':
+    case 'invoice.payment_succeeded':
+    case 'invoice.payment_failed':
+    default:
+      return 'payment.updated';
+  }
+}
+
+/**
+ * CRM signal hook for Stripe billing events (B3).
+ *
+ * Idempotent on the Stripe event id (sourceRecordId = `stripe-<eventId>`),
+ * so Stripe's at-least-once delivery is safe.
+ */
+export async function onStripeSubscriptionEvent(
+  input: StripeSubscriptionHookInput,
+  deps: SignalHookDeps = {}
+): Promise<SyncResult | null> {
+  const sync = deps.syncContact || defaultSyncContact;
+  const logger = deps.logger || console;
+
+  if (!input.email || !input.eventId) {
+    logger.warn('[crmSignalHooks.onStripeSubscriptionEvent] missing email/eventId, skipping');
+    return null;
+  }
+
+  try {
+    return await sync({
+      source: 'stripe',
+      sourceRecordId: `stripe-${input.eventId}`,
+      identity: {
+        email: input.email,
+        firstName: input.firstName || null,
+        lastName: input.lastName || null,
+      },
+      companyName: input.companyName || null,
+      eventType: mapStripeEventType(input.eventType),
+      payload: {
+        stripeEventType: input.eventType,
+        stripeCustomerId: input.stripeCustomerId || null,
+        stripeSubscriptionId: input.stripeSubscriptionId || null,
+        status: input.status || null,
+        subscriptionType: input.subscriptionType || null,
+        mrr: input.mrr || null,
+        currentPeriodEnd: input.currentPeriodEnd || null,
+        ...(input.payload || {}),
+      },
+    });
+  } catch (err: any) {
+    logger.error('[crmSignalHooks.onStripeSubscriptionEvent] sync failed:', err?.message || err);
+    return null;
+  }
+}
