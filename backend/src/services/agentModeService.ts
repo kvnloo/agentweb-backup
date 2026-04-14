@@ -19369,7 +19369,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
-    // Normalize action: LLMs sometimes use underscores instead of hyphens (e.g. list_received_invitations → list-received-invitations)
     const action = (args.action as string)?.replace(/_/g, '-');
     const { profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
@@ -19480,7 +19479,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'list-received-invitations': {
           const receivedResult = await linkedInOutreachService.listReceivedInvitations(account_id, args.cursor);
-          // Trim to essential fields. Unipile uses "invited_user_*" for the sender.
+          // Trim to essential fields. Sender profile is enriched from the inviter object.
           if (Array.isArray(receivedResult?.items)) {
             const trimmedItems = receivedResult.items.map((item: any) => ({
               id: item.id,

@@ -516,7 +516,7 @@ export class LinkedInOutreachService {
       // In Unipile's model: "inviter" object = person who sent the invite (sender),
       // "invited_user" string = the account holder (recipient = us).
       // inviter has: inviter_name, inviter_description, inviter_public_identifier, inviter_profile_picture_url
-      if (result?.items && Array.isArray(result.items) && result.items.length > 0) {
+      if (result?.items?.length > 0) {
         const enrichedItems = await Promise.all(result.items.map(async (item: any) => {
           const inviter = item.inviter || {};
 
