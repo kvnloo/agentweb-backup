@@ -32,6 +32,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'Fix: Admin Tools Now Work When Accessed via Delegated Session',
+      '- When an admin used "Access Portal" to view a customer account, Emma\'s admin tools (e.g. "give me a list of all clients") were incorrectly returning "Access denied" even though the session had delegated admin access',
+      '- Root cause: the client-health route was re-checking admin status from the database using the target customer\'s ID instead of trusting the server-minted token\'s isAdmin flag',
+      '- Admin tools now work correctly in delegated sessions — the admin\'s elevated access is respected throughout',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Fix: Emma Knows the AgentWeb Team in Scheduled Slack Scans',
       '- When Emma runs a scheduled "Daily Slack Check" (or any Slack-scanning session), she now correctly identifies Rui, Harsha, Fangfang, and Matt as internal team members',
       '- Previously, only event-driven Slack sessions (direct @mentions, channel triggers) had team context; scheduled scans did not, so Emma could mistake a team member\'s message for a client message',
