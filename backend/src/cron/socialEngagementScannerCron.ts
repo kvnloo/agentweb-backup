@@ -109,9 +109,25 @@ export class SocialEngagementScanner {
                 return ts >= cutoff;
             });
 
-            console.log(`[Scanner/Posts] ${ownerAccount.account_name}: ${recentPosts.length} recent post(s)`);
+            // De-duplicate posts by content — LinkedIn can return the same physical post
+            // under multiple URN formats (e.g. urn:li:share:X and urn:li:ugcPost:Y) in a
+            // single listPosts response, which would cause the same engager accounts to be
+            // scheduled to comment twice on what is actually one post.
+            const seenContent = new Set<string>();
+            const dedupedPosts = recentPosts.filter((p: any) => {
+                const content = (p.commentary || p.content || '').trim();
+                if (!content) return true; // keep posts without parseable content
+                if (seenContent.has(content)) {
+                    console.log(`[Scanner/Posts] Dedup: skipping post ${p.id || p.urn} — same content as another post in this response`);
+                    return false;
+                }
+                seenContent.add(content);
+                return true;
+            });
 
-            for (const post of recentPosts) {
+            console.log(`[Scanner/Posts] ${ownerAccount.account_name}: ${dedupedPosts.length} recent post(s) (${recentPosts.length} before dedup)`);
+
+            for (const post of dedupedPosts) {
                 const postId: string = post.id || post.urn;
                 if (!postId) continue;
                 await this.schedulePostEngagers(ownerAccount, ownerSettings, postId, platform, potentialEngagers);
@@ -238,8 +254,11 @@ export class SocialEngagementScanner {
         let commentCount = 0;
 
         for (const engager of cappedEngagers) {
-            const needsLike = wantsLike && likeCount < maxLikes;
-            const needsComment = wantsComment && commentCount < maxComments;
+            // Engager's own preferredActions gates what actions it will perform.
+            // Intersect with the owner's preferences so neither side is overridden.
+            const engagerPrefs: ('like' | 'comment')[] = engager.engagementSettings?.preferredActions || ['like', 'comment'];
+            const needsLike = wantsLike && likeCount < maxLikes && engagerPrefs.includes('like');
+            const needsComment = wantsComment && commentCount < maxComments && engagerPrefs.includes('comment');
             if (!needsLike && !needsComment) break;
 
             // Check per action type so an engager who already liked can still comment (and vice versa)

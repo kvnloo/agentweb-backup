@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'Fix: Auto-Engagement No Longer Posts Duplicate Comments on the Same LinkedIn Post',
+      '- Fixed a bug where the same account could end up commenting 2–3 times on a single LinkedIn post',
+      '- Root cause: LinkedIn\'s API returns some posts under two different IDs in the same response; the scanner was treating these as separate posts and scheduling engagement for each',
+      '- The scanner now deduplicates posts by content before scheduling, so only one comment is placed per post per account',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'New: Emma Can Connect Your Accounts Inline — No Page Navigation Needed',
       '- When you ask Emma (in Agent Mode) to connect a platform like LinkedIn, Gmail, YouTube, or Meta, she now shows a connect dialog directly in the chat — no need to leave the conversation',
       '- Supports all 8 integrations: LinkedIn, LinkedIn Ads, Gmail, YouTube, Meta, Instagram, Fathom, and LinkedIn Outreach',
