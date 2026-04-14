@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'Fixed: Meta Ad Accounts Now Appear After Connecting',
+      '- After connecting a Meta account via OAuth, ad accounts created inside Business Manager now correctly appear in your connected accounts list',
+      '- Previously, Business Manager ad accounts with no explicit business entity link were silently filtered out, resulting in 0 accounts showing despite a successful connection',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Fix: Auto-Engagement No Longer Posts Duplicate Comments on the Same LinkedIn Post',
       '- Fixed a bug where the same account could end up commenting 2–3 times on a single LinkedIn post',
       '- Root cause: LinkedIn\'s API returns some posts under two different IDs in the same response; the scanner was treating these as separate posts and scheduling engagement for each',
