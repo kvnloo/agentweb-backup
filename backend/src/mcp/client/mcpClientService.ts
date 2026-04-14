@@ -438,10 +438,13 @@ export class McpClientService {
                 const clientTransport = (sessionClient as any)._transport;
                 const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
                 console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${serverName}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}`);
+                // browser_evaluate runs arbitrary JS which can hang indefinitely.
+                // Cap it at 60s; all other MCP tools keep the 1-hour default.
+                const toolTimeout = originalToolName === 'browser_evaluate' ? 60000 : 3600000;
                 const result = await sessionClient.callTool({
                   name: originalToolName,
                   arguments: toolArgs
-                }, undefined, { timeout: 3600000 });
+                }, undefined, { timeout: toolTimeout });
                 const contentArray = (result.content as any[]) || [];
                 if (result.isError) {
                   throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
