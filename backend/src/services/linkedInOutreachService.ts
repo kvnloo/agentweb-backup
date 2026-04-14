@@ -559,15 +559,22 @@ export class LinkedInOutreachService {
 
   /**
    * Accept a received connection invitation.
+   * Unipile requires provider, shared_secret (from the invitation's specifics), account_id, and action.
+   * The shared_secret is a per-invitation token returned by the list-received-invitations endpoint.
    */
-  async acceptInvitation(invitationId: string, accountId: string): Promise<any> {
+  async acceptInvitation(invitationId: string, accountId: string, sharedSecret: string): Promise<any> {
     try {
       this.log(`Accepting invitation: ${invitationId}`, { accountId });
       const client = await this.getClient();
       const result = await (client as any).request.send({
         path: ['users', 'invite', 'received', invitationId],
         method: 'POST',
-        body: { account_id: accountId },
+        body: {
+          provider: 'LINKEDIN',
+          shared_secret: sharedSecret,
+          account_id: accountId,
+          action: 'accept',
+        },
         headers: { 'Content-Type': 'application/json' },
       });
       this.log(`Successfully accepted invitation: ${invitationId}`);

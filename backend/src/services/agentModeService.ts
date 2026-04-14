@@ -19487,6 +19487,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               invitation_text: item.invitation_text,
               date: item.date,
               sender_profile: item.sender_profile || null,
+              // shared_secret is required for accept-invitation (LinkedIn token from Unipile)
+              shared_secret: item.specifics?.shared_secret || null,
             }));
             return { success: true, data: { ...receivedResult, items: trimmedItems } };
           }
@@ -19495,8 +19497,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'accept-invitation': {
           const invitationId = args.invitation_id;
+          const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
-          const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id);
+          if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
           return { success: true, data: acceptResult };
         }
 
