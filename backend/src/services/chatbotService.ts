@@ -574,6 +574,28 @@ export class ChatbotDB {
       userDb.updateUser(userId, { lastActiveAt: timestamp }).catch((err) => {
         console.error(`Failed to update lastActiveAt for user ${userId}:`, err);
       });
+
+      // CRM signal (B2): log an engagement.emma_session event on AW-ContactEvents.
+      // Fire-and-forget, errors swallowed inside onEmmaSessionStart.
+      void (async () => {
+        try {
+          const user = await userDb.getUserById(userId);
+          const email = user?.email;
+          if (!email) return;
+          const { onEmmaSessionStart } = await import('./crmSignalHooks');
+          await onEmmaSessionStart({
+            sessionId,
+            userId,
+            email,
+            portalType: portalType || null,
+            sessionType: sessionType || 'regular',
+            pageIdentifier: pageIdentifier || null,
+            createdAt: timestamp,
+          });
+        } catch (err) {
+          console.error('[chatbotService.createChatSession] CRM signal failed:', err);
+        }
+      })();
     }
 
     return chatSession;
