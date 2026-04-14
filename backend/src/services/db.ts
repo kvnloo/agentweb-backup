@@ -5,6 +5,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields } from "../utils/leadSchema";
+import { onUserSignup } from "./crmSignalHooks";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -484,6 +485,16 @@ class UserDB {
 
     try {
       await this.docClient.put(params).promise();
+      // Fire-and-forget CRM signal (B2). Never awaited — signup latency must not
+      // depend on AW-ContactEvents. Errors are swallowed inside onUserSignup.
+      void onUserSignup({
+        userId,
+        email: itemToCreate.email,
+        displayName,
+        companyName,
+        isOAuthUser,
+        createdAt: itemToCreate.createdAt,
+      });
       return params.Item as User;
     } catch (error) {
       handleDynamoDbError(error, "createUser");
