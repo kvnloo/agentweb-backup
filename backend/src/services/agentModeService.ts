@@ -412,6 +412,8 @@ export class AgentModeService {
         await import('../emma/slackMessageTools');
         await import('../emma/tempEmailTools');
         await import('../emma/testAccountTools');
+        await import('../emma/navigateTools');
+        await import('../emma/connectAccountTool');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -3073,6 +3075,11 @@ export class AgentModeService {
         message: result?.message,
         results: result?.results,
       };
+    }
+
+    // For navigation/connect tools, preserve the full result so the frontend can act on it
+    if (toolName === 'navigate_to' || toolName === 'connect_account') {
+      return result;
     }
 
     // For other tools, return empty object to minimize storage

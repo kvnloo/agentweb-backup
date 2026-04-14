@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'New: Emma Can Connect Your Accounts Inline — No Page Navigation Needed',
+      '- When you ask Emma (in Agent Mode) to connect a platform like LinkedIn, Gmail, YouTube, or Meta, she now shows a connect dialog directly in the chat — no need to leave the conversation',
+      '- Supports all 8 integrations: LinkedIn, LinkedIn Ads, Gmail, YouTube, Meta, Instagram, Fathom, and LinkedIn Outreach',
+      '- If Emma knows which platform you need, she opens the connect dialog for that platform directly',
+      '- If no specific platform is identified, she shows a picker so you can choose which account to connect',
+      '- After you authorize, Emma automatically continues the conversation with your newly connected account',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Improved: PR Digest Now Supports Any Time Range',
       '- When asking Emma to fetch PRs for "the last 7 days" or any relative time range, she now correctly queries the full period — previously she always defaulted to the past 24 hours regardless of what you asked',
       '- A new days_ago parameter lets Emma pass the range directly (e.g. days_ago: 7) without having to compute ISO timestamps',
