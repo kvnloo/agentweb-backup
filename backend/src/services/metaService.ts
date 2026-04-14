@@ -285,7 +285,7 @@ export class MetaService {
       const adAccountsPath = await user.getAdAccounts(fields);
 
       return adAccountsPath
-        .filter((account: any) => account.business)
+        .filter((account: any) => account.account_id)
         .map((account: any) => ({
           id: account.id,
           name: account.name,
