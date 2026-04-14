@@ -3763,6 +3763,8 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
+    // If the LLM didn't specify a model, fall back to the admin-configured image API default
+    const imageModel = args.imageModel || await agentModeService.getImageApiDefaultModel();
     return await agentModeService.generateImage(
       args.prompt,
       args.filename,
@@ -3771,7 +3773,7 @@ emmaToolRegistry.register({
       args.inputImages || [],
       context?.userId,
       context?.sessionId,
-      args.imageModel,
+      imageModel,
       args.logo_image
     );
   }
