@@ -147,6 +147,7 @@ router.post(
         brandPersonality,
         founders,
         isGradient,
+        brandGuideUrl,
       } = req.body;
 
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
@@ -218,6 +219,16 @@ router.post(
             filename: file.originalname,
           });
         }
+      }
+
+      // Handle brand guide URL (alternative to file upload)
+      if (brandGuideUrl && typeof brandGuideUrl === "string" && brandGuideUrl.trim()) {
+        attachments.push({
+          type: "brandGuide",
+          url: brandGuideUrl.trim(),
+          key: `url-brandguide-${Date.now()}`,
+          filename: "url",
+        });
       }
 
       console.log(
