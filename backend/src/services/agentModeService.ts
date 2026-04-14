@@ -194,6 +194,7 @@ export class AgentModeService {
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
+  private imageApiDefaultModelSettingName = 'agent_mode_image_api_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
@@ -641,6 +642,26 @@ export class AgentModeService {
     }
     // Fall back to the general default model
     return this.getDefaultModel();
+  }
+
+  // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts)
+  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image'];
+
+  async getImageApiDefaultModel(): Promise<string | undefined> {
+    try {
+      const setting = await settingsService.getSetting(this.imageApiDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (AgentModeService.IMAGE_API_MODELS.includes(configuredModel)) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported image API default model "${configuredModel}" in settings; using hardcoded default.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting image API default model setting:', error);
+    }
+    // Return undefined to let imageGeneration.ts use its own hardcoded default
+    return undefined;
   }
 
   async getVideoGenerationDefaultModel(): Promise<string> {

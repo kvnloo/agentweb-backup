@@ -2741,7 +2741,7 @@ export default function AdminDashboard() {
             <Tab label="Chat History" {...a11yProps(6)} />
             <Tab label="Knowledge Base" {...a11yProps(7)} />
             <Tab label="Agent Mode" {...a11yProps(8)} />
-            <Tab label="Image Models" {...a11yProps(9)} />
+            <Tab label="Image Models (Legacy)" {...a11yProps(9)} />
             <Tab label="Default Prompts" {...a11yProps(10)} />
             <Tab label="Benchmarks" {...a11yProps(11)} />
             <Tab label="Subscriptions" {...a11yProps(12)} />
@@ -7077,6 +7077,8 @@ const AgentModeSettings = () => {
   const [savingReportGenerationDefaultModel, setSavingReportGenerationDefaultModel] = useState(false);
   const [imageGenerationDefaultModel, setImageGenerationDefaultModel] = useState('');
   const [savingImageGenerationDefaultModel, setSavingImageGenerationDefaultModel] = useState(false);
+  const [imageApiDefaultModel, setImageApiDefaultModel] = useState('');
+  const [savingImageApiDefaultModel, setSavingImageApiDefaultModel] = useState(false);
   const [videoGenerationDefaultModel, setVideoGenerationDefaultModel] = useState('');
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
   const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
@@ -7121,8 +7123,11 @@ const AgentModeSettings = () => {
       // Load report generation default model
       await loadReportGenerationDefaultModel(models);
 
-      // Load image generation default model
+      // Load image generation default model (LLM session model)
       await loadImageGenerationDefaultModel(models);
+
+      // Load image API default model
+      await loadImageApiDefaultModel();
 
       // Load video generation default model
       await loadVideoGenerationDefaultModel(models);
@@ -7470,6 +7475,56 @@ const AgentModeSettings = () => {
     }
   };
 
+  const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image'];
+
+  const loadImageApiDefaultModel = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_image_api_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && IMAGE_API_MODELS.includes(configuredModel)) {
+          setImageApiDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading image API default model:', settingsError);
+      }
+    }
+    setImageApiDefaultModel('');
+  };
+
+  const saveImageApiDefaultModel = async () => {
+    try {
+      setSavingImageApiDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (imageApiDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_image_api_default_model'), {
+          settingValue: imageApiDefaultModel,
+          description: 'Default image API model for generate_image tool (e.g. gemini-3-pro-image-preview)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_image_api_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Image API default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving image API default model:', error);
+      setError('Failed to save image API default model');
+    } finally {
+      setSavingImageApiDefaultModel(false);
+    }
+  };
+
   const loadVideoGenerationDefaultModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
@@ -7766,7 +7821,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'imageApiDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7853,7 +7908,15 @@ const AgentModeSettings = () => {
         });
 
         setImageGenerationDefaultModel('');
-        setSuccess('Reset image generation default model successfully!');
+        setSuccess('Reset image session default model successfully!');
+      } else if (type === 'imageApiDefaultModel') {
+        setSavingImageApiDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_image_api_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setImageApiDefaultModel('');
+        setSuccess('Reset image API default model successfully!');
       } else if (type === 'videoGenerationDefaultModel') {
         setSavingVideoGenerationDefaultModel(true);
         await axios.delete(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
@@ -7899,6 +7962,8 @@ const AgentModeSettings = () => {
         setSavingReportGenerationDefaultModel(false);
       } else if (type === 'imageGenerationDefaultModel') {
         setSavingImageGenerationDefaultModel(false);
+      } else if (type === 'imageApiDefaultModel') {
+        setSavingImageApiDefaultModel(false);
       } else if (type === 'videoGenerationDefaultModel') {
         setSavingVideoGenerationDefaultModel(false);
       } else if (type === 'customerSupportDefaultModel') {
@@ -8144,11 +8209,11 @@ const AgentModeSettings = () => {
         </CardContent>
       </Card>
 
-      {/* Image Generation Default Model */}
+      {/* Image Session Default Model (LLM used to think/plan during image generation sessions) */}
       <Card sx={{ mb: 3 }}>
         <CardContent>
           <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-            <Typography variant="h6">Image Generation Default Model</Typography>
+            <Typography variant="h6">Image Session Default Model</Typography>
             <Box>
               <Button
                 variant="outlined"
@@ -8169,11 +8234,11 @@ const AgentModeSettings = () => {
           </Box>
 
           <FormControl fullWidth>
-            <InputLabel id="agent-mode-image-generation-model-label">Image Generation Default Model</InputLabel>
+            <InputLabel id="agent-mode-image-session-model-label">Image Session Default Model</InputLabel>
             <Select
-              labelId="agent-mode-image-generation-model-label"
+              labelId="agent-mode-image-session-model-label"
               value={imageGenerationDefaultModel}
-              label="Image Generation Default Model"
+              label="Image Session Default Model"
               onChange={(e) => setImageGenerationDefaultModel(e.target.value as string)}
             >
               <MenuItem value="">
@@ -8191,7 +8256,56 @@ const AgentModeSettings = () => {
           </FormControl>
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            If set, image generation uses this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+            The LLM used to plan and orchestrate during image generation sessions. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Image API Default Model (controls which image generation API/model is called) */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Image API Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('imageApiDefaultModel')}
+                disabled={savingImageApiDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveImageApiDefaultModel}
+                disabled={savingImageApiDefaultModel}
+              >
+                {savingImageApiDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-image-api-model-label">Image API Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-image-api-model-label"
+              value={imageApiDefaultModel}
+              label="Image API Default Model"
+              onChange={(e) => setImageApiDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use hardcoded default (gemini-3-pro-image-preview)</em>
+              </MenuItem>
+              {IMAGE_API_MODELS.map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            The image generation API model used by the <code>generate_image</code> tool when the agent doesn't specify one explicitly. Overrides the hardcoded default.
           </Typography>
         </CardContent>
       </Card>
