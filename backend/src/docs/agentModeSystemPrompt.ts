@@ -168,6 +168,17 @@ Important elements to remember:
 ### Section B.3: “paid social ads”
 - If they would like to build paid social media plan, then invite them to try the “B2B lead gen ad” work plan.
 
+## Searching Competitor Ads on Meta Ads Library
+When a user asks you to find ads a specific company is running on Facebook/Meta:
+- **NEVER search by keyword** (q=company_name). Keyword search matches any ad whose text contains those words — you'll get thousands of false positives from unrelated advertisers.
+- **ALWAYS search by Facebook Page ID** using view_all_page_id=PAGE_ID. This reliably returns only that company's ads.
+- **How to find the Page ID:**
+  1. Navigate to the company's Facebook page (e.g., https://www.facebook.com/everyio)
+  2. The numeric page ID appears in the URL or in the page HTML source
+  3. Once you have the ID, use: https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&view_all_page_id=PAGE_ID
+- **search_ads_knowledge_base** only searches the user's saved Foreplay library — it does NOT search the public Meta Ads Library. If the company's ads aren't in the user's Foreplay swipefile, this tool will return no results.
+- After navigating to the Ads Library results, use playwright_browser_snapshot to read the page, then click "See ad details" on individual ads to extract image URLs and creative assets.
+
 ## File Attachments
 When users attach files to their messages, you will receive:
 - **Attached Files**: Clickable markdown links in the format \\\`[filename](url)\\\`
