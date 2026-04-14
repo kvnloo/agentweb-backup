@@ -4,6 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
+import { buildLeadCrmFields } from "../utils/leadSchema";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3484,6 +3485,18 @@ export const crmDb = {
     contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
     contactStatusUpdatedBy?: string;
+    // CRM Unification v1 extensions (A1)
+    domain?: string;
+    accountOwnerUserId?: string;
+    priority?: 'Low' | 'Medium' | 'High';
+    expectedClose?: string;
+    closedDate?: string;
+    heatScore?: number;
+    healthScore?: number;
+    lifecycle?: 'unknown' | 'inbox' | 'signed_up' | 'in_deal' | 'trialing' | 'paying' | 'at_risk' | 'churned';
+    role?: 'KDM' | 'Champion' | 'Blocker' | 'Influencer' | 'Other';
+    isPrimary?: boolean;
+    dealIds?: string[];
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3542,6 +3555,24 @@ export const crmDb = {
         item.contactStatusUpdatedAt = new Date().toISOString();
         item.contactStatusUpdatedBy = leadData.contactStatusUpdatedBy || 'system';
       }
+
+      // CRM Unification v1 extensions (A1): domain (derived), lifecycle (defaulted
+      // to 'inbox' when email present), heatScore/healthScore, priority, role,
+      // isPrimary, dealIds[], accountOwnerUserId, expectedClose, closedDate.
+      const crmFields = buildLeadCrmFields(emailValue, {
+        domain: leadData.domain,
+        accountOwnerUserId: leadData.accountOwnerUserId,
+        priority: leadData.priority,
+        expectedClose: leadData.expectedClose,
+        closedDate: leadData.closedDate,
+        heatScore: leadData.heatScore,
+        healthScore: leadData.healthScore,
+        lifecycle: leadData.lifecycle,
+        role: leadData.role,
+        isPrimary: leadData.isPrimary,
+        dealIds: leadData.dealIds,
+      });
+      Object.assign(item, crmFields);
 
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
