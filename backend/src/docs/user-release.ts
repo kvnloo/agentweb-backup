@@ -9,6 +9,52 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-14',
+    changes: [
+      'Improved: PR Digest Now Supports Any Time Range',
+      '- When asking Emma to fetch PRs for "the last 7 days" or any relative time range, she now correctly queries the full period — previously she always defaulted to the past 24 hours regardless of what you asked',
+      '- A new days_ago parameter lets Emma pass the range directly (e.g. days_ago: 7) without having to compute ISO timestamps',
+      '- Explicit since/until ISO date parameters still work as before for precise date ranges',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'New: Engagement Personality for Auto-Engagement',
+      '- You can now set a personality for auto-generated comments and replies on the Social Posts → Engagement Settings page',
+      '- Choose from 16 preset tones: Funny, Witty, Playful, Warm, Empathetic, Inspiring, Visionary, Expert, Bold, Storytelling, Curious, Enthusiastic, Professional, Conversational, Thoughtful, and Concise',
+      '- Multiple presets can be combined (e.g. Visionary + Witty)',
+      '- A free-text "Custom style" field lets you describe any tone not covered by the presets',
+      '- Personality is saved per connected account alongside your other engagement settings',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'Improved: Emma Now Recognizes AgentWeb Team Members in Slack Sessions',
+      '- Emma now knows all four AgentWeb team members by name and nickname: Rui Wang (CTO), Harsha Vankayalapati (CEO), Fangfang Tan (CPO), Matthew Wilmer / Matt (CMO)',
+      '- When helping in a Slack thread, Emma understands she is part of the team drafting replies to external contacts — not responding to team members as if they were asking her questions directly',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'Fix: Slack Channel Monitoring No Longer Sends Duplicate Suggest Emails for Emma Sessions',
+      '- When a client @mentions Emma directly in Slack, Emma now responds in Slack without also sending a redundant "suggested reply" email to the team',
+      '- Messages that @mention other team members (e.g. @Rui) still go through the normal suggest flow and will trigger an email if they contain an actionable question or request',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'New: Work Plan Autocomplete Setting',
+      '- You can now toggle Autocomplete on each of your saved work plans in Settings → Work Plans',
+      '- When enabled, Emma runs through all steps automatically without pausing to ask for your approval between each step',
+      '- When disabled (default), Emma presents results after each step and waits for you to confirm before moving on',
+      '- You can also ask Emma to turn autocomplete on or off for the current session\'s work plan directly in chat',
+    ],
+  },
+  {
     date: '2026-04-13',
     changes: [
       'New: Email Session Results Without a Connected Email Account',

@@ -1367,6 +1367,16 @@ export class AgentModeService {
         console.error('Failed to load account memories:', err);
       }
 
+      // For Slack sessions, inject team roster as an assistant acknowledgement so the model
+      // treats it as established knowledge rather than an instruction it can override.
+      const slackPageIds = ['slack-bot', 'slack-bot-admin', 'slack-triggered'];
+      if (slackPageIds.includes(currentSession?.pageIdentifier || '')) {
+        messages.push({
+          role: 'assistant',
+          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+        });
+      }
+
       messages.push(...marketingMessages);
 
       // Cross-message loop detection: when the user repeats the same message multiple times
@@ -17349,7 +17359,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -17373,6 +17383,7 @@ Please:
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds
         })),
+        autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -17396,7 +17407,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -17407,6 +17418,11 @@ Please:
       }
 
       const workPlan = { ...session.workPlan };
+
+      // Update autocomplete if explicitly provided
+      if (autocomplete !== undefined) {
+        workPlan.autocomplete = autocomplete;
+      }
 
       // Remove steps if specified
       if (removeStepCounts && removeStepCounts.length > 0) {

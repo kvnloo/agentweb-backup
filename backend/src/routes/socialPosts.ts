@@ -117,6 +117,7 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
       maxCommentLikesPerPost,
       maxCommentRepliesPerPost,
       commentEngagementWindowMinutes,
+      personality,
     } = normalised;
 
     // Validate post preferredActions (required when enabling post discovery)
@@ -176,6 +177,7 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
           maxCommentLikesPerPost: resolvedMaxCommentLikes,
           maxCommentRepliesPerPost: resolvedMaxCommentReplies,
           commentEngagementWindowMinutes: resolvedCommentWindow,
+          ...(personality && typeof personality === 'object' ? { personality } : {}),
         },
       };
     });
