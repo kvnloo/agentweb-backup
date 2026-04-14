@@ -65,6 +65,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-14',
+    changes: [
+      'Fixed: Emma Now Correctly Finds Competitor Ads on the Meta Ads Library',
+      '- When asked to find ads a company is running on Facebook/Meta, Emma now uses the advertiser autocomplete in the Ads Library to find the company\'s Facebook Page ID, then loads only that page\'s ads',
+      '- Previously, Emma searched by keyword (e.g. "every.io") which returned thousands of false-positive results from unrelated advertisers whose ad copy happened to mention the same words',
+      '- The Foreplay "search ads" tool description has also been clarified: it only searches your saved Foreplay library, not the public Meta Ads Library',
+    ],
+  },
+  {
     date: '2026-04-13',
     changes: [
       'New: Engagement Personality for Auto-Engagement',
