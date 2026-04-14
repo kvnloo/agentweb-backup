@@ -70,12 +70,9 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing pa
 
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.
 
-## Lead capture forms — file detection
-Landing pages may have TWO form implementations. Before editing anything, run list_files and check:
-1. Does public/landing.html exist? If so, that static file is what production actually serves — edit it directly (vanilla JS fetch call), NOT the React component.
-2. Is there an app/api/capture/route.ts (or similar server-side proxy)? The form component must call /api/capture (relative path), and only the proxy file should reference the absolute backend URL.
-3. Never put https://api.agentweb.pro (or any absolute backend URL) in a client-side .tsx / .jsx file — that is a CORS anti-pattern even if the endpoint allows *.
-When fixing a lead forwarding bug, always verify which file the form actually uses before editing.`;
+## Lead capture / form fixes
+Before editing any form-related code, run list_files to understand the actual repo structure — do not assume what files exist. Locate the file that actually handles the form submission, read it, then edit only that file.
+One architectural rule that always applies: never put absolute backend URLs (e.g. https://api.agentweb.pro) in client-side code (.tsx/.jsx/.html script tags served to the browser). Those belong only in server-side files (e.g. a Next.js API route that proxies the request).`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
