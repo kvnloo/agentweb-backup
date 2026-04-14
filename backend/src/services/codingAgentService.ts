@@ -68,7 +68,14 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing pa
 - For public company logos: use Google's favicon service: <img src="https://www.google.com/s2/favicons?domain={domain}&sz=128" /> (e.g., domain=google.com). Works for any company domain.
 - For the user's own brand logo: the task_description will include the logo URL (from brand guidelines or an S3 link). Use that URL directly in the img tag.
 
-Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
+Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.
+
+## Lead capture forms — file detection
+Landing pages may have TWO form implementations. Before editing anything, run list_files and check:
+1. Does public/landing.html exist? If so, that static file is what production actually serves — edit it directly (vanilla JS fetch call), NOT the React component.
+2. Is there an app/api/capture/route.ts (or similar server-side proxy)? The form component must call /api/capture (relative path), and only the proxy file should reference the absolute backend URL.
+3. Never put https://api.agentweb.pro (or any absolute backend URL) in a client-side .tsx / .jsx file — that is a CORS anti-pattern even if the endpoint allows *.
+When fixing a lead forwarding bug, always verify which file the form actually uses before editing.`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
