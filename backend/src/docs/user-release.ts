@@ -51,6 +51,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'Fix: CRM Lead Filtering Now Works for Dates and Custom Fields',
+      '- Filtering leads by createdAt or updatedAt (e.g. "find leads added in the last 24 hours") now returns the correct results instead of returning all leads',
+      '- Filtering by dot-notation custom field paths (e.g. customFields.createdAt) now works correctly',
+      '- Date comparisons using greater_than and less_than operators now handle ISO date strings (e.g. 2026-04-13T00:00:00.000Z) in addition to numbers',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Fix: Emma Knows the AgentWeb Team in Scheduled Slack Scans',
       '- When Emma runs a scheduled "Daily Slack Check" (or any Slack-scanning session), she now correctly identifies Rui, Harsha, Fangfang, and Matt as internal team members',
       '- Previously, only event-driven Slack sessions (direct @mentions, channel triggers) had team context; scheduled scans did not, so Emma could mistake a team member\'s message for a client message',
