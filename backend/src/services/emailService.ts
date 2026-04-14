@@ -1106,6 +1106,103 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     }
   },
 
+  async sendSessionNotificationEmail(
+    toEmails: string | string[],
+    sessionId: string,
+    content: string,
+    subject?: string
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+      // Create or reuse interactive share so recipients can view without login
+      let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
+      try {
+        sessionUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
+      } catch (shareError) {
+        console.error('Error creating interactive share for session notification:', shareError);
+      }
+
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+      const emailSubject = subject ? `📋 Session Report — ${subject}` : `📋 Session Report from AgentWeb`;
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #1976d2; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .section { margin: 20px 0; padding: 15px; border: 1px solid #e9ecef; border-radius: 4px; }
+            .section h3 { margin-top: 0; color: #495057; border-bottom: 2px solid #e9ecef; padding-bottom: 8px; }
+            .response { background-color: #f8f9fa; padding: 15px; border-radius: 4px; border-left: 4px solid #1976d2; word-wrap: break-word; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+            .button:hover { background-color: #1565c0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>📋 Session Report</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${currentDate}</p>
+            </div>
+
+            <div class="content">
+              <div class="section">
+                <h3>💬 Summary</h3>
+                <div class="response">${marked(content)}</div>
+              </div>
+
+              <div class="section">
+                <h3>🔗 View Full Session</h3>
+                <p>Click the button below to view the complete conversation.</p>
+                <a href="${sessionUrl}" class="button">Open Session</a>
+                <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
+                  Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
+                </p>
+              </div>
+            </div>
+
+            <div class="footer">
+              <p style="margin: 0; font-size: 12px; color: #6c757d;">
+                Sent via <a href="${customerFrontendUrl}" style="color: #1976d2;">AgentWeb</a>
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `Session Report — ${currentDate}
+
+${content}
+
+View the full session: ${sessionUrl}
+
+---
+Sent via AgentWeb: ${customerFrontendUrl}
+      `;
+
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, emailSubject, text, html);
+      console.log(`Session notification email sent to: ${emailList.join(', ')}`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending session notification email to ${emailList.join(', ')}:`, error);
+      throw error; // Let the tool surface the error to the agent
+    }
+  },
+
   async sendDailyDigestEmail(
     toEmails: string | string[],
     scheduleName: string,

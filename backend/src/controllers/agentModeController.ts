@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
+import { ABOUT_AGENTWEB_TEAM } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
@@ -1392,6 +1393,13 @@ export async function generateSessionResponse(
             if (contextParts.length) {
               systemPrompt += `\n\n[Page UI Elements]\n${contextParts.join('\n')}`;
             }
+            // Include page-specific tool context so Emma knows which tools are relevant
+            if (parsed.availableTools?.length) {
+              systemPrompt += `\n\n[Available Tools for This Page]\nThe following tools are most relevant to the user's current page: ${parsed.availableTools.join(', ')}. Prefer these tools when responding to user requests on this page.`;
+            }
+            if (parsed.suggestedActions?.length) {
+              systemPrompt += `\n[Suggested Actions]\nCommon actions the user might want on this page:\n${parsed.suggestedActions.map((a: string) => `- ${a}`).join('\n')}`;
+            }
           } catch { /* ignore parse errors */ }
         }
       } else {
@@ -1405,6 +1413,12 @@ export async function generateSessionResponse(
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
           systemPrompt += `\n\n[AUTOMATED UNATTENDED EXECUTION]\nThis is a scheduled, automated run. No human is present. You MUST:\n- Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.\n- If the task specifies a volume or range (e.g. "send 30-40 connection requests", "post 5 times"), treat the FULL stated amount as your target for this session. Do NOT split into sub-batches and pause between them.\n- Never ask "should I continue?" or "shall I proceed with the next batch?" — just execute continuously until the stated goal is reached.\n- If you encounter an unrecoverable error, stop and report it in your final message. Otherwise, keep going.`;
+        }
+
+        // For Slack sessions, inject team identity context so Emma knows who is on the team
+        // and frames her role as helping a team member craft replies to external parties
+        if (session.pageIdentifier === 'slack-bot' || session.pageIdentifier === 'slack-bot-admin' || session.pageIdentifier === 'slack-triggered') {
+          systemPrompt += `\n\n[Slack Context] You are part of the AgentWeb team.\n${ABOUT_AGENTWEB_TEAM}\nMessages in this Slack thread are prefixed with the sender's name (e.g. "Rui Wang: message text"). When a team member asks you to help reply, you are drafting a response FROM that team member TO the other person in the thread — not answering the team member as if they were asking you a direct question. Always respond in the voice of the team member addressing their conversation partner.`;
         }
       }
 

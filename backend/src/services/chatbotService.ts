@@ -3722,18 +3722,19 @@ export async function generateChatResponse(
       retrievalErrorOccurred = true;
     }
 
-    // Initialize tool support for Emma (customer portal only)
+    // Initialize tool support for Emma (customer portal, or admin users on any portal)
     let agentModeService: AgentModeService | null = null;
     let toolDefinitions: any[] = [];
 
-    if (portalType === 'customer') {
+    if (portalType === 'customer' || isDelegatedAdmin) {
       try {
         // Initialize AgentModeService to access tool registry and executeTool
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
         // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
-        const toolsToInclude = new Set<string>([
+        // Only include customer-specific tools when on the customer portal
+        const toolsToInclude = new Set<string>(portalType === 'customer' ? [
           ...AgentModeService.FOUNDATION_TOOLS,
           'read_page_source',
           'enrich_leads_preview', 'enrich_leads_execute',
@@ -3741,38 +3742,40 @@ export async function generateChatResponse(
           'search_user_guide',
           'get_temp_email', 'check_temp_inbox',
           'get_test_account', 'save_test_account', 'list_test_accounts',
-        ]);
+        ] : []);
 
-        // Page-aware tool injection based on the current page URL
-        const urlPath = (currentUrl || '').replace(/^\//, '');
-        const page = urlPath.split('/')[0].split('?')[0];
-        const urlParams = new URLSearchParams(urlPath.includes('?') ? urlPath.split('?')[1] : '');
-        const tab = urlParams.get('tab') || '';
-        const pageKey = tab ? `${page}?tab=${tab}` : page;
-        const pageToolMap: Record<string, string[]> = {
-          'brand-guidelines': ['read_brand_guidelines', 'update_brand_guidelines', 'get_visual_context'],
-          'market-strategy':  ['read_market_strategy', 'update_market_strategy'],
-          'gtm-plan':         ['list_gtm_plans', 'read_gtm_plan', 'create_gtm_plan', 'update_gtm_plan', 'add_gtm_phase', 'add_gtm_work_items', 'update_gtm_work_item', 'update_gtm_phase', 'delete_gtm_items', 'get_gtm_common_items', 'add_gtm_common_items', 'send_gtm_status_report'],
-          'crm':              ['get_lead_lists', 'create_lead_list', 'add_leads_to_list', 'get_leads', 'search_leads', 'get_lead_details', 'update_lead', 'delete_leads', 'update_lead_list', 'delete_lead_list', 'update_lead_status', 'get_lead_list_statuses', 'configure_lead_statuses', 'get_lead_engagements', 'add_lead_engagement', 'send_email_to_lead', 'update_email_draft_for_lead'],
-          'social-posts':     ['list_connected_accounts', 'list_connected_account_posts', 'load_connected_account_metrics', 'post_on_connected_account', 'comment_on_linkedin_post', 'react_to_linkedin_post', 'create_social_media_posts', 'get_visual_context'],
-          'paid-social':      ['list_connected_accounts', 'list_meta_ads_campaigns', 'get_meta_ads_metrics'],
-          'images':           ['generate_image', 'describe_image', 'get_visual_context'],
-          'videos':           ['generate_video', 'describe_video', 'get_visual_context'],
-          'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
-          'templates':        ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
-          'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
-          'research-reports': ['perform_deep_research', 'search_web'],
-          'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
-          'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
-          'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],
-          'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article', 'get_visual_context'],
-          'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
-        };
-        if (pageToolMap[pageKey]) {
-          pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
+        if (portalType === 'customer') {
+          // Page-aware tool injection based on the current page URL
+          const urlPath = (currentUrl || '').replace(/^\//, '');
+          const page = urlPath.split('/')[0].split('?')[0];
+          const urlParams = new URLSearchParams(urlPath.includes('?') ? urlPath.split('?')[1] : '');
+          const tab = urlParams.get('tab') || '';
+          const pageKey = tab ? `${page}?tab=${tab}` : page;
+          const pageToolMap: Record<string, string[]> = {
+            'brand-guidelines': ['read_brand_guidelines', 'update_brand_guidelines', 'get_visual_context'],
+            'market-strategy':  ['read_market_strategy', 'update_market_strategy'],
+            'gtm-plan':         ['list_gtm_plans', 'read_gtm_plan', 'create_gtm_plan', 'update_gtm_plan', 'add_gtm_phase', 'add_gtm_work_items', 'update_gtm_work_item', 'update_gtm_phase', 'delete_gtm_items', 'get_gtm_common_items', 'add_gtm_common_items', 'send_gtm_status_report'],
+            'crm':              ['get_lead_lists', 'create_lead_list', 'add_leads_to_list', 'get_leads', 'search_leads', 'get_lead_details', 'update_lead', 'delete_leads', 'update_lead_list', 'delete_lead_list', 'update_lead_status', 'get_lead_list_statuses', 'configure_lead_statuses', 'get_lead_engagements', 'add_lead_engagement', 'send_email_to_lead', 'update_email_draft_for_lead'],
+            'social-posts':     ['list_connected_accounts', 'list_connected_account_posts', 'load_connected_account_metrics', 'post_on_connected_account', 'comment_on_linkedin_post', 'react_to_linkedin_post', 'create_social_media_posts', 'get_visual_context'],
+            'paid-social':      ['list_connected_accounts', 'list_meta_ads_campaigns', 'get_meta_ads_metrics'],
+            'images':           ['generate_image', 'describe_image', 'get_visual_context'],
+            'videos':           ['generate_video', 'describe_video', 'get_visual_context'],
+            'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
+            'templates':        ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
+            'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
+            'research-reports': ['perform_deep_research', 'search_web'],
+            'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
+            'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
+            'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],
+            'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article', 'get_visual_context'],
+            'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
+          };
+          if (pageToolMap[pageKey]) {
+            pageToolMap[pageKey].forEach(t => toolsToInclude.add(t));
+          }
         }
 
-        // Add admin tools when message is from admin delegated access
+        // Add admin tools when user is admin (direct or delegated)
         if (isDelegatedAdmin) {
           const adminToolNames = agentModeService.getAdminToolNames();
           adminToolNames.forEach(t => toolsToInclude.add(t));

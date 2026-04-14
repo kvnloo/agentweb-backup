@@ -9,6 +9,99 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-14',
+    changes: [
+      'New: Emma Can Connect Your Accounts Inline — No Page Navigation Needed',
+      '- When you ask Emma (in Agent Mode) to connect a platform like LinkedIn, Gmail, YouTube, or Meta, she now shows a connect dialog directly in the chat — no need to leave the conversation',
+      '- Supports all 8 integrations: LinkedIn, LinkedIn Ads, Gmail, YouTube, Meta, Instagram, Fathom, and LinkedIn Outreach',
+      '- If Emma knows which platform you need, she opens the connect dialog for that platform directly',
+      '- If no specific platform is identified, she shows a picker so you can choose which account to connect',
+      '- After you authorize, Emma automatically continues the conversation with your newly connected account',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'New: CRM Data Analysis via Emma',
+      '- Ask Emma to analyze any CRM lead list and she will fetch the full lead data and email engagement history, run code-based analysis, and return insights directly in chat',
+      '- Example questions: "What is the open rate and bounce rate for my Local Ops list?", "Show me the top 10 most engaged leads", "Which leads have bounced emails?"',
+      '- All lead fields are included in the analysis — including custom fields, notes, deal value, and ICP/engagement flags',
+      '- Data files are cached for 30 minutes so follow-up questions on the same list are fast',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Improved: PR Digest Now Supports Any Time Range',
+      '- When asking Emma to fetch PRs for "the last 7 days" or any relative time range, she now correctly queries the full period — previously she always defaulted to the past 24 hours regardless of what you asked',
+      '- A new days_ago parameter lets Emma pass the range directly (e.g. days_ago: 7) without having to compute ISO timestamps',
+      '- Explicit since/until ISO date parameters still work as before for precise date ranges',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Improved: Emma Can Now See Client Payment Data',
+      '- When asked about clients, Emma (the in-app assistant) now includes subscription type, monthly charge, and whether a payment method is on file',
+      '- Applies to both the client list overview and individual client health assessments',
+      '- Available to admin users via the partner portal chat',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fix: Emma Tools Now Available to Admin Users on Partner Portal',
+      '- Admin users were not getting Emma\'s tool access when chatting via the partner portal due to a portal-type gate — now fixed',
+      '- Emma correctly loads admin tools (client listing, health assessments, etc.) for all admin sessions regardless of portal',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'New: Engagement Personality for Auto-Engagement',
+      '- You can now set a personality for auto-generated comments and replies on the Social Posts → Engagement Settings page',
+      '- Choose from 16 preset tones: Funny, Witty, Playful, Warm, Empathetic, Inspiring, Visionary, Expert, Bold, Storytelling, Curious, Enthusiastic, Professional, Conversational, Thoughtful, and Concise',
+      '- Multiple presets can be combined (e.g. Visionary + Witty)',
+      '- A free-text "Custom style" field lets you describe any tone not covered by the presets',
+      '- Personality is saved per connected account alongside your other engagement settings',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'Improved: Emma Now Recognizes AgentWeb Team Members in Slack Sessions',
+      '- Emma now knows all four AgentWeb team members by name and nickname: Rui Wang (CTO), Harsha Vankayalapati (CEO), Fangfang Tan (CPO), Matthew Wilmer / Matt (CMO)',
+      '- When helping in a Slack thread, Emma understands she is part of the team drafting replies to external contacts — not responding to team members as if they were asking her questions directly',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'Fix: Slack Channel Monitoring No Longer Sends Duplicate Suggest Emails for Emma Sessions',
+      '- When a client @mentions Emma directly in Slack, Emma now responds in Slack without also sending a redundant "suggested reply" email to the team',
+      '- Messages that @mention other team members (e.g. @Rui) still go through the normal suggest flow and will trigger an email if they contain an actionable question or request',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'New: Work Plan Autocomplete Setting',
+      '- You can now toggle Autocomplete on each of your saved work plans in Settings → Work Plans',
+      '- When enabled, Emma runs through all steps automatically without pausing to ask for your approval between each step',
+      '- When disabled (default), Emma presents results after each step and waits for you to confirm before moving on',
+      '- You can also ask Emma to turn autocomplete on or off for the current session\'s work plan directly in chat',
+    ],
+  },
+  {
+    date: '2026-04-13',
+    changes: [
+      'New: Email Session Results Without a Connected Email Account',
+      '- Emma can now email a session summary to any list of addresses directly, using the AgentWeb platform — no email integration required',
+      '- Simply ask Emma to "email these results to..." and she will send a formatted HTML report with your content and a link to the full session',
+      '- Previously, Emma would get stuck in a loop if asked to send email when no email integration was connected',
+    ],
+  },
+  {
     date: '2026-04-12',
     changes: [
       'Fix: Voice Mode Now Prompts for Microphone Permission Immediately',

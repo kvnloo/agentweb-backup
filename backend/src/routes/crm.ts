@@ -16,6 +16,11 @@ import { isDoNotContact } from '../utils/leadContactStatus';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
+// In-memory cache for CRM data files uploaded to S3
+// Key: `${userId}:${listId}`, Value: { leadsUrl, eventsUrl, expiresAt }
+const crmDataFileCache = new Map<string, { leadsUrl: string; eventsUrl: string; expiresAt: number }>();
+const CRM_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
 /**
  * Normalize LinkedIn URL to standard format: https://www.linkedin.com/in/<username>
  * Strips trailing slashes, query parameters, fragments, and ensures consistent protocol
@@ -3699,6 +3704,143 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
   } catch (error: any) {
     console.error('Error loading HTML from URL:', error.message || error);
     return res.status(500).json({ message: 'Failed to load content from URL' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/analyze
+ * @desc Analyze CRM lead data and email events using Gemini code execution.
+ *       Fetches all leads + email events, serializes to CSV, uploads to S3 (cached
+ *       for 30 min per user+list), then delegates to performDataAnalysis.
+ */
+router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { instruction, time_range_days } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    if (!instruction || typeof instruction !== 'string') {
+      return res.status(400).json({ message: 'instruction is required' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Check cache
+    const cacheKey = `${userId}:${listId}`;
+    const cached = crmDataFileCache.get(cacheKey);
+    let leadsUrl: string;
+    let eventsUrl: string;
+
+    if (cached && cached.expiresAt > Date.now()) {
+      leadsUrl = cached.leadsUrl;
+      eventsUrl = cached.eventsUrl;
+    } else {
+      // Fetch all leads (paginated)
+      const allLeads: any[] = [];
+      let lastKey: any = undefined;
+      do {
+        const result = await crmDb.getLeadsByListId(listId, 100, lastKey);
+        allLeads.push(...result.items);
+        lastKey = result.lastEvaluatedKey;
+      } while (lastKey);
+
+      // Build leads CSV — include all fields from all lead records dynamically
+      const leadKeySet = new Set<string>();
+      for (const lead of allLeads) {
+        for (const key of Object.keys(lead)) {
+          // Skip large nested objects (e.g. emailDraft HTML) that inflate the payload
+          const val = lead[key];
+          if (val !== null && typeof val === 'object' && !Array.isArray(val)) continue;
+          leadKeySet.add(key);
+        }
+      }
+      // Put core identity fields first for readability, then remaining fields alphabetically
+      const coreFields = ['leadId', 'email', 'firstName', 'lastName', 'company', 'title', 'status', 'stage'];
+      const remainingFields = [...leadKeySet].filter(k => !coreFields.includes(k)).sort();
+      const leadHeaders = [...coreFields.filter(k => leadKeySet.has(k)), ...remainingFields];
+
+      const escapeCell = (v: any): string => {
+        if (v === undefined || v === null) return '';
+        const str = Array.isArray(v) ? JSON.stringify(v) : String(v);
+        return str.includes(',') || str.includes('"') || str.includes('\n') ? `"${str.replace(/"/g, '""')}"` : str;
+      };
+      const leadRows = allLeads.map(lead => leadHeaders.map(h => escapeCell(lead[h])).join(','));
+      const leadsCsv = [leadHeaders.join(','), ...leadRows].join('\n');
+
+      // Fetch email events for this user's domain
+      const user = await userDb.getUserById(userId);
+      const emailDomain = user?.emailDomain?.trim();
+
+      let eventsCsv: string;
+      if (emailDomain) {
+        const timeCutoff = time_range_days
+          ? new Date(Date.now() - Number(time_range_days) * 24 * 60 * 60 * 1000).toISOString()
+          : null;
+
+        const allEvents = await emailEventsDb.getEventsByEmailDomain(emailDomain);
+        const filtered = timeCutoff
+          ? allEvents.filter(e => e.createdAt >= timeCutoff!)
+          : allEvents;
+
+        const eventHeaders = ['eventId', 'leadEmail', 'eventType', 'emailId', 'createdAt'];
+        const eventRows = filtered.map(ev =>
+          eventHeaders.map(h => {
+            const v = (ev as any)[h];
+            if (v === undefined || v === null) return '';
+            const str = String(v);
+            return str.includes(',') || str.includes('"') || str.includes('\n') ? `"${str.replace(/"/g, '""')}"` : str;
+          }).join(',')
+        );
+        eventsCsv = [eventHeaders.join(','), ...eventRows].join('\n');
+      } else {
+        eventsCsv = 'eventId,leadEmail,eventType,emailId,createdAt\n(no email domain configured)';
+      }
+
+      // Upload both CSVs to S3
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const [leadsUpload, eventsUpload] = await Promise.all([
+        uploadFileToS3(Buffer.from(leadsCsv, 'utf-8'), `crm_leads_${listId}.csv`, userId, 'text/csv'),
+        uploadFileToS3(Buffer.from(eventsCsv, 'utf-8'), `crm_email_events_${listId}.csv`, userId, 'text/csv'),
+      ]);
+
+      if (!leadsUpload.success || !eventsUpload.success) {
+        return res.status(500).json({ message: 'Failed to upload CRM data files for analysis' });
+      }
+
+      leadsUrl = leadsUpload.url!;
+      eventsUrl = eventsUpload.url!;
+
+      // Store in cache
+      crmDataFileCache.set(cacheKey, {
+        leadsUrl,
+        eventsUrl,
+        expiresAt: Date.now() + CRM_CACHE_TTL_MS,
+      });
+    }
+
+    // Delegate to Gemini code execution
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.performDataAnalysis(
+      [leadsUrl, eventsUrl],
+      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with fields leadId, email, firstName, lastName, company, title, status, stage, isICP, engagementCount, createdAt.\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
+      userId
+    );
+
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error in CRM analyze endpoint:', error.message || error);
+    return res.status(500).json({ message: 'Failed to analyze CRM data' });
   }
 });
 

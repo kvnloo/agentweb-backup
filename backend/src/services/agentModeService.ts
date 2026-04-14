@@ -412,6 +412,8 @@ export class AgentModeService {
         await import('../emma/slackMessageTools');
         await import('../emma/tempEmailTools');
         await import('../emma/testAccountTools');
+        await import('../emma/navigateTools');
+        await import('../emma/connectAccountTool');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -474,6 +476,54 @@ export class AgentModeService {
       },
       execute: async (args: any, _context: any) => {
         return this.executeSearchToolResponse(args);
+      }
+    });
+
+    this.toolRegistry.register({
+      name: 'notify_session',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'notify_session',
+          description: 'Send an email notification with a summary of this session to a list of email addresses. Use this whenever the user asks you to email results, share a report, or notify someone about what was discussed or generated. The email includes your message formatted as HTML and a link to the full session.',
+          parameters: {
+            type: 'object',
+            properties: {
+              to: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'List of email addresses to notify'
+              },
+              message: {
+                type: 'string',
+                description: 'The content to include in the email body (markdown supported). This should be the report, summary, or results you want to share.'
+              },
+              subject: {
+                type: 'string',
+                description: 'Optional subject suffix (e.g. the report title or topic). If omitted a default subject is used.'
+              }
+            },
+            required: ['to', 'message']
+          }
+        }
+      },
+      execute: async (args: any, context: any) => {
+        const { emailService } = await import('./emailService');
+        const toList: string[] = Array.isArray(args.to) ? args.to : [args.to];
+        if (toList.length === 0) {
+          throw new Error('At least one email address is required in the "to" field.');
+        }
+        await emailService.sendSessionNotificationEmail(
+          toList,
+          context.sessionId,
+          args.message,
+          args.subject
+        );
+        return {
+          success: true,
+          sent_to: toList,
+          message: `Session notification email sent to: ${toList.join(', ')}`
+        };
       }
     });
 
@@ -1317,6 +1367,16 @@ export class AgentModeService {
         }
       } catch (err) {
         console.error('Failed to load account memories:', err);
+      }
+
+      // For Slack sessions, inject team roster as an assistant acknowledgement so the model
+      // treats it as established knowledge rather than an instruction it can override.
+      const slackPageIds = ['slack-bot', 'slack-bot-admin', 'slack-triggered'];
+      if (slackPageIds.includes(currentSession?.pageIdentifier || '')) {
+        messages.push({
+          role: 'assistant',
+          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+        });
       }
 
       messages.push(...marketingMessages);
@@ -2400,6 +2460,9 @@ export class AgentModeService {
 
     // Timing
     'wait_seconds',
+
+    // Session Notifications (no email integration required)
+    'notify_session',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -3012,6 +3075,11 @@ export class AgentModeService {
         message: result?.message,
         results: result?.results,
       };
+    }
+
+    // For navigation/connect tools, preserve the full result so the frontend can act on it
+    if (toolName === 'navigate_to' || toolName === 'connect_account') {
+      return result;
     }
 
     // For other tools, return empty object to minimize storage
@@ -17298,7 +17366,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -17322,6 +17390,7 @@ Please:
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds
         })),
+        autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -17345,7 +17414,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -17356,6 +17425,11 @@ Please:
       }
 
       const workPlan = { ...session.workPlan };
+
+      // Update autocomplete if explicitly provided
+      if (autocomplete !== undefined) {
+        workPlan.autocomplete = autocomplete;
+      }
 
       // Remove steps if specified
       if (removeStepCounts && removeStepCounts.length > 0) {

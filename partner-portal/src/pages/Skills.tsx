@@ -28,6 +28,12 @@ import {
   Autocomplete,
   Divider,
   Checkbox,
+  Select,
+  MenuItem,
+  InputLabel,
+  FormControl,
+  Tab,
+  Tabs,
 } from "@mui/material";
 import {
   Edit as EditIcon,
@@ -44,7 +50,14 @@ import {
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
-import skillService, { Skill, SkillSyncInfo } from "../services/skillService";
+import skillService, {
+  Skill,
+  SkillSyncInfo,
+  SkillAssignment,
+  SkillTriggerMode,
+  SkillCategory,
+  SkillSchedule,
+} from "../services/skillService";
 
 interface SubscriptionType {
   name: string;
@@ -82,6 +95,17 @@ export default function Skills() {
   const [toolNames, setToolNames] = useState<string[]>([]);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [isPublished, setIsPublished] = useState(false);
+  const [category, setCategory] = useState<SkillCategory | "">("");
+  const [triggerMode, setTriggerMode] = useState<SkillTriggerMode>("install_only");
+  const [scheduleFrequency, setScheduleFrequency] = useState<SkillSchedule["frequency"]>("daily");
+  const [schedulePreferredTime, setSchedulePreferredTime] = useState("09:00");
+  const [scheduleDeliveryChannels, setScheduleDeliveryChannels] = useState<string[]>([]);
+  const [welcomeMessage, setWelcomeMessage] = useState("");
+  const [assignments, setAssignments] = useState<SkillAssignment[]>([]);
+  const [assignmentsLoading, setAssignmentsLoading] = useState(false);
+  const [assignUserEmail, setAssignUserEmail] = useState("");
+  const [assigningUser, setAssigningUser] = useState(false);
+  const [editTab, setEditTab] = useState<"settings" | "assignments">("settings");
   const [toolSearchText, setToolSearchText] = useState("");
   const [saving, setSaving] = useState(false);
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
@@ -235,6 +259,26 @@ export default function Skills() {
       setToolNames(skill.toolNames || []);
       setSystemPrompt(skill.systemPrompt || "");
       setIsPublished(skill.isPublished);
+      setCategory(skill.category || "");
+      setTriggerMode(skill.triggerMode || "install_only");
+      setWelcomeMessage(skill.welcomeMessage || "");
+      if (skill.schedule) {
+        setScheduleFrequency(skill.schedule.frequency || "daily");
+        setSchedulePreferredTime(skill.schedule.preferredTime || "09:00");
+        setScheduleDeliveryChannels(skill.schedule.deliveryChannels || []);
+      } else {
+        setScheduleFrequency("daily");
+        setSchedulePreferredTime("09:00");
+        setScheduleDeliveryChannels([]);
+      }
+      // Load assignments for existing skills
+      if (skill.skillId) {
+        setAssignmentsLoading(true);
+        skillService.getSkillAssignments(skill.skillId, token!)
+          .then(setAssignments)
+          .catch(() => setAssignments([]))
+          .finally(() => setAssignmentsLoading(false));
+      }
     } else {
       setCurrentSkill(null);
       setName("");
@@ -242,8 +286,17 @@ export default function Skills() {
       setToolNames([]);
       setSystemPrompt("");
       setIsPublished(false);
+      setCategory("");
+      setTriggerMode("install_only");
+      setWelcomeMessage("");
+      setScheduleFrequency("daily");
+      setSchedulePreferredTime("09:00");
+      setScheduleDeliveryChannels([]);
+      setAssignments([]);
     }
     setToolSearchText("");
+    setEditTab("settings");
+    setAssignUserEmail("");
     setOpenEditDialog(true);
   };
 
@@ -260,12 +313,22 @@ export default function Skills() {
 
     setSaving(true);
     try {
-      const skillData = {
+      const skillData: Partial<Skill> = {
         name,
         description,
         toolNames,
         systemPrompt,
         isPublished,
+        ...(category && { category: category as SkillCategory }),
+        triggerMode,
+        ...(welcomeMessage && { welcomeMessage }),
+        ...((triggerMode === 'scheduled' || triggerMode === 'both') && {
+          schedule: {
+            frequency: scheduleFrequency,
+            preferredTime: schedulePreferredTime,
+            deliveryChannels: scheduleDeliveryChannels,
+          },
+        }),
       };
 
       if (currentSkill && currentSkill.skillId) {
@@ -835,6 +898,20 @@ export default function Skills() {
           </IconButton>
         </DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
+          {/* Tabs: Settings vs Assignments (only show for existing skills) */}
+          {currentSkill?.skillId && (
+            <Tabs
+              value={editTab}
+              onChange={(_, v) => setEditTab(v)}
+              sx={{ mb: 2, borderBottom: 1, borderColor: 'divider' }}
+            >
+              <Tab label="Settings" value="settings" />
+              <Tab label={`Assignments (${assignments.length})`} value="assignments" />
+            </Tabs>
+          )}
+
+          {editTab === "settings" ? (
+          <>
           <TextField
             margin="dense"
             required
@@ -853,6 +930,111 @@ export default function Skills() {
             value={description}
             onChange={(e: ChangeEvent<HTMLInputElement>) => setDescription(e.target.value)}
           />
+
+          {/* Category & Trigger Mode */}
+          <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
+            <FormControl fullWidth size="small">
+              <InputLabel>Category</InputLabel>
+              <Select
+                value={category}
+                label="Category"
+                onChange={(e) => setCategory(e.target.value as SkillCategory | "")}
+              >
+                <MenuItem value="">None</MenuItem>
+                <MenuItem value="marketing">Marketing</MenuItem>
+                <MenuItem value="content">Content</MenuItem>
+                <MenuItem value="analytics">Analytics</MenuItem>
+                <MenuItem value="research">Research</MenuItem>
+                <MenuItem value="outreach">Outreach</MenuItem>
+                <MenuItem value="operations">Operations</MenuItem>
+                <MenuItem value="other">Other</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl fullWidth size="small">
+              <InputLabel>Trigger Mode</InputLabel>
+              <Select
+                value={triggerMode}
+                label="Trigger Mode"
+                onChange={(e) => setTriggerMode(e.target.value as SkillTriggerMode)}
+              >
+                <MenuItem value="install_only">Install Only</MenuItem>
+                <MenuItem value="on_demand">On Demand</MenuItem>
+                <MenuItem value="scheduled">Scheduled</MenuItem>
+                <MenuItem value="both">Both (On Demand + Scheduled)</MenuItem>
+              </Select>
+            </FormControl>
+          </Stack>
+
+          {/* Schedule config — only when trigger mode includes "scheduled" */}
+          {(triggerMode === 'scheduled' || triggerMode === 'both') && (
+            <Paper variant="outlined" sx={{ p: 2, mt: 2 }}>
+              <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                Schedule Configuration
+              </Typography>
+              <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
+                <FormControl fullWidth size="small">
+                  <InputLabel>Frequency</InputLabel>
+                  <Select
+                    value={scheduleFrequency}
+                    label="Frequency"
+                    onChange={(e) => setScheduleFrequency(e.target.value as SkillSchedule["frequency"])}
+                  >
+                    <MenuItem value="daily">Daily</MenuItem>
+                    <MenuItem value="weekly">Weekly</MenuItem>
+                    <MenuItem value="monthly">Monthly</MenuItem>
+                    <MenuItem value="custom">Custom</MenuItem>
+                  </Select>
+                </FormControl>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Preferred Time"
+                  type="time"
+                  value={schedulePreferredTime}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSchedulePreferredTime(e.target.value)}
+                  InputLabelProps={{ shrink: true }}
+                />
+              </Stack>
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1.5, display: 'block' }}>
+                Delivery Channels
+              </Typography>
+              <Stack direction="row" spacing={1} sx={{ mt: 0.5 }}>
+                {['slack', 'email'].map((ch) => (
+                  <FormControlLabel
+                    key={ch}
+                    control={
+                      <Checkbox
+                        size="small"
+                        checked={scheduleDeliveryChannels.includes(ch)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setScheduleDeliveryChannels(prev => [...prev, ch]);
+                          } else {
+                            setScheduleDeliveryChannels(prev => prev.filter(c => c !== ch));
+                          }
+                        }}
+                      />
+                    }
+                    label={<Typography variant="body2">{ch.charAt(0).toUpperCase() + ch.slice(1)}</Typography>}
+                  />
+                ))}
+              </Stack>
+            </Paper>
+          )}
+
+          {/* Welcome Message — for on_demand skills */}
+          {(triggerMode === 'on_demand' || triggerMode === 'both') && (
+            <TextField
+              margin="normal"
+              fullWidth
+              label="Welcome Message"
+              multiline
+              rows={2}
+              value={welcomeMessage}
+              onChange={(e: ChangeEvent<HTMLInputElement>) => setWelcomeMessage(e.target.value)}
+              helperText="Displayed to users when they start this skill in chat."
+            />
+          )}
 
           <TextField
             margin="normal"
@@ -993,6 +1175,148 @@ export default function Skills() {
               label={isPublished ? "Published (Available to Emma)" : "Draft (Not available to Emma)"}
             />
           </Box>
+          </>
+          ) : (
+          /* Assignments Tab */
+          <Box sx={{ minHeight: 300 }}>
+            {assignmentsLoading ? (
+              <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                <CircularProgress />
+              </Box>
+            ) : (
+              <>
+                <Stack direction="row" spacing={1} sx={{ mb: 2 }}>
+                  <TextField
+                    size="small"
+                    label="User Email or ID"
+                    value={assignUserEmail}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setAssignUserEmail(e.target.value)}
+                    sx={{ flex: 1 }}
+                  />
+                  <Button
+                    variant="contained"
+                    size="small"
+                    disabled={!assignUserEmail.trim() || assigningUser}
+                    onClick={async () => {
+                      if (!currentSkill?.skillId) return;
+                      setAssigningUser(true);
+                      try {
+                        const newAssignment = await skillService.createSkillAssignment(
+                          currentSkill.skillId,
+                          { userId: assignUserEmail.trim(), status: 'active' },
+                          token!
+                        );
+                        setAssignments(prev => [...prev, newAssignment]);
+                        setAssignUserEmail("");
+                      } catch (err) {
+                        setError("Failed to assign user");
+                      } finally {
+                        setAssigningUser(false);
+                      }
+                    }}
+                  >
+                    {assigningUser ? <CircularProgress size={18} /> : "Assign"}
+                  </Button>
+                </Stack>
+                {assignments.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
+                    No users assigned to this skill yet.
+                  </Typography>
+                ) : (
+                  <TableContainer>
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>User ID</TableCell>
+                          <TableCell>Status</TableCell>
+                          <TableCell>Last Run</TableCell>
+                          <TableCell>Next Run</TableCell>
+                          <TableCell align="right">Actions</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {assignments.map((a) => (
+                          <TableRow key={a.assignmentId}>
+                            <TableCell>
+                              <Typography variant="body2" sx={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                {a.userId}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                label={a.status}
+                                color={a.status === 'active' ? 'success' : a.status === 'paused' ? 'warning' : a.status === 'error' ? 'error' : 'default'}
+                              />
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="caption">
+                                {a.lastRunTime ? new Date(a.lastRunTime).toLocaleString() : '—'}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="caption">
+                                {a.nextRunTime ? new Date(a.nextRunTime).toLocaleString() : '—'}
+                              </Typography>
+                            </TableCell>
+                            <TableCell align="right">
+                              <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+                                {a.status === 'active' ? (
+                                  <Tooltip title="Pause">
+                                    <IconButton
+                                      size="small"
+                                      onClick={async () => {
+                                        try {
+                                          const updated = await skillService.updateSkillAssignment(a.assignmentId, { status: 'paused' }, token!);
+                                          setAssignments(prev => prev.map(x => x.assignmentId === a.assignmentId ? updated : x));
+                                        } catch { setError("Failed to pause assignment"); }
+                                      }}
+                                    >
+                                      <AdminIcon fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                ) : a.status === 'paused' ? (
+                                  <Tooltip title="Resume">
+                                    <IconButton
+                                      size="small"
+                                      color="primary"
+                                      onClick={async () => {
+                                        try {
+                                          const updated = await skillService.updateSkillAssignment(a.assignmentId, { status: 'active' }, token!);
+                                          setAssignments(prev => prev.map(x => x.assignmentId === a.assignmentId ? updated : x));
+                                        } catch { setError("Failed to resume assignment"); }
+                                      }}
+                                    >
+                                      <AdminIcon fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                ) : null}
+                                <Tooltip title="Delete">
+                                  <IconButton
+                                    size="small"
+                                    color="error"
+                                    onClick={async () => {
+                                      try {
+                                        await skillService.deleteSkillAssignment(a.assignmentId, token!);
+                                        setAssignments(prev => prev.filter(x => x.assignmentId !== a.assignmentId));
+                                      } catch { setError("Failed to delete assignment"); }
+                                    }}
+                                  >
+                                    <DeleteIcon fontSize="small" />
+                                  </IconButton>
+                                </Tooltip>
+                              </Stack>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </>
+            )}
+          </Box>
+          )}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={handleCloseEditDialog} color="inherit">Cancel</Button>

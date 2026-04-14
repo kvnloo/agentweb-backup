@@ -1893,6 +1893,11 @@ Returns for each client:
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
 - signup_time: account creation / sign-up timestamp
+- subscription_type: subscription tier (e.g. Free, Basic, Pro)
+- stripe_customer_id: Stripe customer ID (null if not set)
+- current_period_end: ISO date of current billing period end (null if not set)
+- has_payment_method: whether the client has a payment method on file in Stripe
+- monthly_amount_cents: most recent invoice amount in cents (e.g. 4900 = $49.00), null if not set
 
 Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
     inputSchema: {
@@ -1952,13 +1957,17 @@ mcpToolRegistry.register({
   name: 'get_pr_digest',
   definition: {
     name: 'get_pr_digest',
-    description: 'Fetch merged pull requests from GitHub repositories (agentweb and agentweb-customer-portal) within a time range and return a formatted summary. Defaults to the past 24 hours. Admin-only. Use this to generate daily change digests to send to the team.',
+    description: 'Fetch merged pull requests from GitHub repositories (agentweb and agentweb-customer-portal) within a time range and return a formatted summary. Defaults to the past 24 hours. Admin-only. Use this to generate change digests to send to the team. When the user asks for "last N days" or a specific date range, always pass the appropriate days_ago or since/until — do not rely on the default.',
     inputSchema: {
       type: 'object',
       properties: {
+        days_ago: {
+          type: 'integer',
+          description: 'Number of days to look back from now (e.g., 7 for the last 7 days). Use this when the user specifies a relative time range like "last week" or "past 7 days". Takes precedence over since if both are provided.'
+        },
         since: {
           type: 'string',
-          description: 'Start time in ISO 8601 format (e.g., "2026-03-19T00:00:00Z"). Defaults to 24 hours ago.'
+          description: 'Start time in ISO 8601 format (e.g., "2026-03-19T00:00:00Z"). Defaults to 24 hours ago if neither days_ago nor since is provided.'
         },
         until: {
           type: 'string',
@@ -1970,8 +1979,11 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any) => {
     const now = new Date();
-    const defaultSince = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const since = _args.since || defaultSince.toISOString();
+    const daysAgo: number | undefined = _args.days_ago;
+    const computedSince = daysAgo != null
+      ? new Date(now.getTime() - daysAgo * 24 * 60 * 60 * 1000)
+      : new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const since = daysAgo != null ? computedSince.toISOString() : (_args.since || computedSince.toISOString());
     const until = _args.until || now.toISOString();
 
     const results = await fetchMergedPRs(since, until);

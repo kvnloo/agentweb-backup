@@ -214,6 +214,13 @@ export interface User {
       /** Spread comment engagements randomly within this window (minutes) */
       commentEngagementWindowMinutes: number;
 
+      /** Personality/tone for auto-generated comments and replies */
+      personality?: {
+        /** Selected preset tones (e.g. "funny", "visionary") */
+        presets: string[];
+        /** Free-text custom personality description */
+        custom?: string;
+      };
     };
     created_at: string;
     updated_at: string;
