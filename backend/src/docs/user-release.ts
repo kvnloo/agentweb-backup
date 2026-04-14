@@ -22,6 +22,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'New: CRM Data Analysis via Emma',
+      '- Ask Emma to analyze any CRM lead list and she will fetch the full lead data and email engagement history, run code-based analysis, and return insights directly in chat',
+      '- Example questions: "What is the open rate and bounce rate for my Local Ops list?", "Show me the top 10 most engaged leads", "Which leads have bounced emails?"',
+      '- All lead fields are included in the analysis — including custom fields, notes, deal value, and ICP/engagement flags',
+      '- Data files are cached for 30 minutes so follow-up questions on the same list are fast',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Improved: PR Digest Now Supports Any Time Range',
       '- When asking Emma to fetch PRs for "the last 7 days" or any relative time range, she now correctly queries the full period — previously she always defaulted to the past 24 hours regardless of what you asked',
       '- A new days_ago parameter lets Emma pass the range directly (e.g. days_ago: 7) without having to compute ISO timestamps',

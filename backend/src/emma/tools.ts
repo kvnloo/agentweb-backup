@@ -4197,6 +4197,44 @@ emmaToolRegistry.register({
 
 // --- Tools from utilityTools.ts ---
 emmaToolRegistry.register({
+  name: "analyze_crm_data",
+  definition: {
+    name: "analyze_crm_data",
+    description: "Analyze CRM lead data and email engagement metrics (open rate, bounce rate, click rate, top leads, trends, etc.) using AI-powered code execution. Fetches all leads and email events for the specified list, then runs analysis per the instruction. Data files are cached for 30 minutes so repeated analysis on the same list is fast.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        list_id: {
+          type: "string",
+          description: "The CRM lead list ID to analyze"
+        },
+        instruction: {
+          type: "string",
+          description: "What to analyze or compute from the CRM data (e.g. 'Calculate open rate, click rate, and bounce rate', 'Which leads are most engaged?', 'Show email activity trend by week')"
+        },
+        time_range_days: {
+          type: "number",
+          description: "Optional: limit email events to the last N days (e.g. 30, 90). Defaults to all-time if omitted."
+        }
+      },
+      required: ["list_id", "instruction"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const { mcpFetch } = await import('../mcp/server/httpClient');
+    const ctx = { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/crm/lists/${args.list_id}/analyze`,
+      body: { instruction: args.instruction, time_range_days: args.time_range_days },
+      context: ctx,
+      timeoutMs: 5 * 60 * 1000, // 5 min — Gemini code execution can take a while
+    });
+    return { content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] };
+  }
+});
+
+emmaToolRegistry.register({
   name: "perform_data_analysis",
   definition: {
     name: "perform_data_analysis",
