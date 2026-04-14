@@ -3865,7 +3865,7 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search the user's Foreplay ad library (swipefile + boards) for ads matching the query. Use this tool when the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads by brand, headline, or description. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    description: "Search the user's Foreplay ad library (swipefile + boards) for ads the user has SAVED/bookmarked. Use this for ad creative inspiration or finding specific saved ads by brand, headline, or description. IMPORTANT: This only searches the user's own saved collection — it does NOT search the public Meta/Facebook Ads Library for ads currently running by any company. For finding a specific company's currently-running Meta ads, use Playwright to browse https://www.facebook.com/ads/library/ with the company's Facebook Page ID (view_all_page_id=PAGE_ID) — do NOT use keyword search (q=) as that returns false positives. Do NOT use search_knowledge_base for Foreplay ad searches.",
     inputSchema: {
       type: "object",
       properties: {
