@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-14',
     changes: [
+      'Emma Can Now Clone Meta Ads With Images',
+      '- Emma can now copy an existing Meta ad into a new paused ad — including its image, ad copy, and call-to-action — with a single instruction like "Clone this ad with a new landing page URL"',
+      '- Previously, Emma would get stuck when trying to clone ads because image details were not included in the ad listing; she now retrieves the full creative (image hash, story spec, body, title) in one step',
+      '- Supports overriding the landing page URL, headline, body copy, ad name, target ad set, and call-to-action type when cloning',
+      '- Works with single-image, video, and carousel ad formats',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
       'Fix: Emma Knows the AgentWeb Team in Scheduled Slack Scans',
       '- When Emma runs a scheduled "Daily Slack Check" (or any Slack-scanning session), she now correctly identifies Rui, Harsha, Fangfang, and Matt as internal team members',
       '- Previously, only event-driven Slack sessions (direct @mentions, channel triggers) had team context; scheduled scans did not, so Emma could mistake a team member\'s message for a client message',

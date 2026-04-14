@@ -9884,7 +9884,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -9897,8 +9897,174 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'DELETE':
         if (!ad_id) throw new Error('ad_id is required for DELETE action');
         return this.deleteMetaAdsAd(userId, ad_id, account_id);
+      case 'COPY_AD':
+        if (!ad_id) throw new Error('ad_id (source_ad_id) is required for COPY_AD action');
+        return this.copyMetaAdsAd(userId, ad_id, params, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
+    }
+  }
+
+  /**
+   * Copy an existing ad to a new ad set (or the same one), cloning its creative.
+   * Handles image_hash extraction or re-upload from CDN URL automatically.
+   *
+   * params:
+   *   - name?:         New ad name (defaults to "<source name> (copy)")
+   *   - adset_id?:     Target ad set ID (defaults to the source ad's ad set)
+   *   - link_url?:     Override destination URL in the new creative
+   *   - body?:         Override ad body text
+   *   - title?:        Override headline
+   *   - status?:       New ad status (default: PAUSED)
+   */
+  public async copyMetaAdsAd(userId: string, sourceAdId: string, params: any = {}, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      // Step 1: Fetch the source ad (now includes creative sub-fields)
+      const sourceAd = await metaService.getAd(accessToken, sourceAdId);
+      const creativeRef = sourceAd?.creative;
+      const oldCreativeId = creativeRef?.id || creativeRef?.creative_id;
+      if (!oldCreativeId) {
+        return {
+          success: false,
+          message: 'Source ad has no creative assigned. Cannot copy.',
+          error: 'MISSING_CREATIVE'
+        };
+      }
+      console.log(`AgentMode: Copying ad ${sourceAdId} (creative ${oldCreativeId})`);
+
+      // Step 2: Fetch the full creative details
+      const creativeData = await metaService.getAdCreative(accessToken, oldCreativeId);
+      if (!creativeData?.object_story_spec) {
+        return {
+          success: false,
+          message: 'Could not read the source creative details. The creative may be deleted or in an unsupported format.',
+          error: 'MISSING_OBJECT_STORY_SPEC'
+        };
+      }
+
+      // Step 3: Build new creative params, carrying over media + applying overrides
+      const existingSpec = creativeData.object_story_spec;
+      const pageId = existingSpec.page_id;
+      const newLinkUrl = params.link_url || params.destination || params.url;
+
+      let newCreativeParams: any;
+
+      if (existingSpec.video_data) {
+        const vd = existingSpec.video_data;
+        let imageHash = vd.image_hash;
+        // Re-upload thumbnail from CDN URL if no hash available
+        if (!imageHash && vd.image_url) {
+          console.log(`AgentMode: Re-uploading video thumbnail from CDN URL for copy of ad ${sourceAdId}`);
+          const uploaded = await this.uploadMetaAdsImage(userId, vd.image_url, account_id);
+          imageHash = uploaded?.image_hash;
+        }
+        newCreativeParams = {
+          name: params.name || `${creativeData.name || 'Creative'} (copy)`,
+          page_id: pageId,
+          video_id: vd.video_id,
+          image_hash: imageHash,
+          image_url: imageHash ? undefined : (vd.image_url || creativeData.thumbnail_url),
+          body: params.body || vd.message || creativeData.body || '',
+          title: params.title || vd.title || creativeData.title || '',
+          link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
+          call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        };
+      } else if (existingSpec.link_data?.child_attachments) {
+        const ld = existingSpec.link_data;
+        const updatedCards = await Promise.all(ld.child_attachments.map(async (card: any) => {
+          let imageHash = card.image_hash;
+          const pictureUrl = card.picture || card.image_url;
+          if (!imageHash && pictureUrl) {
+            console.log(`AgentMode: Re-uploading carousel card image from CDN URL for copy of ad ${sourceAdId}`);
+            const uploaded = await this.uploadMetaAdsImage(userId, pictureUrl, account_id);
+            imageHash = uploaded?.image_hash;
+          }
+          return {
+            image_hash: imageHash,
+            image_url: imageHash ? undefined : pictureUrl,
+            video_id: card.video_id,
+            title: card.name || card.title,
+            description: card.description,
+            link_url: newLinkUrl || card.link,
+          };
+        }));
+        newCreativeParams = {
+          name: params.name || `${creativeData.name || 'Creative'} (copy)`,
+          page_id: pageId,
+          body: params.body || ld.message || creativeData.body || '',
+          title: params.title || '',
+          link_url: newLinkUrl || ld.link || '',
+          carousel_cards: updatedCards,
+          call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        };
+      } else if (existingSpec.link_data) {
+        const ld = existingSpec.link_data;
+        let imageHash = ld.image_hash;
+        const pictureUrl = ld.picture || ld.image_url || creativeData.image_url;
+        if (!imageHash && pictureUrl) {
+          console.log(`AgentMode: Re-uploading image from CDN URL for copy of ad ${sourceAdId}`);
+          const uploaded = await this.uploadMetaAdsImage(userId, pictureUrl, account_id);
+          imageHash = uploaded?.image_hash;
+        }
+        newCreativeParams = {
+          name: params.name || `${creativeData.name || 'Creative'} (copy)`,
+          page_id: pageId,
+          image_hash: imageHash,
+          image_url: imageHash ? undefined : pictureUrl,
+          body: params.body || ld.message || creativeData.body || '',
+          title: params.title || ld.name || creativeData.title || '',
+          link_url: newLinkUrl || ld.link || '',
+          call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        };
+      } else {
+        return {
+          success: false,
+          message: 'Unsupported creative type. Cannot copy the ad.',
+          error: 'UNSUPPORTED_CREATIVE_TYPE'
+        };
+      }
+
+      console.log(`AgentMode: Creating copy creative for ad ${sourceAdId}:`, newCreativeParams);
+
+      // Step 4: Create the new creative
+      const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);
+      const newCreativeId = newCreative?.id;
+      if (!newCreativeId) {
+        return {
+          success: false,
+          message: 'Failed to create the copy creative. The Meta API did not return a creative ID.',
+          error: 'CREATIVE_CREATE_FAILED'
+        };
+      }
+
+      // Step 5: Create the new ad
+      const targetAdSetId = params.adset_id || sourceAd.adset_id;
+      const newAdName = params.name || `${sourceAd.name || 'Ad'} (copy)`;
+      const newAd = await metaService.createAd(accountId, accessToken, {
+        name: newAdName,
+        adset_id: targetAdSetId,
+        creative_id: newCreativeId,
+        status: params.status || 'PAUSED',
+      });
+
+      return {
+        success: true,
+        message: `Ad "${newAdName}" copied successfully`,
+        source_ad_id: sourceAdId,
+        new_ad_id: newAd?.id,
+        new_creative_id: newCreativeId,
+        ad: newAd
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error copying Meta ad:', error);
+      return {
+        success: false,
+        message: this.enrichMetaError(error, 'copy Meta ad'),
+        error: error.message,
+        details: error.structuredError
+      };
     }
   }
 
@@ -10923,6 +11089,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD UPDATE requires "ad_id".');
         } else if (action === 'DELETE' && !ad_id) {
           throw new Error('AD DELETE requires "ad_id".');
+        } else if (action === 'COPY_AD' && !ad_id) {
+          throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         }
         break;
 
