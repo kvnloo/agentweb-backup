@@ -63,6 +63,7 @@ jest.mock('../services/db', () => ({
     updateLeadEngagement: jest.fn(),
     deleteLeadEngagement: jest.fn(),
     getLeadEngagementCount: jest.fn(),
+    updateSearchQueryTemplates: jest.fn().mockResolvedValue({}),
   },
   taskDb: {
     getTaskById: jest.fn(),
@@ -832,6 +833,81 @@ describe('CRM Routes', () => {
         processedCount: 3,
         failedCount: 1,
       }));
+    });
+
+    it('should persist config after preview mode', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'test-user-id' });
+      (crmDb.updateSearchQueryTemplates as jest.Mock).mockResolvedValue({});
+      mockPreview.mockResolvedValue({
+        totalLeads: 2,
+        leadsToProcess: 2,
+        alreadyEnriched: 0,
+        samples: [],
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'preview' };
+      mockRequest.body = {
+        instruction: 'Find company info',
+        outputFields: ['company_info'],
+        webSearchTemplate: '{{company}} overview',
+        linkedinSearchTemplate: '{{firstName}} {{company}}',
+        sourcesPerField: { company_info: ['web_search'] },
+      };
+
+      const handler = findEnrichWebPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      // Allow fire-and-forget promise to settle
+      await Promise.resolve();
+
+      expect(crmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
+        'list1',
+        {},
+        { company_info: ['web_search'] },
+        'Find company info',
+        ['company_info'],
+        '{{company}} overview',
+        '{{firstName}} {{company}}',
+      );
+    });
+
+    it('should persist config after enrich mode', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'test-user-id' });
+      (crmDb.updateSearchQueryTemplates as jest.Mock).mockResolvedValue({});
+      mockExecute.mockResolvedValue({
+        processedCount: 1,
+        failedCount: 0,
+        totalToProcess: 1,
+        failureBreakdown: { searchWebFailed: 0, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'enrich' };
+      mockRequest.body = {
+        instruction: 'Find funding data',
+        outputFields: ['funding_stage'],
+        sourcesPerField: undefined,
+      };
+
+      const handler = findEnrichWebPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      await Promise.resolve();
+
+      expect(crmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
+        'list1',
+        {},
+        undefined,
+        'Find funding data',
+        ['funding_stage'],
+        undefined,
+        undefined,
+      );
     });
   });
 

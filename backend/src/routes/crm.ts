@@ -2254,6 +2254,8 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
 
+    let responseBody: object;
+
     if (mode === 'preview') {
       const service = new CrmEnrichmentService();
       const result = await service.preview({
@@ -2268,19 +2270,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         linkedinSearchTemplate,
         sourcesPerField,
       });
-
-      // Persist config so it can be restored when the dialog reopens
-      crmDb.updateSearchQueryTemplates(
-        listId,
-        {},
-        sourcesPerField,
-        instruction,
-        outputFields,
-        webSearchTemplate,
-        linkedinSearchTemplate,
-      ).catch((err: any) => console.warn('[CRM] enrich-web preview: failed to save config:', err));
-
-      return res.json({
+      responseBody = {
         success: true,
         totalLeads: result.totalLeads,
         leadsToProcess: result.leadsToProcess,
@@ -2290,7 +2280,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
           leadName: [s.lead.firstName, s.lead.lastName].filter(Boolean).join(' ') || s.lead.email || s.leadId,
           fieldResults: s.enrichedFields,
         })),
-      });
+      };
     } else if (mode === 'enrich') {
       const service = new CrmEnrichmentService();
       const result = await service.execute({
@@ -2305,19 +2295,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         linkedinSearchTemplate,
         sourcesPerField,
       }, socketId);
-
-      // Persist config so it can be restored when the dialog reopens
-      crmDb.updateSearchQueryTemplates(
-        listId,
-        {},
-        sourcesPerField,
-        instruction,
-        outputFields,
-        webSearchTemplate,
-        linkedinSearchTemplate,
-      ).catch((err: any) => console.warn('[CRM] enrich-web enrich: failed to save config:', err));
-
-      return res.json({
+      responseBody = {
         success: true,
         message: result.failedCount > 0
           ? `Enrichment completed with ${result.processedCount} enriched and ${result.failedCount} failed`
@@ -2328,10 +2306,25 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         failedCount: result.failedCount,
         totalLeadsProcessed: result.totalToProcess,
         failureBreakdown: result.failureBreakdown,
-      });
+      };
+    } else {
+      return res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "enrich"' });
     }
 
-    return res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "enrich"' });
+    // Persist config (fire-and-forget) so settings are restored when the dialog reopens.
+    // `searchQueryTemplates` (per-field map) is deprecated in favour of the top-level
+    // webSearchTemplate / linkedinSearchTemplate fields; {} intentionally clears it.
+    crmDb.updateSearchQueryTemplates(
+      listId,
+      {},
+      sourcesPerField,
+      instruction,
+      outputFields,
+      webSearchTemplate,
+      linkedinSearchTemplate,
+    ).catch((err: unknown) => console.warn(`[CRM] enrich-web ${mode}: failed to save config:`, err));
+
+    return res.json(responseBody);
   } catch (error: any) {
     console.error('Error enriching leads with web company info:', error);
     return res.status(500).json({ message: error.message || 'Failed to enrich leads with web company info' });
