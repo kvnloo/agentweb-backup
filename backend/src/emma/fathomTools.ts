@@ -16,9 +16,6 @@ import { getFathomConfig } from '../config/integrations';
 
 const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
 
-/** Safety cap on Fathom pagination — 20 pages × 10/page = 200 meetings max. */
-export const FATHOM_TOOLS_MAX_PAGES = 20;
-
 /**
  * Retrieve the Fathom access token from the user's connected accounts.
  * For OAuth accounts, automatically refreshes the token if expired.
@@ -108,62 +105,41 @@ emmaToolRegistry.register({
     }
 
     try {
-      const baseParams = new URLSearchParams({
+      const params = new URLSearchParams({
         include_action_items: 'true',
       });
-      if (args.created_after) baseParams.set('created_after', args.created_after);
-      if (args.created_before) baseParams.set('created_before', args.created_before);
+      if (args.created_after) params.set('created_after', args.created_after);
+      if (args.created_before) params.set('created_before', args.created_before);
 
-      const meetings: any[] = [];
-      let cursor: string | undefined;
-      let pageCount = 0;
+      const url = `${FATHOM_API_BASE}/meetings?${params.toString()}`;
+      const response = await axios.get(url, {
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+      });
 
-      do {
-        const params = new URLSearchParams(baseParams);
-        if (cursor) params.set('cursor', cursor);
+      console.log('[fathom_get_meetings] Response type:', typeof response.data, 'isArray:', Array.isArray(response.data), 'keys:', Object.keys(response.data || {}), 'sample:', JSON.stringify(response.data).substring(0, 300));
 
-        const url = `${FATHOM_API_BASE}/meetings?${params.toString()}`;
-        const response = await axios.get(url, {
-          headers: { 'Authorization': `Bearer ${accessToken}` },
-          timeout: 10000,
-        });
+      // Fathom API returns { items: [...], limit, next_cursor }
+      const rawData = response.data as any;
+      const meetingsArray = Array.isArray(rawData) ? rawData
+        : Array.isArray(rawData?.items) ? rawData.items
+        : Array.isArray(rawData?.calls) ? rawData.calls
+        : Array.isArray(rawData?.meetings) ? rawData.meetings
+        : [];
 
-        const rawData = response.data as any;
-        const meetingsArray = Array.isArray(rawData) ? rawData
-          : Array.isArray(rawData?.items) ? rawData.items
-          : Array.isArray(rawData?.calls) ? rawData.calls
-          : Array.isArray(rawData?.meetings) ? rawData.meetings
-          : [];
-
-        for (const m of meetingsArray) {
-          meetings.push({
-            recording_id: m.recording_id,
-            title: m.title || m.meeting_title,
-            url: m.url || m.share_url,
-            created_at: m.created_at,
-            scheduled_start_time: m.scheduled_start_time,
-            recording_start_time: m.recording_start_time,
-            recording_end_time: m.recording_end_time,
-            recorded_by: m.recorded_by?.name || m.recorded_by?.email || null,
-            participants: m.calendar_invitees?.map((i: any) => i.name || i.email) || [],
-            summary: m.default_summary?.short_hand_bullet || m.default_summary || null,
-            action_items_count: Array.isArray(m.action_items) ? m.action_items.length : 0,
-            action_items: (m.action_items || []).map((ai: any) => ai.text || ai.title || ai),
-          });
-        }
-
-        cursor = typeof rawData?.next_cursor === 'string' && rawData.next_cursor.length > 0
-          ? rawData.next_cursor
-          : undefined;
-        pageCount++;
-      } while (cursor && pageCount < FATHOM_TOOLS_MAX_PAGES);
-
-      if (cursor) {
-        console.warn(
-          `[fathom_get_meetings] Hit FATHOM_TOOLS_MAX_PAGES (${FATHOM_TOOLS_MAX_PAGES}) — ` +
-          `truncating. Fetched ${meetings.length} meetings so far.`,
-        );
-      }
+      const meetings = meetingsArray.map((m: any) => ({
+        recording_id: m.recording_id,
+        title: m.title || m.meeting_title,
+        url: m.url || m.share_url,
+        created_at: m.created_at,
+        scheduled_start_time: m.scheduled_start_time,
+        recording_start_time: m.recording_start_time,
+        recording_end_time: m.recording_end_time,
+        recorded_by: m.recorded_by?.name || m.recorded_by?.email || null,
+        participants: m.calendar_invitees?.map((i: any) => i.name || i.email) || [],
+        summary: m.default_summary?.short_hand_bullet || m.default_summary || null,
+        action_items_count: Array.isArray(m.action_items) ? m.action_items.length : 0,
+        action_items: (m.action_items || []).map((ai: any) => ai.text || ai.title || ai),
+      }));
 
       return {
         success: true,
