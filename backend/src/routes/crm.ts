@@ -16,6 +16,14 @@ import { isDoNotContact } from '../utils/leadContactStatus';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
+import {
+  dealDb,
+  DealAuthError,
+  DealNotFoundError,
+  DEAL_STAGES,
+  DealStage,
+  ContactRef,
+} from '../services/dealDb';
 import Stripe from 'stripe';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -4005,6 +4013,180 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error in CRM analyze endpoint:', error.message || error);
     return res.status(500).json({ message: 'Failed to analyze CRM data' });
+  }
+});
+
+// ============================================================================
+// Deals Routes (CRM Unification v1 — A2)
+// ============================================================================
+
+/**
+ * Helper: translate dealDb errors to HTTP responses. Keeps route bodies tight.
+ */
+function handleDealError(res: Response, err: any): Response {
+  if (err instanceof DealNotFoundError) {
+    return res.status(404).json({ message: err.message });
+  }
+  if (err instanceof DealAuthError) {
+    return res.status(403).json({ message: err.message });
+  }
+  if (err instanceof Error && /Invalid|required|must be|cannot be empty/i.test(err.message)) {
+    return res.status(400).json({ message: err.message });
+  }
+  console.error('Deals route error:', err);
+  return res.status(500).json({ message: 'Internal error' });
+}
+
+// GET /api/crm/deals — list deals owned by the current user, optional filters
+router.get('/deals', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const { companyDomain, stage, limit } = req.query as Record<string, string | undefined>;
+    const lim = limit ? Math.min(parseInt(limit, 10) || 100, 500) : 100;
+
+    if (companyDomain) {
+      if (stage && !DEAL_STAGES.includes(stage as DealStage)) {
+        return res.status(400).json({ message: `Invalid stage: ${stage}` });
+      }
+      const deals = await dealDb.getDealsByDomain(companyDomain, {
+        stage: stage as DealStage | undefined,
+        limit: lim,
+      });
+      // Scope to the caller's own deals — domain lookups cross tenants otherwise.
+      const mine = deals.filter(
+        d => d.ownerUserId === userId || d.accountOwnerUserId === userId
+      );
+      return res.json({ deals: mine });
+    }
+
+    const deals = await dealDb.getDealsByOwner(userId, { limit: lim });
+    const filtered = stage ? deals.filter(d => d.stage === stage) : deals;
+    return res.json({ deals: filtered });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// POST /api/crm/deals — create a new deal
+router.post('/deals', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const {
+      primaryContactId,
+      contactIds,
+      accountOwnerUserId,
+      companyDomain,
+      stage,
+      dealValue,
+      dealCurrency,
+      expectedClose,
+      heatScore,
+      source,
+      notes,
+      tenantId,
+    } = req.body || {};
+
+    if (!primaryContactId) {
+      return res.status(400).json({ message: 'primaryContactId required' });
+    }
+
+    const deal = await dealDb.createDeal({
+      ownerUserId: userId,
+      primaryContactId,
+      contactIds,
+      accountOwnerUserId,
+      companyDomain,
+      stage,
+      dealValue,
+      dealCurrency,
+      expectedClose,
+      heatScore,
+      source,
+      notes,
+      tenantId,
+    });
+    return res.status(201).json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// GET /api/crm/deals/:dealId
+router.get('/deals/:dealId', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const deal = await dealDb.getDeal(req.params.dealId);
+    if (!deal) return res.status(404).json({ message: 'Deal not found' });
+    if (deal.ownerUserId !== userId && deal.accountOwnerUserId !== userId) {
+      return res.status(403).json({ message: 'Not authorized to view this deal' });
+    }
+    return res.json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// PUT /api/crm/deals/:dealId
+router.put('/deals/:dealId', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const deal = await dealDb.updateDeal(req.params.dealId, userId, req.body || {});
+    return res.json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// DELETE /api/crm/deals/:dealId
+router.delete('/deals/:dealId', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    await dealDb.deleteDeal(req.params.dealId, userId);
+    return res.json({ success: true });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// POST /api/crm/deals/:dealId/rotate-primary  { newPrimaryContactId, oldPrimaryRef?, newPrimaryRef? }
+router.post('/deals/:dealId/rotate-primary', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const { newPrimaryContactId, oldPrimaryRef, newPrimaryRef } = req.body || {};
+    if (!newPrimaryContactId) {
+      return res.status(400).json({ message: 'newPrimaryContactId required' });
+    }
+    const refs: { oldPrimary?: ContactRef; newPrimary?: ContactRef } = {};
+    if (oldPrimaryRef?.listId && oldPrimaryRef?.leadId) refs.oldPrimary = oldPrimaryRef;
+    if (newPrimaryRef?.listId && newPrimaryRef?.leadId) refs.newPrimary = newPrimaryRef;
+
+    const deal = await dealDb.rotatePrimary(
+      req.params.dealId,
+      userId,
+      newPrimaryContactId,
+      Object.keys(refs).length > 0 ? refs : undefined
+    );
+    return res.json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
   }
 });
 
