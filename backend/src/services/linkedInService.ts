@@ -723,6 +723,42 @@ export class LinkedInService {
   }
 
   /**
+   * Repost (reshare) an existing LinkedIn post, optionally with added commentary.
+   * @param accessToken - OAuth access token
+   * @param authorUrn - URN of the entity doing the repost (person or organization)
+   * @param originalPostUrn - URN of the post to reshare (e.g., "urn:li:share:123" or "urn:li:ugcPost:456")
+   * @param commentary - Optional text to add alongside the repost
+   * @returns Repost URN
+   */
+  async createRepost(accessToken: string, authorUrn: string, originalPostUrn: string, commentary?: string): Promise<string> {
+    return this.safeRequest(async () => {
+      console.log('[LinkedIn] createRepost called for author:', authorUrn, 'original:', originalPostUrn);
+
+      const payload: any = {
+        author: authorUrn,
+        reshareContext: { parent: originalPostUrn },
+        visibility: 'PUBLIC',
+        lifecycleState: 'PUBLISHED',
+        distribution: {
+          feedDistribution: 'MAIN_FEED'
+        }
+      };
+
+      if (commentary) {
+        payload.commentary = this.escapeLinkedInLittle(commentary);
+      }
+
+      const response = await this.client.post('/rest/posts', payload, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      const repostUrn = response.headers['x-restli-id'] || (response.data as any).id;
+      console.log('[LinkedIn] Repost created successfully:', repostUrn);
+      return repostUrn;
+    });
+  }
+
+  /**
    * Create a comment on a LinkedIn post
    * @param accessToken - OAuth access token
    * @param postUrn - URN of the post to comment on (e.g., "urn:li:ugcPost:123" or "urn:li:share:456")
