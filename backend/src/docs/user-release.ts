@@ -189,6 +189,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-14',
+    changes: [
+      'New: View and Accept LinkedIn Connection Requests via Agent Mode',
+      '- Emma can now list pending connection requests you\'ve received on LinkedIn',
+      '- Each request shows the sender\'s name, headline, location, and their invitation message',
+      '- Emma can accept a connection request on your behalf — just say "accept" after reviewing',
+      '- Requires a connected LinkedIn Outreach account (Settings → Connected Accounts)',
+    ],
+  },
+  {
     date: '2026-04-13',
     changes: [
       'New: Engagement Personality for Auto-Engagement',

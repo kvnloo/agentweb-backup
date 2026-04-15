@@ -19369,13 +19369,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
-    const { action, profile_url, provider_id, message } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
     // Write actions must use an account owned by the calling user.
     // This prevents an LLM from reusing a shared/enrichment account_id it may have
     // seen in a prior get-profile tool call to send invitations or messages.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation'];
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserId(userId);
@@ -19476,6 +19477,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: invitationsResult };
         }
 
+        case 'list-received-invitations': {
+          const receivedResult = await linkedInOutreachService.listReceivedInvitations(account_id, args.cursor);
+          // Trim to essential fields. Sender profile is enriched from the inviter object.
+          if (Array.isArray(receivedResult?.items)) {
+            const trimmedItems = receivedResult.items.map((item: any) => ({
+              id: item.id,
+              invitation_text: item.invitation_text,
+              date: item.date,
+              sender_profile: item.sender_profile || null,
+              // shared_secret is required for accept-invitation (LinkedIn token from Unipile)
+              shared_secret: item.specifics?.shared_secret || null,
+            }));
+            return { success: true, data: { ...receivedResult, items: trimmedItems } };
+          }
+          return { success: true, data: receivedResult };
+        }
+
+        case 'accept-invitation': {
+          const invitationId = args.invitation_id;
+          const sharedSecret = args.shared_secret;
+          if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
+          if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+          return { success: true, data: acceptResult };
+        }
+
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
           const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
@@ -19573,8 +19600,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: cancelResult };
         }
 
-        default:
-          throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
+        default: {
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
+          throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
