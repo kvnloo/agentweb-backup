@@ -1973,12 +1973,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
     const existingLinkedIns = new Set(existingLeads.map((l: any) => normalizeLinkedInUrl(l.linkedin || '')).filter(Boolean));
 
     // Debug logging
-    console.log(`[LinkedIn Import] Found ${existingLeads.length} existing leads`);
-    console.log(`[LinkedIn Import] Existing LinkedIn URLs (first 5):`, Array.from(existingLinkedIns).slice(0, 5));
-    console.log(`[LinkedIn Import] Checking ${validConnections.length} connections from file`);
-    if (validConnections.length > 0) {
-      console.log(`[LinkedIn Import] Sample connection URL from file:`, validConnections[0].URL);
-    }
+
 
     // Count duplicates
     let duplicateCount = 0;
@@ -2012,14 +2007,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
     }
 
     // Debug summary for connections
-    console.log(`[LinkedIn Import] Connection deduplication: ${newConnections.length} new, ${duplicateCount} duplicates out of ${validConnections.length} total`);
-    if (newConnections.length > 0 && newConnections.length <= 10) {
-      console.log(`[LinkedIn Import] New connections that don't match:`, newConnections.map(c => ({
-        name: `${c['First Name']} ${c['Last Name']}`,
-        email: c['Email Address'] || 'no email',
-        linkedin: c.URL || 'no linkedin'
-      })));
-    }
+  
 
     // Parse messages if available
     const messagesEntry = zipEntries.find(e => e.entryName === 'messages.csv');
@@ -2088,13 +2076,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         } while (lastEvaluatedKey);
 
         // Debug logging
-        console.log(`[LinkedIn Import] Found ${existingEventKeys.size} existing message events`);
-        console.log(`[LinkedIn Import] Existing event keys (first 5):`, Array.from(existingEventKeys).slice(0, 5));
-        console.log(`[LinkedIn Import] Checking ${validMessages.length} messages from file`);
-        if (validMessages.length > 0) {
-          const sampleMsg = validMessages[0];
-          console.log(`[LinkedIn Import] Sample message key from file:`, `${sampleMsg['CONVERSATION ID']}-${sampleMsg.DATE}`);
-        }
+
 
         // Count new vs duplicate messages, and filter for messages involving the user
         const newMessages: any[] = [];
@@ -2370,7 +2352,6 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
 
     const unmatchedLeads = leadPool.filter(lead => !lead.icpMatch);
 
-    console.log(`[ICP Match] Found ${leadsToProcess.length} leads to process (forceRematch: ${forceRematch}). ${unmatchedLeads.length} unmatched, ${allLeads.length - unmatchedLeads.length} already matched.`);
 
     if (mode === 'preview') {
       return res.json({
@@ -2404,7 +2385,6 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
         chunks.push(leadsToProcess.slice(i, i + chunkSize));
       }
 
-      console.log(`[ICP Match] Processing ${leadsToProcess.length} leads in ${chunks.length} parallel chunks`);
 
       // Shared progress tracking
       let totalProcessedCount = 0;
@@ -2536,7 +2516,6 @@ Please analyze each lead and return a JSON array with your assessment.`;
       const chunkResults = await Promise.all(chunkProcessors);
       const processedCount = chunkResults.reduce((sum, count) => sum + count, 0);
 
-      console.log(`[ICP Match] Completed processing. Total processed: ${processedCount}`);
       emitProgress('ICP matching complete!', 100);
 
       res.json({
@@ -2590,8 +2569,37 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       }
       try {
         const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-        const result = await CrmEnrichmentService.suggestEnrichment(goal);
-        return res.json({ success: true, instruction: result.instruction, outputFields: result.outputFields });
+        // Sample up to 20 leads to find commonly empty standard fields
+        const STANDARD_FIELDS = ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'];
+        let commonlyEmptyFields: string[] = [];
+        try {
+          const samplePage = await crmDb.getLeadsByListId(listId, undefined, undefined);
+          const sampleLeads = (samplePage.items || []).slice(0, 20);
+          if (sampleLeads.length > 0) {
+            commonlyEmptyFields = STANDARD_FIELDS.filter(field => {
+              const populated = sampleLeads.filter((l: any) => l[field] && String(l[field]).trim()).length;
+              return (populated / sampleLeads.length) < 0.5;
+            });
+          }
+        } catch {
+          // Non-fatal — proceed without stats
+        }
+
+        const result = await CrmEnrichmentService.suggestEnrichment(goal, {
+          listId,
+          existingStandardFields: STANDARD_FIELDS,
+          existingCustomFields: Array.isArray(list.fieldNames) ? list.fieldNames as string[] : [],
+          commonlyEmptyFields,
+        });
+        return res.json({
+          success: true,
+          instruction: result.instruction,
+          outputFields: result.outputFields,
+          webSearchTemplate: result.webSearchTemplate,
+          linkedinSearchTemplate: result.linkedinSearchTemplate,
+          sourcesPerField: result.sourcesPerField,
+          sources: result.sources,
+        });
       } catch (err: any) {
         console.error('[CRM] suggestEnrichment failed:', err.message);
         return res.status(502).json({ message: 'AI suggestion failed. Please try again.' });
@@ -2610,7 +2618,24 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         ? req.body.sources
         : ['web_search'];
 
+    const webSearchTemplate: string | undefined =
+      typeof req.body.webSearchTemplate === 'string' && req.body.webSearchTemplate.trim()
+        ? req.body.webSearchTemplate.trim()
+        : undefined;
+
+    const linkedinSearchTemplate: string | undefined =
+      typeof req.body.linkedinSearchTemplate === 'string' && req.body.linkedinSearchTemplate.trim()
+        ? req.body.linkedinSearchTemplate.trim()
+        : undefined;
+
+    const sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> | undefined =
+      req.body.sourcesPerField && typeof req.body.sourcesPerField === 'object'
+        ? req.body.sourcesPerField
+        : undefined;
+
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+
+    let responseBody: object;
 
     if (mode === 'preview') {
       const service = new CrmEnrichmentService();
@@ -2622,9 +2647,11 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         sources,
         forceOverwrite: forceEnrich,
         leadIds,
+        webSearchTemplate,
+        linkedinSearchTemplate,
+        sourcesPerField,
       });
-
-      return res.json({
+      responseBody = {
         success: true,
         totalLeads: result.totalLeads,
         leadsToProcess: result.leadsToProcess,
@@ -2634,7 +2661,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
           leadName: [s.lead.firstName, s.lead.lastName].filter(Boolean).join(' ') || s.lead.email || s.leadId,
           fieldResults: s.enrichedFields,
         })),
-      });
+      };
     } else if (mode === 'enrich') {
       const service = new CrmEnrichmentService();
       const result = await service.execute({
@@ -2645,9 +2672,11 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         sources,
         forceOverwrite: forceEnrich,
         leadIds,
+        webSearchTemplate,
+        linkedinSearchTemplate,
+        sourcesPerField,
       }, socketId);
-
-      return res.json({
+      responseBody = {
         success: true,
         message: result.failedCount > 0
           ? `Enrichment completed with ${result.processedCount} enriched and ${result.failedCount} failed`
@@ -2658,10 +2687,26 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         failedCount: result.failedCount,
         totalLeadsProcessed: result.totalToProcess,
         failureBreakdown: result.failureBreakdown,
-      });
+      };
+    } else {
+      return res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "enrich"' });
     }
 
-    return res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "enrich"' });
+    // Persist config (fire-and-forget) so settings are restored when the dialog reopens.
+    // `searchQueryTemplates` (per-field map) is deprecated in favour of the top-level
+    // webSearchTemplate / linkedinSearchTemplate fields; {} intentionally clears it.
+    crmDb.updateSearchQueryTemplates(
+      listId,
+      {},
+      sourcesPerField,
+      instruction,
+      outputFields,
+      webSearchTemplate,
+      linkedinSearchTemplate,
+      sources,
+    ).catch((err: unknown) => console.warn(`[CRM] enrich-web ${mode}: failed to save config:`, err));
+
+    return res.json(responseBody);
   } catch (error: any) {
     console.error('Error enriching leads with web company info:', error);
     return res.status(500).json({ message: error.message || 'Failed to enrich leads with web company info' });

@@ -11,10 +11,50 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-15',
     changes: [
+      'New: LinkedIn Repost Support',
+      '- Emma can now repost (reshare) existing LinkedIn posts via the linkedin_manage_post tool',
+      '- Optional commentary can be added to provide context when reposting',
+      '- The linkedin_manage_post tool consolidates all LinkedIn post interactions (comment, react, repost, list comments, analytics) into a single tool',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
       'Admin: Update User Contact Email',
       '- Admins can now change the login/contact email for any user account directly from the Users tab in the Admin Dashboard',
       '- Click the pencil icon next to "Contact Email" in the expanded user row, enter the new email, and confirm',
       '- The user\'s ID and all associated data remain unchanged; only the login email is updated',
+      'Fixed: Landing Page Code Editor Now Targets the Correct Files First Time',
+      '- The coding agent that edits landing pages now correctly identifies your site as a Next.js project from the start',
+      '- Previously, the agent could incorrectly attempt to edit static HTML files instead of the actual Next.js component files (e.g., app/page.tsx), leading to repeated failed attempts',
+      '- The agent now receives a full file listing before its first edit, eliminating blind guesswork about project structure',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
+      'Fix: Daily PR Digest Now Counts Only PRs Merged Into Main',
+      '- The PR digest tool was over-counting by including PRs merged into feature branches (e.g. harsha/dev)',
+      '- Digest now correctly counts only PRs merged into the main branch, matching actual shipped changes',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
+      'Emma: Cross-Page Tool Awareness',
+      '- Emma now knows which tools correspond to each page in the portal — even when you reference a page you are not currently on',
+      '- Example: asking "get my SEO data from the SEO/GEO page" from the CRM page correctly triggers the SEO metrics tool',
+      '- Covers all portal pages: SEO/GEO, CRM, Marketing Hub, Social Posts, Brand Guidelines, Landing Pages, and more',
+      '- For requests outside her capabilities, Emma now suggests using the Report Product Issues feature so the team is notified',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
+      'Admin: Simplified Emma Prompt Management',
+      '- The separate "Emma Chat Settings" admin tab has been removed — it was redundant with the Agent Mode system prompt',
+      '- Emma (sidebar popup in Customer Portal) now uses the same unified system prompt as Agent Mode, plus a small sidebar-specific addendum',
+      '- The sidebar addendum is now visible as a read-only section in the Admin > Agent Mode tab for easy reference',
     ],
   },
   {
@@ -146,6 +186,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When asked to find ads a company is running on Facebook/Meta, Emma now uses the advertiser autocomplete in the Ads Library to find the company\'s Facebook Page ID, then loads only that page\'s ads',
       '- Previously, Emma searched by keyword (e.g. "every.io") which returned thousands of false-positive results from unrelated advertisers whose ad copy happened to mention the same words',
       '- The Foreplay "search ads" tool description has also been clarified: it only searches your saved Foreplay library, not the public Meta Ads Library',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'New: View and Accept LinkedIn Connection Requests via Agent Mode',
+      '- Emma can now list pending connection requests you\'ve received on LinkedIn',
+      '- Each request shows the sender\'s name, headline, location, and their invitation message',
+      '- Emma can accept a connection request on your behalf — just say "accept" after reviewing',
+      '- Requires a connected LinkedIn Outreach account (Settings → Connected Accounts)',
     ],
   },
   {

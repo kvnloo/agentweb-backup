@@ -75,6 +75,15 @@ export interface SocialPlatformAdapter {
   createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult>;
 
   /**
+   * Repost (reshare) an existing post
+   * @param account - The connected account to repost from
+   * @param originalPostUrn - URN of the post to reshare
+   * @param commentary - Optional text to add alongside the repost
+   * @param userId - Optional user ID for token refresh capability
+   */
+  createRepost?(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string): Promise<PostResult>;
+
+  /**
    * React to a post (like, praise, etc.)
    * @param account - The connected account to react from
    * @param postUrn - URN of the post to react to

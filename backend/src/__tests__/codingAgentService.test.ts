@@ -475,14 +475,16 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    // First call: GET file-at-commit
+    // Pre-fetch file listing (called before any LLM iteration)
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] });
+    // First tool call: GET file-at-commit
     mockedMcpFetch.mockResolvedValueOnce({
       path: 'app/page.tsx',
       content: '<h1>Original Content</h1>',
       sha: 'oldsha',
       commit_ref: 'abc1234'
     });
-    // Second call: PUT github-edit
+    // Second tool call: PUT github-edit
     mockedMcpFetch.mockResolvedValueOnce({
       success: true,
       commit_url: 'https://github.com/test/repo/commit/newsha',
@@ -525,12 +527,15 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
+    // Pre-fetch file listing (called before any LLM iteration)
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] });
+
     const result = await runCodingAgent('revert without sha', mockContext);
 
     // Should have completed (agent handles the error from tool)
     expect(result.iterations).toBeGreaterThanOrEqual(1);
-    // mcpFetch should NOT have been called since validation fails early
-    expect(mockedMcpFetch).not.toHaveBeenCalled();
+    // Only the pre-fetch should have been called — validation fails before any tool GET/PUT
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
   });
 
   test('revert_file handles file not found at commit', async () => {
@@ -551,14 +556,16 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
+    // Pre-fetch file listing (called before any LLM iteration)
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] });
     // file-at-commit returns no content
     mockedMcpFetch.mockResolvedValueOnce({ path: 'app/missing.tsx' });
 
     const result = await runCodingAgent('revert missing file', mockContext);
 
     expect(result.iterations).toBeGreaterThanOrEqual(1);
-    // Should only have called GET, not PUT (since content was empty)
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+    // Should have called pre-fetch + GET (not PUT since content was empty)
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
   });
 
   test('list_files tool returns file listing', async () => {
@@ -720,6 +727,8 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
+    // Pre-fetch file listing (called before any LLM iteration)
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] });
     // GET file content
     mockedMcpFetch.mockResolvedValueOnce({
       content: 'function hello() {\n  return "world";\n}'
@@ -791,16 +800,17 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    // First poll: building; Second poll: success with URL
+    // Pre-fetch file listing, then two check_deployment polls
     mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
       .mockResolvedValueOnce({ buildStatus: 'building' })
       .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
 
     await runCodingAgent('update logo', draftContext);
 
-    // Verify polling happened: mcpFetch called twice for check_deployment
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
-    expect(mockedMcpFetch).toHaveBeenNthCalledWith(2, expect.objectContaining({
+    // Verify polling happened: mcpFetch called 3 times (pre-fetch + 2 check_deployment polls)
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(3);
+    expect(mockedMcpFetch).toHaveBeenNthCalledWith(3, expect.objectContaining({
       method: 'GET',
       path: expect.stringContaining('/preview-url'),
     }));
@@ -818,12 +828,15 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    mockedMcpFetch.mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
+    // Pre-fetch + single check_deployment call (success — no retry)
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
+      .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
 
     await runCodingAgent('update logo', draftContext);
 
-    // Success state: no retry, mcpFetch called once
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+    // Success state: no retry, mcpFetch called twice (pre-fetch + check_deployment)
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
   });
 
   test('check_deployment stops immediately on error without retrying', async () => {
@@ -838,12 +851,15 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    mockedMcpFetch.mockResolvedValueOnce({ buildStatus: 'error', buildError: 'Module not found' });
+    // Pre-fetch + single check_deployment call (error — no retry)
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
+      .mockResolvedValueOnce({ buildStatus: 'error', buildError: 'Module not found' });
 
     await runCodingAgent('update logo', draftContext);
 
-    // Error state: no retry, mcpFetch called once
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+    // Error state: no retry, mcpFetch called twice (pre-fetch + check_deployment)
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
   });
 
   test('check_deployment stops immediately on not_found without retrying', async () => {
@@ -858,12 +874,15 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    mockedMcpFetch.mockResolvedValueOnce({ buildStatus: 'not_found' });
+    // Pre-fetch + single check_deployment call (not_found — no retry)
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
+      .mockResolvedValueOnce({ buildStatus: 'not_found' });
 
     await runCodingAgent('update logo', draftContext);
 
-    // not_found state: no retry, mcpFetch called once
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+    // not_found state: no retry, mcpFetch called twice (pre-fetch + check_deployment)
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
   });
 
   test('check_deployment times out and returns building status after max retries', async () => {
@@ -878,13 +897,15 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    // Always returns building — simulate a very slow build
-    mockedMcpFetch.mockResolvedValue({ buildStatus: 'building' });
+    // Pre-fetch returns file listing; all subsequent calls return building
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
+      .mockResolvedValue({ buildStatus: 'building' });
 
     const result = await runCodingAgent('update logo', draftContext);
 
-    // Should have polled MAX_POLL_ATTEMPTS (8) times before giving up
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(8);
+    // Should have called: 1 pre-fetch + 8 check_deployment polls = 9 total
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(9);
     // LLM should have received a tool result (even if building)
     expect(result.iterations).toBeGreaterThanOrEqual(1);
   });

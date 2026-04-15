@@ -193,6 +193,34 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
+  async createRepost(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string): Promise<PostResult> {
+    const authorUrn = account.account_id;
+
+    try {
+      const { token } = await this.getValidToken(account, userId);
+
+      const repostUrn = await linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary);
+
+      return {
+        success: true,
+        message: commentary ? 'Reposted with commentary on LinkedIn' : 'Reposted on LinkedIn',
+        postId: repostUrn,
+        postUrl: `https://www.linkedin.com/feed/update/${repostUrn}`
+      };
+    } catch (error: any) {
+      if (error.response?.status === 429) {
+        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+      }
+      if (error.response?.status === 401) {
+        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+      }
+      if (error.response?.status === 403) {
+        throw new Error('Permission denied. The original post may have sharing disabled, or your account lacks permission to repost it.');
+      }
+      throw error;
+    }
+  }
+
   async createReaction(account: ConnectedAccount, postUrn: string, reactionType: string, userId?: string): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const actorUrn = account.account_id; // The account creating the reaction

@@ -18908,6 +18908,84 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  /**
+   * Unified LinkedIn post management handler.
+   * Dispatches to the appropriate operation based on `action`.
+   */
+  async linkedinManagePost(userId: string, args: {
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    account_id: string;
+    post_urn?: string;
+    commentary?: string;
+    comment_text?: string;
+    parent_comment_urn?: string;
+    reaction_type?: string;
+    post_ids?: string[];
+  }): Promise<any> {
+    const { action, account_id } = args;
+    console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
+
+    const requirePostUrn = (a: string) =>
+      !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
+    const requirePostIds = () =>
+      !args.post_ids?.length ? { success: false, message: 'post_ids is required for action=get_analytics' } : null;
+    const requireCommentText = () =>
+      !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
+
+    switch (action) {
+      case 'repost':
+        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary);
+      case 'comment':
+        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn);
+      case 'list_comments':
+        return requirePostUrn('list_comments') ?? this.listLinkedInComments(userId, account_id, args.post_urn!);
+      case 'react':
+        return requirePostUrn('react') ?? this.reactToLinkedInPost(userId, account_id, args.post_urn!, args.reaction_type || 'LIKE');
+      case 'get_analytics':
+        return requirePostIds() ?? this.getPostAnalytics(userId, account_id, args.post_ids!);
+      default:
+        return { success: false, message: `Unknown action: ${action}` };
+    }
+  }
+
+  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string): Promise<any> {
+    console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
+
+    try {
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      const account = await getAccountById(accountId, userId);
+      if (!account) {
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      if (account.platform !== 'linkedin') {
+        return { success: false, message: 'Repost is currently only supported for LinkedIn accounts' };
+      }
+
+      const adapter = socialPlatformService.getAdapter(account.platform) as any;
+      if (!adapter.createRepost) {
+        return { success: false, message: 'Repost is not supported for this platform' };
+      }
+
+      const result = await adapter.createRepost(account, postUrn, commentary, userId);
+
+      return {
+        success: true,
+        message: result.message,
+        post_id: result.postId,
+        post_url: result.postUrl
+      };
+    } catch (error: any) {
+      let message = error.message;
+      if (message.includes('access token expired')) {
+        message = 'Account token expired. Please reconnect the account in Settings.';
+      }
+      return { success: false, message: `Failed to repost: ${message}` };
+    }
+  }
+
   async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
@@ -19291,13 +19369,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
-    const { action, profile_url, provider_id, message } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
     // Write actions must use an account owned by the calling user.
     // This prevents an LLM from reusing a shared/enrichment account_id it may have
     // seen in a prior get-profile tool call to send invitations or messages.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation'];
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserId(userId);
@@ -19398,6 +19477,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: invitationsResult };
         }
 
+        case 'list-received-invitations': {
+          const receivedResult = await linkedInOutreachService.listReceivedInvitations(account_id, args.cursor);
+          // Trim to essential fields. Sender profile is enriched from the inviter object.
+          if (Array.isArray(receivedResult?.items)) {
+            const trimmedItems = receivedResult.items.map((item: any) => ({
+              id: item.id,
+              invitation_text: item.invitation_text,
+              date: item.date,
+              sender_profile: item.sender_profile || null,
+              // shared_secret is required for accept-invitation (LinkedIn token from Unipile)
+              shared_secret: item.specifics?.shared_secret || null,
+            }));
+            return { success: true, data: { ...receivedResult, items: trimmedItems } };
+          }
+          return { success: true, data: receivedResult };
+        }
+
+        case 'accept-invitation': {
+          const invitationId = args.invitation_id;
+          const sharedSecret = args.shared_secret;
+          if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
+          if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+          return { success: true, data: acceptResult };
+        }
+
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
           const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
@@ -19495,8 +19600,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: cancelResult };
         }
 
-        default:
-          throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
+        default: {
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
+          throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

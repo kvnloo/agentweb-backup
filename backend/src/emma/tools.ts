@@ -179,10 +179,12 @@ Actions:
 - get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
+- list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
@@ -193,7 +195,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'update-conversation-history'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -242,11 +244,15 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         invitation_id: {
           type: 'string',
-          description: 'Invitation ID for cancel-invitation action. Obtain from list-sent-invitations.'
+          description: 'Invitation ID for cancel-invitation or accept-invitation actions. Obtain from list-sent-invitations or list-received-invitations respectively.'
+        },
+        shared_secret: {
+          type: 'string',
+          description: 'LinkedIn shared_secret token required for accept-invitation. Returned by list-received-invitations alongside each invitation record.'
         },
         cursor: {
           type: 'string',
-          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations.'
+          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
         }
       },
       required: ['action', 'account_id']
@@ -3382,91 +3388,54 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
-  name: 'comment_on_linkedin_post',
+  name: 'linkedin_manage_post',
   definition: {
-    name: 'comment_on_linkedin_post',
-    description: 'Create a comment on a LinkedIn post, or reply to an existing comment, using a connected LinkedIn account. To reply to a specific comment (nested reply), provide the parent_comment_urn. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
+    name: 'linkedin_manage_post',
+    description: 'Manage LinkedIn post interactions using a connected LinkedIn account. Supports reposting, commenting, listing comments, reacting, and fetching analytics — all in one tool.\n\nActions:\n- repost: Reshare an existing LinkedIn post, optionally adding your own commentary. Requires post_urn. CRITICAL: Always get explicit user approval before reposting.\n- comment: Create a comment on a post, or a nested reply when parent_comment_urn is provided. Requires post_urn and comment_text. CRITICAL: Always get explicit user approval before commenting.\n- list_comments: Fetch all comments on a post with their URNs (useful for finding parent_comment_urn for replies). Requires post_urn.\n- react: React to a post (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT). Requires post_urn. CRITICAL: Always get explicit user approval before reacting.\n- get_analytics: Fetch engagement metrics (likes, comments, shares, impressions, clicks) for one or more posts. Requires post_ids array.',
     inputSchema: {
       type: 'object',
       properties: {
+        action: {
+          type: 'string',
+          enum: ['repost', 'comment', 'list_comments', 'react', 'get_analytics'],
+          description: 'The operation to perform'
+        },
         account_id: {
           type: 'string',
-          description: 'The connected LinkedIn account ID to comment from'
+          description: 'The connected LinkedIn account ID'
         },
         post_urn: {
           type: 'string',
-          description: 'The LinkedIn post URN to comment on (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+          description: 'LinkedIn post URN — required for repost, comment, list_comments, react (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
+        },
+        commentary: {
+          type: 'string',
+          description: 'Optional text to add alongside a repost. Only used with action=repost. LinkedIn plain text only — no markdown.'
         },
         comment_text: {
           type: 'string',
-          description: 'The comment text content. Should be concise and relevant to the post.'
+          description: 'The comment text. Required for action=comment. LinkedIn plain text only — no markdown.'
         },
         parent_comment_urn: {
           type: 'string',
-          description: 'Optional. The URN of a parent comment to reply to (e.g., "urn:li:comment:(urn:li:ugcPost:123,456)"). When provided, the comment is posted as a nested reply under this comment instead of as a top-level comment.'
-        }
-      },
-      required: ['account_id', 'post_urn', 'comment_text']
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text, args.parent_comment_urn);
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'list_linkedin_comments',
-  definition: {
-    name: 'list_linkedin_comments',
-    description: 'List comments on a LinkedIn post. Returns each comment\'s URN, author URN, text, and timestamp. Use this to find the comment_urn needed for replying to a specific comment via comment_on_linkedin_post with parent_comment_urn.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        account_id: {
-          type: 'string',
-          description: 'The connected LinkedIn account ID to use for fetching comments'
-        },
-        post_urn: {
-          type: 'string',
-          description: 'The LinkedIn post URN to list comments for (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
-        }
-      },
-      required: ['account_id', 'post_urn']
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.listLinkedInComments(context?.userId, args.account_id, args.post_urn);
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'react_to_linkedin_post',
-  definition: {
-    name: 'react_to_linkedin_post',
-    description: 'React to a LinkedIn post using a connected LinkedIn account. Supports various reaction types: LIKE (thumbs up), PRAISE (celebrate), EMPATHY (love), INTEREST (insightful), APPRECIATION (support), ENTERTAINMENT (funny). CRITICAL: Always review the reaction with the user and get explicit approval before posting reactions on LinkedIn.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        account_id: {
-          type: 'string',
-          description: 'The connected LinkedIn account ID to react from'
-        },
-        post_urn: {
-          type: 'string',
-          description: 'The LinkedIn post URN to react to (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+          description: 'Optional. URN of a parent comment to reply to (e.g., "urn:li:comment:(urn:li:ugcPost:123,456)"). Only used with action=comment. When provided, posts a nested reply instead of a top-level comment.'
         },
         reaction_type: {
           type: 'string',
           enum: ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'],
-          description: 'The type of reaction. LIKE = Like (👍), PRAISE = Celebrate (👏), EMPATHY = Love (❤️), INTEREST = Insightful (💡), APPRECIATION = Support (🙌), ENTERTAINMENT = Funny (😂)',
-          default: 'LIKE'
+          description: 'Reaction type for action=react. LIKE=👍 PRAISE=👏 EMPATHY=❤️ INTEREST=💡 APPRECIATION=🙌 ENTERTAINMENT=😂. Defaults to LIKE.'
+        },
+        post_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of post URNs to fetch analytics for. Required for action=get_analytics.'
         }
       },
-      required: ['account_id', 'post_urn']
+      required: ['action', 'account_id']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.reactToLinkedInPost(context?.userId, args.account_id, args.post_urn, args.reaction_type || 'LIKE');
+    return await agentModeService.linkedinManagePost(context?.userId, args);
   }
 });
 
@@ -4981,7 +4950,13 @@ emmaToolRegistry.register({
 
 Returns total lead count, how many would be processed, how many are already enriched, and 2 sample enrichment results so the user can verify quality before proceeding.
 
-After showing the preview, ask the user to confirm before calling enrich_leads_execute.`,
+After showing the preview, ask the user to confirm before calling enrich_leads_execute.
+
+Field and source guidance:
+- output_fields: one snake_case field per distinct data point. Numeric values (dates, counts, amounts), categorical values (industry, funding stage), URLs (linkedin_url), and prose summaries (company_profile) each get their own field. When a prose request names sub-items ("profile describing industry, employee count, products"), create the prose field PLUS a separate field for each named item.
+- sources_per_field: map each field to its source. Use "web_search" for company info, funding, tech stack, company LinkedIn URL. Use "linkedin" ONLY for the lead's personal LinkedIn profile (field name: linkedin_url). Use "existing_data" for fields derivable from existing lead data.
+- web_search_template: ONE search query covering all web_search fields. Uses {{placeholder}} tokens ({{company}}, {{firstName}}, {{lastName}}, {{title}}). Example: "{{company}} company overview industry employees funding".
+- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -4996,12 +4971,28 @@ After showing the preview, ask the user to confirm before calling enrich_leads_e
         output_fields: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of custom field names to populate (e.g. ["company_size", "industry"]). Use snake_case.'
+          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
         },
         sources: {
           type: 'array',
           items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use. web_search: searches the web per lead. linkedin: looks up LinkedIn profiles. existing_data: infers from existing lead fields.'
+          description: 'Union of all data sources used across all fields. web_search: searches the web. linkedin: looks up personal LinkedIn profiles. existing_data: infers from existing lead fields.'
+        },
+        sources_per_field: {
+          type: 'object',
+          additionalProperties: {
+            type: 'array',
+            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
+          },
+          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search". Falls back to job-level sources when absent for a field.'
+        },
+        web_search_template: {
+          type: 'string',
+          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}. Example: "{{company}} company overview industry employees funding". Keep concise (4-8 words after substitution).'
+        },
+        linkedin_search_template: {
+          type: 'string',
+          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
         },
         filters: {
           type: 'array',
@@ -5036,6 +5027,9 @@ After showing the preview, ask the user to confirm before calling enrich_leads_e
       instruction: args.instruction,
       outputFields: args.output_fields,
       sources: args.sources,
+      sourcesPerField: args.sources_per_field,
+      webSearchTemplate: args.web_search_template,
+      linkedinSearchTemplate: args.linkedin_search_template,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
     });
@@ -5050,7 +5044,9 @@ emmaToolRegistry.register({
 
 Progress updates are sent via Socket.IO in real-time. Returns immediately with a job ID and the count of leads to be processed.
 
-Call enrich_leads_preview first to show the user what will happen before executing.`,
+Call enrich_leads_preview first to show the user what will happen before executing.
+
+Pass the same output_fields, sources_per_field, web_search_template, and linkedin_search_template used in the preview call.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5065,12 +5061,28 @@ Call enrich_leads_preview first to show the user what will happen before executi
         output_fields: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of custom field names to populate. Use snake_case.'
+          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
         },
         sources: {
           type: 'array',
           items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use.'
+          description: 'Union of all data sources used across all fields.'
+        },
+        sources_per_field: {
+          type: 'object',
+          additionalProperties: {
+            type: 'array',
+            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
+          },
+          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search".'
+        },
+        web_search_template: {
+          type: 'string',
+          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}.'
+        },
+        linkedin_search_template: {
+          type: 'string',
+          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
         },
         filters: {
           type: 'array',
@@ -5105,6 +5117,9 @@ Call enrich_leads_preview first to show the user what will happen before executi
       instruction: args.instruction,
       outputFields: args.output_fields,
       sources: args.sources,
+      sourcesPerField: args.sources_per_field,
+      webSearchTemplate: args.web_search_template,
+      linkedinSearchTemplate: args.linkedin_search_template,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);

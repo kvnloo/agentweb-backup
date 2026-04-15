@@ -16,6 +16,7 @@ jest.mock('../services/db', () => ({
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn(),
     updateFieldNames: jest.fn(),
+    updateSearchQueryTemplates: jest.fn(),
   },
 }));
 
@@ -1026,5 +1027,372 @@ describe('CrmEnrichmentService', () => {
         expect.objectContaining({ account_id: 'sw-acc' }),
       );
     });
+  });
+});
+
+// ─── applySearchTemplate ─────────────────────────────────────────────────────
+
+describe('CrmEnrichmentService.applySearchTemplate', () => {
+  const lead = {
+    firstName: 'John',
+    lastName: 'Doe',
+    company: 'Acme Corp',
+    email: 'john@acme.com',
+    title: 'CEO',
+    linkedin: 'https://www.linkedin.com/in/johndoe',
+    customFields: { industry: 'SaaS' },
+  };
+
+  it('substitutes all standard placeholders', () => {
+    const template = '{{firstName}} {{lastName}} {{company}} {{email}} {{title}}';
+    expect(CrmEnrichmentService.applySearchTemplate(template, lead))
+      .toBe('John Doe Acme Corp john@acme.com CEO');
+  });
+
+  it('derives emailDomain from email', () => {
+    const template = '{{company}} {{emailDomain}}';
+    expect(CrmEnrichmentService.applySearchTemplate(template, lead)).toBe('Acme Corp acme.com');
+  });
+
+  it('substitutes customFields placeholder', () => {
+    const template = '{{company}} {{customFields.industry}}';
+    expect(CrmEnrichmentService.applySearchTemplate(template, lead)).toBe('Acme Corp SaaS');
+  });
+
+  it('collapses multiple spaces when a field is empty', () => {
+    const emptyLead = { company: 'Beta Inc', email: 'test@beta.com' };
+    const template = '{{firstName}} {{lastName}} {{company}}';
+    expect(CrmEnrichmentService.applySearchTemplate(template, emptyLead)).toBe('Beta Inc');
+  });
+
+  it('handles lead with no email gracefully for emailDomain', () => {
+    const noEmailLead = { company: 'Gamma' };
+    const template = '{{company}} {{emailDomain}}';
+    expect(CrmEnrichmentService.applySearchTemplate(template, noEmailLead)).toBe('Gamma');
+  });
+
+  it('handles missing customFields key gracefully', () => {
+    const template = '{{company}} {{customFields.missing_field}}';
+    expect(CrmEnrichmentService.applySearchTemplate(template, lead)).toBe('Acme Corp');
+  });
+});
+
+// ─── Search grouping / deduplication ─────────────────────────────────────────
+
+describe('CrmEnrichmentService search grouping', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Result', snippet: 'info', url: 'https://example.com' }],
+    });
+  });
+
+  it('calls searchWeb exactly once even when multiple web_search fields are provided', async () => {
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ funding_stage: 'Seed', employee_count: '11-50' })
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'list_g1', userId: 'user1', fieldNames: [],
+      searchQueryTemplates: {
+        funding_stage: '{{company}} funding rounds',
+        employee_count: '{{company}} funding rounds',
+      },
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead_g1', company: 'Acme Corp' })],
+      lastEvaluatedKey: null,
+    } as any);
+
+    const service = new CrmEnrichmentService();
+    await service.execute({
+      listId: 'list_g1', userId: 'user1',
+      instruction: 'test', outputFields: ['funding_stage', 'employee_count'],
+      sources: ['web_search'],
+    });
+
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses webSearchTemplate from spec to build the single query', async () => {
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ linkedin_url: 'https://linkedin.com/in/x', tech_stack: 'React' })
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'list_g2', userId: 'user1', fieldNames: [],
+      searchQueryTemplates: {
+        linkedin_url: '{{firstName}} {{lastName}} {{company}} linkedin',
+        tech_stack: '{{company}} technology stack',
+      },
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead_g2', firstName: 'Jane', lastName: 'Smith', company: 'Beta Inc' })],
+      lastEvaluatedKey: null,
+    } as any);
+
+    const service = new CrmEnrichmentService();
+    await service.execute({
+      listId: 'list_g2', userId: 'user1',
+      instruction: 'test', outputFields: ['linkedin_url', 'tech_stack'],
+      sources: ['web_search'],
+      webSearchTemplate: '{{firstName}} {{lastName}} {{company}} linkedin',
+    });
+
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith('Jane Smith Beta Inc linkedin', 5);
+  });
+});
+
+// ─── Template fallback chain ──────────────────────────────────────────────────
+
+describe('CrmEnrichmentService template fallback chain', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+    mockAgentModeService.searchWeb.mockResolvedValue({ success: true, results: [] });
+  });
+
+  it('runtime spec webSearchTemplate overrides stored template', async () => {
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ funding_stage: 'Bootstrapped' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'list_f1', userId: 'user1', fieldNames: [],
+      webSearchTemplate: '{{company}} stored template',
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead_f1', company: 'Delta Corp' })],
+      lastEvaluatedKey: null,
+    } as any);
+
+    const service = new CrmEnrichmentService();
+    await service.execute({
+      listId: 'list_f1', userId: 'user1',
+      instruction: 'test', outputFields: ['funding_stage'],
+      sources: ['web_search'],
+      webSearchTemplate: '{{company}} runtime override',
+    });
+
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith('Delta Corp runtime override', 5);
+  });
+
+  it('stored webSearchTemplate is used when spec provides none', async () => {
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ funding_stage: 'Series A' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'list_f2', userId: 'user1', fieldNames: [],
+      webSearchTemplate: '{{company}} funding crunchbase',
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead_f2', company: 'Epsilon Ltd' })],
+      lastEvaluatedKey: null,
+    } as any);
+
+    const service = new CrmEnrichmentService();
+    await service.execute({
+      listId: 'list_f2', userId: 'user1',
+      instruction: 'test', outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    });
+
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith('Epsilon Ltd funding crunchbase', 5);
+  });
+});
+
+// ─── suggestEnrichment ────────────────────────────────────────────────────────
+
+describe('CrmEnrichmentService.suggestEnrichment', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns instruction, outputFields, webSearchTemplate, and sources', async () => {
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        instruction: 'Find funding info.',
+        outputFields: ['funding_stage', 'funding_amount'],
+        webSearchTemplate: '{{company}} funding rounds investors',
+        sources: ['web_search'],
+      }) } }],
+    });
+
+    const result = await CrmEnrichmentService.suggestEnrichment('find funding info');
+
+    expect(result.instruction).toBe('Find funding info.');
+    expect(result.outputFields).toEqual(['funding_stage', 'funding_amount']);
+    expect(result.webSearchTemplate).toBe('{{company}} funding rounds investors');
+    expect(result.sources).toEqual(['web_search']);
+  });
+
+  it('normalizes outputFields to snake_case', async () => {
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        instruction: 'test',
+        outputFields: ['Employee Count', 'techStack', 'Funding Stage'],
+        searchQueryTemplates: {},
+        sources: ['web_search'],
+      }) } }],
+    });
+
+    const result = await CrmEnrichmentService.suggestEnrichment('test');
+    expect(result.outputFields).toEqual(['employee_count', 'techstack', 'funding_stage']);
+  });
+
+  it('auto-saves config to list when listId is provided', async () => {
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        instruction: 'test',
+        outputFields: ['funding_stage'],
+        webSearchTemplate: '{{company}} funding investors',
+        sources: ['web_search'],
+      }) } }],
+    });
+    mockCrmDb.updateSearchQueryTemplates.mockResolvedValue({} as any);
+
+    await CrmEnrichmentService.suggestEnrichment('test', { listId: 'list_s1' });
+
+    expect(mockCrmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
+      'list_s1', {}, undefined, 'test', ['funding_stage'],
+      '{{company}} funding investors', undefined, ['web_search']
+    );
+  });
+
+  it('saves sourcesPerField when LLM returns it', async () => {
+    const sourcesPerField = { linkedin_url: ['linkedin'], company_info: ['web_search'] };
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        instruction: 'test',
+        outputFields: ['linkedin_url', 'company_info'],
+        webSearchTemplate: '{{company}} overview',
+        linkedinSearchTemplate: '{{firstName}} {{lastName}} {{company}}',
+        sourcesPerField,
+        sources: ['web_search', 'linkedin'],
+      }) } }],
+    });
+    mockCrmDb.updateSearchQueryTemplates.mockResolvedValue({} as any);
+
+    const result = await CrmEnrichmentService.suggestEnrichment('test', { listId: 'list_s2' });
+
+    expect(result.sourcesPerField).toEqual(sourcesPerField);
+    expect(mockCrmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
+      'list_s2', {}, sourcesPerField, 'test', ['linkedin_url', 'company_info'],
+      '{{company}} overview', '{{firstName}} {{lastName}} {{company}}', ['linkedin', 'web_search']
+    );
+  });
+
+  it('does NOT save templates when no listId provided', async () => {
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        instruction: 'test',
+        outputFields: ['tech_stack'],
+        searchQueryTemplates: { tech_stack: '{{company}} tech' },
+        sources: ['web_search'],
+      }) } }],
+    });
+
+    await CrmEnrichmentService.suggestEnrichment('find tech stack');
+
+    expect(mockCrmDb.updateSearchQueryTemplates).not.toHaveBeenCalled();
+  });
+
+  it('falls back gracefully when LLM throws', async () => {
+    mockGeminiCreate.mockRejectedValue(new Error('LLM unavailable'));
+
+    const result = await CrmEnrichmentService.suggestEnrichment('find tech stack');
+
+    expect(result.instruction).toBe('find tech stack');
+    expect(result.outputFields).toEqual([]);
+    expect(result.webSearchTemplate).toBe('');
+    expect(result.sources).toEqual(['web_search']);
+  });
+
+  it('includes existing fields context in user prompt', async () => {
+    let capturedMessages: any[] = [];
+    mockGeminiCreate.mockImplementation(({ messages }: any) => {
+      capturedMessages = messages;
+      return Promise.resolve({
+        choices: [{ message: { content: JSON.stringify({
+          instruction: 'test',
+          outputFields: ['tech_stack'],
+          searchQueryTemplates: {},
+          sources: ['web_search'],
+        }) } }],
+      });
+    });
+
+    await CrmEnrichmentService.suggestEnrichment('find tech stack', {
+      existingStandardFields: ['email', 'company'],
+      existingCustomFields: ['funding_stage'],
+    });
+
+    const userMsg = capturedMessages.find((m: any) => m.role === 'user')?.content || '';
+    expect(userMsg).toContain('email, company');
+    expect(userMsg).toContain('funding_stage');
+  });
+});
+
+// ─── buildFieldGuidance — company vs personal LinkedIn ────────────────────────
+
+describe('CrmEnrichmentService.buildFieldGuidance — LinkedIn field types', () => {
+  const buildFieldGuidance = (fields: string[]): string =>
+    (CrmEnrichmentService as any).buildFieldGuidance(fields);
+
+  it('should return company page (/company/) guidance for company_linkedin_url', () => {
+    const guidance = buildFieldGuidance(['company_linkedin_url']);
+    expect(guidance).toContain('/company/');
+    // Must NOT tell the LLM to look for /in/ URLs for a company page field
+    expect(guidance).not.toContain('/in/');
+  });
+
+  it('should return personal profile (/in/) guidance for personal_linkedin_url', () => {
+    const guidance = buildFieldGuidance(['personal_linkedin_url']);
+    expect(guidance).toContain('/in/');
+    expect(guidance).not.toContain('/company/');
+  });
+
+  it('should return personal profile (/in/) guidance for lead_linkedin_url', () => {
+    const guidance = buildFieldGuidance(['lead_linkedin_url']);
+    expect(guidance).toContain('/in/');
+    expect(guidance).not.toContain('/company/');
+  });
+
+  it('should return company page guidance for company_linkedin (no _url suffix)', () => {
+    const guidance = buildFieldGuidance(['company_linkedin']);
+    expect(guidance).toContain('/company/');
+    expect(guidance).not.toContain('/in/');
+  });
+
+  it('should return both /company/ and /in/ when both field types appear in a mixed list', () => {
+    const guidance = buildFieldGuidance(['company_linkedin_url', 'personal_linkedin_url']);
+    expect(guidance).toContain('/company/');
+    expect(guidance).toContain('/in/');
+  });
+});
+
+// ─── buildSearchQuery — company LinkedIn suffix ───────────────────────────────
+
+describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
+  const buildSearchQuery = (lead: any, outputFields: string[]): string =>
+    (CrmEnrichmentService as any).buildSearchQuery(lead, outputFields);
+
+  it('includes "linkedin" in query for company_linkedin_url field', () => {
+    const lead = { company: 'Acme Corp', email: 'john@acme.com' };
+    const query = buildSearchQuery(lead, ['company_linkedin_url']);
+    expect(query).toContain('Acme Corp');
+    expect(query.toLowerCase()).toContain('linkedin');
+  });
+
+  it('does NOT treat company_linkedin_url as a person-level field', () => {
+    // Should NOT prefix with firstName/lastName for company LinkedIn
+    const lead = { firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
+    const query = buildSearchQuery(lead, ['company_linkedin_url']);
+    // Person-name prefix should not appear for a company-level query
+    expect(query).not.toMatch(/^John Doe/);
+    expect(query).toContain('Acme Corp');
+  });
+
+  it('generates person-based query for personal_linkedin_url field', () => {
+    const lead = { firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
+    const query = buildSearchQuery(lead, ['personal_linkedin_url']);
+    expect(query).toContain('John Doe');
+    expect(query.toLowerCase()).toContain('linkedin');
   });
 });
