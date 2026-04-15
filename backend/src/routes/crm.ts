@@ -15,6 +15,7 @@ import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
+import { dedupContactsForUser } from '../services/contactDedupService';
 import Stripe from 'stripe';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -552,6 +553,72 @@ router.get('/lists', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error fetching lead lists:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead lists' });
+  }
+});
+
+/**
+ * @route GET /api/crm/contacts
+ * @desc Return all of the user's leads deduped by lowercased email.
+ *       Powers the /crm Inbox tab — replaces client-side per-list fetch+dedup
+ *       which was 30-90s on 5000+ lead accounts.
+ * @access Private
+ * @query listType? "sales" | "customers" — restrict to a list type (default: all)
+ * @query listIds? comma-separated listIds to restrict to a subset
+ * @query limit? max deduped rows to return (default: all)
+ * @query sort? "heat" | "recent" (default: heat)
+ */
+router.get('/contacts', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { listType, listIds, limit, sort } = req.query as Record<string, string | undefined>;
+
+    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
+      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+    }
+
+    if (sort !== undefined && sort !== 'heat' && sort !== 'recent') {
+      return res.status(400).json({ message: 'sort must be "heat" or "recent"' });
+    }
+
+    let parsedLimit: number | undefined;
+    if (limit !== undefined) {
+      const n = Number(limit);
+      if (!Number.isFinite(n) || n < 1 || n > 10000) {
+        return res.status(400).json({ message: 'limit must be a number between 1 and 10000' });
+      }
+      parsedLimit = Math.floor(n);
+    }
+
+    const parsedListIds = listIds
+      ? listIds.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+
+    const started = Date.now();
+    const result = await dedupContactsForUser({
+      userId,
+      listType: listType as 'sales' | 'customers' | undefined,
+      listIds: parsedListIds,
+      limit: parsedLimit,
+      sort: sort as 'heat' | 'recent' | undefined,
+    });
+    const durationMs = Date.now() - started;
+
+    return res.json({
+      contacts: result.contacts,
+      total: result.total,
+      rawCount: result.rawCount,
+      listsCount: result.listsCount,
+      durationMs,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/crm/contacts:', error?.message || error);
+    return res.status(500).json({ message: error?.message || 'Failed to load contacts' });
   }
 });
 
