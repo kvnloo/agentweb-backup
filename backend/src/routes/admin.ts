@@ -4481,6 +4481,26 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
   }
 });
 
+// Send team introduction email to a user
+router.post("/users/:userId/send-intro-email", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await emailService.sendTeamIntroductionEmail(user.email, user.displayName);
+    const sentAt = new Date().toISOString();
+    const updatedUser = await userDb.updateUser(userId, { introductionEmailSent: sentAt });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error sending team introduction email:", error);
+    res.status(500).json({ message: "Error sending team introduction email" });
+  }
+});
+
 // Get token usage for a specific user
 router.get("/users/:userId/token-usage", async (req, res) => {
   try {

@@ -22,6 +22,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-15',
     changes: [
+      'Team Introduction Email on Signup',
+      '- New users now receive a personal welcome email from the AgentWeb founders (Harsha, Rui, Fangfang & Matthew) when they sign up',
+      '- The email invites them to reply directly with any questions, and mentions Emma for reporting product issues',
+      '- Admins can also send or resend the introduction email to any user from the Users tab in the Admin Dashboard',
+      '- The Users tab now shows the date the introduction email was last sent for each user',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
       'Fixed: LinkedIn Messages Now Appear in CRM Timeline',
       '- Synced LinkedIn messages were stored in the database correctly but were not displaying in the CRM engagement timeline',
       '- Fixed a field name mismatch where the UI checked for "content" but Unipile-synced messages store text in a "text" field — both formats now render correctly',

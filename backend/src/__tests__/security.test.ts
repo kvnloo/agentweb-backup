@@ -447,6 +447,7 @@ describe('Security Tests', () => {
     beforeEach(() => {
       (mockBcryptHash as unknown as jest.Mock).mockResolvedValue('hashed-password');
       (mockJwt.sign as jest.Mock).mockReturnValue('mock-jwt-token');
+      mockEmailService.sendTeamIntroductionEmail.mockResolvedValue(undefined as any);
     });
 
     it('FAIL: missing email → 400', async () => {
