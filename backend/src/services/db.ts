@@ -3981,12 +3981,23 @@ export const crmDb = {
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
+    accountOwnerUserId?: string | null;
   }) {
     try {
       const setExpressions: string[] = [];
       const removeExpressions: string[] = [];
       const expressionAttributeValues: any = {};
       const expressionAttributeNames: Record<string, string> = {};
+
+      // CRM extension: accountOwnerUserId. Supports null => REMOVE.
+      if (updates.accountOwnerUserId !== undefined) {
+        if (updates.accountOwnerUserId === null || updates.accountOwnerUserId === '') {
+          removeExpressions.push('accountOwnerUserId');
+        } else {
+          setExpressions.push('accountOwnerUserId = :accountOwnerUserId');
+          expressionAttributeValues[':accountOwnerUserId'] = String(updates.accountOwnerUserId);
+        }
+      }
 
       if (updates.email !== undefined) {
         const emailValue = updates.email.trim().toLowerCase();
