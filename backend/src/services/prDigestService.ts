@@ -56,7 +56,7 @@ async function fetchRepoPRs(
 
   // Fetch recently closed PRs (merged PRs have state=closed)
   // GitHub search API: merged within the date range
-  const query = `repo:${org}/${repo} is:pr is:merged merged:${sinceISO}..${untilISO}`;
+  const query = `repo:${org}/${repo} is:pr is:merged base:main merged:${sinceISO}..${untilISO}`;
   const url = `${GITHUB_API}/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=100`;
 
   const searchRes = await fetch(url, { headers });
