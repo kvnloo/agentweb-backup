@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-15',
+    changes: [
+      'Admin: Update User Contact Email',
+      '- Admins can now change the login/contact email for any user account directly from the Users tab in the Admin Dashboard',
+      '- Click the pencil icon next to "Contact Email" in the expanded user row, enter the new email, and confirm',
+      '- The user\'s ID and all associated data remain unchanged; only the login email is updated',
+    ],
+  },
+  {
     date: '2026-04-14',
     changes: [
       'New: Brand Guide Document Now Supports URLs',
