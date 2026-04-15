@@ -53,6 +53,17 @@ const MAX_RETRIES = 2;
 
 const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing page code in a GitHub repository connected to Vercel. Your edits go to a draft branch, creating a Vercel preview deployment for user review.
 
+## Project Architecture
+This is a **Next.js 15 (App Router)** project — NOT a static HTML site.
+- Main page component: \`app/page.tsx\` (root page) or \`app/<slug>/page.tsx\` (sub-pages)
+- Styling: Tailwind CSS classes only — do NOT add \`<style jsx>\`, raw \`<style>\` blocks, or inline styles
+- There is NO \`index.html\`. Do not edit or create static HTML files for page content.
+- Shared UI components live in \`components/\`
+- Global CSS: \`app/globals.css\`
+- API routes: \`app/api/\`
+- Config: \`next.config.js\`, \`tailwind.config.js\`
+- The initial user message includes a file listing. Use it to orient yourself before editing.
+
 ## Principles
 - Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
 - For files over 5KB, use search_in_file to locate code before reading. Use read_file with line ranges, not whole files.
@@ -929,8 +940,19 @@ async function runCodingAgentInternal(
   const client = getBedrockClient();
   const tools = getToolDefinitions();
 
+  // Pre-fetch the file listing so the agent knows the repo structure from the first iteration.
+  // This prevents it from blindly guessing file paths (e.g. editing index.html instead of app/page.tsx).
+  let fileListingPreamble = '';
+  try {
+    const fileList = await executeTool('list_files', {}, context);
+    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${fileList}\n\`\`\`\n\n`;
+  } catch (e) {
+    // Non-fatal: agent can still call list_files itself
+    console.warn('[CODING AGENT] Pre-fetch of file listing failed, agent will list files manually:', e);
+  }
+
   const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: taskDescription }
+    { role: 'user', content: fileListingPreamble + taskDescription }
   ];
 
   let iteration = 0;
