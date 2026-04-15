@@ -35,6 +35,25 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-15',
+    changes: [
+      'Emma: Cross-Page Tool Awareness',
+      '- Emma now knows which tools correspond to each page in the portal — even when you reference a page you are not currently on',
+      '- Example: asking "get my SEO data from the SEO/GEO page" from the CRM page correctly triggers the SEO metrics tool',
+      '- Covers all portal pages: SEO/GEO, CRM, Marketing Hub, Social Posts, Brand Guidelines, Landing Pages, and more',
+      '- For requests outside her capabilities, Emma now suggests using the Report Product Issues feature so the team is notified',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
+      'Admin: Simplified Emma Prompt Management',
+      '- The separate "Emma Chat Settings" admin tab has been removed — it was redundant with the Agent Mode system prompt',
+      '- Emma (sidebar popup in Customer Portal) now uses the same unified system prompt as Agent Mode, plus a small sidebar-specific addendum',
+      '- The sidebar addendum is now visible as a read-only section in the Admin > Agent Mode tab for easy reference',
+    ],
+  },
+  {
     date: '2026-04-14',
     changes: [
       'New: Brand Guide Document Now Supports URLs',
