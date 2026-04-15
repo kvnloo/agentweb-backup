@@ -178,6 +178,20 @@ export interface User {
   current_period_end?: string; // ISO date of current billing period end
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
+  /**
+   * Stripe Connect OAuth — customer-authorized read-only access to their own
+   * Stripe account. Used to enrich CRM contacts with the customer's live
+   * billing data (not AgentWeb's platform billing).
+   *
+   * Tokens are encrypted at rest via utils/stripeConnectCrypto.encryptConnectToken.
+   * Never log or return the encrypted values to the client.
+   */
+  stripeConnectedAccountId?: string; // acct_xxx of the connected Stripe account
+  stripeConnectedAt?: string; // ISO datetime when OAuth was completed
+  stripeConnectAccessToken?: string; // AES-256-GCM encrypted
+  stripeConnectRefreshToken?: string; // AES-256-GCM encrypted
+  stripeConnectScope?: string; // Granted scope, expected: "read_only"
+  stripeConnectMode?: 'live' | 'test'; // Which Stripe mode the connection was made in
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
     | 'meta' | 'twitter' | 'instagram';
@@ -564,6 +578,29 @@ class UserDB {
       return (result.Items?.[0] as User) || null;
     } catch (error) {
       console.error("Error in getUserByStripeCustomerId:", error);
+      throw error;
+    }
+  }
+
+  async getUserByStripeConnectedAccountId(connectedAccountId: string): Promise<User | null> {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: "stripeConnectedAccountId = :cid",
+        ExpressionAttributeValues: {
+          ":cid": connectedAccountId,
+        },
+      };
+      // Full table scan — small user base today, add a GSI if this becomes hot.
+      const result = await this.docClient.scan(params).promise();
+      if (result.Items && result.Items.length > 1) {
+        console.warn(
+          `getUserByStripeConnectedAccountId: found ${result.Items.length} users with stripeConnectedAccountId=${connectedAccountId} — expected 1. Using first match.`
+        );
+      }
+      return (result.Items?.[0] as User) || null;
+    } catch (error) {
+      console.error("Error in getUserByStripeConnectedAccountId:", error);
       throw error;
     }
   }
