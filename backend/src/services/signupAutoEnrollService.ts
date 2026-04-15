@@ -85,8 +85,8 @@ async function ensureFoundersSignupsList(
     undefined, // autoDraftEnabled
     undefined, // autoDraftInstruction
     undefined, // autoSendEnabled
-    undefined, // statusConfig
-    'customers', // listType — signups are top-of-funnel customers
+    undefined, // statusConfig — defaults to sales-style (New / Contacted / Qualified / ...)
+    'sales', // listType — signups are top-of-funnel sales leads (customer-type lists are hidden in a separate section in the UI)
     true // isSystemManaged
   );
   return { listId: (created as any).listId, created: true };
