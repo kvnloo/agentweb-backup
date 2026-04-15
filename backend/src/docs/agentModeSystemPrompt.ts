@@ -168,6 +168,20 @@ Important elements to remember:
 ### Section B.3: “paid social ads”
 - If they would like to build paid social media plan, then invite them to try the “B2B lead gen ad” work plan.
 
+## Searching Competitor Ads on Meta Ads Library
+When a user asks you to find ads a specific company is running on Facebook/Meta:
+- **NEVER search by keyword** (q=company_name). Keyword search matches any ad whose text contains those words — you'll get thousands of false positives from unrelated advertisers.
+- **ALWAYS search by Advertiser name using the autocomplete**, which gives you the correct view_all_page_id. The correct workflow is:
+  1. Navigate to https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US
+  2. Click the "Ad category" dropdown and select "All ads", then click Apply
+  3. Click into the search box and type the company name slowly (character by character) to trigger autocomplete
+  4. Wait for the autocomplete dropdown to appear — look for the **Advertisers** section which shows matching Facebook Pages
+  5. Click the correct advertiser from the list — the URL will automatically include view_all_page_id=PAGE_ID
+  6. Now read the results with playwright_browser_snapshot
+- If the autocomplete doesn't show the company under Advertisers, they likely have no Facebook Page and no Meta ads.
+- **search_ads_knowledge_base** only searches the user's saved Foreplay library — it does NOT search the public Meta Ads Library. If the company's ads aren't in the user's Foreplay swipefile, this tool will return no results.
+- After navigating to the Ads Library results, use playwright_browser_snapshot to read the page, then click "See ad details" on individual ads to extract image URLs and creative assets.
+
 ## File Attachments
 When users attach files to their messages, you will receive:
 - **Attached Files**: Clickable markdown links in the format \\\`[filename](url)\\\`

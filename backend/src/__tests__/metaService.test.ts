@@ -667,7 +667,7 @@ describe('MetaService', () => {
             expect(result).toEqual(mockAdAccounts);
         });
 
-        it('should filter out ad accounts without business', async () => {
+        it('should include ad accounts without a business object (Business Manager accounts)', async () => {
             const mockAdAccounts = [
                 {
                     id: 'act_123',
@@ -680,8 +680,42 @@ describe('MetaService', () => {
                 },
                 {
                     id: 'act_456',
-                    name: 'Personal Account',
+                    name: 'Business Manager Account',
                     account_id: '456',
+                    currency: 'USD',
+                    account_status: 1,
+                    owner: 'user123',
+                    business: null  // Business Manager accounts may have business: null
+                }
+            ];
+            const mockGetAdAccounts = jest.fn().mockResolvedValue(mockAdAccounts);
+            (User as unknown as jest.Mock).mockImplementation(() => ({
+                getAdAccounts: mockGetAdAccounts,
+            }));
+
+            const result = await service.getAdAccounts(mockAccessToken);
+
+            // Both accounts should be included — business: null is valid for Business Manager accounts
+            expect(result).toHaveLength(2);
+            expect(result[0].account_id).toBe('123');
+            expect(result[1].account_id).toBe('456');
+        });
+
+        it('should filter out entries without an account_id', async () => {
+            const mockAdAccounts = [
+                {
+                    id: 'act_123',
+                    name: 'Valid Account',
+                    account_id: '123',
+                    currency: 'USD',
+                    account_status: 1,
+                    owner: 'user123',
+                    business: null
+                },
+                {
+                    id: 'act_456',
+                    name: 'Invalid Entry',
+                    account_id: undefined,  // No account_id — should be excluded
                     currency: 'USD',
                     account_status: 1,
                     owner: 'user123',
@@ -696,7 +730,7 @@ describe('MetaService', () => {
             const result = await service.getAdAccounts(mockAccessToken);
 
             expect(result).toHaveLength(1);
-            expect(result[0].business).toBeTruthy();
+            expect(result[0].account_id).toBe('123');
         });
 
         it('should get pages', async () => {

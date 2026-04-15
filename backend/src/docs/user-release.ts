@@ -9,6 +9,90 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-15',
+    changes: [
+      'Admin: Update User Contact Email',
+      '- Admins can now change the login/contact email for any user account directly from the Users tab in the Admin Dashboard',
+      '- Click the pencil icon next to "Contact Email" in the expanded user row, enter the new email, and confirm',
+      '- The user\'s ID and all associated data remain unchanged; only the login email is updated',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'New: Brand Guide Document Now Supports URLs',
+      '- In Brand Guidelines, you can now provide a URL to your brand guide document instead of uploading a file',
+      '- The upload section shows a file picker and a "Provide a URL" field side by side',
+      '- URL entries display with a link icon and open the URL in a new tab',
+      '- Emma can also update your brand guide document URL via chat',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Admin: Configurable Default Image Generation Model for Agent Mode',
+      '- Admins can now set the default image API model used by the generate_image tool in Agent Mode (Admin > Agent Mode > Image API Default Model)',
+      '- Supported models: gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, gpt-image-1, gemini-2.5-flash-image',
+      '- When no model is explicitly specified by the agent, the configured default is used instead of the hardcoded fallback',
+      '- The "Image Session Default Model" setting (formerly "Image Generation Default Model") controls the LLM used to plan/orchestrate image sessions — clarified in the UI',
+      '- The legacy "Image Models" tab (for web automation task image models) is now labelled as legacy with a redirect notice to the Agent Mode tab',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Emma Can Now Clone Meta Ads With Images',
+      '- Emma can now copy an existing Meta ad into a new paused ad — including its image, ad copy, and call-to-action — with a single instruction like "Clone this ad with a new landing page URL"',
+      '- Previously, Emma would get stuck when trying to clone ads because image details were not included in the ad listing; she now retrieves the full creative (image hash, story spec, body, title) in one step',
+      '- Supports overriding the landing page URL, headline, body copy, ad name, target ad set, and call-to-action type when cloning',
+      '- Works with single-image, video, and carousel ad formats',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fix: Admin Tools Now Work When Accessed via Delegated Session',
+      '- When an admin used "Access Portal" to view a customer account, Emma\'s admin tools (e.g. "give me a list of all clients") were incorrectly returning "Access denied" even though the session had delegated admin access',
+      '- Root cause: the client-health route was re-checking admin status from the database using the target customer\'s ID instead of trusting the server-minted token\'s isAdmin flag',
+      '- Admin tools now work correctly in delegated sessions — the admin\'s elevated access is respected throughout',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fix: CRM Lead Filtering Now Works for Dates and Custom Fields',
+      '- Filtering leads by createdAt or updatedAt (e.g. "find leads added in the last 24 hours") now returns the correct results instead of returning all leads',
+      '- Filtering by dot-notation custom field paths (e.g. customFields.createdAt) now works correctly',
+      '- Date comparisons using greater_than and less_than operators now handle ISO date strings (e.g. 2026-04-13T00:00:00.000Z) in addition to numbers',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fix: Emma Knows the AgentWeb Team in Scheduled Slack Scans',
+      '- When Emma runs a scheduled "Daily Slack Check" (or any Slack-scanning session), she now correctly identifies Rui, Harsha, Fangfang, and Matt as internal team members',
+      '- Previously, only event-driven Slack sessions (direct @mentions, channel triggers) had team context; scheduled scans did not, so Emma could mistake a team member\'s message for a client message',
+      '- Emma now recognizes AgentWeb team members by name across all Slack-related sessions — event-driven and scheduled alike',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fixed: Meta Ad Accounts Now Appear After Connecting',
+      '- After connecting a Meta account via OAuth, ad accounts created inside Business Manager now correctly appear in your connected accounts list',
+      '- Previously, Business Manager ad accounts with no explicit business entity link were silently filtered out, resulting in 0 accounts showing despite a successful connection',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fix: Auto-Engagement No Longer Posts Duplicate Comments on the Same LinkedIn Post',
+      '- Fixed a bug where the same account could end up commenting 2–3 times on a single LinkedIn post',
+      '- Root cause: LinkedIn\'s API returns some posts under two different IDs in the same response; the scanner was treating these as separate posts and scheduling engagement for each',
+      '- The scanner now deduplicates posts by content before scheduling, so only one comment is placed per post per account',
+    ],
+  },
+  {
     date: '2026-04-14',
     changes: [
       'New: Emma Can Connect Your Accounts Inline — No Page Navigation Needed',
@@ -53,6 +137,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Emma Tools Now Available to Admin Users on Partner Portal',
       '- Admin users were not getting Emma\'s tool access when chatting via the partner portal due to a portal-type gate — now fixed',
       '- Emma correctly loads admin tools (client listing, health assessments, etc.) for all admin sessions regardless of portal',
+    ],
+  },
+  {
+    date: '2026-04-14',
+    changes: [
+      'Fixed: Emma Now Correctly Finds Competitor Ads on the Meta Ads Library',
+      '- When asked to find ads a company is running on Facebook/Meta, Emma now uses the advertiser autocomplete in the Ads Library to find the company\'s Facebook Page ID, then loads only that page\'s ads',
+      '- Previously, Emma searched by keyword (e.g. "every.io") which returned thousands of false-positive results from unrelated advertisers whose ad copy happened to mention the same words',
+      '- The Foreplay "search ads" tool description has also been clarified: it only searches your saved Foreplay library, not the public Meta Ads Library',
     ],
   },
   {

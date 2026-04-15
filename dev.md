@@ -3328,3 +3328,16 @@ Investigated options for controlling Meta ad spend to prevent overspending when 
 **Continue using Ramp virtual card approach for now.** Each Meta ad account is funded via a Ramp virtual credit card with a hard spending limit configured on the card. This provides a reliable, externally-enforced hard stop without any additional code complexity. Revisit in-app controls (Option A or B) if:
 - We manage ad accounts for customers where card-per-account isn't practical
 - Users request the ability to self-configure limits without admin intervention
+
+## Meta Marketing API Version Upgrade to v24.0 (2026-04-14)
+
+Meta notified that all Marketing API versions prior to v24.0 will be deprecated on June 9, 2026 (v23.0 and below). Updated `META_API_VERSION` to `v24.0` in both staging and production Elastic Beanstalk environment configs.
+
+**Code changes (on branch `rui/upgrade-meta-api-version`):** All hardcoded `v18.0` fallback defaults in source code will be updated to `v24.0` to match the env var. Affected files:
+- `backend/src/routes/meta.ts` (3 locations)
+- `backend/src/services/agentModeService.ts` (2 locations)
+- `backend/src/services/clientHealthService.ts` (1 location)
+- `backend/src/services/metaService.ts` (3 locations)
+- Test files: `metaAuth.test.ts`, `instagramService.test.ts`, `agentModeService.metaMetrics.test.ts`, `agentModeService.listMetaAdsCampaigns.test.ts`
+
+**Note:** `backend/src/config/integrations.ts` was already at `v24.0`. No customer-portal changes needed.

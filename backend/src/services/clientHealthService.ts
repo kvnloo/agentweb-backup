@@ -138,12 +138,16 @@ function determineStatus(
  */
 export async function assessClientHealth(
   callerUserId: string,
-  clientNameOrEmail: string
+  clientNameOrEmail: string,
+  callerIsAdmin?: boolean
 ): Promise<any> {
   try {
-    // Auth gate: check caller is admin
-    const caller = await userDb.getUserById(callerUserId);
-    if (!caller || !caller.isAdmin) {
+    // Auth gate: check caller is admin.
+    // callerIsAdmin may be pre-verified by the route (e.g. from _svc token for delegated sessions).
+    const isAdmin = callerIsAdmin !== undefined
+      ? callerIsAdmin
+      : (await userDb.getUserById(callerUserId))?.isAdmin === true;
+    if (!isAdmin) {
       return {
         success: false,
         message: 'Access denied. Only admin users can assess client health.',
@@ -349,11 +353,14 @@ export async function assessClientHealth(
 /**
  * List all clients (including admins) with quick health indicators. Admin-only.
  */
-export async function listAllClients(callerUserId: string): Promise<any> {
+export async function listAllClients(callerUserId: string, callerIsAdmin?: boolean): Promise<any> {
   try {
-    // Auth gate: check caller is admin
-    const caller = await userDb.getUserById(callerUserId);
-    if (!caller || !caller.isAdmin) {
+    // Auth gate: check caller is admin.
+    // callerIsAdmin may be pre-verified by the route (e.g. from _svc token for delegated sessions).
+    const isAdmin = callerIsAdmin !== undefined
+      ? callerIsAdmin
+      : (await userDb.getUserById(callerUserId))?.isAdmin === true;
+    if (!isAdmin) {
       return {
         success: false,
         message: 'Access denied. Only admin users can list clients.',

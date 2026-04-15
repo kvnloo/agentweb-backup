@@ -194,6 +194,7 @@ export class AgentModeService {
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
+  private imageApiDefaultModelSettingName = 'agent_mode_image_api_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
@@ -641,6 +642,26 @@ export class AgentModeService {
     }
     // Fall back to the general default model
     return this.getDefaultModel();
+  }
+
+  // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts)
+  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image'];
+
+  async getImageApiDefaultModel(): Promise<string | undefined> {
+    try {
+      const setting = await settingsService.getSetting(this.imageApiDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (AgentModeService.IMAGE_API_MODELS.includes(configuredModel)) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported image API default model "${configuredModel}" in settings; using hardcoded default.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting image API default model setting:', error);
+    }
+    // Return undefined to let imageGeneration.ts use its own hardcoded default
+    return undefined;
   }
 
   async getVideoGenerationDefaultModel(): Promise<string> {
@@ -1369,10 +1390,10 @@ export class AgentModeService {
         console.error('Failed to load account memories:', err);
       }
 
-      // For Slack sessions, inject team roster as an assistant acknowledgement so the model
-      // treats it as established knowledge rather than an instruction it can override.
-      const slackPageIds = ['slack-bot', 'slack-bot-admin', 'slack-triggered'];
-      if (slackPageIds.includes(currentSession?.pageIdentifier || '')) {
+      // For Slack sessions (including scheduled scans), inject team roster as an assistant
+      // acknowledgement so the model treats it as established knowledge rather than an
+      // instruction it can override.
+      if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
         messages.push({
           role: 'assistant',
           content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
@@ -6448,7 +6469,7 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
       const matchingLeads: any[] = [];
       let cursor: any = undefined;
 
@@ -6472,6 +6493,10 @@ export class AgentModeService {
               fieldValue = lead.engagementCount;
             } else if (standardFields.includes(field)) {
               fieldValue = lead[field];
+            } else if (field.includes('.')) {
+              // Dot-notation path (e.g. "customFields.createdAt" → lead.customFields?.createdAt)
+              const parts = field.split('.');
+              fieldValue = parts.reduce((obj: any, part: string) => obj?.[part], lead);
             } else {
               // Custom field
               fieldValue = lead.customFields?.[field];
@@ -6492,10 +6517,18 @@ export class AgentModeService {
                 return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
               case 'starts_with':
                 return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
-              case 'greater_than':
-                return Number(fieldValue) > Number(value);
-              case 'less_than':
-                return Number(fieldValue) < Number(value);
+              case 'greater_than': {
+                const numFv = Number(fieldValue);
+                const numV = Number(value);
+                if (!isNaN(numFv) && !isNaN(numV)) return numFv > numV;
+                return String(fieldValue || '') > String(value || '');
+              }
+              case 'less_than': {
+                const numFv = Number(fieldValue);
+                const numV = Number(value);
+                if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
+                return String(fieldValue || '') < String(value || '');
+              }
               default:
                 return false;
             }
@@ -6873,7 +6906,7 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion to identify leads to delete' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
 
       // Helper function to check if a lead matches all filters
       const leadMatchesFilters = (lead: any): boolean => {
@@ -6889,6 +6922,10 @@ export class AgentModeService {
             fieldValue = lead.engagementCount;
           } else if (standardFields.includes(field)) {
             fieldValue = lead[field];
+          } else if (field.includes('.')) {
+            // Dot-notation path (e.g. "customFields.createdAt" → lead.customFields?.createdAt)
+            const parts = field.split('.');
+            fieldValue = parts.reduce((obj: any, part: string) => obj?.[part], lead);
           } else {
             fieldValue = lead.customFields?.[field];
           }
@@ -6907,10 +6944,18 @@ export class AgentModeService {
               return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
             case 'starts_with':
               return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
-            case 'greater_than':
-              return Number(fieldValue) > Number(value);
-            case 'less_than':
-              return Number(fieldValue) < Number(value);
+            case 'greater_than': {
+              const numFv = Number(fieldValue);
+              const numV = Number(value);
+              if (!isNaN(numFv) && !isNaN(numV)) return numFv > numV;
+              return String(fieldValue || '') > String(value || '');
+            }
+            case 'less_than': {
+              const numFv = Number(fieldValue);
+              const numV = Number(value);
+              if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
+              return String(fieldValue || '') < String(value || '');
+            }
             default:
               return false;
           }
@@ -8055,6 +8100,22 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Normalize a brand guide asset: if the URL is not an S3-hosted file,
+      // mark it as a URL entry (filename: "url") so the frontend can display it correctly.
+      const normalizeBrandGuideAsset = (asset: any): any => {
+        if (asset?.type !== 'brandGuide') return asset;
+        const isS3Url = typeof asset.url === 'string' && asset.url.includes('.s3.') && asset.url.includes('amazonaws.com');
+        const isUrlEntry = !isS3Url;
+        if (isUrlEntry) {
+          return {
+            ...asset,
+            filename: 'url',
+            key: asset.key || `url-brandguide-${Date.now()}`,
+          };
+        }
+        return asset;
+      };
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
@@ -8062,7 +8123,8 @@ Format the response as JSON with this structure:
       if (brandAssets !== undefined) {
         if (Array.isArray(brandAssets)) {
           // Merge by type: replace assets of the same type, keep others
-          brandAssets.forEach(newAsset => {
+          brandAssets.forEach(rawAsset => {
+            const newAsset = normalizeBrandGuideAsset(rawAsset);
             const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
             if (existingIndex >= 0) {
               // Replace existing asset of the same type
@@ -8076,15 +8138,16 @@ Format the response as JSON with this structure:
           });
         } else if (typeof brandAssets === 'object' && brandAssets !== null) {
           // Single asset - merge by type
-          const existingIndex = updatedAttachments.findIndex(existing => existing.type === brandAssets.type);
+          const newAsset = normalizeBrandGuideAsset(brandAssets);
+          const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
           if (existingIndex >= 0) {
             // Replace existing asset of the same type
-            updatedAttachments[existingIndex] = brandAssets;
-            updatedAssets.push(brandAssets); // Track as updated
+            updatedAttachments[existingIndex] = newAsset;
+            updatedAssets.push(newAsset); // Track as updated
           } else {
             // Add new asset type
-            updatedAttachments.push(brandAssets);
-            updatedAssets.push(brandAssets); // Track as added
+            updatedAttachments.push(newAsset);
+            updatedAssets.push(newAsset); // Track as added
           }
         }
       }
@@ -9884,7 +9947,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -9897,8 +9960,174 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'DELETE':
         if (!ad_id) throw new Error('ad_id is required for DELETE action');
         return this.deleteMetaAdsAd(userId, ad_id, account_id);
+      case 'COPY_AD':
+        if (!ad_id) throw new Error('ad_id (source_ad_id) is required for COPY_AD action');
+        return this.copyMetaAdsAd(userId, ad_id, params, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
+    }
+  }
+
+  /**
+   * Copy an existing ad to a new ad set (or the same one), cloning its creative.
+   * Handles image_hash extraction or re-upload from CDN URL automatically.
+   *
+   * params:
+   *   - name?:         New ad name (defaults to "<source name> (copy)")
+   *   - adset_id?:     Target ad set ID (defaults to the source ad's ad set)
+   *   - link_url?:     Override destination URL in the new creative
+   *   - body?:         Override ad body text
+   *   - title?:        Override headline
+   *   - status?:       New ad status (default: PAUSED)
+   */
+  public async copyMetaAdsAd(userId: string, sourceAdId: string, params: any = {}, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      // Step 1: Fetch the source ad (now includes creative sub-fields)
+      const sourceAd = await metaService.getAd(accessToken, sourceAdId);
+      const creativeRef = sourceAd?.creative;
+      const oldCreativeId = creativeRef?.id || creativeRef?.creative_id;
+      if (!oldCreativeId) {
+        return {
+          success: false,
+          message: 'Source ad has no creative assigned. Cannot copy.',
+          error: 'MISSING_CREATIVE'
+        };
+      }
+      console.log(`AgentMode: Copying ad ${sourceAdId} (creative ${oldCreativeId})`);
+
+      // Step 2: Fetch the full creative details
+      const creativeData = await metaService.getAdCreative(accessToken, oldCreativeId);
+      if (!creativeData?.object_story_spec) {
+        return {
+          success: false,
+          message: 'Could not read the source creative details. The creative may be deleted or in an unsupported format.',
+          error: 'MISSING_OBJECT_STORY_SPEC'
+        };
+      }
+
+      // Step 3: Build new creative params, carrying over media + applying overrides
+      const existingSpec = creativeData.object_story_spec;
+      const pageId = existingSpec.page_id;
+      const newLinkUrl = params.link_url || params.destination || params.url;
+
+      let newCreativeParams: any;
+
+      if (existingSpec.video_data) {
+        const vd = existingSpec.video_data;
+        let imageHash = vd.image_hash;
+        // Re-upload thumbnail from CDN URL if no hash available
+        if (!imageHash && vd.image_url) {
+          console.log(`AgentMode: Re-uploading video thumbnail from CDN URL for copy of ad ${sourceAdId}`);
+          const uploaded = await this.uploadMetaAdsImage(userId, vd.image_url, account_id);
+          imageHash = uploaded?.image_hash;
+        }
+        newCreativeParams = {
+          name: params.name || `${creativeData.name || 'Creative'} (copy)`,
+          page_id: pageId,
+          video_id: vd.video_id,
+          image_hash: imageHash,
+          image_url: imageHash ? undefined : (vd.image_url || creativeData.thumbnail_url),
+          body: params.body || vd.message || creativeData.body || '',
+          title: params.title || vd.title || creativeData.title || '',
+          link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
+          call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        };
+      } else if (existingSpec.link_data?.child_attachments) {
+        const ld = existingSpec.link_data;
+        const updatedCards = await Promise.all(ld.child_attachments.map(async (card: any) => {
+          let imageHash = card.image_hash;
+          const pictureUrl = card.picture || card.image_url;
+          if (!imageHash && pictureUrl) {
+            console.log(`AgentMode: Re-uploading carousel card image from CDN URL for copy of ad ${sourceAdId}`);
+            const uploaded = await this.uploadMetaAdsImage(userId, pictureUrl, account_id);
+            imageHash = uploaded?.image_hash;
+          }
+          return {
+            image_hash: imageHash,
+            image_url: imageHash ? undefined : pictureUrl,
+            video_id: card.video_id,
+            title: card.name || card.title,
+            description: card.description,
+            link_url: newLinkUrl || card.link,
+          };
+        }));
+        newCreativeParams = {
+          name: params.name || `${creativeData.name || 'Creative'} (copy)`,
+          page_id: pageId,
+          body: params.body || ld.message || creativeData.body || '',
+          title: params.title || '',
+          link_url: newLinkUrl || ld.link || '',
+          carousel_cards: updatedCards,
+          call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        };
+      } else if (existingSpec.link_data) {
+        const ld = existingSpec.link_data;
+        let imageHash = ld.image_hash;
+        const pictureUrl = ld.picture || ld.image_url || creativeData.image_url;
+        if (!imageHash && pictureUrl) {
+          console.log(`AgentMode: Re-uploading image from CDN URL for copy of ad ${sourceAdId}`);
+          const uploaded = await this.uploadMetaAdsImage(userId, pictureUrl, account_id);
+          imageHash = uploaded?.image_hash;
+        }
+        newCreativeParams = {
+          name: params.name || `${creativeData.name || 'Creative'} (copy)`,
+          page_id: pageId,
+          image_hash: imageHash,
+          image_url: imageHash ? undefined : pictureUrl,
+          body: params.body || ld.message || creativeData.body || '',
+          title: params.title || ld.name || creativeData.title || '',
+          link_url: newLinkUrl || ld.link || '',
+          call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        };
+      } else {
+        return {
+          success: false,
+          message: 'Unsupported creative type. Cannot copy the ad.',
+          error: 'UNSUPPORTED_CREATIVE_TYPE'
+        };
+      }
+
+      console.log(`AgentMode: Creating copy creative for ad ${sourceAdId}:`, newCreativeParams);
+
+      // Step 4: Create the new creative
+      const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);
+      const newCreativeId = newCreative?.id;
+      if (!newCreativeId) {
+        return {
+          success: false,
+          message: 'Failed to create the copy creative. The Meta API did not return a creative ID.',
+          error: 'CREATIVE_CREATE_FAILED'
+        };
+      }
+
+      // Step 5: Create the new ad
+      const targetAdSetId = params.adset_id || sourceAd.adset_id;
+      const newAdName = params.name || `${sourceAd.name || 'Ad'} (copy)`;
+      const newAd = await metaService.createAd(accountId, accessToken, {
+        name: newAdName,
+        adset_id: targetAdSetId,
+        creative_id: newCreativeId,
+        status: params.status || 'PAUSED',
+      });
+
+      return {
+        success: true,
+        message: `Ad "${newAdName}" copied successfully`,
+        source_ad_id: sourceAdId,
+        new_ad_id: newAd?.id,
+        new_creative_id: newCreativeId,
+        ad: newAd
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error copying Meta ad:', error);
+      return {
+        success: false,
+        message: this.enrichMetaError(error, 'copy Meta ad'),
+        error: error.message,
+        details: error.structuredError
+      };
     }
   }
 
@@ -10923,6 +11152,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD UPDATE requires "ad_id".');
         } else if (action === 'DELETE' && !ad_id) {
           throw new Error('AD DELETE requires "ad_id".');
+        } else if (action === 'COPY_AD' && !ad_id) {
+          throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         }
         break;
 
