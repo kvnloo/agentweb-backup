@@ -3297,91 +3297,54 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
-  name: 'comment_on_linkedin_post',
+  name: 'linkedin_manage_post',
   definition: {
-    name: 'comment_on_linkedin_post',
-    description: 'Create a comment on a LinkedIn post, or reply to an existing comment, using a connected LinkedIn account. To reply to a specific comment (nested reply), provide the parent_comment_urn. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
+    name: 'linkedin_manage_post',
+    description: 'Manage LinkedIn post interactions using a connected LinkedIn account. Supports reposting, commenting, listing comments, reacting, and fetching analytics — all in one tool.\n\nActions:\n- repost: Reshare an existing LinkedIn post, optionally adding your own commentary. Requires post_urn. CRITICAL: Always get explicit user approval before reposting.\n- comment: Create a comment on a post, or a nested reply when parent_comment_urn is provided. Requires post_urn and comment_text. CRITICAL: Always get explicit user approval before commenting.\n- list_comments: Fetch all comments on a post with their URNs (useful for finding parent_comment_urn for replies). Requires post_urn.\n- react: React to a post (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT). Requires post_urn. CRITICAL: Always get explicit user approval before reacting.\n- get_analytics: Fetch engagement metrics (likes, comments, shares, impressions, clicks) for one or more posts. Requires post_ids array.',
     inputSchema: {
       type: 'object',
       properties: {
+        action: {
+          type: 'string',
+          enum: ['repost', 'comment', 'list_comments', 'react', 'get_analytics'],
+          description: 'The operation to perform'
+        },
         account_id: {
           type: 'string',
-          description: 'The connected LinkedIn account ID to comment from'
+          description: 'The connected LinkedIn account ID'
         },
         post_urn: {
           type: 'string',
-          description: 'The LinkedIn post URN to comment on (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+          description: 'LinkedIn post URN — required for repost, comment, list_comments, react (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
+        },
+        commentary: {
+          type: 'string',
+          description: 'Optional text to add alongside a repost. Only used with action=repost. LinkedIn plain text only — no markdown.'
         },
         comment_text: {
           type: 'string',
-          description: 'The comment text content. Should be concise and relevant to the post.'
+          description: 'The comment text. Required for action=comment. LinkedIn plain text only — no markdown.'
         },
         parent_comment_urn: {
           type: 'string',
-          description: 'Optional. The URN of a parent comment to reply to (e.g., "urn:li:comment:(urn:li:ugcPost:123,456)"). When provided, the comment is posted as a nested reply under this comment instead of as a top-level comment.'
-        }
-      },
-      required: ['account_id', 'post_urn', 'comment_text']
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text, args.parent_comment_urn);
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'list_linkedin_comments',
-  definition: {
-    name: 'list_linkedin_comments',
-    description: 'List comments on a LinkedIn post. Returns each comment\'s URN, author URN, text, and timestamp. Use this to find the comment_urn needed for replying to a specific comment via comment_on_linkedin_post with parent_comment_urn.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        account_id: {
-          type: 'string',
-          description: 'The connected LinkedIn account ID to use for fetching comments'
-        },
-        post_urn: {
-          type: 'string',
-          description: 'The LinkedIn post URN to list comments for (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
-        }
-      },
-      required: ['account_id', 'post_urn']
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.listLinkedInComments(context?.userId, args.account_id, args.post_urn);
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'react_to_linkedin_post',
-  definition: {
-    name: 'react_to_linkedin_post',
-    description: 'React to a LinkedIn post using a connected LinkedIn account. Supports various reaction types: LIKE (thumbs up), PRAISE (celebrate), EMPATHY (love), INTEREST (insightful), APPRECIATION (support), ENTERTAINMENT (funny). CRITICAL: Always review the reaction with the user and get explicit approval before posting reactions on LinkedIn.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        account_id: {
-          type: 'string',
-          description: 'The connected LinkedIn account ID to react from'
-        },
-        post_urn: {
-          type: 'string',
-          description: 'The LinkedIn post URN to react to (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+          description: 'Optional. URN of a parent comment to reply to (e.g., "urn:li:comment:(urn:li:ugcPost:123,456)"). Only used with action=comment. When provided, posts a nested reply instead of a top-level comment.'
         },
         reaction_type: {
           type: 'string',
           enum: ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'],
-          description: 'The type of reaction. LIKE = Like (👍), PRAISE = Celebrate (👏), EMPATHY = Love (❤️), INTEREST = Insightful (💡), APPRECIATION = Support (🙌), ENTERTAINMENT = Funny (😂)',
-          default: 'LIKE'
+          description: 'Reaction type for action=react. LIKE=👍 PRAISE=👏 EMPATHY=❤️ INTEREST=💡 APPRECIATION=🙌 ENTERTAINMENT=😂. Defaults to LIKE.'
+        },
+        post_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of post URNs to fetch analytics for. Required for action=get_analytics.'
         }
       },
-      required: ['account_id', 'post_urn']
+      required: ['action', 'account_id']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.reactToLinkedInPost(context?.userId, args.account_id, args.post_urn, args.reaction_type || 'LIKE');
+    return await agentModeService.linkedinManagePost(context?.userId, args);
   }
 });
 

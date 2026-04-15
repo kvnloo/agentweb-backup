@@ -434,4 +434,168 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toContain('Failed to load metrics');
     });
   });
+
+  describe('linkedinRepost', () => {
+    const mockAdapter = {
+      createRepost: jest.fn(),
+    };
+
+    beforeEach(() => {
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+    });
+
+    it('should repost successfully without commentary', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createRepost.mockResolvedValue({
+        success: true,
+        message: 'Reposted on LinkedIn',
+        postId: 'urn:li:share:new123',
+        postUrl: 'https://www.linkedin.com/feed/update/urn:li:share:new123',
+      });
+
+      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:orig999');
+
+      expect(result.success).toBe(true);
+      expect(result.post_id).toBe('urn:li:share:new123');
+      expect(mockAdapter.createRepost).toHaveBeenCalledWith(
+        mockLinkedInAccount,
+        'urn:li:share:orig999',
+        undefined,
+        'user-123'
+      );
+    });
+
+    it('should repost with commentary', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createRepost.mockResolvedValue({
+        success: true,
+        message: 'Reposted with commentary on LinkedIn',
+        postId: 'urn:li:share:new456',
+        postUrl: 'https://www.linkedin.com/feed/update/urn:li:share:new456',
+      });
+
+      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:orig999', 'Great post!');
+
+      expect(result.success).toBe(true);
+      expect(mockAdapter.createRepost).toHaveBeenCalledWith(
+        mockLinkedInAccount,
+        'urn:li:share:orig999',
+        'Great post!',
+        'user-123'
+      );
+    });
+
+    it('should return error when post_urn is missing (via dispatcher)', async () => {
+      const result = await service.linkedinManagePost('user-123', {
+        action: 'repost',
+        account_id: 'urn:li:organization:123456',
+        // post_urn intentionally omitted
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('post_urn is required');
+    });
+
+    it('should return error when account not found', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+
+      const result = await service.linkedinRepost('user-123', 'nonexistent', 'urn:li:share:orig999');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
+    });
+
+    it('should return error for non-linkedin account', async () => {
+      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
+
+      const result = await service.linkedinRepost('user-123', 'twitter-user-123', 'urn:li:share:orig999');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('only supported for LinkedIn');
+    });
+
+    it('should handle token expired error gracefully', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createRepost.mockRejectedValue(new Error('LinkedIn access token expired'));
+
+      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:orig999');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('token expired');
+    });
+  });
+
+  describe('linkedinManagePost', () => {
+    it('should dispatch repost action', async () => {
+      jest.spyOn(service, 'linkedinRepost').mockResolvedValue({ success: true, message: 'ok' });
+
+      await service.linkedinManagePost('user-123', {
+        action: 'repost',
+        account_id: 'acc-1',
+        post_urn: 'urn:li:share:orig',
+        commentary: 'Nice!',
+      });
+
+      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!');
+    });
+
+    it('should dispatch comment action', async () => {
+      jest.spyOn(service, 'commentOnLinkedInPost').mockResolvedValue({ success: true });
+
+      await service.linkedinManagePost('user-123', {
+        action: 'comment',
+        account_id: 'acc-1',
+        post_urn: 'urn:li:share:123',
+        comment_text: 'Hello',
+      });
+
+      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined);
+    });
+
+    it('should dispatch list_comments action', async () => {
+      jest.spyOn(service, 'listLinkedInComments').mockResolvedValue({ success: true, comments: [] });
+
+      await service.linkedinManagePost('user-123', {
+        action: 'list_comments',
+        account_id: 'acc-1',
+        post_urn: 'urn:li:share:123',
+      });
+
+      expect(service.listLinkedInComments).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123');
+    });
+
+    it('should dispatch react action with default LIKE', async () => {
+      jest.spyOn(service, 'reactToLinkedInPost').mockResolvedValue({ success: true });
+
+      await service.linkedinManagePost('user-123', {
+        action: 'react',
+        account_id: 'acc-1',
+        post_urn: 'urn:li:share:123',
+      });
+
+      expect(service.reactToLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'LIKE');
+    });
+
+    it('should dispatch get_analytics action', async () => {
+      jest.spyOn(service, 'getPostAnalytics').mockResolvedValue({ success: true, analytics: [] });
+
+      await service.linkedinManagePost('user-123', {
+        action: 'get_analytics',
+        account_id: 'acc-1',
+        post_ids: ['urn:li:share:123'],
+      });
+
+      expect(service.getPostAnalytics).toHaveBeenCalledWith('user-123', 'acc-1', ['urn:li:share:123']);
+    });
+
+    it('should return error for unknown action', async () => {
+      const result = await service.linkedinManagePost('user-123', {
+        action: 'unknown_action' as any,
+        account_id: 'acc-1',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Unknown action');
+    });
+  });
 });

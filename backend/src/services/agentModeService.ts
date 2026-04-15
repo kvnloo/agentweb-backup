@@ -18908,6 +18908,84 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  /**
+   * Unified LinkedIn post management handler.
+   * Dispatches to the appropriate operation based on `action`.
+   */
+  async linkedinManagePost(userId: string, args: {
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    account_id: string;
+    post_urn?: string;
+    commentary?: string;
+    comment_text?: string;
+    parent_comment_urn?: string;
+    reaction_type?: string;
+    post_ids?: string[];
+  }): Promise<any> {
+    const { action, account_id } = args;
+    console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
+
+    const requirePostUrn = (a: string) =>
+      !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
+    const requirePostIds = () =>
+      !args.post_ids?.length ? { success: false, message: 'post_ids is required for action=get_analytics' } : null;
+    const requireCommentText = () =>
+      !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
+
+    switch (action) {
+      case 'repost':
+        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary);
+      case 'comment':
+        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn);
+      case 'list_comments':
+        return requirePostUrn('list_comments') ?? this.listLinkedInComments(userId, account_id, args.post_urn!);
+      case 'react':
+        return requirePostUrn('react') ?? this.reactToLinkedInPost(userId, account_id, args.post_urn!, args.reaction_type || 'LIKE');
+      case 'get_analytics':
+        return requirePostIds() ?? this.getPostAnalytics(userId, account_id, args.post_ids!);
+      default:
+        return { success: false, message: `Unknown action: ${action}` };
+    }
+  }
+
+  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string): Promise<any> {
+    console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
+
+    try {
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      const account = await getAccountById(accountId, userId);
+      if (!account) {
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      if (account.platform !== 'linkedin') {
+        return { success: false, message: 'Repost is currently only supported for LinkedIn accounts' };
+      }
+
+      const adapter = socialPlatformService.getAdapter(account.platform) as any;
+      if (!adapter.createRepost) {
+        return { success: false, message: 'Repost is not supported for this platform' };
+      }
+
+      const result = await adapter.createRepost(account, postUrn, commentary, userId);
+
+      return {
+        success: true,
+        message: result.message,
+        post_id: result.postId,
+        post_url: result.postUrl
+      };
+    } catch (error: any) {
+      let message = error.message;
+      if (message.includes('access token expired')) {
+        message = 'Account token expired. Please reconnect the account in Settings.';
+      }
+      return { success: false, message: `Failed to repost: ${message}` };
+    }
+  }
+
   async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
