@@ -5090,6 +5090,7 @@ const adminToolNames = [
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
+  'manage_user_notes',
 ];
 
 for (const toolName of bridgedToolNames) {
