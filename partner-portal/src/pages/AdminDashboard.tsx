@@ -760,6 +760,9 @@ export default function AdminDashboard() {
   const [currentStripeCustomerIdText, setCurrentStripeCustomerIdText] = useState("");
   const [resyncPaymentsLoading, setResyncPaymentsLoading] = useState(false);
   const [stripeCustomerIdEditLoading, setStripeCustomerIdEditLoading] = useState(false);
+  const [editingEmailUserId, setEditingEmailUserId] = useState<string | null>(null);
+  const [currentEmailText, setCurrentEmailText] = useState("");
+  const [emailEditLoading, setEmailEditLoading] = useState(false);
   const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
   const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
   const [emailDomain, setEmailDomain] = useState("");
@@ -2082,9 +2085,44 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveContactEmail = async (userId: string) => {
+    const newEmail = currentEmailText.trim();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(newEmail)) {
+      setError("Invalid email format");
+      return;
+    }
+    if (!window.confirm(`Change login email to "${newEmail}"? The user will need to use this new email to sign in.`)) {
+      return;
+    }
+    try {
+      setEmailEditLoading(true);
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/email`),
+        { newEmail },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((u: User) =>
+            u.userId === userId ? { ...u, email: response.data.email } : u
+          )
+        );
+        setSuccess("Contact email updated successfully!");
+        setEditingEmailUserId(null);
+        setCurrentEmailText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating contact email:", error);
+      setError(error.response?.data?.message || "Failed to update contact email");
+    } finally {
+      setEmailEditLoading(false);
+    }
+  };
+
   const handleSaveEmailSender = async () => {
     if (!editingEmailSenderUserId) return;
-    
+
     try {
       setEmailSenderEditLoading(true);
       
@@ -3884,6 +3922,23 @@ export default function AdminDashboard() {
                                   </Box>
                                 </Grid>
                                 {/* Config details — all with inline edit */}
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Contact Email</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingEmailUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentEmailText} onChange={(e) => setCurrentEmailText(e.target.value)} placeholder="user@example.com" sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveContactEmail(user.userId)} disabled={emailEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingEmailUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2" sx={{ fontSize: "0.75rem" }}>{user.email}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingEmailUserId(user.userId); setCurrentEmailText(user.email); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Stripe Customer ID</Typography>
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
