@@ -18,6 +18,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-15',
+    changes: [
+      'Fix: Daily PR Digest Now Counts Only PRs Merged Into Main',
+      '- The PR digest tool was over-counting by including PRs merged into feature branches (e.g. harsha/dev)',
+      '- Digest now correctly counts only PRs merged into the main branch, matching actual shipped changes',
+    ],
+  },
+  {
     date: '2026-04-14',
     changes: [
       'New: Brand Guide Document Now Supports URLs',
