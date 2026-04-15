@@ -295,7 +295,7 @@ ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
   AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE
+  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -313,6 +313,7 @@ REQUIRED IDs PER ACTION:
   AD_SET UPDATE/DELETE    → ad_set_id required
   AD CREATE               → ad_set_id required
   AD UPDATE/DELETE        → ad_id required
+  AD COPY_AD              → ad_id (source ad to copy) required
   TARGETING SEARCH        → params.q and params.type required
 
 REQUIRED PARAMS PER ENTITY + ACTION:
@@ -320,8 +321,16 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
+  AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
   CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
   TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+
+COPY_AD WORKFLOW (clone an existing ad with optional overrides):
+  1. Use AD LIST to find the source ad and get its ad_id
+  2. Call AD COPY_AD with the source ad_id and any overrides (e.g. link_url for new landing page)
+  3. The system automatically: reads source creative → copies images (re-uploading from CDN if needed) → creates new creative → creates new ad
+  4. Returns new_ad_id and new_creative_id
+  NOTE: AD LIST now includes creative.object_story_spec so you can inspect image/video/URL details before copying.
 
 CAMPAIGN OBJECTIVES (valid values for 'objective'):
   OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
@@ -351,14 +360,12 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
   OUTCOME_APP_PROMOTION → APP_INSTALLS
 
-GETTING DESTINATION URLS:
-  Destination URLs are NOT returned by AD LIST — they live inside the ad creative's object_story_spec.
-  To get destination URLs:
-    1. Use AD_CREATIVE LIST → returns object_story_spec for all creatives in the account.
-       Extract link from: image creative → object_story_spec.link_data.link
-                          video creative → object_story_spec.video_data.call_to_action.value.link
-                          carousel       → object_story_spec.link_data.child_attachments[].link
-    2. Or cross-reference: AD LIST (to get creative_id per ad) → AD_CREATIVE LIST (to match creative_id → object_story_spec)`,
+GETTING DESTINATION URLS / CREATIVE DETAILS:
+  AD LIST now returns creative sub-fields directly (name, body, title, image_url, thumbnail_url, object_story_spec).
+  Extract link from: image creative → creative.object_story_spec.link_data.link
+                     video creative → creative.object_story_spec.video_data.call_to_action.value.link
+                     carousel       → creative.object_story_spec.link_data.child_attachments[].link
+  If you need creatives for ALL ads in the account without filtering: use AD_CREATIVE LIST.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -369,7 +376,7 @@ GETTING DESTINATION URLS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -2672,7 +2679,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency), ICP fields (icpScore, icpMatch), engagementCount, and any custom field names. All filters use AND logic.',
+    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2687,7 +2694,7 @@ emmaToolRegistry.register({
             properties: {
               field: {
                 type: 'string',
-                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency; ICP: icpScore, icpMatch; engagement: engagementCount; or any custom field name)'
+                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt; ICP: icpScore, icpMatch; engagement: engagementCount; dot-notation paths like "customFields.createdAt"; or any custom field name)'
               },
               operator: {
                 type: 'string',
@@ -3756,6 +3763,8 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
+    // If the LLM didn't specify a model, fall back to the admin-configured image API default
+    const imageModel = args.imageModel || await agentModeService.getImageApiDefaultModel();
     return await agentModeService.generateImage(
       args.prompt,
       args.filename,
@@ -3764,7 +3773,7 @@ emmaToolRegistry.register({
       args.inputImages || [],
       context?.userId,
       context?.sessionId,
-      args.imageModel,
+      imageModel,
       args.logo_image
     );
   }
@@ -3865,7 +3874,7 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search the user's Foreplay ad library (swipefile + boards) for ads matching the query. Use this tool when the user needs ad creative inspiration, competitor ad research, or wants to find specific saved ads by brand, headline, or description. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    description: "Search the user's Foreplay ad library (swipefile + boards) for ads the user has SAVED/bookmarked. Use this for ad creative inspiration or finding specific saved ads by brand, headline, or description. IMPORTANT: This only searches the user's own saved collection — it does NOT search the public Meta/Facebook Ads Library for ads currently running by any company. For finding a specific company's currently-running Meta ads, use Playwright to browse https://www.facebook.com/ads/library/ with the company's Facebook Page ID (view_all_page_id=PAGE_ID) — do NOT use keyword search (q=) as that returns false positives. Do NOT use search_knowledge_base for Foreplay ad searches.",
     inputSchema: {
       type: "object",
       properties: {

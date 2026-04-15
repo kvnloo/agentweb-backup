@@ -1,5 +1,5 @@
-import express from "express";
-import { AuthRequest } from "../types/express";
+import express, { Request, Response } from "express";
+import { AuthenticatedRequest } from "../middleware/auth";
 import { assessClientHealth, listAllClients } from "../services/clientHealthService";
 
 const router = express.Router();
@@ -9,14 +9,17 @@ const router = express.Router();
  * List all clients with quick health indicators.
  * Admin-only (enforced by middleware + service layer).
  */
-router.get("/", async (req: AuthRequest, res) => {
+router.get("/", async (req: Request, res: Response) => {
   try {
-    const userId = req.user?.userId;
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
     if (!userId) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const result = await listAllClients(userId);
+    // Pass isAdmin from req.user — for _svc (mcpFetch) tokens issued during delegated sessions,
+    // auth middleware already elevates isAdmin to true so the service-level DB check can be skipped.
+    const result = await listAllClients(userId, authReq.user.isAdmin);
     return res.json(result);
   } catch (error) {
     console.error("GET /api/client-health error:", error);
@@ -33,15 +36,16 @@ router.get("/", async (req: AuthRequest, res) => {
  * Get detailed health assessment for a specific client.
  * Admin-only (enforced by middleware + service layer).
  */
-router.get("/:clientEmail", async (req: AuthRequest, res) => {
+router.get("/:clientEmail", async (req: Request, res: Response) => {
   try {
-    const userId = req.user?.userId;
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
     if (!userId) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
     const clientEmail = decodeURIComponent(req.params.clientEmail);
-    const result = await assessClientHealth(userId, clientEmail);
+    const result = await assessClientHealth(userId, clientEmail, authReq.user.isAdmin);
     return res.json(result);
   } catch (error) {
     console.error("GET /api/client-health/:clientEmail error:", error);
@@ -58,7 +62,7 @@ router.get("/:clientEmail", async (req: AuthRequest, res) => {
  * Save a note for a client. Currently a no-op placeholder
  * that returns success (notes are stored client-side for now).
  */
-router.post("/:clientId/notes", async (req: AuthRequest, res) => {
+router.post("/:clientId/notes", async (req: Request, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {

@@ -212,6 +212,31 @@ describe('Client Health - listAllClients', () => {
     expect(result.error).toMatch(/admin/i);
   });
 
+  // FAIL test: callerIsAdmin=false should be rejected without DB lookup
+  it('should reject when callerIsAdmin override is false', async () => {
+    const result = await listAllClients('non-admin-user', false);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/admin/i);
+    // Should not hit the DB when override is provided
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  // SUCCESS test: delegated admin session with callerIsAdmin=true bypasses DB check
+  it('should allow access when callerIsAdmin override is true (delegated session)', async () => {
+    const targetUserId = 'target-customer';
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      { userId: targetUserId, email: 'customer@example.com', isAdmin: false },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    // Pass callerIsAdmin=true as the _svc token would set it — no DB lookup for admin check
+    const result = await listAllClients(targetUserId, true);
+
+    expect(result.success).toBe(true);
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
   // FAIL test 2: Should return admin users as well
   it('should return admin users in the list', async () => {
     const adminUserId = 'admin-user';

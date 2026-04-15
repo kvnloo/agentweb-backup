@@ -285,7 +285,7 @@ export class MetaService {
       const adAccountsPath = await user.getAdAccounts(fields);
 
       return adAccountsPath
-        .filter((account: any) => account.business)
+        .filter((account: any) => account.account_id)
         .map((account: any) => ({
           id: account.id,
           name: account.name,
@@ -712,7 +712,10 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'adset_id', 'campaign_id', 'creative'];
+      const fields = [
+        'id', 'name', 'status', 'adset_id', 'campaign_id',
+        'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
+      ];
       const params = adSetId ? { adset_id: adSetId } : {};
       this.log(`Listing ads for account: ${adAccountId}`, { fields, ...params });
       const ads = await account.getAds(fields, params);
@@ -750,7 +753,10 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
-      const fields = ['id', 'name', 'status', 'adset_id', 'campaign_id', 'creative'];
+      const fields = [
+        'id', 'name', 'status', 'adset_id', 'campaign_id',
+        'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
+      ];
       this.log(`Fetching ad: ${adId}`);
       const result = await ad.get(fields);
       return result._data;

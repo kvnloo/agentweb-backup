@@ -1415,9 +1415,9 @@ export async function generateSessionResponse(
           systemPrompt += `\n\n[AUTOMATED UNATTENDED EXECUTION]\nThis is a scheduled, automated run. No human is present. You MUST:\n- Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.\n- If the task specifies a volume or range (e.g. "send 30-40 connection requests", "post 5 times"), treat the FULL stated amount as your target for this session. Do NOT split into sub-batches and pause between them.\n- Never ask "should I continue?" or "shall I proceed with the next batch?" — just execute continuously until the stated goal is reached.\n- If you encounter an unrecoverable error, stop and report it in your final message. Otherwise, keep going.`;
         }
 
-        // For Slack sessions, inject team identity context so Emma knows who is on the team
-        // and frames her role as helping a team member craft replies to external parties
-        if (session.pageIdentifier === 'slack-bot' || session.pageIdentifier === 'slack-bot-admin' || session.pageIdentifier === 'slack-triggered') {
+        // For Slack sessions (including scheduled scans), inject team identity context so Emma
+        // knows who is on the team and can distinguish teammates from external parties.
+        if ((session.pageIdentifier || '').toLowerCase().includes('slack')) {
           systemPrompt += `\n\n[Slack Context] You are part of the AgentWeb team.\n${ABOUT_AGENTWEB_TEAM}\nMessages in this Slack thread are prefixed with the sender's name (e.g. "Rui Wang: message text"). When a team member asks you to help reply, you are drafting a response FROM that team member TO the other person in the thread — not answering the team member as if they were asking you a direct question. Always respond in the voice of the team member addressing their conversation partner.`;
         }
       }

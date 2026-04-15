@@ -229,6 +229,17 @@ export interface User {
   allowedSkills?: string[];
   orgId?: string;
   orgRole?: "owner" | "member";
+  /**
+   * Attribution — forward-compatible with a future UserTouches timeline table.
+   * firstTouch is set once at signup and never mutated; lastTouch refreshes on
+   * each login where the client sends new attribution data.
+   * Top-level utmSource / utmMedium are denormalized from firstTouch for cheap
+   * channel-attribution queries without scanning the blob.
+   */
+  firstTouch?: import("../types/attribution").AttributionTouch;
+  lastTouch?: import("../types/attribution").AttributionTouch;
+  utmSource?: string;
+  utmMedium?: string;
 }
 
 export interface Organization {
@@ -802,6 +813,43 @@ class UserDB {
         message: error.message || `Failed to delete user ${userId}.`,
       };
     }
+  }
+
+  async updateUserEmail(
+    userId: string,
+    newEmail: string
+  ): Promise<{ success: boolean; user?: User; message?: string }> {
+    const normalizedNew = newEmail.toLowerCase().trim();
+
+    // Get current user
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      return { success: false, message: "User not found." };
+    }
+
+    // Check new email not already taken
+    const existing = await this.getUserByEmail(normalizedNew);
+    if (existing) {
+      return { success: false, message: "Email is already in use by another account." };
+    }
+
+    // Write new item with updated email (same userId and all other fields)
+    const newItem = { ...user, email: normalizedNew };
+    await this.docClient
+      .put({ TableName: this.tableName, Item: newItem })
+      .promise();
+
+    // Tombstone the old item: update its userId to "deleted_<userId>" so it can be cleaned up later
+    await this.docClient
+      .update({
+        TableName: this.tableName,
+        Key: { email: user.email },
+        UpdateExpression: "SET userId = :tombstone",
+        ExpressionAttributeValues: { ":tombstone": `deleted_${userId}` },
+      })
+      .promise();
+
+    return { success: true, user: newItem as User };
   }
 
   async getUserByResetToken(resetToken: string): Promise<User | null> {
