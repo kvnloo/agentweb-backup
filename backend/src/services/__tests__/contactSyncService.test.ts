@@ -365,7 +365,7 @@ describe('syncContact — tenantId propagation', () => {
 describe('syncContact — signup auto-enroll hook', () => {
   it('fires autoEnroll on new signup events', async () => {
     const { deps: eventsDb } = makeStubEventsDb();
-    const autoEnroll = jest.fn(async () => undefined);
+    const autoEnroll = jest.fn(async (_ctx: any) => undefined);
     await syncContact(baseInput({ sourceRecordId: 'signup_fresh' }), {
       eventsDb,
       autoEnroll,

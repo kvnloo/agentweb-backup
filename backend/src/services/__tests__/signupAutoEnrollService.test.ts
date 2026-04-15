@@ -3,6 +3,7 @@ import {
   FOUNDERS_USERID,
   FOUNDERS_SIGNUPS_LIST_NAME,
 } from '../signupAutoEnrollService';
+import type { AutoEnrollDeps } from '../signupAutoEnrollService';
 import type { SyncInput, SyncResult } from '../contactSyncService';
 
 function makeCrmDbStub(opts: { existingLists?: any[]; existingLead?: any } = {}) {
@@ -48,11 +49,17 @@ function makeCrmDbStub(opts: { existingLists?: any[]; existingLead?: any } = {})
     return lead;
   });
 
+  // The real crmDb.createLeadList returns the full LeadList row shape (15+
+  // fields). Stubbing that in full for every test would be noisy; we only care
+  // about listId/userId/name/listType/isSystemManaged here, so cast through
+  // unknown to the declared dep shape.
+  const deps = {
+    crmDb: { getLeadListsByUserId, createLeadList, getLeadByEmail, createLead },
+    logger: { error: jest.fn(), warn: jest.fn(), log: jest.fn() },
+  } as unknown as AutoEnrollDeps;
+
   return {
-    deps: {
-      crmDb: { getLeadListsByUserId, createLeadList, getLeadByEmail, createLead },
-      logger: { error: jest.fn(), warn: jest.fn(), log: jest.fn() },
-    },
+    deps,
     lists,
     leads,
     mocks: { getLeadListsByUserId, createLeadList, getLeadByEmail, createLead },
@@ -225,7 +232,10 @@ describe('enrollSignupIntoFoundersList', () => {
       },
       logger: { error: jest.fn(), warn: jest.fn(), log: jest.fn() },
     };
-    const outcome = await enrollSignupIntoFoundersList(makeSignupCtx(), deps);
+    const outcome = await enrollSignupIntoFoundersList(
+      makeSignupCtx(),
+      deps as unknown as AutoEnrollDeps
+    );
     expect(outcome.enrolled).toBe(false);
     expect(outcome.reason).toBe('error');
     expect(deps.logger.error).toHaveBeenCalled();
