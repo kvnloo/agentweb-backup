@@ -722,6 +722,58 @@ router.post('/search-leads', async (req: Request, res: Response) => {
   }
 });
 
+// ─── Emma Autonomous Actions Log (G5) ───────────────────────────────────────
+// Read-only feed of events Emma initiated on behalf of the user. Reuses
+// AW-ContactEvents as the source of truth; filters by source='emma_session'.
+// Every row is shown with an affected-entity link and a (currently disabled)
+// Revert action — v1 keeps it read-only as a safety-rail/visibility surface.
+
+router.get('/actions', async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(parseInt(String(req.query.limit || '50'), 10) || 50, 200);
+    const { dynamodb } = await import('../config/aws');
+    const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+    const TABLE_NAME = `${TABLE_PREFIX}AW-ContactEvents`;
+
+    // Scan-with-filter is acceptable at current volume — Emma-initiated events
+    // are a small fraction of total events and this route is user-triggered,
+    // not hot-path. Upgrade to a source-index GSI if traffic grows.
+    const result = await dynamodb
+      .scan({
+        TableName: TABLE_NAME,
+        FilterExpression: '#src = :src AND (attribute_not_exists(tenantId) OR tenantId = :uid)',
+        ExpressionAttributeNames: { '#src': 'source' },
+        ExpressionAttributeValues: { ':src': 'emma_session', ':uid': userId(req) },
+        Limit: limit * 4, // overscan because filter is applied post-read
+      })
+      .promise();
+
+    const items = (result.Items || []) as Array<Record<string, unknown>>;
+    // Sort newest-first by eventTimestamp
+    items.sort((a, b) => String(b.eventTimestamp).localeCompare(String(a.eventTimestamp)));
+    const trimmed = items.slice(0, limit);
+
+    res.json({
+      actions: trimmed.map((e: any) => ({
+        eventId: e.eventId,
+        eventTimestamp: e.eventTimestamp,
+        eventType: e.eventType,
+        contactId: e.contactId,
+        dealId: e.dealId || null,
+        payload: e.payload || {},
+        sourceRecordId: e.sourceRecordId,
+        // v1: revert disabled for every row. Keep a declarative flag so UI can
+        // show a reason tooltip without having to re-derive it.
+        revertible: false,
+        revertDisabledReason: 'Revert not yet implemented — coming in a follow-up PR.',
+      })),
+      count: trimmed.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ─── Blog (additional routes) ───────────────────────────────────────────────
 
 router.post('/repair-blog', async (req: Request, res: Response) => {
