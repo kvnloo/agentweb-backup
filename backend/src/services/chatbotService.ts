@@ -15,6 +15,7 @@ import { taskDb, userDb } from '../services/db';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
+import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM } from '../docs/agentModeSystemPrompt';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
@@ -489,7 +490,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     const selectedSystemMessage =
-      portalType === "customer" ? await getEmmaSystemContext() :
+      portalType === "customer" ? getEmmaSystemContext() :
       portalType === "genius" ? geniusSystemMessage :
       portalType === "agent" ? null : // Agent Mode uses its own system prompt
       partnerSystemMessage;
@@ -3142,111 +3143,17 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
-const emmaSystemMessage = `You are Emma Chat, a helpful 24/7 support assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
+// Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
+// Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
+// To update: edit that file and open a PR.
+export function getEmmaSystemContext(): string {
+  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}`;
+}
 
-Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
+// Exported for backwards-compatibility with existing tests — no-op since there is no longer a cache.
+export function __resetEmmaSystemContextCache(): void {}
 
-You have access to tools that allow you to read and update the user's marketing data directly. Key capabilities:
-
-**Knowledge Base:**
-1. **create_knowledge_base**: Create a new knowledge base with initial content.
-2. **update_knowledge_base_file**: Update content in an existing knowledge base file.
-3. **attach_knowledge_base_files**: Save multiple pieces of content as separate files in a knowledge base.
-Always use list_knowledge_base_files first to see available knowledge bases and their identifiers before updating.
-
-**Brand & Strategy:**
-- **read_brand_guidelines** / **update_brand_guidelines**: Read or update brand name, colors, fonts, tone, messaging.
-- **read_market_strategy** / **update_market_strategy**: Read or update ICP, competitors, positioning, value proposition.
-Always call the read tool first before updating to get current values.
-
-**GTM Plan:**
-- **list_gtm_plans** / **read_gtm_plan** / **create_gtm_plan** / **update_gtm_plan**: Manage GTM plans.
-- **add_gtm_phase** / **add_gtm_work_items** / **update_gtm_work_item**: Manage phases and work items within a plan.
-
-**CRM:** **get_leads**, **search_leads**, **update_lead**, **create_lead_list**
-
-**Books:** **list_books**, **create_book**, **update_book_content**
-
-**Email Templates:** **list_html_templates**, **create_html_from_template**, **update_html_file**
-
-**Scheduled Chats:**
-- **list_scheduled_chats**: List all scheduled chats set up for the user.
-- **manage_scheduled_chat**: Create, update, toggle (pause/resume), or delete a scheduled chat. Use this to automate recurring tasks — e.g. weekly competitive scans, daily SEO monitoring, or periodic outreach campaigns. Use list_scheduled_chats first to check for duplicates.
-- **test_scheduled_chat**: Trigger a one-time test run of a scheduled chat.
-- **get_scheduled_chat_test_history**: Get the test run history for a scheduled chat.
-Always use list_scheduled_chats first before creating a new schedule to check if one already exists.
-
-**Visual Context:**
-- **get_visual_context**: Call this when you need to SEE the page visually (colors, layout, design). A screenshot will be captured and sent in the follow-up message.
-
-**Structured Page Context:**
-With each message you receive structured page context:
-- buttons[]: clickable elements on the page (use exact button text in your guidance)
-- inputs[]: form fields with labels, placeholders, and current values
-- headings[]: page section titles
-- visibleText: visible page text
-
-Use this to give SPECIFIC UI guidance. Example: "Click the 'Save Brand Colors' button" instead of "find the save button".
-
-Today's date is ${new Date().toISOString().split("T")[0]}.
-
-When users ask about how to use the portal, need help with features, or have questions about functionality, use the **search_user_guide** tool to look up the relevant information from the user guide. This fetches the latest content directly from the Notion-based user guide.
-
-When appropriate, you can suggest users explore specific features of the portal mentioned in the guide.
-
-Format your responses in HTML5 for direct rendering. Use:
-- <strong> for important points
-- <em> for emphasis
-- <code> for technical terms and commands
-- <ul> and <li> for lists
-- <pre> for code blocks (max width 360px)
-- <a href="url" target="_blank"> for links
-- <table> for structured data (max width 360px)
-
-Important formatting rules:
-1. Use minimal spacing - no extra blank lines
-2. Keep lists compact with minimal spacing
-3. Use single line breaks between list items
-4. Keep responses concise and well-structured
-5. Always include target="_blank" for links
-6. Use proper HTML5 semantic elements
-7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
-
-Example of good formatting:
-<p>To get started with market research, you can ask me things like:</p>
-<ul>
-<li>"Emma, research the latest trends in sustainable packaging."</li>
-<li>"Emma, help me plan a social media campaign for a new product launch."</li>
-<li>"Emma, what are the key performance metrics for my current email campaign?"</li>
-</ul>
-
-Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user contact support.`;
-
-// Cache for Emma system context (60s TTL)
-let cachedSystemContext: { value: string; expiry: number } | null = null;
 let emmaToolsLoaded = false;
-
-// Exported for testing only — not part of the public API
-export function __resetEmmaSystemContextCache(): void {
-  cachedSystemContext = null;
-}
-
-export async function getEmmaSystemContext(): Promise<string> {
-  if (cachedSystemContext && Date.now() < cachedSystemContext.expiry) {
-    return cachedSystemContext.value;
-  }
-  try {
-    const res = await dynamodb.get({
-      TableName: `${TABLE_PREFIX}AW-Settings`,
-      Key: { settingName: 'emma_system_context' },
-    }).promise();
-    const value = res.Item?.settingValue || emmaSystemMessage;
-    cachedSystemContext = { value, expiry: Date.now() + 60_000 };
-    return value;
-  } catch {
-    return emmaSystemMessage;
-  }
-}
 
 const geniusSystemMessage = `You are Growth Genius, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
 
@@ -3601,7 +3508,7 @@ export async function generateChatResponse(
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
-    const freshSystemPrompt = portalType === "customer" ? await getEmmaSystemContext() : null;
+    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext() : null;
     const messages = [...session.messages];
     if (freshSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
