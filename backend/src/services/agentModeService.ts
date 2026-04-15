@@ -27,7 +27,7 @@ import type { LLMUsageData } from '../utils/llmService';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -1347,7 +1347,7 @@ export class AgentModeService {
       }
 
       // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
@@ -1490,7 +1490,7 @@ export class AgentModeService {
             }
 
             // Re-build context using helper
-            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds);
+            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
             allowedToolNames = skillContext.allowedToolNames;
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
@@ -2606,10 +2606,8 @@ export class AgentModeService {
       }
     }
 
-    // Add virtual admin skill for admin users (if not already installed)
-    if (isAdmin && !associatedSet.has(ADMIN_SKILL_VIRTUAL_ID)) {
-      skillEntries.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools: Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
-    }
+    // Admin tools are always active for admins — do NOT list them here as "available to install".
+    // They are already included in installedSkillContextMsg via buildSkillContext().
 
     if (skillEntries.length === 0) return '';
     return `Available Skills:\n${skillEntries.join('\n')}`;
@@ -2753,7 +2751,8 @@ export class AgentModeService {
     associatedSkills: any[],
     userAllowedSkillIds: string[],
     publishedSkills: any[],
-    sessionAssociatedSkillIds: string[] = []
+    sessionAssociatedSkillIds: string[] = [],
+    hasAdminAccess: boolean = false
   ): { allowedToolNames: Set<string>; installedSkillContextMsg: string } {
     const allowedToolNames = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
 
@@ -2779,15 +2778,21 @@ export class AgentModeService {
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
 
-    // Handle virtual admin_tools skill
-    if (sessionAssociatedSkillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
+    // Handle virtual admin_tools skill — always available to admin users regardless of session install
+    if (hasAdminAccess || sessionAssociatedSkillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
 
     let installedSkillContextMsg = '';
+    const skillLines: string[] = [];
     if (associatedSkills.length) {
-      const context = associatedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`).join('\n');
-      installedSkillContextMsg = `Installed Skills:\n${context}`;
+      associatedSkills.forEach(s => skillLines.push(`${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`));
+    }
+    if (hasAdminAccess) {
+      skillLines.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
+    }
+    if (skillLines.length) {
+      installedSkillContextMsg = `Installed Skills:\n${skillLines.join('\n')}`;
     }
 
     return { allowedToolNames, installedSkillContextMsg };
