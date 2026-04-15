@@ -94,6 +94,8 @@ export interface User {
   companyName?: string;
   memoryEnabled?: boolean; // Whether Emma's long-term memory is enabled (default: true)
   useCaseCategories?: string[];
+  emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
+  emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
   brandGuidelines?: {
     brandData: {
       brandName: string;
