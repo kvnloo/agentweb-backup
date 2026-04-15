@@ -1846,6 +1846,7 @@ const main = async () => {
     await createPaymentHistoryTable();
     await createTempEmailsTable();
     await createTestAccountsTable();
+    await createDealsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2020,6 +2021,61 @@ const createTestAccountsTable = async () => {
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Deals table (CRM Unification v1 — A2)
+const createDealsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Deals`,
+    AttributeDefinitions: [
+      { AttributeName: 'dealId', AttributeType: 'S' },
+      { AttributeName: 'ownerUserId', AttributeType: 'S' },
+      { AttributeName: 'heatScore', AttributeType: 'N' },
+      { AttributeName: 'companyDomain', AttributeType: 'S' },
+      { AttributeName: 'stage', AttributeType: 'S' },
+      { AttributeName: 'primaryContactId', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'dealId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'ownerUserId-heatScore-index',
+        KeySchema: [
+          { AttributeName: 'ownerUserId', KeyType: 'HASH' },
+          { AttributeName: 'heatScore', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      },
+      {
+        IndexName: 'companyDomain-stage-index',
+        KeySchema: [
+          { AttributeName: 'companyDomain', KeyType: 'HASH' },
+          { AttributeName: 'stage', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      },
+      {
+        IndexName: 'primaryContactId-index',
+        KeySchema: [
+          { AttributeName: 'primaryContactId', KeyType: 'HASH' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
   };
 
   try {
