@@ -9,6 +9,7 @@ jest.mock('../services/linkedInService', () => ({
     createPost: jest.fn(),
     createComment: jest.fn(),
     createReaction: jest.fn(),
+    createRepost: jest.fn(),
     listPosts: jest.fn(),
     getShareStatistics: jest.fn(),
     getAggregatedMetrics: jest.fn(),
@@ -1310,6 +1311,77 @@ describe('LinkedInAdapter', () => {
       const result = await adapter.getPost(mockCompanyAccount, 'urn:li:share:123', 'user-1');
 
       expect(result).toBeNull();
+    });
+  });
+
+  describe('createRepost', () => {
+    const originalPostUrn = 'urn:li:share:999888777';
+    const repostUrn = 'urn:li:share:111222333';
+
+    it('should repost without commentary', async () => {
+      mockLinkedInService.createRepost = jest.fn().mockResolvedValue(repostUrn);
+
+      const result = await adapter.createRepost(mockPersonalAccount, originalPostUrn, undefined, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(result.message).toBe('Reposted on LinkedIn');
+      expect(result.postId).toBe(repostUrn);
+      expect(result.postUrl).toBe(`https://www.linkedin.com/feed/update/${repostUrn}`);
+      expect(mockLinkedInService.createRepost).toHaveBeenCalledWith(
+        'test-access-token',
+        mockPersonalAccount.account_id,
+        originalPostUrn,
+        undefined
+      );
+    });
+
+    it('should repost with commentary', async () => {
+      mockLinkedInService.createRepost = jest.fn().mockResolvedValue(repostUrn);
+
+      const result = await adapter.createRepost(mockPersonalAccount, originalPostUrn, 'Great insight!', 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(result.message).toBe('Reposted with commentary on LinkedIn');
+      expect(mockLinkedInService.createRepost).toHaveBeenCalledWith(
+        'test-access-token',
+        mockPersonalAccount.account_id,
+        originalPostUrn,
+        'Great insight!'
+      );
+    });
+
+    it('should throw on 403 with permission denied message', async () => {
+      mockLinkedInService.createRepost = jest.fn().mockRejectedValue(
+        Object.assign(new Error('Forbidden'), { response: { status: 403 } })
+      );
+
+      await expect(
+        adapter.createRepost(mockPersonalAccount, originalPostUrn, undefined, 'user-1')
+      ).rejects.toThrow('Permission denied. The original post may have sharing disabled');
+    });
+
+    it('should throw on 401 with token expired message', async () => {
+      mockLinkedInService.createRepost = jest.fn().mockRejectedValue(
+        Object.assign(new Error('Unauthorized'), { response: { status: 401 } })
+      );
+
+      await expect(
+        adapter.createRepost(mockPersonalAccount, originalPostUrn, undefined, 'user-1')
+      ).rejects.toThrow('LinkedIn access token expired');
+    });
+
+    it('should work for company page account', async () => {
+      mockLinkedInService.createRepost = jest.fn().mockResolvedValue(repostUrn);
+
+      const result = await adapter.createRepost(mockCompanyAccount, originalPostUrn, undefined, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(mockLinkedInService.createRepost).toHaveBeenCalledWith(
+        'test-org-token',
+        mockCompanyAccount.account_id,
+        originalPostUrn,
+        undefined
+      );
     });
   });
 });
