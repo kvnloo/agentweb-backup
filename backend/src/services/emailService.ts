@@ -2,6 +2,7 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { marked } from 'marked';
 import { resendService } from './resendService';
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
 
@@ -227,6 +228,85 @@ The AgentWeb Team
       console.error("Error sending welcome email:", error);
       throw error;
     }
+  },
+
+  async sendTeamIntroductionEmail(email: string, displayName?: string) {
+    const firstName = displayName ? displayName.split(' ')[0] : 'there';
+    const appUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+        </div>
+
+        <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+          <h2 style="color: #1B2549; margin-top: 0;">Hi ${firstName}, welcome to AgentWeb!</h2>
+
+          <p style="color: #333; line-height: 1.6;">
+            We're Harsha, Rui, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
+          </p>
+
+          <p style="color: #333; line-height: 1.6;">
+            <strong>Just reply to this email</strong> with any questions, feedback, or ideas — we read every message and will get back to you directly.
+          </p>
+
+          <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
+            <h3 style="color: #1B2549; margin-top: 0;">Need help or found an issue?</h3>
+            <p style="color: #333; line-height: 1.6; margin: 0;">
+              You can also chat with <strong>Emma</strong>, our AI assistant inside the app — just say "report an issue" and she'll capture the details for our team.
+            </p>
+          </div>
+
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${appUrl}"
+               style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%);
+                      color: white;
+                      padding: 12px 30px;
+                      text-decoration: none;
+                      border-radius: 6px;
+                      display: inline-block;
+                      font-weight: bold;">
+              Open AgentWeb
+            </a>
+          </div>
+
+          <p style="color: #333; line-height: 1.6; margin-top: 20px;">
+            — Harsha, Rui, Fangfang &amp; Matthew
+          </p>
+        </div>
+
+        <div style="text-align: center; color: #666; font-size: 12px;">
+          <p>You're receiving this because you just signed up for AgentWeb.</p>
+        </div>
+      </div>
+    `;
+
+    const text = `Hi ${firstName}, welcome to AgentWeb!
+
+We're Harsha, Rui, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
+
+Just reply to this email with any questions, feedback, or ideas — we read every message and will get back to you directly.
+
+Need help or found an issue? You can also chat with Emma, our AI assistant inside the app — just say "report an issue" and she'll capture the details for our team.
+
+Open AgentWeb: ${appUrl}
+
+— Harsha, Rui, Fangfang & Matthew
+
+You're receiving this because you just signed up for AgentWeb.
+`;
+
+    await resendService.sendEmail({
+      from: `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`,
+      to: email,
+      subject: 'A personal note from the AgentWeb founders',
+      html,
+      text,
+      cc: 'founders@agentweb.pro',
+      replyTo: 'founders@agentweb.pro',
+    });
+    console.log(`Team introduction email sent to: ${email}`);
   },
 
   async sendSubscriberWelcomeEmail(email: string, taskId: string) {

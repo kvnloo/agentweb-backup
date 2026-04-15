@@ -149,6 +149,7 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   }>;
+  introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Basic")
