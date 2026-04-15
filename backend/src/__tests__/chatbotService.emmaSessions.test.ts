@@ -158,78 +158,26 @@ describe('ChatbotDB.getEmmaSessions', () => {
   });
 });
 
-describe('getEmmaSystemContext caching', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-    __resetEmmaSystemContextCache();
-  });
+describe('getEmmaSystemContext', () => {
+  it('returns the Agent Mode prompt combined with the sidebar addendum', () => {
+    const result = getEmmaSystemContext();
 
-  it('fetches from DynamoDB on first call (cache miss)', async () => {
-    getPromiseMock.mockResolvedValueOnce({ Item: { settingValue: 'Custom system prompt from DB' } });
-
-    const result = await getEmmaSystemContext();
-
-    expect(result).toBe('Custom system prompt from DB');
-    expect(getPromiseMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('returns cached value on second call without hitting DynamoDB', async () => {
-    getPromiseMock.mockResolvedValue({ Item: { settingValue: 'Cached prompt' } });
-
-    await getEmmaSystemContext(); // first call — populates cache
-    await getEmmaSystemContext(); // second call — should use cache
-
-    expect(getPromiseMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('falls back to hardcoded emmaSystemMessage when DynamoDB returns no item', async () => {
-    getPromiseMock.mockResolvedValueOnce({ Item: undefined });
-
-    const result = await getEmmaSystemContext();
-
-    // Should return the hardcoded fallback (contains known signature text)
-    expect(result).toContain('Emma Chat');
+    // Contains core Agent Mode identity
+    expect(result).toContain('EMMA');
     expect(result).toContain('AgentWeb');
+    // Contains sidebar-specific addendum
+    expect(result).toContain('Sidebar Mode Context');
+    expect(result).toContain('Page & Feature Tool Reference');
+    // Never hits DynamoDB
+    expect(getPromiseMock).not.toHaveBeenCalled();
   });
 
-  it('falls back to hardcoded emmaSystemMessage when DynamoDB returns empty settingValue', async () => {
-    getPromiseMock.mockResolvedValueOnce({ Item: { settingValue: '' } });
-
-    const result = await getEmmaSystemContext();
-
-    expect(result).toContain('Emma Chat');
+  it('is synchronous (returns string, not a Promise)', () => {
+    const result = getEmmaSystemContext();
+    expect(typeof result).toBe('string');
   });
 
-  it('falls back to hardcoded emmaSystemMessage on DynamoDB error', async () => {
-    getPromiseMock.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
-
-    const result = await getEmmaSystemContext();
-
-    expect(result).toContain('Emma Chat');
-    // Error path should not cache so the next call retries DynamoDB
-    getPromiseMock.mockResolvedValueOnce({ Item: { settingValue: 'Recovered prompt' } });
-    const secondResult = await getEmmaSystemContext();
-    expect(secondResult).toBe('Recovered prompt');
-  });
-
-  it('re-fetches from DynamoDB after cache TTL expires', async () => {
-    const realDateNow = Date.now;
-    let fakeNow = 1_000_000;
-    Date.now = () => fakeNow;
-
-    try {
-      getPromiseMock.mockResolvedValueOnce({ Item: { settingValue: 'First prompt' } });
-      const first = await getEmmaSystemContext();
-      expect(first).toBe('First prompt');
-
-      // Advance time past 60s TTL
-      fakeNow += 61_000;
-      getPromiseMock.mockResolvedValueOnce({ Item: { settingValue: 'Refreshed prompt' } });
-      const second = await getEmmaSystemContext();
-      expect(second).toBe('Refreshed prompt');
-      expect(getPromiseMock).toHaveBeenCalledTimes(2);
-    } finally {
-      Date.now = realDateNow;
-    }
+  it('__resetEmmaSystemContextCache is a no-op (kept for backwards compatibility)', () => {
+    expect(() => __resetEmmaSystemContextCache()).not.toThrow();
   });
 });

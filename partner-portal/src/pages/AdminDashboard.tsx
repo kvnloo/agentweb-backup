@@ -49,7 +49,6 @@ import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
-import EmmaSettings from "../components/admin/EmmaSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
@@ -677,12 +676,11 @@ export default function AdminDashboard() {
     'subscriptions': 12,
     'mcp-servers': 13,
     'result-endpoints': 14,
-    'emma-settings': 15,
-    'scoring-judges': 16,
-    'crm': 17,
-    'revenue': 18,
-    'funnel': 19,
-    'alert-emails': 18,
+    'scoring-judges': 15,
+    'crm': 16,
+    'revenue': 17,
+    'funnel': 18,
+    'alert-emails': 19,
   };
   
   // Get initial tab value from URL or default to Users
@@ -2785,8 +2783,7 @@ export default function AdminDashboard() {
             <Tab label="Subscriptions" {...a11yProps(12)} />
             <Tab label="MCP Servers" {...a11yProps(13)} />
             <Tab label="Result Endpoints" {...a11yProps(14)} />
-            <Tab label="Emma Chat Settings" {...a11yProps(15)} />
-            <Tab label="Scoring Judges" {...a11yProps(16)} />
+            <Tab label="Scoring Judges" {...a11yProps(15)} />
             <Tab label="CRM" {...a11yProps(17)} />
             <Tab label="Revenue" {...a11yProps(18)} />
             <Tab label="Funnel" {...a11yProps(19)} />
@@ -5562,24 +5559,20 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={15}>
-          <EmmaSettings />
-        </TabPanel>
-
-        <TabPanel value={tabValue} index={16}>
           <ScoringJudgesTab />
         </TabPanel>
 
-        <TabPanel value={tabValue} index={17}>
+        <TabPanel value={tabValue} index={16}>
           <CrmTab />
         </TabPanel>
-        <TabPanel value={tabValue} index={18}>
+        <TabPanel value={tabValue} index={17}>
           <RevenueTab />
         </TabPanel>
-        <TabPanel value={tabValue} index={19}>
+        <TabPanel value={tabValue} index={18}>
           <FunnelTab />
         </TabPanel>
 
-        <TabPanel value={tabValue} index={20}>
+        <TabPanel value={tabValue} index={19}>
           <AlertEmailsTab />
         </TabPanel>
       </Paper>
@@ -7114,6 +7107,7 @@ export default function AdminDashboard() {
 // Agent Mode Settings Component
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
+  const [sidebarAddendum, setSidebarAddendum] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
@@ -7160,8 +7154,8 @@ const AgentModeSettings = () => {
       const models = await loadSupportedModels();
       await loadDefaultModel(models);
 
-      // Load system prompt
-      await loadSystemPrompt();
+      // Load system prompt and sidebar addendum
+      await Promise.all([loadSystemPrompt(), loadSidebarAddendum()]);
 
       // Load welcome message
       await loadWelcomeMessage();
@@ -7262,6 +7256,17 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading system prompt:', error);
       throw error;
+    }
+  };
+
+  const loadSidebarAddendum = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/chatbot/system-prompt'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setSidebarAddendum(response.data);
+    } catch (error) {
+      console.error('Error loading sidebar addendum:', error);
     }
   };
 
@@ -8591,6 +8596,38 @@ const AgentModeSettings = () => {
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Read-only view of the active system prompt. Editing is disabled — changes must go through a PR to backend/src/docs/agentModeSystemPrompt.ts.
           </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Sidebar Addendum */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              Customer Portal Sidebar Addendum
+            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, bgcolor: 'warning.light', px: 2, py: 0.75, borderRadius: 1 }}>
+              <Typography variant="body2" sx={{ fontWeight: 600, color: 'warning.dark' }}>
+                🔒 Read-only — managed in code
+              </Typography>
+            </Box>
+          </Box>
+
+          <Box sx={{ bgcolor: 'info.light', borderRadius: 1, p: 2, mb: 2, border: '1px solid', borderColor: 'info.main' }}>
+            <Typography variant="body2" sx={{ color: 'info.dark' }}>
+              This additional context is <strong>appended to the System Prompt above</strong> when Emma runs as a popup/sidebar inside the Customer Portal. It is <strong>not</strong> used in the full Agent Mode chat. To update: edit <code>EMMA_SIDEBAR_ADDENDUM</code> in <code>backend/src/docs/agentModeSystemPrompt.ts</code> and open a PR.
+            </Typography>
+          </Box>
+
+          <TextField
+            fullWidth
+            multiline
+            rows={10}
+            value={sidebarAddendum}
+            InputProps={{ readOnly: true }}
+            variant="outlined"
+            sx={{ fontFamily: 'monospace', '& .MuiInputBase-input': { color: 'text.secondary' } }}
+          />
         </CardContent>
       </Card>
 

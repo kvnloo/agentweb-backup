@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { authenticateToken, requireAdmin, AuthenticatedRequest } from '../middleware/auth';
 import {
   createChatSession,
   listUserSessions,
@@ -9,8 +9,14 @@ import {
   sendMessageStream,
   deleteChatSession
 } from '../controllers/chatbot';
+import { getEmmaSystemContext } from '../services/chatbotService';
 
 const router = express.Router();
+
+// Admin-only: get the full Emma sidebar system prompt (base + addendum) for display in admin UI
+router.get('/system-prompt', authenticateToken, requireAdmin, (req: Request, res: Response) => {
+  res.json(getEmmaSystemContext());
+});
 
 // All chatbot routes require authentication
 router.use(authenticateToken);
