@@ -13,6 +13,7 @@ import chatbotRoutes from "./routes/chatbot";
 import growthGeniusRoutes from "./routes/growthGenius";
 import docsRoutes from "./routes/docs";
 import stripeRoutes from "./routes/stripe";
+import stripeConnectRoutes from "./routes/stripeConnect";
 import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
@@ -178,6 +179,8 @@ app.use((req, res, next) => {
 // Stripe webhook needs the raw body (Buffer) for signature verification.
 // This MUST come before express.json() which parses the body.
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
+// Stripe Connect webhook needs its own raw-body handler — also before express.json().
+app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -209,6 +212,7 @@ app.use("/api/chatbot", chatbotRoutes);
 app.use("/api/growth-genius", growthGeniusRoutes);
 app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
+app.use("/api/stripe/connect", stripeConnectRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
