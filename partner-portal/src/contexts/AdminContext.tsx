@@ -64,6 +64,7 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  introductionEmailSent?: string; // ISO date when team introduction email was sent
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
   utmSource?: string;
