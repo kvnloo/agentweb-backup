@@ -12,13 +12,6 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // For debugging
-console.log("Environment variables loaded:", {
-  environment: process.env.NODE_ENV || "production",
-  hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
-  hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION,
-  tablePrefix: TABLE_PREFIX,
-});
 
 // Configure AWS SDK
 AWS.config.update({
@@ -333,10 +326,6 @@ class UserDB {
   private tableName: string;
 
   constructor() {
-    console.log(
-      "Initializing DynamoDB with region:",
-      process.env.AWS_REGION || "us-west-2"
-    );
     this.docClient = dynamodb;
     this.tableName = `${TABLE_PREFIX}AW-Users`;
   }
@@ -1186,11 +1175,6 @@ export const taskDb = {
 
           // Log knowledgeBaseFiles updates for debugging
           if (key === 'knowledgeBaseFiles') {
-            console.log('Updating knowledgeBaseFiles:', {
-              taskId,
-              filesCount: Array.isArray(value) ? value.length : 0,
-              value: JSON.stringify(value)
-            });
           }
         }
       });
@@ -1641,7 +1625,6 @@ export const taskDb = {
       const executions = await this.getTaskExecutions(taskId);
 
       if (!executions || executions.length === 0) {
-        console.log(`No executions found for task ${taskId}`);
         return;
       }
 
@@ -1662,7 +1645,6 @@ export const taskDb = {
       });
 
       await Promise.all(updatePromises);
-      console.log(`Updated ownership for ${executions.length} executions of task ${taskId}`);
     } catch (error) {
       console.error('Error updating task execution ownership:', error);
       throw error;
@@ -3071,7 +3053,6 @@ class BenchmarkTestDB {
     } catch (error: any) {
       // Handle DynamoDB item size limit error
       if (error.code === 'ValidationException' && error.message?.includes('exceeded the maximum allowed size')) {
-        console.log(`Item size limit exceeded for test ${testId}. Trimming test history.`);
 
         try {
           // Get the current test to access testHistory
@@ -3090,7 +3071,6 @@ class BenchmarkTestDB {
           // Keep only the last 5 records and trim each one
           const updatedHistory = testHistory.slice(-5).map((r: any) => this.trimTestResult(r));
 
-          console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records (trimmed).`);
 
           // Use a direct update to replace the entire testHistory array with trimmed new result included
           updatedHistory.push(trimmedResult);
@@ -3113,7 +3093,6 @@ class BenchmarkTestDB {
           };
 
           const retryResult = await this.docClient.update(cleanupParams).promise();
-          console.log(`Successfully added test result after cleanup. History now has ${updatedHistory.length} records.`);
           return retryResult.Attributes;
         } catch (cleanupError) {
           console.error('Error cleaning up test history:', cleanupError);
@@ -3509,6 +3488,69 @@ export const crmDb = {
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "updateFieldNames");
+      throw error;
+    }
+  },
+
+  async updateSearchQueryTemplates(
+    listId: string,
+    templates: Record<string, string>,
+    sourcesPerField?: Record<string, string[]>,
+    enrichmentInstruction?: string,
+    enrichmentOutputFields?: string[],
+    webSearchTemplate?: string,
+    linkedinSearchTemplate?: string,
+    enrichSources?: string[],
+  ) {
+    try {
+      const expressionParts = ['searchQueryTemplates = :templates', 'updatedAt = :updatedAt'];
+      const expressionAttributeValues: any = {
+        ':templates': templates,
+        ':updatedAt': new Date().toISOString(),
+      };
+
+      if (sourcesPerField !== undefined) {
+        expressionParts.push('sourcesPerField = :sourcesPerField');
+        expressionAttributeValues[':sourcesPerField'] = sourcesPerField;
+      }
+
+      if (enrichmentInstruction !== undefined) {
+        expressionParts.push('enrichmentInstruction = :instruction');
+        expressionAttributeValues[':instruction'] = enrichmentInstruction;
+      }
+
+      if (enrichmentOutputFields !== undefined) {
+        expressionParts.push('enrichmentOutputFields = :outputFields');
+        expressionAttributeValues[':outputFields'] = enrichmentOutputFields;
+      }
+
+      if (webSearchTemplate !== undefined) {
+        expressionParts.push('webSearchTemplate = :webSearchTemplate');
+        expressionAttributeValues[':webSearchTemplate'] = webSearchTemplate;
+      }
+
+      if (linkedinSearchTemplate !== undefined) {
+        expressionParts.push('linkedinSearchTemplate = :linkedinSearchTemplate');
+        expressionAttributeValues[':linkedinSearchTemplate'] = linkedinSearchTemplate;
+      }
+
+      if (enrichSources !== undefined) {
+        expressionParts.push('enrichSources = :enrichSources');
+        expressionAttributeValues[':enrichSources'] = enrichSources;
+      }
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: `SET ${expressionParts.join(', ')}`,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSearchQueryTemplates");
       throw error;
     }
   },
