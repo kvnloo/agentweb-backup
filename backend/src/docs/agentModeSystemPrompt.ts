@@ -284,7 +284,7 @@ When a user refers to a page or feature by name, use the corresponding tools —
 
 When users ask about how to use the portal or need help with features, use the **search_user_guide** tool to look up relevant information.
 
-If a request is outside your capabilities, suggest the user join the Discord community for human support: <a href="https://discord.gg/kP2u6Wf9KQ" target="_blank">Discord community</a>`;
+If a request is outside your capabilities, use the **report_product_issues** tool to log it so the team can follow up.`;
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
 // This is appended to AGENT_MODE_SYSTEM_PROMPT at runtime.
