@@ -128,4 +128,87 @@ describe('Emma CRM Enrichment Tools', () => {
       expect.objectContaining({ userId: 'user-42' })
     );
   });
+
+  describe('enrich_lead_custom tool', () => {
+    beforeEach(() => {
+      (CrmEnrichmentService.prototype.execute as jest.Mock).mockClear();
+    });
+
+    it('should register enrich_lead_custom tool', () => {
+      const tool = emmaToolRegistry.getTool('enrich_lead_custom');
+      expect(tool).toBeDefined();
+      expect(tool!.definition.name).toBe('enrich_lead_custom');
+      expect(tool!.definition.inputSchema.required).toEqual(
+        expect.arrayContaining(['list_id', 'lead_id', 'custom_field_prompts'])
+      );
+    });
+
+    it('should wrap service.execute() with a single-lead batch and derived outputFields/instruction', async () => {
+      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+      const result = await tool.execute({
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        custom_field_prompts: [
+          { field_name: 'company_size', prompt: 'Find headcount on LinkedIn' },
+          { field_name: 'industry', prompt: 'Classify their industry', data_type: 'text' },
+        ],
+      }, { userId: 'user1' });
+
+      expect(result.leadId).toBe('lead-7');
+      expect(result.listId).toBe('list-abc');
+      expect(result.outputFields).toEqual(['company_size', 'industry']);
+      expect(result.processedCount).toBe(80);
+      expect(CrmEnrichmentService.prototype.execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          listId: 'list-abc',
+          userId: 'user1',
+          outputFields: ['company_size', 'industry'],
+          leadIds: ['lead-7'],
+          forceOverwrite: true,
+          sources: ['web_search', 'linkedin'],
+          instruction: expect.stringContaining('company_size'),
+        }),
+        undefined,
+        undefined
+      );
+    });
+
+    it('should respect custom sources when provided', async () => {
+      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+      await tool.execute({
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        custom_field_prompts: [{ field_name: 'notes', prompt: 'Anything interesting' }],
+        sources: ['existing_data'],
+        force_overwrite: false,
+      }, { userId: 'user1' });
+
+      expect(CrmEnrichmentService.prototype.execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sources: ['existing_data'],
+          forceOverwrite: false,
+        }),
+        undefined,
+        undefined
+      );
+    });
+
+    it('should throw when custom_field_prompts is empty', async () => {
+      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+      await expect(
+        tool.execute({ list_id: 'l', lead_id: 'x', custom_field_prompts: [] }, { userId: 'user1' })
+      ).rejects.toThrow(/non-empty/);
+    });
+
+    it('should throw when no userId in context', async () => {
+      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+      await expect(
+        tool.execute({
+          list_id: 'l',
+          lead_id: 'x',
+          custom_field_prompts: [{ field_name: 'f', prompt: 'p' }],
+        }, {})
+      ).rejects.toThrow(/Authentication required/);
+    });
+  });
 });

@@ -5111,6 +5111,98 @@ Call enrich_leads_preview first to show the user what will happen before executi
   }
 });
 
+emmaToolRegistry.register({
+  name: 'enrich_lead_custom',
+  definition: {
+    name: 'enrich_lead_custom',
+    description: `Enrich a single CRM lead with custom fields on demand, without needing to kick off a whole-list enrichment job.
+
+Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
+
+Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The tool returns the enriched values directly and also persists them to the lead's customFields in DynamoDB.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID containing the lead.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The specific lead to enrich.'
+        },
+        custom_field_prompts: {
+          type: 'array',
+          description: 'One entry per custom field to populate. Each entry has a field_name (snake_case) and a prompt describing what to find.',
+          items: {
+            type: 'object',
+            properties: {
+              field_name: { type: 'string', description: 'Snake_case custom field name to populate, e.g. "company_size".' },
+              prompt: { type: 'string', description: 'Natural language description of what to find for this field.' },
+              data_type: { type: 'string', enum: ['text', 'number', 'date'], description: 'Expected data type. Defaults to text.' }
+            },
+            required: ['field_name', 'prompt']
+          },
+          minItems: 1
+        },
+        sources: {
+          type: 'array',
+          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
+          description: 'Data sources to use. Defaults to ["web_search", "linkedin"] if omitted.'
+        },
+        force_overwrite: {
+          type: 'boolean',
+          description: 'If true, re-enrich fields that are already populated. Default true (custom enrichment is intentional).'
+        }
+      },
+      required: ['list_id', 'lead_id', 'custom_field_prompts']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    const prompts: Array<{ field_name: string; prompt: string; data_type?: string }> = args.custom_field_prompts || [];
+    if (!Array.isArray(prompts) || prompts.length === 0) {
+      throw new Error('custom_field_prompts must be a non-empty array');
+    }
+
+    const outputFields = prompts.map(p => p.field_name);
+    const instruction = prompts
+      .map(p => {
+        const type = p.data_type && p.data_type !== 'text' ? ` (${p.data_type})` : '';
+        return `- ${p.field_name}${type}: ${p.prompt}`;
+      })
+      .join('\n');
+    const sources = Array.isArray(args.sources) && args.sources.length > 0
+      ? args.sources
+      : ['web_search', 'linkedin'];
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    const result = await service.execute({
+      listId: args.list_id,
+      userId: context.userId,
+      instruction,
+      outputFields,
+      sources,
+      leadIds: [args.lead_id],
+      forceOverwrite: args.force_overwrite !== false,
+    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
+
+    return {
+      leadId: args.lead_id,
+      listId: args.list_id,
+      outputFields,
+      processedCount: result.processedCount,
+      failedCount: result.failedCount,
+      failureBreakdown: result.failureBreakdown,
+      warnings: result.warnings,
+      jobId: result.jobId,
+    };
+  }
+});
+
 // ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
 // These tools wrap REST endpoints via mcpFetch. Rather than duplicating
 // definitions, we re-register them from the MCP server registry.
