@@ -63,6 +63,13 @@ export interface ContactEvent {
   payload: Record<string, unknown>;
   sourceRecordId: string;
   dealId?: string;
+  /**
+   * Optional tenant scope for multi-tenant CRM. Null/undefined for platform-level
+   * (founders@ / AgentWeb itself) events. Set to the owning tenant's userId for
+   * tenant-scoped events. Reserved for the next-sprint multi-tenant Epic; safe
+   * to read/write today.
+   */
+  tenantId?: string;
   createdAt: string;
 }
 
@@ -73,6 +80,7 @@ export interface LogEventInput {
   payload?: Record<string, unknown>;
   sourceRecordId: string;
   dealId?: string;
+  tenantId?: string;
   // Optional override — mostly for tests and retroactive event logging.
   eventTimestamp?: string;
 }
@@ -152,6 +160,7 @@ class ContactEventsDb {
       sourceRecordId: input.sourceRecordId,
       createdAt: now,
       ...(input.dealId ? { dealId: input.dealId } : {}),
+      ...(input.tenantId ? { tenantId: input.tenantId } : {}),
     };
 
     await dynamodb

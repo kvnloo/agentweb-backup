@@ -51,6 +51,13 @@ export interface LeadCrmExtensions {
   role?: LeadRole;
   isPrimary?: boolean;
   dealIds?: string[];
+  /**
+   * Owning tenant userId. Today this is almost always the founders@ userId
+   * because AgentWeb is single-tenant on the CRM side. Reserved for the
+   * next-sprint multi-tenant Epic — all writers should set it now so we don't
+   * need a schema migration later.
+   */
+  tenantId?: string;
 }
 
 const VALID_PRIORITIES: ReadonlySet<string> = new Set<LeadPriority>(['Low', 'Medium', 'High']);
@@ -172,6 +179,7 @@ export function buildLeadCrmFields(
   if (ext.role) out.role = ext.role;
   if (typeof ext.isPrimary === 'boolean') out.isPrimary = ext.isPrimary;
   if (ext.dealIds && ext.dealIds.length > 0) out.dealIds = ext.dealIds;
+  if (ext.tenantId && ext.tenantId.trim()) out.tenantId = ext.tenantId.trim();
 
   return out;
 }

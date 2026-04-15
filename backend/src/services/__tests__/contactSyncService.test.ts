@@ -1,3 +1,15 @@
+// Stub the auto-enroll module — contactSyncService lazy-requires it at call
+// time. Without this, signup-typed test inputs would drag in real db.ts and
+// try to talk to DynamoDB.
+jest.mock('../signupAutoEnrollService', () => ({
+  enrollSignupIntoFoundersList: jest.fn(async () => ({
+    enrolled: false,
+    reason: 'test_stub',
+  })),
+  FOUNDERS_USERID: 'be754b6c-767e-44ec-b181-4042cfe45ea9',
+  FOUNDERS_SIGNUPS_LIST_NAME: 'AgentWeb Signups',
+}));
+
 import {
   syncContact,
   resolveIdentity,
@@ -330,6 +342,82 @@ describe('syncContact — score recompute', () => {
       now: () => new Date('2025-01-02T00:00:00.000Z'),
     });
     expect(result.scores.heatScore).toBe(15);
+  });
+});
+
+describe('syncContact — tenantId propagation', () => {
+  it('passes tenantId through to logEvent', async () => {
+    const { deps: eventsDb, store } = makeStubEventsDb();
+    await syncContact(
+      baseInput({ tenantId: 'tenant-abc', sourceRecordId: 'su_1' }),
+      { eventsDb, autoEnroll: async () => undefined }
+    );
+    expect(eventsDb.logEvent).toHaveBeenCalledTimes(1);
+    expect((eventsDb.logEvent as jest.Mock).mock.calls[0][0].tenantId).toBe(
+      'tenant-abc'
+    );
+    // Note: the stub doesn't persist tenantId onto the stored event, so just
+    // assert the logEvent input — that's what the real contactEventsDb uses.
+    expect(store).toHaveLength(1);
+  });
+});
+
+describe('syncContact — signup auto-enroll hook', () => {
+  it('fires autoEnroll on new signup events', async () => {
+    const { deps: eventsDb } = makeStubEventsDb();
+    const autoEnroll = jest.fn(async (_ctx: any) => undefined);
+    await syncContact(baseInput({ sourceRecordId: 'signup_fresh' }), {
+      eventsDb,
+      autoEnroll,
+    });
+    expect(autoEnroll).toHaveBeenCalledTimes(1);
+    const arg = autoEnroll.mock.calls[0][0] as any;
+    expect(arg.input.source).toBe('signup');
+    expect(arg.input.eventType).toBe('contact.created');
+    expect(arg.result.deduplicated).toBe(false);
+  });
+
+  it('does NOT fire autoEnroll on non-signup events', async () => {
+    const { deps: eventsDb } = makeStubEventsDb();
+    const autoEnroll = jest.fn(async () => undefined);
+    await syncContact(
+      baseInput({
+        source: 'stripe',
+        eventType: 'payment.subscribed',
+        sourceRecordId: 'stripe_1',
+      }),
+      { eventsDb, autoEnroll }
+    );
+    expect(autoEnroll).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire autoEnroll on a deduplicated (replayed) signup', async () => {
+    const { deps: eventsDb } = makeStubEventsDb();
+    const autoEnroll = jest.fn(async () => undefined);
+    await syncContact(baseInput({ sourceRecordId: 'signup_dup' }), {
+      eventsDb,
+      autoEnroll,
+    });
+    await syncContact(baseInput({ sourceRecordId: 'signup_dup' }), {
+      eventsDb,
+      autoEnroll,
+    });
+    expect(autoEnroll).toHaveBeenCalledTimes(1);
+  });
+
+  it('swallows autoEnroll errors — signup never fails', async () => {
+    const { deps: eventsDb } = makeStubEventsDb();
+    const autoEnroll = jest.fn(async () => {
+      throw new Error('enroll blew up');
+    });
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await syncContact(baseInput({ sourceRecordId: 'signup_err' }), {
+      eventsDb,
+      autoEnroll,
+    });
+    expect(res.contactId).toBe('jane@acme.com');
+    expect(res.deduplicated).toBe(false);
+    errSpy.mockRestore();
   });
 });
 

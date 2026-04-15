@@ -61,6 +61,11 @@ export interface SyncInput {
   eventTimestamp?: string;
   /** Optional dealId to tag on the event. */
   dealId?: string;
+  /**
+   * Owning tenant userId. Null/undefined means platform-scoped (founders@ /
+   * AgentWeb itself). Reserved for the next-sprint multi-tenant Epic.
+   */
+  tenantId?: string;
 }
 
 export interface ResolvedContact {
@@ -99,6 +104,13 @@ export interface ContactSyncDeps {
   loadSignals?: (contactId: string) => Promise<ContactSignalBundle>;
   persistScores?: (contactId: string, snap: SyncScoreSnapshot) => Promise<void>;
   now?: () => Date;
+  /**
+   * Optional auto-enroll hook, fired after a signup event is successfully
+   * logged. Today this auto-populates the founders@ "AgentWeb Signups" list;
+   * the multi-tenant Epic may expand it. Must swallow all errors internally
+   * — syncContact will NOT fail a signup on an enrolment error.
+   */
+  autoEnroll?: (ctx: { input: SyncInput; result: SyncResult }) => Promise<unknown>;
 }
 
 export function resolveIdentity(input: SyncInput): ResolvedContact {
@@ -248,6 +260,7 @@ export async function syncContact(
     sourceRecordId: input.sourceRecordId,
     eventTimestamp: input.eventTimestamp,
     dealId: input.dealId,
+    tenantId: input.tenantId,
   });
 
   let scores: SyncScoreSnapshot = {
@@ -268,11 +281,50 @@ export async function syncContact(
     }
   }
 
-  return {
+  const syncResult: SyncResult = {
     contactId: resolved.contactId,
     created,
     deduplicated: logResult.deduplicated,
     event: logResult.event,
     scores,
   };
+
+  // Auto-enroll hook — fires on successful signup events. Errors are fully
+  // swallowed both here and inside the hook; signup must never fail because
+  // CRM auto-enrolment failed.
+  if (
+    !logResult.deduplicated &&
+    input.source === 'signup' &&
+    input.eventType === 'contact.created'
+  ) {
+    // Lazy-require to avoid the circular import:
+    //   contactSyncService -> signupAutoEnrollService -> db -> crmSignalHooks -> contactSyncService
+    // We import the module at call time so the cycle is broken at load time.
+    let enroll = deps.autoEnroll;
+    if (!enroll) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        enroll = require('./signupAutoEnrollService').enrollSignupIntoFoundersList;
+      } catch (err: any) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[contactSyncService] failed to load autoEnroll module (swallowed):',
+          err?.message || err
+        );
+      }
+    }
+    try {
+      if (enroll) await enroll({ input, result: syncResult });
+    } catch (err: any) {
+      // defaultAutoEnroll already swallows; this is belt-and-suspenders for
+      // caller-injected hooks that might throw.
+      // eslint-disable-next-line no-console
+      console.error(
+        '[contactSyncService] autoEnroll hook threw (swallowed):',
+        err?.message || err
+      );
+    }
+  }
+
+  return syncResult;
 }

@@ -3117,7 +3117,8 @@ export const crmDb = {
     autoDraftInstruction?: string,
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
-    listType?: 'sales' | 'customers'
+    listType?: 'sales' | 'customers',
+    isSystemManaged?: boolean
   ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3161,6 +3162,7 @@ export const crmDb = {
             { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
           ]),
           ...(listType ? { listType } : {}),
+          ...(isSystemManaged ? { isSystemManaged: true } : {}),
         },
       };
 
@@ -3519,6 +3521,7 @@ export const crmDb = {
     role?: 'KDM' | 'Champion' | 'Blocker' | 'Influencer' | 'Other';
     isPrimary?: boolean;
     dealIds?: string[];
+    tenantId?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3593,6 +3596,7 @@ export const crmDb = {
         role: leadData.role,
         isPrimary: leadData.isPrimary,
         dealIds: leadData.dealIds,
+        tenantId: leadData.tenantId,
       });
       Object.assign(item, crmFields);
 
