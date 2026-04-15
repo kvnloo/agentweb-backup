@@ -144,6 +144,7 @@ export class CrmEnrichmentService {
   }
 
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
+  private static readonly SUGGEST_MODEL = 'gemini-2.5-pro';
 
   /**
    * Substitute {{placeholder}} tokens in a search query template with actual lead field values.
@@ -753,15 +754,26 @@ Given a user's enrichment goal or instruction, produce:
    - ALWAYS embed lead context using {{placeholder}} tokens in the instruction where it helps the extraction LLM understand what to look for. Available tokens: {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{emailDomain}}, {{title}}. These are substituted with the actual lead's values at runtime before the instruction is sent to the extraction LLM.
    - Example: "Research {{company}} ({{emailDomain}}) to extract: primary industry, current employee count, main products/services offered, key market differentiators, the official LinkedIn company page URL, and the personal LinkedIn profile URL for {{firstName}} {{lastName}}."
 
-2. A list of output field names in snake_case — one field per distinct data point. Rules:
-   - Numeric values (employee count, revenue, dates, amounts) → always its own separate field
-   - Categorical / label values (funding stage, ICP category, industry, tier) → always its own separate field
-   - URL values (LinkedIn URLs, website URLs) → always their own separate field
-   - Prose summaries (profile, description, overview) → one field
-   - CRITICAL: Never merge different data types — even when a goal says "a profile that describes industry, employee size, and products", create SEPARATE fields for each distinct data point. That example → FOUR fields: company_profile + industry + employee_count + products_services
-   - Extended example — "a 3-6 sentence company profile describing industry, employee size, products, differentiators, plus company LinkedIn page and lead's personal LinkedIn" → SIX fields: company_profile, industry, employee_count, products_services, company_linkedin_url, personal_linkedin_url
-   - Capture every distinct data point mentioned, including ones embedded inside a prose request (e.g. "last funding date" inside a funding description → last_funding_date field)
-   - Do NOT suggest fields that are already populated on the leads — skip those. EXCEPTION: standard fields that are listed as "commonly EMPTY" below are valid enrichment targets and MUST be included in outputFields if the goal requests them. The most important case: if the goal mentions personal LinkedIn URL, ALWAYS include "linkedin_url" in outputFields (even though "linkedin" appears in the existing standard fields list) — it is almost always empty and is the primary value to fill.
+2. A list of output field names in snake_case — one field per distinct data point.
+
+   APPROACH: Before naming any fields, read every sentence of the instruction and enumerate ALL data points mentioned anywhere. Do not skip a sentence because it "describes" or "qualifies" another field. Then classify each data point using the rules below.
+
+   Field type rules:
+   - Numeric values (employee count, revenue, dates, amounts) → its own field
+   - Categorical / label values (funding stage, ICP category, industry, tier) → its own field
+   - URL values (LinkedIn URLs, website URLs) → its own field
+   - Prose summary (profile, description, overview) → one field for the narrative text (e.g. company_profile), THEN treat every named data point inside that prose request as also requiring its own separate field
+
+   "The profile must describe X, Y, Z" rule:
+   X, Y, Z are SEPARATE output fields to extract — not stylistic writing requirements on the prose field. Always produce: the prose field + one field per named item inside it.
+
+   WRONG vs RIGHT — study this before generating fields:
+   Instruction: "Research {{company}} to generate a 3-6 sentence company profile. The profile must explicitly describe the company's primary industry, current employee count, main products or services offered, and key market differentiators. Additionally, identify the company's latest funding stage, total funding amount raised, and the date of their most recent funding round. Finally, confirm if {{firstName}} {{lastName}} is currently active in their role at {{company}}, provide their personal LinkedIn profile URL, and extract the date of their last LinkedIn post."
+   WRONG: ["latest_funding_stage","total_funding_amount","last_funding_date","is_active_in_role","linkedin_url","last_linkedin_post_date"]  ← first paragraph completely ignored, 5 fields missing
+   CORRECT: ["company_profile","industry","employee_count","products_services","market_differentiators","latest_funding_stage","total_funding_amount","last_funding_date","is_active_in_role","linkedin_url","last_linkedin_post_date"]
+
+   Other rules:
+   - Do NOT suggest fields already populated on the leads — skip those. EXCEPTION: fields listed as "commonly EMPTY" below are valid targets and MUST be included. Special case: always include "linkedin_url" when the goal mentions personal LinkedIn URL (it is almost always empty even though "linkedin" is a standard field).
    - CONSISTENCY RULE: if you set a linkedinSearchTemplate, you MUST include at least one output field with source ["linkedin"] — typically "linkedin_url". Never generate a linkedinSearchTemplate without a matching linkedin output field.
 
 3. A webSearchTemplate string — ONE search query template used for ALL web_search fields combined. Uses {{placeholder}} tokens: {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{emailDomain}}, {{title}}.
@@ -819,7 +831,7 @@ No markdown, no backticks, no extra text.`;
     let raw = '';
     try {
       const completion = await geminiClient.chat.completions.create({
-        model: CrmEnrichmentService.ENRICH_MODEL,
+        model: CrmEnrichmentService.SUGGEST_MODEL,
         temperature: 0.2,
         messages: [
           { role: 'system', content: systemPrompt },
@@ -832,7 +844,7 @@ No markdown, no backticks, no extra text.`;
       // Retry without json_object mode
       try {
         const retry = await geminiClient.chat.completions.create({
-          model: CrmEnrichmentService.ENRICH_MODEL,
+          model: CrmEnrichmentService.SUGGEST_MODEL,
           temperature: 0.2,
           messages: [
             { role: 'system', content: systemPrompt },

@@ -4896,7 +4896,13 @@ emmaToolRegistry.register({
 
 Returns total lead count, how many would be processed, how many are already enriched, and 2 sample enrichment results so the user can verify quality before proceeding.
 
-After showing the preview, ask the user to confirm before calling enrich_leads_execute.`,
+After showing the preview, ask the user to confirm before calling enrich_leads_execute.
+
+Field and source guidance:
+- output_fields: one snake_case field per distinct data point. Numeric values (dates, counts, amounts), categorical values (industry, funding stage), URLs (linkedin_url), and prose summaries (company_profile) each get their own field. When a prose request names sub-items ("profile describing industry, employee count, products"), create the prose field PLUS a separate field for each named item.
+- sources_per_field: map each field to its source. Use "web_search" for company info, funding, tech stack, company LinkedIn URL. Use "linkedin" ONLY for the lead's personal LinkedIn profile (field name: linkedin_url). Use "existing_data" for fields derivable from existing lead data.
+- web_search_template: ONE search query covering all web_search fields. Uses {{placeholder}} tokens ({{company}}, {{firstName}}, {{lastName}}, {{title}}). Example: "{{company}} company overview industry employees funding".
+- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -4911,12 +4917,28 @@ After showing the preview, ask the user to confirm before calling enrich_leads_e
         output_fields: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of custom field names to populate (e.g. ["company_size", "industry"]). Use snake_case.'
+          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
         },
         sources: {
           type: 'array',
           items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use. web_search: searches the web per lead. linkedin: looks up LinkedIn profiles. existing_data: infers from existing lead fields.'
+          description: 'Union of all data sources used across all fields. web_search: searches the web. linkedin: looks up personal LinkedIn profiles. existing_data: infers from existing lead fields.'
+        },
+        sources_per_field: {
+          type: 'object',
+          additionalProperties: {
+            type: 'array',
+            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
+          },
+          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search". Falls back to job-level sources when absent for a field.'
+        },
+        web_search_template: {
+          type: 'string',
+          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}. Example: "{{company}} company overview industry employees funding". Keep concise (4-8 words after substitution).'
+        },
+        linkedin_search_template: {
+          type: 'string',
+          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
         },
         filters: {
           type: 'array',
@@ -4951,6 +4973,9 @@ After showing the preview, ask the user to confirm before calling enrich_leads_e
       instruction: args.instruction,
       outputFields: args.output_fields,
       sources: args.sources,
+      sourcesPerField: args.sources_per_field,
+      webSearchTemplate: args.web_search_template,
+      linkedinSearchTemplate: args.linkedin_search_template,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
     });
@@ -4965,7 +4990,9 @@ emmaToolRegistry.register({
 
 Progress updates are sent via Socket.IO in real-time. Returns immediately with a job ID and the count of leads to be processed.
 
-Call enrich_leads_preview first to show the user what will happen before executing.`,
+Call enrich_leads_preview first to show the user what will happen before executing.
+
+Pass the same output_fields, sources_per_field, web_search_template, and linkedin_search_template used in the preview call.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -4980,12 +5007,28 @@ Call enrich_leads_preview first to show the user what will happen before executi
         output_fields: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of custom field names to populate. Use snake_case.'
+          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
         },
         sources: {
           type: 'array',
           items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use.'
+          description: 'Union of all data sources used across all fields.'
+        },
+        sources_per_field: {
+          type: 'object',
+          additionalProperties: {
+            type: 'array',
+            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
+          },
+          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search".'
+        },
+        web_search_template: {
+          type: 'string',
+          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}.'
+        },
+        linkedin_search_template: {
+          type: 'string',
+          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
         },
         filters: {
           type: 'array',
@@ -5020,6 +5063,9 @@ Call enrich_leads_preview first to show the user what will happen before executi
       instruction: args.instruction,
       outputFields: args.output_fields,
       sources: args.sources,
+      sourcesPerField: args.sources_per_field,
+      webSearchTemplate: args.web_search_template,
+      linkedinSearchTemplate: args.linkedin_search_template,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
