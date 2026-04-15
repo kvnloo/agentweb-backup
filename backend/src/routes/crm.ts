@@ -16,6 +16,15 @@ import { isDoNotContact } from '../utils/leadContactStatus';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import Stripe from 'stripe';
+import {
+  buildBuiltInPresets,
+  validateCreateInput,
+  generateViewId,
+  VALID_SCOPES,
+  isPresetViewId,
+  SavedView as SavedViewUtil,
+  SavedViewScope as SavedViewScopeUtil,
+} from '../utils/savedViews';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -431,6 +440,165 @@ router.post('/sync', async (req: Request, res: Response) => {
     const msg = typeof error?.message === 'string' ? error.message : 'Sync failed';
     const status = /required|no email|no sourceRecordId/i.test(msg) ? 400 : 500;
     return res.status(status).json({ message: msg });
+  }
+});
+
+// --------------------------------------------------------------------------
+// Saved Views (H1) — user-customized filter/sort combos over /crm tabs.
+// Built-in presets are returned from code (can't be edited/deleted); user
+// views are persisted on the User record via db.ts User.savedViews.
+// Pure logic (validation, preset shapes, id gen) lives in utils/savedViews.ts
+// and is unit-tested there.
+// --------------------------------------------------------------------------
+
+/**
+ * @route GET /api/crm/saved-views
+ * @desc Return built-in presets + user's saved views.
+ * @access Private
+ */
+router.get('/saved-views', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    const user = await userDb.getUserById(userId);
+    const userViews: SavedViewUtil[] = Array.isArray(user?.savedViews)
+      ? user!.savedViews!.map((v) => ({
+          viewId: v.viewId,
+          name: v.name,
+          scope: v.scope,
+          filters: v.filters,
+          sort: v.sort,
+          isPreset: false,
+          createdAt: v.createdAt,
+        }))
+      : [];
+    const presets = buildBuiltInPresets(userId);
+    return res.json({ views: [...presets, ...userViews] });
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/saved-views:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to fetch saved views' });
+  }
+});
+
+/**
+ * @route POST /api/crm/saved-views
+ * @desc Create a new user-saved view.
+ * @access Private
+ */
+router.post('/saved-views', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const parsed = validateCreateInput(req.body || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ message: parsed.error });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const newView = {
+      viewId: generateViewId(),
+      name: parsed.value.name,
+      scope: parsed.value.scope as SavedViewScopeUtil,
+      filters: parsed.value.filters,
+      sort: parsed.value.sort,
+      isPreset: false as const,
+      createdAt: new Date().toISOString(),
+    };
+
+    const existingViews = Array.isArray(user.savedViews) ? user.savedViews : [];
+    const nextViews = [...existingViews, newView];
+    await userDb.updateUser(userId, { savedViews: nextViews } as any);
+    return res.status(201).json(newView);
+  } catch (error: any) {
+    console.error('Error in POST /api/crm/saved-views:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to create saved view' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/saved-views/:viewId
+ * @desc Update a user-saved view. Presets are immutable (returns 400).
+ * @access Private
+ */
+router.put('/saved-views/:viewId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    const { viewId } = req.params;
+    if (isPresetViewId(viewId)) {
+      return res.status(400).json({ message: 'Built-in presets cannot be modified' });
+    }
+
+    const { name, scope, filters, sort } = req.body || {};
+    if (scope !== undefined && !VALID_SCOPES.includes(scope)) {
+      return res.status(400).json({ message: `scope must be one of ${VALID_SCOPES.join(', ')}` });
+    }
+
+    const user = await userDb.getUserById(userId);
+    const existingViews = Array.isArray(user?.savedViews) ? user!.savedViews! : [];
+    const idx = existingViews.findIndex((v) => v.viewId === viewId);
+    if (idx === -1) {
+      return res.status(404).json({ message: 'View not found' });
+    }
+    const updated = {
+      ...existingViews[idx],
+      ...(name !== undefined ? { name: String(name).trim() } : {}),
+      ...(scope !== undefined ? { scope } : {}),
+      ...(filters !== undefined ? { filters } : {}),
+      ...(sort !== undefined ? { sort } : {}),
+    };
+    const nextViews = [...existingViews];
+    nextViews[idx] = updated;
+    await userDb.updateUser(userId, { savedViews: nextViews } as any);
+    return res.json(updated);
+  } catch (error: any) {
+    console.error('Error in PUT /api/crm/saved-views/:viewId:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to update saved view' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/saved-views/:viewId
+ * @desc Delete a user-saved view. Presets are immutable (returns 400).
+ * @access Private
+ */
+router.delete('/saved-views/:viewId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    const { viewId } = req.params;
+    if (isPresetViewId(viewId)) {
+      return res.status(400).json({ message: 'Built-in presets cannot be deleted' });
+    }
+    const user = await userDb.getUserById(userId);
+    const existingViews = Array.isArray(user?.savedViews) ? user!.savedViews! : [];
+    const idx = existingViews.findIndex((v) => v.viewId === viewId);
+    if (idx === -1) {
+      return res.status(404).json({ message: 'View not found' });
+    }
+    const nextViews = existingViews.filter((v) => v.viewId !== viewId);
+    await userDb.updateUser(userId, { savedViews: nextViews } as any);
+    return res.json({ success: true, viewId });
+  } catch (error: any) {
+    console.error('Error in DELETE /api/crm/saved-views/:viewId:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to delete saved view' });
   }
 });
 
