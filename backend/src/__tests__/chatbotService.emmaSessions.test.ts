@@ -166,7 +166,7 @@ describe('getEmmaSystemContext', () => {
     expect(result).toContain('EMMA');
     expect(result).toContain('AgentWeb');
     // Contains sidebar-specific addendum
-    expect(result).toContain('Sidebar Mode Context');
+    expect(result).toContain('Sidebar Mode');
     expect(result).toContain('Page & Feature Tool Reference');
     // Never hits DynamoDB
     expect(getPromiseMock).not.toHaveBeenCalled();
