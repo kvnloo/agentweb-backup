@@ -24,6 +24,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Admins can now change the login/contact email for any user account directly from the Users tab in the Admin Dashboard',
       '- Click the pencil icon next to "Contact Email" in the expanded user row, enter the new email, and confirm',
       '- The user\'s ID and all associated data remain unchanged; only the login email is updated',
+      'Fixed: Landing Page Code Editor Now Targets the Correct Files First Time',
+      '- The coding agent that edits landing pages now correctly identifies your site as a Next.js project from the start',
+      '- Previously, the agent could incorrectly attempt to edit static HTML files instead of the actual Next.js component files (e.g., app/page.tsx), leading to repeated failed attempts',
+      '- The agent now receives a full file listing before its first edit, eliminating blind guesswork about project structure',
     ],
   },
   {
