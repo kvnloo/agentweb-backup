@@ -37,6 +37,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed a field name mismatch where the UI checked for "content" but Unipile-synced messages store text in a "text" field — both formats now render correctly',
       '- Messages now show a LinkedIn icon with a sent/received badge and a preview of the message body',
       '- Sent messages are now immediately saved to the CRM when dispatched (no need to manually re-sync to see them appear)',
+    ],
+  },
   {
     date: '2026-04-15',
     changes: [
