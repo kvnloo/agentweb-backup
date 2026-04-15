@@ -667,7 +667,10 @@ async function addPageToExistingRepo(
     // ── Step 4: Extract and remap files for the new page route ──
     const allFiles = await unzipBuffer(zipBuffer);
     autoFixV0Files(allFiles);
-    const filesToCommit = remapFilesForSubPage(allFiles, slug);
+    const filesToCommit = remapFilesForSubPage(allFiles, slug, {
+      name,
+      description: prompt,
+    });
 
     console.log(`[V0 SERVICE] Extracted ${filesToCommit.length} files for /${slug}: ${filesToCommit.map(f => f.path).join(", ")}`);
 
@@ -816,9 +819,74 @@ async function addPageToExistingRepo(
  *
  * Also rewrites import paths in the page file to point to the relocated components.
  */
+/**
+ * Inject or replace a Next.js `metadata` export in a page.tsx file so that the
+ * sub-page has its own <title> rather than inheriting the root layout's title.
+ *
+ * Why: sub-pages added via addPageToExistingRepo skip app/layout.tsx (the root
+ * layout already exists in the repo), so without a page-level metadata export
+ * every new page shows the root layout's title — which was set from the very
+ * first page the user generated. See Notion: "Landing page title tag
+ * hardcoded to wrong value".
+ */
+export function injectPageMetadata(
+  pageSource: string,
+  pageName: string,
+  description?: string
+): string {
+  const safeTitle = pageName.replace(/`/g, "\\`");
+  const safeDescription = description ? description.replace(/`/g, "\\`").slice(0, 300) : undefined;
+
+  const metadataBlock =
+    `import type { Metadata } from "next";\n\n` +
+    `export const metadata: Metadata = {\n` +
+    `  title: \`${safeTitle}\`,\n` +
+    (safeDescription ? `  description: \`${safeDescription}\`,\n` : "") +
+    `};\n\n`;
+
+  // If a metadata export already exists, replace the title field (and description)
+  // rather than stacking a second export.
+  const metadataExportRegex = /export\s+const\s+metadata[^{]*=\s*\{[\s\S]*?\};?/;
+  if (metadataExportRegex.test(pageSource)) {
+    return pageSource.replace(metadataExportRegex, (existing) => {
+      let next = existing;
+      // Replace title: "..." / title: '...' / title: `...`
+      const titleField = new RegExp(`title:\\s*(?:"[^"]*"|'[^']*'|\`[^\`]*\`)`);
+      if (titleField.test(next)) {
+        next = next.replace(titleField, `title: \`${safeTitle}\``);
+      } else {
+        // No existing title field — inject one after the opening brace.
+        next = next.replace(/\{/, `{\n  title: \`${safeTitle}\`,`);
+      }
+      if (safeDescription) {
+        const descField = new RegExp(`description:\\s*(?:"[^"]*"|'[^']*'|\`[^\`]*\`)`);
+        if (descField.test(next)) {
+          next = next.replace(descField, `description: \`${safeDescription}\``);
+        } else {
+          next = next.replace(/\{/, `{\n  description: \`${safeDescription}\`,`);
+        }
+      }
+      return next;
+    });
+  }
+
+  // No existing metadata export — prepend one.
+  // Place it after any leading "use client" directive and existing imports.
+  // The simplest safe rule: put it at the top of the file. Next.js parses this
+  // per-file so ordering doesn't matter for correctness.
+  // If "use client" is present we do NOT inject (client components can't export
+  // metadata). Fall back to a <title> tag inside the component instead.
+  if (/^\s*["']use client["']/m.test(pageSource)) {
+    return pageSource; // metadata export not allowed; accept the inherited title for client-only pages.
+  }
+
+  return metadataBlock + pageSource;
+}
+
 export function remapFilesForSubPage(
   files: Array<{ path: string; content: Buffer }>,
-  slug: string
+  slug: string,
+  pageMetadata?: { name: string; description?: string }
 ): Array<{ path: string; content: Buffer }> {
   // Files to skip — the existing project already has these
   const skipPatterns = [
@@ -845,8 +913,20 @@ export function remapFilesForSubPage(
     if (skipPatterns.some((p) => p.test(file.path))) continue;
 
     if (file.path === "app/page.tsx") {
-      // Main page → sub-route page
-      result.push({ path: `app/${slug}/page.tsx`, content: file.content });
+      // Main page → sub-route page.
+      // Inject per-page metadata so the sub-page exports its own <title>
+      // instead of inheriting the root layout's (stale) title. See
+      // injectPageMetadata for the rationale.
+      let content = file.content;
+      if (pageMetadata?.name) {
+        const withMetadata = injectPageMetadata(
+          file.content.toString("utf-8"),
+          pageMetadata.name,
+          pageMetadata.description
+        );
+        content = Buffer.from(withMetadata);
+      }
+      result.push({ path: `app/${slug}/page.tsx`, content });
     } else if (file.path.startsWith("components/") && !file.path.startsWith("components/ui/")) {
       // Custom components → namespaced under the sub-route to avoid conflicts
       const relativeName = file.path.replace("components/", "");

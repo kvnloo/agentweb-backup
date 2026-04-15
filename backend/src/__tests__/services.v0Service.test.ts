@@ -128,6 +128,7 @@ import {
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
+  injectPageMetadata,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -840,6 +841,100 @@ describe("v0Service - remapFilesForSubPage", () => {
   it("handles empty files array", () => {
     const result = remapFilesForSubPage([], "test");
     expect(result).toHaveLength(0);
+  });
+
+  it("injects per-page metadata into sub-page page.tsx when pageMetadata is provided", () => {
+    const files = [
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div>Hi</div>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "abm-startups", {
+      name: "ABM for Startups",
+      description: "Targeted outreach for early-stage founders",
+    });
+    expect(result).toHaveLength(1);
+    const pageContent = result[0].content.toString("utf-8");
+    expect(pageContent).toContain('import type { Metadata } from "next"');
+    expect(pageContent).toContain("export const metadata");
+    expect(pageContent).toContain("title: `ABM for Startups`");
+    expect(pageContent).toContain("description: `Targeted outreach for early-stage founders`");
+  });
+
+  it("does not inject metadata when pageMetadata is not provided (back-compat)", () => {
+    const files = [
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div>Hi</div>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "abm");
+    expect(result).toHaveLength(1);
+    expect(result[0].content.toString("utf-8")).not.toContain("export const metadata");
+  });
+});
+
+// =============================================================================
+// injectPageMetadata
+// =============================================================================
+describe("v0Service - injectPageMetadata", () => {
+  it("prepends a metadata export to a page that has none", () => {
+    const src = `export default function Page() { return <div/>; }`;
+    const out = injectPageMetadata(src, "My Page", "Page description");
+    expect(out).toContain('import type { Metadata } from "next"');
+    expect(out).toContain("export const metadata");
+    expect(out).toContain("title: `My Page`");
+    expect(out).toContain("description: `Page description`");
+    // Original body still present
+    expect(out).toContain("export default function Page()");
+  });
+
+  it("replaces the title in an existing metadata export rather than stacking a new one", () => {
+    const src = `import type { Metadata } from "next";
+
+export const metadata: Metadata = {
+  title: "Stale Title",
+  description: "Old description",
+};
+
+export default function Page() { return <div/>; }`;
+    const out = injectPageMetadata(src, "Fresh Title", "Fresh description");
+    // Only one metadata export should exist
+    const matches = out.match(/export const metadata/g) || [];
+    expect(matches.length).toBe(1);
+    expect(out).toContain("title: `Fresh Title`");
+    expect(out).toContain("description: `Fresh description`");
+    expect(out).not.toContain("Stale Title");
+    expect(out).not.toContain("Old description");
+  });
+
+  it("inserts a title field when metadata exists but has no title", () => {
+    const src = `export const metadata = { other: "x" };
+export default function Page() { return <div/>; }`;
+    const out = injectPageMetadata(src, "Injected Title");
+    expect(out).toContain("title: `Injected Title`");
+    // Existing field preserved
+    expect(out).toContain('other: "x"');
+  });
+
+  it("is a no-op for client components since they cannot export metadata", () => {
+    const src = `"use client";
+
+export default function Page() { return <div/>; }`;
+    const out = injectPageMetadata(src, "Some Title");
+    expect(out).toBe(src);
+    expect(out).not.toContain("export const metadata");
+  });
+
+  it("escapes backticks in the page name to prevent template literal injection", () => {
+    const src = `export default function Page() { return <div/>; }`;
+    const out = injectPageMetadata(src, "Weird `Title` With Backticks");
+    // Backticks inside the title must be escaped so the generated .tsx compiles
+    expect(out).toContain("title: `Weird \\`Title\\` With Backticks`");
+  });
+
+  it("truncates very long descriptions to 300 chars", () => {
+    const longDesc = "x".repeat(500);
+    const src = `export default function Page() { return <div/>; }`;
+    const out = injectPageMetadata(src, "My Page", longDesc);
+    const descMatch = out.match(/description:\s*`([^`]+)`/);
+    expect(descMatch).not.toBeNull();
+    expect(descMatch![1].length).toBeLessThanOrEqual(300);
   });
 });
 
