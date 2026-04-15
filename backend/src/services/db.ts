@@ -263,6 +263,22 @@ export interface User {
   lastTouch?: import("../types/attribution").AttributionTouch;
   utmSource?: string;
   utmMedium?: string;
+  /**
+   * Saved CRM views — user's customized filter+sort combinations applied
+   * to the /crm dashboard tabs. Built-in presets are injected by the
+   * savedViews route and NOT persisted here (isPreset views are returned
+   * from code, never written). Only user-saved views are stored.
+   * See `backend/src/routes/crm.ts` saved-views endpoints.
+   */
+  savedViews?: Array<{
+    viewId: string;
+    name: string;
+    scope: 'inbox' | 'working' | 'paying' | 'all';
+    filters?: Record<string, any>;
+    sort?: string;
+    isPreset?: false; // user-saved views are never preset
+    createdAt: string;
+  }>;
 }
 
 export interface Organization {
