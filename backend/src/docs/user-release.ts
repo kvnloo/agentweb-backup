@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-15',
     changes: [
+      'Fixed: LinkedIn Messages Now Appear in CRM Timeline',
+      '- Synced LinkedIn messages were stored in the database correctly but were not displaying in the CRM engagement timeline',
+      '- Fixed a field name mismatch where the UI checked for "content" but Unipile-synced messages store text in a "text" field — both formats now render correctly',
+      '- Messages now show a LinkedIn icon with a sent/received badge and a preview of the message body',
+      '- Sent messages are now immediately saved to the CRM when dispatched (no need to manually re-sync to see them appear)',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
       'New: LinkedIn Repost Support',
       '- Emma can now repost (reshare) existing LinkedIn posts via the linkedin_manage_post tool',
       '- Optional commentary can be added to provide context when reposting',
