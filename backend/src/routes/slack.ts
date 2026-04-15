@@ -73,6 +73,13 @@ async function handleSlackTriggeredSession(params: {
 
     if (!rawMessage) return;
 
+    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments
+    const senderEmail = await getSlackUserEmail(slackUserId);
+    if (senderEmail && senderEmail.endsWith('@agentweb.pro')) {
+      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${senderEmail})`);
+      return;
+    }
+
     // Look up user by slackChannel field (with cache)
     const mappingKey = `slack_channel_mapping_${channel}`;
     let user = null;
