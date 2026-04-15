@@ -119,7 +119,7 @@ describe('enrollSignupIntoFoundersList', () => {
       undefined,
       undefined,
       undefined,
-      'customers',
+      'sales',
       true // isSystemManaged
     );
     expect(lists).toHaveLength(1);
