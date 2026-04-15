@@ -19515,11 +19515,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
           // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
           const { list_id: sendListId, lead_id: sendLeadId } = args;
+          let sendLead: any = null;
           if (sendListId && sendLeadId) {
             const { crmDb } = await import('./db');
-            const lead = await crmDb.getLeadById(sendListId, sendLeadId);
-            if (lead) {
-              const syncAt = (lead as any).linkedinMessageSyncAt as string | undefined;
+            sendLead = await crmDb.getLeadById(sendListId, sendLeadId);
+            if (sendLead) {
+              const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
               if (!syncAt || syncAt < oneDayAgo) {
                 return {
@@ -19532,6 +19533,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }
 
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
+
+          // Persist the sent message to the CRM so it shows up in engagement history.
+          // The Unipile response may contain the message ID; fall back to a timestamp-based ID.
+          if (sendListId && sendLeadId && sendLead) {
+            const leadLinkedIn = (sendLead.linkedin as string | undefined)?.toLowerCase();
+            if (leadLinkedIn) {
+              const { emailEventsDb } = await import('./emailEventsDb');
+              const { crmDb: sendCrmDb } = await import('./db');
+              const msgId = messageResponse?.id ?? messageResponse?.message_id ?? `sent_${Date.now()}`;
+              const sentAt = new Date().toISOString();
+              await Promise.all([
+                emailEventsDb.addLinkedInMessageEvent({
+                  eventId: `linkedin_msg_${msgId}`,
+                  emailDomain: `linkedin-${sendListId}`,
+                  leadEmail: leadLinkedIn,
+                  eventType: 'linkedin.message.sent',
+                  text: message,
+                  timestamp: sentAt,
+                  senderId: account_id,
+                  messageProviderId: msgId,
+                }),
+                // Refresh the sync timestamp so the 24h gate stays valid
+                sendCrmDb.updateLeadLinkedInSyncAt(sendListId, sendLeadId, sentAt),
+              ]);
+              console.log(`[AgentMode] send-message: persisted sent message for lead ${sendLeadId} in list ${sendListId}`);
+            }
+          }
+
           return { success: true, data: messageResponse };
         }
 
