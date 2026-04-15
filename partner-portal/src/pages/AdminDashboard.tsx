@@ -141,6 +141,13 @@ interface WaitlistEntry {
   marketingChannels?: string[];
 }
 
+interface UserNote {
+  id: string;
+  content: string;
+  timestamp: string;
+  authorEmail: string;
+}
+
 // Define ChatSession interface for the frontend, including portalType
 interface AdminChatSession {
   sessionId: string;
@@ -751,6 +758,10 @@ export default function AdminDashboard() {
   const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
   const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
   const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
+  const [userNotesMap, setUserNotesMap] = useState<Record<string, UserNote[]>>({});
+  const [userNotesLoading, setUserNotesLoading] = useState<Record<string, boolean>>({});
+  const [newNoteText, setNewNoteText] = useState<Record<string, string>>({});
+  const [addingNoteLoading, setAddingNoteLoading] = useState<Record<string, boolean>>({});
   const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
   const [currentAdAccountText, setCurrentAdAccountText] = useState("");
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
@@ -1988,10 +1999,58 @@ export default function AdminDashboard() {
     }
   };
 
+  const loadUserNotes = async (userId: string) => {
+    setUserNotesLoading((prev) => ({ ...prev, [userId]: true }));
+    try {
+      const response = await axios.get(buildApiUrl(`/api/admin/users/${userId}/notes`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setUserNotesMap((prev) => ({ ...prev, [userId]: response.data.notes || [] }));
+    } catch (error: any) {
+      console.error("Error loading user notes:", error);
+      setError(error.response?.data?.message || "Failed to load user notes");
+    } finally {
+      setUserNotesLoading((prev) => ({ ...prev, [userId]: false }));
+    }
+  };
+
+  const handleAddUserNote = async (userId: string) => {
+    const content = (newNoteText[userId] || "").trim();
+    if (!content) return;
+    setAddingNoteLoading((prev) => ({ ...prev, [userId]: true }));
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${userId}/notes`),
+        { content },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setUserNotesMap((prev) => ({ ...prev, [userId]: response.data.notes || [] }));
+      setNewNoteText((prev) => ({ ...prev, [userId]: "" }));
+      if (response.data.warning) setSuccess(response.data.warning);
+    } catch (error: any) {
+      console.error("Error adding user note:", error);
+      setError(error.response?.data?.message || "Failed to add note");
+    } finally {
+      setAddingNoteLoading((prev) => ({ ...prev, [userId]: false }));
+    }
+  };
+
+  const handleDeleteUserNote = async (userId: string, noteId: string) => {
+    try {
+      const response = await axios.delete(buildApiUrl(`/api/admin/users/${userId}/notes/${noteId}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setUserNotesMap((prev) => ({ ...prev, [userId]: response.data.notes || [] }));
+    } catch (error: any) {
+      console.error("Error deleting user note:", error);
+      setError(error.response?.data?.message || "Failed to delete note");
+    }
+  };
+
   const handleSaveAdAccount = async (userId: string) => {
     try {
       setAdAccountEditLoading(true);
-      
+
       // Validate Meta Ad Account ID format (should be a numeric string)
       const adAccountId = currentAdAccountText.trim();
       if (adAccountId && !/^\d+$/.test(adAccountId)) {
@@ -3773,6 +3832,9 @@ export default function AdminDashboard() {
                               .catch(() => setUserActivities(prev => ({ ...prev, [nextExpanded]: [] })))
                               .finally(() => setUserActivitiesLoading(prev => ({ ...prev, [nextExpanded]: false })));
                           }
+                          if (nextExpanded && userNotesMap[nextExpanded] === undefined) {
+                            loadUserNotes(nextExpanded);
+                          }
                         }}
                       >
                         <TableCell sx={{ p: 0.5, width: 32 }}>
@@ -4060,6 +4122,67 @@ export default function AdminDashboard() {
                                       <>
                                         <Typography variant="body2">{user.supportNote || "—"}</Typography>
                                         <IconButton size="small" onClick={() => { setEditingSupportNoteUserId(user.userId); setCurrentSupportNoteText(user.supportNote || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                {/* User Notes */}
+                                <Grid item xs={12}>
+                                  <Typography variant="caption" color="text.secondary">Notes</Typography>
+                                  <Box sx={{ mt: 0.5 }}>
+                                    {userNotesLoading[user.userId] ? (
+                                      <CircularProgress size={16} />
+                                    ) : (
+                                      <>
+                                        {(userNotesMap[user.userId] || []).length === 0 && (
+                                          <Typography variant="body2" color="text.disabled">No notes yet</Typography>
+                                        )}
+                                        {(userNotesMap[user.userId] || []).map((note) => (
+                                          <Box
+                                            key={note.id}
+                                            sx={{
+                                              display: "flex",
+                                              alignItems: "flex-start",
+                                              gap: 0.5,
+                                              mb: 0.75,
+                                              p: 0.75,
+                                              borderRadius: 1,
+                                              bgcolor: "action.hover",
+                                            }}
+                                          >
+                                            <Box sx={{ flex: 1 }}>
+                                              <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{note.content}</Typography>
+                                              <Typography variant="caption" color="text.secondary">
+                                                {format(new Date(note.timestamp), "MMM d, yyyy h:mm a")} · {note.authorEmail}
+                                              </Typography>
+                                            </Box>
+                                            <Tooltip title="Delete note">
+                                              <IconButton size="small" onClick={() => handleDeleteUserNote(user.userId, note.id)} sx={{ flexShrink: 0 }}>
+                                                <DeleteIcon sx={{ fontSize: 14 }} />
+                                              </IconButton>
+                                            </Tooltip>
+                                          </Box>
+                                        ))}
+                                        <Box sx={{ display: "flex", gap: 0.5, mt: 0.5 }}>
+                                          <TextField
+                                            size="small"
+                                            placeholder="Add a note…"
+                                            value={newNoteText[user.userId] || ""}
+                                            onChange={(e) => setNewNoteText((prev) => ({ ...prev, [user.userId]: e.target.value }))}
+                                            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleAddUserNote(user.userId); } }}
+                                            multiline
+                                            maxRows={3}
+                                            sx={{ flex: 1 }}
+                                          />
+                                          <IconButton
+                                            size="small"
+                                            color="primary"
+                                            onClick={() => handleAddUserNote(user.userId)}
+                                            disabled={addingNoteLoading[user.userId] || !(newNoteText[user.userId] || "").trim()}
+                                          >
+                                            {addingNoteLoading[user.userId] ? <CircularProgress size={16} /> : <AddIcon fontSize="small" />}
+                                          </IconButton>
+                                        </Box>
                                       </>
                                     )}
                                   </Box>
