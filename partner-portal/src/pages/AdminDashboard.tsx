@@ -91,6 +91,7 @@ import {
   Warning as WarningIcon,
   Cancel as CancelIcon,
   Search as SearchIcon,
+  Email as EmailIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -139,6 +140,13 @@ interface WaitlistEntry {
   monthlyMarketingSpend?: string;
   businessArea?: string;
   marketingChannels?: string[];
+}
+
+interface UserNote {
+  id: string;
+  content: string;
+  timestamp: string;
+  authorEmail: string;
 }
 
 // Define ChatSession interface for the frontend, including portalType
@@ -242,6 +250,7 @@ interface User {
   }>;
   tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
+  introductionEmailSent?: string; // ISO date when team introduction email was sent
   utmSource?: string;
   utmMedium?: string;
   utmCampaign?: string;
@@ -751,6 +760,10 @@ export default function AdminDashboard() {
   const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
   const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
   const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
+  const [userNotesMap, setUserNotesMap] = useState<Record<string, UserNote[]>>({});
+  const [userNotesLoading, setUserNotesLoading] = useState<Record<string, boolean>>({});
+  const [newNoteText, setNewNoteText] = useState<Record<string, string>>({});
+  const [addingNoteLoading, setAddingNoteLoading] = useState<Record<string, boolean>>({});
   const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
   const [currentAdAccountText, setCurrentAdAccountText] = useState("");
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
@@ -803,6 +816,10 @@ export default function AdminDashboard() {
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
   const [grantBonusAmount, setGrantBonusAmount] = useState("");
   const [grantBonusLoading, setGrantBonusLoading] = useState(false);
+  const [introEmailDialogOpen, setIntroEmailDialogOpen] = useState(false);
+  const [introEmailUserId, setIntroEmailUserId] = useState<string | null>(null);
+  const [introEmailUserEmail, setIntroEmailUserEmail] = useState("");
+  const [introEmailLoading, setIntroEmailLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -1988,10 +2005,58 @@ export default function AdminDashboard() {
     }
   };
 
+  const loadUserNotes = async (userId: string) => {
+    setUserNotesLoading((prev) => ({ ...prev, [userId]: true }));
+    try {
+      const response = await axios.get(buildApiUrl(`/api/admin/users/${userId}/notes`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setUserNotesMap((prev) => ({ ...prev, [userId]: response.data.notes || [] }));
+    } catch (error: any) {
+      console.error("Error loading user notes:", error);
+      setError(error.response?.data?.message || "Failed to load user notes");
+    } finally {
+      setUserNotesLoading((prev) => ({ ...prev, [userId]: false }));
+    }
+  };
+
+  const handleAddUserNote = async (userId: string) => {
+    const content = (newNoteText[userId] || "").trim();
+    if (!content) return;
+    setAddingNoteLoading((prev) => ({ ...prev, [userId]: true }));
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${userId}/notes`),
+        { content },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setUserNotesMap((prev) => ({ ...prev, [userId]: response.data.notes || [] }));
+      setNewNoteText((prev) => ({ ...prev, [userId]: "" }));
+      if (response.data.warning) setSuccess(response.data.warning);
+    } catch (error: any) {
+      console.error("Error adding user note:", error);
+      setError(error.response?.data?.message || "Failed to add note");
+    } finally {
+      setAddingNoteLoading((prev) => ({ ...prev, [userId]: false }));
+    }
+  };
+
+  const handleDeleteUserNote = async (userId: string, noteId: string) => {
+    try {
+      const response = await axios.delete(buildApiUrl(`/api/admin/users/${userId}/notes/${noteId}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setUserNotesMap((prev) => ({ ...prev, [userId]: response.data.notes || [] }));
+    } catch (error: any) {
+      console.error("Error deleting user note:", error);
+      setError(error.response?.data?.message || "Failed to delete note");
+    }
+  };
+
   const handleSaveAdAccount = async (userId: string) => {
     try {
       setAdAccountEditLoading(true);
-      
+
       // Validate Meta Ad Account ID format (should be a numeric string)
       const adAccountId = currentAdAccountText.trim();
       if (adAccountId && !/^\d+$/.test(adAccountId)) {
@@ -2621,6 +2686,33 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to grant token bonus");
     } finally {
       setGrantBonusLoading(false);
+    }
+  };
+
+  const handleSendIntroEmail = async () => {
+    if (!introEmailUserId) return;
+    try {
+      setIntroEmailLoading(true);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${introEmailUserId}/send-intro-email`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === introEmailUserId
+              ? { ...user, introductionEmailSent: response.data.introductionEmailSent }
+              : user
+          )
+        );
+        setSuccess(`Team introduction email sent to ${introEmailUserEmail}`);
+        setIntroEmailDialogOpen(false);
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to send introduction email");
+    } finally {
+      setIntroEmailLoading(false);
     }
   };
 
@@ -3719,13 +3811,14 @@ export default function AdminDashboard() {
                   <TableCell>
                     <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
                   </TableCell>
+                  <TableCell>Intro Email</TableCell>
                   <TableCell sx={{ width: 100 }}>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center">
+                    <TableCell colSpan={9} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -3772,6 +3865,9 @@ export default function AdminDashboard() {
                               .then(res => setUserActivities(prev => ({ ...prev, [nextExpanded]: res.data.sessions })))
                               .catch(() => setUserActivities(prev => ({ ...prev, [nextExpanded]: [] })))
                               .finally(() => setUserActivitiesLoading(prev => ({ ...prev, [nextExpanded]: false })));
+                          }
+                          if (nextExpanded && userNotesMap[nextExpanded] === undefined) {
+                            loadUserNotes(nextExpanded);
                           }
                         }}
                       >
@@ -3833,6 +3929,17 @@ export default function AdminDashboard() {
                             {used > 0 ? used.toLocaleString() : "—"}
                           </Typography>
                         </TableCell>
+                        <TableCell>
+                          {user.introductionEmailSent ? (
+                            <Tooltip title={`Sent ${new Date(user.introductionEmailSent).toLocaleString()}`}>
+                              <Typography variant="body2" color="success.main" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                                {format(new Date(user.introductionEmailSent), "MMM d, yyyy")}
+                              </Typography>
+                            </Tooltip>
+                          ) : (
+                            <Typography variant="body2" color="text.disabled">—</Typography>
+                          )}
+                        </TableCell>
                         <TableCell onClick={(e) => e.stopPropagation()}>
                           <Box sx={{ display: "flex", gap: 0.5 }}>
                             {user.roles?.includes("customer") && (
@@ -3850,7 +3957,7 @@ export default function AdminDashboard() {
                       </TableRow>
                       {/* Expandable detail row */}
                       <TableRow>
-                        <TableCell colSpan={8} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
+                        <TableCell colSpan={9} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
                           <Collapse in={isExpanded} timeout="auto" unmountOnExit>
                             <Box sx={{ py: 2, px: 1 }}>
                               <Grid container spacing={2}>
@@ -4064,6 +4171,67 @@ export default function AdminDashboard() {
                                     )}
                                   </Box>
                                 </Grid>
+                                {/* User Notes */}
+                                <Grid item xs={12}>
+                                  <Typography variant="caption" color="text.secondary">Notes</Typography>
+                                  <Box sx={{ mt: 0.5 }}>
+                                    {userNotesLoading[user.userId] ? (
+                                      <CircularProgress size={16} />
+                                    ) : (
+                                      <>
+                                        {(userNotesMap[user.userId] || []).length === 0 && (
+                                          <Typography variant="body2" color="text.disabled">No notes yet</Typography>
+                                        )}
+                                        {(userNotesMap[user.userId] || []).map((note) => (
+                                          <Box
+                                            key={note.id}
+                                            sx={{
+                                              display: "flex",
+                                              alignItems: "flex-start",
+                                              gap: 0.5,
+                                              mb: 0.75,
+                                              p: 0.75,
+                                              borderRadius: 1,
+                                              bgcolor: "action.hover",
+                                            }}
+                                          >
+                                            <Box sx={{ flex: 1 }}>
+                                              <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{note.content}</Typography>
+                                              <Typography variant="caption" color="text.secondary">
+                                                {format(new Date(note.timestamp), "MMM d, yyyy h:mm a")} · {note.authorEmail}
+                                              </Typography>
+                                            </Box>
+                                            <Tooltip title="Delete note">
+                                              <IconButton size="small" onClick={() => handleDeleteUserNote(user.userId, note.id)} sx={{ flexShrink: 0 }}>
+                                                <DeleteIcon sx={{ fontSize: 14 }} />
+                                              </IconButton>
+                                            </Tooltip>
+                                          </Box>
+                                        ))}
+                                        <Box sx={{ display: "flex", gap: 0.5, mt: 0.5 }}>
+                                          <TextField
+                                            size="small"
+                                            placeholder="Add a note…"
+                                            value={newNoteText[user.userId] || ""}
+                                            onChange={(e) => setNewNoteText((prev) => ({ ...prev, [user.userId]: e.target.value }))}
+                                            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleAddUserNote(user.userId); } }}
+                                            multiline
+                                            maxRows={3}
+                                            sx={{ flex: 1 }}
+                                          />
+                                          <IconButton
+                                            size="small"
+                                            color="primary"
+                                            onClick={() => handleAddUserNote(user.userId)}
+                                            disabled={addingNoteLoading[user.userId] || !(newNoteText[user.userId] || "").trim()}
+                                          >
+                                            {addingNoteLoading[user.userId] ? <CircularProgress size={16} /> : <AddIcon fontSize="small" />}
+                                          </IconButton>
+                                        </Box>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
                                 {/* Usage + actions row */}
                                 <Grid item xs={6}>
                                   <Typography variant="caption" color="text.secondary">Token Usage</Typography>
@@ -4110,6 +4278,11 @@ export default function AdminDashboard() {
                                       </Button>
                                     )}
                                     <Button size="small" variant="outlined" startIcon={<LockIcon />} onClick={() => handleSetPassword(user.userId, user.email)}>Password</Button>
+                                    <Tooltip title={user.introductionEmailSent ? `Intro email sent ${new Date(user.introductionEmailSent).toLocaleDateString()}` : "Send team introduction email"}>
+                                      <Button size="small" variant="outlined" color={user.introductionEmailSent ? "success" : "primary"} startIcon={<EmailIcon />} onClick={() => { setIntroEmailUserId(user.userId); setIntroEmailUserEmail(user.email); setIntroEmailDialogOpen(true); }}>
+                                        Intro{user.introductionEmailSent ? " ✓" : ""}
+                                      </Button>
+                                    </Tooltip>
                                     {!user.isAdmin && user.isActive !== false && (
                                       <Button size="small" variant="outlined" color="warning" startIcon={<PersonOffIcon />} onClick={() => { setSelectedUser(user); setDeactivateDialogOpen(true); }}>Deactivate</Button>
                                     )}
@@ -5646,6 +5819,21 @@ export default function AdminDashboard() {
       </Dialog>
 
       {/* Grant Token Bonus Dialog */}
+      <Dialog open={introEmailDialogOpen} onClose={() => setIntroEmailDialogOpen(false)}>
+        <DialogTitle>Send Team Introduction Email</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Send a team introduction email to <strong>{introEmailUserEmail}</strong>? The email will be CC'd to founders@agentweb.pro so the conversation can continue from there.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setIntroEmailDialogOpen(false)} disabled={introEmailLoading}>Cancel</Button>
+          <Button onClick={handleSendIntroEmail} variant="contained" disabled={introEmailLoading}>
+            {introEmailLoading ? <CircularProgress size={24} /> : "Send"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
         <DialogTitle>Grant Bonus Tokens</DialogTitle>
         <DialogContent>

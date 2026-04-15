@@ -123,7 +123,7 @@ jest.mock('uuid', () => ({
 }));
 
 jest.mock('../services/emailService', () => ({
-  emailService: { sendEmail: jest.fn() },
+  emailService: { sendEmail: jest.fn(), sendTeamIntroductionEmail: jest.fn().mockResolvedValue(undefined) },
 }));
 
 describe('Tier-based Access Control', () => {

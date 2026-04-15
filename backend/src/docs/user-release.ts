@@ -11,6 +11,27 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-15',
     changes: [
+      'Admin: User Notes — Track Status and Context for Each Client',
+      '- Admins can now add, view, and delete time-stamped notes on any user account from the Users tab in the Admin Dashboard',
+      '- Notes appear in the expanded user row, below the Support Note field, in a timeline view showing content, timestamp, and author email',
+      '- Up to 50 notes per user; oldest note is automatically dropped when the limit is exceeded',
+      '- Emma (admin) can also read, add, and delete user notes by email or userId via the manage_user_notes tool',
+      '  Example: "add a note to test1@example.com: trial extended 7 days"',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
+      'Team Introduction Email on Signup',
+      '- New users now receive a personal welcome email from the AgentWeb founders (Harsha, Rui, Fangfang & Matthew) when they sign up',
+      '- The email invites them to reply directly with any questions, and mentions Emma for reporting product issues',
+      '- Admins can also send or resend the introduction email to any user from the Users tab in the Admin Dashboard',
+      '- The Users tab now shows the date the introduction email was last sent for each user',
+    ],
+  },
+  {
+    date: '2026-04-15',
+    changes: [
       'Fixed: LinkedIn Messages Now Appear in CRM Timeline',
       '- Synced LinkedIn messages were stored in the database correctly but were not displaying in the CRM engagement timeline',
       '- Fixed a field name mismatch where the UI checked for "content" but Unipile-synced messages store text in a "text" field — both formats now render correctly',

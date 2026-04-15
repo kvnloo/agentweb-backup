@@ -2023,6 +2023,68 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'manage_user_notes',
+  definition: {
+    name: 'manage_user_notes',
+    description: `Manage time-stamped admin notes for a specific user. Notes are stored per user and sorted newest-first. Up to 50 notes per user; adding a 51st removes the oldest. Use this to track client status, blockers, or action items over time. Admin only.
+
+You can identify the user by either user_id OR email — provide one of them.
+
+Actions:
+- list: Get all notes for a user (newest first)
+- add: Add a new note for a user
+- delete: Delete a specific note by note_id`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'add', 'delete'],
+          description: 'The action to perform'
+        },
+        user_id: { type: 'string', description: 'The userId of the user (use this OR email)' },
+        email: { type: 'string', description: 'The email address of the user (use this OR user_id)' },
+        content: { type: 'string', description: 'The note text (required for add)' },
+        note_id: { type: 'string', description: 'The note ID (required for delete)' }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const { action, content, note_id } = args;
+    let { user_id, email } = args;
+
+    if (!user_id && !email) return jsonResult({ error: 'Either user_id or email is required' });
+
+    // Resolve email to userId if only email was provided
+    if (!user_id && email) {
+      const lookup = await mcpFetch({ method: 'GET', path: `/api/admin/users/lookup?email=${encodeURIComponent(email)}`, context: ctx(context) });
+      if (lookup.error || !lookup.userId) return jsonResult({ error: `User not found for email: ${email}` });
+      user_id = lookup.userId;
+    }
+
+    switch (action) {
+      case 'list': {
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/users/${user_id}/notes`, context: ctx(context) });
+        return jsonResult(data);
+      }
+      case 'add': {
+        if (!content) return jsonResult({ error: 'content is required for add' });
+        const data = await mcpFetch({ method: 'POST', path: `/api/admin/users/${user_id}/notes`, context: ctx(context), body: { content } });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        if (!note_id) return jsonResult({ error: 'note_id is required for delete' });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/users/${user_id}/notes/${note_id}`, context: ctx(context) });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${action}` });
+    }
+  }
+});
+
+mcpToolRegistry.register({
   name: 'manage_scoring_judges',
   definition: {
     name: 'manage_scoring_judges',

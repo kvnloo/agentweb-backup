@@ -425,6 +425,22 @@ router.get("/users", async (req, res) => {
   }
 });
 
+// Lookup user ID by email (used by Emma tools) — must be before /:userId to avoid param collision
+router.get("/users/lookup", async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ message: "email query parameter is required" });
+    }
+    const user = await userDb.getUserByEmail(email.toLowerCase().trim());
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json({ userId: user.userId, email: user.email });
+  } catch (error) {
+    console.error("Error looking up user by email:", error);
+    res.status(500).json({ message: "Error looking up user" });
+  }
+});
+
 // Get a single user by ID
 router.get("/users/:userId", async (req, res) => {
   try {
@@ -514,6 +530,112 @@ router.put("/users/:userId/support-note", async (req, res) => {
   } catch (error) {
     console.error("Error updating user support note:", error);
     res.status(500).json({ message: "Error updating support note" });
+  }
+});
+
+// --- User Notes (stored in AW-Settings as usernote_<userId>) ---
+const USER_NOTES_MAX = 50;
+
+export interface UserNote {
+  id: string;
+  content: string;
+  timestamp: string;
+  authorEmail: string;
+}
+
+// GET /api/admin/users/:userId/notes — list all notes, newest first
+router.get("/users/:userId/notes", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const setting = await settingsService.getSetting(`usernote_${userId}`);
+    const notes: UserNote[] = setting ? JSON.parse(setting.settingValue) : [];
+    // Return newest first
+    notes.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    res.json({ notes });
+  } catch (error) {
+    console.error("Error getting user notes:", error);
+    res.status(500).json({ message: "Error getting user notes" });
+  }
+});
+
+// POST /api/admin/users/:userId/notes — add a note
+router.post("/users/:userId/notes", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { content } = req.body;
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ message: "content is required" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const setting = await settingsService.getSetting(`usernote_${userId}`);
+    let notes: UserNote[] = setting ? JSON.parse(setting.settingValue) : [];
+
+    const newNote: UserNote = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      content: content.trim(),
+      timestamp: new Date().toISOString(),
+      authorEmail: (req as any).user?.email || "admin",
+    };
+
+    notes.push(newNote);
+
+    // Cap at 50; drop the oldest if over
+    if (notes.length > USER_NOTES_MAX) {
+      notes.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+      const dropped = notes.length - USER_NOTES_MAX;
+      notes = notes.slice(dropped);
+    }
+
+    await settingsService.setSetting(
+      `usernote_${userId}`,
+      JSON.stringify(notes),
+      `User notes for ${user.email}`,
+      (req as any).user?.email || "admin"
+    );
+
+    // Return newest first
+    notes.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    res.json({ notes, warning: notes.length === USER_NOTES_MAX ? `Limit of ${USER_NOTES_MAX} notes reached. Oldest note was removed.` : undefined });
+  } catch (error) {
+    console.error("Error adding user note:", error);
+    res.status(500).json({ message: "Error adding user note" });
+  }
+});
+
+// DELETE /api/admin/users/:userId/notes/:noteId — delete a specific note
+router.delete("/users/:userId/notes/:noteId", async (req, res) => {
+  try {
+    const { userId, noteId } = req.params;
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const setting = await settingsService.getSetting(`usernote_${userId}`);
+    let notes: UserNote[] = setting ? JSON.parse(setting.settingValue) : [];
+
+    const before = notes.length;
+    notes = notes.filter((n) => n.id !== noteId);
+    if (notes.length === before) {
+      return res.status(404).json({ message: "Note not found" });
+    }
+
+    await settingsService.setSetting(
+      `usernote_${userId}`,
+      JSON.stringify(notes),
+      `User notes for ${user.email}`,
+      (req as any).user?.email || "admin"
+    );
+
+    notes.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    res.json({ notes });
+  } catch (error) {
+    console.error("Error deleting user note:", error);
+    res.status(500).json({ message: "Error deleting user note" });
   }
 });
 
@@ -4356,6 +4478,26 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Send team introduction email to a user
+router.post("/users/:userId/send-intro-email", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await emailService.sendTeamIntroductionEmail(user.email, user.displayName);
+    const sentAt = new Date().toISOString();
+    const updatedUser = await userDb.updateUser(userId, { introductionEmailSent: sentAt });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error sending team introduction email:", error);
+    res.status(500).json({ message: "Error sending team introduction email" });
   }
 });
 
