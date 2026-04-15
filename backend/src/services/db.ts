@@ -826,6 +826,43 @@ class UserDB {
     }
   }
 
+  async updateUserEmail(
+    userId: string,
+    newEmail: string
+  ): Promise<{ success: boolean; user?: User; message?: string }> {
+    const normalizedNew = newEmail.toLowerCase().trim();
+
+    // Get current user
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      return { success: false, message: "User not found." };
+    }
+
+    // Check new email not already taken
+    const existing = await this.getUserByEmail(normalizedNew);
+    if (existing) {
+      return { success: false, message: "Email is already in use by another account." };
+    }
+
+    // Write new item with updated email (same userId and all other fields)
+    const newItem = { ...user, email: normalizedNew };
+    await this.docClient
+      .put({ TableName: this.tableName, Item: newItem })
+      .promise();
+
+    // Tombstone the old item: update its userId to "deleted_<userId>" so it can be cleaned up later
+    await this.docClient
+      .update({
+        TableName: this.tableName,
+        Key: { email: user.email },
+        UpdateExpression: "SET userId = :tombstone",
+        ExpressionAttributeValues: { ":tombstone": `deleted_${userId}` },
+      })
+      .promise();
+
+    return { success: true, user: newItem as User };
+  }
+
   async getUserByResetToken(resetToken: string): Promise<User | null> {
     try {
       const params = {

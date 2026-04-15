@@ -1081,6 +1081,33 @@ router.put("/users/:userId/cms-type", async (req, res) => {
   }
 });
 
+// Update user primary email (delete-and-recreate — old record tombstoned with deleted_ prefix)
+router.put("/users/:userId/email", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { newEmail } = req.body;
+
+    if (!newEmail || typeof newEmail !== "string") {
+      return res.status(400).json({ message: "newEmail is required" });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(newEmail.trim())) {
+      return res.status(400).json({ message: "Invalid email format" });
+    }
+
+    const result = await userDb.updateUserEmail(userId, newEmail.trim());
+    if (!result.success) {
+      return res.status(400).json({ message: result.message });
+    }
+
+    res.json(result.user);
+  } catch (error) {
+    console.error("Error updating user email:", error);
+    res.status(500).json({ message: "Error updating user email" });
+  }
+});
+
 // Update user password
 router.put("/users/:userId/password", async (req, res) => {
   try {
