@@ -4523,4 +4523,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed a data consistency issue where logos uploaded just before saving or deleting could be silently lost due to a stale database read',
     ],
   },
+  {
+    date: '2026-04-16',
+    changes: [
+      'Fixed: Session Scoring Now Correctly Recognizes Tool Calls',
+      '- The satisfaction scorer and custom judges now see when the assistant used tools (like create_social_media_posts, search_web) during a session',
+      '- Previously, assistant turns that only made tool calls had empty text content, making the judge incorrectly conclude no tools were used',
+      '- Tool results are now included in the scoring transcript so judges can evaluate whether tasks were actually completed',
+    ],
+  },
 ];
