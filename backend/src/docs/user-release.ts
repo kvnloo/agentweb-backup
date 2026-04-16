@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-16',
     changes: [
+      'Admin: Slack Channel Name Now Shown in User Details',
+      '- The Users tab in the Admin Dashboard now resolves Slack channel IDs to their human-readable names (e.g. #test-channel)',
+      '- Channel names appear alongside the ID in the user details row and in the channel configuration dialog for easy double-checking',
+      '- Channels where the bot is not a member gracefully fall back to showing the raw channel ID',
+    ],
+  },
+  {
+    date: '2026-04-16',
+    changes: [
       'Fixed: Duplicate LinkedIn Comments Now Prevented',
       '- Emma now checks whether your connected LinkedIn account has already commented on a post before posting',
       '- If a comment already exists from your account, Emma skips the duplicate and reports back that the comment was already made',
