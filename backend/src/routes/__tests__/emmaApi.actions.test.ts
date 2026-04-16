@@ -85,9 +85,10 @@ describe('GET /api/emma/actions', () => {
     const params = mockScan.mock.calls[0][0];
     expect(params.FilterExpression).toContain('#src = :src');
     expect(params.ExpressionAttributeValues[':src']).toBe('emma_session');
-    // tenant-scoping guard
+    // tenant-scoping guard — must NOT have attribute_not_exists fallback
     expect(params.ExpressionAttributeValues[':uid']).toBe('user-123');
-    expect(params.FilterExpression).toContain('tenantId');
+    expect(params.FilterExpression).toContain('tenantId = :uid');
+    expect(params.FilterExpression).not.toContain('attribute_not_exists');
   });
 
   it('caps limit at 200 even when a larger value is requested', async () => {
@@ -96,6 +97,44 @@ describe('GET /api/emma/actions', () => {
     const params = mockScan.mock.calls[0][0];
     // request limit is capped at 200; scan Limit is 4x the cap for overscan
     expect(params.Limit).toBeLessThanOrEqual(200 * 4);
+  });
+
+  it('does not return events belonging to a different tenant (cross-tenant isolation)', async () => {
+    // Simulate DynamoDB returning events that belong to user-B (shouldn't
+    // happen if FilterExpression is correct, but validates the query shape).
+    mockScan.mockResolvedValueOnce({
+      Items: [
+        {
+          eventId: 'evt_other',
+          eventTimestamp: '2026-04-11T00:00:00.000Z',
+          eventType: 'engagement.emma_session',
+          contactId: 'other@example.com',
+          source: 'emma_session',
+          tenantId: 'user-B',
+          sourceRecordId: 'src-other',
+          payload: {},
+        },
+      ],
+    });
+
+    const res = await request(makeApp()).get('/api/emma/actions');
+    expect(res.status).toBe(200);
+
+    // The FilterExpression must include `tenantId = :uid` with :uid = 'user-123'
+    const params = mockScan.mock.calls[0][0];
+    expect(params.FilterExpression).toBe('#src = :src AND tenantId = :uid');
+    expect(params.ExpressionAttributeValues[':uid']).toBe('user-123');
+    // No attribute_not_exists fallback that could leak untenanted rows
+    expect(params.FilterExpression).not.toContain('attribute_not_exists');
+  });
+
+  it('clamps negative limit to 1 instead of erroring', async () => {
+    mockScan.mockResolvedValueOnce({ Items: [] });
+    const res = await request(makeApp()).get('/api/emma/actions?limit=-5');
+    expect(res.status).toBe(200);
+    const params = mockScan.mock.calls[0][0];
+    // negative input should become 1, then overscan = 4
+    expect(params.Limit).toBe(4);
   });
 
   it('returns 500 on dynamo failure', async () => {

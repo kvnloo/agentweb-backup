@@ -730,7 +730,7 @@ router.post('/search-leads', async (req: Request, res: Response) => {
 
 router.get('/actions', async (req: Request, res: Response) => {
   try {
-    const limit = Math.min(parseInt(String(req.query.limit || '50'), 10) || 50, 200);
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10) || 50, 1), 200);
     const { dynamodb } = await import('../config/aws');
     const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
     const TABLE_NAME = `${TABLE_PREFIX}AW-ContactEvents`;
@@ -741,7 +741,7 @@ router.get('/actions', async (req: Request, res: Response) => {
     const result = await dynamodb
       .scan({
         TableName: TABLE_NAME,
-        FilterExpression: '#src = :src AND (attribute_not_exists(tenantId) OR tenantId = :uid)',
+        FilterExpression: '#src = :src AND tenantId = :uid',
         ExpressionAttributeNames: { '#src': 'source' },
         ExpressionAttributeValues: { ':src': 'emma_session', ':uid': userId(req) },
         Limit: limit * 4, // overscan because filter is applied post-read
