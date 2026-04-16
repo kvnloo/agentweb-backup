@@ -1,6 +1,7 @@
 /**
- * Unit tests for HubSpotService — Contacts CRUD methods
- * Tests cover: listContacts, findContactByEmail, createContact, updateContact, deleteContact
+ * Unit tests for HubSpotService
+ * Covers: create() factory, token caching, contacts CRUD, new methods (upsertContact,
+ * createDeal, updateDeal, associateContactToDeal, ensureDealProperty, testConnection)
  */
 
 process.env.JWT_SECRET = 'test-secret';
@@ -31,8 +32,11 @@ const mockAxiosGet = axios.get as jest.Mock;
 const mockAxiosPost = axios.post as jest.Mock;
 const mockAxiosPatch = axios.patch as jest.Mock;
 const mockAxiosDelete = axios.delete as jest.Mock;
+const mockAxiosPut = axios.put as jest.Mock;
 const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
 const mockGetAccountById = getAccountById as jest.MockedFunction<typeof getAccountById>;
+
+const VALID_EXPIRES_AT = Date.now() + 3600 * 1000;
 
 const MOCK_ACCOUNT = {
   platform: 'hubspot' as const,
@@ -42,7 +46,7 @@ const MOCK_ACCOUNT = {
     account_type: 'oauth' as const,
     access_token: 'valid-token',
     refresh_token: 'refresh-token',
-    token_expires_at: Date.now() + 3600 * 1000,
+    token_expires_at: VALID_EXPIRES_AT,
     hub_id: 12345,
     hub_domain: 'mycompany.hubspot.com',
   },
@@ -65,187 +69,542 @@ const MOCK_HS_CONTACT = {
   },
 };
 
-describe('HubSpotService — Contacts CRUD', () => {
-  let service: HubSpotService;
+const MOCK_HS_DEAL = {
+  id: 'hs-deal-1',
+  properties: {
+    dealname: 'John Doe - Deal',
+    amount: '5000',
+    dealstage: 'appointmentscheduled',
+  },
+};
 
-  beforeEach(() => {
-    service = new HubSpotService();
-    jest.clearAllMocks();
+// ─── create() factory and token caching ──────────────────────────────────────
+
+describe('HubSpotService — create() factory and token caching', () => {
+  it('create() resolves token via DB lookup (one read)', async () => {
     mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
-    mockGetAccountById.mockResolvedValue(MOCK_ACCOUNT);
+    await HubSpotService.create('user-1');
+    expect(mockGetAccountsByUserId).toHaveBeenCalledTimes(1);
   });
 
-  // ─── listContacts ─────────────────────────────────────────────────
+  it('service methods use cached token without extra DB reads after create()', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
 
-  describe('listContacts', () => {
-    it('returns mapped contacts array from HubSpot', async () => {
-      mockAxiosGet.mockResolvedValue({
-        data: { results: [MOCK_HS_CONTACT], paging: { next: { after: 'cursor-100' } } },
-      });
+    const svc = await HubSpotService.create('user-1');
+    mockGetAccountsByUserId.mockClear();
 
-      const result = await service.listContacts('user-1');
+    await svc.listContacts();
+    await svc.listContacts();
+    await svc.listContacts();
 
-      expect(mockAxiosGet).toHaveBeenCalledWith(
-        expect.stringContaining('crm/v3/objects/contacts'),
-        expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer valid-token' }) })
-      );
-      expect(result.contacts).toHaveLength(1);
-      expect(result.contacts[0]).toMatchObject({
-        contactId: 'hs-contact-1',
-        email: 'john@acme.com',
-        firstName: 'John',
-        lastName: 'Doe',
-        company: 'Acme Corp',
-      });
-      expect(result.nextCursor).toBe('cursor-100');
-    });
-
-    it('passes after cursor for pagination', async () => {
-      mockAxiosGet.mockResolvedValue({ data: { results: [] } });
-
-      await service.listContacts('user-1', undefined, 'some-cursor');
-
-      expect(mockAxiosGet).toHaveBeenCalledWith(
-        expect.stringContaining('after=some-cursor'),
-        expect.any(Object)
-      );
-    });
-
-    it('returns empty array when no contacts', async () => {
-      mockAxiosGet.mockResolvedValue({ data: { results: [] } });
-      const result = await service.listContacts('user-1');
-      expect(result.contacts).toHaveLength(0);
-      expect(result.nextCursor).toBeUndefined();
-    });
-
-    it('throws if no HubSpot account connected', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([]);
-      await expect(service.listContacts('user-1')).rejects.toThrow('HubSpot account not connected');
-    });
+    // No further DB reads — token is cached on the instance
+    expect(mockGetAccountsByUserId).not.toHaveBeenCalled();
   });
 
-  // ─── findContactByEmail ───────────────────────────────────────────
+  it('fromToken() skips DB lookup entirely', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
 
-  describe('findContactByEmail', () => {
-    it('returns contact when found by email', async () => {
-      mockAxiosPost.mockResolvedValue({ data: { results: [MOCK_HS_CONTACT] } });
+    const svc = HubSpotService.fromToken('direct-api-key');
+    await svc.listContacts();
 
-      const contact = await service.findContactByEmail('user-1', 'john@acme.com');
-
-      expect(contact).not.toBeNull();
-      expect(contact?.email).toBe('john@acme.com');
-      expect(mockAxiosPost).toHaveBeenCalledWith(
-        expect.stringContaining('crm/v3/objects/contacts/search'),
-        expect.objectContaining({ filterGroups: expect.any(Array) }),
-        expect.any(Object)
-      );
-    });
-
-    it('returns null when contact not found', async () => {
-      mockAxiosPost.mockResolvedValue({ data: { results: [] } });
-      const contact = await service.findContactByEmail('user-1', 'nobody@nowhere.com');
-      expect(contact).toBeNull();
-    });
+    expect(mockGetAccountsByUserId).not.toHaveBeenCalled();
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts'),
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer direct-api-key' }) })
+    );
   });
 
-  // ─── createContact ────────────────────────────────────────────────
+  it('create() refreshes token when expiring soon', async () => {
+    const expiringSoonAccount = {
+      ...MOCK_ACCOUNT,
+      config: {
+        ...MOCK_ACCOUNT.config,
+        token_expires_at: Date.now() + 30 * 1000, // 30s — within 60s buffer
+      },
+    };
+    mockGetAccountsByUserId.mockResolvedValue([expiringSoonAccount]);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'refreshed-token', refresh_token: 'new-refresh', expires_in: 3600 },
+    });
+    (updateAccountTokens as jest.Mock).mockResolvedValue(undefined);
 
-  describe('createContact', () => {
-    it('creates contact and returns mapped result', async () => {
-      mockAxiosPost.mockResolvedValue({ data: MOCK_HS_CONTACT });
+    await HubSpotService.create('user-1');
 
-      const contact = await service.createContact('user-1', {
-        email: 'john@acme.com',
-        firstName: 'John',
-        lastName: 'Doe',
-        company: 'Acme Corp',
-        phone: '+1234567890',
-        jobTitle: 'CTO',
-        linkedinUrl: 'https://linkedin.com/in/johndoe',
-      });
+    // Should have called HubSpot token endpoint during factory
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('oauth/v1/token'),
+      expect.any(String),
+      expect.any(Object)
+    );
+  });
+});
 
-      expect(mockAxiosPost).toHaveBeenCalledWith(
-        expect.stringContaining('crm/v3/objects/contacts'),
-        expect.objectContaining({
-          properties: expect.objectContaining({
-            email: 'john@acme.com',
-            firstname: 'John',
-            lastname: 'Doe',
-            company: 'Acme Corp',
-          }),
+// ─── testConnection ────────────────────────────────────────────────────────────
+
+describe('HubSpotService — testConnection', () => {
+  let svc: HubSpotService;
+  beforeEach(() => {
+    svc = HubSpotService.fromToken('test-token');
+  });
+
+  it('returns valid:true when API responds successfully', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    const result = await svc.testConnection();
+    expect(result.valid).toBe(true);
+    expect(result.error).toBeUndefined();
+  });
+
+  it('returns valid:false with error message on API failure', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { data: { message: 'Invalid token' } } });
+    const result = await svc.testConnection();
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe('Invalid token');
+  });
+});
+
+// ─── listContacts ─────────────────────────────────────────────────────────────
+
+describe('HubSpotService — listContacts', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns mapped contacts array from HubSpot', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [MOCK_HS_CONTACT], paging: { next: { after: 'cursor-100' } } },
+    });
+
+    const result = await svc.listContacts();
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts'),
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer valid-token' }) })
+    );
+    expect(result.contacts).toHaveLength(1);
+    expect(result.contacts[0]).toMatchObject({
+      contactId: 'hs-contact-1',
+      email: 'john@acme.com',
+      firstName: 'John',
+      lastName: 'Doe',
+      company: 'Acme Corp',
+    });
+    expect(result.nextCursor).toBe('cursor-100');
+  });
+
+  it('passes after cursor for pagination', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    await svc.listContacts('some-cursor');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('after=some-cursor'),
+      expect.any(Object)
+    );
+  });
+
+  it('returns empty array when no contacts', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    const result = await svc.listContacts();
+    expect(result.contacts).toHaveLength(0);
+    expect(result.nextCursor).toBeUndefined();
+  });
+});
+
+// ─── findContactByEmail ────────────────────────────────────────────────────────
+
+describe('HubSpotService — findContactByEmail', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns contact when found by email', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { results: [MOCK_HS_CONTACT] } });
+    const contact = await svc.findContactByEmail('john@acme.com');
+    expect(contact).not.toBeNull();
+    expect(contact?.email).toBe('john@acme.com');
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts/search'),
+      expect.objectContaining({ filterGroups: expect.any(Array) }),
+      expect.any(Object)
+    );
+  });
+
+  it('returns null when contact not found', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { results: [] } });
+    const contact = await svc.findContactByEmail('nobody@nowhere.com');
+    expect(contact).toBeNull();
+  });
+});
+
+// ─── upsertContact ─────────────────────────────────────────────────────────────
+
+describe('HubSpotService — upsertContact', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('creates contact and returns isNew:true when not found', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [] } })           // search → not found
+      .mockResolvedValueOnce({ data: MOCK_HS_CONTACT });           // create
+
+    const result = await svc.upsertContact({ email: 'john@acme.com', firstName: 'John', lastName: 'Doe' });
+    expect(result.isNew).toBe(true);
+    expect(result.contactId).toBe('hs-contact-1');
+  });
+
+  it('updates contact and returns isNew:false when found by email', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [MOCK_HS_CONTACT] } }); // search → found
+    mockAxiosPatch.mockResolvedValueOnce({ data: MOCK_HS_CONTACT });               // update
+
+    const result = await svc.upsertContact({ email: 'john@acme.com', firstName: 'John' });
+    expect(result.isNew).toBe(false);
+    expect(result.contactId).toBe('hs-contact-1');
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      expect.stringContaining('hs-contact-1'),
+      expect.any(Object),
+      expect.any(Object)
+    );
+  });
+
+  it('merges customFields into properties on create', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [] } })
+      .mockResolvedValueOnce({ data: MOCK_HS_CONTACT });
+
+    await svc.upsertContact({ email: 'john@acme.com', customFields: { custom_score: '90' } });
+
+    expect(mockAxiosPost).toHaveBeenLastCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts'),
+      expect.objectContaining({ properties: expect.objectContaining({ custom_score: '90' }) }),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── createContact ─────────────────────────────────────────────────────────────
+
+describe('HubSpotService — createContact', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('creates contact and returns mapped result', async () => {
+    mockAxiosPost.mockResolvedValue({ data: MOCK_HS_CONTACT });
+    const contact = await svc.createContact({
+      email: 'john@acme.com',
+      firstName: 'John',
+      lastName: 'Doe',
+      company: 'Acme Corp',
+      phone: '+1234567890',
+      jobTitle: 'CTO',
+      linkedinUrl: 'https://linkedin.com/in/johndoe',
+    });
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts'),
+      expect.objectContaining({
+        properties: expect.objectContaining({
+          email: 'john@acme.com',
+          firstname: 'John',
+          lastname: 'Doe',
+          company: 'Acme Corp',
         }),
-        expect.any(Object)
-      );
-      expect(contact.contactId).toBe('hs-contact-1');
-      expect(contact.email).toBe('john@acme.com');
-    });
-
-    it('throws on API error', async () => {
-      mockAxiosPost.mockRejectedValue(new Error('API error'));
-      await expect(service.createContact('user-1', { email: 'x@x.com' })).rejects.toThrow('API error');
-    });
-
-    it('maps all optional fields correctly', async () => {
-      mockAxiosPost.mockResolvedValue({ data: MOCK_HS_CONTACT });
-
-      await service.createContact('user-1', {
-        email: 'test@test.com',
-        linkedinUrl: 'https://linkedin.com/in/test',
-      });
-
-      expect(mockAxiosPost).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          properties: expect.objectContaining({
-            hs_linkedin_url: 'https://linkedin.com/in/test',
-          }),
-        }),
-        expect.any(Object)
-      );
-    });
+      }),
+      expect.any(Object)
+    );
+    expect(contact.contactId).toBe('hs-contact-1');
   });
 
-  // ─── updateContact ────────────────────────────────────────────────
+  it('throws on API error', async () => {
+    mockAxiosPost.mockRejectedValue(new Error('API error'));
+    await expect(svc.createContact({ email: 'x@x.com' })).rejects.toThrow('API error');
+  });
+});
 
-  describe('updateContact', () => {
-    it('patches contact by id with correct properties', async () => {
-      mockAxiosPatch.mockResolvedValue({ data: MOCK_HS_CONTACT });
+// ─── updateContact ─────────────────────────────────────────────────────────────
 
-      const contact = await service.updateContact('user-1', 'hs-contact-1', { jobTitle: 'CEO' });
+describe('HubSpotService — updateContact', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
 
-      expect(mockAxiosPatch).toHaveBeenCalledWith(
-        expect.stringContaining('crm/v3/objects/contacts/hs-contact-1'),
-        expect.objectContaining({
-          properties: expect.objectContaining({ jobtitle: 'CEO' }),
-        }),
-        expect.any(Object)
-      );
-      expect(contact.contactId).toBe('hs-contact-1');
-    });
+  it('patches contact by id', async () => {
+    mockAxiosPatch.mockResolvedValue({ data: MOCK_HS_CONTACT });
+    const contact = await svc.updateContact('hs-contact-1', { jobTitle: 'CEO' });
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts/hs-contact-1'),
+      expect.objectContaining({ properties: expect.objectContaining({ jobtitle: 'CEO' }) }),
+      expect.any(Object)
+    );
+    expect(contact.contactId).toBe('hs-contact-1');
+  });
+});
 
-    it('throws on invalid contact id', async () => {
-      mockAxiosPatch.mockRejectedValue({ response: { status: 404 } });
-      await expect(service.updateContact('user-1', 'bad-id', { firstName: 'X' })).rejects.toBeDefined();
-    });
+// ─── deleteContact ─────────────────────────────────────────────────────────────
+
+describe('HubSpotService — deleteContact', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('calls delete on correct contact endpoint', async () => {
+    mockAxiosDelete.mockResolvedValue({ data: {} });
+    await svc.deleteContact('hs-contact-1');
+    expect(mockAxiosDelete).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts/hs-contact-1'),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── createDeal ────────────────────────────────────────────────────────────────
+
+describe('HubSpotService — createDeal', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('posts to deals endpoint and returns deal id', async () => {
+    mockAxiosPost.mockResolvedValue({ data: MOCK_HS_DEAL });
+    const dealId = await svc.createDeal({ dealname: 'Test Deal', amount: '5000' });
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/deals'),
+      expect.objectContaining({ properties: expect.objectContaining({ dealname: 'Test Deal' }) }),
+      expect.any(Object)
+    );
+    expect(dealId).toBe('hs-deal-1');
+  });
+});
+
+// ─── updateDeal ────────────────────────────────────────────────────────────────
+
+describe('HubSpotService — updateDeal', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('patches deal by id', async () => {
+    mockAxiosPatch.mockResolvedValue({ data: MOCK_HS_DEAL });
+    await svc.updateDeal('hs-deal-1', { amount: '9000' });
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/deals/hs-deal-1'),
+      expect.objectContaining({ properties: expect.objectContaining({ amount: '9000' }) }),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── associateContactToDeal ────────────────────────────────────────────────────
+
+describe('HubSpotService — associateContactToDeal', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('calls v4 associations default endpoint', async () => {
+    mockAxiosPut.mockResolvedValue({ data: {} });
+    await svc.associateContactToDeal('hs-contact-1', 'hs-deal-1');
+    expect(mockAxiosPut).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v4/objects/contacts/hs-contact-1/associations/default/deals/hs-deal-1'),
+      undefined,
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── ensureDealProperty ────────────────────────────────────────────────────────
+
+describe('HubSpotService — ensureDealProperty', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns existing property name when it exists (no create)', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'custom_score' } });
+    const name = await svc.ensureDealProperty('custom_score', 'Custom Score');
+    expect(name).toBe('custom_score');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
-  // ─── deleteContact ────────────────────────────────────────────────
+  it('creates property when 404 and returns slug', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    mockAxiosPost.mockResolvedValue({ data: { name: 'custom_score' } });
+    const name = await svc.ensureDealProperty('Custom Score!', 'Custom Score');
+    expect(name).toBe('custom_score');
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/properties/deals'),
+      expect.objectContaining({ name: 'custom_score' }),
+      expect.any(Object)
+    );
+  });
 
-  describe('deleteContact', () => {
-    it('calls delete on correct contact endpoint', async () => {
-      mockAxiosDelete.mockResolvedValue({ data: {} });
+  it('sanitises property name to lowercase alphanumeric+underscore', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    mockAxiosPost.mockResolvedValue({ data: { name: 'my_custom_field' } });
+    const name = await svc.ensureDealProperty('My Custom Field!', 'My Custom Field');
+    expect(name).toBe('my_custom_field');
+  });
+});
 
-      await service.deleteContact('user-1', 'hs-contact-1');
+// ─── getDealPipelineStages ────────────────────────────────────────────────────
 
-      expect(mockAxiosDelete).toHaveBeenCalledWith(
-        expect.stringContaining('crm/v3/objects/contacts/hs-contact-1'),
-        expect.any(Object)
-      );
+describe('HubSpotService — getDealPipelineStages', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns non-archived stages from the requested pipeline', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: {
+        stages: [
+          { id: 'appointmentscheduled', label: 'Appointment Scheduled', displayOrder: 0, metadata: { probability: '0.2' } },
+          { id: 'archived_stage', label: 'Archived', displayOrder: 1, archived: true },
+        ],
+      },
     });
 
-    it('throws on API error', async () => {
-      mockAxiosDelete.mockRejectedValue(new Error('Not found'));
-      await expect(service.deleteContact('user-1', 'bad-id')).rejects.toThrow('Not found');
+    const stages = await svc.getDealPipelineStages('default');
+    expect(stages).toEqual([
+      expect.objectContaining({
+        id: 'appointmentscheduled',
+        label: 'Appointment Scheduled',
+        displayOrder: 0,
+      }),
+    ]);
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('crm/pipelines/2026-03/deals/default'),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── createDealStage ──────────────────────────────────────────────────────────
+
+describe('HubSpotService — createDealStage', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('creates a stage on the requested pipeline', async () => {
+    mockAxiosPost.mockResolvedValue({
+      data: {
+        id: 'qualified',
+        label: 'Qualified',
+        displayOrder: 3,
+        metadata: { probability: 0.5 },
+      },
     });
+
+    const stage = await svc.createDealStage('default', {
+      stageId: 'qualified',
+      label: 'Qualified',
+      displayOrder: 3,
+      probability: 0.53,
+    });
+
+    expect(stage).toEqual(expect.objectContaining({
+      id: 'qualified',
+      label: 'Qualified',
+      displayOrder: 3,
+    }));
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/pipelines/2026-03/deals/default/stages'),
+      expect.objectContaining({
+        stageId: 'qualified',
+        label: 'Qualified',
+        displayOrder: 3,
+        metadata: { probability: 0.5 },
+      }),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── ensureContactProperty ────────────────────────────────────────────────────
+
+describe('HubSpotService — ensureContactProperty', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns existing property name when it exists', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'existing_prop' } });
+    const name = await svc.ensureContactProperty('existing_prop', 'Existing Prop');
+    expect(name).toBe('existing_prop');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('creates property when 404', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    mockAxiosPost.mockResolvedValue({ data: { name: 'new_prop' } });
+    const name = await svc.ensureContactProperty('new_prop', 'New Prop');
+    expect(name).toBe('new_prop');
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/properties/contacts'),
+      expect.objectContaining({ name: 'new_prop' }),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── listContactsPage ─────────────────────────────────────────────────────────
+
+describe('HubSpotService — listContactsPage', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('fetches contacts with specified properties and returns raw results', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [MOCK_HS_CONTACT], paging: { next: { after: 'next-cursor' } } },
+    });
+    const result = await svc.listContactsPage(['email', 'firstname']);
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('properties=email%2Cfirstname'),
+      expect.any(Object)
+    );
+    expect(result.results).toHaveLength(1);
+    expect(result.nextCursor).toBe('next-cursor');
+  });
+
+  it('appends after cursor when provided', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    await svc.listContactsPage(['email'], 'cursor-xyz');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('after=cursor-xyz'),
+      expect.any(Object)
+    );
+  });
+});
+
+// ─── getContactDealAssociations ────────────────────────────────────────────────
+
+describe('HubSpotService — getContactDealAssociations', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns array of deal ids from associations', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [{ id: 'deal-1' }, { id: 'deal-2' }] },
+    });
+    const ids = await svc.getContactDealAssociations('hs-contact-1');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('contacts/hs-contact-1/associations/deals'),
+      expect.any(Object)
+    );
+    expect(ids).toEqual(['deal-1', 'deal-2']);
+  });
+
+  it('returns empty array when no deals associated', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    const ids = await svc.getContactDealAssociations('hs-contact-1');
+    expect(ids).toEqual([]);
+  });
+});
+
+// ─── getDeal ──────────────────────────────────────────────────────────────────
+
+describe('HubSpotService — getDeal', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('fetches deal by id with specified properties', async () => {
+    mockAxiosGet.mockResolvedValue({ data: MOCK_HS_DEAL });
+    const deal = await svc.getDeal('hs-deal-1', ['amount', 'dealstage']);
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/deals/hs-deal-1'),
+      expect.any(Object)
+    );
+    expect(deal).toEqual(MOCK_HS_DEAL);
+  });
+
+  it('returns null on 404', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    const deal = await svc.getDeal('bad-id', ['amount']);
+    expect(deal).toBeNull();
   });
 });

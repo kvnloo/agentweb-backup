@@ -6,7 +6,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
-import { hubspotService } from '../services/hubspotService';
+import { HubSpotService } from '../services/hubspotService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
@@ -617,8 +617,10 @@ router.post('/hubspot', async (req: express.Request, res: express.Response) => {
 
       let email = data.properties.email;
       if (!email) {
-        const fetchedEmail = await hubspotService.getContactEmailById(userId, objectId, data.portalId.toString());
-        if (fetchedEmail) email = fetchedEmail;
+        try {
+          const fetchedEmail = await (await HubSpotService.create(userId)).getContactEmailById(objectId);
+          if (fetchedEmail) email = fetchedEmail;
+        } catch { /* non-fatal — skip if token unavailable */ }
       }
 
       if (!email) {

@@ -46,81 +46,188 @@ export interface HubSpotContact {
   customFields?: Record<string, any>;
 }
 
+export interface UpsertContactResult {
+  contactId: string;
+  isNew: boolean;
+}
+
+export interface HubSpotPipelineStage {
+  id: string;
+  label: string;
+  displayOrder: number;
+  metadata?: Record<string, any>;
+  archived?: boolean;
+}
+
+export interface HubSpotPipeline {
+  id: string;
+  label: string;
+  displayOrder: number;
+  stages: HubSpotPipelineStage[];
+}
+
 const TOKEN_REFRESH_BUFFER_MS = 60 * 1000; // refresh 60s before expiry
-const refreshLocks = new Map<string, Promise<string>>();
+
+// Stores in-flight refresh promises keyed by "userId:accountId".
+// Value is { access_token, token_expires_at } so waiting callers get both.
+const refreshLocks = new Map<string, Promise<{ access_token: string; token_expires_at: number }>>();
+
+// ─── Module-level account resolver ───────────────────────────────────────────
+// Used by both the static factory and the mid-operation refresh path.
+
+async function resolveHubSpotAccount(userId: string, accountId?: string) {
+  if (accountId) {
+    const account = await getAccountById(accountId, userId);
+    if (!account || account.platform !== 'hubspot') {
+      throw new Error(`HubSpot account "${accountId}" not found. Please reconnect your account.`);
+    }
+    return account;
+  }
+
+  const accounts = await getAccountsByUserId(userId);
+  const hubspotAccounts = accounts.filter(acc => acc.platform === 'hubspot');
+  if (hubspotAccounts.length === 0) {
+    throw new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
+  }
+  if (hubspotAccounts.length > 1) {
+    const list = hubspotAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+    throw new Error(`Multiple HubSpot accounts found: [${list}]. Specify account_id.`);
+  }
+  return hubspotAccounts[0];
+}
 
 export class HubSpotService {
+  // ─── Instance state ───────────────────────────────────────────────────────
+  // _token      — always set; for direct (Private App) tokens, _tokenExpiresAt is undefined
+  // _userId     — stored for mid-operation refresh; absent on direct-token instances
+  // _accountId  — same
+  // _tokenExpiresAt — undefined means "never refreshes" (direct token path)
+  private _token: string;
+  private readonly _userId?: string;
+  private readonly _accountId?: string;
+  private _tokenExpiresAt?: number;
+
+  private constructor(
+    token: string,
+    userId?: string,
+    accountId?: string,
+    tokenExpiresAt?: number,
+  ) {
+    this._token = token;
+    this._userId = userId;
+    this._accountId = accountId;
+    this._tokenExpiresAt = tokenExpiresAt;
+  }
+
+  // ─── Factories ────────────────────────────────────────────────────────────
+
   /**
-   * Returns a valid HubSpot access token, refreshing it if it's expired/expiring soon.
-   * If multiple HubSpot accounts are connected, accountId is required.
+   * OAuth path — resolves and (if needed) refreshes the token from the DB,
+   * then returns a fully-initialised instance. One DB read per operation.
    */
-  async getValidAccessToken(userId: string, accountId?: string): Promise<string> {
-    const account = await this.resolveHubSpotAccount(userId, accountId);
+  static async create(userId: string, accountId?: string): Promise<HubSpotService> {
+    const account = await resolveHubSpotAccount(userId, accountId);
     const config = account.config as any;
+    const expiresAt: number = config.token_expires_at || 0;
 
-    const expiresAt = config.token_expires_at || 0;
-    const isExpiringSoon = expiresAt - Date.now() < TOKEN_REFRESH_BUFFER_MS;
-
-    if (!isExpiringSoon) {
-      return config.access_token;
+    if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
+      return new HubSpotService(config.access_token, userId, account.account_id, expiresAt);
     }
 
     if (!config.refresh_token) {
       throw new Error('HubSpot access token expired and no refresh token is available. Please reconnect your HubSpot account.');
     }
 
-    const lockKey = `${userId}:${account.account_id}`;
+    // Token is expiring — create provisional instance, refresh, then return it.
+    const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt);
+    await instance.doRefresh(userId, account.account_id, config.refresh_token);
+    return instance;
+  }
+
+  /**
+   * Private App token path — bypasses all DB / OAuth logic.
+   * Used by HubspotAdapter for token-based (non-OAuth) connections.
+   */
+  static fromToken(apiKey: string): HubSpotService {
+    return new HubSpotService(apiKey); // no _tokenExpiresAt → never refreshes
+  }
+
+  // ─── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Returns a valid access token for this instance.
+   * - Direct token (no _tokenExpiresAt): returned immediately, zero I/O.
+   * - OAuth token still fresh: returned from cache.
+   * - OAuth token expiring mid-operation: refreshes and updates instance state.
+   */
+  private async token(): Promise<string> {
+    if (!this._tokenExpiresAt) return this._token;
+
+    if (this._tokenExpiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) return this._token;
+
+    // Expiring mid-operation — refresh using stored credentials
+    if (!this._userId || !this._accountId) {
+      throw new Error('Cannot refresh: OAuth context missing on this instance.');
+    }
+    const account = await resolveHubSpotAccount(this._userId, this._accountId);
+    const config = account.config as any;
+    if (!config.refresh_token) {
+      throw new Error('HubSpot access token expired and no refresh token is available. Please reconnect your HubSpot account.');
+    }
+    await this.doRefresh(this._userId, this._accountId, config.refresh_token);
+    return this._token;
+  }
+
+  private async doRefresh(userId: string, accountId: string, refreshToken: string): Promise<void> {
+    const hubspotConfig = await getHubSpotConfig();
+    const lockKey = `${userId}:${accountId}`;
+
     if (refreshLocks.has(lockKey)) {
-      return refreshLocks.get(lockKey)!;
+      const result = await refreshLocks.get(lockKey)!;
+      this._token = result.access_token;
+      this._tokenExpiresAt = result.token_expires_at;
+      return;
     }
 
-    const refreshPromise = this.refreshToken(userId, account.account_id, config.refresh_token)
-      .finally(() => {
-        refreshLocks.delete(lockKey);
-      });
-    refreshLocks.set(lockKey, refreshPromise);
-    return refreshPromise;
-  }
+    const refreshPromise = (async () => {
+      const response = await axios.post(
+        hubspotConfig.tokenUrl,
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: hubspotConfig.clientId,
+          client_secret: hubspotConfig.clientSecret,
+        }).toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
 
-  private async refreshToken(userId: string, accountId: string, refreshToken: string): Promise<string> {
-    const hubspotConfig = await getHubSpotConfig();
+      const { access_token, refresh_token, expires_in } = response.data as {
+        access_token: string;
+        refresh_token?: string;
+        expires_in: number;
+      };
 
-    const response = await axios.post(
-      hubspotConfig.tokenUrl,
-      new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: hubspotConfig.clientId,
-        client_secret: hubspotConfig.clientSecret,
-      }).toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
+      const token_expires_at = Date.now() + expires_in * 1000;
 
-    const { access_token, refresh_token, expires_in } = response.data as {
-      access_token: string;
-      refresh_token?: string;
-      expires_in: number;
-    };
-
-    await updateAccountTokens(
-      userId,
-      'hubspot',
-      {
+      await updateAccountTokens(userId, 'hubspot', {
         access_token,
         refresh_token: refresh_token ?? refreshToken,
-        token_expires_at: Date.now() + expires_in * 1000,
-      },
-      accountId
-    );
+        token_expires_at,
+      }, accountId);
 
-    return access_token;
+      return { access_token, token_expires_at };
+    })().finally(() => refreshLocks.delete(lockKey));
+
+    refreshLocks.set(lockKey, refreshPromise);
+
+    const result = await refreshPromise;
+    this._token = result.access_token;
+    this._tokenExpiresAt = result.token_expires_at;
   }
 
-  // ─── Private helpers ────────────────────────────────────────────────────────
-
-  private authHeaders(accessToken: string) {
+  private async authHeaders(): Promise<Record<string, string>> {
     return {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${await this.token()}`,
       'Content-Type': 'application/json',
     };
   }
@@ -140,36 +247,59 @@ export class HubSpotService {
     };
   }
 
+  // ─── Connection test ──────────────────────────────────────────────────────────
+
+  async testConnection(): Promise<{ valid: boolean; error?: string }> {
+    try {
+      await axios.get(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/contacts`,
+        { headers: await this.authHeaders(), params: { limit: 1 } }
+      );
+      return { valid: true };
+    } catch (err: any) {
+      const msg = err.response?.data?.message || err.message || 'Unknown error';
+      return { valid: false, error: msg };
+    }
+  }
+
   // ─── Contacts ────────────────────────────────────────────────────────────────
 
   async listContacts(
-    userId: string,
-    accountId?: string,
     cursor?: string
   ): Promise<{ contacts: HubSpotContact[]; nextCursor?: string }> {
-    const token = await this.getValidAccessToken(userId, accountId);
     const properties = 'email,firstname,lastname,phone,jobtitle,company,hs_linkedin_url,lastmodifieddate';
     const limit = 50;
-
     let url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts?limit=${limit}&properties=${properties}`;
     if (cursor) url += `&after=${cursor}`;
 
-    const res = await axios.get(url, { headers: this.authHeaders(token) });
-
+    const res = await axios.get(url, { headers: await this.authHeaders() });
     return {
       contacts: ((res.data as any)?.results ?? []).map((r: any) => this.mapContact(r)),
       nextCursor: (res.data as any)?.paging?.next?.after,
     };
   }
 
-  async findContactByEmail(
-    userId: string,
-    email: string,
-    accountId?: string
-  ): Promise<HubSpotContact | null> {
-    const token = await this.getValidAccessToken(userId, accountId);
-    const properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url', 'lastmodifieddate'];
+  /**
+   * Raw paginated contacts for pull sync — returns HubSpot results as-is
+   * so the adapter can apply its own field mapping.
+   */
+  async listContactsPage(
+    properties: string[],
+    cursor?: string
+  ): Promise<{ results: any[]; nextCursor?: string }> {
+    const propsParam = encodeURIComponent(properties.join(','));
+    let url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts?limit=100&properties=${propsParam}`;
+    if (cursor) url += `&after=${cursor}`;
 
+    const res = await axios.get(url, { headers: await this.authHeaders() });
+    return {
+      results: (res.data as any)?.results ?? [],
+      nextCursor: (res.data as any)?.paging?.next?.after,
+    };
+  }
+
+  async findContactByEmail(email: string): Promise<HubSpotContact | null> {
+    const properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url', 'lastmodifieddate'];
     const res = await axios.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/search`,
       {
@@ -177,21 +307,46 @@ export class HubSpotService {
         properties,
         limit: 1,
       },
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
-
     const results = (res.data as any)?.results ?? [];
     return results.length > 0 ? this.mapContact(results[0]) : null;
   }
 
-  async createContact(
-    userId: string,
-    data: Omit<HubSpotContact, 'contactId'>,
-    accountId?: string
-  ): Promise<HubSpotContact> {
-    const token = await this.getValidAccessToken(userId, accountId);
-    const properties: Record<string, string> = {};
+  /**
+   * Find-or-create by email. Returns contactId and whether it was newly created.
+   * Updates all provided fields if the contact already exists.
+   */
+  async upsertContact(
+    data: Omit<HubSpotContact, 'contactId'>
+  ): Promise<UpsertContactResult> {
+    if (!data.email) throw new Error('upsertContact requires an email address');
 
+    const searchRes = await axios.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/search`,
+      {
+        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: data.email.toLowerCase() }] }],
+        properties: ['email'],
+        limit: 1,
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    const existing = ((searchRes.data as any)?.results ?? [])[0];
+
+    if (existing) {
+      const updated = await this.updateContact(existing.id, data);
+      return { contactId: updated.contactId, isNew: false };
+    }
+
+    const created = await this.createContact(data);
+    return { contactId: created.contactId, isNew: true };
+  }
+
+  async createContact(
+    data: Omit<HubSpotContact, 'contactId'>
+  ): Promise<HubSpotContact> {
+    const properties: Record<string, string> = {};
     if (data.email) properties.email = data.email.toLowerCase();
     if (data.firstName) properties.firstname = data.firstName;
     if (data.lastName) properties.lastname = data.lastName;
@@ -199,7 +354,6 @@ export class HubSpotService {
     if (data.jobTitle) properties.jobtitle = data.jobTitle;
     if (data.company) properties.company = data.company;
     if (data.linkedinUrl) properties.hs_linkedin_url = data.linkedinUrl;
-
     if (data.customFields) {
       for (const [k, v] of Object.entries(data.customFields)) {
         properties[k] = String(v);
@@ -209,21 +363,16 @@ export class HubSpotService {
     const res = await axios.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts`,
       { properties },
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
-
-    return this.mapContact((res.data as any));
+    return this.mapContact(res.data as any);
   }
 
   async updateContact(
-    userId: string,
     contactId: string,
-    data: Partial<Omit<HubSpotContact, 'contactId'>>,
-    accountId?: string
+    data: Partial<Omit<HubSpotContact, 'contactId'>>
   ): Promise<HubSpotContact> {
-    const token = await this.getValidAccessToken(userId, accountId);
     const properties: Record<string, string> = {};
-
     if (data.email !== undefined) properties.email = data.email.toLowerCase();
     if (data.firstName !== undefined) properties.firstname = data.firstName;
     if (data.lastName !== undefined) properties.lastname = data.lastName;
@@ -231,7 +380,6 @@ export class HubSpotService {
     if (data.jobTitle !== undefined) properties.jobtitle = data.jobTitle;
     if (data.company !== undefined) properties.company = data.company;
     if (data.linkedinUrl !== undefined) properties.hs_linkedin_url = data.linkedinUrl;
-
     if (data.customFields) {
       for (const [k, v] of Object.entries(data.customFields)) {
         properties[k] = String(v);
@@ -241,18 +389,16 @@ export class HubSpotService {
     const res = await axios.patch(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}`,
       { properties },
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
-
-    return this.mapContact((res.data as any));
+    return this.mapContact(res.data as any);
   }
 
-  async getContactEmailById(userId: string, contactId: string, accountId?: string): Promise<string | null> {
-    const token = await this.getValidAccessToken(userId, accountId);
+  async getContactEmailById(contactId: string): Promise<string | null> {
     try {
       const res = await axios.get(
         `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}?properties=email`,
-        { headers: this.authHeaders(token) }
+        { headers: await this.authHeaders() }
       );
       return (res.data as any)?.properties?.email || null;
     } catch (e: any) {
@@ -261,19 +407,234 @@ export class HubSpotService {
     }
   }
 
-  async deleteContact(userId: string, contactId: string, accountId?: string): Promise<void> {
-    const token = await this.getValidAccessToken(userId, accountId);
+  async deleteContact(contactId: string): Promise<void> {
     await axios.delete(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}`,
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
+  }
+
+  // ─── Property discovery ───────────────────────────────────────────────────────
+
+  /**
+   * Returns all non-archived contact properties from HubSpot.
+   * Uses GET /crm/v3/properties/contacts.
+   */
+  async listContactProperties(): Promise<Array<{ name: string; label: string; type: string }>> {
+    const res = await axios.get(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts?archived=false`,
+      { headers: await this.authHeaders() }
+    );
+    return ((res.data as any).results ?? [])
+      .filter((p: any) => !p.archived)
+      .map((p: any) => ({ name: p.name as string, label: p.label as string, type: p.type as string }));
+  }
+
+  /**
+   * Returns all non-archived deal properties from HubSpot.
+   * Uses GET /crm/v3/properties/deals.
+   */
+  async listDealProperties(): Promise<Array<{ name: string; label: string; type: string }>> {
+    const res = await axios.get(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/deals?archived=false`,
+      { headers: await this.authHeaders() }
+    );
+    return ((res.data as any).results ?? [])
+      .filter((p: any) => !p.archived)
+      .map((p: any) => ({ name: p.name as string, label: p.label as string, type: p.type as string }));
+  }
+
+  // ─── Deals ────────────────────────────────────────────────────────────────────
+
+  /**
+   * Create a deal. Returns the new deal's HubSpot ID.
+   */
+  async createDeal(properties: Record<string, string>): Promise<string> {
+    const res = await axios.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals`,
+      { properties },
+      { headers: await this.authHeaders() }
+    );
+    return (res.data as any).id;
+  }
+
+  async updateDeal(dealId: string, properties: Record<string, string>): Promise<void> {
+    await axios.patch(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}`,
+      { properties },
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async deleteDeal(dealId: string): Promise<void> {
+    await axios.delete(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  /**
+   * Associate a contact with a deal using the v4 Associations API.
+   * Uses the HUBSPOT_DEFINED default association type (contact_to_deal).
+   */
+  async associateContactToDeal(contactId: string, dealId: string): Promise<void> {
+    await axios.put(
+      `${HUBSPOT_API_BASE}/crm/v4/objects/contacts/${contactId}/associations/default/deals/${dealId}`,
+      undefined,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  /**
+   * Get the IDs of all deals associated with a contact.
+   */
+  async getContactDealAssociations(contactId: string): Promise<string[]> {
+    const res = await axios.get(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}/associations/deals`,
+      { headers: await this.authHeaders() }
+    );
+    return ((res.data as any)?.results ?? []).map((r: any) => r.id as string);
+  }
+
+  /**
+   * Fetch a raw deal record by ID.
+   * Returns the full HubSpot response object, or null on 404.
+   */
+  async getDeal(dealId: string, properties: string[]): Promise<any | null> {
+    try {
+      const propsParam = properties.join(',');
+      const res = await axios.get(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}?properties=${propsParam}`,
+        { headers: await this.authHeaders() }
+      );
+      return res.data as any;
+    } catch (e: any) {
+      if (e?.response?.status === 404) return null;
+      throw e;
+    }
+  }
+
+  // ─── Deal pipelines / stages ────────────────────────────────────────────────
+
+  async getDealPipelineStages(pipelineId = 'default'): Promise<HubSpotPipelineStage[]> {
+    const res = await axios.get(
+      `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals/${pipelineId}`,
+      { headers: await this.authHeaders() }
+    );
+
+    return (((res.data as any)?.stages ?? []) as any[])
+      .filter((stage: any) => !stage?.archived)
+      .map((stage: any) => ({
+        id: String(stage.id),
+        label: String(stage.label ?? stage.id),
+        displayOrder: Number(stage.displayOrder ?? 0),
+        metadata: stage.metadata ?? {},
+        archived: stage.archived,
+      }));
+  }
+
+  async listDealPipelines(): Promise<HubSpotPipeline[]> {
+    const res = await axios.get(
+      `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals`,
+      { headers: await this.authHeaders() }
+    );
+
+    return (((res.data as any)?.results ?? []) as any[])
+      .filter((pipeline: any) => !pipeline?.archived)
+      .map((pipeline: any) => ({
+        id: String(pipeline.id),
+        label: String(pipeline.label ?? pipeline.id),
+        displayOrder: Number(pipeline.displayOrder ?? 0),
+        stages: ((pipeline.stages ?? []) as any[])
+          .filter((stage: any) => !stage?.archived)
+          .map((stage: any) => ({
+            id: String(stage.id),
+            label: String(stage.label ?? stage.id),
+            displayOrder: Number(stage.displayOrder ?? 0),
+            metadata: stage.metadata ?? {},
+            archived: stage.archived,
+          })),
+      }));
+  }
+
+  async createDealPipeline(
+    label: string,
+    stages: Array<{ stageId: string; label: string; displayOrder: number; probability: number }>
+  ): Promise<HubSpotPipeline> {
+    const payload = {
+      label,
+      displayOrder: 0,
+      stages: stages.map(stage => ({
+        stageId: stage.stageId.replace(/[^a-zA-Z0-9_]/g, '_'), // HubSpot stageId must be alphanumeric
+        label: stage.label,
+        displayOrder: stage.displayOrder,
+        metadata: {
+          probability: Number(stage.probability.toFixed(1)),
+        },
+      })),
+    };
+
+    try {
+      const res = await axios.post(
+        `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals`,
+        payload,
+        { headers: await this.authHeaders() }
+      );
+
+      const pipeline = res.data as any;
+      return {
+        id: String(pipeline.id),
+        label: String(pipeline.label ?? label),
+        displayOrder: Number(pipeline.displayOrder ?? 0),
+        stages: ((pipeline.stages ?? []) as any[]).map((stage: any) => ({
+          id: String(stage.id),
+          label: String(stage.label ?? stage.id),
+          displayOrder: Number(stage.displayOrder ?? 0),
+          metadata: stage.metadata ?? {},
+          archived: stage.archived,
+        })),
+      };
+    } catch (err: any) {
+      console.error(`[HubSpotService] Failed to create pipeline:`, err.response?.data || err.message);
+      throw err;
+    }
+  }
+
+  async createDealStage(
+    pipelineId: string,
+    stage: {
+      stageId: string;
+      label: string;
+      displayOrder: number;
+      probability: number;
+    }
+  ): Promise<HubSpotPipelineStage> {
+    const res = await axios.post(
+      `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals/${pipelineId}/stages`,
+      {
+        stageId: stage.stageId,
+        label: stage.label,
+        displayOrder: stage.displayOrder,
+        metadata: {
+          probability: Number(stage.probability.toFixed(1)),
+        },
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    const created = res.data as any;
+    return {
+      id: String(created.id),
+      label: String(created.label ?? created.id),
+      displayOrder: Number(created.displayOrder ?? stage.displayOrder),
+      metadata: created.metadata ?? {},
+      archived: created.archived,
+    };
   }
 
   // ─── Companies ───────────────────────────────────────────────────────────────
 
-  async findCompanyByName(userId: string, name: string, accountId?: string): Promise<string | null> {
-    const token = await this.getValidAccessToken(userId, accountId);
-
+  async findCompanyByName(name: string): Promise<string | null> {
     const res = await axios.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/companies/search`,
       {
@@ -281,47 +642,38 @@ export class HubSpotService {
         properties: ['name'],
         limit: 1,
       },
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
-
     const results = (res.data as any)?.results ?? [];
     return results.length > 0 ? results[0].id : null;
   }
 
-  async createCompany(userId: string, name: string, accountId?: string): Promise<string> {
-    const token = await this.getValidAccessToken(userId, accountId);
-
+  async createCompany(name: string): Promise<string> {
     const res = await axios.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/companies`,
       { properties: { name } },
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
-
     return (res.data as any).id;
   }
 
-  // Find or create a company by name, returns HubSpot company ID
-  async findOrCreateCompany(userId: string, name: string, accountId?: string): Promise<string> {
-    const existing = await this.findCompanyByName(userId, name, accountId);
+  async findOrCreateCompany(name: string): Promise<string> {
+    const existing = await this.findCompanyByName(name);
     if (existing) return existing;
-    return this.createCompany(userId, name, accountId);
+    return this.createCompany(name);
   }
 
   // ─── Properties ──────────────────────────────────────────────────────────────
 
-  async ensureContactProperty(userId: string, key: string, label: string, accountId?: string): Promise<string> {
-    const token = await this.getValidAccessToken(userId, accountId);
-    // HubSpot properties must be lower case and alphanumerics/underscores
-    const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_');
-
+  async ensureContactProperty(key: string, label: string): Promise<string> {
+    const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
     try {
       await axios.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/${propertyName}`,
-        { headers: this.authHeaders(token) }
+        { headers: await this.authHeaders() }
       );
       return propertyName;
     } catch (err: any) {
-      // 404 means the property doesn't exist, so create it
       if (err?.response?.status === 404) {
         await axios.post(
           `${HUBSPOT_API_BASE}/crm/v3/properties/contacts`,
@@ -332,7 +684,38 @@ export class HubSpotService {
             fieldType: 'text',
             groupName: 'contactinformation',
           },
-          { headers: this.authHeaders(token) }
+          { headers: await this.authHeaders() }
+        );
+        return propertyName;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Ensure a custom deal property exists. Creates it if not found (404).
+   * Requires crm.schemas.deals.write scope.
+   */
+  async ensureDealProperty(key: string, label: string): Promise<string> {
+    const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    try {
+      await axios.get(
+        `${HUBSPOT_API_BASE}/crm/v3/properties/deals/${propertyName}`,
+        { headers: await this.authHeaders() }
+      );
+      return propertyName;
+    } catch (err: any) {
+      if (err?.response?.status === 404) {
+        await axios.post(
+          `${HUBSPOT_API_BASE}/crm/v3/properties/deals`,
+          {
+            name: propertyName,
+            label,
+            type: 'string',
+            fieldType: 'text',
+            groupName: 'dealinformation',
+          },
+          { headers: await this.authHeaders() }
         );
         return propertyName;
       }
@@ -343,70 +726,83 @@ export class HubSpotService {
   // ─── Lists ────────────────────────────────────────────────────────────────────
   // HubSpot "lists" are static lists of contacts (ILS v3 API)
 
-  async findListByName(userId: string, name: string, accountId?: string): Promise<string | null> {
-    const token = await this.getValidAccessToken(userId, accountId);
+  async findListByName(name: string): Promise<string | null> {
+    try {
+      // Strategy 1: Direct retrieval by name (v3 API) - most efficient
+      const encodedName = encodeURIComponent(name);
+      const res = await axios.get(
+        `${HUBSPOT_API_BASE}/crm/v3/lists/object-type-id/0-1/name/${encodedName}`,
+        { headers: await this.authHeaders() }
+      );
+      const data = res.data as any;
+      if (data?.listId) return String(data.listId);
+    } catch (err: any) {
+      if (err.response?.status !== 404) {
+        console.warn(`[HubSpot] Direct list retrieval failed for "${name}":`, err.message);
+      }
+    }
 
-    const res = await axios.get(
-      `${HUBSPOT_API_BASE}/crm/v3/lists/?count=100`,
-      { headers: this.authHeaders(token) }
-    );
-
-    const lists = (res.data as any)?.lists ?? [];
-    const match = lists.find((l: any) => l.name === name);
-    return match ? String(match.listId) : null;
+    // Strategy 2: Fallback to robust search (case-insensitive in-memory check, but server-side filtered)
+    const lists = await this.getAllLists(name);
+    const searchName = name.toLowerCase();
+    const match = lists.find(l => l.name.toLowerCase() === searchName);
+    return match ? match.id : null;
   }
 
-  async createList(userId: string, name: string, accountId?: string): Promise<string> {
-    const token = await this.getValidAccessToken(userId, accountId);
-
+  async createList(name: string): Promise<string> {
     const res = await axios.post(
       `${HUBSPOT_API_BASE}/crm/v3/lists/`,
       { name, objectTypeId: '0-1', processingType: 'MANUAL' },
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
-
     return String((res.data as any)?.listId ?? (res.data as any)?.list?.listId);
   }
 
-  // Find or create a list by name, returns HubSpot list ID
-  async findOrCreateList(userId: string, name: string, accountId?: string): Promise<string> {
-    const existing = await this.findListByName(userId, name, accountId);
+  async findOrCreateList(name: string): Promise<string> {
+    const existing = await this.findListByName(name);
     if (existing) return existing;
-    return this.createList(userId, name, accountId);
+    return this.createList(name);
   }
 
-  async addContactToList(userId: string, listId: string, contactIds: string[], accountId?: string): Promise<void> {
-    const token = await this.getValidAccessToken(userId, accountId);
-
+  async addContactToList(listId: string, contactIds: string[]): Promise<void> {
     await axios.put(
       `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
       contactIds,
-      { headers: this.authHeaders(token) }
+      { headers: await this.authHeaders() }
     );
   }
 
-  // ─── Account resolution ──────────────────────────────────────────────────────
+  async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {
+    const results: Array<{ id: string; name: string }> = [];
+    let after: string | undefined;
 
-  private async resolveHubSpotAccount(userId: string, accountId?: string) {
-    if (accountId) {
-      const account = await getAccountById(accountId, userId);
-      if (!account || account.platform !== 'hubspot') {
-        throw new Error(`HubSpot account "${accountId}" not found. Please reconnect your account.`);
+    do {
+      const body: Record<string, any> = {
+        processingTypes: ['MANUAL', 'SNAPSHOT', 'DYNAMIC'],
+        count: 200,
+        objectTypeId: '0-1', // Focus on contacts
+      };
+      if (query) body.query = query;
+      if (after) body.after = after;
+
+      const res = await axios.post(
+        `${HUBSPOT_API_BASE}/crm/v3/lists/search`,
+        body,
+        { headers: await this.authHeaders() }
+      );
+
+      const data = res.data as any;
+      const lists: any[] = data?.lists ?? [];
+      for (const l of lists) {
+        results.push({
+          id: String(l.listId || l.id),
+          name: l.name || l.label,
+        });
       }
-      return account;
-    }
 
-    const accounts = await getAccountsByUserId(userId);
-    const hubspotAccounts = accounts.filter(acc => acc.platform === 'hubspot');
-    if (hubspotAccounts.length === 0) {
-      throw new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
-    }
-    if (hubspotAccounts.length > 1) {
-      const list = hubspotAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
-      throw new Error(`Multiple HubSpot accounts found: [${list}]. Specify account_id.`);
-    }
-    return hubspotAccounts[0];
+      after = data?.paging?.next?.after;
+    } while (after);
+
+    return results;
   }
 }
-
-export const hubspotService = new HubSpotService();

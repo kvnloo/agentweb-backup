@@ -3906,7 +3906,7 @@ export const crmDb = {
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
-    attioRecordId?: string;
+    syncMetadata?: Record<string, any>;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4098,9 +4098,9 @@ export const crmDb = {
         }
       }
 
-      if (updates.attioRecordId !== undefined) {
-        setExpressions.push('attioRecordId = :attioRecordId');
-        expressionAttributeValues[':attioRecordId'] = updates.attioRecordId;
+      if (updates.syncMetadata !== undefined) {
+        setExpressions.push('syncMetadata = :syncMetadata');
+        expressionAttributeValues[':syncMetadata'] = updates.syncMetadata;
       }
 
       // Always update updatedAt
@@ -4138,12 +4138,15 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
-      standardFields.forEach(field => {
-        if (updates[field as keyof typeof updates] !== undefined && String(updates[field as keyof typeof updates]).trim()) {
-          fieldNames.push(field);
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+
+      // Top level fields
+      Object.keys(updates).forEach(key => {
+        if (!internalFields.includes(key) && (updates as any)[key] !== undefined && (updates as any)[key] !== null && String((updates as any)[key]).trim() !== '') {
+          fieldNames.push(key);
         }
       });
+      // customFields explicitly
       if (updates.customFields) {
         Object.keys(updates.customFields).forEach(key => {
           if (updates.customFields![key] && String(updates.customFields![key]).trim()) {
@@ -4202,6 +4205,7 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    syncMetadata?: Record<string, any>;
   }>) {
     try {
       const results = {
@@ -4283,6 +4287,7 @@ export const crmDb = {
             notes: lead.notes || '',
             linkedin: lead.linkedin?.trim() || '',
             customFields: lead.customFields || {},
+            syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
             isICP: 0,
             isEngaged: 0,
@@ -4333,13 +4338,17 @@ export const crmDb = {
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
 
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+
       // Extract from new leads
       newLeads.forEach(lead => {
-        standardFields.forEach(field => {
-          if (lead[field as keyof typeof lead] && String(lead[field as keyof typeof lead]).trim()) {
-            allFieldNames.push(field);
+        // Top level fields
+        Object.keys(lead).forEach(key => {
+          if (!internalFields.includes(key) && (lead as any)[key] !== undefined && (lead as any)[key] !== null && String((lead as any)[key]).trim() !== '') {
+            allFieldNames.push(key);
           }
         });
+        // customFields explicitly
         if (lead.customFields) {
           Object.keys(lead.customFields).forEach(key => {
             if (lead.customFields![key] && String(lead.customFields![key]).trim()) {
@@ -4351,11 +4360,13 @@ export const crmDb = {
 
       // Extract from leads being updated
       leadsToUpdate.forEach(({ newData }) => {
-        standardFields.forEach(field => {
-          if (newData[field as keyof typeof newData] && String(newData[field as keyof typeof newData]).trim()) {
-            allFieldNames.push(field);
+        // Top level fields
+        Object.keys(newData).forEach(key => {
+          if (!internalFields.includes(key) && (newData as any)[key] !== undefined && (newData as any)[key] !== null && String((newData as any)[key]).trim() !== '') {
+            allFieldNames.push(key);
           }
         });
+        // customFields explicitly
         if (newData.customFields) {
           Object.keys(newData.customFields).forEach(key => {
             if (newData.customFields![key] && String(newData.customFields![key]).trim()) {
@@ -4386,61 +4397,48 @@ export const crmDb = {
           const updates: any = {};
           let changed = false;
 
-          // Check and update standard fields - only if newData has a value and it's different
-          if (newData.firstName !== undefined && newData.firstName.trim()) {
-            const newValue = newData.firstName.trim();
-            const existingValue = normalize(existingLead.firstName);
-            if (existingValue !== newValue) {
-              updates.firstName = newValue;
-              changed = true;
+          // Define standard string fields that should be trimmed and compared
+          const standardStringFields: (keyof typeof newData)[] = [
+            'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'dealCurrency'
+          ];
+
+          for (const field of standardStringFields) {
+            const incomingVal = newData[field];
+            if (incomingVal !== undefined && typeof incomingVal === 'string' && incomingVal.trim() !== '') {
+              const newValue = incomingVal.trim();
+              const existingValue = normalize(existingLead[field as string]);
+              if (existingValue !== newValue) {
+                updates[field as string] = newValue;
+                changed = true;
+              }
             }
           }
-          if (newData.lastName !== undefined && newData.lastName.trim()) {
-            const newValue = newData.lastName.trim();
-            const existingValue = normalize(existingLead.lastName);
-            if (existingValue !== newValue) {
-              updates.lastName = newValue;
-              changed = true;
+
+          // Internal sync fields (stored in syncMetadata)
+          const internalSyncFields = ['syncMetadata'];
+          for (const field of internalSyncFields) {
+            const incomingVal = (newData as any)[field];
+            if (incomingVal !== undefined && incomingVal !== null) {
+              const existingVal = existingLead[field] || {};
+              // Merging syncMetadata to avoid overwriting existing provider IDs with new ones
+              const mergedMetadata = { ...existingVal, ...incomingVal };
+              if (JSON.stringify(existingVal) !== JSON.stringify(mergedMetadata)) {
+                updates[field] = mergedMetadata;
+                changed = true;
+              }
             }
           }
-          if (newData.phone !== undefined && newData.phone.trim()) {
-            const newValue = newData.phone.trim();
-            const existingValue = normalize(existingLead.phone);
-            if (existingValue !== newValue) {
-              updates.phone = newValue;
-              changed = true;
-            }
-          }
-          if (newData.company !== undefined && newData.company.trim()) {
-            const newValue = newData.company.trim();
-            const existingValue = normalize(existingLead.company);
-            if (existingValue !== newValue) {
-              updates.company = newValue;
-              changed = true;
-            }
-          }
-          if (newData.title !== undefined && newData.title.trim()) {
-            const newValue = newData.title.trim();
-            const existingValue = normalize(existingLead.title);
-            if (existingValue !== newValue) {
-              updates.title = newValue;
-              changed = true;
-            }
-          }
-          if (newData.notes !== undefined && newData.notes.trim()) {
-            const newValue = newData.notes.trim();
-            const existingValue = normalize(existingLead.notes);
-            if (existingValue !== newValue) {
-              updates.notes = newValue;
-              changed = true;
-            }
-          }
-          if (newData.linkedin !== undefined && newData.linkedin.trim()) {
-            const newValue = newData.linkedin.trim();
-            const existingValue = normalize(existingLead.linkedin);
-            if (existingValue !== newValue) {
-              updates.linkedin = newValue;
-              changed = true;
+
+          // Define standard literal fields that don't need trimming (can be numbers, booleans, or specific enums)
+          const standardLiteralFields: (keyof typeof newData)[] = ['status', 'dealValue'];
+
+          for (const field of standardLiteralFields) {
+            const incomingVal = newData[field];
+            if (incomingVal !== undefined && incomingVal !== null) {
+              if (existingLead[field as string] !== incomingVal) {
+                updates[field as string] = incomingVal;
+                changed = true;
+              }
             }
           }
 
@@ -5242,8 +5240,8 @@ export const socialEngagementTrackingDb = {
           ':failed': 'failed',
           ':maxRetries': SOCIAL_ENGAGEMENT_MAX_RETRIES,
         };
-        if (tracker.commentId)    { setFields.push('commentId = :commentId');       exprValues[':commentId']    = tracker.commentId; }
-        if (tracker.postId)       { setFields.push('postId = :postId');             exprValues[':postId']       = tracker.postId; }
+        if (tracker.commentId) { setFields.push('commentId = :commentId'); exprValues[':commentId'] = tracker.commentId; }
+        if (tracker.postId) { setFields.push('postId = :postId'); exprValues[':postId'] = tracker.postId; }
         try {
           await dynamodb.update({
             TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,

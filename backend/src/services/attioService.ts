@@ -51,57 +51,85 @@ export interface AttioWebhook {
   subscriptions: string[];
 }
 
+// ─── Module-level account resolver ───────────────────────────────────────────
+
+async function resolveAttioAccount(userId: string, accountId?: string) {
+  if (accountId) {
+    const account = await getAccountById(accountId, userId);
+    if (!account || account.platform !== 'attio') {
+      throw new Error(`Attio account "${accountId}" not found. Please reconnect.`);
+    }
+    return account;
+  }
+
+  const accounts = await getAccountsByUserId(userId);
+  const attioAccounts = accounts.filter(a => a.platform === 'attio');
+
+  if (attioAccounts.length === 0) {
+    throw new Error('Attio account not connected. Please connect your Attio account in Settings.');
+  }
+  if (attioAccounts.length > 1) {
+    const list = attioAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+    throw new Error(`Multiple Attio accounts found: [${list}]. Specify account_id.`);
+  }
+
+  return attioAccounts[0];
+}
+
 export class AttioService {
   private readonly baseUrl = ATTIO_API_BASE;
 
+  // ─── Instance state ───────────────────────────────────────────────────────
+  // _token      — always set (resolved at factory time or passed directly)
+  // _userId     — only set on OAuth instances; needed by registerWebhook
+  // _accountId  — same
+  private readonly _token: string;
+  private readonly _userId?: string;
+  private readonly _accountId?: string;
+
+  private constructor(token: string, userId?: string, accountId?: string) {
+    this._token = token;
+    this._userId = userId;
+    this._accountId = accountId;
+  }
+
+  // ─── Factories ────────────────────────────────────────────────────────────
+
+  /**
+   * OAuth path — resolves token from DB (one read), then returns a
+   * fully-initialised instance. Attio tokens never expire, so no refresh.
+   */
+  static async create(userId: string, accountId?: string): Promise<AttioService> {
+    const account = await resolveAttioAccount(userId, accountId);
+    return new AttioService(
+      (account.config as any).access_token,
+      userId,
+      account.account_id,
+    );
+  }
+
+  /**
+   * Direct API key / pre-resolved token path — bypasses all DB logic.
+   * Used by AttioAdapter for token-based (non-OAuth) connections.
+   */
+  static fromToken(apiKey: string): AttioService {
+    return new AttioService(apiKey);
+  }
+
   // ─── Private helpers ──────────────────────────────────────────────────────
 
-  private headers(accessToken: string) {
+  private headers() {
     return {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${this._token}`,
       'Content-Type': 'application/json',
     };
   }
 
-  private async resolveAttioAccount(userId: string, accountId?: string) {
-    if (accountId) {
-      const account = await getAccountById(accountId, userId);
-      if (!account || account.platform !== 'attio') {
-        throw new Error(`Attio account "${accountId}" not found. Please reconnect.`);
-      }
-      return account;
-    }
+  // ─── Connection test ──────────────────────────────────────────────────────
 
-    const accounts = await getAccountsByUserId(userId);
-    const attioAccounts = accounts.filter(a => a.platform === 'attio');
-
-    if (attioAccounts.length === 0) {
-      throw new Error('Attio account not connected. Please connect your Attio account in Settings.');
-    }
-    if (attioAccounts.length > 1) {
-      const list = attioAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
-      throw new Error(`Multiple Attio accounts found: [${list}]. Specify account_id.`);
-    }
-
-    return attioAccounts[0];
-  }
-
-  async getValidAccessToken(userId: string, accountId?: string): Promise<string> {
-    const account = await this.resolveAttioAccount(userId, accountId);
-    return (account.config as any).access_token;
-  }
-
-  // kept as private alias for internal callers
-  private async getAccessToken(userId: string, accountId?: string): Promise<string> {
-    return this.getValidAccessToken(userId, accountId);
-  }
-
-  async testConnection(userId: string, accountId?: string): Promise<{ valid: boolean; error?: string }> {
+  async testConnection(): Promise<{ valid: boolean; error?: string }> {
     try {
-      const token = await this.getValidAccessToken(userId, accountId);
-      await axios.get(`${ATTIO_API_BASE}/objects`, {
-        headers: this.headers(token),
-      });
+      await axios.get(`${ATTIO_API_BASE}/objects`, { headers: this.headers() });
       return { valid: true };
     } catch (err: any) {
       const msg = err.response?.data?.message || err.message || 'Unknown error';
@@ -136,19 +164,14 @@ export class AttioService {
 
   // ─── People ───────────────────────────────────────────────────────────────
 
-  async listPeople(
-    userId: string,
-    accountId?: string,
-    cursor?: string
-  ): Promise<{ people: AttioPerson[]; nextCursor?: string }> {
-    const token = await this.getAccessToken(userId, accountId);
+  async listPeople(cursor?: string): Promise<{ people: AttioPerson[]; nextCursor?: string }> {
     const body: any = { limit: 50 };
     if (cursor) body.cursor = cursor;
 
     const res = await axios.post(
       `${this.baseUrl}/objects/people/records/query`,
       body,
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     return {
@@ -157,14 +180,7 @@ export class AttioService {
     };
   }
 
-  async findPersonByEmail(
-    userId: string,
-    email: string,
-    accountId?: string
-  ): Promise<AttioPerson | null> {
-    const token = await this.getAccessToken(userId, accountId);
-
-    // Use the query endpoint with an exact email filter instead of fuzzy search.
+  async findPersonByEmail(email: string): Promise<AttioPerson | null> {
     const res = await axios.post(
       `${this.baseUrl}/objects/people/records/query`,
       {
@@ -173,7 +189,7 @@ export class AttioService {
         },
         limit: 1,
       },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     const records = (res.data as any)?.data ?? [];
@@ -181,14 +197,9 @@ export class AttioService {
     return this.mapPerson(records[0]);
   }
 
-  // Upsert a person by email using Attio's PUT endpoint.
-  // Creates the record if no match found; updates if email already exists.
   async upsertPerson(
-    userId: string,
-    data: Omit<AttioPerson, 'recordId'> & { email: string },
-    accountId?: string
+    data: Omit<AttioPerson, 'recordId'> & { email: string }
   ): Promise<AttioPerson> {
-    const token = await this.getAccessToken(userId, accountId);
     const values: any = {};
 
     const firstName = data.firstName?.trim();
@@ -215,23 +226,14 @@ export class AttioService {
 
     const res = await axios.put(
       `${this.baseUrl}/objects/people/records?matching_attribute=email_addresses`,
-      {
-        data: {
-          values,
-        },
-      },
-      { headers: this.headers(token) }
+      { data: { values } },
+      { headers: this.headers() }
     );
 
     return this.mapPerson((res.data as any)?.data);
   }
 
-  async createPerson(
-    userId: string,
-    data: Omit<AttioPerson, 'recordId'>,
-    accountId?: string
-  ): Promise<AttioPerson> {
-    const token = await this.getAccessToken(userId, accountId);
+  async createPerson(data: Omit<AttioPerson, 'recordId'>): Promise<AttioPerson> {
     const values: any = {};
 
     const firstName = data.firstName?.trim();
@@ -261,19 +263,16 @@ export class AttioService {
     const res = await axios.post(
       `${this.baseUrl}/objects/people/records`,
       { data: { values } },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     return this.mapPerson((res.data as any)?.data);
   }
 
   async updatePerson(
-    userId: string,
     recordId: string,
-    data: Partial<Omit<AttioPerson, 'recordId'>>,
-    accountId?: string
+    data: Partial<Omit<AttioPerson, 'recordId'>>
   ): Promise<AttioPerson> {
-    const token = await this.getAccessToken(userId, accountId);
     const values: any = {};
 
     const firstName = data.firstName?.trim();
@@ -303,35 +302,29 @@ export class AttioService {
     const res = await axios.patch(
       `${this.baseUrl}/objects/people/records/${recordId}`,
       { data: { values } },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     return this.mapPerson((res.data as any)?.data);
   }
 
-  async deletePerson(userId: string, recordId: string, accountId?: string): Promise<void> {
-    const token = await this.getAccessToken(userId, accountId);
+  async deletePerson(recordId: string): Promise<void> {
     await axios.delete(
       `${this.baseUrl}/objects/people/records/${recordId}`,
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
   }
 
   // ─── Companies ────────────────────────────────────────────────────────────
 
-  async listCompanies(
-    userId: string,
-    accountId?: string,
-    cursor?: string
-  ): Promise<{ companies: AttioCompany[]; nextCursor?: string }> {
-    const token = await this.getAccessToken(userId, accountId);
+  async listCompanies(cursor?: string): Promise<{ companies: AttioCompany[]; nextCursor?: string }> {
     const body: any = { limit: 50 };
     if (cursor) body.cursor = cursor;
 
     const res = await axios.post(
       `${this.baseUrl}/objects/companies/records/query`,
       body,
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     return {
@@ -340,30 +333,34 @@ export class AttioService {
     };
   }
 
-  async findCompanyByName(
-    userId: string,
-    name: string,
-    accountId?: string
-  ): Promise<AttioCompany | null> {
-    const token = await this.getAccessToken(userId, accountId);
-
+  async findCompanyByName(name: string): Promise<AttioCompany | null> {
     const res = await axios.post(
       `${this.baseUrl}/objects/companies/records/query`,
       { filter: { name: { $contains: name } }, limit: 1 },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     const records = (res.data as any)?.data ?? [];
     return records.length > 0 ? this.mapCompany(records[0]) : null;
   }
 
-  async createCompany(userId: string, name: string, accountId?: string): Promise<AttioCompany> {
-    const token = await this.getAccessToken(userId, accountId);
+  async getCompanyById(recordId: string): Promise<AttioCompany | null> {
+    try {
+      const res = await axios.get(
+        `${this.baseUrl}/objects/companies/records/${recordId}`,
+        { headers: this.headers() }
+      );
+      return this.mapCompany((res.data as any)?.data);
+    } catch {
+      return null;
+    }
+  }
 
+  async createCompany(name: string): Promise<AttioCompany> {
     const res = await axios.post(
       `${this.baseUrl}/objects/companies/records`,
       { data: { values: { name: [{ value: name }] } } },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     return this.mapCompany((res.data as any)?.data);
@@ -373,18 +370,21 @@ export class AttioService {
   // Attio Lists are named collections of People or Company records.
   // Use the /v2/lists endpoint. Lists are scoped per object type (people/companies).
 
-  async findListByName(userId: string, name: string, accountId?: string): Promise<string | null> {
-    const token = await this.getAccessToken(userId, accountId);
-    const res = await axios.get(`${this.baseUrl}/lists`, { headers: this.headers(token) });
-    const lists = (res.data as any)?.data ?? [];
-    const match = lists.find((l: any) => l.name === name);
-    // list_id is nested: id.list_id
-    return match ? match.id?.list_id : null;
+  async getAllLists(): Promise<Array<{ id: string; name: string }>> {
+    const res = await axios.get(`${this.baseUrl}/lists`, { headers: this.headers() });
+    return ((res.data as any)?.data ?? []).map((l: any) => ({
+      id: l.id?.list_id as string,
+      name: l.name as string,
+    }));
   }
 
-  async createList(userId: string, name: string, objectSlug: 'people' | 'companies', accountId?: string): Promise<string> {
-    const token = await this.getAccessToken(userId, accountId);
+  async findListByName(name: string): Promise<string | null> {
+    const lists = await this.getAllLists();
+    const match = lists.find(l => l.name === name);
+    return match ? match.id : null;
+  }
 
+  async createList(name: string, objectSlug: 'people' | 'companies'): Promise<string> {
     // api_slug must be snake_case, max ~50 chars
     // We append a random hash to prevent 409 slug_conflict with trashed/deleted lists
     const baseSlug = name
@@ -405,27 +405,23 @@ export class AttioService {
           workspace_member_access: [],
         },
       },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     return (res.data as any)?.data?.id?.list_id;
   }
 
-  // Find or create a list by name for a given object type, returns Attio list ID
-  async findOrCreateList(userId: string, name: string, objectSlug: 'people' | 'companies', accountId?: string): Promise<string> {
-    const existing = await this.findListByName(userId, name, accountId);
+  async findOrCreateList(name: string, objectSlug: 'people' | 'companies'): Promise<string> {
+    const existing = await this.findListByName(name);
     if (existing) return existing;
-    return this.createList(userId, name, objectSlug, accountId);
+    return this.createList(name, objectSlug);
   }
 
   async addPersonToList(
-    userId: string,
     listId: string,
     recordId: string,
-    accountId?: string,
     entryValues?: Record<string, any[]>
   ): Promise<void> {
-    const token = await this.getAccessToken(userId, accountId);
     await axios.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
@@ -435,112 +431,113 @@ export class AttioService {
           entry_values: entryValues ?? {},
         },
       },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
   }
 
   // ─── List entry attributes ────────────────────────────────────────────────
   // List entry attributes are scoped to a specific list (not global to the object).
-  // Used to sync custom fields from our lead records without polluting the global
-  // people object with attributes from every list.
 
-  async listListAttributes(userId: string, attioListId: string, accountId?: string): Promise<any[]> {
-    const token = await this.getAccessToken(userId, accountId);
+  async listListAttributes(attioListId: string): Promise<any[]> {
     const res = await axios.get(
       `${this.baseUrl}/lists/${attioListId}/attributes`,
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
     return (res.data as any)?.data ?? [];
   }
 
-  // Converts any key (camelCase, spaces, etc.) to snake_case slug
+  /**
+   * Returns all attributes defined on the Attio People object.
+   * Uses GET /v2/objects/people/attributes.
+   * Each entry: { api_slug, title, type, is_system_attribute, is_writable }
+   */
+  async getAllPeopleAttributes(): Promise<Array<{ api_slug: string; title: string; type: string; is_system_attribute: boolean }>> {
+    const res = await axios.get(
+      `${this.baseUrl}/objects/people/attributes`,
+      { headers: this.headers() }
+    );
+    return ((res.data as any)?.data ?? []).map((a: any) => ({
+      api_slug: a.api_slug as string,
+      title: a.title as string,
+      type: a.type as string,
+      is_system_attribute: !!a.is_system_attribute,
+    }));
+  }
+
   private toSlug(key: string): string {
     return key
-      .replace(/([a-z])([A-Z])/g, '$1_$2')   // camelCase → camel_case
-      .replace(/[\s\-]+/g, '_')               // spaces/hyphens → _
-      .replace(/[^a-z0-9_]/gi, '')            // strip other chars
+      .replace(/([a-z])([A-Z])/g, '$1_$2')
+      .replace(/[\s\-]+/g, '_')
+      .replace(/[^a-z0-9_]/gi, '')
       .toLowerCase()
-      .replace(/^_+|_+$/g, '')               // trim leading/trailing _
+      .replace(/^_+|_+$/g, '')
       .slice(0, 50);
   }
 
-  // Find or create a list entry attribute. Returns the api_slug.
   async ensureListAttribute(
-    userId: string,
     attioListId: string,
     key: string,
     title: string,
-    accountId?: string
+    type: string = 'text'
   ): Promise<string> {
     const slug = this.toSlug(key);
-    const existing = await this.listListAttributes(userId, attioListId, accountId);
-    const found = existing.find((a: any) => a.api_slug === slug);
-    if (found) return slug;
+    const existing = await this.listListAttributes(attioListId);
 
-    const token = await this.getAccessToken(userId, accountId);
-    await axios.post(
+    const found = existing.find((a: any) => this.toSlug(a.api_slug) === slug);
+    if (found) return found.api_slug;
+
+    const res = await axios.post(
       `${this.baseUrl}/lists/${attioListId}/attributes`,
       {
         data: {
           title,
           description: null,
           api_slug: slug,
-          type: 'text',
+          type,
           is_required: false,
           is_unique: false,
           is_multiselect: false,
           config: {},
         },
       },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
-    return slug;
+    return (res.data as any)?.data?.api_slug ?? slug;
   }
 
   async findListEntry(
-    userId: string,
     listId: string,
-    personRecordId: string,
-    accountId?: string
+    personRecordId: string
   ): Promise<string | null> {
-    const token = await this.getAccessToken(userId, accountId);
-    // Attio's List Entries /query endpoint filters by list attributes, not parent records.
-    // To find an entry for a specific record, query the record's entries directly.
     const res = await axios.get(
       `${this.baseUrl}/objects/people/records/${personRecordId}/entries`,
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
     const entries = (res.data as any)?.data ?? [];
 
     if (entries.length > 0) {
-      console.log("[DEBUG] Sample List Entry:", JSON.stringify(entries[0], null, 2));
+      console.log('[DEBUG] Sample List Entry:', JSON.stringify(entries[0], null, 2));
     }
 
-    // entries contains all list entries for this person. Filter by the listId we want.
     const match = entries.find((e: any) =>
       e?.id?.list_id === listId || e?.list_id === listId || e?.parent_list?.id === listId
     );
     return match?.id?.entry_id ?? match?.entry_id ?? null;
   }
 
-  // Update the entry_values on an existing list entry.
   async updateListEntry(
-    userId: string,
     listId: string,
     entryId: string,
-    entryValues: Record<string, any[]>,
-    accountId?: string
+    entryValues: Record<string, any[]>
   ): Promise<void> {
-    const token = await this.getAccessToken(userId, accountId);
     await axios.patch(
       `${this.baseUrl}/lists/${listId}/entries/${entryId}`,
       { data: { entry_values: entryValues } },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
   }
 
-  async addCompanyToList(userId: string, listId: string, recordId: string, accountId?: string): Promise<void> {
-    const token = await this.getAccessToken(userId, accountId);
+  async addCompanyToList(listId: string, recordId: string): Promise<void> {
     await axios.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
@@ -550,43 +547,41 @@ export class AttioService {
           entry_values: {},
         },
       },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
   }
 
   // ─── Webhooks ─────────────────────────────────────────────────────────────
 
-  async registerWebhook(userId: string, accountId?: string): Promise<AttioWebhook> {
-    const token = await this.getAccessToken(userId, accountId);
-    const account = await this.resolveAttioAccount(userId, accountId);
+  async registerWebhook(): Promise<AttioWebhook> {
+    if (!this._userId || !this._accountId) {
+      throw new Error('registerWebhook requires an OAuth instance. Use AttioService.create(userId).');
+    }
     const targetUrl = `${process.env.BACKEND_URL}/api/webhooks/attio`;
     const subscriptions = ['record.created', 'record.updated', 'record.deleted'];
 
     const res = await axios.post(
       `${this.baseUrl}/webhooks`,
       { data: { target_url: targetUrl, subscriptions } },
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
 
     const webhookId = (res.data as any)?.data?.id?.webhook_id ?? (res.data as any)?.data?.id;
 
-    // Store webhook_id so we can delete it when the user disconnects
-    await updateAccountConfig(userId, 'attio', account.account_id, { webhook_id: webhookId });
+    await updateAccountConfig(this._userId, 'attio', this._accountId, { webhook_id: webhookId });
 
     return { webhookId, targetUrl, subscriptions };
   }
 
-  async deleteWebhook(userId: string, webhookId: string, accountId?: string): Promise<void> {
-    const token = await this.getAccessToken(userId, accountId);
+  async deleteWebhook(webhookId: string): Promise<void> {
     await axios.delete(
       `${this.baseUrl}/webhooks/${webhookId}`,
-      { headers: this.headers(token) }
+      { headers: this.headers() }
     );
   }
 
-  async listWebhooks(userId: string, accountId?: string): Promise<AttioWebhook[]> {
-    const token = await this.getAccessToken(userId, accountId);
-    const res = await axios.get(`${this.baseUrl}/webhooks`, { headers: this.headers(token) });
+  async listWebhooks(): Promise<AttioWebhook[]> {
+    const res = await axios.get(`${this.baseUrl}/webhooks`, { headers: this.headers() });
 
     return ((res.data as any)?.data ?? []).map((w: any) => ({
       webhookId: w.id?.webhook_id ?? w.id,
@@ -594,6 +589,89 @@ export class AttioService {
       subscriptions: w.subscriptions ?? [],
     }));
   }
-}
 
-export const attioService = new AttioService();
+  // ─── Sync helpers (used by AttioAdapter) ──────────────────────────────────
+
+  async verifyList(listId: string): Promise<void> {
+    await axios.get(`${this.baseUrl}/lists/${listId}`, { headers: this.headers() });
+  }
+
+  async loadAttributeTypes(
+    objectSlug: string,
+    listId?: string
+  ): Promise<Map<string, string>> {
+    const cache = new Map<string, string>();
+    try {
+      const objRes = await axios.get(`${this.baseUrl}/objects/${objectSlug}/attributes`, { headers: this.headers() });
+      for (const attr of (objRes.data as any).data || []) {
+        cache.set(`object:${objectSlug}:${attr.api_slug}`, attr.type);
+      }
+    } catch { /* non-fatal */ }
+    if (listId) {
+      try {
+        const listRes = await axios.get(`${this.baseUrl}/lists/${listId}/attributes`, { headers: this.headers() });
+        for (const attr of (listRes.data as any).data || []) {
+          cache.set(`list:${listId}:${attr.api_slug}`, attr.type);
+        }
+      } catch { /* non-fatal */ }
+    }
+    console.log(`[AttioService] Loaded ${cache.size} attribute types for ${objectSlug} (list: ${listId})`);
+    return cache;
+  }
+
+  async upsertPersonByValues(
+    values: Record<string, any>
+  ): Promise<{ recordId: string; isNew: boolean }> {
+    const res = await axios.put(
+      `${this.baseUrl}/objects/people/records?matching_attribute=email_addresses`,
+      { data: { values } },
+      { headers: this.headers() }
+    );
+    return {
+      recordId: (res.data as any).data?.id?.record_id,
+      isNew: res.status === 201,
+    };
+  }
+
+  async createPersonByValues(values: Record<string, any>): Promise<string> {
+    const res = await axios.post(
+      `${this.baseUrl}/objects/people/records`,
+      { data: { values } },
+      { headers: this.headers() }
+    );
+    return (res.data as any).data?.id?.record_id;
+  }
+
+  async updatePersonByValues(recordId: string, values: Record<string, any>): Promise<void> {
+    await axios.patch(
+      `${this.baseUrl}/objects/people/records/${recordId}`,
+      { data: { values } },
+      { headers: this.headers() }
+    );
+  }
+
+  async getPersonValues(recordId: string): Promise<Record<string, any>> {
+    const res = await axios.get(
+      `${this.baseUrl}/objects/people/records/${recordId}`,
+      { headers: this.headers() }
+    );
+    return (res.data as any).data?.values ?? {};
+  }
+
+  async listListEntries(
+    listId: string,
+    cursor?: string
+  ): Promise<{ entries: any[]; nextCursor?: string }> {
+    const body: any = { limit: 50 };
+    if (cursor) body.cursor = cursor;
+    const res = await axios.post(
+      `${this.baseUrl}/lists/${listId}/entries/query`,
+      body,
+      { headers: this.headers() }
+    );
+    return {
+      entries: (res.data as any).data ?? [],
+      nextCursor: (res.data as any).next_cursor,
+    };
+  }
+}

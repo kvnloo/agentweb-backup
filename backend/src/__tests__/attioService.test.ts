@@ -61,32 +61,45 @@ const MOCK_COMPANY_RECORD = {
 };
 
 describe('AttioService', () => {
+  // Most tests use fromToken to skip the DB lookup — tests the API call behaviour.
+  // Factory / account resolution tests use AttioService.create() directly.
   let service: AttioService;
 
   beforeEach(() => {
-    service = new AttioService();
+    service = AttioService.fromToken('test-token');
     jest.clearAllMocks();
     mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
     mockGetAccountById.mockResolvedValue(MOCK_ACCOUNT);
     mockUpdateAccountConfig.mockResolvedValue(undefined);
   });
 
-  // ─── Account resolution ──────────────────────────────────────────
+  // ─── Factory / account resolution ────────────────────────────────
 
-  describe('account resolution', () => {
+  describe('AttioService.create()', () => {
     it('throws if no Attio account connected', async () => {
       mockGetAccountsByUserId.mockResolvedValue([]);
-      await expect(service.listPeople('user-1')).rejects.toThrow('Attio account not connected');
+      await expect(AttioService.create('user-1')).rejects.toThrow('Attio account not connected');
     });
 
     it('throws if multiple Attio accounts and no accountId specified', async () => {
       mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT, { ...MOCK_ACCOUNT, account_id: 'ws-456' }]);
-      await expect(service.listPeople('user-1')).rejects.toThrow('Multiple Attio accounts');
+      await expect(AttioService.create('user-1')).rejects.toThrow('Multiple Attio accounts');
     });
 
     it('throws if accountId not found', async () => {
       mockGetAccountById.mockResolvedValue(null);
-      await expect(service.listPeople('user-1', 'bad-id')).rejects.toThrow('not found');
+      await expect(AttioService.create('user-1', 'bad-id')).rejects.toThrow('not found');
+    });
+
+    it('returns service instance with token from account config', async () => {
+      const svc = await AttioService.create('user-1');
+      // Verify the resolved token is used in API calls
+      mockAxiosGet.mockResolvedValue({ data: { data: [] } });
+      await svc.listWebhooks();
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer test-token' }) })
+      );
     });
   });
 
@@ -96,7 +109,7 @@ describe('AttioService', () => {
     it('returns mapped people array', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD], next_cursor: undefined } });
 
-      const result = await service.listPeople('user-1');
+      const result = await service.listPeople();
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.attio.com/v2/objects/people/records/query',
@@ -110,7 +123,7 @@ describe('AttioService', () => {
     it('passes cursor for pagination', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [], next_cursor: 'next-page' } });
 
-      const result = await service.listPeople('user-1', undefined, 'some-cursor');
+      const result = await service.listPeople('some-cursor');
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),
@@ -122,7 +135,7 @@ describe('AttioService', () => {
 
     it('returns empty array when no records', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
-      const result = await service.listPeople('user-1');
+      const result = await service.listPeople();
       expect(result.people).toHaveLength(0);
     });
   });
@@ -133,7 +146,7 @@ describe('AttioService', () => {
         data: { data: [{ id: { record_id: 'rec-person-1' } }] },
       });
 
-      const person = await service.findPersonByEmail('user-1', 'john@acme.com');
+      const person = await service.findPersonByEmail('john@acme.com');
 
       expect(person).not.toBeNull();
       expect(person?.recordId).toBe('rec-person-1');
@@ -142,7 +155,7 @@ describe('AttioService', () => {
 
     it('returns null when search returns no results', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
-      const person = await service.findPersonByEmail('user-1', 'nobody@nowhere.com');
+      const person = await service.findPersonByEmail('nobody@nowhere.com');
       expect(person).toBeNull();
     });
   });
@@ -151,7 +164,7 @@ describe('AttioService', () => {
     it('creates person and returns mapped record', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: MOCK_PERSON_RECORD } });
 
-      const person = await service.createPerson('user-1', {
+      const person = await service.createPerson({
         firstName: 'John',
         lastName: 'Doe',
         email: 'john@acme.com',
@@ -172,14 +185,14 @@ describe('AttioService', () => {
     it('handles person with no email gracefully', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: { id: { record_id: 'rec-2' }, values: { name: [{ first_name: 'No', last_name: 'Email' }] } } } });
 
-      const person = await service.createPerson('user-1', { firstName: 'No', lastName: 'Email' });
+      const person = await service.createPerson({ firstName: 'No', lastName: 'Email' });
       expect(person.recordId).toBe('rec-2');
       expect(person.email).toBe('');
     });
 
     it('throws on API error', async () => {
       mockAxiosPost.mockRejectedValue(new Error('API error'));
-      await expect(service.createPerson('user-1', { email: 'x@x.com' })).rejects.toThrow('API error');
+      await expect(service.createPerson({ email: 'x@x.com' })).rejects.toThrow('API error');
     });
   });
 
@@ -187,7 +200,7 @@ describe('AttioService', () => {
     it('calls patch with correct record id and values', async () => {
       mockAxiosPatch.mockResolvedValue({ data: { data: MOCK_PERSON_RECORD } });
 
-      const person = await service.updatePerson('user-1', 'rec-person-1', { jobTitle: 'CEO' });
+      const person = await service.updatePerson('rec-person-1', { jobTitle: 'CEO' });
 
       expect(mockAxiosPatch).toHaveBeenCalledWith(
         'https://api.attio.com/v2/objects/people/records/rec-person-1',
@@ -199,7 +212,7 @@ describe('AttioService', () => {
 
     it('throws on invalid record id', async () => {
       mockAxiosPatch.mockRejectedValue({ response: { status: 404 } });
-      await expect(service.updatePerson('user-1', 'bad-id', { jobTitle: 'X' })).rejects.toBeDefined();
+      await expect(service.updatePerson('bad-id', { jobTitle: 'X' })).rejects.toBeDefined();
     });
   });
 
@@ -207,7 +220,7 @@ describe('AttioService', () => {
     it('calls delete with correct record id', async () => {
       mockAxiosDelete.mockResolvedValue({ data: {} });
 
-      await service.deletePerson('user-1', 'rec-person-1');
+      await service.deletePerson('rec-person-1');
 
       expect(mockAxiosDelete).toHaveBeenCalledWith(
         'https://api.attio.com/v2/objects/people/records/rec-person-1',
@@ -217,7 +230,7 @@ describe('AttioService', () => {
 
     it('throws on API error', async () => {
       mockAxiosDelete.mockRejectedValue(new Error('Not found'));
-      await expect(service.deletePerson('user-1', 'bad-id')).rejects.toThrow('Not found');
+      await expect(service.deletePerson('bad-id')).rejects.toThrow('Not found');
     });
   });
 
@@ -227,7 +240,7 @@ describe('AttioService', () => {
     it('returns mapped companies array', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_COMPANY_RECORD] } });
 
-      const result = await service.listCompanies('user-1');
+      const result = await service.listCompanies();
 
       expect(result.companies).toHaveLength(1);
       expect(result.companies[0]).toMatchObject({ recordId: 'rec-company-1', name: 'Acme Corp' });
@@ -235,7 +248,7 @@ describe('AttioService', () => {
 
     it('returns empty array when no companies', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
-      const result = await service.listCompanies('user-1');
+      const result = await service.listCompanies();
       expect(result.companies).toHaveLength(0);
     });
   });
@@ -243,13 +256,13 @@ describe('AttioService', () => {
   describe('findCompanyByName', () => {
     it('returns company when found', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_COMPANY_RECORD] } });
-      const company = await service.findCompanyByName('user-1', 'Acme Corp');
+      const company = await service.findCompanyByName('Acme Corp');
       expect(company?.name).toBe('Acme Corp');
     });
 
     it('returns null when not found', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
-      const company = await service.findCompanyByName('user-1', 'Unknown Co');
+      const company = await service.findCompanyByName('Unknown Co');
       expect(company).toBeNull();
     });
   });
@@ -258,7 +271,7 @@ describe('AttioService', () => {
     it('creates company with name and returns mapped record', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: MOCK_COMPANY_RECORD } });
 
-      const company = await service.createCompany('user-1', 'Acme Corp');
+      const company = await service.createCompany('Acme Corp');
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.attio.com/v2/objects/companies/records',
@@ -273,9 +286,11 @@ describe('AttioService', () => {
 
   describe('registerWebhook', () => {
     it('posts to /v2/webhooks with correct subscriptions and stores webhook_id', async () => {
+      // registerWebhook needs userId/accountId — use create() factory
+      const oauthService = await AttioService.create('user-1');
       mockAxiosPost.mockResolvedValue({ data: { data: { id: { webhook_id: 'wh-abc' }, target_url: 'https://api.agentweb.pro/api/webhooks/attio', subscriptions: ['record.created', 'record.updated', 'record.deleted'] } } });
 
-      const result = await service.registerWebhook('user-1');
+      const result = await oauthService.registerWebhook();
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.attio.com/v2/webhooks',
@@ -291,9 +306,13 @@ describe('AttioService', () => {
       expect(result.webhookId).toBe('wh-abc');
     });
 
-    it('throws if account not found', async () => {
+    it('throws if called on a fromToken instance (no OAuth context)', async () => {
+      await expect(service.registerWebhook()).rejects.toThrow('requires an OAuth instance');
+    });
+
+    it('throws if account not found during create()', async () => {
       mockGetAccountsByUserId.mockResolvedValue([]);
-      await expect(service.registerWebhook('user-1')).rejects.toThrow('Attio account not connected');
+      await expect(AttioService.create('user-1')).rejects.toThrow('Attio account not connected');
     });
   });
 
@@ -301,7 +320,7 @@ describe('AttioService', () => {
     it('calls delete on correct webhook endpoint', async () => {
       mockAxiosDelete.mockResolvedValue({ data: {} });
 
-      await service.deleteWebhook('user-1', 'wh-abc');
+      await service.deleteWebhook('wh-abc');
 
       expect(mockAxiosDelete).toHaveBeenCalledWith(
         'https://api.attio.com/v2/webhooks/wh-abc',
@@ -320,7 +339,7 @@ describe('AttioService', () => {
         },
       });
 
-      const webhooks = await service.listWebhooks('user-1');
+      const webhooks = await service.listWebhooks();
 
       expect(webhooks).toHaveLength(1);
       expect(webhooks[0]).toMatchObject({ webhookId: 'wh-1', targetUrl: 'https://api.agentweb.pro/api/webhooks/attio' });
@@ -328,7 +347,7 @@ describe('AttioService', () => {
 
     it('returns empty array when no webhooks', async () => {
       mockAxiosGet.mockResolvedValue({ data: { data: [] } });
-      const webhooks = await service.listWebhooks('user-1');
+      const webhooks = await service.listWebhooks();
       expect(webhooks).toHaveLength(0);
     });
   });
@@ -346,7 +365,7 @@ describe('AttioService', () => {
         },
       });
 
-      const attrs = await service.listListAttributes('user-1', 'list-abc');
+      const attrs = await service.listListAttributes('list-abc');
 
       expect(mockAxiosGet).toHaveBeenCalledWith(
         'https://api.attio.com/v2/lists/list-abc/attributes',
@@ -358,13 +377,8 @@ describe('AttioService', () => {
 
     it('returns empty array when list has no custom attributes', async () => {
       mockAxiosGet.mockResolvedValue({ data: { data: [] } });
-      const attrs = await service.listListAttributes('user-1', 'list-abc');
+      const attrs = await service.listListAttributes('list-abc');
       expect(attrs).toHaveLength(0);
-    });
-
-    it('throws if account not connected', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([]);
-      await expect(service.listListAttributes('user-1', 'list-abc')).rejects.toThrow('Attio account not connected');
     });
   });
 
@@ -374,7 +388,7 @@ describe('AttioService', () => {
         data: { data: [{ api_slug: 'industry', title: 'Industry' }] },
       });
 
-      const slug = await service.ensureListAttribute('user-1', 'list-abc', 'industry', 'Industry');
+      const slug = await service.ensureListAttribute('list-abc', 'industry', 'Industry');
 
       expect(slug).toBe('industry');
       expect(mockAxiosPost).not.toHaveBeenCalled();
@@ -384,7 +398,7 @@ describe('AttioService', () => {
       mockAxiosGet.mockResolvedValue({ data: { data: [] } });
       mockAxiosPost.mockResolvedValue({ data: { data: { api_slug: 'revenue_arr' } } });
 
-      const slug = await service.ensureListAttribute('user-1', 'list-abc', 'revenue_arr', 'Revenue ARR');
+      const slug = await service.ensureListAttribute('list-abc', 'revenue_arr', 'Revenue ARR');
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.attio.com/v2/lists/list-abc/attributes',
@@ -408,7 +422,7 @@ describe('AttioService', () => {
       mockAxiosGet.mockResolvedValue({ data: { data: [] } });
       mockAxiosPost.mockResolvedValue({ data: { data: { api_slug: 'lead_source' } } });
 
-      const slug = await service.ensureListAttribute('user-1', 'list-abc', 'leadSource', 'Lead Source');
+      const slug = await service.ensureListAttribute('list-abc', 'leadSource', 'Lead Source');
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),
@@ -425,7 +439,7 @@ describe('AttioService', () => {
     it('passes entry_values when provided', async () => {
       mockAxiosPost.mockResolvedValue({ data: {} });
 
-      await service.addPersonToList('user-1', 'list-abc', 'rec-person-1', undefined, {
+      await service.addPersonToList('list-abc', 'rec-person-1', {
         industry: [{ value: 'SaaS' }],
         notes: [{ value: 'Hot lead' }],
       });
@@ -449,7 +463,7 @@ describe('AttioService', () => {
     it('sends empty entry_values when none provided', async () => {
       mockAxiosPost.mockResolvedValue({ data: {} });
 
-      await service.addPersonToList('user-1', 'list-abc', 'rec-person-1');
+      await service.addPersonToList('list-abc', 'rec-person-1');
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),

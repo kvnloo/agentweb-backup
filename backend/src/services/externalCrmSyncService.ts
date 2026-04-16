@@ -1,9 +1,26 @@
-import axios from 'axios';
 import { settingsService } from './settingsService';
 import { crmDb } from './db';
-import { hubspotService } from './hubspotService';
-import { attioService } from './attioService';
-import { encryptPassword, decryptPassword } from '../utils/crypto';
+import { decryptPassword, encryptPassword } from '../utils/crypto';
+import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
+import { AttioAdapter } from './adapters/attioAdapter';
+import { HubspotAdapter } from './adapters/hubspotAdapter';
+import { HubSpotService, HubSpotPipelineStage } from './hubspotService';
+import { AttioService } from './attioService';
+
+// ─── CRM Adapter Registry ─────────────────────────────────────────────────────
+
+const adapters: Record<string, CrmAdapter> = {
+  attio: new AttioAdapter(),
+  hubspot: new HubspotAdapter(),
+};
+
+function getAdapter(provider: string): CrmAdapter {
+  const adapter = adapters[provider.toLowerCase()];
+  if (!adapter) {
+    throw new Error(`Unsupported CRM provider: "${provider}". Supported: ${Object.keys(adapters).join(', ')}`);
+  }
+  return adapter;
+}
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -20,15 +37,22 @@ export interface ExternalCrmSyncConfig {
   userId: string;
   // Auth — exactly one should be set
   accountId?: string;         // OAuth connected account
-  apiKeyEncrypted?: string;   // Manual token (encrypted)
+  apiKeyEncrypted?: string;   // Manual token (encrypted at rest)
   // Settings
   autoSyncEnabled: boolean;
   contactFieldMapping: FieldMapping[];
   dealFieldMapping: FieldMapping[];
   customFieldMapping: FieldMapping[];
+  // Delete sync options
+  deleteOnPush?: boolean;   // Delete CRM record when a local lead is deleted
+  deleteOnPull?: boolean;   // Mark local lead as removed when CRM record is deleted
+  // Human-readable display name — used when creating external lists/pipelines
+  listName?: string;
   // Cached external IDs to skip redundant lookups
-  externalListId?: string;          // HubSpot list ID
+  externalListId?: string;          // Attio people list ID (legacy alias of externalPeopleListId)
   externalPeopleListId?: string;    // Attio people list ID
+  externalPipelineId?: string;      // HubSpot deal pipeline ID
+  hubspotDealStageMap?: Record<string, string>; // AgentWeb status value -> HubSpot stage ID
   // Sync state
   lastPushSyncAt?: string;
   lastPullSyncAt?: string;
@@ -44,7 +68,18 @@ export interface SyncResult {
   updatedCount: number;
   errorCount: number;
   errors: string[];
+  removedCount?: number;        // leads marked as CRM-removed (deleteOnPull)
+  seenExternalIds?: string[];   // populated by adapters during pull, consumed by service for delete sweep
 }
+
+export interface CrmProperty {
+  name: string;   // api key / slug
+  label: string;  // human-readable display name
+  type?: string;  // optional type hint for the UI
+}
+
+type StatusType = 'active' | 'won' | 'lost' | 'churned';
+type StatusOption = { value: string; label: string; color: string; type: StatusType };
 
 // ─── Default mappings ─────────────────────────────────────────────────────────
 
@@ -56,7 +91,12 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
   { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
   { agentwebField: 'title', crmProperty: 'jobtitle', direction: 'both', enabled: true },
   { agentwebField: 'linkedin', crmProperty: 'hs_linkedin_url', direction: 'push', enabled: true },
-  { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: true },
+];
+
+// 'notes' has no standard HubSpot contact property — pushed as a custom property
+// so ensureContactProperty runs before the push and creates it if absent.
+export const DEFAULT_HUBSPOT_CUSTOM_MAPPING: FieldMapping[] = [
+  // { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: false },
 ];
 
 export const DEFAULT_HUBSPOT_DEAL_MAPPING: FieldMapping[] = [
@@ -70,16 +110,23 @@ export const DEFAULT_ATTIO_CONTACT_MAPPING: FieldMapping[] = [
   { agentwebField: 'firstName', crmProperty: 'first_name', direction: 'both', enabled: true },
   { agentwebField: 'lastName', crmProperty: 'last_name', direction: 'both', enabled: true },
   { agentwebField: 'phone', crmProperty: 'phone_numbers', direction: 'both', enabled: true },
-  { agentwebField: 'company', crmProperty: 'company_name', direction: 'both', enabled: true },
   { agentwebField: 'title', crmProperty: 'job_title', direction: 'both', enabled: true },
-  { agentwebField: 'linkedin', crmProperty: 'linkedin_url', direction: 'push', enabled: true },
+  { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
+  { agentwebField: 'linkedin', crmProperty: 'linkedin', direction: 'push', enabled: true },
+  // Note: 'company' is NOT a native text field on Attio People records.
+  // It is synced as a list-entry attribute via DEFAULT_ATTIO_CUSTOM_MAPPING below.
 ];
 
-export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [
+// Attio has no separate deal entity in this integration. Deal/status fields live
+// on the list entry alongside any other custom mappings.
+export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'dealValue', crmProperty: 'deal_value', direction: 'both', enabled: true },
   { agentwebField: 'dealCurrency', crmProperty: 'deal_currency', direction: 'both', enabled: true },
   { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
+  { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: false },
 ];
+
+export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -87,34 +134,17 @@ function settingKey(listId: string, provider: string): string {
   return `ext_crm_sync_${listId}_${provider}`;
 }
 
-function getNestedValue(obj: any, path: string): any {
-  return path.split('.').reduce((cur, part) => (cur == null ? undefined : cur[part]), obj);
-}
-
-function chunkArray<T>(arr: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-
-function buildPushProps(lead: any, mapping: FieldMapping[]): Record<string, string> {
-  const props: Record<string, string> = {};
-  for (const m of mapping) {
-    if (!m.enabled || m.direction === 'pull') continue;
-    // Custom fields live in lead.customFields, standard fields at root
-    const value = lead.customFields?.[m.agentwebField] ?? getNestedValue(lead, m.agentwebField);
-    if (value != null && String(value).trim() !== '') {
-      props[m.crmProperty] = String(value);
-    }
-  }
-  return props;
-}
-
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 export class ExternalCrmSyncService {
+  private formatError(err: any): string {
+    return err?.response?.data?.message
+      || err?.response?.data?.error
+      || err?.message
+      || 'Unknown error';
+  }
 
-  // ─── Config CRUD ────────────────────────────────────────────────────────
+  // ─── Config CRUD ────────────────────────────────────────────────────────────
 
   async getConfig(userId: string, listId: string, provider: string): Promise<ExternalCrmSyncConfig | null> {
     const setting = await settingsService.getSetting(settingKey(listId, provider));
@@ -139,11 +169,43 @@ export class ExternalCrmSyncService {
       contactFieldMapping?: FieldMapping[];
       dealFieldMapping?: FieldMapping[];
       customFieldMapping?: FieldMapping[];
+      deleteOnPush?: boolean;
+      deleteOnPull?: boolean;
+      // List/pipeline selection — only honoured before first sync (server enforces the lock)
+      externalListId?: string;       // Attio: chosen people list ID
+      externalPipelineId?: string;   // HubSpot: chosen deal pipeline ID
+      listName?: string;
     }
   ): Promise<ExternalCrmSyncConfig> {
     const existing = await this.getConfig(userId, listId, provider);
     const now = new Date().toISOString();
     const isHubspot = provider === 'hubspot';
+
+    const nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
+      ?? (isHubspot ? DEFAULT_HUBSPOT_DEAL_MAPPING : DEFAULT_ATTIO_DEAL_MAPPING);
+    const nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
+      ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
+
+    // List/pipeline selection is locked once any sync has occurred.
+    const alreadySynced = !!(existing?.lastPushSyncAt || existing?.lastPullSyncAt);
+
+    // listName: display name used for creating new lists/pipelines
+    const resolvedListName = alreadySynced
+      ? existing?.listName
+      : (updates.listName ?? existing?.listName);
+
+    const resolvedExternalPeopleListId = alreadySynced
+      ? existing?.externalPeopleListId
+      : (updates.externalListId ?? existing?.externalPeopleListId);
+    // Keep externalListId in sync with externalPeopleListId (legacy alias)
+    const resolvedExternalListId = alreadySynced
+      ? existing?.externalListId
+      : (updates.externalListId ?? existing?.externalListId);
+
+    // HubSpot deal pipeline
+    const resolvedExternalPipelineId = alreadySynced
+      ? existing?.externalPipelineId
+      : (isHubspot ? (updates.externalPipelineId ?? existing?.externalPipelineId) : undefined);
 
     const config: ExternalCrmSyncConfig = {
       provider: provider as 'hubspot' | 'attio',
@@ -154,11 +216,17 @@ export class ExternalCrmSyncService {
       autoSyncEnabled: updates.autoSyncEnabled ?? existing?.autoSyncEnabled ?? false,
       contactFieldMapping: updates.contactFieldMapping ?? existing?.contactFieldMapping
         ?? (isHubspot ? DEFAULT_HUBSPOT_CONTACT_MAPPING : DEFAULT_ATTIO_CONTACT_MAPPING),
-      dealFieldMapping: updates.dealFieldMapping ?? existing?.dealFieldMapping
-        ?? (isHubspot ? DEFAULT_HUBSPOT_DEAL_MAPPING : DEFAULT_ATTIO_DEAL_MAPPING),
-      customFieldMapping: updates.customFieldMapping ?? existing?.customFieldMapping ?? [],
-      externalListId: existing?.externalListId,
-      externalPeopleListId: existing?.externalPeopleListId,
+      dealFieldMapping: !isHubspot ? [] : nextDealFieldMapping,
+      customFieldMapping: !isHubspot
+        ? this.mergeAttioEntryMappings(nextCustomFieldMapping, nextDealFieldMapping)
+        : nextCustomFieldMapping,
+      deleteOnPush: updates.deleteOnPush ?? existing?.deleteOnPush ?? false,
+      deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
+      listName: resolvedListName,
+      externalListId: resolvedExternalListId,
+      externalPeopleListId: resolvedExternalPeopleListId,
+      externalPipelineId: resolvedExternalPipelineId,
+      hubspotDealStageMap: existing?.hubspotDealStageMap,
       lastPushSyncAt: existing?.lastPushSyncAt,
       lastPullSyncAt: existing?.lastPullSyncAt,
       lastSyncStatus: existing?.lastSyncStatus,
@@ -167,15 +235,21 @@ export class ExternalCrmSyncService {
       updatedAt: now,
     };
 
-    // Clear cached external IDs if the account changed (new connection)
-    if (updates.accountId && updates.accountId !== existing?.accountId) {
-      config.externalListId = undefined;
-      config.externalPeopleListId = undefined;
-    }
+    // Note: We intentionally do NOT wipe externalPeopleListId here.
+    // The adapters use verifyList() to actively test access on each sync.
+    // If the new token is for the same workspace, the ID is preserved.
+    // If not, the adapter gets a 404 and clears + re-discovers it automatically.
 
-    // New manual API key provided → encrypt it; clear OAuth accountId
+    // Handle mutually exclusive credentials: OAuth Account ID vs. Manual API Key
     if (updates.apiKey) {
+      // New manual API key → encrypt and store; clear OAuth accountId
       config.apiKeyEncrypted = encryptPassword(updates.apiKey, userId);
+      config.accountId = undefined;
+    } else if (updates.accountId) {
+      // New OAuth account → store and clear manual API key
+      config.apiKeyEncrypted = undefined;
+    } else if (updates.accountId === '') {
+      // Explicitly clearing accountId
       config.accountId = undefined;
     }
 
@@ -195,31 +269,41 @@ export class ExternalCrmSyncService {
     await settingsService.deleteSetting(settingKey(listId, provider));
   }
 
-  // ─── Token resolution ────────────────────────────────────────────────────
+  async getDefaultMappings(provider: string): Promise<{
+    contactFieldMapping: FieldMapping[];
+    dealFieldMapping: FieldMapping[];
+    customFieldMapping: FieldMapping[];
+  }> {
+    const isHubspot = provider === 'hubspot';
+    if (isHubspot) {
+      return {
+        contactFieldMapping: DEFAULT_HUBSPOT_CONTACT_MAPPING,
+        dealFieldMapping: DEFAULT_HUBSPOT_DEAL_MAPPING,
+        customFieldMapping: [], // Match frontend's current behavior for HubSpot
+      };
+    } else {
+      return {
+        contactFieldMapping: DEFAULT_ATTIO_CONTACT_MAPPING,
+        dealFieldMapping: [],
+        customFieldMapping: DEFAULT_ATTIO_CUSTOM_MAPPING,
+      };
+    }
+  }
 
-  private async resolveToken(config: ExternalCrmSyncConfig, userId: string): Promise<string> {
+  // ─── Auth resolution ─────────────────────────────────────────────────────────
+  // Resolves config into a CrmAuth object that adapters use to get a token.
+  // If token-based, we decrypt here — adapters never touch encrypted data.
+
+  private resolveAuth(config: ExternalCrmSyncConfig): CrmAuth {
     if (config.accountId) {
-      if (config.provider === 'hubspot') {
-        return hubspotService.getValidAccessToken(userId, config.accountId);
-      } else {
-        return attioService.getValidAccessToken(userId, config.accountId);
-      }
+      return { type: 'oauth', userId: config.userId, accountId: config.accountId };
     }
     if (config.apiKeyEncrypted) {
       const { password } = decryptPassword(config.apiKeyEncrypted);
-      return password;
+      return { type: 'token', apiKey: password };
     }
     throw new Error('No authentication method configured');
   }
-
-  private makeClient(token: string, baseURL: string) {
-    return axios.create({
-      baseURL,
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    });
-  }
-
-  // ─── Test connection ─────────────────────────────────────────────────────
 
   async testConnection(userId: string, listId: string, provider: string): Promise<{ valid: boolean; error?: string }> {
     const config = await this.getConfig(userId, listId, provider);
@@ -229,568 +313,397 @@ export class ExternalCrmSyncService {
     }
 
     try {
-      const token = await this.resolveToken(config, userId);
-
-      if (provider === 'hubspot') {
-        const client = this.makeClient(token, 'https://api.hubapi.com');
-        await client.get('/crm/v3/objects/contacts', { params: { limit: 1 } });
-      } else {
-        const client = this.makeClient(token, 'https://api.attio.com/v2');
-        await client.get('/objects');
-      }
-
-      return { valid: true };
+      const auth = this.resolveAuth(config);
+      const adapter = getAdapter(provider);
+      return adapter.testConnection(auth);
     } catch (err: any) {
-      const msg = err.response?.data?.message || err.message || 'Unknown error';
-      return { valid: false, error: msg };
+      return { valid: false, error: err.message || 'Unknown error' };
     }
   }
 
-  // ─── Custom field discovery ──────────────────────────────────────────────
+  // ─── External list discovery ──────────────────────────────────────────────────
 
-  async getDistinctCustomFieldKeys(listId: string): Promise<string[]> {
-    const keys = new Set<string>();
-    let lastKey: any = undefined;
+  // Returns Attio people lists (for Attio) or an empty array (HubSpot contact lists not yet supported)
+  async getExternalLists(
+    userId: string,
+    listId: string,
+    provider: string,
+    options?: { accountId?: string; apiKey?: string }
+  ): Promise<Array<{ id: string; name: string }>> {
+    let auth: CrmAuth;
 
-    do {
-      const page = await crmDb.getLeadsByListId(listId, 100, lastKey);
-      for (const lead of (page.items as any[])) {
-        if (lead.customFields && typeof lead.customFields === 'object') {
-          for (const [k, v] of Object.entries(lead.customFields)) {
-            if (v != null && String(v).trim() !== '') {
-              keys.add(k);
-            }
-          }
-        }
+    if (options?.accountId) {
+      // Use the provided accountId directly (works before config is saved)
+      auth = { type: 'oauth', userId, accountId: options.accountId };
+    } else if (options?.apiKey) {
+      // Use the provided apiKey directly
+      auth = { type: 'token', apiKey: options.apiKey };
+    } else {
+      const config = await this.getConfig(userId, listId, provider);
+      if (!config) throw new Error('No sync configuration found. Save your connection settings first.');
+      if (!config.accountId && !config.apiKeyEncrypted) {
+        throw new Error('No authentication configured. Save your connection settings first.');
       }
-      lastKey = page.lastEvaluatedKey;
-    } while (lastKey);
+      auth = this.resolveAuth(config);
+    }
 
-    return Array.from(keys).sort();
+    if (provider === 'attio') {
+      const svc = auth.type === 'token'
+        ? AttioService.fromToken(auth.apiKey!)
+        : await AttioService.create(auth.userId!, auth.accountId!);
+      return svc.getAllLists();
+    }
+
+    if (provider === 'hubspot') {
+      const svc = await this.getHubSpotService(auth);
+      return svc.getAllLists();
+    }
+
+    return [];
   }
 
-  // ─── Push: all leads → CRM ───────────────────────────────────────────────
+  // Returns HubSpot deal pipelines so the user can pre-select one before first sync
+  async getExternalPipelines(
+    userId: string,
+    listId: string,
+    provider: string,
+    options?: { accountId?: string; apiKey?: string }
+  ): Promise<Array<{ id: string; name: string }>> {
+    if (provider !== 'hubspot') return [];
+
+    let auth: CrmAuth;
+
+    if (options?.accountId) {
+      // Use the provided accountId directly (works before config is saved)
+      auth = { type: 'oauth', userId, accountId: options.accountId };
+    } else if (options?.apiKey) {
+      // Use the provided apiKey directly
+      auth = { type: 'token', apiKey: options.apiKey };
+    } else {
+      const config = await this.getConfig(userId, listId, provider);
+      if (!config) throw new Error('No sync configuration found. Save your connection settings first.');
+      if (!config.accountId && !config.apiKeyEncrypted) {
+        throw new Error('No authentication configured. Save your connection settings first.');
+      }
+      auth = this.resolveAuth(config);
+    }
+
+    const svc = await this.getHubSpotService(auth);
+    const pipelines = await svc.listDealPipelines();
+    return pipelines.map(p => ({ id: p.id, name: p.label }));
+  }
+
+  // ─── External property discovery ─────────────────────────────────────────────
+
+  /**
+   * Fetches available CRM properties/attributes for use in mapping dropdowns.
+   *
+   * HubSpot:
+   *   objectType='contact' → all Contact properties (standard + custom)
+   *   objectType='deal'    → all Deal properties only
+   * Attio:
+   *   All sections → People object attributes + list-entry attributes merged.
+   *   objectType is ignored for Attio.
+   *
+   * Accepts inline accountId / apiKey to work before the config is saved.
+   */
+  async getExternalProperties(
+    userId: string,
+    listId: string,
+    provider: string,
+    options: { objectType?: 'contact' | 'deal'; accountId?: string; apiKey?: string }
+  ): Promise<{ properties: CrmProperty[] }> {
+    if (!['hubspot', 'attio'].includes(provider)) {
+      throw new Error(`Unsupported provider: "${provider}". Supported: hubspot, attio`);
+    }
+
+    let auth: CrmAuth;
+    if (options.accountId) {
+      auth = { type: 'oauth', userId, accountId: options.accountId };
+    } else if (options.apiKey) {
+      auth = { type: 'token', apiKey: options.apiKey };
+    } else {
+      const config = await this.getConfig(userId, listId, provider);
+      if (!config) throw new Error('No sync configuration found. Save your connection settings first.');
+      if (!config.accountId && !config.apiKeyEncrypted) {
+        throw new Error('No authentication configured. Save your connection settings first.');
+      }
+      auth = this.resolveAuth(config);
+    }
+
+    if (provider === 'hubspot') {
+      const svc = await this.getHubSpotService(auth);
+      if (options.objectType === 'deal') {
+        const props = await svc.listDealProperties();
+        return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
+      }
+      // Default: contact properties (used for Contact and Custom sections)
+      const props = await svc.listContactProperties();
+      return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
+    }
+
+    // Attio: merge People object attributes + list-entry attributes
+    const svc = auth.type === 'token'
+      ? AttioService.fromToken(auth.apiKey!)
+      : await AttioService.create(auth.userId!, auth.accountId!);
+
+    const peopleAttrs = await svc.getAllPeopleAttributes();
+    const properties: CrmProperty[] = peopleAttrs.map(a => ({
+      name: a.api_slug,
+      label: a.title,
+      type: a.type,
+    }));
+
+    // Also include list-entry attributes (may have custom attributes added by us)
+    const config = await this.getConfig(userId, listId, provider).catch(() => null);
+    const listId_ext = config?.externalPeopleListId ?? config?.externalListId;
+    if (listId_ext) {
+      const listAttrs = await svc.listListAttributes(listId_ext).catch(() => []);
+      const existingSlugs = new Set(properties.map(p => p.name));
+      for (const a of listAttrs) {
+        if (!existingSlugs.has(a.api_slug)) {
+          properties.push({ name: a.api_slug as string, label: (a.title || a.api_slug) as string, type: a.type as string });
+        }
+      }
+    }
+
+    return { properties };
+  }
+
+  // ─── Delete lead from CRM ─────────────────────────────────────────────────────
+
+  /**
+   * Deletes a lead's corresponding record(s) from the external CRM.
+   * Only acts when deleteOnPush is enabled in config.
+   * Called from the CRM lead delete route.
+   */
+  async deleteLeadFromCrm(userId: string, listId: string, provider: string, lead: any): Promise<void> {
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) throw new Error('No sync configuration found');
+    if (!config.deleteOnPush) return;
+
+    const auth = this.resolveAuth(config);
+
+    if (provider === 'hubspot') {
+      const svc = await this.getHubSpotService(auth);
+      const contactId = lead.syncMetadata?.hubspot_contact_id ?? lead.customFields?.hubspot_contact_id;
+      const dealId = lead.syncMetadata?.hubspot_deal_id ?? lead.customFields?.hubspot_deal_id;
+      if (dealId) {
+        await svc.deleteDeal(dealId).catch(err =>
+          console.error(`[ExternalCrmSync] deleteLeadFromCrm: failed to delete deal ${dealId}:`, err.message)
+        );
+      }
+      if (contactId) {
+        await svc.deleteContact(contactId);
+      }
+      return;
+    }
+
+    if (provider === 'attio') {
+      const svc = auth.type === 'token'
+        ? AttioService.fromToken(auth.apiKey!)
+        : await AttioService.create(auth.userId!, auth.accountId!);
+      const recordId = lead.syncMetadata?.attio_record_id ?? lead.customFields?.attio_record_id;
+      if (recordId) {
+        await svc.deletePerson(recordId);
+      }
+    }
+  }
+
+  // ─── Custom field discovery ───────────────────────────────────────────────────
+
+  async getDistinctCustomFieldKeys(listId: string, provider?: string): Promise<string[]> {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || !list.fieldNames) return [];
+
+    const allToFilter = this.getStandardFieldKeys(provider);
+    const keys = (list.fieldNames as string[]).filter(k => !allToFilter.includes(k));
+    return Array.from(new Set(keys)).sort();
+  }
+
+  private getStandardFieldKeys(provider?: string): string[] {
+    const internalFields = [
+      'leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt',
+      'hubspot_contact_id', 'hubspot_deal_id', 'attio_record_id',
+      'status', 'dealValue', 'dealCurrency', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin'
+    ];
+
+    const hubspotAliases = ['company_name', 'first_name', 'last_name', 'job_title', 'linkedin_url', 'phone_number'];
+    const attioAliases = ['company_name', 'first_name', 'last_name', 'job_title', 'phone_number', 'linkedin_url'];
+
+    let aliasesToFilter: string[] = [];
+    if (provider === 'hubspot') {
+      aliasesToFilter = hubspotAliases;
+    } else if (provider === 'attio') {
+      aliasesToFilter = attioAliases;
+    }
+
+    return Array.from(new Set([...internalFields, ...aliasesToFilter]));
+  }
+
+  // ─── Push: all leads → CRM ───────────────────────────────────────────────────
 
   async pushAllLeads(userId: string, listId: string, provider: string): Promise<SyncResult> {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) throw new Error('No sync configuration found');
     if (!config.accountId && !config.apiKeyEncrypted) throw new Error('No authentication method configured');
 
-    const token = await this.resolveToken(config, userId);
-    const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-
-    let lastKey: any = undefined;
-    const allLeads: any[] = [];
-    do {
-      const page = await crmDb.getLeadsByListId(listId, 100, lastKey);
-      allLeads.push(...(page.items as any[]));
-      lastKey = page.lastEvaluatedKey;
-    } while (lastKey);
-
-    if (allLeads.length === 0) return result;
-
-    if (provider === 'hubspot') {
-      await this.pushToHubSpot(token, allLeads, config, result);
-    } else {
-      await this.pushToAttio(token, allLeads, config, result);
+    // Attach the human-readable list name so adapters can use it when naming external lists
+    if (!config.listName) {
+      const list = await crmDb.getLeadListById(listId);
+      if (list?.name) config.listName = list.name;
     }
 
-    await this.updateSyncTimestamp(config, 'push', result.errorCount === 0);
-    return result;
+    await this.syncHubSpotStatusOptions(config, 'push');
+
+    const auth = this.resolveAuth(config);
+    const adapter = getAdapter(provider);
+
+    const totalResult: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+    let lastKey: any = undefined;
+    let hasLeads = false;
+
+    do {
+      const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
+      const chunk = page.items as any[];
+      lastKey = page.lastEvaluatedKey;
+
+      if (chunk.length > 0) {
+        hasLeads = true;
+        const chunkResult = await adapter.pushLeads(auth, chunk, config);
+
+        // Accumulate results
+        totalResult.successCount += chunkResult.successCount;
+        totalResult.newCount += chunkResult.newCount;
+        totalResult.updatedCount += chunkResult.updatedCount;
+        totalResult.errorCount += chunkResult.errorCount;
+        if (chunkResult.errors?.length > 0) {
+          totalResult.errors.push(...chunkResult.errors);
+        }
+      }
+    } while (lastKey);
+
+    if (!hasLeads) {
+      return { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+    }
+
+    // Persist updated externalPeopleListId if the adapter set it
+    await this.saveUpdatedConfig(config);
+    await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
+
+    return totalResult;
   }
 
-  // ─── Pull: CRM → all leads ────────────────────────────────────────────────
+  // ─── Pull: CRM → all leads ────────────────────────────────────────────────────
 
   async pullAllContacts(userId: string, listId: string, provider: string): Promise<SyncResult> {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) throw new Error('No sync configuration found');
     if (!config.accountId && !config.apiKeyEncrypted) throw new Error('No authentication method configured');
 
-    const token = await this.resolveToken(config, userId);
-    const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-
-    if (provider === 'hubspot') {
-      await this.pullFromHubSpot(token, listId, config, result);
-    } else {
-      await this.pullFromAttio(token, listId, config, result);
+    if (!config.listName) {
+      const list = await crmDb.getLeadListById(listId);
+      if (list?.name) config.listName = list.name;
     }
 
+    await this.syncHubSpotStatusOptions(config, 'pull');
+
+    const auth = this.resolveAuth(config);
+    const adapter = getAdapter(provider);
+
+    const result = await adapter.pullContacts(auth, listId, config);
+
+    // Delete sweep: mark local leads as CRM-removed when deleteOnPull is enabled
+    if (config.deleteOnPull && result.seenExternalIds) {
+      result.removedCount = await this.markRemovedLeads(listId, provider, result.seenExternalIds);
+    }
+    // Strip internal field — not needed outside service
+    delete result.seenExternalIds;
+
+    // Persist updated externalPeopleListId if the adapter set/cleared it
+    await this.saveUpdatedConfig(config);
     await this.updateSyncTimestamp(config, 'pull', result.errorCount === 0);
+
     return result;
   }
 
-  // ─── Auto-sync single lead (fire-and-forget) ─────────────────────────────
+  // ─── Mark removed leads ───────────────────────────────────────────────────────
+
+  /**
+   * After a pull, find local leads whose CRM record ID is no longer in seenIds
+   * and stamp `syncMetadata.crmRemovedAt` to flag them as removed in the CRM.
+   * Returns count of newly-marked leads.
+   */
+  private async markRemovedLeads(
+    listId: string,
+    provider: string,
+    seenIds: string[]
+  ): Promise<number> {
+    const seenSet = new Set(seenIds);
+    const idField = provider === 'hubspot' ? 'hubspot_contact_id' : 'attio_record_id';
+
+    let removedCount = 0;
+    let lastKey: any = undefined;
+
+    do {
+      const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
+      lastKey = page.lastEvaluatedKey;
+
+      for (const lead of page.items as any[]) {
+        const externalId = lead.syncMetadata?.[idField];
+        if (!externalId) continue;                          // never synced — skip
+        if (seenSet.has(externalId)) continue;              // still exists in CRM — skip
+        if (lead.syncMetadata?.crmRemovedAt) continue;      // already marked — skip
+
+        await crmDb.updateLead(listId, lead.leadId, {
+          syncMetadata: {
+            ...(lead.syncMetadata || {}),
+            crmRemovedAt: new Date().toISOString(),
+          },
+        }).catch(err => console.error(`[ExternalCrmSync] markRemovedLeads: failed for lead ${lead.leadId}:`, err.message));
+        removedCount++;
+      }
+    } while (lastKey);
+
+    return removedCount;
+  }
+
+  // ─── Auto-sync single lead (fire-and-forget) ──────────────────────────────────
 
   async autoSyncLead(
     userId: string,
     listId: string,
     lead: any,
     provider: 'hubspot' | 'attio',
-    eventType: 'created' | 'updated'
+    _eventType: 'created' | 'updated'
   ): Promise<void> {
     try {
       const config = await this.getConfig(userId, listId, provider);
       if (!config?.autoSyncEnabled) return;
       if (!config.accountId && !config.apiKeyEncrypted) return;
 
-      const token = await this.resolveToken(config, userId);
-      const singleResult: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+      await this.syncHubSpotStatusOptions(config, 'push');
 
-      if (provider === 'hubspot') {
-        await this.pushToHubSpot(token, [lead], config, singleResult);
-      } else {
-        await this.pushToAttio(token, [lead], config, singleResult);
-      }
+      const auth = this.resolveAuth(config);
+      const adapter = getAdapter(provider);
+      await adapter.pushLeads(auth, [lead], config);
+      await this.saveUpdatedConfig(config).catch(() => { });
     } catch (err: any) {
       const details = err.response?.data?.message || err.response?.data || err.message;
       console.error(`[ExternalCrmSync] Auto-sync failed for lead ${lead.leadId} in list ${listId}:`, details);
     }
   }
 
-  // ─── HubSpot push implementation ─────────────────────────────────────────
+  // ─── Private helpers ──────────────────────────────────────────────────────────
 
-  private async pushToHubSpot(
-    token: string,
-    leads: any[],
-    config: ExternalCrmSyncConfig,
-    result: SyncResult
-  ): Promise<void> {
-    const client = this.makeClient(token, 'https://api.hubapi.com');
-
-    // Pre-create any custom properties needed
-    const customMappingEnabled = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
-    for (const m of customMappingEnabled) {
-      await this.ensureHubSpotProperty(client, m.crmProperty).catch(() => { /* non-fatal */ });
-    }
-
-    for (const lead of leads) {
-      try {
-        if (!lead.email) continue; // HubSpot requires email to upsert
-
-        // Build contact properties from enabled mappings
-        const contactProps = buildPushProps(lead, config.contactFieldMapping);
-        const customProps = buildPushProps(lead, config.customFieldMapping);
-        const allContactProps = { ...contactProps, ...customProps };
-
-        if (Object.keys(allContactProps).length === 0) continue;
-
-        // Search for existing contact by email
-        let contactId: string | undefined;
-        try {
-          const searchRes = await client.post('/crm/v3/objects/contacts/search', {
-            filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: lead.email }] }],
-            properties: ['email'],
-            limit: 1,
-          });
-          const hits = (searchRes.data as any).results;
-          if (hits?.length > 0) contactId = hits[0].id;
-        } catch { /* treat as not found */ }
-
-        if (contactId) {
-          await client.patch(`/crm/v3/objects/contacts/${contactId}`, { properties: allContactProps });
-          result.updatedCount++;
-        } else {
-          const createRes = await client.post('/crm/v3/objects/contacts', { properties: allContactProps });
-          contactId = (createRes.data as any).id;
-          result.newCount++;
-        }
-        result.successCount++;
-
-        // Deal fields
-        const dealProps = buildPushProps(lead, config.dealFieldMapping);
-        if (contactId && Object.keys(dealProps).length > 0) {
-          await this.upsertHubSpotDeal(client, contactId, dealProps, lead);
-        }
-
-        // Persist HubSpot contact ID back to lead
-        if (contactId) {
-          await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-            customFields: { ...(lead.customFields || {}), hubspot_contact_id: contactId },
-          }).catch(() => { /* non-critical */ });
-        }
-      } catch (err: any) {
-        result.errorCount++;
-        const msg = err.response?.data?.message || err.message || 'Unknown error';
-        result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
-      }
-    }
+  private async saveUpdatedConfig(config: ExternalCrmSyncConfig): Promise<void> {
+    await settingsService.setSetting(
+      settingKey(config.listId, config.provider),
+      JSON.stringify(config),
+      `External CRM sync config for list ${config.listId} → ${config.provider}`,
+      config.userId
+    ).catch(() => { /* non-critical */ });
   }
-
-  private async ensureHubSpotProperty(client: any, propertyName: string): Promise<void> {
-    const slug = propertyName.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-    try {
-      await client.get(`/crm/v3/properties/contacts/${slug}`);
-    } catch (e: any) {
-      if (e.response?.status === 404) {
-        await client.post('/crm/v3/properties/contacts', {
-          name: slug,
-          label: slug.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-          type: 'string',
-          fieldType: 'text',
-          groupName: 'contactinformation',
-        });
-      }
-    }
-  }
-
-  private async upsertHubSpotDeal(client: any, contactId: string, dealProps: Record<string, string>, lead: any): Promise<void> {
-    const existingDealId = lead.customFields?.hubspot_deal_id;
-    let dealId: string;
-
-    if (existingDealId) {
-      try {
-        await client.patch(`/crm/v3/objects/deals/${existingDealId}`, { properties: dealProps });
-        dealId = existingDealId;
-      } catch {
-        // Deal may have been deleted, create new
-        const res = await client.post('/crm/v3/objects/deals', { properties: this.addDealName(dealProps, lead) });
-        dealId = (res.data as any).id;
-        await this.associateHubSpotDeal(client, contactId, dealId);
-      }
-    } else {
-      const res = await client.post('/crm/v3/objects/deals', { properties: this.addDealName(dealProps, lead) });
-      dealId = (res.data as any).id;
-      await this.associateHubSpotDeal(client, contactId, dealId);
-    }
-
-    if (dealId) {
-      await crmDb.updateLead(lead.listId || '', lead.leadId, {
-        customFields: { ...(lead.customFields || {}), hubspot_deal_id: dealId },
-      }).catch(() => { });
-    }
-  }
-
-  private addDealName(props: Record<string, string>, lead: any): Record<string, string> {
-    if (props.dealname) return props;
-    const name = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || lead.email || 'Unknown';
-    return { ...props, dealname: `${name} - Deal` };
-  }
-
-  private async associateHubSpotDeal(client: any, contactId: string, dealId: string): Promise<void> {
-    await client.put(
-      `/crm/v3/objects/contacts/${contactId}/associations/deals/${dealId}/contact_to_deal`
-    );
-  }
-
-  // ─── HubSpot pull implementation ─────────────────────────────────────────
-
-  private async pullFromHubSpot(
-    token: string,
-    listId: string,
-    config: ExternalCrmSyncConfig,
-    result: SyncResult
-  ): Promise<void> {
-    const client = this.makeClient(token, 'https://api.hubapi.com');
-
-    // Build the properties to fetch based on enabled pull-direction mappings
-    const pullContactMappings = config.contactFieldMapping.filter(m => m.enabled && m.direction !== 'push');
-    const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
-    const pullCustomMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'push');
-
-    const contactProps = [
-      ...pullContactMappings.map(m => m.crmProperty),
-      ...pullCustomMappings.map(m => m.crmProperty),
-    ].join(',');
-
-    const allLeadData: any[] = [];
-    let after: string | undefined;
-
-    do {
-      const params: any = { limit: 100, properties: contactProps || 'email,firstname,lastname' };
-      if (after) params.after = after;
-      const res = await client.get('/crm/v3/objects/contacts', { params });
-      const data = res.data as any;
-
-      for (const contact of (data.results || [])) {
-        const leadData: Record<string, any> = {};
-        const customFields: Record<string, any> = { hubspot_contact_id: contact.id };
-
-        // Map contact fields back
-        for (const m of pullContactMappings) {
-          const val = contact.properties?.[m.crmProperty];
-          if (val != null && val !== '') leadData[m.agentwebField] = val;
-        }
-
-        // Map custom fields back
-        for (const m of pullCustomMappings) {
-          const val = contact.properties?.[m.crmProperty];
-          if (val != null && val !== '') customFields[m.agentwebField] = val;
-        }
-
-        // Fetch associated deals if deal pull mappings exist
-        if (pullDealMappings.length > 0) {
-          try {
-            const dealProps = pullDealMappings.map(m => m.crmProperty).join(',');
-            const assocRes = await client.get(`/crm/v3/objects/contacts/${contact.id}/associations/deals`);
-            const assocIds = ((assocRes.data as any).results || []).map((r: any) => r.id);
-            if (assocIds.length > 0) {
-              const dealRes = await client.get(`/crm/v3/objects/deals/${assocIds[0]}`, { params: { properties: dealProps } });
-              const deal = dealRes.data as any;
-              for (const m of pullDealMappings) {
-                const val = deal.properties?.[m.crmProperty];
-                if (val != null && val !== '') leadData[m.agentwebField] = val;
-              }
-              customFields.hubspot_deal_id = deal.id;
-            }
-          } catch { /* skip deal fetch errors */ }
-        }
-
-        if (Object.keys(customFields).length > 0) leadData.customFields = customFields;
-        allLeadData.push(leadData);
-      }
-
-      after = data.paging?.next?.after;
-    } while (after);
-
-    if (allLeadData.length === 0) return;
-
-    const batchResult = await crmDb.batchCreateLeads(listId, allLeadData);
-    result.successCount = batchResult.successCount;
-    result.newCount = batchResult.newCount;
-    result.updatedCount = batchResult.mergedCount;
-    result.errorCount = batchResult.errorCount;
-    result.errors = batchResult.errors;
-  }
-
-  // ─── Attio push implementation ────────────────────────────────────────────
-
-  private async pushToAttio(
-    token: string,
-    leads: any[],
-    config: ExternalCrmSyncConfig,
-    result: SyncResult
-  ): Promise<void> {
-    const client = this.makeClient(token, 'https://api.attio.com/v2');
-
-    // Ensure the people list exists
-    const listName = config.listId; // will be overridden by list name in route layer
-    let peopleListId = config.externalPeopleListId;
-    if (!peopleListId) {
-      peopleListId = await this.findOrCreateAttioList(client, `AgentWeb - ${config.listId}`, 'people');
-      // Persist for future syncs (fire-and-forget)
-      config.externalPeopleListId = peopleListId;
-    }
-
-    // Ensure list entry attributes for deal + custom field mappings
-    const entryMappings = [
-      ...config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'pull'),
-      ...config.customFieldMapping.filter(m => m.enabled && m.direction !== 'pull'),
-    ];
-    for (const m of entryMappings) {
-      await this.ensureAttioListAttribute(client, peopleListId, m.crmProperty).catch(() => { /* non-fatal */ });
-    }
-
-    for (const lead of leads) {
-      try {
-        // Build person upsert body from contact mapping
-        const personBody = this.buildAttioPersonBody(lead, config.contactFieldMapping);
-
-        // Upsert person
-        let personId: string;
-        if (lead.email) {
-          const res = await client.put('/objects/people/records', {
-            matching_attribute: 'email_addresses',
-            values: personBody,
-          });
-          personId = (res.data as any).data?.id?.record_id ?? (res.data as any).id?.record_id;
-        } else if (lead.attioRecordId) {
-          await client.patch(`/objects/people/records/${lead.attioRecordId}`, { values: personBody });
-          personId = lead.attioRecordId;
-        } else {
-          const res = await client.post('/objects/people/records', { values: personBody });
-          personId = (res.data as any).data?.id?.record_id ?? (res.data as any).id?.record_id;
-          await crmDb.updateLead(lead.listId || config.listId, lead.leadId, { attioRecordId: personId }).catch(() => { });
-        }
-
-        if (!personId) {
-          result.errorCount++;
-          result.errors.push(`${lead.leadId}: Attio returned no record ID`);
-          continue;
-        }
-
-        // Build list entry values from deal + custom field mappings
-        const entryValues: Record<string, any[]> = {};
-        for (const m of entryMappings) {
-          const value = lead.customFields?.[m.agentwebField] ?? getNestedValue(lead, m.agentwebField);
-          if (value != null && String(value).trim() !== '') {
-            entryValues[m.crmProperty] = [{ value: String(value) }];
-          }
-        }
-
-        // Add to list or update existing entry
-        try {
-          const existingRes = await client.get(`/lists/${peopleListId}/entries`, {
-            params: { 'filter[record_id]': personId },
-          });
-          const entries = (existingRes.data as any).data || [];
-          if (entries.length > 0 && Object.keys(entryValues).length > 0) {
-            await client.patch(`/lists/${peopleListId}/entries/${entries[0].id.entry_id}`, {
-              entry_values: entryValues,
-            });
-          } else if (entries.length === 0) {
-            await client.post(`/lists/${peopleListId}/entries`, {
-              record_id: personId,
-              entry_values: entryValues,
-            });
-          }
-        } catch {
-          // Fallback: try to add (ignore duplicate errors)
-          await client.post(`/lists/${peopleListId}/entries`, {
-            record_id: personId,
-            entry_values: entryValues,
-          }).catch(() => { });
-        }
-
-        result.successCount++;
-        result.newCount++;
-      } catch (err: any) {
-        result.errorCount++;
-        const msg = err.response?.data?.message || err.message || 'Unknown error';
-        result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
-      }
-    }
-  }
-
-  private buildAttioPersonBody(lead: any, contactMapping: FieldMapping[]): Record<string, any> {
-    const body: Record<string, any> = {};
-    for (const m of contactMapping) {
-      if (!m.enabled || m.direction === 'pull') continue;
-      const value = getNestedValue(lead, m.agentwebField);
-      if (value == null || String(value).trim() === '') continue;
-
-      // Attio uses arrays for multi-value fields
-      if (m.crmProperty === 'email_addresses') {
-        body.email_addresses = [{ email_address: String(value) }];
-      } else if (m.crmProperty === 'phone_numbers') {
-        body.phone_numbers = [{ original_phone_number: String(value) }];
-      } else if (m.crmProperty === 'first_name' || m.crmProperty === 'last_name') {
-        if (!body.name) body.name = [{}];
-        body.name[0][m.crmProperty] = String(value);
-      } else {
-        body[m.crmProperty] = [{ value: String(value) }];
-      }
-    }
-    return body;
-  }
-
-  private async findOrCreateAttioList(client: any, name: string, objectSlug: string): Promise<string> {
-    // Search existing lists
-    try {
-      const res = await client.get('/lists');
-      const lists = (res.data as any).data || [];
-      const found = lists.find((l: any) => l.name === name && l.api_slug?.includes(objectSlug));
-      if (found) return found.id?.list_id ?? found.list_id;
-    } catch { /* create fresh */ }
-
-    const res = await client.post('/lists', { name, api_slug: `${objectSlug}_${Date.now()}` });
-    return (res.data as any).data?.id?.list_id ?? (res.data as any).id?.list_id;
-  }
-
-  private async ensureAttioListAttribute(client: any, listId: string, slug: string): Promise<void> {
-    const cleanSlug = slug.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-    try {
-      await client.get(`/lists/${listId}/attributes/${cleanSlug}`);
-    } catch (e: any) {
-      if (e.response?.status === 404) {
-        const title = cleanSlug.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
-        await client.post(`/lists/${listId}/attributes`, {
-          api_slug: cleanSlug,
-          name: title,
-          type: 'text',
-          is_required: false,
-        }).catch(() => { /* already exists race condition */ });
-      }
-    }
-  }
-
-  // ─── Attio pull implementation ────────────────────────────────────────────
-
-  private async pullFromAttio(
-    token: string,
-    listId: string,
-    config: ExternalCrmSyncConfig,
-    result: SyncResult
-  ): Promise<void> {
-    const client = this.makeClient(token, 'https://api.attio.com/v2');
-
-    const peopleListId = config.externalPeopleListId;
-    if (!peopleListId) {
-      result.errors.push('No Attio list configured. Run a push first to create the list.');
-      result.errorCount++;
-      return;
-    }
-
-    const pullContactMappings = config.contactFieldMapping.filter(m => m.enabled && m.direction !== 'push');
-    const pullEntryMappings = [
-      ...config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push'),
-      ...config.customFieldMapping.filter(m => m.enabled && m.direction !== 'push'),
-    ];
-
-    const allLeadData: any[] = [];
-    let cursor: string | undefined;
-
-    do {
-      const params: any = { limit: 50 };
-      if (cursor) params.cursor = cursor;
-      const res = await client.get(`/lists/${peopleListId}/entries`, { params });
-      const data = res.data as any;
-
-      for (const entry of (data.data || [])) {
-        const personId = entry.record_id?.record_id ?? entry.record_id;
-        const leadData: Record<string, any> = {};
-        const customFields: Record<string, any> = { attio_record_id: personId };
-
-        // Fetch full person record
-        try {
-          const personRes = await client.get(`/objects/people/records/${personId}`);
-          const personValues = (personRes.data as any).data?.values ?? {};
-
-          for (const m of pullContactMappings) {
-            if (m.crmProperty === 'email_addresses') {
-              const val = personValues.email_addresses?.[0]?.email_address;
-              if (val) leadData[m.agentwebField] = val;
-            } else if (m.crmProperty === 'phone_numbers') {
-              const val = personValues.phone_numbers?.[0]?.original_phone_number;
-              if (val) leadData[m.agentwebField] = val;
-            } else if (m.crmProperty === 'first_name') {
-              const val = personValues.name?.[0]?.first_name;
-              if (val) leadData[m.agentwebField] = val;
-            } else if (m.crmProperty === 'last_name') {
-              const val = personValues.name?.[0]?.last_name;
-              if (val) leadData[m.agentwebField] = val;
-            } else {
-              const val = personValues[m.crmProperty]?.[0]?.value;
-              if (val != null && val !== '') leadData[m.agentwebField] = val;
-            }
-          }
-        } catch { /* skip person fetch errors */ }
-
-        // Map list entry values (deal + custom fields)
-        const entryValues = entry.entry_values ?? {};
-        for (const m of pullEntryMappings) {
-          const cleanSlug = m.crmProperty.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-          const val = entryValues[cleanSlug]?.[0]?.value;
-          if (val != null && val !== '') customFields[m.agentwebField] = val;
-        }
-
-        if (Object.keys(customFields).length > 0) leadData.customFields = customFields;
-        allLeadData.push(leadData);
-      }
-
-      cursor = data.next_cursor;
-    } while (cursor);
-
-    if (allLeadData.length === 0) return;
-
-    const batchResult = await crmDb.batchCreateLeads(listId, allLeadData);
-    result.successCount = batchResult.successCount;
-    result.newCount = batchResult.newCount;
-    result.updatedCount = batchResult.mergedCount;
-    result.errorCount = batchResult.errorCount;
-    result.errors = batchResult.errors;
-  }
-
-  // ─── Sync timestamp helper ────────────────────────────────────────────────
 
   private async updateSyncTimestamp(
     config: ExternalCrmSyncConfig,
@@ -798,20 +711,238 @@ export class ExternalCrmSyncService {
     success: boolean
   ): Promise<void> {
     const now = new Date().toISOString();
-    const update: Partial<ExternalCrmSyncConfig> = { updatedAt: now };
+    if (direction === 'push') config.lastPushSyncAt = now;
+    else config.lastPullSyncAt = now;
+    config.lastSyncStatus = success ? 'success' : 'error';
+    config.updatedAt = now;
+    await this.saveUpdatedConfig(config);
+  }
 
-    if (direction === 'push') update.lastPushSyncAt = now;
-    else update.lastPullSyncAt = now;
+  private mergeAttioEntryMappings(
+    customMappings: FieldMapping[] = [],
+    legacyDealMappings: FieldMapping[] = []
+  ): FieldMapping[] {
+    const merged = new Map<string, FieldMapping>();
+    for (const mapping of [...DEFAULT_ATTIO_CUSTOM_MAPPING, ...legacyDealMappings, ...customMappings]) {
+      merged.set(mapping.agentwebField, mapping);
+    }
+    return Array.from(merged.values());
+  }
 
-    update.lastSyncStatus = success ? 'success' : 'error';
-    Object.assign(config, update);
+  private async syncHubSpotStatusOptions(
+    config: ExternalCrmSyncConfig,
+    syncDirection: 'push' | 'pull'
+  ): Promise<void> {
+    if (config.provider !== 'hubspot') return;
 
-    await settingsService.setSetting(
-      settingKey(config.listId, config.provider),
-      JSON.stringify(config),
-      `External CRM sync config for list ${config.listId} → ${config.provider}`,
-      config.userId
-    ).catch(() => { /* non-critical */ });
+    const stageMapping = config.dealFieldMapping.find(m =>
+      m.enabled &&
+      m.agentwebField === 'status' &&
+      m.crmProperty === 'dealstage'
+    );
+    if (!stageMapping) return;
+    if (syncDirection === 'push' && stageMapping.direction === 'pull') return;
+    if (syncDirection === 'pull' && stageMapping.direction === 'push') return;
+
+    const list = await crmDb.getLeadListById(config.listId);
+    if (!list) return;
+
+    const svc = await this.getHubSpotService(this.resolveAuth(config));
+
+    // ─── Pipeline discovery/creation ──────────────────────────────────────────
+    const PIPELINE_LABEL = config.listName || 'Lead Pipeline';
+    let pipelineId: string = 'default';
+
+    // If the user pre-selected a pipeline, use it directly and skip discovery
+    const preSelectedPipeline = config.externalPipelineId;
+    if (preSelectedPipeline) {
+      pipelineId = preSelectedPipeline;
+      console.log(`[ExternalCrmSync] Using pre-selected pipeline: ${pipelineId}`);
+    } else {
+      const pipelines = await svc.listDealPipelines();
+      const leadPipeline = pipelines.find(p =>
+        p.label === PIPELINE_LABEL ||
+        p.id === 'lead_pipeline' ||
+        p.label.toLowerCase() === PIPELINE_LABEL.toLowerCase()
+      );
+
+      if (leadPipeline) {
+        pipelineId = leadPipeline.id;
+      } else {
+        // Prepare initial stages for the new pipeline
+        const statusConfig = this.normalizeStatusConfig(list.statusConfig);
+        const initialStages = statusConfig.map((s, idx) => ({
+          stageId: s.value,
+          label: s.label,
+          displayOrder: idx,
+          probability: this.statusToProbability(s, statusConfig)
+        }));
+
+        if (initialStages.length === 0) {
+          // HubSpot requires at least one stage to create a pipeline
+          initialStages.push({ stageId: 'lead', label: 'Lead', displayOrder: 0, probability: 0.1 });
+        }
+
+        try {
+          const newPipeline = await svc.createDealPipeline(PIPELINE_LABEL, initialStages);
+          pipelineId = newPipeline.id;
+        } catch (err: any) {
+          console.warn(
+            `[ExternalCrmSync] Failed to create custom pipeline "${PIPELINE_LABEL}". Falling back to "default".`,
+            err.response?.data || err.message
+          );
+          pipelineId = 'default';
+        }
+      }
+    }
+
+    let stages: HubSpotPipelineStage[];
+    try {
+      stages = await svc.getDealPipelineStages(pipelineId);
+    } catch (err: any) {
+      console.error(
+        `[ExternalCrmSync] failed to fetch HubSpot deal stages for list=${config.listId} pipeline=${pipelineId}: ${this.formatError(err)}`
+      );
+      throw err;
+    }
+
+    let didUpdateList = false;
+    let statusConfig = this.normalizeStatusConfig(list.statusConfig);
+    const stageMap: Record<string, string> = {};
+
+    if (syncDirection === 'push') {
+      const toCreate = statusConfig.filter(status => {
+        const exactMatch = stages.find(stage => stage.id === status.value);
+        if (exactMatch) {
+          stageMap[status.value] = exactMatch.id;
+          return false;
+        }
+
+        const labelMatch = stages.find(stage => this.normalizeLabel(stage.label) === this.normalizeLabel(status.label));
+        if (labelMatch) {
+          stageMap[status.value] = labelMatch.id;
+          return false;
+        }
+
+        return true;
+      });
+      if (toCreate.length > 0) {
+        let nextDisplayOrder = stages.reduce((max, stage) => Math.max(max, stage.displayOrder), -1) + 1;
+        for (const status of toCreate) {
+          const probability = this.statusToProbability(status, statusConfig);
+          try {
+            const createdStage = await svc.createDealStage(pipelineId, {
+              stageId: status.value,
+              label: status.label,
+              displayOrder: nextDisplayOrder++,
+              probability,
+            });
+            stages = [...stages, createdStage];
+            stageMap[status.value] = createdStage.id;
+          } catch (err: any) {
+            console.error(
+              `[ExternalCrmSync] failed to create HubSpot stage "${status.value}" for list=${config.listId}: ${this.formatError(err)}`
+            );
+            throw err;
+          }
+        }
+      }
+    }
+
+    if (syncDirection === 'pull') {
+      const existingValues = new Set(statusConfig.map(status => status.value));
+      const pulledStatuses = stages
+        .filter(stage =>
+          !existingValues.has(stage.id) &&
+          !statusConfig.some(status => this.normalizeLabel(status.label) === this.normalizeLabel(stage.label))
+        )
+        .map(stage => this.stageToStatusOption(stage));
+
+      if (pulledStatuses.length > 0) {
+        statusConfig = [...statusConfig, ...pulledStatuses];
+        didUpdateList = true;
+      }
+
+      for (const status of statusConfig) {
+        const exactMatch = stages.find(stage => stage.id === status.value);
+        if (exactMatch) {
+          stageMap[status.value] = exactMatch.id;
+          continue;
+        }
+
+        const labelMatch = stages.find(stage => this.normalizeLabel(stage.label) === this.normalizeLabel(status.label));
+        if (labelMatch) {
+          stageMap[status.value] = labelMatch.id;
+        }
+      }
+    }
+
+    config.hubspotDealStageMap = Object.keys(stageMap).length > 0 ? stageMap : undefined;
+
+    if (didUpdateList) {
+      try {
+        await crmDb.updateLeadList(config.listId, { statusConfig });
+      } catch (err: any) {
+        console.error(
+          `[ExternalCrmSync] failed to persist AgentWeb statusConfig for list=${config.listId}: ${this.formatError(err)}`
+        );
+        throw err;
+      }
+    }
+  }
+
+  private async getHubSpotService(auth: CrmAuth): Promise<HubSpotService> {
+    if (auth.type === 'token') return HubSpotService.fromToken(auth.apiKey);
+    return HubSpotService.create(auth.userId, auth.accountId);
+  }
+
+  private normalizeStatusConfig(statusConfig: any): StatusOption[] {
+    return Array.isArray(statusConfig) ? statusConfig.filter((entry): entry is StatusOption =>
+      entry &&
+      typeof entry.value === 'string' &&
+      typeof entry.label === 'string' &&
+      typeof entry.color === 'string' &&
+      typeof entry.type === 'string'
+    ) : [];
+  }
+
+  private statusToProbability(status: StatusOption, allStatuses: StatusOption[]): number {
+    if (status.type === 'won') return 1.0;
+    if (status.type === 'lost' || status.type === 'churned') return 0.0;
+
+    const activeStatuses = allStatuses.filter(item => item.type === 'active');
+    const index = Math.max(activeStatuses.findIndex(item => item.value === status.value), 0);
+    const raw = ((index + 1) / (activeStatuses.length + 1)) * 0.9;
+    return Math.max(0.1, Math.min(0.9, Math.round(raw * 10) / 10));
+  }
+
+  private stageToStatusOption(stage: HubSpotPipelineStage): StatusOption {
+    const label = stage.label || stage.id;
+    const normalized = `${stage.id} ${label} `.toLowerCase();
+    const probability = Number(stage.metadata?.probability ?? NaN);
+
+    let type: StatusType = 'active';
+    if (probability >= 1 || normalized.includes('won')) type = 'won';
+    else if (normalized.includes('churn')) type = 'churned';
+    else if (probability === 0 || normalized.includes('lost')) type = 'lost';
+
+    return {
+      value: stage.id,
+      label,
+      color: this.colorForStatusType(type),
+      type,
+    };
+  }
+
+  private colorForStatusType(type: StatusType): string {
+    if (type === 'won') return 'green';
+    if (type === 'lost') return 'red';
+    if (type === 'churned') return 'orange';
+    return 'blue';
+  }
+
+  private normalizeLabel(value: string): string {
+    return String(value || '').trim().toLowerCase();
   }
 }
 
