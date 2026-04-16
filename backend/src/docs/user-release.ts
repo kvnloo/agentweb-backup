@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-16',
     changes: [
+      'Fixed: Duplicate LinkedIn Comments Now Prevented',
+      '- Emma now checks whether your connected LinkedIn account has already commented on a post before posting',
+      '- If a comment already exists from your account, Emma skips the duplicate and reports back that the comment was already made',
+      '- This prevents cases where a session retry or resume would result in multiple identical comments appearing on a post',
+    ],
+  },
+  {
+    date: '2026-04-16',
+    changes: [
       'Slack: Emma Now Sees Images Attached to @Mentions and Thread Replies',
       '- When you attach an image to a Slack @Emma mention or reply in a thread, Emma will now analyze the image and respond with visual context',
       '- Images are stored securely in your account and displayed as inline previews in the session portal (ishare links)',
