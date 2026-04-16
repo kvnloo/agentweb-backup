@@ -110,9 +110,11 @@ export const register = async (req: Request, res: Response) => {
       attribution: touch,
     }).catch(() => {});
 
-    emailService.sendTeamIntroductionEmail(email, finalDisplayName)
-      .then(() => userDb.updateUser(userId, { introductionEmailSent: new Date().toISOString() }))
-      .catch((err) => console.error("Failed to send team introduction email:", err));
+    if (process.env.NODE_ENV !== "development") {
+      emailService.sendTeamIntroductionEmail(email, finalDisplayName)
+        .then(() => userDb.updateUser(userId, { introductionEmailSent: new Date().toISOString() }))
+        .catch((err) => console.error("Failed to send team introduction email:", err));
+    }
 
     // JWT includes roles array
     const token = jwt.sign(
