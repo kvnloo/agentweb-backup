@@ -1,4 +1,4 @@
-import { getSecret } from "../utils/secretsManager";
+import AWS from "aws-sdk";
 
 /**
  * Parameters for composing a branded video via Remotion Lambda.
@@ -63,6 +63,18 @@ const FPS = 30;
 export class RemotionService {
   private config: RemotionConfig | null = null;
 
+  /**
+   * Fetch a secret from a specific region, bypassing the app-wide secretsManager
+   * client which is pinned to us-west-2.  The Remotion secret lives in us-east-1
+   * (same region as the Lambda function) so we need a dedicated client here.
+   */
+  private async fetchSecret(secretName: string, region: string): Promise<string> {
+    const client = new AWS.SecretsManager({ region });
+    const data = await client.getSecretValue({ SecretId: secretName }).promise();
+    if (data.SecretString) return data.SecretString;
+    throw new Error(`Secret ${secretName} has no SecretString`);
+  }
+
   private async getConfig(): Promise<RemotionConfig> {
     if (this.config) return this.config;
 
@@ -71,7 +83,24 @@ export class RemotionService {
         ? "dev/AgentWeb/Remotion"
         : "prod/AgentWeb/Remotion";
 
-    const raw = await getSecret(secretName);
+    // The Remotion secret is stored in us-east-1 (same region as the Lambda function).
+    // Try us-east-1 first, then fall back to us-west-2 (where other app secrets live).
+    let raw: string;
+    try {
+      console.log(`RemotionService: Fetching secret ${secretName} from us-east-1...`);
+      raw = await this.fetchSecret(secretName, "us-east-1");
+      console.log(`RemotionService: Secret fetched successfully from us-east-1`);
+    } catch (e1: any) {
+      console.warn(`RemotionService: us-east-1 fetch failed (${e1.code}: ${e1.message}), trying us-west-2...`);
+      try {
+        raw = await this.fetchSecret(secretName, "us-west-2");
+        console.log(`RemotionService: Secret fetched successfully from us-west-2`);
+      } catch (e2: any) {
+        console.error(`RemotionService: Both regions failed. us-east-1: ${e1.code}, us-west-2: ${e2.code}`);
+        throw new Error(`Remotion secret not found in us-east-1 (${e1.code}) or us-west-2 (${e2.code})`);
+      }
+    }
+
     if (!raw) {
       throw new Error(`Remotion config not found in Secrets Manager (${secretName})`);
     }
@@ -103,9 +132,51 @@ export class RemotionService {
    *   3. Lambda renders and writes the output to the configured S3 bucket
    *   4. Return the output S3 URL
    */
+  /**
+   * Ensure AWS credentials are set in environment variables so that
+   * @remotion/lambda (which doesn't use the SDK credential chain) can
+   * authenticate.  On EC2 we pull them from the instance metadata service.
+   */
+  private async ensureRemotionCredentials(): Promise<void> {
+    // Already set — nothing to do
+    if (process.env.REMOTION_AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID) return;
+
+    // Fetch credentials from the EC2 instance metadata (IMDSv2)
+    try {
+      const tokenResp = await fetch(
+        "http://169.254.169.254/latest/api/token",
+        { method: "PUT", headers: { "X-aws-ec2-metadata-token-ttl-seconds": "60" } }
+      );
+      const token = await tokenResp.text();
+
+      const roleResp = await fetch(
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        { headers: { "X-aws-ec2-metadata-token": token } }
+      );
+      const roleName = (await roleResp.text()).trim();
+
+      const credResp = await fetch(
+        `http://169.254.169.254/latest/meta-data/iam/security-credentials/${roleName}`,
+        { headers: { "X-aws-ec2-metadata-token": token } }
+      );
+      const creds = await credResp.json() as any;
+
+      process.env.REMOTION_AWS_ACCESS_KEY_ID = creds.AccessKeyId;
+      process.env.REMOTION_AWS_SECRET_ACCESS_KEY = creds.SecretAccessKey;
+      process.env.REMOTION_AWS_SESSION_TOKEN = creds.Token;
+      console.log("RemotionService: Loaded credentials from instance metadata for role", roleName);
+    } catch (err: any) {
+      console.warn("RemotionService: Could not load instance metadata credentials:", err.message);
+      // Let renderMediaOnLambda try on its own (will fail with a clear message if missing)
+    }
+  }
+
   async compose(params: RemotionComposeParams): Promise<RemotionComposeResult> {
     try {
       const config = await this.getConfig();
+
+      // Ensure @remotion/lambda has credentials — it doesn't use the SDK chain
+      await this.ensureRemotionCredentials();
 
       // Lazy-require so the backend doesn't fail to start if @remotion/lambda
       // is not yet installed (it will only be used when compose is called)
