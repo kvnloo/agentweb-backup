@@ -1335,15 +1335,21 @@ export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
     throw new Error('SLACK_BOT_TOKEN not set');
   }
 
-  const response = await fetch(urlPrivate, {
-    headers: {
-      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-    },
+  // Use axios instead of fetch: axios preserves the Authorization header through ALL
+  // redirects by default, while Node's fetch strips it on cross-origin redirects.
+  // Slack's url_private redirects through multiple slack.com subdomains before returning
+  // the file bytes, and all hops require the Bearer token.
+  const axios = (await import('axios')).default;
+  const response = await axios.get<ArrayBuffer>(urlPrivate, {
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    responseType: 'arraybuffer',
+    timeout: 30000,
   });
 
-  if (!response.ok) {
-    throw new Error(`Failed to download Slack file: ${response.status} ${response.statusText}`);
+  const buffer = Buffer.from(response.data);
+  const prefix = buffer.slice(0, 20).toString('utf8');
+  if (prefix.trimStart().startsWith('<!') || prefix.trimStart().toLowerCase().startsWith('<html')) {
+    throw new Error(`Slack file download returned HTML for URL: ${urlPrivate}`);
   }
-
-  return Buffer.from(await response.arrayBuffer());
+  return buffer;
 }
