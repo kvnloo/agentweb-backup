@@ -152,6 +152,8 @@ function pdfPageRender(pageData: any): Promise<string> {
 interface LLMModelConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
+  /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
+  isLive?: boolean;
 }
 
 // Type for LLM call options
@@ -1091,6 +1093,8 @@ export class AgentModeService {
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-flash-lite-preview': { client: null, supportsTemperature: true },
+    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
+    'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
@@ -1163,10 +1167,15 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
+    // Live models use WebSocket via liveVoiceService — callLLM is not applicable
+    if (this.llmModels[model].isLive) {
+      throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
+    }
+
     // Get the client - lazy-load Gemini or Bedrock client if needed
     let client = this.llmModels[model].client;
     if (!client) {
-      if (model === 'gemini-3-pro-preview' || model === 'gemini-3-flash-preview' || model === 'gemini-3.1-pro-preview' || model === 'gemini-3.1-flash-lite-preview') {
+      if (model.startsWith('gemini-')) {
         client = await this.getGeminiClient();
         // Update the cached client for future use
         this.llmModels[model].client = client;
