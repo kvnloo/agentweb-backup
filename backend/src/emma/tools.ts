@@ -1064,6 +1064,7 @@ emmaToolRegistry.register({
           properties: {
             brandName: { type: 'string', description: 'Brand name' },
             tagline: { type: 'string', description: 'Brand tagline or slogan' },
+            domain: { type: 'string', description: 'Website domain (e.g. example.com)' },
             primaryColor: { type: 'string', description: 'Primary brand color (hex code)' },
             primaryColorEnd: { type: 'string', description: 'End color for gradient (hex code)' },
             secondaryColor: { type: 'string', description: 'Secondary brand color (hex code)' },
