@@ -29,6 +29,7 @@ const io = new Server(server, {
         /^https:\/\/[a-zA-Z0-9\-]+\.agentweb\.pro$/,
         'https://agentweb.pro',
         'http://localhost:5173',
+        'http://localhost:5174',
         process.env.FRONTEND_URL || 'http://localhost:5173',
         process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174',
         /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
