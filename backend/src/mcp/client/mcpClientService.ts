@@ -133,6 +133,31 @@ interface SessionClientPool {
   lastActivity: number;
 }
 
+// Circuit breaker state for a server
+interface ServerCircuitState {
+  failureCount: number;
+  firstFailureAt: number;
+  openUntil: number; // timestamp when circuit re-closes (0 = closed)
+}
+
+/**
+ * Returns true if an error is a connection-level failure (not a tool logic error).
+ * Used to decide whether to evict a cached client from the session pool.
+ */
+function isConnectionError(error: unknown): boolean {
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    msg.includes('connection timeout') ||
+    msg.includes('socket hang up') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('etimedout') ||
+    msg.includes('sse stream disconnected') ||
+    msg.includes('transport closed') ||
+    msg.includes('this operation was aborted')
+  );
+}
+
 export class McpClientService {
   private clients: Map<string, Client> = new Map();
   private mcpTools: AgentTool[] = [];
@@ -150,6 +175,11 @@ export class McpClientService {
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
   private cleanupInterval?: NodeJS.Timeout;
 
+  // Circuit breaker: fail fast when a server has timed out repeatedly
+  private readonly CIRCUIT_BREAKER_THRESHOLD = parseInt(process.env.MCP_CIRCUIT_BREAKER_THRESHOLD || '3', 10);
+  private readonly CIRCUIT_BREAKER_COOLDOWN_MS = parseInt(process.env.MCP_CIRCUIT_BREAKER_COOLDOWN_MS || String(5 * 60 * 1000), 10);
+  private serverCircuits: Map<string, ServerCircuitState> = new Map();
+
   // Playwright browser pre-install: shared Promise so concurrent sessions wait on the same install
   private static readonly PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp';
   private static playwrightBrowsersInstall: Promise<void> | null = null;
@@ -159,6 +189,49 @@ export class McpClientService {
     this.startSessionCleanup();
   }
 
+  /**
+   * Check if a server's circuit breaker is open (too many recent failures).
+   * Returns a human-readable reason string if open, or null if closed.
+   */
+  private checkCircuit(serverName: string): string | null {
+    const state = this.serverCircuits.get(serverName);
+    if (!state) return null;
+    const now = Date.now();
+    if (state.openUntil > now) {
+      const remainingSecs = Math.ceil((state.openUntil - now) / 1000);
+      return `Connection timeout for ${serverName} (service temporarily unavailable — retrying in ${remainingSecs}s)`;
+    }
+    return null;
+  }
+
+  /**
+   * Record a connection failure for a server and open the circuit if the threshold is reached.
+   */
+  private recordConnectionFailure(serverName: string): void {
+    const now = Date.now();
+    let state = this.serverCircuits.get(serverName);
+    if (!state || now - state.firstFailureAt > this.CIRCUIT_BREAKER_COOLDOWN_MS) {
+      // First failure in a fresh window
+      state = { failureCount: 1, firstFailureAt: now, openUntil: 0 };
+    } else {
+      state.failureCount++;
+    }
+    if (state.failureCount >= this.CIRCUIT_BREAKER_THRESHOLD) {
+      state.openUntil = now + this.CIRCUIT_BREAKER_COOLDOWN_MS;
+      console.warn(`[MCP-CIRCUIT] Circuit OPEN for "${serverName}" after ${state.failureCount} failures — pausing for ${this.CIRCUIT_BREAKER_COOLDOWN_MS / 1000}s`);
+    }
+    this.serverCircuits.set(serverName, state);
+  }
+
+  /**
+   * Reset the circuit breaker for a server after a successful connection.
+   */
+  private resetCircuit(serverName: string): void {
+    if (this.serverCircuits.has(serverName)) {
+      console.log(`[MCP-CIRCUIT] Circuit CLOSED for "${serverName}" — connection succeeded`);
+      this.serverCircuits.delete(serverName);
+    }
+  }
 
   /**
    * Initialize MCP clients and discover tools
@@ -301,6 +374,12 @@ export class McpClientService {
       return sessionPool.clients.get(serverName)!;
     }
 
+    // Circuit breaker: fail fast if the server has timed out too many times recently
+    const circuitReason = this.checkCircuit(serverName);
+    if (circuitReason) {
+      throw new Error(circuitReason);
+    }
+
     // Create new client for this session
     const serverConfig = this.serverConfigs.get(serverName);
     if (!serverConfig) {
@@ -388,7 +467,15 @@ export class McpClientService {
       console.error(`[MCP-SESSION] Transport error for ${serverName} (session ${poolKey.substring(0, 8)}):`, err);
     };
 
-    await Promise.race([connectPromise, timeoutPromise]);
+    try {
+      await Promise.race([connectPromise, timeoutPromise]);
+    } catch (connectError) {
+      this.recordConnectionFailure(serverName);
+      throw connectError;
+    }
+
+    // Successful connection — reset circuit breaker
+    this.resetCircuit(serverName);
 
     // Wait for session establishment
     const transportType = getTransportType(serverConfig.config);
@@ -452,6 +539,14 @@ export class McpClientService {
                   .join('\n');
                 return { content, raw: result };
               } catch (error) {
+                // Evict dead client from session pool so the next call reconnects
+                if (isConnectionError(error)) {
+                  const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
+                  if (execPool?.clients.has(serverName)) {
+                    console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
+                    execPool.clients.delete(serverName);
+                  }
+                }
                 console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
                 throw error;
               }
@@ -904,6 +999,14 @@ export class McpClientService {
               raw: result
             };
           } catch (error) {
+            // Evict dead client from session pool so the next call reconnects
+            if (isConnectionError(error)) {
+              const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
+              if (execPool?.clients.has(name)) {
+                console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
+                execPool.clients.delete(name);
+              }
+            }
             console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
             throw error;
           }
