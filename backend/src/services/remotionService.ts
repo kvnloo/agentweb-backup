@@ -184,7 +184,11 @@ export class RemotionService {
         "@remotion/lambda/client"
       );
 
-      const clipDurationSeconds = params.clipDurationSeconds ?? 8;
+      // Veo generates clips up to 8 seconds. Cap here so a stale or incorrect
+      // clipDurationSeconds from the caller never makes the composition longer
+      // than the actual clip (which would cause the video to freeze at the end).
+      const MAX_VEO_CLIP_SECONDS = 8;
+      const clipDurationSeconds = Math.min(params.clipDurationSeconds ?? MAX_VEO_CLIP_SECONDS, MAX_VEO_CLIP_SECONDS);
       const durationInFrames = Math.round(clipDurationSeconds * FPS);
 
       // Ensure filename ends with .mp4
