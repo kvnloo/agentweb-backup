@@ -3341,3 +3341,18 @@ Meta notified that all Marketing API versions prior to v24.0 will be deprecated 
 - Test files: `metaAuth.test.ts`, `instagramService.test.ts`, `agentModeService.metaMetrics.test.ts`, `agentModeService.listMetaAdsCampaigns.test.ts`
 
 **Note:** `backend/src/config/integrations.ts` was already at `v24.0`. No customer-portal changes needed.
+
+## Email Verification on Sign-Up — Decision to Postpone (2026-04-16)
+
+### Context
+
+Investigated and implemented email verification for email/password sign-ups (Option B — soft verification with a warning banner, no access gates). The implementation is complete and tested on branch `rui/support-email-verification-in-sign-up`.
+
+### Decision: Postpone
+
+**We are not shipping this now.** The team introduction email already serves a partial verification purpose — every new sign-up receives a personal email from the founders, which organically surfaces invalid/throwaway addresses. Adding a second verification email on top of that would create unnecessary friction for new users at a point where conversion matters most.
+
+**The code is parked on the branch and can be picked up later if needed.** Revisit if:
+- Spam/fake account volume becomes a real problem
+- A compliance requirement demands explicit email confirmation
+- The team introduction email flow changes or is removed
