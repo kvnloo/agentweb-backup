@@ -14382,10 +14382,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     videoModel?: string,
     startFrame?: string,
-    endFrame?: string
+    endFrame?: string,
+    compose?: boolean,
+    composeParams?: Record<string, any>
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('./videoGeneration');
@@ -14407,7 +14409,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         userId,
         videoModel,
         startFrame,
-        endFrame
+        endFrame,
+        compose,
+        composeParams: composeParams as any,
       });
 
       if (result.success && result.videoUrl) {
@@ -14442,13 +14446,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.warn('Failed to store video generation metadata:', error);
         }
 
+        const isComposed = Boolean((result as any).composedVideoUrl);
         return {
           success: true,
-          message: `✅ Video "${result.filename}" generated successfully!`,
+          message: isComposed
+            ? `✅ Video "${result.filename}" generated and composed with brand overlays!`
+            : `✅ Video "${result.filename}" generated successfully!`,
           videoUrl: result.videoUrl,
+          ...(isComposed && { composedVideoUrl: (result as any).composedVideoUrl }),
           filename: result.filename,
           prompt: prompt,
-          model: videoModel || 'veo-3.1-generate-preview'
+          model: videoModel || 'veo-3.1-generate-preview',
+          composed: isComposed,
         };
       } else {
         return {

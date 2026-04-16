@@ -1,11 +1,14 @@
 import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
+import { remotionService, RemotionComposeParams } from "./remotionService";
 
 interface VideoGenerationResult {
   success: boolean;
   videoUrl?: string;
   filename?: string;
+  /** Present when the video was post-processed by Remotion */
+  composedVideoUrl?: string;
   error?: string;
 }
 
@@ -24,6 +27,10 @@ interface VideoGenerationParams {
   videoModel?: string; // Optional model parameter - must be one of the supported models
   startFrame?: string; // Optional: URL of the first frame image
   endFrame?: string; // Optional: URL of the last frame image
+  /** When true, post-process the generated clip with Remotion to add brand overlays */
+  compose?: boolean;
+  /** Brand overlay params — required when compose is true */
+  composeParams?: Omit<RemotionComposeParams, "clipUrl" | "filename" | "userId">;
 }
 
 export class VideoService {
@@ -479,7 +486,32 @@ export class VideoService {
             error: `Unsupported model: ${modelToUse}`
           };
         }
-        
+
+        // Post-process with Remotion if requested and Veo succeeded
+        if (result.success && result.videoUrl && params.compose && params.composeParams) {
+          console.log('VideoService: Composing branded video with Remotion...');
+          const composeResult = await remotionService.compose({
+            ...params.composeParams,
+            clipUrl: result.videoUrl,
+            filename: params.filename,
+            userId: params.userId,
+          });
+
+          if (composeResult.success && composeResult.videoUrl) {
+            // Return both URLs: raw clip and composed final video
+            result = {
+              ...result,
+              composedVideoUrl: composeResult.videoUrl,
+              // Callers get the composed video as the primary URL
+              videoUrl: composeResult.videoUrl,
+              filename: composeResult.filename ?? result.filename,
+            };
+          } else {
+            // Composition failed — log a warning but still return the raw clip
+            console.warn(`VideoService: Remotion composition failed (${composeResult.error}), returning raw clip`);
+          }
+        }
+
         return result;
       } catch (error: any) {
         console.error(`❌ Error in video generation with ${modelToUse}:`, error);
