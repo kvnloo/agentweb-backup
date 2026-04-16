@@ -1344,8 +1344,14 @@ export async function generateSessionResponse(
   // Process attachments and include URLs in message content for LLM
   let messageContent = userMessage;
   if (attachments && attachments.length > 0) {
+    const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
+    const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
     const attachmentUrls = attachments.map((attachment: any) => {
-      return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+      const mimetype = (attachment.mimetype || '').toLowerCase();
+      const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
+      const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
+      const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
+      return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
     }).join('\n');
     messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
   }
