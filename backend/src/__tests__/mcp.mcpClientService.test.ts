@@ -1208,4 +1208,181 @@ describe('McpClientService', () => {
        }));
     });
   });
+
+  describe('circuit breaker', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('should open circuit after threshold failures and throw immediately without connecting', async () => {
+      // Configure a server via DB
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{
+          name: 'flaky-server',
+          transport: 'sse',
+          url: 'http://flaky.example.com/mcp'
+        }])
+      });
+
+      const mockTools = [{ name: 'search', description: 'Search', inputSchema: { type: 'object' } }];
+      // Call 1 (connectToServer during init) succeeds; subsequent session-level connects fail.
+      // The circuit breaker only tracks failures from getSessionClient, not the init connect.
+      let connectCallCount = 0;
+      const mockClient = {
+        connect: jest.fn().mockImplementation(() => {
+          connectCallCount++;
+          if (connectCallCount === 1) return Promise.resolve(); // init connection succeeds
+          return Promise.reject(new Error('Connection timeout for flaky-server')); // session connects fail
+        }),
+        listTools: jest.fn().mockResolvedValue({ tools: mockTools }),
+        callTool: jest.fn(),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+      const tools = service.getTools();
+      expect(tools).toHaveLength(1);
+
+      const context = { userId: 'user1', sessionId: 'sess1', llmModel: 'test', service: null };
+
+      // Calls 1–3: real session connect attempts (connectCallCount goes 2, 3, 4)
+      await expect(tools[0].execute({}, context)).rejects.toThrow('Connection timeout for flaky-server');
+      await expect(tools[0].execute({}, context)).rejects.toThrow('Connection timeout for flaky-server');
+      await expect(tools[0].execute({}, context)).rejects.toThrow('Connection timeout for flaky-server');
+
+      const connectCountAfterThreshold = connectCallCount;
+
+      // Call 4: circuit is now open — should fail immediately without calling connect()
+      await expect(tools[0].execute({}, context)).rejects.toThrow('service temporarily unavailable');
+      expect(connectCallCount).toBe(connectCountAfterThreshold); // no new connect attempt
+    });
+
+    it('should close circuit after cooldown and allow reconnection', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{
+          name: 'recover-server',
+          transport: 'sse',
+          url: 'http://recover.example.com/mcp'
+        }])
+      });
+
+      // First connect (init) always succeeds; session connects fail until shouldFail = false
+      let sessionConnectShouldFail = true;
+      let connectCallCount = 0;
+      const mockClient = {
+        connect: jest.fn().mockImplementation(() => {
+          connectCallCount++;
+          if (connectCallCount === 1) return Promise.resolve(); // init succeeds
+          return sessionConnectShouldFail
+            ? Promise.reject(new Error('Connection timeout for recover-server'))
+            : Promise.resolve();
+        }),
+        listTools: jest.fn().mockResolvedValue({ tools: [{ name: 'tool', description: 'tool', inputSchema: {} }] }),
+        callTool: jest.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }], isError: false }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+      const tools = service.getTools();
+      expect(tools).toHaveLength(1);
+      const context = { userId: 'userA', sessionId: 'sessA', llmModel: 'test', service: null };
+
+      // Exhaust threshold (default 3) to open circuit
+      for (let i = 0; i < 3; i++) {
+        await expect(tools[0].execute({}, context)).rejects.toThrow('Connection timeout');
+      }
+      // Circuit is open now
+      await expect(tools[0].execute({}, context)).rejects.toThrow('service temporarily unavailable');
+
+      // Advance time past cooldown (default 5 minutes)
+      jest.advanceTimersByTime(5 * 60 * 1000 + 1000);
+      sessionConnectShouldFail = false;
+
+      // After cooldown, the tool should succeed
+      const result = await tools[0].execute({}, context);
+      expect(result).toEqual(expect.objectContaining({ content: 'ok' }));
+    });
+  });
+
+  describe('dead client eviction on callTool connection error', () => {
+    it('should evict stale client from session pool when callTool fails with connection error', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{
+          name: 'evict-server',
+          transport: 'sse',
+          url: 'http://evict.example.com/mcp'
+        }])
+      });
+
+      const mockTools = [{ name: 'do_thing', description: 'Does a thing', inputSchema: { type: 'object' } }];
+      let callToolCount = 0;
+      const mockClient = {
+        // connect() is called once during init (connectToServer) + once per getSessionClient
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: mockTools }),
+        callTool: jest.fn().mockImplementation(() => {
+          callToolCount++;
+          if (callToolCount === 1) {
+            // First callTool: transport dies mid-session
+            return Promise.reject(new Error('Connection timeout for evict-server'));
+          }
+          // Subsequent calls (on fresh client after eviction): succeed
+          return Promise.resolve({ content: [{ type: 'text', text: 'success' }], isError: false });
+        }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+      const tools = service.getTools();
+      const context = { userId: 'user-evict', sessionId: 'sess-evict', llmModel: 'test', service: null };
+
+      // First execute fails with connection error — dead client should be evicted
+      await expect(tools[0].execute({}, context)).rejects.toThrow('Connection timeout');
+
+      // Second execute: new client is created (eviction worked), succeeds
+      const result = await tools[0].execute({}, context);
+      expect(result).toEqual(expect.objectContaining({ content: 'success' }));
+      // connect() called: once during init + once during first getSessionClient + once after eviction = 3
+      expect(mockClient.connect).toHaveBeenCalledTimes(3);
+    });
+
+    it('should NOT evict client on non-connection errors (tool logic errors)', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{
+          name: 'logic-error-server',
+          transport: 'sse',
+          url: 'http://logic.example.com/mcp'
+        }])
+      });
+
+      const mockTools = [{ name: 'logic_tool', description: 'Logic tool', inputSchema: { type: 'object' } }];
+      let connectCallCount = 0;
+      const mockClient = {
+        connect: jest.fn().mockImplementation(() => { connectCallCount++; return Promise.resolve(); }),
+        listTools: jest.fn().mockResolvedValue({ tools: mockTools }),
+        callTool: jest.fn().mockRejectedValue(new Error('Invalid query parameter')),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+      const tools = service.getTools();
+      const context = { userId: 'user-logic', sessionId: 'sess-logic', llmModel: 'test', service: null };
+
+      // Two calls with a logic error — both fail but no client eviction
+      await expect(tools[0].execute({}, context)).rejects.toThrow('Invalid query parameter');
+      await expect(tools[0].execute({}, context)).rejects.toThrow('Invalid query parameter');
+
+      // connect() called: once during init + once on first getSessionClient = 2
+      // Second execute reuses the pooled client (not evicted) → no additional connect
+      expect(connectCallCount).toBe(2);
+    });
+  });
 });

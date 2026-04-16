@@ -12416,6 +12416,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Helper to format tool error for LLM feedback
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
+    // Connection-level failures (timeouts, circuit open) require a different instruction:
+    // tell the LLM to stop retrying and surface the error to the user instead of
+    // spinning through other variants of the same tool.
+    const isConnectionTimeout =
+      safeMessage.includes('Connection timeout') ||
+      safeMessage.includes('service temporarily unavailable');
+    if (isConnectionTimeout) {
+      return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
