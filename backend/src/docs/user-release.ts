@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-16',
+    changes: [
+      'Slack: Emma Now Sees Images Attached to @Mentions and Thread Replies',
+      '- When you attach an image to a Slack @Emma mention or reply in a thread, Emma will now analyze the image and respond with visual context',
+      '- Images are stored securely in your account and displayed as inline previews in the session portal (ishare links)',
+      '- Non-image file attachments are also forwarded to Emma and listed as downloadable links in the session',
+    ],
+  },
+  {
     date: '2026-04-15',
     changes: [
       'Admin: User Notes — Track Status and Context for Each Client',
