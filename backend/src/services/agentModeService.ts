@@ -19089,6 +19089,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        // Check for existing comment by this actor to prevent duplicates
+        try {
+          const existingComments = await (adapter as any).getComments(account, postUrn, userId);
+          const alreadyCommented = existingComments.some((c: any) => c.actorUrn === account.account_id);
+          if (alreadyCommented) {
+            console.warn('[AgentMode] commentOnLinkedInPost: actor already has a comment on this post, skipping to prevent duplicate');
+            return {
+              success: true,
+              message: 'Already commented on this post — skipping to avoid duplicate.',
+              already_commented: true
+            };
+          }
+        } catch (checkError: any) {
+          // If the check fails, log and proceed — better to risk a duplicate than silently fail
+          console.warn('[AgentMode] commentOnLinkedInPost: could not check existing comments, proceeding anyway:', checkError.message);
+        }
+
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
         const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
 
