@@ -783,6 +783,7 @@ export default function AdminDashboard() {
   const [slackChannelDialogOpen, setSlackChannelDialogOpen] = useState(false);
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
   const [currentSlackChannels, setCurrentSlackChannels] = useState<string[]>([]);
+  const [slackChannelNames, setSlackChannelNames] = useState<Record<string, string>>({});
   const [slackChannelInputText, setSlackChannelInputText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
   const [adminSlackChannel, setAdminSlackChannel] = useState("");
@@ -925,6 +926,20 @@ export default function AdminDashboard() {
       });
     }
   }, [tabValue]);
+
+  // Resolve Slack channel names for all users whenever users list loads
+  useEffect(() => {
+    const allChannelIds = Array.from(new Set(
+      contextUsers.flatMap((u: User) =>
+        u.slackChannels && u.slackChannels.length > 0
+          ? u.slackChannels
+          : u.slackChannel ? [u.slackChannel] : []
+      )
+    ));
+    if (allChannelIds.length > 0) {
+      resolveSlackChannelNames(allChannelIds);
+    }
+  }, [contextUsers]);
 
   // Load subscription types
   const loadSubscriptionTypes = async () => {
@@ -2235,6 +2250,26 @@ export default function AdminDashboard() {
     } finally {
       setEmailSenderEditLoading(false);
     }
+  };
+
+  const resolveSlackChannelNames = async (channelIds: string[]) => {
+    const unresolved = channelIds.filter((id) => !slackChannelNames[id]);
+    if (unresolved.length === 0) return;
+    const results: Record<string, string> = {};
+    await Promise.all(
+      unresolved.map(async (id) => {
+        try {
+          const res = await axios.get(
+            buildApiUrl(`/api/admin/slack/channel-info?channelId=${encodeURIComponent(id)}`),
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          results[id] = res.data.displayName || res.data.name || id;
+        } catch {
+          results[id] = id;
+        }
+      })
+    );
+    setSlackChannelNames((prev) => ({ ...prev, ...results }));
   };
 
   const handleSaveSlackChannel = async () => {
@@ -4088,9 +4123,15 @@ export default function AdminDashboard() {
                                   <Typography variant="caption" color="text.secondary">Slack Channels</Typography>
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
                                     <Typography variant="body2">
-                                      {(user.slackChannels && user.slackChannels.length > 0)
-                                        ? user.slackChannels.join(", ")
-                                        : (user.slackChannel || "—")}
+                                      {(() => {
+                                        const ids = user.slackChannels && user.slackChannels.length > 0
+                                          ? user.slackChannels
+                                          : user.slackChannel ? [user.slackChannel] : [];
+                                        if (ids.length === 0) return "—";
+                                        return ids.map((id) =>
+                                          slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
+                                        ).join(", ");
+                                      })()}
                                     </Typography>
                                     <IconButton size="small" onClick={() => {
                                       setEditingSlackChannelUserId(user.userId);
@@ -4100,6 +4141,7 @@ export default function AdminDashboard() {
                                       setCurrentSlackChannels(channels);
                                       setSlackChannelInputText("");
                                       setSlackChannelDialogOpen(true);
+                                      resolveSlackChannelNames(channels);
                                     }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
                                 </Grid>
@@ -6797,6 +6839,7 @@ export default function AdminDashboard() {
               setSlackChannelDialogOpen(false);
               setEditingSlackChannelUserId(null);
               setCurrentSlackChannels([]);
+              setSlackChannelNames({});
               setSlackChannelInputText("");
             }}
             sx={{ position: 'absolute', right: 8, top: 8 }}
@@ -6816,7 +6859,7 @@ export default function AdminDashboard() {
               {currentSlackChannels.map((ch) => (
                 <Chip
                   key={ch}
-                  label={ch}
+                  label={slackChannelNames[ch] ? `${slackChannelNames[ch]} (${ch})` : ch}
                   size="small"
                   onDelete={() => setCurrentSlackChannels((prev) => prev.filter((c) => c !== ch))}
                   disabled={slackChannelEditLoading}
@@ -6838,6 +6881,7 @@ export default function AdminDashboard() {
                   const val = slackChannelInputText.trim();
                   if (val && !currentSlackChannels.includes(val)) {
                     setCurrentSlackChannels((prev) => [...prev, val]);
+                    resolveSlackChannelNames([val]);
                   }
                   setSlackChannelInputText("");
                 }
@@ -6855,6 +6899,7 @@ export default function AdminDashboard() {
                 const val = slackChannelInputText.trim();
                 if (val && !currentSlackChannels.includes(val)) {
                   setCurrentSlackChannels((prev) => [...prev, val]);
+                  resolveSlackChannelNames([val]);
                 }
                 setSlackChannelInputText("");
               }}
@@ -6869,6 +6914,7 @@ export default function AdminDashboard() {
               setSlackChannelDialogOpen(false);
               setEditingSlackChannelUserId(null);
               setCurrentSlackChannels([]);
+              setSlackChannelNames({});
               setSlackChannelInputText("");
             }}
             disabled={slackChannelEditLoading}
