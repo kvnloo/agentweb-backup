@@ -1,6 +1,54 @@
-import { chatbotDb, ChatSession } from "./chatbotService";
+import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 
 const SCORING_MODEL = "gemini-3.1-flash-lite-preview";
+
+const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring context
+
+/**
+ * Serialize session messages into a readable conversation transcript for scoring.
+ * Includes user, assistant, and tool messages. For assistant messages that only
+ * contain tool calls (empty content), synthesizes a "[called tools: ...]" line so
+ * the judge can see that tools were actually invoked rather than treating the turn
+ * as a silent/empty response.
+ */
+function serializeMessagesForScoring(messages: ChatMessage[]): string {
+  const lines: string[] = [];
+
+  for (const m of messages) {
+    if (m.role === "system") continue;
+
+    if (m.role === "user") {
+      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      lines.push(`user: ${text}`);
+
+    } else if (m.role === "assistant") {
+      const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).trim();
+      const toolCalls: Array<{ name: string; arguments?: any }> = (m as any).metadata?.toolCalls || [];
+
+      if (text && toolCalls.length > 0) {
+        const toolNames = toolCalls.map((tc) => tc.name).join(", ");
+        lines.push(`assistant: ${text}\n[called tools: ${toolNames}]`);
+      } else if (text) {
+        lines.push(`assistant: ${text}`);
+      } else if (toolCalls.length > 0) {
+        // No text content — only tool calls. Make them visible to the judge.
+        const toolNames = toolCalls.map((tc) => tc.name).join(", ");
+        lines.push(`assistant: [called tools: ${toolNames}]`);
+      }
+      // Completely empty assistant message (no text, no tool calls) — skip
+
+    } else if (m.role === "tool") {
+      const name = (m as any).name || "tool";
+      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const preview = raw.length > MAX_TOOL_CONTENT_FOR_SCORING
+        ? raw.slice(0, MAX_TOOL_CONTENT_FOR_SCORING) + "…"
+        : raw;
+      lines.push(`tool result (${name}): ${preview}`);
+    }
+  }
+
+  return lines.join("\n");
+}
 
 export const DEFAULT_SCORING_SYSTEM_PROMPT = `You are an expert at evaluating user satisfaction in AI chat sessions.
 Analyze the conversation and rate the user's satisfaction on a scale of 1-5:
@@ -46,13 +94,11 @@ async function getDefaultScoringPrompt(): Promise<string> {
 }
 
 export async function scoreSession(
-  messages: Array<{ role: string; content: string }>,
+  messages: ChatMessage[],
   currentMessageCount: number
 ): Promise<{ score: number; reason: string; evaluatedMessageIndex: number }> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const conversationText = recentMessages
-    .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`)
-    .join("\n");
+  const conversationText = serializeMessagesForScoring(recentMessages);
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
@@ -97,14 +143,12 @@ export interface ScoringJudge {
 }
 
 export async function scoreSessionWithJudge(
-  messages: Array<{ role: string; content: string }>,
+  messages: ChatMessage[],
   currentMessageCount: number,
   judge: ScoringJudge
 ): Promise<{ score: number; reason: string; evaluatedMessageIndex: number }> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const conversationText = recentMessages
-    .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`)
-    .join("\n");
+  const conversationText = serializeMessagesForScoring(recentMessages);
 
   const { agentModeService } = await import("./agentModeService");
 
@@ -155,14 +199,7 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  const simplifiedMessages = (session.messages || [])
-    .filter((m: any) => m.role === "user" || m.role === "assistant")
-    .map((m: any) => ({
-      role: m.role,
-      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-    }));
-
-  const result = await scoreSessionWithJudge(simplifiedMessages, messageCount, judge);
+  const result = await scoreSessionWithJudge(session.messages || [], messageCount, judge);
 
   const judgeScore = {
     score: result.score,
@@ -203,15 +240,7 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
-  // Filter to role + content only
-  const simplifiedMessages = (session.messages || [])
-    .filter((m: any) => m.role === "user" || m.role === "assistant")
-    .map((m: any) => ({
-      role: m.role,
-      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-    }));
-
-  const result = await scoreSession(simplifiedMessages, messageCount);
+  const result = await scoreSession(session.messages || [], messageCount);
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {
     score: result.score,
