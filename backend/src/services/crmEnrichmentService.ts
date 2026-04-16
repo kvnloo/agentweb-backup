@@ -144,7 +144,7 @@ export class CrmEnrichmentService {
   }
 
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
-  private static readonly SUGGEST_MODEL = 'gemini-2.5-pro';
+  private static readonly SUGGEST_MODEL = 'gemini-3.1-flash-lite-preview';
 
   /**
    * Substitute {{placeholder}} tokens in a search query template with actual lead field values.

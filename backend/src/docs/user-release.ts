@@ -9,6 +9,20 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-16',
+    changes: [
+      'Slack: Emma Now Sees Images Attached to @Mentions and Thread Replies',
+      '- When you attach an image to a Slack @Emma mention or reply in a thread, Emma will now analyze the image and respond with visual context',
+      '- Images are stored securely in your account and displayed as inline previews in the session portal (ishare links)',
+      '- Non-image file attachments are also forwarded to Emma and listed as downloadable links in the session',
+      'Fixed: Brave Search Tools No Longer Spin for Minutes When the Search Service Is Unavailable',
+      '- Previously, if the Brave Search service failed to connect, the AI would retry all 5 search tool variants (web, news, image, local, video) with a 15-second wait each — resulting in 2+ minutes of unresponsive spinning',
+      '- A circuit breaker now detects repeated connection failures and fails fast after 3 attempts, with a 5-minute cooldown before retrying',
+      '- When search is unavailable, the AI now immediately stops retrying and tells you the service is temporarily unreachable instead of cycling through alternatives',
+      '- Stale or broken connections are automatically cleaned up so the next request always starts fresh',
+    ],
+  },
+  {
     date: '2026-04-15',
     changes: [
       'Admin: User Notes — Track Status and Context for Each Client',
@@ -4507,6 +4521,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: Deleting a Brand Guide Document No Longer Removes Your Logos',
       '- Deleting a brand guide PDF from the Brand Guidelines page now correctly removes only that document — logos and secondary logos are preserved',
       '- Fixed a data consistency issue where logos uploaded just before saving or deleting could be silently lost due to a stale database read',
+    ],
+  },
+  {
+    date: '2026-04-16',
+    changes: [
+      'Fixed: Session Scoring Now Correctly Recognizes Tool Calls',
+      '- The satisfaction scorer and custom judges now see when the assistant used tools (like create_social_media_posts, search_web) during a session',
+      '- Previously, assistant turns that only made tool calls had empty text content, making the judge incorrectly conclude no tools were used',
+      '- Tool results are now included in the scoring transcript so judges can evaluate whether tasks were actually completed',
     ],
   },
 ];

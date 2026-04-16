@@ -1,4 +1,5 @@
 import { scoreSession } from '../services/sessionScoringService';
+import { ChatMessage } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 
 jest.mock('../services/agentModeService', () => ({
@@ -59,7 +60,7 @@ Three key trends to watch:
       },
     ];
 
-    const result = await scoreSession(messages, 2);
+    const result = await scoreSession(messages as ChatMessage[], 2);
 
     // Verify the scoring system was called with the correct prompt
     expect(mockCallLLM).toHaveBeenCalledWith(
@@ -120,7 +121,7 @@ Key trends:
       },
     ];
 
-    const result = await scoreSession(messages, 2);
+    const result = await scoreSession(messages as ChatMessage[], 2);
 
     expect(result.score).toBe(2);
     expect(result.reason).toContain('failed to generate plain text content');
@@ -159,7 +160,7 @@ Key trends:
       },
     ];
 
-    const result = await scoreSession(messages, 2);
+    const result = await scoreSession(messages as ChatMessage[], 2);
 
     expect(result.score).toBe(5);
     expect(result.reason).toContain('excellent');
@@ -209,7 +210,7 @@ The Team</pre>
       },
     ];
 
-    const result = await scoreSession(messages, 2);
+    const result = await scoreSession(messages as ChatMessage[], 2);
 
     expect(result.score).toBe(5);
     expect(result.reason).toContain('correctly generated a plain text email');
@@ -250,7 +251,7 @@ Parameters: {"posts": [{"platform": "linkedin", "content": "AI is transforming i
       },
     ];
 
-    const result = await scoreSession(messages, 3);
+    const result = await scoreSession(messages as ChatMessage[], 3);
 
     expect(result.score).toBe(5);
     expect(result.reason).toContain('plain text');

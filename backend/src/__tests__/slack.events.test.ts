@@ -216,6 +216,85 @@ describe('Slack Events API', () => {
       );
     });
 
+    it('should pass file attachments to Emma when app_mention includes files', async () => {
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const { downloadSlackFile } = require('../services/slackService');
+
+      settingsService.getSetting.mockResolvedValue({
+        settingValue: 'user-123',
+      });
+
+      userDb.getUserById.mockResolvedValue({
+        userId: 'user-123',
+        email: 'test@example.com',
+        slackChannel: 'C12345',
+      });
+
+      chatbotDb.createChatSession.mockResolvedValue({
+        sessionId: 'session-123',
+        userId: 'user-123',
+        messages: [],
+        llmModel: 'gpt-4o',
+      });
+
+      chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'session-123' });
+
+      generateSessionResponse.mockResolvedValue({
+        content: 'Yes, I can see the image!',
+        toolCalls: [],
+      });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U12345',
+            text: '<@UEMMA123> can you see this image?',
+            channel: 'C12345',
+            ts: '1234567890.123456',
+            files: [
+              {
+                url_private: 'https://files.slack.com/screenshot.png',
+                name: 'screenshot.png',
+                size: 420858,
+                mimetype: 'image/png',
+              },
+            ],
+          },
+        });
+
+      expect(response.status).toBe(200);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Verify file was downloaded from Slack and uploaded to S3
+      expect(downloadSlackFile).toHaveBeenCalledWith('https://files.slack.com/screenshot.png');
+      expect(uploadFileToS3).toHaveBeenCalledWith(
+        Buffer.from('file-content'),
+        'screenshot.png',
+        'user-123',
+        'image/png'
+      );
+
+      // Verify Emma received the message with the attachment
+      expect(generateSessionResponse).toHaveBeenCalledWith(
+        'session-123',
+        'John Doe: can you see this image?',
+        'user-123',
+        'gpt-4o',
+        [
+          {
+            url: 'https://s3.example.com/file.png',
+            filename: 'screenshot.png',
+            size: 420858,
+            mimetype: 'image/png',
+          },
+        ]
+      );
+    });
+
     it('should handle user not found in cache by scanning all users', async () => {
       // Mock cache miss
       settingsService.getSetting.mockResolvedValue(null);
@@ -423,6 +502,174 @@ describe('Slack Events API', () => {
         await new Promise(resolve => setTimeout(resolve, 100));
 
         // Should not even look up the thread mapping
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+      });
+
+      it('should process file_share thread replies with text and files', async () => {
+        const { uploadFileToS3 } = require('../utils/s3Utils');
+        const { downloadSlackFile } = require('../services/slackService');
+
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+
+        generateSessionResponse.mockResolvedValue({
+          content: 'I can see the video you shared!',
+          toolCalls: [],
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              subtype: 'file_share',
+              user: 'U12345',
+              text: 'Checkout the video and make again',
+              channel: 'C12345',
+              ts: '1234567892.000000',
+              thread_ts: '1234567890.123456',
+              files: [
+                {
+                  url_private: 'https://files.slack.com/video.mp4',
+                  name: 'video.mp4',
+                  size: 1024000,
+                  mimetype: 'video/mp4',
+                },
+              ],
+            },
+          });
+
+        expect(response.status).toBe(200);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Verify file was downloaded from Slack and uploaded to S3
+        expect(downloadSlackFile).toHaveBeenCalledWith('https://files.slack.com/video.mp4');
+        expect(uploadFileToS3).toHaveBeenCalledWith(
+          Buffer.from('file-content'),
+          'video.mp4',
+          'user-123',
+          'video/mp4'
+        );
+
+        // Verify Emma received the message with the attachment
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-123',
+          'John Doe: Checkout the video and make again',
+          'user-123',
+          'gpt-4o',
+          [
+            {
+              url: 'https://s3.example.com/file.png',
+              filename: 'video.mp4',
+              size: 1024000,
+              mimetype: 'video/mp4',
+            },
+          ]
+        );
+      });
+
+      it('should process file_share thread replies with files but no text', async () => {
+        const { downloadSlackFile } = require('../services/slackService');
+
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+
+        generateSessionResponse.mockResolvedValue({
+          content: 'I see you shared a file.',
+          toolCalls: [],
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              subtype: 'file_share',
+              user: 'U12345',
+              text: '',
+              channel: 'C12345',
+              ts: '1234567893.000000',
+              thread_ts: '1234567890.123456',
+              files: [
+                {
+                  url_private: 'https://files.slack.com/image.png',
+                  name: 'image.png',
+                  size: 51200,
+                  mimetype: 'image/png',
+                },
+              ],
+            },
+          });
+
+        expect(response.status).toBe(200);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Verify file was downloaded
+        expect(downloadSlackFile).toHaveBeenCalledWith('https://files.slack.com/image.png');
+
+        // Verify Emma received a placeholder message text when no text was provided
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-123',
+          'John Doe: [attached file]',
+          'user-123',
+          'gpt-4o',
+          expect.arrayContaining([
+            expect.objectContaining({ filename: 'image.png', mimetype: 'image/png' }),
+          ])
+        );
+      });
+
+      it('should ignore file_share messages in untracked threads', async () => {
+        settingsService.getSetting.mockResolvedValue(null);
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              subtype: 'file_share',
+              user: 'U12345',
+              text: '',
+              channel: 'C12345',
+              ts: '1234567894.000000',
+              thread_ts: '9999999999.999999',
+              files: [
+                {
+                  url_private: 'https://files.slack.com/video.mp4',
+                  name: 'video.mp4',
+                  size: 1024000,
+                  mimetype: 'video/mp4',
+                },
+              ],
+            },
+          });
+
+        expect(response.status).toBe(200);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // No Emma response should be generated for untracked threads
         expect(generateSessionResponse).not.toHaveBeenCalled();
       });
     });

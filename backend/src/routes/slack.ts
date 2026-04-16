@@ -43,6 +43,8 @@ async function getEmmaBotUserId(): Promise<string | null> {
 }
 
 function userMatchesChannel(u: any, channel: string): boolean {
+  // Skip tombstoned (deleted) users
+  if (u.userId?.startsWith('deleted_')) return false;
   return (u.slackChannels && u.slackChannels.includes(channel)) || u.slackChannel === channel;
 }
 
@@ -86,7 +88,11 @@ async function handleSlackTriggeredSession(params: {
 
     const cachedMapping = await settingsService.getSetting(mappingKey);
     if (cachedMapping?.settingValue) {
-      user = await userDb.getUserById(cachedMapping.settingValue);
+      const cachedUser = await userDb.getUserById(cachedMapping.settingValue);
+      // Skip tombstoned (deleted) users — their userId starts with "deleted_"
+      if (cachedUser && !cachedUser.userId?.startsWith('deleted_')) {
+        user = cachedUser;
+      }
     }
 
     if (!user) {
@@ -197,8 +203,9 @@ async function handleSlackSessionResponse(params: {
   userMessage: string;
   adminEmail?: string;
   isAdminChannel?: boolean;
+  files?: any[];
 }) {
-  const { session, user, channel, ts, rawMessage, userMessage, adminEmail, isAdminChannel } = params;
+  const { session, user, channel, ts, rawMessage, userMessage, adminEmail, isAdminChannel, files } = params;
   const { chatbotDb } = await import('../services/chatbotService');
   const { settingsService } = await import('../services/settingsService');
   const { ensureGtmWorkItemForSlackSession } = await import('../services/gtmPlanService');
@@ -265,13 +272,42 @@ async function handleSlackSessionResponse(params: {
     await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
   }
 
+  // Download and upload any files attached to the initial Slack message
+  const attachments: any[] = [];
+  if (files && files.length > 0) {
+    for (const file of files) {
+      try {
+        const fileBuffer = await downloadSlackFile(file.url_private);
+        const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const uploadResult = await uploadFileToS3(
+          fileBuffer,
+          file.name || 'attachment',
+          user.userId,
+          file.mimetype || 'application/octet-stream'
+        );
+        if (!uploadResult.success || !uploadResult.url) {
+          console.error('❌ Failed to upload Slack file to S3');
+          continue;
+        }
+        attachments.push({
+          url: uploadResult.url,
+          filename: file.name || 'attachment',
+          size: file.size,
+          mimetype: file.mimetype || 'application/octet-stream',
+        });
+      } catch (fileError) {
+        console.error('❌ Error downloading Slack file:', fileError);
+      }
+    }
+  }
+
   try {
     const response = await generateSessionResponse(
       session.sessionId,
       userMessage,
       user.userId,
       llmModel,
-      [] // attachments
+      attachments
     );
 
     // Remove the thinking message
@@ -473,7 +509,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts } = event;
+        const { text, user: slackUserId, channel, ts, files } = event;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -566,7 +602,11 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
             const cachedMapping = await settingsService.getSetting(mappingKey);
             if (cachedMapping?.settingValue) {
-              user = await userDb.getUserById(cachedMapping.settingValue);
+              const cachedUser = await userDb.getUserById(cachedMapping.settingValue);
+              // Skip tombstoned (deleted) users — their userId starts with "deleted_"
+              if (cachedUser && !cachedUser.userId?.startsWith('deleted_')) {
+                user = cachedUser;
+              }
             }
 
             if (!user) {
@@ -625,6 +665,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             userMessage,
             adminEmail: delegateInfo?.adminEmail,
             isAdminChannel,
+            files: event.files,
           });
 
           console.log('✅ Emma bot mention handled successfully');
@@ -666,7 +707,8 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle message events in threads (follow-up messages to Emma sessions, or non-Emma threads)
       // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
-      if (event.type === 'message' && event.thread_ts && !event.bot_id && !event.subtype) {
+      // Allow file_share subtype so that Slack file uploads are also processed
+      if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
         const { text, user: slackUserId, channel, thread_ts: threadTs, files } = event;
 
         // Look up if this thread is associated with an Emma session
@@ -739,7 +781,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
 
               const displayName = await getSlackUserDisplayName(slackUserId);
-              const formattedMessage = `${displayName}: ${text || ''}`.trim();
+              // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
+              const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
+              const formattedMessage = `${displayName}: ${messageText}`.trim();
 
               const attachments: any[] = [];
               if (files && files.length > 0) {

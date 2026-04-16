@@ -1040,15 +1040,33 @@ export class AgentModeService {
         } else if (item.type === 'image_url') {
           const url = item.image_url?.url || '';
           if (url.startsWith('data:')) {
-            const match = url.match(/^data:image\/([\w+]+);base64,(.+)$/);
-            if (match) {
-              const format = match[1] === 'jpg' ? 'jpeg' : match[1];
-              blocks.push({
-                image: {
-                  format,
-                  source: { bytes: Buffer.from(match[2], 'base64') },
-                }
-              });
+            // Support data URIs with possible extra params: data:image/png;charset=utf-8;base64,...
+            // or the standard form: data:image/png;base64,...
+            // Extract just the mime type subtype (e.g. "png", "jpeg") and the base64 data
+            const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
+            if (dataUriMatch) {
+              const rawFormat = dataUriMatch[1].toLowerCase();
+              const format = rawFormat === 'jpg' ? 'jpeg' : rawFormat;
+              const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
+              if (VALID_BEDROCK_FORMATS.has(format)) {
+                blocks.push({
+                  image: {
+                    format,
+                    source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
+                  }
+                });
+              } else {
+                // Unsupported format — convert to JPEG-labeled generic binary; Bedrock may still handle it
+                console.warn(`AgentMode: Bedrock image format "${format}" not in valid set, trying as jpeg`);
+                blocks.push({
+                  image: {
+                    format: 'jpeg',
+                    source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
+                  }
+                });
+              }
+            } else {
+              console.warn(`AgentMode: Could not parse data URI for Bedrock image block, url prefix="${url.substring(0, 60)}"`);
             }
           } else if (url) {
             blocks.push({ text: `[Image: ${url}]` });
@@ -2249,8 +2267,14 @@ export class AgentModeService {
       // This matches how generateSessionResponse processes attachments (lines 495-502 in agentModeController)
       if (msg.role === 'user' && (msg as any).metadata?.attachments?.length > 0) {
         const attachments = (msg as any).metadata.attachments;
+        const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
+        const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
         const attachmentUrls = attachments.map((attachment: any) => {
-          return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+          const mimetype = (attachment.mimetype || '').toLowerCase();
+          const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
+          const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
+          const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
+          return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
         }).join('\n');
         // Ensure content is a string before concatenating
         let contentStr = '';
@@ -4179,10 +4203,17 @@ export class AgentModeService {
       if (llmModel.startsWith('anthropic.') && !imageUrl.startsWith('data:')) {
         try {
           const axios = (await import('axios')).default;
-          const imgResp = await axios.get<ArrayBuffer>(imageUrl, { responseType: 'arraybuffer', timeout: 30000 });
-          const contentType = imgResp.headers['content-type'] || 'image/png';
-          const base64 = Buffer.from(imgResp.data as ArrayBuffer).toString('base64');
+          // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
+          const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
+          const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
+          const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
+          // Normalize content-type: strip any charset/extra params and trim whitespace
+          const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
+          const contentType = rawContentType || 'image/png';
+          const imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          const base64 = imageBuffer.toString('base64');
           resolvedImageUrl = `data:${contentType};base64,${base64}`;
+          console.log(`AgentMode: describeImage downloaded ${imageBuffer.length} bytes, contentType="${contentType}", dataUri prefix="${resolvedImageUrl.substring(0, 40)}"`);
         } catch (downloadError) {
           console.error('AgentMode: Failed to download image for Bedrock, falling back to URL:', downloadError instanceof Error ? downloadError.message : downloadError);
         }
@@ -12385,6 +12416,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Helper to format tool error for LLM feedback
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
+    // Connection-level failures (timeouts, circuit open) require a different instruction:
+    // tell the LLM to stop retrying and surface the error to the user instead of
+    // spinning through other variants of the same tool.
+    const isConnectionTimeout =
+      safeMessage.includes('Connection timeout') ||
+      safeMessage.includes('service temporarily unavailable');
+    if (isConnectionTimeout) {
+      return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 

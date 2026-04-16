@@ -3356,3 +3356,37 @@ Investigated and implemented email verification for email/password sign-ups (Opt
 - Spam/fake account volume becomes a real problem
 - A compliance requirement demands explicit email confirmation
 - The team introduction email flow changes or is removed
+
+## CRM Enrichment Cost Investigation (2026-04-16)
+
+### Context
+
+Investigated the API cost structure for the lead enrichment feature (`crmEnrichmentService.ts`) to understand per-lead spend across web search, LLM extraction, and LinkedIn lookup.
+
+### APIs and Cost per Lead
+
+| Component | Provider | Calls/Lead | Est. Cost/Lead |
+|-----------|----------|-----------|----------------|
+| Web Search | Google Custom Search | 1–2 (fallback on empty) | ~$0.005–0.01 |
+| LLM Extraction | Gemini 3.1 Flash Lite | 1–2 (retry on parse fail) | ~$0.00015 |
+| LinkedIn Lookup | Unipile | 0–3 (if LinkedIn source enabled) | ~$0.03–0.15 |
+| **Total** | | **2–7** | **~$0.005–0.16/lead** |
+
+### Key Findings
+
+- **Web search only:** ~$0.005–0.01/lead (dominant cost without LinkedIn)
+- **With LinkedIn:** ~$0.04–0.16/lead (Unipile per-profile cost dominates)
+- **LLM cost is negligible** (~$0.00015/lead) given Gemini Flash Lite pricing
+- Concurrency: 20 parallel workers (no LinkedIn) or 5 (with LinkedIn) — peak burst can hit Google Custom Search quotas (known issue from Feb 2026)
+- **No cost tracking or metering exists** for enrichment operations; usage is not counted against user token quotas
+
+### Model Change (2026-04-16)
+
+Switched `SUGGEST_MODEL` from `gemini-2.5-pro` to `gemini-3.1-flash-lite-preview` to match `ENRICH_MODEL`. Field suggestion is a structured extraction task (not complex reasoning), so the cheaper/faster model is sufficient.
+
+### Cost Tracking Decision
+
+**Delaying cost tracking for enrichment until the feature is used more widely.** Current usage volume does not justify the instrumentation overhead. When enrichment adoption grows, add per-enrichment token/API call accounting to `tokenUsageService.ts` and meter it against user subscription allowances. Revisit when:
+- Enrichment is a standard part of multiple users' workflows
+- Monthly enrichment API cost becomes visible in billing analysis
+- Subscription tiers need to differentiate on enrichment volume
