@@ -43,6 +43,8 @@ export class LLMService {
         modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6';
       } else if (model === 'anthropic.claude-opus-4-6-v1') {
         modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1';
+      } else if (model === 'anthropic.claude-opus-4-7') {
+        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7';
       }
 
       this.chatModel = new ChatBedrockConverse({

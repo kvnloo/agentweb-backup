@@ -813,6 +813,7 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+      'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -1094,6 +1095,7 @@ export class AgentModeService {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
+    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
