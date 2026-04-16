@@ -15,6 +15,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When you attach an image to a Slack @Emma mention or reply in a thread, Emma will now analyze the image and respond with visual context',
       '- Images are stored securely in your account and displayed as inline previews in the session portal (ishare links)',
       '- Non-image file attachments are also forwarded to Emma and listed as downloadable links in the session',
+      'Fixed: Brave Search Tools No Longer Spin for Minutes When the Search Service Is Unavailable',
+      '- Previously, if the Brave Search service failed to connect, the AI would retry all 5 search tool variants (web, news, image, local, video) with a 15-second wait each — resulting in 2+ minutes of unresponsive spinning',
+      '- A circuit breaker now detects repeated connection failures and fails fast after 3 attempts, with a 5-minute cooldown before retrying',
+      '- When search is unavailable, the AI now immediately stops retrying and tells you the service is temporarily unreachable instead of cycling through alternatives',
+      '- Stale or broken connections are automatically cleaned up so the next request always starts fresh',
     ],
   },
   {
