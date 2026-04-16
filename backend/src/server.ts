@@ -8,6 +8,13 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { generateChatResponse } from './services/chatbotService';
 import { checkTokenUsage } from './services/tokenUsageService';
+import {
+  startLiveSession,
+  sendAudioChunk,
+  sendTextTurn,
+  closeLiveSession,
+  hasLiveSession,
+} from './services/liveVoiceService';
 
 dotenv.config();
 
@@ -92,6 +99,61 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('disconnect', (reason: string) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
+    // Clean up any live voice sessions owned by this socket
+    socket.data.liveSessions?.forEach((sessionId: string) => {
+      if (hasLiveSession(sessionId)) {
+        closeLiveSession(sessionId);
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Gemini Live Voice handlers
+  // ---------------------------------------------------------------------------
+
+  // Emit helper that sends events to this specific socket
+  const liveEmit = (event: string, data: unknown) => socket.emit(event, data);
+
+  // Verify the socket user owns the sessionId before allowing live operations
+  function getLiveUserId(): string {
+    const token = socket.handshake.auth.token;
+    if (!token) throw new Error('No auth token');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as {
+      userId: string;
+      delegateAccess?: { targetUserId: string };
+    };
+    return decoded.delegateAccess?.targetUserId || decoded.userId;
+  }
+
+  socket.on('live:start', async ({ sessionId }: { sessionId: string }) => {
+    try {
+      getLiveUserId(); // auth check — throws if invalid
+      // Track which live sessions this socket owns (for disconnect cleanup)
+      if (!socket.data.liveSessions) socket.data.liveSessions = new Set<string>();
+      socket.data.liveSessions.add(sessionId);
+      await startLiveSession(sessionId, socket.id, liveEmit);
+    } catch (err: any) {
+      socket.emit('live:error', { sessionId, error: err?.message ?? 'Failed to start live session' });
+    }
+  });
+
+  socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
+    sendAudioChunk(sessionId, chunk).catch((err) => {
+      socket.emit('live:error', { sessionId, error: err?.message });
+    });
+  });
+
+  socket.on('live:text', async ({ sessionId, text }: { sessionId: string; text: string }) => {
+    try {
+      await sendTextTurn(sessionId, text);
+    } catch (err: any) {
+      socket.emit('live:error', { sessionId, error: err?.message });
+    }
+  });
+
+  socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
+    closeLiveSession(sessionId);
+    socket.data.liveSessions?.delete(sessionId);
   });
 
   // Handle chat messages
