@@ -3390,3 +3390,19 @@ Switched `SUGGEST_MODEL` from `gemini-2.5-pro` to `gemini-3.1-flash-lite-preview
 - Enrichment is a standard part of multiple users' workflows
 - Monthly enrichment API cost becomes visible in billing analysis
 - Subscription tiers need to differentiate on enrichment volume
+
+## LinkedIn Outreach — Email Finding Investigation (2026-04-16)
+
+### Context
+
+Investigated whether the LinkedIn outreach feature can be used to find or retrieve email addresses for prospects.
+
+### Findings
+
+**LinkedIn does not expose email addresses via its API.** The Unipile SDK (used by `linkedInOutreachService.ts`) returns the following fields for a LinkedIn profile: `provider_id`, `public_identifier`, `first_name`, `last_name`, `headline`, `location`, `network_distance`, `is_open_profile`, `work_experience`, `summary`, `profile_picture_url`. Email is not among them — this is a deliberate LinkedIn platform restriction, not a gap in the Unipile integration.
+
+All 10 LinkedIn outreach actions (`search-people`, `get-profile`, `send-invite`, `send-message`, `update-conversation-history`, etc.) operate on profile URLs and provider IDs only. The CRM lead record stores the LinkedIn profile URL in the `linkedin` field but no email derived from it.
+
+### Decision
+
+**Finding email from LinkedIn is not supported and will not be added to the LinkedIn outreach feature.** Email discovery is an enrichment concern, not an outreach concern. If email finding from a LinkedIn profile is needed, it should be implemented as part of the CRM enrichment feature (`crmEnrichmentService.ts`) using a third-party enrichment provider (e.g. Apollo.io, which accepts LinkedIn profile URLs and returns verified business emails). This keeps outreach and enrichment concerns cleanly separated.
