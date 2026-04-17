@@ -278,7 +278,8 @@ emmaToolRegistry.register({
     description:
       'Send a message to a Slack channel, or reply to an existing thread. ' +
       'Use this to respond to clients or team members on behalf of the user. ' +
-      'Always confirm with the user before sending unless they have explicitly asked you to send. ' +
+      'IMPORTANT: You MUST show the user the exact message text and get their explicit approval (e.g. "yes", "send it", "go ahead") BEFORE calling this tool. ' +
+      'Never send without showing the draft and receiving a clear confirmation — even if the user previously asked you to send a message. ' +
       'For non-admin users with a single channel, messages are automatically sent to their configured channel. ' +
       'For non-admin users with multiple channels, channel_id or channel_name is required.',
     inputSchema: {
