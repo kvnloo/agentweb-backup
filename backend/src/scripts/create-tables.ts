@@ -1846,6 +1846,7 @@ const main = async () => {
     await createPaymentHistoryTable();
     await createTempEmailsTable();
     await createTestAccountsTable();
+    await createOAuthSessionsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2018,6 +2019,30 @@ const createTestAccountsTable = async () => {
         ],
         Projection: { ProjectionType: 'ALL' },
       },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createOAuthSessionsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-OAuthSessions`,
+    AttributeDefinitions: [
+      { AttributeName: 'sessionId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'sessionId', KeyType: 'HASH' },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };

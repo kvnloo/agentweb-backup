@@ -5682,6 +5682,62 @@ export const scheduleTemplateDb = {
   },
 };
 
+const OAUTH_SESSIONS_TABLE = `${TABLE_PREFIX}AW-OAuthSessions`;
+
+export const oauthSessionDb = {
+  async save(session: {
+    sessionId: string;
+    userId: string;
+    access_token: string;
+    expires_in?: number;
+    scopes: string[];
+    flow: string;
+  }): Promise<void> {
+    const TEN_MINUTES_SECONDS = 10 * 60;
+    const ttl = Math.floor(Date.now() / 1000) + TEN_MINUTES_SECONDS;
+    try {
+      await dynamodb.put({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Item: { ...session, ttl },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'oauthSessionDb.save');
+    }
+  },
+
+  async get(sessionId: string, userId: string): Promise<{
+    userId: string;
+    access_token: string;
+    expires_in?: number;
+    scopes: string[];
+    flow: string;
+  } | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Key: { sessionId },
+      }).promise();
+      if (!result.Item) return null;
+      if (result.Item.userId !== userId) return null;
+      return result.Item as any;
+    } catch (error) {
+      handleDynamoDbError(error, 'oauthSessionDb.get');
+      return null;
+    }
+  },
+
+  async delete(sessionId: string): Promise<void> {
+    try {
+      await dynamodb.delete({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Key: { sessionId },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'oauthSessionDb.delete');
+    }
+  },
+};
+
 const TEMP_EMAILS_TABLE = `${TABLE_PREFIX}AW-TempEmails`;
 
 export const tempEmailDb = {
