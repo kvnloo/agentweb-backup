@@ -6,8 +6,8 @@
  *
  *   POST /api/crm/:provider/:listId/webhook
  *
- * Security: the webhook secret is verified from the `X-Webhook-Secret` request
- * header, matched against the `webhookSecret` stored in the sync config
+ * Security: the webhook secret is verified from the `secret` query parameter in the URL
+ * (e.g. /webhook?secret=xxx), matched against the `webhookSecret` stored in the sync config
  * (generated once on first saveConfig(), never rotated).
  *
  * For HubSpot OAuth app users the existing shared endpoint (/api/webhooks/hubspot)
@@ -30,7 +30,7 @@ type SupportedProvider = typeof SUPPORTED_PROVIDERS[number];
 
 router.post('/:provider/:listId/webhook', async (req: express.Request, res: express.Response) => {
   const { provider, listId } = req.params;
-  const secret = req.headers['x-webhook-secret'] as string | undefined;
+  const secret = (req.query.secret as string | undefined) || (req.headers['x-webhook-secret'] as string | undefined);
 
   // 1. Validate provider early (this is the only non-silent error)
   if (!SUPPORTED_PROVIDERS.includes(provider as SupportedProvider)) {

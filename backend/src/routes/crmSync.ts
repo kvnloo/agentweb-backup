@@ -103,11 +103,10 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       lastSyncError: config.lastSyncError,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
-      // Webhook URL — secret is passed as X-Webhook-Secret header, not in the URL
+      // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
       webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook`
+        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
         : undefined,
-      webhookSecret: config.webhookSecret,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to get config' });
@@ -157,11 +156,10 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
-      // Webhook URL — secret is passed as X-Webhook-Secret header, not in the URL
+      // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
       webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook`
+        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
         : undefined,
-      webhookSecret: config.webhookSecret,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to save config' });

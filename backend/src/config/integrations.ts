@@ -157,14 +157,6 @@ export const INTEGRATION_CONFIG = {
   }
 };
 
-// npm install -g @hubspot/cli
-// hs account auth
-// hs project create
-// 4) Go into the project folder
-// Typical app project files are created under src/app and use *-hsmeta.json config files.
-// hs project validate
-// hs project lint
-// hs project upload
 
 /**
  * Get scopes for a specific LinkedIn account type
