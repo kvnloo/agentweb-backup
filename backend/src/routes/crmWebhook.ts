@@ -44,6 +44,9 @@ router.post('/:provider/:listId/webhook', async (req: express.Request, res: expr
   const config = await externalCrmSyncService.getConfig((list as any).userId, listId, provider).catch(() => null);
   if (!config?.webhookSecret) return res.status(200).json({ received: true });
 
+  // 3a. Respect the user's webhookEnabled preference (defaults true if unset)
+  if (config.webhookEnabled === false) return res.status(200).json({ received: true });
+
   // 4. Verify secret — silently ignore mismatches (don't leak info)
   if (!secret || secret !== config.webhookSecret) {
     return res.status(200).json({ received: true });

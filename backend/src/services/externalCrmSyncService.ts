@@ -47,11 +47,9 @@ export interface ExternalCrmSyncConfig {
   // Delete sync options
   deleteOnPush?: boolean;   // Delete CRM record when a local lead is deleted
   deleteOnPull?: boolean;   // Mark local lead as removed when CRM record is deleted
-  // Human-readable display name — used when creating external lists/pipelines
+  // Human-readable display name — used when creating deal pipelines
   listName?: string;
   // Cached external IDs to skip redundant lookups
-  externalListId?: string;          // Attio people list ID (legacy alias of externalPeopleListId)
-  externalPeopleListId?: string;    // Attio people list ID
   externalPipelineId?: string;      // HubSpot deal pipeline ID
   hubspotDealStageMap?: Record<string, string>; // AgentWeb status value -> HubSpot stage ID
   // Sync state
@@ -63,6 +61,8 @@ export interface ExternalCrmSyncConfig {
   updatedAt: string;
   // Per-list webhook URL secret (embedded in webhook URL, verified on every request)
   webhookSecret?: string;
+  // Whether incoming webhook events from the CRM should update AgentWeb leads (default: true)
+  webhookEnabled?: boolean;
 }
 
 export interface SyncResult {
@@ -189,8 +189,8 @@ export class ExternalCrmSyncService {
       customFieldMapping?: FieldMapping[];
       deleteOnPush?: boolean;
       deleteOnPull?: boolean;
-      // List/pipeline selection — only honoured before first sync (server enforces the lock)
-      externalListId?: string;       // Attio: chosen people list ID
+      webhookEnabled?: boolean;
+      // Pipeline selection — only honoured before first sync (server enforces the lock)
       externalPipelineId?: string;   // HubSpot: chosen deal pipeline ID
       listName?: string;
     }
@@ -204,21 +204,13 @@ export class ExternalCrmSyncService {
     const nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
 
-    // List/pipeline selection is locked once any sync has occurred.
+    // Pipeline selection is locked once any sync has occurred.
     const alreadySynced = !!(existing?.lastPushSyncAt || existing?.lastPullSyncAt);
 
-    // listName: display name used for creating new lists/pipelines
+    // listName: display name used for creating new deal pipelines
     const resolvedListName = alreadySynced
       ? existing?.listName
       : (updates.listName ?? existing?.listName);
-
-    const resolvedExternalPeopleListId = alreadySynced
-      ? existing?.externalPeopleListId
-      : (updates.externalListId ?? existing?.externalPeopleListId);
-    // Keep externalListId in sync with externalPeopleListId (legacy alias)
-    const resolvedExternalListId = alreadySynced
-      ? existing?.externalListId
-      : (updates.externalListId ?? existing?.externalListId);
 
     // HubSpot deal pipeline
     const resolvedExternalPipelineId = alreadySynced
@@ -240,9 +232,8 @@ export class ExternalCrmSyncService {
         : nextCustomFieldMapping,
       deleteOnPush: updates.deleteOnPush ?? existing?.deleteOnPush ?? false,
       deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
+      webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
       listName: resolvedListName,
-      externalListId: resolvedExternalListId,
-      externalPeopleListId: resolvedExternalPeopleListId,
       externalPipelineId: resolvedExternalPipelineId,
       hubspotDealStageMap: existing?.hubspotDealStageMap,
       lastPushSyncAt: existing?.lastPushSyncAt,
@@ -353,42 +344,13 @@ export class ExternalCrmSyncService {
 
   // ─── External list discovery ──────────────────────────────────────────────────
 
-  // Returns Attio people lists (for Attio) or an empty array (HubSpot contact lists not yet supported)
+  // External lists are no longer used — contacts sync directly without list membership.
   async getExternalLists(
-    userId: string,
-    listId: string,
-    provider: string,
-    options?: { accountId?: string; apiKey?: string }
+    _userId: string,
+    _listId: string,
+    _provider: string,
+    _options?: { accountId?: string; apiKey?: string }
   ): Promise<Array<{ id: string; name: string }>> {
-    let auth: CrmAuth;
-
-    if (options?.accountId) {
-      // Use the provided accountId directly (works before config is saved)
-      auth = { type: 'oauth', userId, accountId: options.accountId };
-    } else if (options?.apiKey) {
-      // Use the provided apiKey directly
-      auth = { type: 'token', apiKey: options.apiKey };
-    } else {
-      const config = await this.getConfig(userId, listId, provider);
-      if (!config) throw new Error('No sync configuration found. Save your connection settings first.');
-      if (!config.accountId && !config.apiKeyEncrypted) {
-        throw new Error('No authentication configured. Save your connection settings first.');
-      }
-      auth = this.resolveAuth(config);
-    }
-
-    if (provider === 'attio') {
-      const svc = auth.type === 'token'
-        ? AttioService.fromToken(auth.apiKey!)
-        : await AttioService.create(auth.userId!, auth.accountId!);
-      return svc.getAllLists();
-    }
-
-    if (provider === 'hubspot') {
-      const svc = await this.getHubSpotService(auth);
-      return svc.getAllLists();
-    }
-
     return [];
   }
 
@@ -472,7 +434,7 @@ export class ExternalCrmSyncService {
       return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
     }
 
-    // Attio: merge People object attributes + list-entry attributes
+    // Attio: return People object attributes only (contacts sync directly, no list)
     const svc = auth.type === 'token'
       ? AttioService.fromToken(auth.apiKey!)
       : await AttioService.create(auth.userId!, auth.accountId!);
@@ -483,19 +445,6 @@ export class ExternalCrmSyncService {
       label: a.title,
       type: a.type,
     }));
-
-    // Also include list-entry attributes (may have custom attributes added by us)
-    const config = await this.getConfig(userId, listId, provider).catch(() => null);
-    const listId_ext = config?.externalPeopleListId ?? config?.externalListId;
-    if (listId_ext) {
-      const listAttrs = await svc.listListAttributes(listId_ext).catch(() => []);
-      const existingSlugs = new Set(properties.map(p => p.name));
-      for (const a of listAttrs) {
-        if (!existingSlugs.has(a.api_slug)) {
-          properties.push({ name: a.api_slug as string, label: (a.title || a.api_slug) as string, type: a.type as string });
-        }
-      }
-    }
 
     return { properties };
   }

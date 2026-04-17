@@ -407,6 +407,28 @@ export class HubSpotService {
     }
   }
 
+  /**
+   * Fetches a contact by ID and returns all its property values as a flat map.
+   * Pass specific propertyNames to request only those fields; omit to fetch
+   * the standard set (email, name, phone, jobtitle, company, linkedin).
+   * Returns {} if the contact is not found (404).
+   */
+  async getContactById(contactId: string, propertyNames?: string[]): Promise<Record<string, string>> {
+    try {
+      const props = (propertyNames && propertyNames.length > 0)
+        ? propertyNames.join(',')
+        : 'email,firstname,lastname,phone,jobtitle,company,hs_linkedin_url';
+      const res = await axios.get(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}?properties=${props}`,
+        { headers: await this.authHeaders() }
+      );
+      return (res.data as any)?.properties ?? {};
+    } catch (e: any) {
+      if (e?.response?.status === 404) return {};
+      throw e;
+    }
+  }
+
   async deleteContact(contactId: string): Promise<void> {
     await axios.delete(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}`,

@@ -274,46 +274,11 @@ describe('ExternalCrmSyncService', () => {
       ]));
     });
 
-    it('stores selected existing Attio list as externalPeopleListId before first sync', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
-
-      await service.saveConfig('user1', 'list1', 'attio', {
-        accountId: 'attio-acct',
-        externalListId: 'people-list-123',
-      });
-
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
-      expect(saved.externalPeopleListId).toBe('people-list-123');
-      expect(saved.externalListId).toBeUndefined();
-    });
-
-    it('clears existing Attio list selection when switching to a new list before first sync', async () => {
+    it('keeps the pipeline ID locked after first sync', async () => {
       const existing = makeConfig({
-        provider: 'attio',
-        externalPeopleListId: 'people-list-123',
-      });
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(existing),
-      } as any);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
-
-      await service.saveConfig('user1', 'list1', 'attio', {
-        listName: 'New Attio List',
-      });
-
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
-      expect(saved.externalPeopleListId).toBeUndefined();
-      expect(saved.listName).toBe('New Attio List');
-    });
-
-    it('keeps the synced external target locked after first sync', async () => {
-      const existing = makeConfig({
-        provider: 'attio',
-        listName: 'Locked List',
-        externalPeopleListId: 'people-list-123',
+        provider: 'hubspot',
+        listName: 'Locked Pipeline',
+        externalPipelineId: 'pipeline-123',
         lastPushSyncAt: '2024-02-01T00:00:00.000Z',
       });
       mockSettingsService.getSetting.mockResolvedValue({
@@ -321,15 +286,15 @@ describe('ExternalCrmSyncService', () => {
       } as any);
       mockSettingsService.setSetting.mockResolvedValue(undefined as any);
 
-      await service.saveConfig('user1', 'list1', 'attio', {
-        externalListId: 'people-list-999',
-        listName: 'Renamed List',
+      await service.saveConfig('user1', 'list1', 'hubspot', {
+        externalPipelineId: 'pipeline-999',
+        listName: 'Renamed Pipeline',
       });
 
       const call = mockSettingsService.setSetting.mock.calls[0];
       const saved = JSON.parse(call[1]);
-      expect(saved.externalPeopleListId).toBe('people-list-123');
-      expect(saved.listName).toBe('Locked List');
+      expect(saved.externalPipelineId).toBe('pipeline-123');
+      expect(saved.listName).toBe('Locked Pipeline');
     });
   });
 
@@ -716,27 +681,12 @@ describe('ExternalCrmSyncService', () => {
     });
 
     it('returns Attio people attributes for any objectType', async () => {
-      const config = makeConfig({ provider: 'attio', externalPeopleListId: 'list-ext-1' });
+      const config = makeConfig({ provider: 'attio' });
       mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
-      (mockAttioServiceInstance as any).listListAttributes = jest.fn().mockResolvedValue([
-        { api_slug: 'deal_status', title: 'Deal Status', type: 'status' },
-      ]);
 
       const result = await service.getExternalProperties('user1', 'list1', 'attio', {});
 
       expect((mockAttioServiceInstance as any).getAllPeopleAttributes).toHaveBeenCalled();
-      expect((mockAttioServiceInstance as any).listListAttributes).toHaveBeenCalledWith('list-ext-1');
-      // deduplication: people attrs + list attrs merged
-      expect(result.properties.length).toBeGreaterThanOrEqual(attioAttrs.length);
-      expect(result.properties.some((p: any) => p.name === 'deal_status')).toBe(true);
-    });
-
-    it('returns Attio attributes even when no externalPeopleListId (no list attrs)', async () => {
-      const config = makeConfig({ provider: 'attio', externalPeopleListId: undefined });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
-
-      const result = await service.getExternalProperties('user1', 'list1', 'attio', {});
-
       expect(result.properties).toHaveLength(attioAttrs.length);
     });
 

@@ -311,4 +311,52 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     await new Promise(r => setTimeout(r, 50));
     expect(crmDb.updateLead).not.toHaveBeenCalled();
   });
+
+  // ─── webhookEnabled flag ──────────────────────────────────────────────────────
+
+  it('ignores events when webhookEnabled is false', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('hubspot'),
+      webhookEnabled: false,
+    });
+    const existingLead = { leadId: 'lead-1', email: 'test@corp.com' };
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+
+    const events = [
+      { subscriptionType: 'contact.propertyChange', portalId: 11111, objectId: '55555', propertyName: 'email', propertyValue: 'test@corp.com' },
+      { subscriptionType: 'contact.propertyChange', portalId: 11111, objectId: '55555', propertyName: 'phone', propertyValue: '+1-555-0001' },
+    ];
+
+    const res = await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .send(events);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('processes events normally when webhookEnabled is true', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('hubspot'),
+      webhookEnabled: true,
+    });
+    const existingLead = { leadId: 'lead-2', email: 'alice@corp.com' };
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+
+    const events = [
+      { subscriptionType: 'contact.propertyChange', portalId: 11111, objectId: '66666', propertyName: 'email', propertyValue: 'alice@corp.com' },
+      { subscriptionType: 'contact.propertyChange', portalId: 11111, objectId: '66666', propertyName: 'company', propertyValue: 'Corp Inc' },
+    ];
+
+    const res = await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .send(events);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-2', expect.objectContaining({ company: 'Corp Inc' })
+    );
+  });
 });

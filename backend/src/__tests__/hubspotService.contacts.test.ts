@@ -608,3 +608,67 @@ describe('HubSpotService — getDeal', () => {
     expect(deal).toBeNull();
   });
 });
+
+// ─── getContactById ───────────────────────────────────────────────────────────
+
+describe('HubSpotService — getContactById', () => {
+  let svc: HubSpotService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = HubSpotService.fromToken('test-token');
+  });
+
+  it('fetches standard fields when no propertyNames provided', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: {
+        id: 'contact-1',
+        properties: {
+          email: 'jane@corp.com',
+          firstname: 'Jane',
+          lastname: 'Smith',
+          phone: '+1-555-0001',
+          jobtitle: 'Engineer',
+          company: 'Corp Inc',
+          hs_linkedin_url: 'https://linkedin.com/in/jane',
+        },
+      },
+    });
+
+    const result = await svc.getContactById('contact-1');
+
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('contacts/contact-1?properties=email,firstname,lastname,phone,jobtitle,company,hs_linkedin_url'),
+      expect.any(Object)
+    );
+    expect(result.email).toBe('jane@corp.com');
+    expect(result.firstname).toBe('Jane');
+    expect(result.jobtitle).toBe('Engineer');
+  });
+
+  it('fetches only specified propertyNames when provided', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { id: 'contact-2', properties: { my_custom_field: 'custom_val', email: 'x@y.com' } },
+    });
+
+    const result = await svc.getContactById('contact-2', ['email', 'my_custom_field']);
+
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('contacts/contact-2?properties=email,my_custom_field'),
+      expect.any(Object)
+    );
+    expect(result.my_custom_field).toBe('custom_val');
+    expect(result.email).toBe('x@y.com');
+  });
+
+  it('returns empty object on 404', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    const result = await svc.getContactById('nonexistent');
+    expect(result).toEqual({});
+  });
+
+  it('rethrows non-404 errors', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 500 }, message: 'Server error' });
+    await expect(svc.getContactById('contact-err')).rejects.toMatchObject({ response: { status: 500 } });
+  });
+});

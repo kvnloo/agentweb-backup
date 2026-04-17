@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import express from 'express';
 import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
@@ -7,11 +8,34 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
+import { getHubSpotConfig } from '../config/integrations';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+
+// ─── HubSpot signature helpers ────────────────────────────────────────────────
+
+/**
+ * Verifies a HubSpot v1 webhook signature.
+ * HubSpot computes: SHA-256(clientSecret + rawBody) and sends it as hex in
+ * the X-HubSpot-Signature header.
+ * We re-stringify req.body (already JSON-parsed) which matches HubSpot's
+ * canonical JSON in practice.
+ */
+function verifyHubSpotSignature(clientSecret: string, body: any, signature: string): boolean {
+  try {
+    const expected = crypto
+      .createHash('sha256')
+      .update(clientSecret + JSON.stringify(body))
+      .digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
 
 const router = express.Router();
 
@@ -575,89 +599,140 @@ router.post('/attio', async (req: express.Request, res: express.Response) => {
 //   contact.propertyChange  → update matching lead's fields
 //   contact.deletion        → flag matching lead as removed
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/hubspot', async (req: express.Request, res: express.Response) => {
-  try {
-    const events: any[] = Array.isArray(req.body) ? req.body : [req.body];
-    const changesByObjectId: Record<string, { portalId: number, properties: Record<string, string> }> = {};
+router.post('/hubspot', (req: express.Request, res: express.Response) => {
+  // Return 200 immediately — HubSpot retries on non-2xx or timeout.
+  // All processing happens asynchronously (fire-and-forget).
+  res.status(200).json({ received: true });
 
-    for (const event of events) {
-      const eventType: string = event?.subscriptionType ?? 'unknown';
-      const portalId: number = event?.portalId;
-      const objectId: string = String(event?.objectId ?? '');
-      const propertyName: string = event?.propertyName ?? '';
-      const propertyValue: string = event?.propertyValue ?? '';
-
-      console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
-
-      const isRelevantEvent = [
-        'contact.creation',
-        'contact.propertyChange',
-        'contact.deletion',
-      ].includes(eventType);
-
-      if (!isRelevantEvent) {
-        continue;
+  void (async () => {
+    try {
+      // ── Signature verification ──────────────────────────────────────────────
+      // Verify X-HubSpot-Signature when present. If the header is missing we
+      // log a warning and continue (supports local dev / test environments).
+      const signature = req.headers['x-hubspot-signature'] as string | undefined;
+      if (signature) {
+        const hubspotConfig = await getHubSpotConfig().catch(() => null);
+        if (hubspotConfig?.clientSecret) {
+          if (!verifyHubSpotSignature(hubspotConfig.clientSecret, req.body, signature)) {
+            console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
+            return;
+          }
+        }
+      } else {
+        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification');
       }
 
-      if (!changesByObjectId[objectId]) {
-        changesByObjectId[objectId] = { portalId, properties: {} };
-      }
-      if (propertyName && propertyValue !== undefined) {
-        changesByObjectId[objectId].properties[propertyName] = propertyValue;
-      }
-    }
+      // ── Aggregate events by objectId ────────────────────────────────────────
+      const events: any[] = Array.isArray(req.body) ? req.body : [req.body];
+      type ContactChange = {
+        portalId: number;
+        properties: Record<string, string>;
+        isCreation: boolean;
+        isDeleted: boolean;
+      };
+      const changesByObjectId: Record<string, ContactChange> = {};
 
-    // Process each aggregated object
-    for (const [objectId, data] of Object.entries(changesByObjectId)) {
-      const userId = await getUserIdByHubSpotPortalId(data.portalId);
-      if (!userId) {
-        console.log(`[HubSpot Webhook] No user found for portal ${data.portalId}`);
-        continue;
+      for (const event of events) {
+        const eventType: string = event?.subscriptionType ?? 'unknown';
+        const portalId: number = event?.portalId;
+        const objectId: string = String(event?.objectId ?? '');
+        const propertyName: string = event?.propertyName ?? '';
+        const propertyValue: string = event?.propertyValue ?? '';
+
+        console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+        const isRelevantEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
+        if (!isRelevantEvent || !objectId) continue;
+
+        if (!changesByObjectId[objectId]) {
+          changesByObjectId[objectId] = { portalId, properties: {}, isCreation: false, isDeleted: false };
+        }
+        if (eventType === 'contact.creation') changesByObjectId[objectId].isCreation = true;
+        if (eventType === 'contact.deletion') changesByObjectId[objectId].isDeleted = true;
+        if (propertyName && propertyValue !== undefined) {
+          changesByObjectId[objectId].properties[propertyName] = propertyValue;
+        }
       }
 
-      let email = data.properties.email;
-      if (!email) {
-        try {
-          const fetchedEmail = await (await HubSpotService.create(userId)).getContactEmailById(objectId);
-          if (fetchedEmail) email = fetchedEmail;
-        } catch { /* non-fatal — skip if token unavailable */ }
-      }
+      // ── Process each contact ────────────────────────────────────────────────
+      for (const [objectId, data] of Object.entries(changesByObjectId)) {
+        const userId = await getUserIdByHubSpotPortalId(data.portalId);
+        if (!userId) {
+          console.log(`[HubSpot Webhook] No user found for portal ${data.portalId}`);
+          continue;
+        }
 
-      if (!email) {
-        console.log(`[HubSpot Webhook] Could not determine email for contact ${objectId}, skipping`);
-        continue;
-      }
+        const svc = await HubSpotService.create(userId).catch(() => null);
 
-      const lists = await crmDb.getLeadListsByUserId(userId);
-      if (!lists) continue;
+        // For contact.creation: fetch full contact to populate all standard fields
+        // (the creation event payload contains no property values).
+        if (data.isCreation && svc) {
+          try {
+            const fullContact = await svc.getContactById(objectId);
+            // Merge fetched properties; explicit webhook payload values take precedence
+            Object.entries(fullContact).forEach(([k, v]) => {
+              if (data.properties[k] === undefined && v) data.properties[k] = v;
+            });
+          } catch { /* non-fatal */ }
+        }
 
-      for (const list of lists) {
-        const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
-        if (lead) {
+        // Resolve email from payload or API fallback
+        let email = data.properties.email;
+        if (!email && svc) {
+          try {
+            const fetchedEmail = await svc.getContactEmailById(objectId);
+            if (fetchedEmail) email = fetchedEmail;
+          } catch { /* non-fatal — skip if token unavailable */ }
+        }
+
+        if (!email) {
+          console.log(`[HubSpot Webhook] Could not determine email for contact ${objectId}, skipping`);
+          continue;
+        }
+
+        const lists = await crmDb.getLeadListsByUserId(userId);
+        if (!lists) continue;
+
+        for (const list of lists) {
+          // Check per-list webhook preference — skip if user has disabled webhook updates
+          const syncConfig = await externalCrmSyncService.getConfig(userId, list.listId, 'hubspot').catch(() => null);
+          if (syncConfig?.webhookEnabled === false) {
+            console.log(`[HubSpot Webhook] webhookEnabled=false for list ${list.listId}, skipping`);
+            continue;
+          }
+
+          const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
+          if (!lead) continue;
+
+          if (data.isDeleted) {
+            await crmDb.updateLead(list.listId, lead.leadId, {
+              syncMetadata: { ...(lead.syncMetadata || {}), crmRemoved: true },
+            });
+            console.log(`[HubSpot Webhook] Marked lead ${lead.leadId} as CRM-removed`);
+            continue;
+          }
+
           const updates: any = {};
-
-          if (data.properties.firstname !== undefined) updates.firstName = data.properties.firstname;
-          if (data.properties.lastname !== undefined) updates.lastName = data.properties.lastname;
-          if (data.properties.phone !== undefined) updates.phone = data.properties.phone;
-          if (data.properties.jobtitle !== undefined) updates.title = data.properties.jobtitle;
-          if (data.properties.company !== undefined) updates.company = data.properties.company;
+          if (data.properties.firstname    !== undefined) updates.firstName = data.properties.firstname;
+          if (data.properties.lastname     !== undefined) updates.lastName  = data.properties.lastname;
+          if (data.properties.phone        !== undefined) updates.phone     = data.properties.phone;
+          if (data.properties.jobtitle     !== undefined) updates.title     = data.properties.jobtitle;
+          if (data.properties.company      !== undefined) updates.company   = data.properties.company;
           if (data.properties.hs_linkedin_url !== undefined) updates.linkedin = data.properties.hs_linkedin_url;
 
-          const customFieldUpdates: any = {};
           const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
-
+          const customFieldUpdates: any = {};
           Object.entries(data.properties).forEach(([key, val]) => {
             if (standardHubspotProps.includes(key)) return;
-
-            // Try to find a matching existing custom field by slugging the keys
-            let matchedLocalKey = key;
+            // Match existing custom field key using case-insensitive slug comparison
+            let matchedKey = key;
             if (lead.customFields) {
-              const existingKeys = Object.keys(lead.customFields);
-              const foundKey = existingKeys.find(k => k.toLowerCase().replace(/[^a-z0-9]/g, '_') === key);
-              if (foundKey) matchedLocalKey = foundKey;
+              const found = Object.keys(lead.customFields).find(
+                k => k.toLowerCase().replace(/[^a-z0-9]/g, '_') === key
+              );
+              if (found) matchedKey = found;
             }
-
-            customFieldUpdates[matchedLocalKey] = val;
+            customFieldUpdates[matchedKey] = val;
           });
 
           if (Object.keys(customFieldUpdates).length > 0) {
@@ -670,13 +745,10 @@ router.post('/hubspot', async (req: express.Request, res: express.Response) => {
           }
         }
       }
+    } catch (error: any) {
+      console.error('[HubSpot Webhook] error:', error);
     }
-
-    res.status(200).json({ received: true });
-  } catch (error: any) {
-    console.error('[HubSpot Webhook] error:', error);
-    res.status(200).json({ received: true, error: error.message });
-  }
+  })();
 });
 
 export default router;

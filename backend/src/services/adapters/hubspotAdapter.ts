@@ -55,10 +55,6 @@ export class HubspotAdapter implements CrmAdapter {
     ): Promise<SyncResult> {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
         const svc = await this.getSvc(auth); // token resolved ONCE here
-        const syncedContactIds: string[] = [];
-
-        // ── 0. Ensure the HubSpot contact list exists ──
-        const contactListId = await this.ensureContactList(svc, config);
 
         // ── 1. Pre-create any missing custom contact properties ──────────────────
         const customContactMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
@@ -109,7 +105,6 @@ export class HubspotAdapter implements CrmAdapter {
 
                 if (isNew) result.newCount++; else result.updatedCount++;
                 result.successCount++;
-                syncedContactIds.push(contactId);
 
                 // Persist HubSpot contact ID back to our DB
                 await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
@@ -134,18 +129,6 @@ export class HubspotAdapter implements CrmAdapter {
                 const msg = this.formatError(err);
                 console.error(`[HubspotAdapter] lead sync failed for ${lead.email || lead.leadId}: ${msg}`);
                 result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
-            }
-        }
-
-        // ── 5. Add synced contacts to the list ──
-        if (contactListId && syncedContactIds.length > 0) {
-            try {
-                await svc.addContactToList(contactListId, syncedContactIds);
-            } catch (err: any) {
-                const msg = this.formatError(err);
-                console.error(`[HubspotAdapter] failed to add contacts to list ${contactListId}: ${msg}`);
-                result.errorCount++;
-                result.errors.push(`List membership: ${msg}`);
             }
         }
 
@@ -422,26 +405,4 @@ export class HubspotAdapter implements CrmAdapter {
         return `${name} - Deal`;
     }
 
-    private async ensureContactList(
-        svc: HubSpotService,
-        config: ExternalCrmSyncConfig
-    ): Promise<string | undefined> {
-        let listId = config.externalListId;
-
-        // If we have an ID, we assume it exists
-        if (!listId) {
-            const listName = config.listName || config.listId;
-            try {
-                listId = await svc.findOrCreateList(listName);
-                config.externalListId = listId;
-                console.log(`[HubspotAdapter] found or created list "${listName}" with ID ${listId}`);
-            } catch (err: any) {
-                const msg = this.formatError(err);
-                console.error(`[HubspotAdapter] failed to find or create list "${listName}": ${msg}`);
-                throw new Error(`Failed to initialize HubSpot list: ${msg}`);
-            }
-        }
-
-        return listId;
-    }
 }

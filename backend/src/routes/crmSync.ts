@@ -94,9 +94,8 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       customFieldMapping: config.customFieldMapping,
       deleteOnPush: config.deleteOnPush ?? false,
       deleteOnPull: config.deleteOnPull ?? false,
+      webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
-      externalListId: config.externalListId,
-      externalPeopleListId: config.externalPeopleListId,
       externalPipelineId: config.externalPipelineId,
       lastPushSyncAt: config.lastPushSyncAt,
       lastPullSyncAt: config.lastPullSyncAt,
@@ -131,14 +130,14 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
     const {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping,
-      deleteOnPush, deleteOnPull,
-      externalListId, externalPipelineId, listName,
+      deleteOnPush, deleteOnPull, webhookEnabled,
+      externalPipelineId, listName,
     } = req.body;
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping,
-      deleteOnPush, deleteOnPull,
-      externalListId, externalPipelineId, listName,
+      deleteOnPush, deleteOnPull, webhookEnabled,
+      externalPipelineId, listName,
     });
 
     res.json({
@@ -152,9 +151,8 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       customFieldMapping: config.customFieldMapping,
       deleteOnPush: config.deleteOnPush ?? false,
       deleteOnPull: config.deleteOnPull ?? false,
+      webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
-      externalListId: config.externalListId,
-      externalPeopleListId: config.externalPeopleListId,
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
@@ -181,27 +179,6 @@ router.delete('/config/:listId/:provider', async (req: any, res) => {
     res.json({ message: 'Sync configuration deleted' });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to delete config' });
-  }
-});
-
-// ─── External list discovery ──────────────────────────────────────────────────
-
-// GET /api/crm-sync/external-lists/:listId/:provider
-// Returns existing lists from the external CRM (Attio people lists; HubSpot: reserved for contact lists).
-router.get('/external-lists/:listId/:provider', async (req: any, res) => {
-  try {
-    const userId = req.user?.userId;
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-    const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
-    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
-
-    const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
-    const lists = await externalCrmSyncService.getExternalLists(userId, listId, provider, { accountId, apiKey });
-    res.json({ lists });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch external lists' });
   }
 });
 
