@@ -499,11 +499,12 @@ export class ExternalCrmSyncService {
     const internalFields = [
       'leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt',
       'hubspot_contact_id', 'hubspot_deal_id', 'attio_record_id',
-      'status', 'dealValue', 'dealCurrency', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin'
+      'status', 'dealValue', 'dealCurrency', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin',
+      'chatSessionCount'
     ];
 
     const hubspotAliases = ['company_name', 'first_name', 'last_name', 'job_title', 'linkedin_url', 'phone_number'];
-    const attioAliases = ['company_name', 'first_name', 'last_name', 'job_title', 'phone_number', 'linkedin_url'];
+    const attioAliases = ['first_name', 'last_name', 'job_title', 'phone_number', 'linkedin_url'];
 
     let aliasesToFilter: string[] = [];
     if (provider === 'hubspot') {
@@ -528,7 +529,11 @@ export class ExternalCrmSyncService {
       if (list?.name) config.listName = list.name;
     }
 
-    await this.syncHubSpotStatusOptions(config, 'push');
+    try {
+      await this.syncHubSpotStatusOptions(config, 'push');
+    } catch (err) {
+      console.warn('[ExternalCrmSync] syncHubSpotStatusOptions failed, continuing sync:', (err as Error).message);
+    }
 
     const auth = this.resolveAuth(config);
     const adapter = getAdapter(provider);
@@ -580,7 +585,11 @@ export class ExternalCrmSyncService {
       if (list?.name) config.listName = list.name;
     }
 
-    await this.syncHubSpotStatusOptions(config, 'pull');
+    try {
+      await this.syncHubSpotStatusOptions(config, 'pull');
+    } catch (err) {
+      console.warn('[ExternalCrmSync] syncHubSpotStatusOptions failed, continuing sync:', (err as Error).message);
+    }
 
     const auth = this.resolveAuth(config);
     const adapter = getAdapter(provider);

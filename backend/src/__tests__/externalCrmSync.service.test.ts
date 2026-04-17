@@ -2,20 +2,13 @@ import { ExternalCrmSyncService, ExternalCrmSyncConfig, FieldMapping } from '../
 
 // ─── Mock dependencies ────────────────────────────────────────────────────────
 
-jest.mock('../services/settingsService', () => ({
-  settingsService: {
-    getSetting: jest.fn(),
-    setSetting: jest.fn(),
-    deleteSetting: jest.fn(),
-  },
-}));
-
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
+    setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -80,17 +73,39 @@ jest.mock('../services/attioService', () => ({
 jest.mock('axios');
 const axios = require('axios');
 
-import { settingsService } from '../services/settingsService';
 import { crmDb } from '../services/db';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 
-const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockHubSpotCreate = HubSpotService.create as jest.Mock;
 const mockHubSpotFromToken = HubSpotService.fromToken as jest.Mock;
 const mockAttioCreate = AttioService.create as jest.Mock;
 const mockAttioFromToken = AttioService.fromToken as jest.Mock;
+
+/**
+ * Helper: configure crmDb.getLeadListById to return a list with
+ * externalCrmSyncConfigs[provider] = config (or null if config is null).
+ */
+function mockListWithConfig(config: ExternalCrmSyncConfig | null, provider = 'hubspot', extraListFields: Record<string, any> = {}) {
+  const externalCrmSyncConfigs = config ? { [provider]: config } : {};
+  mockCrmDb.getLeadListById.mockResolvedValue({
+    listId: 'list1',
+    userId: 'user1',
+    name: 'Test List',
+    externalCrmSyncConfigs,
+    ...extraListFields,
+  } as any);
+}
+
+function mockNoConfig() {
+  mockCrmDb.getLeadListById.mockResolvedValue({
+    listId: 'list1',
+    userId: 'user1',
+    name: 'Test List',
+    externalCrmSyncConfigs: {},
+  } as any);
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -138,34 +153,35 @@ describe('ExternalCrmSyncService', () => {
     mockHubSpotServiceInstance.getDeal.mockResolvedValue(null);
     mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
     mockHubSpotServiceInstance.createDealStage.mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } });
+    mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
     service = new ExternalCrmSyncService();
   });
 
   // ─── getConfig ────────────────────────────────────────────────────────────
 
   describe('getConfig', () => {
-    it('returns null when no setting exists', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+    it('returns null when list does not exist', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toBeNull();
+    });
+
+    it('returns null when no config for provider', async () => {
+      mockNoConfig();
       const result = await service.getConfig('user1', 'list1', 'hubspot');
       expect(result).toBeNull();
     });
 
     it('returns null when userId does not match', async () => {
       const config = makeConfig({ userId: 'other-user' });
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'ext_crm_sync_list1_hubspot',
-        settingValue: JSON.stringify(config),
-      } as any);
+      mockListWithConfig(config);
       const result = await service.getConfig('user1', 'list1', 'hubspot');
       expect(result).toBeNull();
     });
 
-    it('returns parsed config when userId matches', async () => {
+    it('returns config when userId matches', async () => {
       const config = makeConfig();
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'ext_crm_sync_list1_hubspot',
-        settingValue: JSON.stringify(config),
-      } as any);
+      mockListWithConfig(config);
       const result = await service.getConfig('user1', 'list1', 'hubspot');
       expect(result).toMatchObject({ provider: 'hubspot', listId: 'list1', userId: 'user1' });
     });
@@ -178,7 +194,7 @@ describe('ExternalCrmSyncService', () => {
     it('generates a webhookSecret, sets it on the config in-place, and persists it', async () => {
       const config = makeConfig();
       delete (config as any).webhookSecret;
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.ensureWebhookSecret('user1', 'list1', 'hubspot', config);
 
@@ -186,11 +202,10 @@ describe('ExternalCrmSyncService', () => {
       expect(typeof config.webhookSecret).toBe('string');
       expect(config.webhookSecret!.length).toBeGreaterThan(0);
 
-      expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
-        expect.stringContaining('list1'),
-        expect.stringContaining('"webhookSecret"'),
-        expect.any(String),
-        'user1'
+      expect(mockCrmDb.setLeadListCrmSyncConfig).toHaveBeenCalledWith(
+        'list1',
+        'hubspot',
+        expect.objectContaining({ webhookSecret: config.webhookSecret })
       );
     });
   });
@@ -199,13 +214,13 @@ describe('ExternalCrmSyncService', () => {
 
   describe('saveConfig', () => {
     it('creates new config with encrypted API key when no existing config', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.saveConfig('user1', 'list1', 'hubspot', { apiKey: 'my-token' });
 
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
       expect(saved.apiKeyEncrypted).toBe('enc:my-token');
       expect(saved.provider).toBe('hubspot');
       expect(saved.userId).toBe('user1');
@@ -213,48 +228,46 @@ describe('ExternalCrmSyncService', () => {
 
     it('preserves existing encrypted key when no new apiKey provided', async () => {
       const existing = makeConfig({ apiKeyEncrypted: 'enc:old-token' });
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(existing),
-      } as any);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.saveConfig('user1', 'list1', 'hubspot', { autoSyncEnabled: true });
 
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
       expect(saved.apiKeyEncrypted).toBe('enc:old-token');
       expect(saved.autoSyncEnabled).toBe(true);
     });
 
     it('stores accountId when provided (OAuth path)', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'oauth-acct' });
 
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
       expect(saved.accountId).toBe('oauth-acct');
       expect(saved.apiKeyEncrypted).toBeUndefined();
     });
 
     it('saves custom field mapping', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       const customMapping: FieldMapping[] = [
         { agentwebField: 'source', crmProperty: 'lead_source', direction: 'push', enabled: true },
       ];
       await service.saveConfig('user1', 'list1', 'hubspot', { customFieldMapping: customMapping });
 
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
       expect(saved.customFieldMapping).toEqual(customMapping);
     });
 
     it('merges Attio deal mappings into custom mappings', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.saveConfig('user1', 'list1', 'attio', {
         dealFieldMapping: [
@@ -265,8 +278,8 @@ describe('ExternalCrmSyncService', () => {
         ],
       });
 
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
       expect(saved.dealFieldMapping).toEqual([]);
       expect(saved.customFieldMapping).toEqual(expect.arrayContaining([
         expect.objectContaining({ agentwebField: 'status', crmProperty: 'deal_status' }),
@@ -281,18 +294,16 @@ describe('ExternalCrmSyncService', () => {
         externalPipelineId: 'pipeline-123',
         lastPushSyncAt: '2024-02-01T00:00:00.000Z',
       });
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(existing),
-      } as any);
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.saveConfig('user1', 'list1', 'hubspot', {
         externalPipelineId: 'pipeline-999',
         listName: 'Renamed Pipeline',
       });
 
-      const call = mockSettingsService.setSetting.mock.calls[0];
-      const saved = JSON.parse(call[1]);
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
       expect(saved.externalPipelineId).toBe('pipeline-123');
       expect(saved.listName).toBe('Locked Pipeline');
     });
@@ -302,19 +313,17 @@ describe('ExternalCrmSyncService', () => {
 
   describe('deleteConfig', () => {
     it('does nothing when no config exists', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockNoConfig();
       await service.deleteConfig('user1', 'list1', 'hubspot');
-      expect(mockSettingsService.deleteSetting).not.toHaveBeenCalled();
+      expect(mockCrmDb.setLeadListCrmSyncConfig).not.toHaveBeenCalled();
     });
 
-    it('deletes setting when config exists', async () => {
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(makeConfig()),
-      } as any);
-      mockSettingsService.deleteSetting.mockResolvedValue(undefined as any);
+    it('calls setLeadListCrmSyncConfig with null when config exists', async () => {
+      mockListWithConfig(makeConfig());
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.deleteConfig('user1', 'list1', 'hubspot');
-      expect(mockSettingsService.deleteSetting).toHaveBeenCalledWith('ext_crm_sync_list1_hubspot');
+      expect(mockCrmDb.setLeadListCrmSyncConfig).toHaveBeenCalledWith('list1', 'hubspot', null);
     });
   });
 
@@ -322,7 +331,7 @@ describe('ExternalCrmSyncService', () => {
 
   describe('testConnection', () => {
     it('returns error when no config found', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
       const result = await service.testConnection('user1', 'list1', 'hubspot');
       expect(result.valid).toBe(false);
       expect(result.error).toMatch(/no.*config/i);
@@ -330,17 +339,13 @@ describe('ExternalCrmSyncService', () => {
 
     it('returns error when config has no token or accountId', async () => {
       const config = makeConfig({ accountId: undefined, apiKeyEncrypted: undefined });
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(config),
-      } as any);
+      mockListWithConfig(config);
       const result = await service.testConnection('user1', 'list1', 'hubspot');
       expect(result.valid).toBe(false);
     });
 
     it('returns valid=true on successful HubSpot API call (OAuth)', async () => {
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(makeConfig({ accountId: 'acct1' })),
-      } as any);
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
       axios.create.mockReturnValue({
         get: jest.fn().mockResolvedValue({ data: { results: [] } }),
@@ -351,9 +356,7 @@ describe('ExternalCrmSyncService', () => {
     });
 
     it('returns valid=false when HubSpot API call fails', async () => {
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(makeConfig({ accountId: 'acct1' })),
-      } as any);
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
       mockHubSpotServiceInstance.testConnection.mockResolvedValue({ valid: false, error: 'Unauthorized' });
 
       const result = await service.testConnection('user1', 'list1', 'hubspot');
@@ -363,9 +366,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('returns valid=true on successful Attio API call (manual token)', async () => {
       const config = makeConfig({ provider: 'attio', accountId: undefined, apiKeyEncrypted: 'enc:attio-token' });
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(config),
-      } as any);
+      mockListWithConfig(config, 'attio');
       axios.create.mockReturnValue({
         get: jest.fn().mockResolvedValue({ data: { data: [] } }),
       });
@@ -447,25 +448,22 @@ describe('ExternalCrmSyncService', () => {
 
   describe('pushAllLeads - HubSpot', () => {
     it('throws when no config found', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
       await expect(service.pushAllLeads('user1', 'list1', 'hubspot'))
         .rejects.toThrow(/no.*config/i);
     });
 
     it('throws when no token or accountId configured', async () => {
       const config = makeConfig({ accountId: undefined, apiKeyEncrypted: undefined });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
       await expect(service.pushAllLeads('user1', 'list1', 'hubspot'))
         .rejects.toThrow(/no.*auth/i);
     });
 
     it('returns success result with zero errors for empty lead list', async () => {
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingValue: JSON.stringify(makeConfig()),
-      } as any);
+      mockListWithConfig(makeConfig());
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
 
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
       expect(result.errorCount).toBe(0);
@@ -474,14 +472,13 @@ describe('ExternalCrmSyncService', () => {
 
     it('skips leads without email when pushing to HubSpot (no upsert possible)', async () => {
       const config = makeConfig();
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [{ leadId: 'l1', firstName: 'John' }], // no email
         lastEvaluatedKey: null,
         hasMore: false,
       });
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
 
       const mockClient = { post: jest.fn(), patch: jest.fn(), get: jest.fn(), put: jest.fn() };
       axios.create.mockReturnValue(mockClient);
@@ -500,14 +497,13 @@ describe('ExternalCrmSyncService', () => {
         dealFieldMapping: [],
         customFieldMapping: [],
       });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [{ leadId: 'l1', email: 'test@test.com', phone: '1234' }],
         lastEvaluatedKey: null,
         hasMore: false,
       });
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
       mockCrmDb.updateLead.mockResolvedValue(undefined as any);
 
       const mockClient = {
@@ -536,14 +532,13 @@ describe('ExternalCrmSyncService', () => {
           { agentwebField: 'userId', crmProperty: 'aw_user_id', direction: 'push', enabled: false },
         ],
       });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [{ leadId: 'l1', email: 'test@test.com', customFields: { source: 'web', userId: 'u1' } }],
         lastEvaluatedKey: null,
         hasMore: false,
       });
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
       mockCrmDb.updateLead.mockResolvedValue(undefined as any);
 
       const mockClient = {
@@ -570,17 +565,16 @@ describe('ExternalCrmSyncService', () => {
 
   describe('pushAllLeads - Attio', () => {
     it('throws when no config found for attio', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
       await expect(service.pushAllLeads('user1', 'list1', 'attio'))
         .rejects.toThrow(/no.*config/i);
     });
 
     it('returns success result with zero errors for empty lead list (Attio)', async () => {
       const config = makeConfig({ provider: 'attio', accountId: 'attio-acct' });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config, 'attio');
       mockAttioCreate.mockResolvedValue({ testConnection: jest.fn().mockResolvedValue({ valid: true }) });
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
-      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
 
       const result = await service.pushAllLeads('user1', 'list1', 'attio');
       expect(result.errorCount).toBe(0);
@@ -593,7 +587,7 @@ describe('ExternalCrmSyncService', () => {
   describe('autoSyncLead', () => {
     it('does nothing when auto-sync is disabled', async () => {
       const config = makeConfig({ autoSyncEnabled: false });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created');
 
@@ -601,7 +595,7 @@ describe('ExternalCrmSyncService', () => {
     });
 
     it('does nothing when no config exists', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created');
 
@@ -610,7 +604,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('does not throw on sync failure (fire-and-forget)', async () => {
       const config = makeConfig({ autoSyncEnabled: true });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
       mockHubSpotCreate.mockRejectedValue(new Error('token error'));
 
       await expect(
@@ -650,7 +644,7 @@ describe('ExternalCrmSyncService', () => {
     });
 
     it('throws when no config and no credentials provided', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
       await expect(
         service.getExternalProperties('user1', 'list1', 'hubspot', {})
       ).rejects.toThrow();
@@ -658,7 +652,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('returns HubSpot contact properties when objectType=contact', async () => {
       const config = makeConfig();
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
 
       const result = await service.getExternalProperties('user1', 'list1', 'hubspot', { objectType: 'contact' });
 
@@ -670,7 +664,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('returns HubSpot deal properties when objectType=deal', async () => {
       const config = makeConfig();
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
 
       const result = await service.getExternalProperties('user1', 'list1', 'hubspot', { objectType: 'deal' });
 
@@ -682,7 +676,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('returns Attio people attributes for any objectType', async () => {
       const config = makeConfig({ provider: 'attio' });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config, 'attio');
 
       const result = await service.getExternalProperties('user1', 'list1', 'attio', {});
 
@@ -691,7 +685,7 @@ describe('ExternalCrmSyncService', () => {
     });
 
     it('accepts inline accountId/apiKey without a saved config', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
 
       const result = await service.getExternalProperties('user1', 'list1', 'hubspot', {
         accountId: 'inline-acct',
@@ -711,7 +705,7 @@ describe('ExternalCrmSyncService', () => {
     });
 
     it('throws when no config exists', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
       await expect(
         service.deleteLeadFromCrm('user1', 'list1', 'hubspot', { leadId: 'l1', email: 'a@b.com' })
       ).rejects.toThrow(/no sync configuration/i);
@@ -719,7 +713,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('no-ops when deleteOnPush is false', async () => {
       const config = makeConfig({ deleteOnPush: false });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
 
       await service.deleteLeadFromCrm('user1', 'list1', 'hubspot', { leadId: 'l1', email: 'a@b.com' });
 
@@ -728,7 +722,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('no-ops when lead has no external CRM ID', async () => {
       const config = makeConfig({ deleteOnPush: true });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
 
       await service.deleteLeadFromCrm('user1', 'list1', 'hubspot', {
         leadId: 'l1', email: 'a@b.com', syncMetadata: {},
@@ -739,7 +733,7 @@ describe('ExternalCrmSyncService', () => {
 
     it('calls HubSpot deleteContact when deleteOnPush=true and contactId exists', async () => {
       const config = makeConfig({ deleteOnPush: true });
-      mockSettingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify(config) } as any);
+      mockListWithConfig(config);
 
       await service.deleteLeadFromCrm('user1', 'list1', 'hubspot', {
         leadId: 'l1', email: 'a@b.com',

@@ -92,7 +92,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
 
   it('returns 400 for unsupported provider', async () => {
     const res = await request(app)
-      .post(`/api/crm/salesforce/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/salesforce/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send({});
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/unsupported provider/i);
@@ -101,7 +102,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
   it('returns 200 silently for unknown listId', async () => {
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
     const res = await request(app)
-      .post(`/api/crm/hubspot/nonexistent-list/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/nonexistent-list/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send({});
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true });
@@ -110,7 +112,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
 
   it('returns 200 silently for wrong secret', async () => {
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=wrong-secret`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', 'wrong-secret')
       .send({});
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true });
@@ -120,7 +123,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
   it('returns 200 silently when no config found', async () => {
     (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(null);
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send({});
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true });
@@ -132,7 +136,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
     const hookSecret = 'attio-handshake-token-abc';
     const res = await request(app)
-      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .set('x-hook-secret', hookSecret)
       .send({});
     expect(res.status).toBe(200);
@@ -167,7 +172,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     ];
 
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(events);
 
     expect(res.status).toBe(200);
@@ -203,7 +209,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     ];
 
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(events);
 
     expect(res.status).toBe(200);
@@ -229,7 +236,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     ];
 
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(events);
 
     expect(res.status).toBe(200);
@@ -260,7 +268,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     };
 
     const res = await request(app)
-      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(event);
 
     expect(res.status).toBe(200);
@@ -286,7 +295,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     };
 
     const res = await request(app)
-      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(event);
 
     expect(res.status).toBe(200);
@@ -304,7 +314,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     ];
 
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(events);
 
     expect(res.status).toBe(200);
@@ -328,7 +339,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     ];
 
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(events);
 
     expect(res.status).toBe(200);
@@ -350,7 +362,8 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     ];
 
     const res = await request(app)
-      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook?secret=${VALID_SECRET}`)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
       .send(events);
 
     expect(res.status).toBe(200);

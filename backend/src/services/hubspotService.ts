@@ -2,6 +2,11 @@ import axios from 'axios';
 import { getHubSpotConfig } from '../config/integrations';
 import { getAccountsByUserId, getAccountById, updateAccountTokens } from './connectedAccountsDb';
 
+// Module-level axios instance with a 15-second timeout for all HubSpot API calls.
+// Falls back to the base axios object when axios.create returns falsy (e.g., in jest auto-mock).
+const _created = axios.create?.({ timeout: 15000 });
+const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HUBSPOT WEBHOOK EVENTS
 //
@@ -190,7 +195,7 @@ export class HubSpotService {
     }
 
     const refreshPromise = (async () => {
-      const response = await axios.post(
+      const response = await axiosInstance.post(
         hubspotConfig.tokenUrl,
         new URLSearchParams({
           grant_type: 'refresh_token',
@@ -251,7 +256,7 @@ export class HubSpotService {
 
   async testConnection(): Promise<{ valid: boolean; error?: string }> {
     try {
-      await axios.get(
+      await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/objects/contacts`,
         { headers: await this.authHeaders(), params: { limit: 1 } }
       );
@@ -272,7 +277,7 @@ export class HubSpotService {
     let url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts?limit=${limit}&properties=${properties}`;
     if (cursor) url += `&after=${cursor}`;
 
-    const res = await axios.get(url, { headers: await this.authHeaders() });
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
     return {
       contacts: ((res.data as any)?.results ?? []).map((r: any) => this.mapContact(r)),
       nextCursor: (res.data as any)?.paging?.next?.after,
@@ -291,7 +296,7 @@ export class HubSpotService {
     let url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts?limit=100&properties=${propsParam}`;
     if (cursor) url += `&after=${cursor}`;
 
-    const res = await axios.get(url, { headers: await this.authHeaders() });
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
     return {
       results: (res.data as any)?.results ?? [],
       nextCursor: (res.data as any)?.paging?.next?.after,
@@ -300,7 +305,7 @@ export class HubSpotService {
 
   async findContactByEmail(email: string): Promise<HubSpotContact | null> {
     const properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url', 'lastmodifieddate'];
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/search`,
       {
         filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email.toLowerCase() }] }],
@@ -322,7 +327,7 @@ export class HubSpotService {
   ): Promise<UpsertContactResult> {
     if (!data.email) throw new Error('upsertContact requires an email address');
 
-    const searchRes = await axios.post(
+    const searchRes = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/search`,
       {
         filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: data.email.toLowerCase() }] }],
@@ -360,7 +365,7 @@ export class HubSpotService {
       }
     }
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts`,
       { properties },
       { headers: await this.authHeaders() }
@@ -386,7 +391,7 @@ export class HubSpotService {
       }
     }
 
-    const res = await axios.patch(
+    const res = await axiosInstance.patch(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}`,
       { properties },
       { headers: await this.authHeaders() }
@@ -396,7 +401,7 @@ export class HubSpotService {
 
   async getContactEmailById(contactId: string): Promise<string | null> {
     try {
-      const res = await axios.get(
+      const res = await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}?properties=email`,
         { headers: await this.authHeaders() }
       );
@@ -418,7 +423,7 @@ export class HubSpotService {
       const props = (propertyNames && propertyNames.length > 0)
         ? propertyNames.join(',')
         : 'email,firstname,lastname,phone,jobtitle,company,hs_linkedin_url';
-      const res = await axios.get(
+      const res = await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}?properties=${props}`,
         { headers: await this.authHeaders() }
       );
@@ -430,7 +435,7 @@ export class HubSpotService {
   }
 
   async deleteContact(contactId: string): Promise<void> {
-    await axios.delete(
+    await axiosInstance.delete(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}`,
       { headers: await this.authHeaders() }
     );
@@ -443,7 +448,7 @@ export class HubSpotService {
    * Uses GET /crm/v3/properties/contacts.
    */
   async listContactProperties(): Promise<Array<{ name: string; label: string; type: string }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${HUBSPOT_API_BASE}/crm/v3/properties/contacts?archived=false`,
       { headers: await this.authHeaders() }
     );
@@ -457,7 +462,7 @@ export class HubSpotService {
    * Uses GET /crm/v3/properties/deals.
    */
   async listDealProperties(): Promise<Array<{ name: string; label: string; type: string }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${HUBSPOT_API_BASE}/crm/v3/properties/deals?archived=false`,
       { headers: await this.authHeaders() }
     );
@@ -472,7 +477,7 @@ export class HubSpotService {
    * Create a deal. Returns the new deal's HubSpot ID.
    */
   async createDeal(properties: Record<string, string>): Promise<string> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/deals`,
       { properties },
       { headers: await this.authHeaders() }
@@ -481,7 +486,7 @@ export class HubSpotService {
   }
 
   async updateDeal(dealId: string, properties: Record<string, string>): Promise<void> {
-    await axios.patch(
+    await axiosInstance.patch(
       `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}`,
       { properties },
       { headers: await this.authHeaders() }
@@ -489,7 +494,7 @@ export class HubSpotService {
   }
 
   async deleteDeal(dealId: string): Promise<void> {
-    await axios.delete(
+    await axiosInstance.delete(
       `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}`,
       { headers: await this.authHeaders() }
     );
@@ -500,7 +505,7 @@ export class HubSpotService {
    * Uses the HUBSPOT_DEFINED default association type (contact_to_deal).
    */
   async associateContactToDeal(contactId: string, dealId: string): Promise<void> {
-    await axios.put(
+    await axiosInstance.put(
       `${HUBSPOT_API_BASE}/crm/v4/objects/contacts/${contactId}/associations/default/deals/${dealId}`,
       undefined,
       { headers: await this.authHeaders() }
@@ -511,7 +516,7 @@ export class HubSpotService {
    * Get the IDs of all deals associated with a contact.
    */
   async getContactDealAssociations(contactId: string): Promise<string[]> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}/associations/deals`,
       { headers: await this.authHeaders() }
     );
@@ -525,7 +530,7 @@ export class HubSpotService {
   async getDeal(dealId: string, properties: string[]): Promise<any | null> {
     try {
       const propsParam = properties.join(',');
-      const res = await axios.get(
+      const res = await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}?properties=${propsParam}`,
         { headers: await this.authHeaders() }
       );
@@ -539,8 +544,8 @@ export class HubSpotService {
   // ─── Deal pipelines / stages ────────────────────────────────────────────────
 
   async getDealPipelineStages(pipelineId = 'default'): Promise<HubSpotPipelineStage[]> {
-    const res = await axios.get(
-      `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals/${pipelineId}`,
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/pipelines/deals/${pipelineId}`,
       { headers: await this.authHeaders() }
     );
 
@@ -556,8 +561,8 @@ export class HubSpotService {
   }
 
   async listDealPipelines(): Promise<HubSpotPipeline[]> {
-    const res = await axios.get(
-      `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals`,
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/pipelines/deals`,
       { headers: await this.authHeaders() }
     );
 
@@ -597,8 +602,8 @@ export class HubSpotService {
     };
 
     try {
-      const res = await axios.post(
-        `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals`,
+      const res = await axiosInstance.post(
+        `${HUBSPOT_API_BASE}/crm/v3/pipelines/deals`,
         payload,
         { headers: await this.authHeaders() }
       );
@@ -631,8 +636,8 @@ export class HubSpotService {
       probability: number;
     }
   ): Promise<HubSpotPipelineStage> {
-    const res = await axios.post(
-      `${HUBSPOT_API_BASE}/crm/pipelines/v3/deals/${pipelineId}/stages`,
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/pipelines/deals/${pipelineId}/stages`,
       {
         stageId: stage.stageId,
         label: stage.label,
@@ -657,7 +662,7 @@ export class HubSpotService {
   // ─── Companies ───────────────────────────────────────────────────────────────
 
   async findCompanyByName(name: string): Promise<string | null> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/companies/search`,
       {
         filterGroups: [{ filters: [{ propertyName: 'name', operator: 'EQ', value: name }] }],
@@ -671,7 +676,7 @@ export class HubSpotService {
   }
 
   async createCompany(name: string): Promise<string> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/companies`,
       { properties: { name } },
       { headers: await this.authHeaders() }
@@ -690,14 +695,14 @@ export class HubSpotService {
   async ensureContactProperty(key: string, label: string): Promise<string> {
     const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
     try {
-      await axios.get(
+      await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/${propertyName}`,
         { headers: await this.authHeaders() }
       );
       return propertyName;
     } catch (err: any) {
       if (err?.response?.status === 404) {
-        await axios.post(
+        await axiosInstance.post(
           `${HUBSPOT_API_BASE}/crm/v3/properties/contacts`,
           {
             name: propertyName,
@@ -721,14 +726,14 @@ export class HubSpotService {
   async ensureDealProperty(key: string, label: string): Promise<string> {
     const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
     try {
-      await axios.get(
+      await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/deals/${propertyName}`,
         { headers: await this.authHeaders() }
       );
       return propertyName;
     } catch (err: any) {
       if (err?.response?.status === 404) {
-        await axios.post(
+        await axiosInstance.post(
           `${HUBSPOT_API_BASE}/crm/v3/properties/deals`,
           {
             name: propertyName,
@@ -752,7 +757,7 @@ export class HubSpotService {
     try {
       // Strategy 1: Direct retrieval by name (v3 API) - most efficient
       const encodedName = encodeURIComponent(name);
-      const res = await axios.get(
+      const res = await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/lists/object-type-id/0-1/name/${encodedName}`,
         { headers: await this.authHeaders() }
       );
@@ -772,7 +777,7 @@ export class HubSpotService {
   }
 
   async createList(name: string): Promise<string> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/lists/`,
       { name, objectTypeId: '0-1', processingType: 'MANUAL' },
       { headers: await this.authHeaders() }
@@ -787,7 +792,7 @@ export class HubSpotService {
   }
 
   async addContactToList(listId: string, contactIds: string[]): Promise<void> {
-    await axios.put(
+    await axiosInstance.put(
       `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
       contactIds,
       { headers: await this.authHeaders() }
@@ -807,7 +812,7 @@ export class HubSpotService {
       if (query) body.query = query;
       if (after) body.after = after;
 
-      const res = await axios.post(
+      const res = await axiosInstance.post(
         `${HUBSPOT_API_BASE}/crm/v3/lists/search`,
         body,
         { headers: await this.authHeaders() }

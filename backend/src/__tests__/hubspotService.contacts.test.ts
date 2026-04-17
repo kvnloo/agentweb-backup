@@ -459,7 +459,7 @@ describe('HubSpotService — getDealPipelineStages', () => {
       }),
     ]);
     expect(mockAxiosGet).toHaveBeenCalledWith(
-      expect.stringContaining('crm/pipelines/2026-03/deals/default'),
+      expect.stringContaining('crm/v3/pipelines/deals/default'),
       expect.any(Object)
     );
   });
@@ -494,7 +494,7 @@ describe('HubSpotService — createDealStage', () => {
       displayOrder: 3,
     }));
     expect(mockAxiosPost).toHaveBeenCalledWith(
-      expect.stringContaining('crm/pipelines/2026-03/deals/default/stages'),
+      expect.stringContaining('crm/v3/pipelines/deals/default/stages'),
       expect.objectContaining({
         stageId: 'qualified',
         label: 'Qualified',

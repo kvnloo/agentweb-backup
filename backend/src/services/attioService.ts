@@ -1,6 +1,11 @@
 import axios from 'axios';
 import { getAccountsByUserId, getAccountById, updateAccountConfig } from './connectedAccountsDb';
 
+// Module-level axios instance with a 15-second timeout for all Attio API calls.
+// Falls back to the base axios object when axios.create returns falsy (e.g., in jest auto-mock).
+const _created = axios.create?.({ timeout: 15000 });
+const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
+
 const ATTIO_API_BASE = 'https://api.attio.com/v2';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,7 +134,7 @@ export class AttioService {
 
   async testConnection(): Promise<{ valid: boolean; error?: string }> {
     try {
-      await axios.get(`${ATTIO_API_BASE}/objects`, { headers: this.headers() });
+      await axiosInstance.get(`${ATTIO_API_BASE}/objects`, { headers: this.headers() });
       return { valid: true };
     } catch (err: any) {
       const msg = err.response?.data?.message || err.message || 'Unknown error';
@@ -168,7 +173,7 @@ export class AttioService {
     const body: any = { limit: 50 };
     if (cursor) body.cursor = cursor;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/records/query`,
       body,
       { headers: this.headers() }
@@ -181,7 +186,7 @@ export class AttioService {
   }
 
   async findPersonByEmail(email: string): Promise<AttioPerson | null> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/records/query`,
       {
         filter: {
@@ -224,7 +229,7 @@ export class AttioService {
       values.company = [{ target_object: 'companies', target_record_id: data.companyId }];
     }
 
-    const res = await axios.put(
+    const res = await axiosInstance.put(
       `${this.baseUrl}/objects/people/records?matching_attribute=email_addresses`,
       { data: { values } },
       { headers: this.headers() }
@@ -260,7 +265,7 @@ export class AttioService {
       values.company = [{ target_object: 'companies', target_record_id: data.companyId }];
     }
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/records`,
       { data: { values } },
       { headers: this.headers() }
@@ -283,23 +288,23 @@ export class AttioService {
       if (lastName) nameEntry.last_name = lastName;
       values.name = [nameEntry];
     }
-    if (data.email !== undefined) {
+    if (data.email != null && data.email !== '') {
       values.email_addresses = [{ email_address: data.email.toLowerCase() }];
     }
-    if (data.phone !== undefined) {
+    if (data.phone != null && data.phone !== '') {
       values.phone_numbers = [{ original_phone_number: data.phone }];
     }
-    if (data.jobTitle !== undefined) {
+    if (data.jobTitle != null && data.jobTitle !== '') {
       values.job_title = [{ value: data.jobTitle }];
     }
-    if (data.linkedinUrl !== undefined) {
+    if (data.linkedinUrl != null && data.linkedinUrl !== '') {
       values.linkedin = [{ value: data.linkedinUrl }];
     }
-    if (data.companyId !== undefined) {
+    if (data.companyId != null && data.companyId !== '') {
       values.company = [{ target_object: 'companies', target_record_id: data.companyId }];
     }
 
-    const res = await axios.patch(
+    const res = await axiosInstance.patch(
       `${this.baseUrl}/objects/people/records/${recordId}`,
       { data: { values } },
       { headers: this.headers() }
@@ -309,7 +314,7 @@ export class AttioService {
   }
 
   async deletePerson(recordId: string): Promise<void> {
-    await axios.delete(
+    await axiosInstance.delete(
       `${this.baseUrl}/objects/people/records/${recordId}`,
       { headers: this.headers() }
     );
@@ -321,7 +326,7 @@ export class AttioService {
     const body: any = { limit: 50 };
     if (cursor) body.cursor = cursor;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/companies/records/query`,
       body,
       { headers: this.headers() }
@@ -334,7 +339,7 @@ export class AttioService {
   }
 
   async findCompanyByName(name: string): Promise<AttioCompany | null> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/companies/records/query`,
       { filter: { name: { $contains: name } }, limit: 1 },
       { headers: this.headers() }
@@ -346,7 +351,7 @@ export class AttioService {
 
   async getCompanyById(recordId: string): Promise<AttioCompany | null> {
     try {
-      const res = await axios.get(
+      const res = await axiosInstance.get(
         `${this.baseUrl}/objects/companies/records/${recordId}`,
         { headers: this.headers() }
       );
@@ -357,7 +362,7 @@ export class AttioService {
   }
 
   async createCompany(name: string): Promise<AttioCompany> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/companies/records`,
       { data: { values: { name: [{ value: name }] } } },
       { headers: this.headers() }
@@ -371,7 +376,7 @@ export class AttioService {
   // Use the /v2/lists endpoint. Lists are scoped per object type (people/companies).
 
   async getAllLists(): Promise<Array<{ id: string; name: string }>> {
-    const res = await axios.get(`${this.baseUrl}/lists`, { headers: this.headers() });
+    const res = await axiosInstance.get(`${this.baseUrl}/lists`, { headers: this.headers() });
     return ((res.data as any)?.data ?? []).map((l: any) => ({
       id: l.id?.list_id as string,
       name: l.name as string,
@@ -394,7 +399,7 @@ export class AttioService {
       .slice(0, 40);
     const apiSlug = `${baseSlug}_${Math.floor(Math.random() * 100000)}`;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists`,
       {
         data: {
@@ -422,7 +427,7 @@ export class AttioService {
     recordId: string,
     entryValues?: Record<string, any[]>
   ): Promise<void> {
-    await axios.post(
+    await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
         data: {
@@ -439,7 +444,7 @@ export class AttioService {
   // List entry attributes are scoped to a specific list (not global to the object).
 
   async listListAttributes(attioListId: string): Promise<any[]> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/lists/${attioListId}/attributes`,
       { headers: this.headers() }
     );
@@ -452,7 +457,7 @@ export class AttioService {
    * Each entry: { api_slug, title, type, is_system_attribute, is_writable }
    */
   async getAllPeopleAttributes(): Promise<Array<{ api_slug: string; title: string; type: string; is_system_attribute: boolean }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/people/attributes`,
       { headers: this.headers() }
     );
@@ -486,7 +491,7 @@ export class AttioService {
     const found = existing.find((a: any) => this.toSlug(a.api_slug) === slug);
     if (found) return found.api_slug;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${attioListId}/attributes`,
       {
         data: {
@@ -509,15 +514,11 @@ export class AttioService {
     listId: string,
     personRecordId: string
   ): Promise<string | null> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/people/records/${personRecordId}/entries`,
       { headers: this.headers() }
     );
     const entries = (res.data as any)?.data ?? [];
-
-    if (entries.length > 0) {
-      console.log('[DEBUG] Sample List Entry:', JSON.stringify(entries[0], null, 2));
-    }
 
     const match = entries.find((e: any) =>
       e?.id?.list_id === listId || e?.list_id === listId || e?.parent_list?.id === listId
@@ -530,7 +531,7 @@ export class AttioService {
     entryId: string,
     entryValues: Record<string, any[]>
   ): Promise<void> {
-    await axios.patch(
+    await axiosInstance.patch(
       `${this.baseUrl}/lists/${listId}/entries/${entryId}`,
       { data: { entry_values: entryValues } },
       { headers: this.headers() }
@@ -538,7 +539,7 @@ export class AttioService {
   }
 
   async addCompanyToList(listId: string, recordId: string): Promise<void> {
-    await axios.post(
+    await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
         data: {
@@ -560,7 +561,7 @@ export class AttioService {
     const targetUrl = `${process.env.BACKEND_URL}/api/webhooks/attio`;
     const subscriptions = ['record.created', 'record.updated', 'record.deleted'];
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/webhooks`,
       { data: { target_url: targetUrl, subscriptions } },
       { headers: this.headers() }
@@ -574,14 +575,14 @@ export class AttioService {
   }
 
   async deleteWebhook(webhookId: string): Promise<void> {
-    await axios.delete(
+    await axiosInstance.delete(
       `${this.baseUrl}/webhooks/${webhookId}`,
       { headers: this.headers() }
     );
   }
 
   async listWebhooks(): Promise<AttioWebhook[]> {
-    const res = await axios.get(`${this.baseUrl}/webhooks`, { headers: this.headers() });
+    const res = await axiosInstance.get(`${this.baseUrl}/webhooks`, { headers: this.headers() });
 
     return ((res.data as any)?.data ?? []).map((w: any) => ({
       webhookId: w.id?.webhook_id ?? w.id,
@@ -593,7 +594,7 @@ export class AttioService {
   // ─── Sync helpers (used by AttioAdapter) ──────────────────────────────────
 
   async verifyList(listId: string): Promise<void> {
-    await axios.get(`${this.baseUrl}/lists/${listId}`, { headers: this.headers() });
+    await axiosInstance.get(`${this.baseUrl}/lists/${listId}`, { headers: this.headers() });
   }
 
   async loadAttributeTypes(
@@ -602,14 +603,14 @@ export class AttioService {
   ): Promise<Map<string, string>> {
     const cache = new Map<string, string>();
     try {
-      const objRes = await axios.get(`${this.baseUrl}/objects/${objectSlug}/attributes`, { headers: this.headers() });
+      const objRes = await axiosInstance.get(`${this.baseUrl}/objects/${objectSlug}/attributes`, { headers: this.headers() });
       for (const attr of (objRes.data as any).data || []) {
         cache.set(`object:${objectSlug}:${attr.api_slug}`, attr.type);
       }
     } catch { /* non-fatal */ }
     if (listId) {
       try {
-        const listRes = await axios.get(`${this.baseUrl}/lists/${listId}/attributes`, { headers: this.headers() });
+        const listRes = await axiosInstance.get(`${this.baseUrl}/lists/${listId}/attributes`, { headers: this.headers() });
         for (const attr of (listRes.data as any).data || []) {
           cache.set(`list:${listId}:${attr.api_slug}`, attr.type);
         }
@@ -622,19 +623,24 @@ export class AttioService {
   async upsertPersonByValues(
     values: Record<string, any>
   ): Promise<{ recordId: string; isNew: boolean }> {
-    const res = await axios.put(
+    const res = await axiosInstance.put(
       `${this.baseUrl}/objects/people/records?matching_attribute=email_addresses`,
       { data: { values } },
       { headers: this.headers() }
     );
+    const recordId = (res.data as any).data?.id?.record_id;
+    const emailAddress = values.email_addresses?.[0]?.email_address ?? '<unknown>';
+    if (!recordId) {
+      throw new Error(`Attio upsert returned no record ID for email: ${emailAddress}`);
+    }
     return {
-      recordId: (res.data as any).data?.id?.record_id,
+      recordId,
       isNew: res.status === 201,
     };
   }
 
   async createPersonByValues(values: Record<string, any>): Promise<string> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/records`,
       { data: { values } },
       { headers: this.headers() }
@@ -643,7 +649,7 @@ export class AttioService {
   }
 
   async updatePersonByValues(recordId: string, values: Record<string, any>): Promise<void> {
-    await axios.patch(
+    await axiosInstance.patch(
       `${this.baseUrl}/objects/people/records/${recordId}`,
       { data: { values } },
       { headers: this.headers() }
@@ -651,7 +657,7 @@ export class AttioService {
   }
 
   async getPersonValues(recordId: string): Promise<Record<string, any>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/people/records/${recordId}`,
       { headers: this.headers() }
     );
@@ -664,7 +670,7 @@ export class AttioService {
   ): Promise<{ entries: any[]; nextCursor?: string }> {
     const body: any = { limit: 50 };
     if (cursor) body.cursor = cursor;
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries/query`,
       body,
       { headers: this.headers() }

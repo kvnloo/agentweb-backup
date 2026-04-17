@@ -4,10 +4,11 @@
  * Allows external CRM systems (HubSpot private apps, Attio) to push real-time
  * record-change events to a unique per-list URL:
  *
- *   POST /api/crm/:provider/:listId/webhook?secret=<webhookSecret>
+ *   POST /api/crm/:provider/:listId/webhook
  *
- * Security: the `secret` query param is verified against the `webhookSecret`
- * stored in the sync config (generated once on first saveConfig(), never rotated).
+ * Security: the webhook secret is verified from the `X-Webhook-Secret` request
+ * header, matched against the `webhookSecret` stored in the sync config
+ * (generated once on first saveConfig(), never rotated).
  *
  * For HubSpot OAuth app users the existing shared endpoint (/api/webhooks/hubspot)
  * continues to handle events — this endpoint is for API-key users who configure
@@ -29,7 +30,7 @@ type SupportedProvider = typeof SUPPORTED_PROVIDERS[number];
 
 router.post('/:provider/:listId/webhook', async (req: express.Request, res: express.Response) => {
   const { provider, listId } = req.params;
-  const secret = req.query.secret as string | undefined;
+  const secret = req.headers['x-webhook-secret'] as string | undefined;
 
   // 1. Validate provider early (this is the only non-silent error)
   if (!SUPPORTED_PROVIDERS.includes(provider as SupportedProvider)) {

@@ -103,10 +103,11 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       lastSyncError: config.lastSyncError,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
-      // Full webhook URL (secret embedded) — never expose webhookSecret as a standalone field
+      // Webhook URL — secret is passed as X-Webhook-Secret header, not in the URL
       webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook`
         : undefined,
+      webhookSecret: config.webhookSecret,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to get config' });
@@ -156,9 +157,11 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
+      // Webhook URL — secret is passed as X-Webhook-Secret header, not in the URL
       webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook`
         : undefined,
+      webhookSecret: config.webhookSecret,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to save config' });
