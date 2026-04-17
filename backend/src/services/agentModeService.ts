@@ -1481,6 +1481,14 @@ export class AgentModeService {
       let maxTokensContinuations = 0;
       const MAX_TOKEN_CONTINUATIONS = 3;
 
+      // Wall-clock timeout: break if a single response takes longer than 4.5 minutes
+      const RESPONSE_TIMEOUT_MS = 4.5 * 60 * 1000;
+
+      // search_web per-response cap: remove the tool after this many calls to avoid
+      // runaway search loops (one session hit 53 calls → >6 min latency)
+      let searchWebCallCount = 0;
+      const SEARCH_WEB_CAP = 15;
+
       let wasCancelled = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
@@ -1489,6 +1497,15 @@ export class AgentModeService {
           wasCancelled = true;
           if (!content) {
             content = 'Generation was stopped.';
+          }
+          break;
+        }
+
+        // Wall-clock timeout: stop if this response has been running for too long
+        if (Date.now() - startTime > RESPONSE_TIMEOUT_MS) {
+          console.warn(`AgentMode: Response timeout exceeded (${Math.round((Date.now() - startTime) / 1000)}s) for session ${sessionId} at iteration ${iteration}`);
+          if (!content) {
+            content = "This request is taking longer than expected. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
           }
           break;
         }
@@ -1986,6 +2003,24 @@ export class AgentModeService {
           } catch (counterError) {
             console.error('AgentMode: Failed to batch update function call counters:', counterError);
             // Don't fail the whole iteration if counter update fails
+          }
+        }
+
+        // search_web cap: count calls made this response and remove the tool once limit is reached
+        const searchWebThisIteration = toolResults.filter(
+          (r) => r.toolCall.function.name === 'search_web'
+        ).length;
+        if (searchWebThisIteration > 0) {
+          searchWebCallCount += searchWebThisIteration;
+          if (searchWebCallCount >= SEARCH_WEB_CAP) {
+            console.warn(`AgentMode: search_web cap (${SEARCH_WEB_CAP}) reached in session ${sessionId} (${searchWebCallCount} calls). Removing tool for remaining iterations.`);
+            if (filteredToolsCache) {
+              filteredToolsCache = filteredToolsCache.filter((t: any) => t.function?.name !== 'search_web');
+            }
+            (messages as any[]).push({
+              role: 'user',
+              content: `[SYSTEM] You have used web search ${searchWebCallCount} times in this response, which is the maximum allowed. Do NOT call search_web again. Compile your final answer using the search results you already have.`
+            });
           }
         }
 
