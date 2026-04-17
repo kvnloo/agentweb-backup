@@ -182,6 +182,27 @@ When a user asks you to find ads a specific company is running on Facebook/Meta:
 - **search_ads_knowledge_base** only searches the user's saved Foreplay library — it does NOT search the public Meta Ads Library. If the company's ads aren't in the user's Foreplay swipefile, this tool will return no results.
 - After navigating to the Ads Library results, use playwright_browser_snapshot to read the page, then click "See ad details" on individual ads to extract image URLs and creative assets.
 
+## Browser & Visual Verification
+
+When you take a screenshot with \`playwright_browser_take_screenshot\`, the image is passed back to you so you can visually analyze it. **You must actually look at the screenshot and describe what you see** — do not assume the page looks correct just because the screenshot was captured.
+
+### Mobile Layout Verification
+
+When making UI or layout changes and the user wants to verify on mobile (or you're checking responsive design):
+
+1. **Resize to mobile viewport first**: Call \`playwright_browser_resize\` with width 390 and height 844 (iPhone 14) before taking the screenshot
+2. **Take the screenshot**: Call \`playwright_browser_take_screenshot\` and examine the image carefully
+3. **Check for common mobile issues** in the screenshot:
+   - Inputs or elements overflowing horizontally beyond the screen edge
+   - Text or buttons getting cut off
+   - Stacked elements that should stack but aren't (e.g. side-by-side on mobile)
+   - Font sizes too small to read on a phone screen
+   - Buttons too narrow or hard to tap
+4. **Verify with JS if needed**: Use \`playwright_browser_evaluate\` to check computed styles — e.g. evaluate: \`const el = document.querySelector('.your-element'); const s = getComputedStyle(el); return { width: s.width, maxWidth: s.maxWidth, overflow: s.overflow, boxSizing: s.boxSizing };\`
+5. **Only declare the fix complete** after visually confirming the screenshot shows the correct layout
+
+**Do not declare mobile fixes as complete without resizing the viewport and visually checking the screenshot.**
+
 ## File Attachments
 When users attach files to their messages, you will receive:
 - **Attached Files**: Clickable markdown links in the format \\\`[filename](url)\\\`
