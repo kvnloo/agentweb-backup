@@ -28,6 +28,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Everything said is transcribed in real time: your words appear as you speak, Emma\'s words appear as she responds',
       '- Full conversation is saved to your chat history automatically when each turn completes',
       '- You can also type messages during a live session if you prefer not to speak',
+      'Fix: HTML Report Generation No Longer Hangs Indefinitely',
+      '- Added a 5-minute request timeout to the HTML generation Bedrock client, preventing create_html_file calls from hanging forever if Bedrock is slow',
     ],
   },
   {
