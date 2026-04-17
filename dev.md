@@ -3391,6 +3391,32 @@ Switched `SUGGEST_MODEL` from `gemini-2.5-pro` to `gemini-3.1-flash-lite-preview
 - Monthly enrichment API cost becomes visible in billing analysis
 - Subscription tiers need to differentiate on enrichment volume
 
+## Work Plan Parallel Step Execution — Investigation (2026-04-17)
+
+### Context
+
+Investigated whether work plan steps can be executed in parallel when they don't depend on each other.
+
+### How Work Plans Execute Today
+
+Work plans are **linear LLM-guided checklists**, not an execution engine. Steps are injected into the LLM's prompt context via `buildMarketingContext()` (`agentModeService.ts:2221`). The LLM reads the current pending step, does the work, calls `setWorkPlanStatus()` to mark it complete, then moves to the next. There is no dispatch loop — execution is driven by the single LLM conversation thread, one turn at a time.
+
+`WorkPlanStep` has no dependency or grouping fields today (`stepCount`, `title`, `description`, `requiredFunctionCalls`, `skillIds`).
+
+### Why True Step-Level Parallelism Is Not Well Supported
+
+An Agent Mode session is a **single LLM conversation thread**: one LLM turn at a time, tools execute, then the next turn starts. Parallelizing multi-turn steps (steps that require multiple rounds of tool calls and LLM reasoning) would require each step to run its own independent LLM loop. The only mechanism for that is sub-agents (via the swarm infrastructure, `backend/src/services/swarm/`), but sub-agents have isolated contexts — they can't share session state mid-execution — and add significant spawn overhead. This makes step-level parallelism via sub-agents architecturally complex with limited practical benefit for the typical plan.
+
+### Existing Parallelism: Tool Calls
+
+**Claude already supports parallel tool calls within a single LLM turn.** When the LLM issues multiple tool calls in one response, they execute concurrently. This is the natural and well-supported parallelism primitive in Agent Mode.
+
+### Decision
+
+**We will not add a parallel step execution mechanism.** Instead, steps that could logically run in parallel should be **merged into a single step** with a description that instructs the LLM to accomplish both objectives. The LLM will naturally fire the required tool calls in parallel within that one step's turn, achieving the same concurrency without any infrastructure changes.
+
+This keeps the work plan model simple (linear checklist) and leverages parallelism that already works reliably. Revisit if a future use case genuinely requires independent multi-turn parallel workstreams — at that point, sub-agent orchestration would be the right path.
+
 ## LinkedIn Outreach — Email Finding Investigation (2026-04-16)
 
 ### Context
