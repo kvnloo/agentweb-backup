@@ -1,11 +1,15 @@
 import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
+import { remotionService, RemotionComposeParams } from "./remotionService";
+import { imageService } from "./imageGeneration";
 
 interface VideoGenerationResult {
   success: boolean;
   videoUrl?: string;
   filename?: string;
+  /** Present when the video was post-processed by Remotion */
+  composedVideoUrl?: string;
   error?: string;
 }
 
@@ -24,6 +28,18 @@ interface VideoGenerationParams {
   videoModel?: string; // Optional model parameter - must be one of the supported models
   startFrame?: string; // Optional: URL of the first frame image
   endFrame?: string; // Optional: URL of the last frame image
+  /** Requested duration in seconds (passed to Veo API). Veo supports 5–8s; defaults to 8. */
+  durationSeconds?: number;
+  /**
+   * When true and clipCount > 1, generate N+1 keyframe images before generating clips.
+   * Clip[i] gets startFrame=keyframes[i], endFrame=keyframes[i+1], so Veo interpolates
+   * between AI-generated visual waypoints — producing smooth, visually coherent transitions.
+   */
+  useKeyframes?: boolean;
+  /** When true, post-process the generated clip with Remotion to add brand overlays */
+  compose?: boolean;
+  /** Brand overlay params — required when compose is true */
+  composeParams?: Omit<RemotionComposeParams, "clipUrl" | "filename" | "userId">;
 }
 
 export class VideoService {
@@ -285,6 +301,12 @@ export class VideoService {
         config.lastFrame = lastFrameImage;
       }
 
+      // Add duration if provided (Veo supports 5–8 seconds)
+      if (params.durationSeconds) {
+        config.durationSeconds = Math.min(8, Math.max(5, params.durationSeconds));
+        console.log(`VideoService: Requesting durationSeconds=${config.durationSeconds} from Veo`);
+      }
+
       // Add config if we have any config options (including lastFrame)
       if (Object.keys(config).length > 0) {
         generateRequest.config = config;
@@ -425,6 +447,66 @@ export class VideoService {
   }
 
   /**
+   * Generate N+1 keyframe images for a multi-clip video sequence.
+   * Frame i is the start of clip i; frame i+1 is its end, which is also the start of clip i+1.
+   * All frames are generated in parallel using the image service.
+   *
+   * @param prompt  The video prompt — each frame description is derived from this
+   * @param clipCount  Number of video clips (we generate clipCount+1 frames)
+   * @param filenameBase  Base filename without extension (e.g. "my_video")
+   * @param userId  Used for S3 path scoping by the image service
+   * @returns Array of image URLs (length = clipCount+1), or null if generation failed
+   */
+  private async generateKeyframes(
+    prompt: string,
+    clipCount: number,
+    filenameBase: string,
+    userId: string
+  ): Promise<string[] | null> {
+    const frameCount = clipCount + 1;
+    console.log(`VideoService: Generating ${frameCount} keyframes for ${clipCount}-clip sequence`);
+
+    // Build per-frame prompts that describe temporal progression through the scene
+    const framePrompts = Array.from({ length: frameCount }, (_, i) => {
+      const pct = Math.round((i / (frameCount - 1)) * 100);
+      if (i === 0) {
+        return `Opening frame (0%) of a video scene: ${prompt}. Cinematic still frame, 16:9 aspect ratio, photorealistic.`;
+      } else if (i === frameCount - 1) {
+        return `Closing frame (100%) of a video scene: ${prompt}. Cinematic still frame, 16:9 aspect ratio, photorealistic.`;
+      } else {
+        return `Mid-scene frame (${pct}% through the scene) of a video: ${prompt}. Cinematic still frame, 16:9 aspect ratio, photorealistic.`;
+      }
+    });
+
+    try {
+      const results = await Promise.all(
+        framePrompts.map((fp, i) =>
+          imageService.generateImage({
+            prompt: fp,
+            filename: `${filenameBase}_kf${i + 1}.png`,
+            size: "16:9",
+            userId,
+          })
+        )
+      );
+
+      // If any frame failed, log and return null (caller falls back to no-keyframe generation)
+      const failed = results.find((r) => !r.success);
+      if (failed) {
+        console.warn(`VideoService: Keyframe generation failed: ${failed.error} — falling back to no-keyframe mode`);
+        return null;
+      }
+
+      const urls = results.map((r) => r.imageUrl!);
+      console.log(`VideoService: Generated ${urls.length} keyframes`);
+      return urls;
+    } catch (err: any) {
+      console.warn(`VideoService: Keyframe generation threw: ${err.message} — falling back to no-keyframe mode`);
+      return null;
+    }
+  }
+
+  /**
    * Generate a video using various AI models
    */
   async generateVideo(
@@ -468,18 +550,91 @@ export class VideoService {
       // Determine which model to use for generation
       const modelToUse = params.videoModel;
       
+      // Determine how many clips to generate
+      // Veo supports max 8s per clip; for longer videos generate multiple clips in parallel
+      const VEO_MAX_SECONDS = 8;
+      const requestedDuration = params.durationSeconds ?? VEO_MAX_SECONDS;
+      const perClipDuration = Math.min(VEO_MAX_SECONDS, Math.max(5, requestedDuration > VEO_MAX_SECONDS ? VEO_MAX_SECONDS : requestedDuration));
+      const clipCount = requestedDuration > VEO_MAX_SECONDS ? Math.ceil(requestedDuration / VEO_MAX_SECONDS) : 1;
+
+      console.log(`VideoService: Generating ${clipCount} clip(s) × ${perClipDuration}s for requested ${requestedDuration}s`);
+
       // Generate video
       let result: VideoGenerationResult;
       try {
+        let clipUrls: string[] = [];
+
         if (modelToUse === "veo-3.1-generate-preview") {
-          result = await this.generateWithVeo31(params);
+          if (clipCount === 1) {
+            result = await this.generateWithVeo31({ ...params, durationSeconds: perClipDuration });
+            if (result.success && result.videoUrl) {
+              clipUrls = [result.videoUrl];
+            }
+          } else {
+            // For multi-clip: optionally generate keyframes first to guide each clip's start/end
+            const filenameBase = params.filename.replace(/\.mp4$/i, '');
+            let keyframes: string[] | null = null;
+            if (params.useKeyframes) {
+              keyframes = await this.generateKeyframes(params.prompt, clipCount, filenameBase, params.userId);
+            }
+
+            // Generate all clips concurrently; each clip gets its keyframe pair when available
+            const clipResults = await Promise.all(
+              Array.from({ length: clipCount }, (_, i) =>
+                this.generateWithVeo31({
+                  ...params,
+                  durationSeconds: perClipDuration,
+                  filename: `${filenameBase}_clip${i + 1}.mp4`,
+                  // Keyframe steering: clip[i] goes from frame[i] to frame[i+1]
+                  startFrame: keyframes ? keyframes[i] : params.startFrame,
+                  endFrame: keyframes ? keyframes[i + 1] : params.endFrame,
+                })
+              )
+            );
+
+            // Check if any failed
+            const failed = clipResults.find((r) => !r.success);
+            if (failed) {
+              result = failed;
+            } else {
+              clipUrls = clipResults.map((r) => r.videoUrl!);
+              result = { success: true, videoUrl: clipUrls[0], filename: params.filename };
+            }
+          }
         } else {
           result = {
             success: false,
             error: `Unsupported model: ${modelToUse}`
           };
         }
-        
+
+        // Post-process with Remotion if requested and Veo succeeded
+        if (result.success && clipUrls.length > 0 && params.compose && params.composeParams) {
+          console.log(`VideoService: Composing ${clipUrls.length} clip(s) with Remotion...`);
+          const composeResult = await remotionService.compose({
+            ...params.composeParams,
+            clipUrl: clipUrls[0],
+            extraClipUrls: clipUrls.slice(1),
+            clipDurationSeconds: perClipDuration,
+            filename: params.filename,
+            userId: params.userId,
+          });
+
+          if (composeResult.success && composeResult.videoUrl) {
+            // Return both URLs: raw clip and composed final video
+            result = {
+              ...result,
+              composedVideoUrl: composeResult.videoUrl,
+              // Callers get the composed video as the primary URL
+              videoUrl: composeResult.videoUrl,
+              filename: composeResult.filename ?? result.filename,
+            };
+          } else {
+            // Composition failed — log a warning but still return the raw clip
+            console.warn(`VideoService: Remotion composition failed (${composeResult.error}), returning raw clip`);
+          }
+        }
+
         return result;
       } catch (error: any) {
         console.error(`❌ Error in video generation with ${modelToUse}:`, error);

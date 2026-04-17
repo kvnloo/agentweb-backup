@@ -38,6 +38,7 @@
     "@modelcontextprotocol/server-github": "^2025.4.8",
     "@projectwallace/css-analyzer": "^9.3.0",
     "@reactflow/core": "^11.11.4",
+    "@remotion/lambda": "^4.0.290",
     "@runwayml/sdk": "^3.7.0",
     "@slack/web-api": "^7.9.3",
     "@types/aws-sdk": "^2.7.4",

@@ -3753,7 +3753,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation.',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3770,6 +3770,14 @@ emmaToolRegistry.register({
           description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
           enum: ['veo-3.1-generate-preview']
         },
+        durationSeconds: {
+          type: 'number',
+          description: 'Optional: Requested total duration of the generated video in seconds. For durations up to 8s, a single Veo clip is generated. For durations 9–32s, multiple 8s clips are generated in parallel and concatenated by Remotion. Defaults to 8 if not specified. Common values: 8 (default), 16 (2 clips), 24 (3 clips). Requires compose:true for multi-clip videos.'
+        },
+        useKeyframes: {
+          type: 'boolean',
+          description: 'Optional: When true and durationSeconds > 8 (multiple clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so Veo interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
+        },
         startFrame: {
           type: 'string',
           description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
@@ -3777,13 +3785,68 @@ emmaToolRegistry.register({
         endFrame: {
           type: 'string',
           description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
+        },
+        compose: {
+          type: 'boolean',
+          description: 'Optional: When true, post-process the generated clip with Remotion to add branded overlays (brand name headline, tagline, logo, and optional CTA card). Requires composeParams. Use this when the user wants a polished, branded video rather than the raw AI-generated clip.'
+        },
+        composeParams: {
+          type: 'object',
+          description: 'Optional: Brand overlay configuration for Remotion post-processing. Required when compose is true.',
+          properties: {
+            brandName: {
+              type: 'string',
+              description: 'Brand display name shown as the headline overlay on the video'
+            },
+            tagline: {
+              type: 'string',
+              description: 'Optional tagline or subtitle shown under the brand name'
+            },
+            primaryColor: {
+              type: 'string',
+              description: 'Primary hex color for the gradient bar and background tint (e.g. "#1a73e8")'
+            },
+            secondaryColor: {
+              type: 'string',
+              description: 'Secondary hex color for accent elements like the divider line (e.g. "#fbbc04")'
+            },
+            logoUrl: {
+              type: 'string',
+              description: 'Optional URL of the brand logo image to display in the overlay'
+            },
+            ctaText: {
+              type: 'string',
+              description: 'Optional call-to-action text for the outro card (e.g. "Get started today")'
+            },
+            ctaUrl: {
+              type: 'string',
+              description: 'Optional URL shown alongside the CTA text (e.g. "agentweb.pro")'
+            },
+            clipDurationSeconds: {
+              type: 'number',
+              description: 'Optional: Duration of the source clip in seconds. Defaults to 8 (Veo default). Used to set correct composition duration.'
+            }
+          },
+          required: ['brandName', 'primaryColor', 'secondaryColor']
         }
       },
       required: ['prompt', 'filename']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.generateVideo(args.prompt, args.filename, context?.userId, context?.sessionId, args.videoModel, args.startFrame, args.endFrame);
+    return await agentModeService.generateVideo(
+      args.prompt,
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      args.videoModel,
+      args.startFrame,
+      args.endFrame,
+      args.compose,
+      args.composeParams,
+      args.durationSeconds,
+      args.useKeyframes
+    );
   }
 });
 

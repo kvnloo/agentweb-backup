@@ -9,6 +9,21 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-17',
+    changes: [
+      'New: AI-Powered Video Generation with Remotion Brand Overlays',
+      '- Emma can now generate branded marketing videos with animated overlays: sliding brand name/tagline headline at the start, optional CTA card at the end',
+      '- Supports custom brand colors, logo, and call-to-action text via the generate_video tool (use compose:true with composeParams)',
+      '- New durationSeconds parameter (5–32s): request any length and the system generates the right number of clips automatically',
+      'New: Multi-Clip Video Stitching for Long Videos',
+      '- Videos longer than 8 seconds are automatically split into multiple Veo clips generated in parallel and seamlessly stitched together by Remotion',
+      '- Example: a 16s video generates two 8s clips and merges them with a single continuous brand overlay',
+      'New: Keyframe-Guided Video Continuity (useKeyframes)',
+      '- When useKeyframes:true is passed to generate_video, the system generates AI keyframe images to visually define the start, midpoint, and end of the video',
+      '- Each clip receives a matching start/end frame so Veo interpolates between defined visual waypoints, producing smooth transitions across clip boundaries instead of hard cuts',
+    ],
+  },
+  {
     date: '2026-04-16',
     changes: [
       'Admin: Slack Channel Name Now Shown in User Details',
