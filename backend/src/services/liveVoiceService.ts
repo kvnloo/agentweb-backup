@@ -93,6 +93,106 @@ async function getGenAI(): Promise<GoogleGenAI> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool schema conversion
+// ---------------------------------------------------------------------------
+
+/**
+ * Gemini Live requires function declarations in a flat format with strict naming.
+ * This converts OpenAI-format tool definitions to Gemini-compatible declarations.
+ *
+ * Rules:
+ * - Name must match ^[a-zA-Z][a-zA-Z0-9_]{0,63}$
+ * - Parameters must be valid JSON Schema (no $schema, additionalProperties unsupported for arrays)
+ * - No nested $ref or complex combinators (anyOf/oneOf at top level)
+ */
+function toGeminiFunctionDeclaration(openAiTool: any): any | null {
+  try {
+    const fn = openAiTool?.function;
+    if (!fn?.name) return null;
+
+    // Sanitize name: must start with letter, only alphanumeric + underscore, max 64 chars
+    const rawName: string = fn.name;
+    const sanitized = rawName
+      .replace(/^[^a-zA-Z]+/, '')          // strip leading non-letters
+      .replace(/[^a-zA-Z0-9_]/g, '_')      // replace invalid chars with _
+      .slice(0, 64);
+    if (!sanitized) return null;
+
+    const declaration: any = {
+      name: sanitized,
+      description: (fn.description || fn.name).slice(0, 1000),
+    };
+
+    if (fn.parameters) {
+      declaration.parameters = sanitizeSchema(fn.parameters);
+    }
+
+    return declaration;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Recursively clean a JSON Schema object to be Gemini-compatible.
+ * Removes unsupported fields and normalizes types.
+ */
+function sanitizeSchema(schema: any): any {
+  if (!schema || typeof schema !== 'object') return schema;
+
+  const cleaned: any = {};
+
+  // Copy supported fields only
+  if (schema.type) cleaned.type = schema.type;
+  if (schema.description) cleaned.description = String(schema.description).slice(0, 500);
+  if (schema.enum) cleaned.enum = schema.enum;
+
+  if (schema.properties && typeof schema.properties === 'object') {
+    cleaned.properties = {};
+    for (const [key, val] of Object.entries(schema.properties)) {
+      cleaned.properties[key] = sanitizeSchema(val);
+    }
+  }
+
+  if (Array.isArray(schema.required)) {
+    cleaned.required = schema.required;
+  }
+
+  // items for array types
+  if (schema.items) {
+    cleaned.items = sanitizeSchema(schema.items);
+  }
+
+  // Flatten simple anyOf/oneOf with a single type entry
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length === 1) {
+    return sanitizeSchema(schema.anyOf[0]);
+  }
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length === 1) {
+    return sanitizeSchema(schema.oneOf[0]);
+  }
+
+  return cleaned;
+}
+
+/**
+ * Load and convert agent mode tools for this user into Gemini Live format.
+ * Returns an empty array on error (voice still works without tools).
+ */
+async function loadGeminiFunctionDeclarations(userId: string): Promise<any[]> {
+  try {
+    const rawTools = await agentModeService.getFilteredTools(userId);
+    const declarations = rawTools
+      .map(toGeminiFunctionDeclaration)
+      .filter((d): d is any => d !== null);
+    console.log(`[liveVoiceService] Loaded ${declarations.length}/${rawTools.length} tools for Gemini Live`);
+    return declarations;
+  } catch (err: any) {
+    console.warn('[liveVoiceService] Failed to load tools for Gemini Live:', err?.message);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -126,9 +226,8 @@ export async function startLiveSession(
   };
   activeSessions.set(sessionId, entry);
 
-  // TODO: Wire agent mode tools into Live session once Gemini tool schema is validated.
-  // Disabled for now — tool names/parameters need sanitization for Gemini Live requirements.
-  const functionDeclarations: any[] = [];
+  // Load user's allowed tools converted to Gemini Live format
+  const functionDeclarations = await loadGeminiFunctionDeclarations(userId);
 
   const ai = await getGenAI();
 
@@ -149,6 +248,8 @@ export async function startLiveSession(
       // Enable automatic transcription so transcripts are available in audio-only mode
       inputAudioTranscription: {},
       outputAudioTranscription: {},
+      // Wire in agent mode tools (sanitized for Gemini Live schema requirements)
+      ...(functionDeclarations.length > 0 ? { tools: [{ functionDeclarations }] } : {}),
     },
     callbacks: {
       onopen: () => {
