@@ -4544,6 +4544,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-16',
     changes: [
+      'Fixed: Emma Can Now Update Website Domain in Brand Guidelines',
+      '- Emma can now set or update the Website Domain field in your Brand Guidelines via chat',
+      '- Previously, asking Emma to update your website domain was silently ignored even though the field is visible on the page',
+    ],
+  },
+  {
+    date: '2026-04-16',
+    changes: [
       'Fixed: Session Scoring Now Correctly Recognizes Tool Calls',
       '- The satisfaction scorer and custom judges now see when the assistant used tools (like create_social_media_posts, search_web) during a session',
       '- Previously, assistant turns that only made tool calls had empty text content, making the judge incorrectly conclude no tools were used',
