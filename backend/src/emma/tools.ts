@@ -3774,6 +3774,10 @@ emmaToolRegistry.register({
           type: 'number',
           description: 'Optional: Requested total duration of the generated video in seconds. For durations up to 8s, a single Veo clip is generated. For durations 9–32s, multiple 8s clips are generated in parallel and concatenated by Remotion. Defaults to 8 if not specified. Common values: 8 (default), 16 (2 clips), 24 (3 clips). Requires compose:true for multi-clip videos.'
         },
+        useKeyframes: {
+          type: 'boolean',
+          description: 'Optional: When true and durationSeconds > 8 (multiple clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so Veo interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
+        },
         startFrame: {
           type: 'string',
           description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
@@ -3840,7 +3844,8 @@ emmaToolRegistry.register({
       args.endFrame,
       args.compose,
       args.composeParams,
-      args.durationSeconds
+      args.durationSeconds,
+      args.useKeyframes
     );
   }
 });
