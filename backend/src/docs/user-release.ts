@@ -42,6 +42,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Ask Emma to find assets you\'ve created in Agent Mode: "show me my images", "find my videos", "find reports about SEO"',
       '- Emma searches across all your Agent Mode sessions and returns results sorted newest first',
       '- Each result includes the asset URL, type, creation date, and the session it came from — so Emma can trace back how any asset was generated',
+      'New: Stitch Pre-Existing Video Clips into a Branded Final Video',
+      '- New compose_video tool lets Emma combine already-generated video clips into a single branded video without needing to regenerate them',
+      '- Provide the ordered clip URLs, brand name, colors, and optional CTA — Emma stitches them together using Remotion with full brand overlays',
+      '- Useful when clips were generated in separate sessions or need to be replaced individually before final assembly',
     ],
   },
   {
