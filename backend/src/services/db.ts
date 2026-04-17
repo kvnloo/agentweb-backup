@@ -3683,6 +3683,7 @@ export const crmDb = {
         ExpressionAttributeValues: {
           ':listId': listId,
         },
+        ScanIndexForward: false, // newest leadId (timestamp-prefixed) first
       };
 
       if (limit !== undefined && limit > 0) {
