@@ -169,6 +169,30 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.getConfig('user1', 'list1', 'hubspot');
       expect(result).toMatchObject({ provider: 'hubspot', listId: 'list1', userId: 'user1' });
     });
+
+  });
+
+  // ─── ensureWebhookSecret ──────────────────────────────────────────────────
+
+  describe('ensureWebhookSecret', () => {
+    it('generates a webhookSecret, sets it on the config in-place, and persists it', async () => {
+      const config = makeConfig();
+      delete (config as any).webhookSecret;
+      mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+      await service.ensureWebhookSecret('user1', 'list1', 'hubspot', config);
+
+      expect(config.webhookSecret).toBeDefined();
+      expect(typeof config.webhookSecret).toBe('string');
+      expect(config.webhookSecret!.length).toBeGreaterThan(0);
+
+      expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+        expect.stringContaining('list1'),
+        expect.stringContaining('"webhookSecret"'),
+        expect.any(String),
+        'user1'
+      );
+    });
   });
 
   // ─── saveConfig ───────────────────────────────────────────────────────────

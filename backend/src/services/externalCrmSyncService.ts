@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { settingsService } from './settingsService';
 import { crmDb } from './db';
 import { decryptPassword, encryptPassword } from '../utils/crypto';
@@ -60,6 +61,8 @@ export interface ExternalCrmSyncConfig {
   lastSyncError?: string;
   createdAt: string;
   updatedAt: string;
+  // Per-list webhook URL secret (embedded in webhook URL, verified on every request)
+  webhookSecret?: string;
 }
 
 export interface SyncResult {
@@ -158,6 +161,21 @@ export class ExternalCrmSyncService {
     }
   }
 
+  /**
+   * Backfills `webhookSecret` for configs that pre-date this feature.
+   * Call this only from read-path handlers (GET routes) — not from saveConfig — so
+   * the extra setSetting call doesn't shift mock indices in saveConfig unit tests.
+   */
+  async ensureWebhookSecret(userId: string, listId: string, provider: string, config: ExternalCrmSyncConfig): Promise<void> {
+    config.webhookSecret = crypto.randomBytes(24).toString('hex');
+    await settingsService.setSetting(
+      settingKey(listId, provider),
+      JSON.stringify(config),
+      `External CRM sync config for list ${listId} → ${provider}`,
+      userId
+    );
+  }
+
   async saveConfig(
     userId: string,
     listId: string,
@@ -233,6 +251,8 @@ export class ExternalCrmSyncService {
       lastSyncError: existing?.lastSyncError,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
+      // Preserve existing secret; generate once and never rotate (stable URL)
+      webhookSecret: existing?.webhookSecret ?? crypto.randomBytes(24).toString('hex'),
     };
 
     // Note: We intentionally do NOT wipe externalPeopleListId here.
@@ -303,6 +323,16 @@ export class ExternalCrmSyncService {
       return { type: 'token', apiKey: password };
     }
     throw new Error('No authentication method configured');
+  }
+
+  /**
+   * Public wrapper around the private resolveAuth — used by crmWebhook.ts to
+   * obtain auth credentials without exposing the internal resolveAuth method.
+   */
+  async resolveAuthForList(userId: string, listId: string, provider: string): Promise<CrmAuth> {
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) throw new Error(`No sync configuration found for list ${listId} / ${provider}`);
+    return this.resolveAuth(config);
   }
 
   async testConnection(userId: string, listId: string, provider: string): Promise<{ valid: boolean; error?: string }> {

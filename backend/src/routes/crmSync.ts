@@ -78,6 +78,11 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     const config = await externalCrmSyncService.getConfig(userId, listId, provider);
     if (!config) return res.json({ configured: false });
 
+    // Lazily backfill webhookSecret for configs created before this feature was added
+    if (!config.webhookSecret) {
+      await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
+    }
+
     res.json({
       configured: true,
       provider: config.provider,
@@ -99,6 +104,10 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       lastSyncError: config.lastSyncError,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
+      // Full webhook URL (secret embedded) — never expose webhookSecret as a standalone field
+      webhookUrl: config.webhookSecret
+        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        : undefined,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to get config' });
@@ -149,6 +158,9 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
+      webhookUrl: config.webhookSecret
+        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        : undefined,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to save config' });
