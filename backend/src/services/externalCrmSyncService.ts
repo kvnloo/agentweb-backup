@@ -185,6 +185,17 @@ export class ExternalCrmSyncService {
       listName?: string;
     }
   ): Promise<ExternalCrmSyncConfig> {
+    // Prevent configuring a second provider on the same list
+    const list = await crmDb.getLeadListById(listId);
+    const allConfigs = (list as any)?.externalCrmSyncConfigs as Record<string, ExternalCrmSyncConfig> | undefined;
+    if (allConfigs) {
+      const conflicting = Object.keys(allConfigs).find(p => p !== provider && allConfigs[p]?.userId);
+      if (conflicting) {
+        const name = conflicting.charAt(0).toUpperCase() + conflicting.slice(1);
+        throw new Error(`This list is already connected to ${name}. Remove that configuration before adding a new one.`);
+      }
+    }
+
     const existing = await this.getConfig(userId, listId, provider);
     const now = new Date().toISOString();
     const isHubspot = provider === 'hubspot';
