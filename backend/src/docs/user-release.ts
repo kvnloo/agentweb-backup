@@ -4548,4 +4548,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Tool results are now included in the scoring transcript so judges can evaluate whether tasks were actually completed',
     ],
   },
+  {
+    date: '2026-04-17',
+    changes: [
+      'Fixed: CRM Now Shows Your Most Recently Added Leads First',
+      '- Opening a CRM lead list now loads your newest leads at the top instead of the oldest',
+      '- Previously, the first page showed the oldest records from when the list was first created',
+    ],
+  },
 ];
