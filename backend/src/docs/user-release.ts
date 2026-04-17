@@ -4594,4 +4594,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Previously, Emma could send messages too aggressively without waiting for your review',
     ],
   },
+  {
+    date: '2026-04-17',
+    changes: [
+      'Fixed: Meta Ad Account Connection Now Works Reliably',
+      '- Connecting a Meta ad account no longer fails with "Invalid or expired token session" when the page load balances across servers',
+      '- Previously, the OAuth token was stored in memory on one server instance; if the final connect step hit a different instance it would fail',
+      '- Token sessions are now stored in a shared database so all server instances can look them up',
+    ],
+  },
 ];
