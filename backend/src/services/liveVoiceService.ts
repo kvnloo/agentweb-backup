@@ -55,10 +55,12 @@ interface LiveEntry {
   socketId: string;
   emitFn: EmitFn;
   userId: string;
-  /** Accumulated assistant text for the current turn */
+  /** Accumulated assistant transcript text for the current turn (display-safe) */
   currentTurnText: string;
   /** Accumulated user text for the current turn (set when sendTextTurn is called) */
   pendingUserText: string;
+  /** Tool call results for the current turn — saved to DynamoDB but NOT shown in chat UI */
+  toolContextText: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +243,7 @@ export async function startLiveSession(
     userId,
     currentTurnText: '',
     pendingUserText: '',
+    toolContextText: '',
   };
   activeSessions.set(sessionId, entry);
 
@@ -352,6 +355,16 @@ export function hasLiveSession(sessionId: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Internal: strip voice-director emotion tags (e.g. [warm], [excited]) from text
+// before displaying it in the chat UI. These tags are instructions for Gemini's
+// TTS layer and should never appear in the transcript visible to the user.
+const EMOTION_TAG_RE = /\[\s*(warm|excited|thoughtful|encouraging|concerned|pause)\s*\]/gi;
+
+function stripEmotionTags(text: string): string {
+  return text.replace(EMOTION_TAG_RE, '').replace(/\s{2,}/g, ' ').trim();
+}
+
+// ---------------------------------------------------------------------------
 // Internal: handle incoming Gemini messages
 // ---------------------------------------------------------------------------
 
@@ -375,8 +388,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
       // Accumulate inline text (present in text-mode; empty in audio-only mode)
       if (part.text) {
-        entry.currentTurnText += part.text;
-        emitFn('live:transcript', { sessionId, text: part.text });
+        const displayText = stripEmotionTags(part.text);
+        entry.currentTurnText += displayText;
+        if (displayText) emitFn('live:transcript', { sessionId, text: displayText });
       }
     }
   }
@@ -385,19 +399,21 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   // (requires outputAudioTranscription: {} in session config)
   const outputTranscript = message.serverContent?.outputTranscription;
   if (outputTranscript?.text) {
-    console.log(`[liveVoiceService] outputTranscription for ${sessionId}: "${outputTranscript.text}"`);
-    entry.currentTurnText += outputTranscript.text;
-    emitFn('live:transcript', { sessionId, text: outputTranscript.text });
+    const displayText = stripEmotionTags(outputTranscript.text);
+    console.log(`[liveVoiceService] outputTranscription for ${sessionId}: "${displayText}"`);
+    entry.currentTurnText += displayText;
+    if (displayText) emitFn('live:transcript', { sessionId, text: displayText });
   }
 
   // Input transcription: Gemini's speech-to-text of what the user said
   // (requires inputAudioTranscription: {} in session config)
   const inputTranscript = message.serverContent?.inputTranscription;
   if (inputTranscript?.text) {
-    console.log(`[liveVoiceService] inputTranscription for ${sessionId}: "${inputTranscript.text}"`);
-    entry.pendingUserText += inputTranscript.text;
+    const displayText = stripEmotionTags(inputTranscript.text);
+    console.log(`[liveVoiceService] inputTranscription for ${sessionId}: "${displayText}"`);
+    entry.pendingUserText += displayText;
     // Forward to browser so user's words appear in real-time as they speak
-    emitFn('live:user-transcript', { sessionId, text: inputTranscript.text });
+    if (displayText) emitFn('live:user-transcript', { sessionId, text: displayText });
   }
 
   // Tool call: execute the requested tool(s) and send results back to Gemini
@@ -420,8 +436,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           );
           const text = typeof result === 'string' ? result : JSON.stringify(result);
           responseContent = { result: text };
-          // Append tool result as context text for saving later
-          entry.currentTurnText += `\n[Tool: ${fc.name}]\n${text}`;
+          // Append tool result to separate context (saved to DynamoDB for LLM context,
+          // but NOT included in the assistant chat bubble shown to the user)
+          entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
         } catch (err: any) {
           console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
           responseContent = { error: err?.message ?? 'Tool execution failed' };
@@ -436,25 +453,33 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
   // Turn complete: save transcript to DynamoDB asynchronously, then notify browser
   if (message.serverContent?.turnComplete) {
+    // assistantText = clean transcript shown in chat UI (no tool output, no emotion tags)
     const assistantText = entry.currentTurnText.trim();
     const userText = entry.pendingUserText.trim();
+    const toolContext = entry.toolContextText.trim();
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
     // Reset for next turn before async work
     entry.currentTurnText = '';
     entry.pendingUserText = '';
+    entry.toolContextText = '';
 
     // Emit turn-complete immediately so browser can update UI
+    // assistantText contains only the clean spoken transcript — no tool call output
     emitFn('live:turn-complete', { sessionId, assistantText, userText });
 
     // Fire-and-forget save — never blocks the audio stream
+    // Include tool context in the saved assistant message so conversation history is complete
     if (assistantText) {
+      const savedAssistantContent = toolContext
+        ? `${assistantText}\n${toolContext}`
+        : assistantText;
       const messagesToSave = [];
       if (userText) {
         messagesToSave.push({ role: 'user' as const, content: userText });
       }
-      messagesToSave.push({ role: 'assistant' as const, content: assistantText });
+      messagesToSave.push({ role: 'assistant' as const, content: savedAssistantContent });
 
       chatbotDb.addMessagesToSession(sessionId, messagesToSave).catch((err) => {
         console.warn(`[liveVoiceService] Failed to save transcript for session ${sessionId}:`, err?.message);

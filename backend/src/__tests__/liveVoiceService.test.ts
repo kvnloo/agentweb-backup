@@ -432,6 +432,108 @@ describe('turnComplete handling', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Emotion tag stripping
+// ---------------------------------------------------------------------------
+
+describe('emotion tag stripping', () => {
+  it('strips [warm] and other emotion tags from inline text before emitting live:transcript', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-emotion-inline', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      serverContent: {
+        modelTurn: {
+          parts: [{ text: '[warm] Great news! [excited] Your CTR is up 12%.' }],
+        },
+      },
+    });
+
+    const transcriptCall = emitFn.mock.calls.find(([event]) => event === 'live:transcript');
+    expect(transcriptCall).toBeDefined();
+    expect(transcriptCall![1].text).not.toMatch(/\[warm\]/i);
+    expect(transcriptCall![1].text).not.toMatch(/\[excited\]/i);
+    expect(transcriptCall![1].text).toContain('Great news!');
+  });
+
+  it('strips emotion tags from outputTranscription before emitting and saving', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-emotion-output', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: {
+        outputTranscription: { text: '[thoughtful] Your campaigns are doing well. [pause] Let me check the numbers.' },
+      },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { turnComplete: true },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const transcriptCall = emitFn.mock.calls.find(([event]) => event === 'live:transcript');
+    expect(transcriptCall![1].text).not.toMatch(/\[(thoughtful|pause)\]/i);
+    expect(transcriptCall![1].text).toContain('Your campaigns are doing well.');
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const savedContent: string = saveCall[1].find((m: any) => m.role === 'assistant')?.content ?? '';
+    expect(savedContent).not.toMatch(/\[(thoughtful|pause)\]/i);
+  });
+
+  it('strips emotion tags from inputTranscription (user speech transcript)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-emotion-input', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      serverContent: {
+        inputTranscription: { text: '[warm] How is my ad spend?' },
+      },
+    });
+
+    const userTranscriptCall = emitFn.mock.calls.find(([event]) => event === 'live:user-transcript');
+    expect(userTranscriptCall).toBeDefined();
+    expect(userTranscriptCall![1].text).not.toMatch(/\[warm\]/i);
+    expect(userTranscriptCall![1].text).toContain('How is my ad spend?');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool text isolation (not shown in chat UI)
+// ---------------------------------------------------------------------------
+
+describe('tool text isolation', () => {
+  it('does not include tool call output in assistantText emitted to browser', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-tool-emit', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    // Simulate: outputTranscription with spoken response (what should appear in chat)
+    callbacks['onmessage']?.({
+      serverContent: {
+        outputTranscription: { text: 'Here is your campaign summary.' },
+      },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { turnComplete: true },
+    });
+
+    await Promise.resolve();
+
+    const turnCompleteCall = emitFn.mock.calls.find(([event]) => event === 'live:turn-complete');
+    expect(turnCompleteCall).toBeDefined();
+    // assistantText should only contain the spoken transcript
+    expect(turnCompleteCall![1].assistantText).toBe('Here is your campaign summary.');
+    // No tool output appended
+    expect(turnCompleteCall![1].assistantText).not.toContain('[Tool:');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // closeLiveSession
 // ---------------------------------------------------------------------------
 
