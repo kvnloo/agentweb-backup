@@ -17409,7 +17409,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      // Use max model limit for HTML generation — reports like GTM audits can be large
+      // Use high token limit for HTML generation — reports like GTM audits can be large
       const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
 
       // Build system prompt for HTML generation
