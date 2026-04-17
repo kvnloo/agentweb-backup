@@ -32,6 +32,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed a browser permissions policy that blocked microphone access in Chrome (Firefox was unaffected)',
       'Fix: HTML Report Generation No Longer Hangs Indefinitely',
       '- Added a 5-minute request timeout to the HTML generation Bedrock client, preventing create_html_file calls from hanging forever if Bedrock is slow',
+      'New: Emma Can Search Your Assets (Images, Videos, Reports)',
+      '- Ask Emma to find assets you\'ve created in Agent Mode: "show me my images", "find my videos", "find reports about SEO"',
+      '- Emma searches across all your Agent Mode sessions and returns results sorted newest first',
+      '- Each result includes the asset URL, type, creation date, and the session it came from — so Emma can trace back how any asset was generated',
     ],
   },
   {
