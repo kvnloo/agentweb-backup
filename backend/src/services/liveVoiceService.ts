@@ -142,8 +142,34 @@ function sanitizeSchema(schema: any): any {
 
   const cleaned: any = {};
 
+  // anyOf/oneOf (and snake_case variants from MCP): Gemini Live doesn't support these.
+  // Must be checked FIRST before anything else so we return early.
+  // Flatten to a single type: prefer 'array' > 'string' > first entry.
+  const combinator = schema.anyOf || schema.oneOf || schema.any_of || schema.one_of;
+  if (Array.isArray(combinator) && combinator.length > 0) {
+    if (combinator.length === 1) return sanitizeSchema(combinator[0]);
+    // Filter out null type entries (these mean nullable, handled via nullable field)
+    const nonNull = combinator.filter((s: any) => s?.type !== 'null' && s !== 'null');
+    if (nonNull.length === 1) return sanitizeSchema(nonNull[0]);
+    const arrayVariant = nonNull.find((s: any) => s?.type === 'array');
+    if (arrayVariant) return sanitizeSchema(arrayVariant);
+    const stringVariant = nonNull.find((s: any) => s?.type === 'string');
+    if (stringVariant) return sanitizeSchema(stringVariant);
+    return sanitizeSchema(nonNull[0] || combinator[0]);
+  }
+
+  // type field: if it's an array of types (JSON Schema draft 2019+), flatten to one type.
+  // The Google GenAI SDK converts array types into anyOf which Gemini Live rejects.
+  let schemaType = schema.type;
+  if (Array.isArray(schemaType)) {
+    const nonNullTypes = schemaType.filter((t: string) => t !== 'null');
+    schemaType = nonNullTypes.includes('array') ? 'array'
+      : nonNullTypes.includes('string') ? 'string'
+      : nonNullTypes[0];
+  }
+
   // Copy supported fields only
-  if (schema.type) cleaned.type = schema.type;
+  if (schemaType) cleaned.type = schemaType;
   if (schema.description) cleaned.description = String(schema.description).slice(0, 500);
   if (schema.enum) cleaned.enum = schema.enum;
 
@@ -158,17 +184,9 @@ function sanitizeSchema(schema: any): any {
     cleaned.required = schema.required;
   }
 
-  // items for array types
-  if (schema.items) {
-    cleaned.items = sanitizeSchema(schema.items);
-  }
-
-  // Flatten simple anyOf/oneOf with a single type entry
-  if (Array.isArray(schema.anyOf) && schema.anyOf.length === 1) {
-    return sanitizeSchema(schema.anyOf[0]);
-  }
-  if (Array.isArray(schema.oneOf) && schema.oneOf.length === 1) {
-    return sanitizeSchema(schema.oneOf[0]);
+  // items is required by Gemini when type === 'array'
+  if (schemaType === 'array') {
+    cleaned.items = schema.items ? sanitizeSchema(schema.items) : { type: 'string' };
   }
 
   return cleaned;
