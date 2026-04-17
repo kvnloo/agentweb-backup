@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-17',
     changes: [
+      'Fix: Emma Now Visually Verifies Screenshots Instead of Assuming Success',
+      '- Emma (Agent Mode) now receives the actual screenshot image as a vision input when she calls browser_take_screenshot, rather than a plain text confirmation string',
+      '- This means Emma can see whether a mobile layout, design change, or UI fix actually looks correct — she no longer declares tasks done without seeing the result',
+      '- Emma also follows a structured mobile verification workflow: resizing the browser to 390px width, describing what she sees in the screenshot, and using browser_evaluate to check CSS properties before reporting completion',
+    ],
+  },
+  {
+    date: '2026-04-17',
+    changes: [
       'New: AI-Powered Video Generation with Remotion Brand Overlays',
       '- Emma can now generate branded marketing videos with animated overlays: sliding brand name/tagline headline at the start, optional CTA card at the end',
       '- Supports custom brand colors, logo, and call-to-action text via the generate_video tool (use compose:true with composeParams)',
