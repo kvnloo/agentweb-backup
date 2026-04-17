@@ -456,6 +456,27 @@ describe('emotion tag stripping', () => {
     expect(transcriptCall![1].text).toContain('Great news!');
   });
 
+  it('strips emotion tags that include punctuation like [warm,] or [pause.]', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-emotion-punctuation', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      serverContent: {
+        modelTurn: {
+          parts: [{ text: '[warm,] Hello there! [pause.] Your results are in.' }],
+        },
+      },
+    });
+
+    const transcriptCall = emitFn.mock.calls.find(([event]) => event === 'live:transcript');
+    expect(transcriptCall).toBeDefined();
+    expect(transcriptCall![1].text).not.toMatch(/\[warm/i);
+    expect(transcriptCall![1].text).not.toMatch(/\[pause/i);
+    expect(transcriptCall![1].text).toContain('Hello there!');
+    expect(transcriptCall![1].text).toContain('Your results are in.');
+  });
+
   it('strips emotion tags from outputTranscription before emitting and saving', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();

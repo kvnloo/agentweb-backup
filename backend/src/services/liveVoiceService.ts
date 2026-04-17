@@ -358,7 +358,9 @@ export function hasLiveSession(sessionId: string): boolean {
 // Internal: strip voice-director emotion tags (e.g. [warm], [excited]) from text
 // before displaying it in the chat UI. These tags are instructions for Gemini's
 // TTS layer and should never appear in the transcript visible to the user.
-const EMOTION_TAG_RE = /\[\s*(warm|excited|thoughtful|encouraging|concerned|pause)\s*\]/gi;
+// Matches emotion tags with optional trailing punctuation inside the brackets:
+// [warm] [warm,] [warm.] [warm!] etc.
+const EMOTION_TAG_RE = /\[\s*(warm|excited|thoughtful|encouraging|concerned|pause)\s*[.,!?;:]*\s*\]/gi;
 
 function stripEmotionTags(text: string): string {
   // Do NOT trim individual chunks — Gemini streams words with trailing spaces and
