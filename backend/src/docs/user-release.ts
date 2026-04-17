@@ -4572,4 +4572,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Previously, tombstoned records could appear as normal accounts in the admin dashboard and block re-registration on old email addresses',
     ],
   },
+  {
+    date: '2026-04-17',
+    changes: [
+      'Fixed: Emma No Longer Suggests Replies for AgentWeb Team Messages',
+      '- Emma will no longer generate suggested reply emails when an AgentWeb team member posts in a monitored Slack thread',
+      '- Previously, replies from @agentweb.pro accounts in existing threads could trigger unnecessary suggest-reply sessions',
+    ],
+  },
 ];
