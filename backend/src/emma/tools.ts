@@ -3772,7 +3772,7 @@ emmaToolRegistry.register({
         },
         durationSeconds: {
           type: 'number',
-          description: 'Optional: Requested duration of the generated video in seconds. Veo supports 5–8 seconds. Defaults to 8 if not specified. Use this to control the clip length.'
+          description: 'Optional: Requested total duration of the generated video in seconds. For durations up to 8s, a single Veo clip is generated. For durations 9–32s, multiple 8s clips are generated in parallel and concatenated by Remotion. Defaults to 8 if not specified. Common values: 8 (default), 16 (2 clips), 24 (3 clips). Requires compose:true for multi-clip videos.'
         },
         startFrame: {
           type: 'string',

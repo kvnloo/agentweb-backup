@@ -483,11 +483,47 @@ export class VideoService {
       // Determine which model to use for generation
       const modelToUse = params.videoModel;
       
+      // Determine how many clips to generate
+      // Veo supports max 8s per clip; for longer videos generate multiple clips in parallel
+      const VEO_MAX_SECONDS = 8;
+      const requestedDuration = params.durationSeconds ?? VEO_MAX_SECONDS;
+      const perClipDuration = Math.min(VEO_MAX_SECONDS, Math.max(5, requestedDuration > VEO_MAX_SECONDS ? VEO_MAX_SECONDS : requestedDuration));
+      const clipCount = requestedDuration > VEO_MAX_SECONDS ? Math.ceil(requestedDuration / VEO_MAX_SECONDS) : 1;
+
+      console.log(`VideoService: Generating ${clipCount} clip(s) × ${perClipDuration}s for requested ${requestedDuration}s`);
+
       // Generate video
       let result: VideoGenerationResult;
       try {
+        let clipUrls: string[] = [];
+
         if (modelToUse === "veo-3.1-generate-preview") {
-          result = await this.generateWithVeo31(params);
+          if (clipCount === 1) {
+            result = await this.generateWithVeo31({ ...params, durationSeconds: perClipDuration });
+            if (result.success && result.videoUrl) {
+              clipUrls = [result.videoUrl];
+            }
+          } else {
+            // Generate all clips concurrently with the per-clip duration
+            const clipParams = { ...params, durationSeconds: perClipDuration };
+            const clipResults = await Promise.all(
+              Array.from({ length: clipCount }, (_, i) =>
+                this.generateWithVeo31({
+                  ...clipParams,
+                  filename: `${params.filename.replace(/\.mp4$/i, '')}_clip${i + 1}.mp4`,
+                })
+              )
+            );
+
+            // Check if any failed
+            const failed = clipResults.find((r) => !r.success);
+            if (failed) {
+              result = failed;
+            } else {
+              clipUrls = clipResults.map((r) => r.videoUrl!);
+              result = { success: true, videoUrl: clipUrls[0], filename: params.filename };
+            }
+          }
         } else {
           result = {
             success: false,
@@ -496,18 +532,13 @@ export class VideoService {
         }
 
         // Post-process with Remotion if requested and Veo succeeded
-        if (result.success && result.videoUrl && params.compose && params.composeParams) {
-          console.log('VideoService: Composing branded video with Remotion...');
-          // If durationSeconds was requested, propagate it to Remotion so the composition
-          // duration matches the actual clip length. composeParams.clipDurationSeconds takes
-          // precedence if the caller set it explicitly.
-          const effectiveComposeParams = {
-            ...params.composeParams,
-            clipDurationSeconds: params.composeParams.clipDurationSeconds ?? params.durationSeconds,
-          };
+        if (result.success && clipUrls.length > 0 && params.compose && params.composeParams) {
+          console.log(`VideoService: Composing ${clipUrls.length} clip(s) with Remotion...`);
           const composeResult = await remotionService.compose({
-            ...effectiveComposeParams,
-            clipUrl: result.videoUrl,
+            ...params.composeParams,
+            clipUrl: clipUrls[0],
+            extraClipUrls: clipUrls.slice(1),
+            clipDurationSeconds: perClipDuration,
             filename: params.filename,
             userId: params.userId,
           });

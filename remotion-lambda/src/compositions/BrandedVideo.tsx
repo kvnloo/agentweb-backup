@@ -10,8 +10,12 @@ import {
 } from "remotion";
 
 export interface BrandedVideoProps {
-  /** S3 URL of the raw AI-generated video clip */
+  /** S3 URL of the first (or only) raw AI-generated video clip */
   clipUrl: string;
+  /** Additional clip URLs to concatenate after clipUrl (for >8s videos) */
+  extraClipUrls?: string[];
+  /** Duration of each individual clip in frames (all clips have the same duration) */
+  perClipDurationInFrames?: number;
   /** Brand display name shown as headline */
   brandName: string;
   /** Optional tagline or subtitle */
@@ -202,9 +206,11 @@ const OutroOverlay: React.FC<{
   );
 };
 
-/** Root composition: clip + intro overlay + optional outro */
+/** Root composition: one or more clips concatenated + intro overlay + optional outro */
 export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   clipUrl,
+  extraClipUrls = [],
+  perClipDurationInFrames,
   brandName,
   tagline,
   primaryColor,
@@ -215,17 +221,38 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   introDurationFrames = 90,
   outroDurationFrames = 90,
 }) => {
-  const { durationInFrames } = useVideoConfig();
+  const { durationInFrames, fps } = useVideoConfig();
   const hasOutro = Boolean(ctaText);
+
   // Guard against 0 or negative values which would throw in <Sequence>
   const safeIntroDuration = Math.max(1, introDurationFrames);
   const safeOutroDuration = Math.max(1, outroDurationFrames);
   const outroStart = Math.max(0, durationInFrames - safeOutroDuration);
 
+  // Build the full ordered list of clips
+  const allClips = [clipUrl, ...extraClipUrls];
+  const clipCount = allClips.length;
+
+  // Duration for each clip segment: either from props or evenly divide total
+  const perClipFrames = perClipDurationInFrames
+    ? Math.max(1, perClipDurationInFrames)
+    : Math.floor(durationInFrames / clipCount);
+
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      {/* Raw AI-generated clip fills the full frame */}
-      <OffthreadVideo src={clipUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+      {/* Concatenate all clips sequentially */}
+      {allClips.map((url, i) => (
+        <Sequence
+          key={`clip-${i}`}
+          from={i * perClipFrames}
+          durationInFrames={perClipFrames}
+        >
+          <OffthreadVideo
+            src={url}
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          />
+        </Sequence>
+      ))}
 
       {/* Intro brand overlay */}
       <Sequence from={0} durationInFrames={safeIntroDuration}>

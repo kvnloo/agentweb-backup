@@ -7,6 +7,8 @@ import AWS from "aws-sdk";
 export interface RemotionComposeParams {
   /** S3 URL of the raw AI-generated video clip (e.g. from Veo 3.1) */
   clipUrl: string;
+  /** Additional clip URLs to concatenate after clipUrl (for >8s videos) */
+  extraClipUrls?: string[];
   /** Brand display name shown as headline overlay */
   brandName: string;
   /** Optional tagline shown under the brand name */
@@ -187,11 +189,16 @@ export class RemotionService {
       // Veo generates clips up to 8 seconds. Cap here so a stale or incorrect
       // clipDurationSeconds from the caller never makes the composition longer
       // than the actual clip (which would cause the video to freeze at the end).
+      // Build the full ordered list of clip URLs
+      const allClipUrls = [params.clipUrl, ...(params.extraClipUrls ?? [])];
+      const clipCount = allClipUrls.length;
+
+      // Each Veo clip is at most 8 seconds; use the per-clip duration for total calculation
       const MAX_VEO_CLIP_SECONDS = 8;
-      // Use || instead of ?? so 0 also falls back to the default (0 is invalid)
-      const clipDurationSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
-      const durationInFrames = Math.round(clipDurationSeconds * FPS);
-      console.log(`RemotionService: clipDurationSeconds=${params.clipDurationSeconds} → capped=${clipDurationSeconds} → durationInFrames=${durationInFrames}`);
+      const perClipSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
+      const totalDurationSeconds = perClipSeconds * clipCount;
+      const durationInFrames = Math.round(totalDurationSeconds * FPS);
+      console.log(`RemotionService: ${clipCount} clip(s) × ${perClipSeconds}s = ${totalDurationSeconds}s → durationInFrames=${durationInFrames}`);
 
       // Ensure filename ends with .mp4
       let filename = params.filename;
@@ -199,13 +206,15 @@ export class RemotionService {
         filename = `${filename}.mp4`;
       }
 
-      const introDurationFrames = Math.max(1, Math.min(90, Math.round(durationInFrames * 0.35)));
+      const introDurationFrames = Math.max(1, Math.min(90, Math.round(durationInFrames * 0.15)));
       const outroDurationFrames = params.ctaText
-        ? Math.max(1, Math.min(90, Math.round(durationInFrames * 0.35)))
+        ? Math.max(1, Math.min(90, Math.round(durationInFrames * 0.15)))
         : 90; // default to 90 even if no CTA; BrandedVideo guards against rendering it
 
       const inputPropsWithDuration = {
-        clipUrl: params.clipUrl,
+        clipUrl: allClipUrls[0],
+        extraClipUrls: allClipUrls.slice(1),
+        perClipDurationInFrames: Math.round(perClipSeconds * FPS),
         brandName: params.brandName,
         tagline: params.tagline,
         primaryColor: params.primaryColor,
@@ -219,7 +228,7 @@ export class RemotionService {
       };
 
       console.log(
-        `RemotionService: Rendering BrandedVideo for user ${params.userId}, durationInFrames=${durationInFrames}, introDurationFrames=${introDurationFrames}, outroDurationFrames=${outroDurationFrames}, hasCtaText=${Boolean(params.ctaText)}`
+        `RemotionService: Rendering BrandedVideo for user ${params.userId}, clips=${clipCount}, durationInFrames=${durationInFrames}, introDurationFrames=${introDurationFrames}, outroDurationFrames=${outroDurationFrames}, hasCtaText=${Boolean(params.ctaText)}`
       );
 
       const renderResult = await renderMediaOnLambda({
