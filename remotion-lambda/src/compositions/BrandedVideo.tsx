@@ -217,7 +217,10 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
 }) => {
   const { durationInFrames } = useVideoConfig();
   const hasOutro = Boolean(ctaText);
-  const outroStart = durationInFrames - outroDurationFrames;
+  // Guard against 0 or negative values which would throw in <Sequence>
+  const safeIntroDuration = Math.max(1, introDurationFrames);
+  const safeOutroDuration = Math.max(1, outroDurationFrames);
+  const outroStart = Math.max(0, durationInFrames - safeOutroDuration);
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
@@ -225,26 +228,26 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
       <OffthreadVideo src={clipUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
 
       {/* Intro brand overlay */}
-      <Sequence from={0} durationInFrames={introDurationFrames}>
+      <Sequence from={0} durationInFrames={safeIntroDuration}>
         <IntroOverlay
           brandName={brandName}
           tagline={tagline}
           primaryColor={primaryColor}
           secondaryColor={secondaryColor}
           logoUrl={logoUrl}
-          durationFrames={introDurationFrames}
+          durationFrames={safeIntroDuration}
         />
       </Sequence>
 
       {/* Outro CTA overlay */}
       {hasOutro && ctaText && (
-        <Sequence from={outroStart} durationInFrames={outroDurationFrames}>
+        <Sequence from={outroStart} durationInFrames={safeOutroDuration}>
           <OutroOverlay
             ctaText={ctaText}
             ctaUrl={ctaUrl}
             primaryColor={primaryColor}
             secondaryColor={secondaryColor}
-            durationFrames={outroDurationFrames}
+            durationFrames={safeOutroDuration}
           />
         </Sequence>
       )}

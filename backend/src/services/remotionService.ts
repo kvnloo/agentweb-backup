@@ -188,8 +188,10 @@ export class RemotionService {
       // clipDurationSeconds from the caller never makes the composition longer
       // than the actual clip (which would cause the video to freeze at the end).
       const MAX_VEO_CLIP_SECONDS = 8;
-      const clipDurationSeconds = Math.min(params.clipDurationSeconds ?? MAX_VEO_CLIP_SECONDS, MAX_VEO_CLIP_SECONDS);
+      // Use || instead of ?? so 0 also falls back to the default (0 is invalid)
+      const clipDurationSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
       const durationInFrames = Math.round(clipDurationSeconds * FPS);
+      console.log(`RemotionService: clipDurationSeconds=${params.clipDurationSeconds} → capped=${clipDurationSeconds} → durationInFrames=${durationInFrames}`);
 
       // Ensure filename ends with .mp4
       let filename = params.filename;
@@ -197,11 +199,12 @@ export class RemotionService {
         filename = `${filename}.mp4`;
       }
 
-      console.log(
-        `RemotionService: Rendering BrandedVideo composition for user ${params.userId}, clip: ${params.clipUrl}`
-      );
+      const introDurationFrames = Math.max(1, Math.min(90, Math.round(durationInFrames * 0.35)));
+      const outroDurationFrames = params.ctaText
+        ? Math.max(1, Math.min(90, Math.round(durationInFrames * 0.35)))
+        : 90; // default to 90 even if no CTA; BrandedVideo guards against rendering it
 
-      const inputProps = {
+      const inputPropsWithDuration = {
         clipUrl: params.clipUrl,
         brandName: params.brandName,
         tagline: params.tagline,
@@ -210,19 +213,14 @@ export class RemotionService {
         logoUrl: params.logoUrl,
         ctaText: params.ctaText,
         ctaUrl: params.ctaUrl,
-        introDurationFrames: Math.min(90, Math.round(durationInFrames * 0.35)),
-        outroDurationFrames: params.ctaText
-          ? Math.min(90, Math.round(durationInFrames * 0.35))
-          : 0,
-      };
-
-      // Pass durationInFrames via inputProps so the Root composition can
-      // read it and override the composition duration at render time.
-      // The BrandedVideo Root uses durationInFrames from props when provided.
-      const inputPropsWithDuration = {
-        ...inputProps,
+        introDurationFrames,
+        outroDurationFrames,
         durationInFrames,
       };
+
+      console.log(
+        `RemotionService: Rendering BrandedVideo for user ${params.userId}, durationInFrames=${durationInFrames}, introDurationFrames=${introDurationFrames}, outroDurationFrames=${outroDurationFrames}, hasCtaText=${Boolean(params.ctaText)}`
+      );
 
       const renderResult = await renderMediaOnLambda({
         region: config.region as any,
