@@ -225,11 +225,14 @@ async function handleAttioEvent(
 
   for (const event of events) {
     const eventType: string = event?.event_type ?? '';
-    const recordId: string = event?.id?.record_id ?? '';
-    const actorType: string = event?.actor?.type ?? '';
+    const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
+    const actorType: string = event?.actor?.type ?? event?.data?.actor?.type ?? '';
+    const objectSlug: string = event?.data?.object?.slug ?? '';
 
     const relevant = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
     if (!relevant || !recordId) continue;
+    // Only process People records — skip Companies and other object types
+    if (objectSlug && objectSlug !== 'people') continue;
     if (actorType === 'api-token') {
       console.log(`[CrmWebhook/Attio] Skipping API-sourced event for recordId=${recordId}`);
       continue;

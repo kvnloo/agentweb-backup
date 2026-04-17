@@ -195,10 +195,19 @@ export class ExternalCrmSyncService {
     const now = new Date().toISOString();
     const isHubspot = provider === 'hubspot';
 
-    const nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
+    let nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_DEAL_MAPPING : DEFAULT_ATTIO_DEAL_MAPPING);
-    const nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
+    let nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
+
+    // Attio has no separate "deal" object — deal mappings are stored as list-entry (custom) attrs.
+    // When saving for Attio, merge any deal mappings into customFieldMapping and clear dealFieldMapping.
+    if (!isHubspot && nextDealFieldMapping.length > 0) {
+      const existingCustomKeys = new Set(nextCustomFieldMapping.map((m: FieldMapping) => m.agentwebField));
+      const dealEntries = nextDealFieldMapping.filter((m: FieldMapping) => !existingCustomKeys.has(m.agentwebField));
+      nextCustomFieldMapping = [...nextCustomFieldMapping, ...dealEntries];
+      nextDealFieldMapping = [];
+    }
 
     // Pipeline selection is locked once any sync has occurred.
     const alreadySynced = !!(existing?.lastPushSyncAt || existing?.lastPullSyncAt);

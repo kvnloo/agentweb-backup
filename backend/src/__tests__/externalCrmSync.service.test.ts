@@ -681,7 +681,15 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.getExternalProperties('user1', 'list1', 'attio', {});
 
       expect((mockAttioServiceInstance as any).getAllPeopleAttributes).toHaveBeenCalled();
-      expect(result.properties).toHaveLength(attioAttrs.length);
+      // The personal-name attribute expands into first_name:text, last_name:text, plus the original —
+      // so 3 input attrs → 5 output properties (email-address + 3 for personal-name + currency)
+      expect(result.properties).toHaveLength(5);
+      expect(result.properties).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'email_addresses', type: 'email-address' }),
+        expect.objectContaining({ name: 'first_name', type: 'text' }),
+        expect.objectContaining({ name: 'last_name', type: 'text' }),
+        expect.objectContaining({ name: 'deal_value', type: 'currency' }),
+      ]));
     });
 
     it('accepts inline accountId/apiKey without a saved config', async () => {
