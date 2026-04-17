@@ -128,17 +128,21 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('live:start', async ({ sessionId }: { sessionId: string }) => {
     try {
-      getLiveUserId(); // auth check — throws if invalid
+      const userId = getLiveUserId(); // auth check — throws if invalid
+      console.log(`[liveVoice] live:start received for session ${sessionId} on socket ${socket.id}`);
       // Track which live sessions this socket owns (for disconnect cleanup)
       if (!socket.data.liveSessions) socket.data.liveSessions = new Set<string>();
       socket.data.liveSessions.add(sessionId);
-      await startLiveSession(sessionId, socket.id, liveEmit);
+      await startLiveSession(sessionId, socket.id, liveEmit, userId);
+      console.log(`[liveVoice] live:start completed for session ${sessionId}`);
     } catch (err: any) {
+      console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message ?? 'Failed to start live session' });
     }
   });
 
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
+    console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
     sendAudioChunk(sessionId, chunk).catch((err) => {
       socket.emit('live:error', { sessionId, error: err?.message });
     });
@@ -146,8 +150,10 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('live:text', async ({ sessionId, text }: { sessionId: string; text: string }) => {
     try {
+      console.log(`[liveVoice] live:text received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
       await sendTextTurn(sessionId, text);
     } catch (err: any) {
+      console.error(`[liveVoice] live:text error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message });
     }
   });

@@ -13,9 +13,10 @@
  *   without blocking the audio stream
  */
 
-import { GoogleGenAI, Modality, MediaResolution, LiveServerMessage, Session } from '@google/genai';
+import { GoogleGenAI, Modality, LiveServerMessage, Session, Transcription } from '@google/genai';
 import { chatbotDb } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
+import { agentModeService } from './agentModeService';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -53,6 +54,7 @@ interface LiveEntry {
   session: Session;
   socketId: string;
   emitFn: EmitFn;
+  userId: string;
   /** Accumulated assistant text for the current turn */
   currentTurnText: string;
   /** Accumulated user text for the current turn (set when sendTextTurn is called) */
@@ -105,7 +107,8 @@ async function getGenAI(): Promise<GoogleGenAI> {
 export async function startLiveSession(
   sessionId: string,
   socketId: string,
-  emitFn: EmitFn
+  emitFn: EmitFn,
+  userId: string
 ): Promise<void> {
   // Close any existing session for this sessionId
   if (activeSessions.has(sessionId)) {
@@ -117,10 +120,15 @@ export async function startLiveSession(
     session: null as unknown as Session,
     socketId,
     emitFn,
+    userId,
     currentTurnText: '',
     pendingUserText: '',
   };
   activeSessions.set(sessionId, entry);
+
+  // TODO: Wire agent mode tools into Live session once Gemini tool schema is validated.
+  // Disabled for now — tool names/parameters need sanitization for Gemini Live requirements.
+  const functionDeclarations: any[] = [];
 
   const ai = await getGenAI();
 
@@ -128,7 +136,6 @@ export async function startLiveSession(
     model: LIVE_MODEL,
     config: {
       responseModalities: [Modality.AUDIO],
-      mediaResolution: MediaResolution.MEDIA_RESOLUTION_MEDIUM,
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
@@ -139,26 +146,29 @@ export async function startLiveSession(
       systemInstruction: {
         parts: [{ text: LIVE_SYSTEM_PROMPT }],
       },
-      contextWindowCompression: {
-        triggerTokens: '104857',
-        slidingWindow: { targetTokens: '52428' },
-      },
+      // Enable automatic transcription so transcripts are available in audio-only mode
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
     },
     callbacks: {
       onopen: () => {
-        // Session open — nothing to emit; browser already knows it connected
+        console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}`);
       },
       onmessage: (message: LiveServerMessage) => {
-        handleIncomingMessage(sessionId, message);
+        console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
+        handleIncomingMessage(sessionId, message).catch((err) => {
+          console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message);
+        });
       },
       onerror: (e: ErrorEvent) => {
-        console.error(`[liveVoiceService] Error on session ${sessionId}:`, e.message);
+        console.error(`[liveVoiceService] Gemini ERROR on session ${sessionId}:`, e.message, e);
         const currentEntry = activeSessions.get(sessionId);
         if (currentEntry) {
           currentEntry.emitFn('live:error', { sessionId, error: e.message });
         }
       },
       onclose: (e: CloseEvent) => {
+        console.log(`[liveVoiceService] Gemini CLOSED session ${sessionId}, code=${e.code}, reason=${e.reason}`);
         const currentEntry = activeSessions.get(sessionId);
         if (currentEntry) {
           currentEntry.emitFn('live:closed', { sessionId });
@@ -173,23 +183,15 @@ export async function startLiveSession(
 
 /**
  * Send a base64-encoded audio chunk from the browser microphone to Gemini.
+ * Uses sendRealtimeInput (streaming audio API) with the actual browser format (webm/opus).
  */
 export async function sendAudioChunk(sessionId: string, base64Chunk: string): Promise<void> {
   const entry = getEntry(sessionId);
-  entry.session.sendClientContent({
-    turns: [
-      {
-        role: 'user',
-        parts: [
-          {
-            inlineData: {
-              data: base64Chunk,
-              mimeType: AUDIO_MIME_TYPE,
-            },
-          },
-        ],
-      },
-    ],
+  entry.session.sendRealtimeInput({
+    audio: {
+      data: base64Chunk,
+      mimeType: 'audio/pcm;rate=16000',
+    },
   });
 }
 
@@ -234,7 +236,7 @@ export function hasLiveSession(sessionId: string): boolean {
 // Internal: handle incoming Gemini messages
 // ---------------------------------------------------------------------------
 
-function handleIncomingMessage(sessionId: string, message: LiveServerMessage): void {
+async function handleIncomingMessage(sessionId: string, message: LiveServerMessage): Promise<void> {
   const entry = activeSessions.get(sessionId);
   if (!entry) return;
 
@@ -252,12 +254,61 @@ function handleIncomingMessage(sessionId: string, message: LiveServerMessage): v
         });
       }
 
-      // Accumulate text transcript for saving on turnComplete
+      // Accumulate inline text (present in text-mode; empty in audio-only mode)
       if (part.text) {
         entry.currentTurnText += part.text;
         emitFn('live:transcript', { sessionId, text: part.text });
       }
     }
+  }
+
+  // Output transcription: Gemini sends text transcripts of its own audio speech
+  // (requires outputAudioTranscription: {} in session config)
+  const outputTranscript = message.serverContent?.outputTranscription;
+  if (outputTranscript?.text) {
+    entry.currentTurnText += outputTranscript.text;
+    emitFn('live:transcript', { sessionId, text: outputTranscript.text });
+  }
+
+  // Input transcription: Gemini's speech-to-text of what the user said
+  // (requires inputAudioTranscription: {} in session config)
+  const inputTranscript = message.serverContent?.inputTranscription;
+  if (inputTranscript?.text) {
+    entry.pendingUserText += inputTranscript.text;
+  }
+
+  // Tool call: execute the requested tool(s) and send results back to Gemini
+  if (message.toolCall?.functionCalls?.length) {
+    const functionCalls = message.toolCall.functionCalls;
+    console.log(`[liveVoiceService] Tool calls for ${sessionId}:`, functionCalls.map(fc => fc.name));
+
+    // Execute all function calls in parallel
+    const responses: any[] = await Promise.all(
+      functionCalls.map(async (fc) => {
+        let responseContent: Record<string, unknown>;
+        try {
+          const result = await agentModeService.executeTool(
+            LIVE_MODEL,
+            fc.name!,
+            fc.args ?? {},
+            entry.userId,
+            sessionId,
+            false,
+          );
+          const text = typeof result === 'string' ? result : JSON.stringify(result);
+          responseContent = { result: text };
+          // Append tool result as context text for saving later
+          entry.currentTurnText += `\n[Tool: ${fc.name}]\n${text}`;
+        } catch (err: any) {
+          console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
+          responseContent = { error: err?.message ?? 'Tool execution failed' };
+        }
+        return { id: fc.id, name: fc.name!, response: responseContent } as any;
+      })
+    );
+
+    entry.session.sendToolResponse({ functionResponses: responses });
+    return;
   }
 
   // Turn complete: save transcript to DynamoDB asynchronously, then notify browser
