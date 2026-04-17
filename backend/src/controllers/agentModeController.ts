@@ -1530,9 +1530,21 @@ export async function generateSessionResponse(
     }
   );
 
-  // Add all response messages to session (includes assistant responses and tool calls)
+  // Add all response messages to session (includes assistant responses and tool calls).
+  // Strip base64 image data URIs from tool result content before persisting — they are
+  // ~300KB each and would exceed the DynamoDB 400KB item limit.
   if (response.responseMessages.length > 0) {
-    await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+    const persistableMessages = response.responseMessages.map((msg: any) => {
+      if (msg.role === 'tool' && Array.isArray(msg.content)) {
+        const strippedContent = msg.content
+          .filter((item: any) => item.type !== 'image_url')
+          .map((item: any) => item.text ?? item)
+          .join('\n') || '[screenshot captured]';
+        return { ...msg, content: strippedContent };
+      }
+      return msg;
+    });
+    await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
   }
 
   // If this session is linked to a GTM work item, update status to pending_review after AI responds

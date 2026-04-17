@@ -1000,10 +1000,39 @@ export class AgentModeService {
       } else if (msg.role === 'tool') {
         // Tool results become user messages with toolResult blocks
         role = 'user';
+        // Content may be a string or a multipart array (e.g. screenshot with image)
+        let toolResultContent: any[];
+        if (Array.isArray(msg.content)) {
+          toolResultContent = [];
+          for (const item of msg.content) {
+            if (item.type === 'text') {
+              toolResultContent.push({ text: item.text });
+            } else if (item.type === 'image_url') {
+              const url = item.image_url?.url || '';
+              if (url.startsWith('data:')) {
+                const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
+                if (dataUriMatch) {
+                  const rawFormat = dataUriMatch[1].toLowerCase();
+                  const format = (rawFormat === 'jpg' ? 'jpeg' : rawFormat) as string;
+                  const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
+                  toolResultContent.push({
+                    image: {
+                      format: VALID_BEDROCK_FORMATS.has(format) ? format : 'jpeg',
+                      source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
+                    }
+                  });
+                }
+              }
+            }
+          }
+          if (toolResultContent.length === 0) toolResultContent = [{ text: '' }];
+        } else {
+          toolResultContent = [{ text: String(msg.content || '') }];
+        }
         contentBlocks.push({
           toolResult: {
             toolUseId: msg.tool_call_id,
-            content: [{ text: String(msg.content || '') }],
+            content: toolResultContent,
           }
         });
       } else {
@@ -1873,7 +1902,8 @@ export class AgentModeService {
                   const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
                   const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
                   if (uploadResult) {
-                    processedResult = { screenshotUrl: uploadResult.url, success: true };
+                    // Keep dataUrl so the LLM can visually analyze the screenshot
+                    processedResult = { screenshotUrl: uploadResult.url, dataUrl, success: true };
                   }
                 } catch (e) {
                   console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
@@ -1898,12 +1928,16 @@ export class AgentModeService {
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
-            // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
-            // The screenshot is displayed to the user via the tool call card in the frontend.
-            // We intentionally omit the URL so the LLM doesn't embed it in markdown responses.
+            // For playwright screenshots, pass the image back to the LLM as a vision input
+            // so it can visually analyze the result (e.g. verify mobile layout, check for UI issues).
+            // The screenshot is also displayed to the user via the tool call card in the frontend.
+            // We use a text prefix to discourage embedding the raw URL in markdown responses.
             let toolContent: any;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
-              toolContent = `Screenshot captured successfully and displayed to the user.`;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl) {
+              toolContent = [
+                { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
+                { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
+              ];
             } else {
               toolContent = extractToolContent(result);
             }
