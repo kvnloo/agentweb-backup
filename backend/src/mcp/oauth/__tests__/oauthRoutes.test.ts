@@ -32,11 +32,13 @@ jest.mock('../oauthService', () => ({
 }));
 
 // Mock authenticateToken middleware — simulates logged-in user
+const mockGetUserFromToken = jest.fn();
 jest.mock('../../../middleware/auth', () => ({
   authenticateToken: (req: any, res: any, next: any) => {
     req.user = { userId: 'user-456', email: 'test@example.com', isAdmin: false };
     next();
   },
+  getUserFromToken: (...args: any[]) => mockGetUserFromToken(...args),
 }));
 
 // Mock aws-sdk to prevent real AWS calls
@@ -72,14 +74,17 @@ describe('MCP OAuth Routes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetUserFromToken.mockResolvedValue({ user: null });
     process.env.BACKEND_URL = 'https://api.agentweb.pro';
     process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
+    delete process.env.MCP_OAUTH_SKIP_CONSENT;
     app = createTestApp();
   });
 
   afterEach(() => {
     delete process.env.BACKEND_URL;
     delete process.env.CUSTOMER_FRONTEND_URL;
+    delete process.env.MCP_OAUTH_SKIP_CONSENT;
   });
 
   // ─── Well-Known Metadata ────────────────────────────────────────────────
@@ -272,6 +277,103 @@ describe('MCP OAuth Routes', () => {
         .expect(400);
 
       expect(res.body.error).toContain('code_challenge');
+    });
+
+    // These three tests lock in the fix for the consent bypass: the dev
+    // auto-approve path must never short-circuit consent unless BOTH the
+    // explicit env flag is set AND a real authenticated user is resolved.
+    // Previously NODE_ENV=development alone was enough, which fired on
+    // staging and minted anonymous "dev-user" tokens.
+    it('should redirect to consent page when MCP_OAUTH_SKIP_CONSENT is unset, even with a valid JWT', async () => {
+      mockGetClient.mockResolvedValue({
+        clientId: 'client-123',
+        clientName: 'Test Client',
+        redirectUris: ['https://example.com/callback'],
+      });
+      mockGetUserFromToken.mockResolvedValue({
+        user: { userId: 'real-user-1', email: 'u@example.com', isAdmin: false },
+      });
+
+      const res = await request(app)
+        .get('/oauth/authorize')
+        .set('Authorization', 'Bearer valid-jwt')
+        .query({
+          response_type: 'code',
+          client_id: 'client-123',
+          redirect_uri: 'https://example.com/callback',
+          scope: 'mcp:tools',
+          state: 'xyz',
+          code_challenge: 'challenge',
+          code_challenge_method: 'S256',
+        })
+        .expect(302);
+
+      expect(res.headers.location).toContain('https://app.agentweb.pro/oauth/authorize');
+      expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
+    });
+
+    it('should redirect to consent page (NOT issue a code) when skip-consent flag is set but request is unauthenticated', async () => {
+      process.env.MCP_OAUTH_SKIP_CONSENT = 'true';
+      mockGetClient.mockResolvedValue({
+        clientId: 'client-123',
+        clientName: 'Test Client',
+        redirectUris: ['https://example.com/callback'],
+      });
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+
+      const res = await request(app)
+        .get('/oauth/authorize')
+        .query({
+          response_type: 'code',
+          client_id: 'client-123',
+          redirect_uri: 'https://example.com/callback',
+          scope: 'mcp:tools',
+          state: 'xyz',
+          code_challenge: 'challenge',
+          code_challenge_method: 'S256',
+        })
+        .expect(302);
+
+      expect(res.headers.location).toContain('https://app.agentweb.pro/oauth/authorize');
+      expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
+    });
+
+    it('should auto-approve with the real userId when skip-consent flag is set AND the caller is authenticated', async () => {
+      process.env.MCP_OAUTH_SKIP_CONSENT = 'true';
+      mockGetClient.mockResolvedValue({
+        clientId: 'client-123',
+        clientName: 'Test Client',
+        redirectUris: ['https://example.com/callback'],
+      });
+      mockGetUserFromToken.mockResolvedValue({
+        user: { userId: 'real-user-42', email: 'u@example.com', isAdmin: false },
+      });
+      mockCreateAuthorizationCode.mockResolvedValue({ code: 'generated-code' });
+
+      const res = await request(app)
+        .get('/oauth/authorize')
+        .set('Authorization', 'Bearer valid-jwt')
+        .query({
+          response_type: 'code',
+          client_id: 'client-123',
+          redirect_uri: 'https://example.com/callback',
+          scope: 'mcp:tools',
+          state: 'xyz',
+          code_challenge: 'challenge',
+          code_challenge_method: 'S256',
+        })
+        .expect(302);
+
+      expect(res.headers.location).toBe(
+        'https://example.com/callback?code=generated-code&state=xyz'
+      );
+      expect(mockCreateAuthorizationCode).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'real-user-42' })
+      );
+      // Regression guard: never pass the literal "dev-user" fallback.
+      expect(mockCreateAuthorizationCode).not.toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'dev-user' })
+      );
     });
   });
 
