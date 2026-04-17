@@ -4589,4 +4589,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Previously, replies from @agentweb.pro accounts in existing threads could trigger unnecessary suggest-reply sessions',
     ],
   },
+  {
+    date: '2026-04-17',
+    changes: [
+      'Improved: Emma Now Asks for Your Approval Before Sending Slack Messages',
+      '- Emma will always show you the full draft message and ask for explicit confirmation before posting to Slack',
+      '- Previously, Emma could send messages too aggressively without waiting for your review',
+    ],
+  },
 ];
