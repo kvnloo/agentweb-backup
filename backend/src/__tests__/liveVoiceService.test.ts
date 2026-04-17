@@ -13,6 +13,7 @@
 
 const mockLiveConnect = jest.fn();
 const mockSessionSendClientContent = jest.fn();
+const mockSessionSendRealtimeInput = jest.fn();
 const mockSessionClose = jest.fn();
 
 jest.mock('@google/genai', () => ({
@@ -46,6 +47,7 @@ jest.mock('../utils/secretsManager', () => ({
 function makeMockSession() {
   return {
     sendClientContent: mockSessionSendClientContent,
+    sendRealtimeInput: mockSessionSendRealtimeInput,
     close: mockSessionClose,
   };
 }
@@ -99,7 +101,7 @@ describe('startLiveSession', () => {
     const callbacks = makeCallbacks();
     const emitFn = jest.fn();
 
-    await startLiveSession('session-1', 'socket-abc', emitFn);
+    await startLiveSession('session-1', 'socket-abc', emitFn, 'test-user-id');
 
     expect(mockLiveConnect).toHaveBeenCalledTimes(1);
     expect(mockLiveConnect).toHaveBeenCalledWith(
@@ -130,10 +132,10 @@ describe('startLiveSession', () => {
   it('starting a second session for the same sessionId replaces the old one', async () => {
     const emitFn = jest.fn();
     makeCallbacks();
-    await startLiveSession('session-dup', 'socket-1', emitFn);
+    await startLiveSession('session-dup', 'socket-1', emitFn, 'test-user-id');
 
     makeCallbacks();
-    await startLiveSession('session-dup', 'socket-2', emitFn);
+    await startLiveSession('session-dup', 'socket-2', emitFn, 'test-user-id');
 
     // close was called on the first session
     expect(mockSessionClose).toHaveBeenCalledTimes(1);
@@ -143,10 +145,10 @@ describe('startLiveSession', () => {
   it('different sessionIds maintain independent sessions', async () => {
     const emitFn = jest.fn();
     makeCallbacks();
-    await startLiveSession('session-A', 'socket-1', emitFn);
+    await startLiveSession('session-A', 'socket-1', emitFn, 'test-user-id');
 
     makeCallbacks();
-    await startLiveSession('session-B', 'socket-2', emitFn);
+    await startLiveSession('session-B', 'socket-2', emitFn, 'test-user-id');
 
     expect(hasLiveSession('session-A')).toBe(true);
     expect(hasLiveSession('session-B')).toBe(true);
@@ -159,27 +161,19 @@ describe('startLiveSession', () => {
 // ---------------------------------------------------------------------------
 
 describe('sendAudioChunk', () => {
-  it('forwards base64 audio to Gemini sendClientContent', async () => {
+  it('forwards base64 audio to Gemini sendRealtimeInput', async () => {
     const emitFn = jest.fn();
     makeCallbacks();
-    await startLiveSession('session-audio', 'socket-1', emitFn);
+    await startLiveSession('session-audio', 'socket-1', emitFn, 'test-user-id');
 
     await sendAudioChunk('session-audio', 'SGVsbG8=');
 
-    expect(mockSessionSendClientContent).toHaveBeenCalledWith(
+    expect(mockSessionSendRealtimeInput).toHaveBeenCalledWith(
       expect.objectContaining({
-        turns: expect.arrayContaining([
-          expect.objectContaining({
-            parts: expect.arrayContaining([
-              expect.objectContaining({
-                inlineData: expect.objectContaining({
-                  data: 'SGVsbG8=',
-                  mimeType: expect.stringContaining('audio'),
-                }),
-              }),
-            ]),
-          }),
-        ]),
+        audio: expect.objectContaining({
+          data: 'SGVsbG8=',
+          mimeType: expect.stringContaining('audio'),
+        }),
       })
     );
   });
@@ -197,7 +191,7 @@ describe('sendTextTurn', () => {
   it('forwards text input to Gemini sendClientContent', async () => {
     const emitFn = jest.fn();
     makeCallbacks();
-    await startLiveSession('session-text', 'socket-1', emitFn);
+    await startLiveSession('session-text', 'socket-1', emitFn, 'test-user-id');
 
     await sendTextTurn('session-text', 'What is my ad spend this month?');
 
@@ -227,7 +221,7 @@ describe('incoming audio relay', () => {
   it('emits live:audio event when Gemini returns inline audio data', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-relay', 'socket-1', emitFn);
+    await startLiveSession('session-relay', 'socket-1', emitFn, 'test-user-id');
 
     // Simulate Gemini sending back audio
     callbacks['onmessage']?.({
@@ -252,10 +246,10 @@ describe('incoming audio relay', () => {
     });
   });
 
-  it('emits live:transcript when Gemini returns text', async () => {
+  it('emits live:transcript when Gemini returns inline text', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-transcript', 'socket-1', emitFn);
+    await startLiveSession('session-transcript', 'socket-1', emitFn, 'test-user-id');
 
     callbacks['onmessage']?.({
       serverContent: {
@@ -270,6 +264,23 @@ describe('incoming audio relay', () => {
       text: 'Your ad spend is $1,200 this month.',
     });
   });
+
+  it('emits live:transcript when Gemini returns outputTranscription (audio-only mode)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-audiotranscript', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      serverContent: {
+        outputTranscription: { text: 'Your campaigns are performing well.' },
+      },
+    });
+
+    expect(emitFn).toHaveBeenCalledWith('live:transcript', {
+      sessionId: 'session-audiotranscript',
+      text: 'Your campaigns are performing well.',
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -277,10 +288,10 @@ describe('incoming audio relay', () => {
 // ---------------------------------------------------------------------------
 
 describe('turnComplete handling', () => {
-  it('saves user and assistant messages to DynamoDB on turnComplete', async () => {
+  it('saves user and assistant messages to DynamoDB on turnComplete (inline text mode)', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-save', 'socket-1', emitFn);
+    await startLiveSession('session-save', 'socket-1', emitFn, 'test-user-id');
     mockAddMessagesToSession.mockResolvedValue({});
 
     // Simulate a full turn: user input was tracked, Gemini responds with text, then turnComplete
@@ -307,10 +318,71 @@ describe('turnComplete handling', () => {
     );
   });
 
+  it('saves transcript from outputTranscription field (audio-only mode)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-save-audio', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    // Simulate audio-only turn: transcript comes via outputTranscription, not part.text
+    callbacks['onmessage']?.({
+      serverContent: {
+        outputTranscription: { text: 'Your CTR is 3.2% this week.' },
+      },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { turnComplete: true },
+    });
+
+    // Allow async save to run
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockAddMessagesToSession).toHaveBeenCalledWith(
+      'session-save-audio',
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'assistant', content: expect.stringContaining('Your CTR is 3.2% this week.') }),
+      ])
+    );
+  });
+
+  it('saves user speech transcript from inputTranscription field', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-save-user', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    // Simulate: user speech transcribed by Gemini, then assistant responds
+    callbacks['onmessage']?.({
+      serverContent: {
+        inputTranscription: { text: 'How is my ad spend?' },
+      },
+    });
+    callbacks['onmessage']?.({
+      serverContent: {
+        outputTranscription: { text: 'Your ad spend is $500 this week.' },
+      },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { turnComplete: true },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockAddMessagesToSession).toHaveBeenCalledWith(
+      'session-save-user',
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'user', content: expect.stringContaining('How is my ad spend?') }),
+        expect.objectContaining({ role: 'assistant', content: expect.stringContaining('Your ad spend is $500 this week.') }),
+      ])
+    );
+  });
+
   it('emits live:turn-complete event after turn finishes', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-complete', 'socket-1', emitFn);
+    await startLiveSession('session-complete', 'socket-1', emitFn, 'test-user-id');
     mockAddMessagesToSession.mockResolvedValue({});
 
     callbacks['onmessage']?.({
@@ -334,7 +406,7 @@ describe('turnComplete handling', () => {
     // The save is fire-and-forget; audio events should fire before save completes
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-nonblock', 'socket-1', emitFn);
+    await startLiveSession('session-nonblock', 'socket-1', emitFn, 'test-user-id');
 
     let saveResolve: () => void;
     mockAddMessagesToSession.mockReturnValue(
@@ -366,7 +438,7 @@ describe('closeLiveSession', () => {
   it('closes the Gemini session and removes it from active map', async () => {
     const emitFn = jest.fn();
     makeCallbacks();
-    await startLiveSession('session-close', 'socket-1', emitFn);
+    await startLiveSession('session-close', 'socket-1', emitFn, 'test-user-id');
 
     expect(hasLiveSession('session-close')).toBe(true);
 
@@ -389,7 +461,7 @@ describe('error handling', () => {
   it('emits live:error when Gemini fires onerror', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-err', 'socket-1', emitFn);
+    await startLiveSession('session-err', 'socket-1', emitFn, 'test-user-id');
 
     callbacks['onerror']?.({ message: 'Connection lost' });
 
@@ -402,7 +474,7 @@ describe('error handling', () => {
   it('cleans up session when Gemini closes unexpectedly', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
-    await startLiveSession('session-drop', 'socket-1', emitFn);
+    await startLiveSession('session-drop', 'socket-1', emitFn, 'test-user-id');
 
     callbacks['onclose']?.({ reason: 'server closed' });
 
