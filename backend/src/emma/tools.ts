@@ -3754,7 +3754,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA).',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3847,6 +3847,79 @@ emmaToolRegistry.register({
       args.composeParams,
       args.durationSeconds,
       args.useKeyframes
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'compose_video',
+  definition: {
+    name: 'compose_video',
+    description: 'Stitch pre-existing video clips together and add brand overlays using Remotion. Use this when you have already generated individual clips and need to combine them into a single branded video. For new multi-clip videos, prefer a single generate_video call with durationSeconds instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        clip_urls: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Ordered list of S3/HTTPS URLs of the pre-generated video clips to stitch together (first to last)'
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename for the composed video (e.g. "final_branded_video.mp4")'
+        },
+        clip_duration_seconds: {
+          type: 'number',
+          description: 'Duration of each individual clip in seconds (all clips must have the same duration). Defaults to 8.'
+        },
+        brand_name: {
+          type: 'string',
+          description: 'Brand display name shown as the headline overlay'
+        },
+        tagline: {
+          type: 'string',
+          description: 'Optional tagline or subtitle shown under the brand name'
+        },
+        primary_color: {
+          type: 'string',
+          description: 'Primary hex color for the gradient bar and background tint (e.g. "#1a73e8")'
+        },
+        secondary_color: {
+          type: 'string',
+          description: 'Secondary hex color for accent elements (e.g. "#fbbc04")'
+        },
+        logo_url: {
+          type: 'string',
+          description: 'Optional URL of the brand logo image'
+        },
+        cta_text: {
+          type: 'string',
+          description: 'Optional call-to-action text for the outro card'
+        },
+        cta_url: {
+          type: 'string',
+          description: 'Optional website URL shown alongside the CTA text'
+        }
+      },
+      required: ['clip_urls', 'filename', 'brand_name', 'primary_color', 'secondary_color']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.composeVideo(
+      args.clip_urls,
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      {
+        brandName: args.brand_name,
+        tagline: args.tagline,
+        primaryColor: args.primary_color,
+        secondaryColor: args.secondary_color,
+        logoUrl: args.logo_url,
+        ctaText: args.cta_text,
+        ctaUrl: args.cta_url,
+      },
+      args.clip_duration_seconds
     );
   }
 });
