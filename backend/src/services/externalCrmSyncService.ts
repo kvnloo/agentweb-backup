@@ -323,15 +323,29 @@ export class ExternalCrmSyncService {
     return this.resolveAuth(config);
   }
 
-  async testConnection(userId: string, listId: string, provider: string): Promise<{ valid: boolean; error?: string }> {
-    const config = await this.getConfig(userId, listId, provider);
-    if (!config) return { valid: false, error: 'No sync configuration found' };
-    if (!config.accountId && !config.apiKeyEncrypted) {
-      return { valid: false, error: 'No authentication configured' };
+  async testConnection(
+    userId: string,
+    listId: string,
+    provider: string,
+    inline?: { apiKey?: string; accountId?: string }
+  ): Promise<{ valid: boolean; error?: string }> {
+    let auth: CrmAuth | null = null;
+
+    // Use inline credentials if provided (e.g. user testing before first save or after delete)
+    if (inline?.apiKey) {
+      auth = { type: 'token', apiKey: inline.apiKey };
+    } else if (inline?.accountId) {
+      auth = { type: 'oauth', userId, accountId: inline.accountId };
+    } else {
+      const config = await this.getConfig(userId, listId, provider);
+      if (!config) return { valid: false, error: 'No sync configuration found' };
+      if (!config.accountId && !config.apiKeyEncrypted) {
+        return { valid: false, error: 'No authentication configured' };
+      }
+      auth = this.resolveAuth(config);
     }
 
     try {
-      const auth = this.resolveAuth(config);
       const adapter = getAdapter(provider);
       return adapter.testConnection(auth);
     } catch (err: any) {

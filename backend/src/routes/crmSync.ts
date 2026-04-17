@@ -248,7 +248,8 @@ router.post('/test/:listId/:provider', async (req: any, res) => {
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     console.log(`[CrmSync] Testing connection for list ${listId} provider ${provider}...`);
-    const result = await externalCrmSyncService.testConnection(userId, listId, provider);
+    const { apiKey, accountId } = req.body ?? {};
+    const result = await externalCrmSyncService.testConnection(userId, listId, provider, { apiKey, accountId });
     console.log(`[CrmSync] Test result:`, JSON.stringify(result));
     res.json(result);
   } catch (err: any) {
