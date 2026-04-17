@@ -2,6 +2,7 @@ import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb, userDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
+import { chatbotDb } from '../services/chatbotService';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -5595,6 +5596,51 @@ emmaToolRegistry.register({
       displayName: user.displayName || null,
       companyName: user.companyName || null,
       subscriptionType: user.subscriptionType || null,
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'search_user_assets',
+  definition: {
+    name: 'search_user_assets',
+    description: "Search for assets (images, videos, HTML reports) that were generated in the user's Agent Mode sessions. Returns matching assets with their URLs, filenames, creation dates, asset type, and the session they came from (sessionId + title). Use this when the user asks to find images, videos, reports, or files they've created.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: {
+          type: 'string',
+          enum: ['images', 'videos', 'htmlReports', 'all'],
+          description: "Filter by asset type. Use 'all' or omit to return every type."
+        },
+        query: {
+          type: 'string',
+          description: 'Optional keyword to filter by filename (case-insensitive partial match).'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const assets = await chatbotDb.searchUserAssets(userId, args.type, args.query);
+
+    if (assets.length === 0) {
+      return { message: 'No assets found matching your criteria.', assets: [] };
+    }
+
+    return {
+      count: assets.length,
+      assets: assets.map(a => ({
+        url: a.url,
+        filename: a.filename,
+        assetType: a.assetType,
+        generatedAt: a.generatedAt,
+        sessionId: a.sessionId,
+        sessionTitle: a.sessionTitle,
+      })),
     };
   }
 });
