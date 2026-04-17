@@ -399,6 +399,7 @@ describe('turnComplete handling', () => {
     expect(emitFn).toHaveBeenCalledWith('live:turn-complete', {
       sessionId: 'session-complete',
       assistantText: 'Done.',
+      userText: '',
     });
   });
 

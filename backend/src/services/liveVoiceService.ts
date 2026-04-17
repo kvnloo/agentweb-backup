@@ -266,6 +266,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   // (requires outputAudioTranscription: {} in session config)
   const outputTranscript = message.serverContent?.outputTranscription;
   if (outputTranscript?.text) {
+    console.log(`[liveVoiceService] outputTranscription for ${sessionId}: "${outputTranscript.text}"`);
     entry.currentTurnText += outputTranscript.text;
     emitFn('live:transcript', { sessionId, text: outputTranscript.text });
   }
@@ -274,7 +275,10 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   // (requires inputAudioTranscription: {} in session config)
   const inputTranscript = message.serverContent?.inputTranscription;
   if (inputTranscript?.text) {
+    console.log(`[liveVoiceService] inputTranscription for ${sessionId}: "${inputTranscript.text}"`);
     entry.pendingUserText += inputTranscript.text;
+    // Forward to browser so user's words appear in real-time as they speak
+    emitFn('live:user-transcript', { sessionId, text: inputTranscript.text });
   }
 
   // Tool call: execute the requested tool(s) and send results back to Gemini
@@ -316,12 +320,14 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     const assistantText = entry.currentTurnText.trim();
     const userText = entry.pendingUserText.trim();
 
+    console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
+
     // Reset for next turn before async work
     entry.currentTurnText = '';
     entry.pendingUserText = '';
 
     // Emit turn-complete immediately so browser can update UI
-    emitFn('live:turn-complete', { sessionId, assistantText });
+    emitFn('live:turn-complete', { sessionId, assistantText, userText });
 
     // Fire-and-forget save — never blocks the audio stream
     if (assistantText) {
