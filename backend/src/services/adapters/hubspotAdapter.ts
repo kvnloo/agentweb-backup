@@ -96,7 +96,6 @@ export class HubspotAdapter implements CrmAdapter {
                 if (Object.keys(allContactProps).length === 0) continue;
 
                 // Upsert contact — service handles find-or-create
-                const existingContactId = lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
                 const { contactId, isNew } = await svc.upsertContact({
                     email: lead.email,
                     ...this.propsToContactData(allContactProps),

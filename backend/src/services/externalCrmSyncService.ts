@@ -119,16 +119,11 @@ export const DEFAULT_ATTIO_CONTACT_MAPPING: FieldMapping[] = [
   // It is synced as a list-entry attribute via DEFAULT_ATTIO_CUSTOM_MAPPING below.
 ];
 
-// Attio has no separate deal entity in this integration. Deal/status fields live
-// on the list entry alongside any other custom mappings.
+export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
+
 export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
-  { agentwebField: 'dealValue', crmProperty: 'deal_value', direction: 'both', enabled: true },
-  { agentwebField: 'dealCurrency', crmProperty: 'deal_currency', direction: 'both', enabled: true },
-  { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: false },
 ];
-
-export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -227,10 +222,8 @@ export class ExternalCrmSyncService {
       autoSyncEnabled: updates.autoSyncEnabled ?? existing?.autoSyncEnabled ?? false,
       contactFieldMapping: updates.contactFieldMapping ?? existing?.contactFieldMapping
         ?? (isHubspot ? DEFAULT_HUBSPOT_CONTACT_MAPPING : DEFAULT_ATTIO_CONTACT_MAPPING),
-      dealFieldMapping: !isHubspot ? [] : nextDealFieldMapping,
-      customFieldMapping: !isHubspot
-        ? this.mergeAttioEntryMappings(nextCustomFieldMapping, nextDealFieldMapping)
-        : nextCustomFieldMapping,
+      dealFieldMapping: nextDealFieldMapping,
+      customFieldMapping: nextCustomFieldMapping,
       deleteOnPush: updates.deleteOnPush ?? existing?.deleteOnPush ?? false,
       deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
       webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
@@ -285,12 +278,12 @@ export class ExternalCrmSyncService {
       return {
         contactFieldMapping: DEFAULT_HUBSPOT_CONTACT_MAPPING,
         dealFieldMapping: DEFAULT_HUBSPOT_DEAL_MAPPING,
-        customFieldMapping: [], // Match frontend's current behavior for HubSpot
+        customFieldMapping: DEFAULT_HUBSPOT_CUSTOM_MAPPING,
       };
     } else {
       return {
         contactFieldMapping: DEFAULT_ATTIO_CONTACT_MAPPING,
-        dealFieldMapping: [],
+        dealFieldMapping: DEFAULT_ATTIO_DEAL_MAPPING,
         customFieldMapping: DEFAULT_ATTIO_CUSTOM_MAPPING,
       };
     }
@@ -356,7 +349,7 @@ export class ExternalCrmSyncService {
     provider: string,
     options?: { accountId?: string; apiKey?: string }
   ): Promise<Array<{ id: string; name: string }>> {
-    if (provider !== 'hubspot') return [];
+    if (provider !== 'hubspot' && provider !== 'attio') return [];
 
     let auth: CrmAuth;
 
@@ -375,9 +368,16 @@ export class ExternalCrmSyncService {
       auth = this.resolveAuth(config);
     }
 
-    const svc = await this.getHubSpotService(auth);
-    const pipelines = await svc.listDealPipelines();
-    return pipelines.map(p => ({ id: p.id, name: p.label }));
+    if (provider === 'hubspot') {
+      const svc = await this.getHubSpotService(auth);
+      const pipelines = await svc.listDealPipelines();
+      return pipelines.map(p => ({ id: p.id, name: p.label }));
+    } else {
+      const svc = auth.type === 'token'
+        ? AttioService.fromToken(auth.apiKey!)
+        : await AttioService.create(auth.userId!, auth.accountId!);
+      return svc.getAllLists();
+    }
   }
 
   // ─── External property discovery ─────────────────────────────────────────────
@@ -429,17 +429,31 @@ export class ExternalCrmSyncService {
       return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
     }
 
-    // Attio: return People object attributes only (contacts sync directly, no list)
+    // Attio: contacts use People attributes, while deal mappings use Deals attributes.
     const svc = auth.type === 'token'
       ? AttioService.fromToken(auth.apiKey!)
       : await AttioService.create(auth.userId!, auth.accountId!);
 
+
+
+    // Attio: merge People object attributes + list-entry attributes
+
     const peopleAttrs = await svc.getAllPeopleAttributes();
-    const properties: CrmProperty[] = peopleAttrs.map(a => ({
-      name: a.api_slug,
-      label: a.title,
-      type: a.type,
-    }));
+    const properties: CrmProperty[] = [];
+
+    for (const a of peopleAttrs) {
+      if (a.type === 'personal-name') {
+        // Expand the composite name attribute into selectable first_name / last_name sub-fields.
+        // The adapter's buildPersonValues already handles these slugs specially, so they map
+        // correctly to values.name[0].first_name / values.name[0].last_name on write.
+        properties.push({ name: 'first_name', label: 'First Name', type: 'text' });
+        properties.push({ name: 'last_name', label: 'Last Name', type: 'text' });
+        // Also keep the composite 'name' for full-name string mappings
+        properties.push({ name: a.api_slug, label: a.title, type: a.type });
+      } else {
+        properties.push({ name: a.api_slug, label: a.title, type: a.type });
+      }
+    }
 
     return { properties };
   }

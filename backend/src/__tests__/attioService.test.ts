@@ -94,10 +94,11 @@ describe('AttioService', () => {
     it('returns service instance with token from account config', async () => {
       const svc = await AttioService.create('user-1');
       // Verify the resolved token is used in API calls
-      mockAxiosGet.mockResolvedValue({ data: { data: [] } });
-      await svc.listWebhooks();
-      expect(mockAxiosGet).toHaveBeenCalledWith(
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
+      await svc.listPeople();
+      expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),
+        expect.any(Object),
         expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer test-token' }) })
       );
     });
@@ -279,76 +280,6 @@ describe('AttioService', () => {
         expect.any(Object)
       );
       expect(company.name).toBe('Acme Corp');
-    });
-  });
-
-  // ─── Webhooks ────────────────────────────────────────────────────
-
-  describe('registerWebhook', () => {
-    it('posts to /v2/webhooks with correct subscriptions and stores webhook_id', async () => {
-      // registerWebhook needs userId/accountId — use create() factory
-      const oauthService = await AttioService.create('user-1');
-      mockAxiosPost.mockResolvedValue({ data: { data: { id: { webhook_id: 'wh-abc' }, target_url: 'https://api.agentweb.pro/api/webhooks/attio', subscriptions: ['record.created', 'record.updated', 'record.deleted'] } } });
-
-      const result = await oauthService.registerWebhook();
-
-      expect(mockAxiosPost).toHaveBeenCalledWith(
-        'https://api.attio.com/v2/webhooks',
-        expect.objectContaining({
-          data: expect.objectContaining({
-            target_url: 'https://api.agentweb.pro/api/webhooks/attio',
-            subscriptions: ['record.created', 'record.updated', 'record.deleted'],
-          }),
-        }),
-        expect.any(Object)
-      );
-      expect(mockUpdateAccountConfig).toHaveBeenCalledWith('user-1', 'attio', 'ws-123', { webhook_id: 'wh-abc' });
-      expect(result.webhookId).toBe('wh-abc');
-    });
-
-    it('throws if called on a fromToken instance (no OAuth context)', async () => {
-      await expect(service.registerWebhook()).rejects.toThrow('requires an OAuth instance');
-    });
-
-    it('throws if account not found during create()', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([]);
-      await expect(AttioService.create('user-1')).rejects.toThrow('Attio account not connected');
-    });
-  });
-
-  describe('deleteWebhook', () => {
-    it('calls delete on correct webhook endpoint', async () => {
-      mockAxiosDelete.mockResolvedValue({ data: {} });
-
-      await service.deleteWebhook('wh-abc');
-
-      expect(mockAxiosDelete).toHaveBeenCalledWith(
-        'https://api.attio.com/v2/webhooks/wh-abc',
-        expect.any(Object)
-      );
-    });
-  });
-
-  describe('listWebhooks', () => {
-    it('returns mapped webhooks array', async () => {
-      mockAxiosGet.mockResolvedValue({
-        data: {
-          data: [
-            { id: { webhook_id: 'wh-1' }, target_url: 'https://api.agentweb.pro/api/webhooks/attio', subscriptions: ['record.created'] },
-          ],
-        },
-      });
-
-      const webhooks = await service.listWebhooks();
-
-      expect(webhooks).toHaveLength(1);
-      expect(webhooks[0]).toMatchObject({ webhookId: 'wh-1', targetUrl: 'https://api.agentweb.pro/api/webhooks/attio' });
-    });
-
-    it('returns empty array when no webhooks', async () => {
-      mockAxiosGet.mockResolvedValue({ data: { data: [] } });
-      const webhooks = await service.listWebhooks();
-      expect(webhooks).toHaveLength(0);
     });
   });
 

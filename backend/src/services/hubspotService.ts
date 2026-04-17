@@ -36,6 +36,7 @@ const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 // belongs to by matching against connected accounts with hub_id === portalId.
 // ─────────────────────────────────────────────────────────────────────────────
 
+
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
 export interface HubSpotContact {

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { getAccountsByUserId, getAccountById, updateAccountConfig } from './connectedAccountsDb';
+import { getAccountsByUserId, getAccountById } from './connectedAccountsDb';
 
 // Module-level axios instance with a 15-second timeout for all Attio API calls.
 // Falls back to the base axios object when axios.create returns falsy (e.g., in jest auto-mock).
@@ -7,31 +7,6 @@ const _created = axios.create?.({ timeout: 15000 });
 const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
 const ATTIO_API_BASE = 'https://api.attio.com/v2';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ATTIO WEBHOOK EVENTS
-//
-// Webhooks are registered PER USER via POST /v2/webhooks using their access
-// token. Call registerWebhook() when a user connects Attio. The returned
-// webhook_id is stored in their account config so it can be deleted on disconnect.
-//
-// Events we subscribe to:
-//
-//   record.created  — a new People or Companies record was created in Attio
-//                     → pull into our lead list (create lead if email not found)
-//
-//   record.updated  — a field changed on a People or Companies record
-//                     (e.g. email, phone, job_title, company link)
-//                     → find matching lead by email and update fields
-//
-//   record.deleted  — a People or Companies record was permanently deleted
-//                     → mark lead as removed / flag for review
-//
-// Events we intentionally skip:
-//   attribute.created   — workspace schema change, not contact data
-//   list.entry.created  — list membership change, not contact data
-//   comment.created     — user comments, not relevant for sync
-// ─────────────────────────────────────────────────────────────────────────────
 
 export interface AttioPerson {
   recordId: string;
@@ -48,12 +23,6 @@ export interface AttioCompany {
   recordId: string;
   name: string;
   domainNames?: string[];
-}
-
-export interface AttioWebhook {
-  webhookId: string;
-  targetUrl: string;
-  subscriptions: string[];
 }
 
 // ─── Module-level account resolver ───────────────────────────────────────────
@@ -213,6 +182,7 @@ export class AttioService {
       const nameEntry: any = {};
       if (firstName) nameEntry.first_name = firstName;
       if (lastName) nameEntry.last_name = lastName;
+      nameEntry.full_name = [firstName, lastName].filter(Boolean).join(' ');
       values.name = [nameEntry];
     }
     values.email_addresses = [{ email_address: data.email.toLowerCase() }];
@@ -247,6 +217,7 @@ export class AttioService {
       const nameEntry: any = {};
       if (firstName) nameEntry.first_name = firstName;
       if (lastName) nameEntry.last_name = lastName;
+      nameEntry.full_name = [firstName, lastName].filter(Boolean).join(' ');
       values.name = [nameEntry];
     }
     if (data.email) {
@@ -286,6 +257,7 @@ export class AttioService {
       const nameEntry: any = {};
       if (firstName) nameEntry.first_name = firstName;
       if (lastName) nameEntry.last_name = lastName;
+      nameEntry.full_name = [firstName, lastName].filter(Boolean).join(' ');
       values.name = [nameEntry];
     }
     if (data.email != null && data.email !== '') {
@@ -510,6 +482,36 @@ export class AttioService {
     return (res.data as any)?.data?.api_slug ?? slug;
   }
 
+  async ensurePersonAttribute(
+    key: string,
+    title: string,
+    type: string = 'text'
+  ): Promise<string> {
+    const slug = this.toSlug(key);
+    const existing = await this.getAllPeopleAttributes();
+
+    const found = existing.find(a => this.toSlug(a.api_slug) === slug);
+    if (found) return found.api_slug;
+
+    const res = await axios.post(
+      `${this.baseUrl}/objects/people/attributes`,
+      {
+        data: {
+          title,
+          description: null,
+          api_slug: slug,
+          type,
+          is_required: false,
+          is_unique: false,
+          is_multiselect: false,
+          config: {},
+        },
+      },
+      { headers: this.headers() }
+    );
+    return (res.data as any)?.data?.api_slug ?? slug;
+  }
+
   async findListEntry(
     listId: string,
     personRecordId: string
@@ -552,44 +554,6 @@ export class AttioService {
     );
   }
 
-  // ─── Webhooks ─────────────────────────────────────────────────────────────
-
-  async registerWebhook(): Promise<AttioWebhook> {
-    if (!this._userId || !this._accountId) {
-      throw new Error('registerWebhook requires an OAuth instance. Use AttioService.create(userId).');
-    }
-    const targetUrl = `${process.env.BACKEND_URL}/api/webhooks/attio`;
-    const subscriptions = ['record.created', 'record.updated', 'record.deleted'];
-
-    const res = await axiosInstance.post(
-      `${this.baseUrl}/webhooks`,
-      { data: { target_url: targetUrl, subscriptions } },
-      { headers: this.headers() }
-    );
-
-    const webhookId = (res.data as any)?.data?.id?.webhook_id ?? (res.data as any)?.data?.id;
-
-    await updateAccountConfig(this._userId, 'attio', this._accountId, { webhook_id: webhookId });
-
-    return { webhookId, targetUrl, subscriptions };
-  }
-
-  async deleteWebhook(webhookId: string): Promise<void> {
-    await axiosInstance.delete(
-      `${this.baseUrl}/webhooks/${webhookId}`,
-      { headers: this.headers() }
-    );
-  }
-
-  async listWebhooks(): Promise<AttioWebhook[]> {
-    const res = await axiosInstance.get(`${this.baseUrl}/webhooks`, { headers: this.headers() });
-
-    return ((res.data as any)?.data ?? []).map((w: any) => ({
-      webhookId: w.id?.webhook_id ?? w.id,
-      targetUrl: w.target_url,
-      subscriptions: w.subscriptions ?? [],
-    }));
-  }
 
   // ─── Sync helpers (used by AttioAdapter) ──────────────────────────────────
 
@@ -649,20 +613,143 @@ export class AttioService {
   }
 
   async updatePersonByValues(recordId: string, values: Record<string, any>): Promise<void> {
-    await axiosInstance.patch(
-      `${this.baseUrl}/objects/people/records/${recordId}`,
+    await this.updateRecord('people', recordId, values);
+  }
+
+  async getPersonValues(recordId: string): Promise<Record<string, any>> {
+    return this.getRecordValues('people', recordId);
+  }
+
+
+
+  // ─── Generic Records ──────────────────────────────────────────────────────
+
+  async createRecord(objectSlug: string, values: Record<string, any>): Promise<string> {
+    const res = await axios.post(
+      `${this.baseUrl}/objects/${objectSlug}/records`,
+      { data: { values } },
+      { headers: this.headers() }
+    );
+    return (res.data as any).data?.id?.record_id;
+  }
+
+  async updateRecord(objectSlug: string, recordId: string, values: Record<string, any>): Promise<void> {
+    await axios.patch(
+      `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { data: { values } },
       { headers: this.headers() }
     );
   }
 
-  async getPersonValues(recordId: string): Promise<Record<string, any>> {
-    const res = await axiosInstance.get(
-      `${this.baseUrl}/objects/people/records/${recordId}`,
+  async getRecordValues(objectSlug: string, recordId: string): Promise<Record<string, any>> {
+    const res = await axios.get(
+      `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { headers: this.headers() }
     );
     return (res.data as any).data?.values ?? {};
   }
+
+  async deleteRecord(objectSlug: string, recordId: string): Promise<void> {
+    await axios.delete(
+      `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
+      { headers: this.headers() }
+    );
+  }
+
+  async queryRecords(
+    objectSlug: string,
+    filter: Record<string, any>,
+    limit: number = 50
+  ): Promise<any[]> {
+    const res = await axios.post(
+      `${this.baseUrl}/objects/${objectSlug}/records/query`,
+      { filter, limit },
+      { headers: this.headers() }
+    );
+    return (res.data as any).data ?? [];
+  }
+
+
+
+  async getAllObjectAttributes(objectSlug: string): Promise<Array<{ api_slug: string; title: string; type: string; is_system_attribute: boolean; attribute_id: string }>> {
+    const res = await axios.get(
+      `${this.baseUrl}/objects/${objectSlug}/attributes`,
+      { headers: this.headers() }
+    );
+    return ((res.data as any)?.data ?? []).map((a: any) => ({
+      api_slug: a.api_slug as string,
+      title: a.title as string,
+      type: a.type as string,
+      is_system_attribute: !!a.is_system_attribute,
+      attribute_id: a.id?.attribute_id as string,
+    }));
+  }
+
+  async ensureObjectAttribute(
+    objectSlug: string,
+    key: string,
+    title: string,
+    type: string = 'text'
+  ): Promise<string> {
+    const slug = this.toSlug(key);
+    const existing = await this.getAllObjectAttributes(objectSlug);
+
+    const found = existing.find(a => this.toSlug(a.api_slug) === slug);
+    if (found) return found.api_slug;
+
+    const res = await axios.post(
+      `${this.baseUrl}/objects/${objectSlug}/attributes`,
+      {
+        data: {
+          title,
+          description: null,
+          api_slug: slug,
+          type,
+          is_required: false,
+          is_unique: false,
+          is_multiselect: false,
+          config: {},
+        },
+      },
+      { headers: this.headers() }
+    );
+    return (res.data as any)?.data?.api_slug ?? slug;
+  }
+
+  // ─── Attribute Statuses ───────────────────────────────────────────────────
+
+  async listAttributeStatuses(objectSlug: string, attributeSlug: string): Promise<Array<{ id: string; title: string }>> {
+    const res = await axios.get(
+      `${this.baseUrl}/objects/${objectSlug}/attributes/${attributeSlug}/statuses`,
+      { headers: this.headers() }
+    );
+    return ((res.data as any)?.data ?? []).map((s: any) => ({
+      id: s.id?.status_id ?? s.id,
+      title: s.title as string,
+    }));
+  }
+
+  async ensureStatusOption(objectSlug: string, attributeSlug: string, title: string): Promise<string> {
+    const existing = await this.listAttributeStatuses(objectSlug, attributeSlug);
+    const titleLower = title.trim().toLowerCase();
+    const found = existing.find(s => s.title.toLowerCase() === titleLower);
+    if (found) return found.title;
+
+    // Create the status if it doesn't exist
+    const res = await axios.post(
+      `${this.baseUrl}/objects/${objectSlug}/attributes/${attributeSlug}/statuses`,
+      {
+        data: {
+          title: title.trim(),
+          celebration_enabled: false,
+        },
+      },
+      { headers: this.headers() }
+    );
+    return (res.data as any)?.data?.title ?? title.trim();
+  }
+
+  // ─── List entries ─────────────────────────────────────────────────────────
 
   async listListEntries(
     listId: string,

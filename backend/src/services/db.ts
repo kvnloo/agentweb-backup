@@ -3666,6 +3666,7 @@ export const crmDb = {
     contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
     contactStatusUpdatedBy?: string;
+    syncMetadata?: Record<string, any>;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3723,6 +3724,9 @@ export const crmDb = {
         }
         item.contactStatusUpdatedAt = new Date().toISOString();
         item.contactStatusUpdatedBy = leadData.contactStatusUpdatedBy || 'system';
+      }
+      if (leadData.syncMetadata && Object.keys(leadData.syncMetadata).length > 0) {
+        item.syncMetadata = leadData.syncMetadata;
       }
 
       const params = {
@@ -3928,6 +3932,25 @@ export const crmDb = {
       return result.Items && result.Items.length > 0 ? result.Items[0] : null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByEmail");
+      throw error;
+    }
+  },
+
+  async getLeadByHubSpotContactId(listId: string, contactId: string) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        KeyConditionExpression: 'listId = :listId',
+        FilterExpression: 'syncMetadata.hubspot_contact_id = :contactId',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':contactId': contactId,
+        },
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items?.[0] ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByHubSpotContactId");
       throw error;
     }
   },
