@@ -4564,4 +4564,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Previously, the first page showed the oldest records from when the list was first created',
     ],
   },
+  {
+    date: '2026-04-17',
+    changes: [
+      'Fixed: Deleted Accounts No Longer Appear as Active Users',
+      '- Accounts that have been soft-deleted (e.g. after an email change) are now correctly hidden from admin user lists, CRM sync, and all login flows',
+      '- Previously, tombstoned records could appear as normal accounts in the admin dashboard and block re-registration on old email addresses',
+    ],
+  },
 ];

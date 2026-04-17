@@ -502,7 +502,9 @@ class UserDB {
     };
 
     const result = await this.docClient.query(params).promise();
-    return result.Items?.[0];
+    const item = result.Items?.[0];
+    if (item?.userId?.startsWith("deleted_")) return undefined;
+    return item;
   }
 
   async getUserById(userId: string) {
@@ -517,7 +519,9 @@ class UserDB {
       };
 
       const result = await this.docClient.query(params).promise();
-      return result.Items?.[0];
+      const item = result.Items?.[0];
+      if (item?.userId?.startsWith("deleted_")) return undefined;
+      return item;
     } catch (error) {
       console.error("Error in getUserById:", error);
       throw error;
@@ -582,7 +586,9 @@ class UserDB {
       };
 
       const result = await this.docClient.scan(params).promise();
-      const users = result.Items || [];
+      const users = (result.Items || []).filter(
+        (u) => !u.userId?.startsWith("deleted_")
+      );
 
       // Get task and workflow counts for each user
       const usersWithCounts = await Promise.all(

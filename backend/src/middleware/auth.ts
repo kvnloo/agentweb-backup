@@ -90,6 +90,10 @@ export async function getUserFromToken(req: Request): Promise<{
       };
     } else {
       // Normal token - get the user data
+      if (decoded.userId?.startsWith("deleted_")) {
+        return { user: null };
+      }
+
       const user = await userDb.getUserById(decoded.userId);
 
       if (!user) {
