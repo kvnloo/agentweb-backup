@@ -15,11 +15,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma (Agent Mode) now receives the actual screenshot image as a vision input when she calls browser_take_screenshot, rather than a plain text confirmation string',
       '- This means Emma can see whether a mobile layout, design change, or UI fix actually looks correct — she no longer declares tasks done without seeing the result',
       '- Emma also follows a structured mobile verification workflow: resizing the browser to 390px width, describing what she sees in the screenshot, and using browser_evaluate to check CSS properties before reporting completion',
-    ],
-  },
-  {
-    date: '2026-04-17',
-    changes: [
+      'Fix: Data Analysis No Longer Hangs Indefinitely in Agent Mode',
+      '- Added a 20-minute timeout to the Gemini code-execution API call inside perform_data_analysis, preventing it from stalling forever and triggering the 45-minute worker timeout',
       'New: AI-Powered Video Generation with Remotion Brand Overlays',
       '- Emma can now generate branded marketing videos with animated overlays: sliding brand name/tagline headline at the start, optional CTA card at the end',
       '- Supports custom brand colors, logo, and call-to-action text via the generate_video tool (use compose:true with composeParams)',
