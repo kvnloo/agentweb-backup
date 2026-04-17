@@ -12,6 +12,24 @@ import metaAuthRouter from '../routes/metaAuth';
 jest.mock('../services/metaService');
 jest.mock('../services/instagramService');
 jest.mock('../services/connectedAccountsDb');
+
+// In-memory mock for oauthSessionDb so tests don't hit DynamoDB
+const mockSessionStore = new Map<string, any>();
+jest.mock('../services/db', () => ({
+    oauthSessionDb: {
+        save: jest.fn().mockImplementation(async (session: any) => {
+            mockSessionStore.set(session.sessionId, session);
+        }),
+        get: jest.fn().mockImplementation(async (sessionId: string, userId: string) => {
+            const s = mockSessionStore.get(sessionId);
+            if (!s || s.userId !== userId) return null;
+            return s;
+        }),
+        delete: jest.fn().mockImplementation(async (sessionId: string) => {
+            mockSessionStore.delete(sessionId);
+        }),
+    },
+}));
 jest.mock('../utils/secretsManager', () => ({
     getMetaCredentials: jest.fn().mockResolvedValue({
         clientId: 'test_client_id',
@@ -61,6 +79,7 @@ app.use('/auth/meta', metaAuthRouter);
 describe('Meta Auth Routes', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        mockSessionStore.clear();
     });
 
     describe('POST /connect-ad-accounts', () => {
