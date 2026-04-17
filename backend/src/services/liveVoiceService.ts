@@ -361,7 +361,10 @@ export function hasLiveSession(sessionId: string): boolean {
 const EMOTION_TAG_RE = /\[\s*(warm|excited|thoughtful|encouraging|concerned|pause)\s*\]/gi;
 
 function stripEmotionTags(text: string): string {
-  return text.replace(EMOTION_TAG_RE, '').replace(/\s{2,}/g, ' ').trim();
+  // Do NOT trim individual chunks — Gemini streams words with trailing spaces and
+  // trimming each chunk would concatenate words without spaces. Normalize double-spaces
+  // that emotion tag removal might leave behind, but preserve all leading/trailing space.
+  return text.replace(EMOTION_TAG_RE, '').replace(/\s{2,}/g, ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +459,6 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     // assistantText = clean transcript shown in chat UI (no tool output, no emotion tags)
     const assistantText = entry.currentTurnText.trim();
     const userText = entry.pendingUserText.trim();
-    const toolContext = entry.toolContextText.trim();
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
@@ -470,16 +472,14 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     emitFn('live:turn-complete', { sessionId, assistantText, userText });
 
     // Fire-and-forget save — never blocks the audio stream
-    // Include tool context in the saved assistant message so conversation history is complete
+    // Save only the clean assistant transcript — Gemini Live maintains its own session
+    // context and does not need tool results re-injected from DynamoDB on the next turn.
     if (assistantText) {
-      const savedAssistantContent = toolContext
-        ? `${assistantText}\n${toolContext}`
-        : assistantText;
       const messagesToSave = [];
       if (userText) {
         messagesToSave.push({ role: 'user' as const, content: userText });
       }
-      messagesToSave.push({ role: 'assistant' as const, content: savedAssistantContent });
+      messagesToSave.push({ role: 'assistant' as const, content: assistantText });
 
       chatbotDb.addMessagesToSession(sessionId, messagesToSave).catch((err) => {
         console.warn(`[liveVoiceService] Failed to save transcript for session ${sessionId}:`, err?.message);

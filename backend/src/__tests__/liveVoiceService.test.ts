@@ -483,6 +483,33 @@ describe('emotion tag stripping', () => {
     expect(savedContent).not.toMatch(/\[(thoughtful|pause)\]/i);
   });
 
+  it('preserves inter-chunk spacing when Gemini streams words in separate chunks', async () => {
+    // Gemini streams with trailing spaces like "I've got " + "them!" — stripping per-chunk
+    // must not remove the trailing space or words will be concatenated without spaces.
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-spacing', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: "I've got " } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'them! Your brand is TaskFlow.' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { turnComplete: true },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const turnCompleteCall = emitFn.mock.calls.find(([event]) => event === 'live:turn-complete');
+    // Words must be separated by a space, not concatenated
+    expect(turnCompleteCall![1].assistantText).toContain("I've got them!");
+    expect(turnCompleteCall![1].assistantText).not.toContain("I've gotthem!");
+  });
+
   it('strips emotion tags from inputTranscription (user speech transcript)', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
@@ -526,8 +553,8 @@ describe('tool text isolation', () => {
 
     const turnCompleteCall = emitFn.mock.calls.find(([event]) => event === 'live:turn-complete');
     expect(turnCompleteCall).toBeDefined();
-    // assistantText should only contain the spoken transcript
-    expect(turnCompleteCall![1].assistantText).toBe('Here is your campaign summary.');
+    // assistantText should only contain the spoken transcript (trimmed at turn level)
+    expect(turnCompleteCall![1].assistantText).toContain('Here is your campaign summary.');
     // No tool output appended
     expect(turnCompleteCall![1].assistantText).not.toContain('[Tool:');
   });
