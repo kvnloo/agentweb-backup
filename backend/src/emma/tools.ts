@@ -3770,6 +3770,10 @@ emmaToolRegistry.register({
           description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
           enum: ['veo-3.1-generate-preview']
         },
+        durationSeconds: {
+          type: 'number',
+          description: 'Optional: Requested duration of the generated video in seconds. Veo supports 5–8 seconds. Defaults to 8 if not specified. Use this to control the clip length.'
+        },
         startFrame: {
           type: 'string',
           description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
@@ -3835,7 +3839,8 @@ emmaToolRegistry.register({
       args.startFrame,
       args.endFrame,
       args.compose,
-      args.composeParams
+      args.composeParams,
+      args.durationSeconds
     );
   }
 });

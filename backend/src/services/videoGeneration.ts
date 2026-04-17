@@ -27,6 +27,8 @@ interface VideoGenerationParams {
   videoModel?: string; // Optional model parameter - must be one of the supported models
   startFrame?: string; // Optional: URL of the first frame image
   endFrame?: string; // Optional: URL of the last frame image
+  /** Requested duration in seconds (passed to Veo API). Veo supports 5–8s; defaults to 8. */
+  durationSeconds?: number;
   /** When true, post-process the generated clip with Remotion to add brand overlays */
   compose?: boolean;
   /** Brand overlay params — required when compose is true */
@@ -292,6 +294,12 @@ export class VideoService {
         config.lastFrame = lastFrameImage;
       }
 
+      // Add duration if provided (Veo supports 5–8 seconds)
+      if (params.durationSeconds) {
+        config.durationSeconds = Math.min(8, Math.max(5, params.durationSeconds));
+        console.log(`VideoService: Requesting durationSeconds=${config.durationSeconds} from Veo`);
+      }
+
       // Add config if we have any config options (including lastFrame)
       if (Object.keys(config).length > 0) {
         generateRequest.config = config;
@@ -490,8 +498,15 @@ export class VideoService {
         // Post-process with Remotion if requested and Veo succeeded
         if (result.success && result.videoUrl && params.compose && params.composeParams) {
           console.log('VideoService: Composing branded video with Remotion...');
-          const composeResult = await remotionService.compose({
+          // If durationSeconds was requested, propagate it to Remotion so the composition
+          // duration matches the actual clip length. composeParams.clipDurationSeconds takes
+          // precedence if the caller set it explicitly.
+          const effectiveComposeParams = {
             ...params.composeParams,
+            clipDurationSeconds: params.composeParams.clipDurationSeconds ?? params.durationSeconds,
+          };
+          const composeResult = await remotionService.compose({
+            ...effectiveComposeParams,
             clipUrl: result.videoUrl,
             filename: params.filename,
             userId: params.userId,

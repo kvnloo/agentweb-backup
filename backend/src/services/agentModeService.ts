@@ -14384,10 +14384,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     startFrame?: string,
     endFrame?: string,
     compose?: boolean,
-    composeParams?: Record<string, any>
+    composeParams?: Record<string, any>,
+    durationSeconds?: number
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('./videoGeneration');
@@ -14410,6 +14411,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         videoModel,
         startFrame,
         endFrame,
+        durationSeconds,
         compose,
         composeParams: composeParams as any,
       });
