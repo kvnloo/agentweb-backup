@@ -3415,6 +3415,75 @@ export const crmDb = {
   },
 
 
+  /**
+   * Writes or removes a single provider's CRM sync config on the lead list item.
+   *
+   * Stored as: externalCrmSyncConfigs: { hubspot: {...}, attio: {...} }
+   *
+   * Uses if_not_exists so the parent map is initialised automatically if absent.
+   * Pass config=null to REMOVE the provider key without touching the other provider.
+   */
+  async setLeadListCrmSyncConfig(
+    listId: string,
+    provider: string,
+    config: Record<string, any> | null
+  ): Promise<void> {
+    try {
+      let params: any;
+
+      if (config !== null) {
+        // Read the current map, merge the provider key in JS, write the whole map back.
+        // This avoids the DynamoDB limitation where SET map.key fails when the parent
+        // map doesn't yet exist on the item (if_not_exists + nested path evaluated
+        // simultaneously against the original item state, not sequentially).
+        const current = await dynamodb.get({
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          ProjectionExpression: '#ecs',
+          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
+        }).promise();
+        const existingMap = (current.Item?.externalCrmSyncConfigs as Record<string, any>) ?? {};
+        const mergedMap = { ...existingMap, [provider]: config };
+
+        params = {
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          UpdateExpression: 'SET #ecs = :mergedMap, #updatedAt = :now',
+          ExpressionAttributeNames: {
+            '#ecs': 'externalCrmSyncConfigs',
+            '#updatedAt': 'updatedAt',
+          },
+          ExpressionAttributeValues: {
+            ':mergedMap': mergedMap,
+            ':now': new Date().toISOString(),
+          },
+        };
+      } else {
+        params = {
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          UpdateExpression: 'REMOVE #ecs.#provider SET #updatedAt = :now',
+          ExpressionAttributeNames: {
+            '#ecs': 'externalCrmSyncConfigs',
+            '#provider': provider,
+            '#updatedAt': 'updatedAt',
+          },
+          ExpressionAttributeValues: {
+            ':now': new Date().toISOString(),
+          },
+        };
+      }
+
+      await dynamodb.update(params).promise();
+    } catch (error: any) {
+      // If removing a nested key from a map that doesn't exist yet, DynamoDB throws
+      // ValidationException. Treat it as a no-op — the config is already absent.
+      if (config === null && error?.code === 'ValidationException') return;
+      handleDynamoDbError(error, 'setLeadListCrmSyncConfig');
+      throw error;
+    }
+  },
+
   async deleteLeadList(listId: string) {
     try {
       // First, delete all leads in this list

@@ -596,30 +596,30 @@ export interface HubSpotCredentials {
 }
 
 export async function getHubSpotCredentials(): Promise<HubSpotCredentials> {
+return {clientId: "1f117302-97f9-45c6-bd1f-87a1a7aec665", clientSecret: "827aeeaa-1c0f-4f9f-a0ab-e42a01255f57"}
+  // try {
+  //   const environment = process.env.NODE_ENV || 'development';
+  //   const secretName = environment === 'production'
+  //     ? 'prod/AgentWeb/HubSpot'
+  //     : 'dev/AgentWeb/HubSpot';
 
-  try {
-    const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/HubSpot'
-      : 'dev/AgentWeb/HubSpot';
+  //   const secretString = await getSecret(secretName);
 
-    const secretString = await getSecret(secretName);
+  //   if (!secretString || secretString.trim() === '') {
+  //     throw new Error('HubSpot credentials secret is empty');
+  //   }
 
-    if (!secretString || secretString.trim() === '') {
-      throw new Error('HubSpot credentials secret is empty');
-    }
+  //   const credentials = JSON.parse(secretString) as HubSpotCredentials;
 
-    const credentials = JSON.parse(secretString) as HubSpotCredentials;
+  //   if (!credentials.clientId || !credentials.clientSecret) {
+  //     throw new Error('HubSpot credentials missing clientId or clientSecret');
+  //   }
 
-    if (!credentials.clientId || !credentials.clientSecret) {
-      throw new Error('HubSpot credentials missing clientId or clientSecret');
-    }
-
-    return credentials;
-  } catch (error) {
-    console.error('Error fetching HubSpot credentials from Secrets Manager:', error);
-    throw new Error('Failed to fetch HubSpot credentials from Secrets Manager');
-  }
+  //   return credentials;
+  // } catch (error) {
+  //   console.error('Error fetching HubSpot credentials from Secrets Manager:', error);
+  //   throw new Error('Failed to fetch HubSpot credentials from Secrets Manager');
+  // }
 }
 
 export interface AttioCredentials {

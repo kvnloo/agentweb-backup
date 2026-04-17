@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import { settingsService } from './settingsService';
 import { crmDb } from './db';
 import { decryptPassword, encryptPassword } from '../utils/crypto';
 import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
@@ -133,10 +132,6 @@ export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function settingKey(listId: string, provider: string): string {
-  return `ext_crm_sync_${listId}_${provider}`;
-}
-
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 export class ExternalCrmSyncService {
@@ -150,30 +145,25 @@ export class ExternalCrmSyncService {
   // ─── Config CRUD ────────────────────────────────────────────────────────────
 
   async getConfig(userId: string, listId: string, provider: string): Promise<ExternalCrmSyncConfig | null> {
-    const setting = await settingsService.getSetting(settingKey(listId, provider));
-    if (!setting) return null;
-    try {
-      const config: ExternalCrmSyncConfig = JSON.parse(setting.settingValue);
-      if (config.userId !== userId) return null;
-      return config;
-    } catch {
-      return null;
-    }
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return null;
+
+    const configs = (list as any).externalCrmSyncConfigs as Record<string, ExternalCrmSyncConfig> | undefined;
+    if (!configs?.[provider]) return null;
+
+    const config = configs[provider];
+    if (config.userId !== userId) return null;
+    return config;
   }
 
   /**
    * Backfills `webhookSecret` for configs that pre-date this feature.
-   * Call this only from read-path handlers (GET routes) — not from saveConfig — so
-   * the extra setSetting call doesn't shift mock indices in saveConfig unit tests.
+   * Call this only from read-path handlers (GET routes) — not from saveConfig.
    */
   async ensureWebhookSecret(userId: string, listId: string, provider: string, config: ExternalCrmSyncConfig): Promise<void> {
+    if (config.webhookSecret) return;
     config.webhookSecret = crypto.randomBytes(24).toString('hex');
-    await settingsService.setSetting(
-      settingKey(listId, provider),
-      JSON.stringify(config),
-      `External CRM sync config for list ${listId} → ${provider}`,
-      userId
-    );
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, config as any);
   }
 
   async saveConfig(
@@ -264,20 +254,14 @@ export class ExternalCrmSyncService {
       config.accountId = undefined;
     }
 
-    await settingsService.setSetting(
-      settingKey(listId, provider),
-      JSON.stringify(config),
-      `External CRM sync config for list ${listId} → ${provider}`,
-      userId
-    );
-
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, config as any);
     return config;
   }
 
   async deleteConfig(userId: string, listId: string, provider: string): Promise<void> {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) return;
-    await settingsService.deleteSetting(settingKey(listId, provider));
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, null);
   }
 
   async getDefaultMappings(provider: string): Promise<{
@@ -676,12 +660,8 @@ export class ExternalCrmSyncService {
   // ─── Private helpers ──────────────────────────────────────────────────────────
 
   private async saveUpdatedConfig(config: ExternalCrmSyncConfig): Promise<void> {
-    await settingsService.setSetting(
-      settingKey(config.listId, config.provider),
-      JSON.stringify(config),
-      `External CRM sync config for list ${config.listId} → ${config.provider}`,
-      config.userId
-    ).catch(() => { /* non-critical */ });
+    await crmDb.setLeadListCrmSyncConfig(config.listId, config.provider, config as any)
+      .catch(() => { /* non-critical */ });
   }
 
   private async updateSyncTimestamp(
