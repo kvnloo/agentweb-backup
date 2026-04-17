@@ -127,6 +127,28 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.analysis).toContain('**Analysis:** Summary of analysis results.');
   });
 
+  test('Gemini API call includes a request timeout to prevent indefinite hangs', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: 'Result.' }]
+            }
+          }
+        ]
+      }
+    });
+
+    await (service as any).performDataAnalysis([], 'Summarize.', 'user-1');
+
+    expect(mockedAxiosPost).toHaveBeenCalledTimes(1);
+    const postConfig = mockedAxiosPost.mock.calls[0][2]; // third arg is axios config
+    expect(postConfig).toBeDefined();
+    expect(typeof postConfig.timeout).toBe('number');
+    expect(postConfig.timeout).toBeGreaterThan(0);
+  });
+
   test('uploads inline chart data when present in response', async () => {
     mockedAxiosGet.mockResolvedValueOnce({
       data: Buffer.from('csv-data'),

@@ -4692,7 +4692,8 @@ export class AgentModeService {
           headers: {
             'x-goog-api-key': geminiApiKey,
             'Content-Type': 'application/json'
-          }
+          },
+          timeout: 10 * 60 * 1000, // 10 minutes — code execution can be slow but must not hang indefinitely
         }
       );
 
