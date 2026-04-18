@@ -14526,6 +14526,61 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Compose pre-existing video clips into a branded final video using Remotion.
+   * Use this when clips have already been generated and need to be stitched + branded.
+   */
+  public async composeVideo(
+    clipUrls: string[],
+    filename: string,
+    userId: string,
+    sessionId: string,
+    composeParams: Record<string, any>,
+    clipDurationSeconds?: number
+  ): Promise<any> {
+    try {
+      if (!clipUrls || clipUrls.length === 0) {
+        return { success: false, message: 'At least one clip URL is required', error: 'missing_clip_urls' };
+      }
+
+      console.log(`AgentMode: Composing ${clipUrls.length} pre-existing clip(s) for user ${userId}`);
+
+      const { remotionService } = await import('./remotionService');
+      const composeResult = await remotionService.compose({
+        brandName: composeParams.brandName,
+        tagline: composeParams.tagline,
+        primaryColor: composeParams.primaryColor,
+        secondaryColor: composeParams.secondaryColor,
+        logoUrl: composeParams.logoUrl,
+        ctaText: composeParams.ctaText,
+        ctaUrl: composeParams.ctaUrl,
+        clipUrl: clipUrls[0],
+        extraClipUrls: clipUrls.slice(1),
+        clipDurationSeconds: clipDurationSeconds ?? 8,
+        filename,
+        userId,
+      });
+
+      if (composeResult.success && composeResult.videoUrl) {
+        return {
+          success: true,
+          message: `✅ ${clipUrls.length} clip(s) composed into branded video!`,
+          videoUrl: composeResult.videoUrl,
+          filename: composeResult.filename ?? filename,
+        };
+      }
+
+      return {
+        success: false,
+        message: composeResult.error || 'Composition failed',
+        error: composeResult.error,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error composing video:', error);
+      return { success: false, message: 'Failed to compose video', error: error.message };
+    }
+  }
+
+  /**
    * Remove C2PA metadata from an image by downloading it, stripping metadata, and uploading to S3
    */
   public async removeC2PAFromImage(
