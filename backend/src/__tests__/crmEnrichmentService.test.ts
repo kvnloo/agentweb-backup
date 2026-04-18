@@ -688,6 +688,108 @@ describe('CrmEnrichmentService', () => {
     });
   });
 
+  // ─── PERSONAL EMAIL DOMAIN GUARD ─────────────────────────────────────────
+
+  describe('isPersonalEmailDomain', () => {
+    it('identifies common personal providers', () => {
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@gmail.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@yahoo.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@hotmail.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@outlook.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@icloud.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@protonmail.com')).toBe(true);
+    });
+
+    it('does not flag business domains', () => {
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@acme.com')).toBe(false);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@blacktiger.tech')).toBe(false);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@zime.ai')).toBe(false);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('user@theliva.ai')).toBe(false);
+    });
+
+    it('handles missing or malformed email gracefully', () => {
+      expect(CrmEnrichmentService.isPersonalEmailDomain('')).toBe(false);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('nodomain')).toBe(false);
+    });
+  });
+
+  describe('execute - personal email domain skips company search', () => {
+    it('should NOT use gmail.com as a company search term', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({ leadId: 'lead1', company: '', email: 'john@gmail.com' })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: 'Unknown' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find employee count',
+        outputFields: ['employee_count'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      // Web search must NOT be called with a personal domain as the company term
+      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalledWith(
+        expect.stringContaining('gmail.com'),
+        expect.anything(),
+      );
+    });
+
+    it('should NOT use outlook.com as a company search term', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({ leadId: 'lead1', company: '', email: 'alex@outlook.com' })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: 'Unknown' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find employee count',
+        outputFields: ['employee_count'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalledWith(
+        expect.stringContaining('outlook.com'),
+        expect.anything(),
+      );
+    });
+
+    it('should still use business domain when company is empty', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({ leadId: 'lead1', company: '', email: 'reed@blacktiger.tech' })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Black Tiger', snippet: '51-200 employees' }] });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: '51-200' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find employee count',
+        outputFields: ['employee_count'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(
+        expect.stringContaining('blacktiger.tech'),
+        5,
+      );
+    });
+  });
+
   // ─── LEAD IDS FILTERING ──────────────────────────────────────────────────
 
   describe('leadIds filtering', () => {
