@@ -605,6 +605,182 @@ describe('closeLiveSession', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Noise turn filtering
+// ---------------------------------------------------------------------------
+
+describe('noise turn filtering', () => {
+  it('does NOT save a user transcript that is purely filler noise (e.g. "uh")', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-uh', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: 'uh' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: {
+        outputTranscription: { text: 'I didn\'t catch that — could you repeat?' },
+      },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeUndefined();
+  });
+
+  it('does NOT save a user transcript that is just background noise punctuation ("...")', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-dots', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: '...' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'How can I help?' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeUndefined();
+  });
+
+  it('does NOT save a user transcript below the minimum word count (single isolated word noise)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-single', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: 'the' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Pardon?' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeUndefined();
+  });
+
+  it('DOES save a short but meaningful user transcript ("Yes" as affirmation)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-yes', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: 'Yes' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Great, proceeding.' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeDefined();
+    expect(userMsg.content).toContain('Yes');
+  });
+
+  it('DOES save a short but meaningful user transcript ("No" as negation)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-no', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: 'No' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Okay, cancelling.' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeDefined();
+    expect(userMsg.content).toContain('No');
+  });
+
+  it('DOES save a multi-word user transcript despite having filler words among real words', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-mixed', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: 'uh how is my ad spend' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Your ad spend is $500.' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeDefined();
+    expect(userMsg.content).toContain('uh how is my ad spend');
+  });
+
+  it('still emits live:user-transcript for display even when the turn is noise (do not suppress UI)', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-noise-display', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { inputTranscription: { text: 'mm' } },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Sorry, I missed that.' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // UI should still receive the transcript (for display), but DynamoDB should not
+    const userTranscriptEmit = emitFn.mock.calls.find(([event]) => event === 'live:user-transcript');
+    expect(userTranscriptEmit).toBeDefined();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const userMsg = messages.find((m: any) => m.role === 'user');
+    expect(userMsg).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 

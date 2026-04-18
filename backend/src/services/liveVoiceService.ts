@@ -61,6 +61,10 @@ interface LiveEntry {
   pendingUserText: string;
   /** Tool call results for the current turn — saved to DynamoDB but NOT shown in chat UI */
   toolContextText: string;
+  /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
+  resumptionHandle?: string;
+  /** Cached function declarations so reconnects reuse the same tool config without reloading */
+  functionDeclarations: any[];
 }
 
 // ---------------------------------------------------------------------------
@@ -217,39 +221,14 @@ async function loadGeminiFunctionDeclarations(userId: string): Promise<any[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * Start a Gemini Live session for the given Agent Mode sessionId.
- * If a session already exists for this sessionId, it is closed first.
- *
- * @param sessionId  Agent Mode chat session ID
- * @param socketId   Socket.IO socket ID of the connected browser
- * @param emitFn     Function to emit Socket.IO events back to the browser
+ * Open (or re-open) a Gemini Live WebSocket for the given Agent Mode sessionId.
+ * Internal — callers should use startLiveSession (public) or reconnectLiveSession.
  */
-export async function startLiveSession(
+async function openGeminiSession(
   sessionId: string,
-  socketId: string,
-  emitFn: EmitFn,
-  userId: string
+  entry: LiveEntry,
+  resumptionHandle?: string
 ): Promise<void> {
-  // Close any existing session for this sessionId
-  if (activeSessions.has(sessionId)) {
-    closeLiveSession(sessionId);
-  }
-
-  // Placeholder entry — filled after session resolves
-  const entry: LiveEntry = {
-    session: null as unknown as Session,
-    socketId,
-    emitFn,
-    userId,
-    currentTurnText: '',
-    pendingUserText: '',
-    toolContextText: '',
-  };
-  activeSessions.set(sessionId, entry);
-
-  // Load user's allowed tools converted to Gemini Live format
-  const functionDeclarations = await loadGeminiFunctionDeclarations(userId);
-
   const ai = await getGenAI();
 
   const geminiSession = await ai.live.connect({
@@ -270,11 +249,13 @@ export async function startLiveSession(
       inputAudioTranscription: {},
       outputAudioTranscription: {},
       // Wire in agent mode tools (sanitized for Gemini Live schema requirements)
-      ...(functionDeclarations.length > 0 ? { tools: [{ functionDeclarations }] } : {}),
+      ...(entry.functionDeclarations.length > 0 ? { tools: [{ functionDeclarations: entry.functionDeclarations }] } : {}),
+      // Request session resumption tokens so we can reconnect transparently after code 1000 closes
+      sessionResumption: resumptionHandle ? { handle: resumptionHandle } : {},
     },
     callbacks: {
       onopen: () => {
-        console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}`);
+        console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}${resumptionHandle ? ' (resumed)' : ''}`);
       },
       onmessage: (message: LiveServerMessage) => {
         console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
@@ -292,15 +273,68 @@ export async function startLiveSession(
       onclose: (e: CloseEvent) => {
         console.log(`[liveVoiceService] Gemini CLOSED session ${sessionId}, code=${e.code}, reason=${e.reason}`);
         const currentEntry = activeSessions.get(sessionId);
-        if (currentEntry) {
-          currentEntry.emitFn('live:closed', { sessionId });
+        if (!currentEntry) return;
+
+        // Code 1000 = normal closure by Gemini after a turn. Reconnect transparently
+        // using the latest resumption handle so the conversation continues.
+        if (e.code === 1000 && currentEntry.resumptionHandle) {
+          console.log(`[liveVoiceService] Auto-reconnecting session ${sessionId} with handle ${currentEntry.resumptionHandle.slice(0, 8)}...`);
+          openGeminiSession(sessionId, currentEntry, currentEntry.resumptionHandle)
+            .then(() => { currentEntry.session = activeSessions.get(sessionId)!.session; })
+            .catch((err) => {
+              console.error(`[liveVoiceService] Reconnect failed for ${sessionId}:`, err?.message);
+              activeSessions.delete(sessionId);
+              currentEntry.emitFn('live:closed', { sessionId });
+            });
+          return;
         }
+
+        // Abnormal close or no handle — surface to client
         activeSessions.delete(sessionId);
+        currentEntry.emitFn('live:closed', { sessionId });
       },
     },
   });
 
   entry.session = geminiSession;
+}
+
+/**
+ * Start a Gemini Live session for the given Agent Mode sessionId.
+ * If a session already exists for this sessionId, it is closed first.
+ *
+ * @param sessionId  Agent Mode chat session ID
+ * @param socketId   Socket.IO socket ID of the connected browser
+ * @param emitFn     Function to emit Socket.IO events back to the browser
+ */
+export async function startLiveSession(
+  sessionId: string,
+  socketId: string,
+  emitFn: EmitFn,
+  userId: string
+): Promise<void> {
+  // Close any existing session for this sessionId
+  if (activeSessions.has(sessionId)) {
+    closeLiveSession(sessionId);
+  }
+
+  // Load user's allowed tools converted to Gemini Live format
+  const functionDeclarations = await loadGeminiFunctionDeclarations(userId);
+
+  // Placeholder entry — filled after session resolves
+  const entry: LiveEntry = {
+    session: null as unknown as Session,
+    socketId,
+    emitFn,
+    userId,
+    currentTurnText: '',
+    pendingUserText: '',
+    toolContextText: '',
+    functionDeclarations,
+  };
+  activeSessions.set(sessionId, entry);
+
+  await openGeminiSession(sessionId, entry);
 }
 
 /**
@@ -369,6 +403,54 @@ function stripEmotionTags(text: string): string {
   return text.replace(EMOTION_TAG_RE, '').replace(/\s{2,}/g, ' ');
 }
 
+// Single-word affirmations/negations that are short but meaningful — always persist.
+const MEANINGFUL_SINGLE_WORDS = new Set([
+  'yes', 'no', 'ok', 'okay', 'sure', 'nope', 'yep', 'yeah', 'nah',
+  'stop', 'go', 'done', 'next', 'back', 'help',
+]);
+
+// Pure filler/noise tokens that Gemini STT emits for background sounds or
+// stray microphone pickup. These are never meaningful when they appear alone.
+const NOISE_TOKENS = new Set([
+  // Vocal fillers
+  'uh', 'um', 'mm', 'hmm', 'hm', 'ah', 'oh', 'er',
+  // Articles / conjunctions that Gemini often emits as isolated noise fragments
+  'the', 'a', 'an', 'and', 'but', 'or', 'so', 'i',
+]);
+
+/**
+ * Returns true if the user transcript looks like STT noise from background
+ * audio and should NOT be persisted to DynamoDB.
+ *
+ * Rules (all must hold to classify as noise):
+ *  1. After stripping punctuation and whitespace the text is ≤1 word, AND
+ *  2. That word is either a known noise token or the text is purely punctuation.
+ *
+ * Multi-word transcripts are always treated as real input even if they start
+ * with filler words ("uh how is my ad spend" is meaningful).
+ * Short meaningful words like "Yes" / "No" are explicitly allowed through.
+ */
+function isNoiseTurn(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  // Strip punctuation-only strings (e.g. "...", "???")
+  const stripped = trimmed.replace(/[.,!?;:\-\u2026"'()]+/g, '').trim();
+  if (!stripped) return true;
+
+  // Multi-word — always a real turn
+  const words = stripped.split(/\s+/).filter(Boolean);
+  if (words.length > 1) return false;
+
+  const word = words[0].toLowerCase();
+
+  // Allow through short but meaningful words
+  if (MEANINGFUL_SINGLE_WORDS.has(word)) return false;
+
+  // Single known noise token
+  return NOISE_TOKENS.has(word);
+}
+
 // ---------------------------------------------------------------------------
 // Internal: handle incoming Gemini messages
 // ---------------------------------------------------------------------------
@@ -419,6 +501,11 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     entry.pendingUserText += displayText;
     // Forward to browser so user's words appear in real-time as they speak
     if (displayText) emitFn('live:user-transcript', { sessionId, text: displayText });
+  }
+
+  // Capture resumption handle so onclose can reconnect transparently
+  if (message.sessionResumptionUpdate?.newHandle && message.sessionResumptionUpdate.resumable) {
+    entry.resumptionHandle = message.sessionResumptionUpdate.newHandle;
   }
 
   // Tool call: execute the requested tool(s) and send results back to Gemini
@@ -478,7 +565,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     // context and does not need tool results re-injected from DynamoDB on the next turn.
     if (assistantText) {
       const messagesToSave = [];
-      if (userText) {
+      // Skip saving user turns that are STT noise from background audio — persisting
+      // them corrupts the context window and causes repetitive/fragmented responses.
+      if (userText && !isNoiseTurn(userText)) {
         messagesToSave.push({ role: 'user' as const, content: userText });
       }
       messagesToSave.push({ role: 'assistant' as const, content: assistantText });
