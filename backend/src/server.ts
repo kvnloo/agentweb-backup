@@ -6,7 +6,7 @@ import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { generateChatResponse } from './services/chatbotService';
+import { generateChatResponse, chatbotDb } from './services/chatbotService';
 import { checkTokenUsage } from './services/tokenUsageService';
 import {
   startLiveSession,
@@ -62,19 +62,42 @@ const io = new Server(server, {
 export { io };
 
 // Middleware to authenticate WebSocket connections
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth.token;
-  if (!token) {
-    return next(new Error('Authentication error'));
+  const conversableToken = socket.handshake.auth.conversableToken;
+  const conversableSessionId = socket.handshake.auth.conversableSessionId;
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+      socket.data.user = decoded;
+      return next();
+    } catch {
+      return next(new Error('Authentication error'));
+    }
   }
 
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
-    socket.data.user = decoded;
-    next();
-  } catch (error) {
-    next(new Error('Authentication error'));
+  // Allow conversable (iShare) sockets — validate token against session in DynamoDB
+  if (conversableToken && conversableSessionId) {
+    try {
+      const session = await chatbotDb.getChatSession(conversableSessionId);
+      if (!session) return next(new Error('Session not found'));
+      const interactiveToken = session.interactiveShareMetadata?.token;
+      if (!interactiveToken || interactiveToken !== conversableToken) {
+        return next(new Error('Invalid conversable token'));
+      }
+      if (!session.interactiveShareMetadata?.isActive) {
+        return next(new Error('Interactive share is not active'));
+      }
+      socket.data.conversableSessionId = conversableSessionId;
+      socket.data.conversableUserId = session.userId;
+      return next();
+    } catch (err: any) {
+      return next(new Error('Conversable auth error'));
+    }
   }
+
+  return next(new Error('Authentication error'));
 });
 
 // WebSocket connection handling
@@ -117,6 +140,10 @@ io.on('connection', (socket: Socket) => {
 
   // Verify the socket user owns the sessionId before allowing live operations
   function getLiveUserId(): string {
+    // Conversable (iShare) socket — userId resolved at auth time
+    if (socket.data.conversableUserId) {
+      return socket.data.conversableUserId;
+    }
     const token = socket.handshake.auth.token;
     if (!token) throw new Error('No auth token');
     const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as {
@@ -128,6 +155,10 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('live:start', async ({ sessionId }: { sessionId: string }) => {
     try {
+      // For conversable sockets, enforce that the sessionId matches what was auth'd
+      if (socket.data.conversableSessionId && socket.data.conversableSessionId !== sessionId) {
+        throw new Error('Session ID mismatch for conversable socket');
+      }
       const userId = getLiveUserId(); // auth check — throws if invalid
       console.log(`[liveVoice] live:start received for session ${sessionId} on socket ${socket.id}`);
       // Track which live sessions this socket owns (for disconnect cleanup)
