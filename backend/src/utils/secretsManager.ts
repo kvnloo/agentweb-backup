@@ -589,3 +589,66 @@ export async function getStripeCredentials(): Promise<StripeCredentials> {
     throw new Error('Failed to fetch Stripe credentials. Store in Secrets Manager at dev/AgentWeb/Stripe or prod/AgentWeb/Stripe.');
   }
 }
+
+export interface HubSpotCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+export async function getHubSpotCredentials(): Promise<HubSpotCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/HubSpot'
+      : 'dev/AgentWeb/HubSpot';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('HubSpot credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as HubSpotCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('HubSpot credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching HubSpot credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch HubSpot credentials from Secrets Manager');
+  }
+}
+
+export interface AttioCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+export async function getAttioCredentials(): Promise<AttioCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Attio'
+      : 'dev/AgentWeb/Attio';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Attio credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as AttioCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Attio credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Attio credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Attio credentials from Secrets Manager');
+  }
+}
+

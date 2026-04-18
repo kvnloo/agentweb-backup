@@ -172,7 +172,7 @@ export interface User {
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
-    | 'meta' | 'twitter' | 'instagram';
+    | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'youtube' | 'clickup';
     account_id: string;
     account_name: string;
     config: {
@@ -2083,7 +2083,7 @@ export const scheduleDb = {
         },
       };
 
-            return await paginatedQuery(dynamodb, params);
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -3268,6 +3268,16 @@ export const crmDb = {
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       listType?: 'sales' | 'customers';
+      syncConfig?: {
+        platform: 'hubspot' | 'attio';
+        accountId: string;
+        direction: 'push' | 'pull' | 'bidirectional';
+        lastSyncedAt?: string;
+        syncCursor?: string;
+        externalListId?: string;      // ID of the list in HubSpot/Attio
+        externalPeopleListId?: string; // Attio people list ID
+        externalCompaniesListId?: string; // Attio companies list ID
+      } | null;
     }
   ) {
     try {
@@ -3371,6 +3381,12 @@ export const crmDb = {
         expressionAttributeValues[':listType'] = updates.listType;
       }
 
+      if (updates.syncConfig !== undefined) {
+        expressionAttributeNames['#syncConfig'] = 'syncConfig';
+        updateExpressions.push('#syncConfig = :syncConfig');
+        expressionAttributeValues[':syncConfig'] = updates.syncConfig;
+      }
+
       if (updateExpressions.length === 0) {
         return await this.getLeadListById(listId);
       }
@@ -3398,6 +3414,75 @@ export const crmDb = {
     }
   },
 
+
+  /**
+   * Writes or removes a single provider's CRM sync config on the lead list item.
+   *
+   * Stored as: externalCrmSyncConfigs: { hubspot: {...}, attio: {...} }
+   *
+   * Uses if_not_exists so the parent map is initialised automatically if absent.
+   * Pass config=null to REMOVE the provider key without touching the other provider.
+   */
+  async setLeadListCrmSyncConfig(
+    listId: string,
+    provider: string,
+    config: Record<string, any> | null
+  ): Promise<void> {
+    try {
+      let params: any;
+
+      if (config !== null) {
+        // Read the current map, merge the provider key in JS, write the whole map back.
+        // This avoids the DynamoDB limitation where SET map.key fails when the parent
+        // map doesn't yet exist on the item (if_not_exists + nested path evaluated
+        // simultaneously against the original item state, not sequentially).
+        const current = await dynamodb.get({
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          ProjectionExpression: '#ecs',
+          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
+        }).promise();
+        const existingMap = (current.Item?.externalCrmSyncConfigs as Record<string, any>) ?? {};
+        const mergedMap = { ...existingMap, [provider]: config };
+
+        params = {
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          UpdateExpression: 'SET #ecs = :mergedMap, #updatedAt = :now',
+          ExpressionAttributeNames: {
+            '#ecs': 'externalCrmSyncConfigs',
+            '#updatedAt': 'updatedAt',
+          },
+          ExpressionAttributeValues: {
+            ':mergedMap': mergedMap,
+            ':now': new Date().toISOString(),
+          },
+        };
+      } else {
+        params = {
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          UpdateExpression: 'REMOVE #ecs.#provider SET #updatedAt = :now',
+          ExpressionAttributeNames: {
+            '#ecs': 'externalCrmSyncConfigs',
+            '#provider': provider,
+            '#updatedAt': 'updatedAt',
+          },
+          ExpressionAttributeValues: {
+            ':now': new Date().toISOString(),
+          },
+        };
+      }
+
+      await dynamodb.update(params).promise();
+    } catch (error: any) {
+      // If removing a nested key from a map that doesn't exist yet, DynamoDB throws
+      // ValidationException. Treat it as a no-op — the config is already absent.
+      if (config === null && error?.code === 'ValidationException') return;
+      handleDynamoDbError(error, 'setLeadListCrmSyncConfig');
+      throw error;
+    }
+  },
 
   async deleteLeadList(listId: string) {
     try {
@@ -3581,6 +3666,7 @@ export const crmDb = {
     contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
     contactStatusUpdatedBy?: string;
+    syncMetadata?: Record<string, any>;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3638,6 +3724,9 @@ export const crmDb = {
         }
         item.contactStatusUpdatedAt = new Date().toISOString();
         item.contactStatusUpdatedBy = leadData.contactStatusUpdatedBy || 'system';
+      }
+      if (leadData.syncMetadata && Object.keys(leadData.syncMetadata).length > 0) {
+        item.syncMetadata = leadData.syncMetadata;
       }
 
       const params = {
@@ -3847,6 +3936,25 @@ export const crmDb = {
     }
   },
 
+  async getLeadByHubSpotContactId(listId: string, contactId: string) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        KeyConditionExpression: 'listId = :listId',
+        FilterExpression: 'syncMetadata.hubspot_contact_id = :contactId',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':contactId': contactId,
+        },
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items?.[0] ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByHubSpotContactId");
+      throw error;
+    }
+  },
+
   async updateLead(listId: string, leadId: string, updates: {
     email?: string;
     firstName?: string;
@@ -3890,6 +3998,7 @@ export const crmDb = {
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
+    syncMetadata?: Record<string, any>;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4081,6 +4190,11 @@ export const crmDb = {
         }
       }
 
+      if (updates.syncMetadata !== undefined) {
+        setExpressions.push('syncMetadata = :syncMetadata');
+        expressionAttributeValues[':syncMetadata'] = updates.syncMetadata;
+      }
+
       // Always update updatedAt
       setExpressions.push('updatedAt = :updatedAt');
       expressionAttributeValues[':updatedAt'] = new Date().toISOString();
@@ -4116,12 +4230,15 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
-      standardFields.forEach(field => {
-        if (updates[field as keyof typeof updates] !== undefined && String(updates[field as keyof typeof updates]).trim()) {
-          fieldNames.push(field);
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+
+      // Top level fields
+      Object.keys(updates).forEach(key => {
+        if (!internalFields.includes(key) && (updates as any)[key] !== undefined && (updates as any)[key] !== null && String((updates as any)[key]).trim() !== '') {
+          fieldNames.push(key);
         }
       });
+      // customFields explicitly
       if (updates.customFields) {
         Object.keys(updates.customFields).forEach(key => {
           if (updates.customFields![key] && String(updates.customFields![key]).trim()) {
@@ -4180,6 +4297,7 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    syncMetadata?: Record<string, any>;
   }>) {
     try {
       const results = {
@@ -4261,6 +4379,7 @@ export const crmDb = {
             notes: lead.notes || '',
             linkedin: lead.linkedin?.trim() || '',
             customFields: lead.customFields || {},
+            syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
             isICP: 0,
             isEngaged: 0,
@@ -4311,13 +4430,17 @@ export const crmDb = {
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
 
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+
       // Extract from new leads
       newLeads.forEach(lead => {
-        standardFields.forEach(field => {
-          if (lead[field as keyof typeof lead] && String(lead[field as keyof typeof lead]).trim()) {
-            allFieldNames.push(field);
+        // Top level fields
+        Object.keys(lead).forEach(key => {
+          if (!internalFields.includes(key) && (lead as any)[key] !== undefined && (lead as any)[key] !== null && String((lead as any)[key]).trim() !== '') {
+            allFieldNames.push(key);
           }
         });
+        // customFields explicitly
         if (lead.customFields) {
           Object.keys(lead.customFields).forEach(key => {
             if (lead.customFields![key] && String(lead.customFields![key]).trim()) {
@@ -4329,11 +4452,13 @@ export const crmDb = {
 
       // Extract from leads being updated
       leadsToUpdate.forEach(({ newData }) => {
-        standardFields.forEach(field => {
-          if (newData[field as keyof typeof newData] && String(newData[field as keyof typeof newData]).trim()) {
-            allFieldNames.push(field);
+        // Top level fields
+        Object.keys(newData).forEach(key => {
+          if (!internalFields.includes(key) && (newData as any)[key] !== undefined && (newData as any)[key] !== null && String((newData as any)[key]).trim() !== '') {
+            allFieldNames.push(key);
           }
         });
+        // customFields explicitly
         if (newData.customFields) {
           Object.keys(newData.customFields).forEach(key => {
             if (newData.customFields![key] && String(newData.customFields![key]).trim()) {
@@ -4364,61 +4489,48 @@ export const crmDb = {
           const updates: any = {};
           let changed = false;
 
-          // Check and update standard fields - only if newData has a value and it's different
-          if (newData.firstName !== undefined && newData.firstName.trim()) {
-            const newValue = newData.firstName.trim();
-            const existingValue = normalize(existingLead.firstName);
-            if (existingValue !== newValue) {
-              updates.firstName = newValue;
-              changed = true;
+          // Define standard string fields that should be trimmed and compared
+          const standardStringFields: (keyof typeof newData)[] = [
+            'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'dealCurrency'
+          ];
+
+          for (const field of standardStringFields) {
+            const incomingVal = newData[field];
+            if (incomingVal !== undefined && typeof incomingVal === 'string' && incomingVal.trim() !== '') {
+              const newValue = incomingVal.trim();
+              const existingValue = normalize(existingLead[field as string]);
+              if (existingValue !== newValue) {
+                updates[field as string] = newValue;
+                changed = true;
+              }
             }
           }
-          if (newData.lastName !== undefined && newData.lastName.trim()) {
-            const newValue = newData.lastName.trim();
-            const existingValue = normalize(existingLead.lastName);
-            if (existingValue !== newValue) {
-              updates.lastName = newValue;
-              changed = true;
+
+          // Internal sync fields (stored in syncMetadata)
+          const internalSyncFields = ['syncMetadata'];
+          for (const field of internalSyncFields) {
+            const incomingVal = (newData as any)[field];
+            if (incomingVal !== undefined && incomingVal !== null) {
+              const existingVal = existingLead[field] || {};
+              // Merging syncMetadata to avoid overwriting existing provider IDs with new ones
+              const mergedMetadata = { ...existingVal, ...incomingVal };
+              if (JSON.stringify(existingVal) !== JSON.stringify(mergedMetadata)) {
+                updates[field] = mergedMetadata;
+                changed = true;
+              }
             }
           }
-          if (newData.phone !== undefined && newData.phone.trim()) {
-            const newValue = newData.phone.trim();
-            const existingValue = normalize(existingLead.phone);
-            if (existingValue !== newValue) {
-              updates.phone = newValue;
-              changed = true;
-            }
-          }
-          if (newData.company !== undefined && newData.company.trim()) {
-            const newValue = newData.company.trim();
-            const existingValue = normalize(existingLead.company);
-            if (existingValue !== newValue) {
-              updates.company = newValue;
-              changed = true;
-            }
-          }
-          if (newData.title !== undefined && newData.title.trim()) {
-            const newValue = newData.title.trim();
-            const existingValue = normalize(existingLead.title);
-            if (existingValue !== newValue) {
-              updates.title = newValue;
-              changed = true;
-            }
-          }
-          if (newData.notes !== undefined && newData.notes.trim()) {
-            const newValue = newData.notes.trim();
-            const existingValue = normalize(existingLead.notes);
-            if (existingValue !== newValue) {
-              updates.notes = newValue;
-              changed = true;
-            }
-          }
-          if (newData.linkedin !== undefined && newData.linkedin.trim()) {
-            const newValue = newData.linkedin.trim();
-            const existingValue = normalize(existingLead.linkedin);
-            if (existingValue !== newValue) {
-              updates.linkedin = newValue;
-              changed = true;
+
+          // Define standard literal fields that don't need trimming (can be numbers, booleans, or specific enums)
+          const standardLiteralFields: (keyof typeof newData)[] = ['status', 'dealValue'];
+
+          for (const field of standardLiteralFields) {
+            const incomingVal = newData[field];
+            if (incomingVal !== undefined && incomingVal !== null) {
+              if (existingLead[field as string] !== incomingVal) {
+                updates[field as string] = incomingVal;
+                changed = true;
+              }
             }
           }
 
@@ -5183,9 +5295,9 @@ export const socialEngagementTrackingDb = {
           ':scheduleId': tracker.scheduleId,
           ':one': 1,
         };
-        if (tracker.executedAt)    { setFields.push('executedAt = :executedAt');       exprValues[':executedAt']    = tracker.executedAt; }
+        if (tracker.executedAt) { setFields.push('executedAt = :executedAt'); exprValues[':executedAt'] = tracker.executedAt; }
         if (tracker.generatedText) { setFields.push('generatedText = :generatedText'); exprValues[':generatedText'] = tracker.generatedText; }
-        if (tracker.reactionType)  { setFields.push('reactionType = :reactionType');   exprValues[':reactionType']  = tracker.reactionType; }
+        if (tracker.reactionType) { setFields.push('reactionType = :reactionType'); exprValues[':reactionType'] = tracker.reactionType; }
 
         await dynamodb.update({
           TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
@@ -5220,8 +5332,8 @@ export const socialEngagementTrackingDb = {
           ':failed': 'failed',
           ':maxRetries': SOCIAL_ENGAGEMENT_MAX_RETRIES,
         };
-        if (tracker.commentId)    { setFields.push('commentId = :commentId');       exprValues[':commentId']    = tracker.commentId; }
-        if (tracker.postId)       { setFields.push('postId = :postId');             exprValues[':postId']       = tracker.postId; }
+        if (tracker.commentId) { setFields.push('commentId = :commentId'); exprValues[':commentId'] = tracker.commentId; }
+        if (tracker.postId) { setFields.push('postId = :postId'); exprValues[':postId'] = tracker.postId; }
         try {
           await dynamodb.update({
             TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,

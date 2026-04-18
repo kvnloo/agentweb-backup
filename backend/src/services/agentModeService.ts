@@ -6831,6 +6831,18 @@ export class AgentModeService {
 
       await crmDb.updateLead(listId, leadId, dbUpdates);
 
+      void (async () => {
+        try {
+          const { externalCrmSyncService } = await import('./externalCrmSyncService');
+          await Promise.allSettled([
+            externalCrmSyncService.autoSyncLead(userId, listId, { ...lead, ...dbUpdates }, 'hubspot', 'updated'),
+            externalCrmSyncService.autoSyncLead(userId, listId, { ...lead, ...dbUpdates }, 'attio', 'updated'),
+          ]);
+        } catch (syncError) {
+          console.error('AgentMode: Error triggering external CRM auto-sync:', syncError);
+        }
+      })();
+
       return {
         success: true,
         message: `Lead updated successfully (${Object.keys(updates).join(', ')})`,
