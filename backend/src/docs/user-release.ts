@@ -49,6 +49,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-18',
+    changes: [
+      'Fix: CRM Enrichment No Longer Misidentifies Company for Personal Email Leads',
+      '- Leads with personal email addresses (Gmail, Yahoo, Outlook, Hotmail, iCloud, ProtonMail, etc.) no longer get enriched with wrong company data',
+      '- Previously, enrichment used the email domain (e.g. gmail.com) as a company search term, causing all Gmail leads to get "Google" as their company',
+      '- Personal email domains are now detected and excluded from company lookups — these leads get "Unknown" for company fields instead of incorrect data',
+    ],
+  },
+  {
     date: '2026-04-15',
     changes: [
       'Admin: User Notes — Track Status and Context for Each Client',
