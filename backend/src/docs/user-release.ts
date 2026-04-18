@@ -51,6 +51,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-18',
     changes: [
+      'Fix: Voice Mode Now Works in iShare (Interactive Share) Sessions',
+      '- Clicking "Start" for voice mode in an iShare link now connects and activates the live session',
+      '- Previously the Start button had no effect — the socket connection was blocked because iShare users have no login token',
+      '- iShare voice sessions now authenticate via the conversable token instead of requiring a login',
       'Fix: CRM Enrichment No Longer Misidentifies Company for Personal Email Leads',
       '- Leads with personal email addresses (Gmail, Yahoo, Outlook, Hotmail, iCloud, ProtonMail, etc.) no longer get enriched with wrong company data',
       '- Previously, enrichment used the email domain (e.g. gmail.com) as a company search term, causing all Gmail leads to get "Google" as their company',
