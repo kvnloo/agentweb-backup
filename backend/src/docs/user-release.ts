@@ -55,6 +55,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Leads with personal email addresses (Gmail, Yahoo, Outlook, Hotmail, iCloud, ProtonMail, etc.) no longer get enriched with wrong company data',
       '- Previously, enrichment used the email domain (e.g. gmail.com) as a company search term, causing all Gmail leads to get "Google" as their company',
       '- Personal email domains are now detected and excluded from company lookups — these leads get "Unknown" for company fields instead of incorrect data',
+      'Fix: Image Generation No Longer Fails When Creating Multiple Images in One Session',
+      '- When Emma is asked to generate several images in a row (e.g. a batch of ad creatives), they are now generated one at a time instead of all simultaneously',
+      '- Previously, batched image generation triggered concurrent Gemini API calls that hit rate limits, causing some images to fail or time out',
+      '- Images and videos in a batch now execute sequentially, ensuring each generation completes successfully before the next begins',
     ],
   },
   {

@@ -1844,12 +1844,18 @@ export class AgentModeService {
         // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
         // Sequential is required when wait_seconds is in the batch so the wait happens
         // in the correct order relative to the tools before/after it.
+        // Also run sequentially when multiple generate_image or generate_video calls are batched
+        // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
         const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
+        const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
+          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video'
+        );
 
         let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
 
-        if (hasWaitTool) {
-          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools
+        if (hasWaitTool || hasMultipleMediaGenTools) {
+          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
+          // and prevents rate-limit throttling when batching multiple image/video generation calls
           toolResults = [];
           for (const { toolCall, functionArgs } of preparedCalls) {
             const toolStart = Date.now();
