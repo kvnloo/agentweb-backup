@@ -52,7 +52,62 @@ export type ContactEventType =
   | 'deal.created'
   | 'deal.stage_changed'
   | 'deal.primary_rotated'
+  // Activity timeline additions (see natural-language timeline task).
+  // NOTE: `attribution.first_touch` was added inline by the UTM backend PR
+  // via the permissive string fallback below — intentionally not duplicated
+  // here to avoid collisions with that PR's final merge. When both PRs land,
+  // add it to this union in a follow-up cleanup.
+  | 'form.submitted'
+  | 'page.visited'
+  | 'user.registered'
+  | 'onboarding.stage_changed'
+  | 'manual.note'
   | string; // allow future-unknown types — keep flexible rather than locked
+
+/**
+ * Runtime-checkable set of the event types we explicitly model. Used by the
+ * timeline renderer to pick a template, by the public events endpoint to
+ * validate input, and by tests to lock the enum. Unknown types still flow
+ * through (see the permissive `string` fallback on ContactEventType above)
+ * so forward-compat isn't broken — this set is for "do we have a template?"
+ * checks, not for gatekeeping writes.
+ */
+export const KNOWN_CONTACT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'contact.created',
+  'contact.updated',
+  'stage.changed',
+  'lifecycle.changed',
+  'payment.subscribed',
+  'payment.updated',
+  'payment.canceled',
+  'meeting.attended',
+  'support.opened',
+  'support.resolved',
+  'engagement.emma_session',
+  'engagement.email_opened',
+  'engagement.email_clicked',
+  'engagement.linkedin_reply',
+  'deal.created',
+  'deal.stage_changed',
+  'deal.primary_rotated',
+  'attribution.first_touch',
+  'form.submitted',
+  'page.visited',
+  'user.registered',
+  'onboarding.stage_changed',
+  'manual.note',
+]);
+
+/**
+ * Event types a public (unauthenticated) caller is allowed to log via
+ * POST /api/crm/public/events. This is intentionally narrow — only events
+ * that are (a) safe to spoof and (b) commonly fired from a landing page.
+ * Auth'd callers (Emma tools, server hooks) can log any KNOWN type.
+ */
+export const PUBLIC_LOGGABLE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'form.submitted',
+  'page.visited',
+]);
 
 export interface ContactEvent {
   contactId: string;
