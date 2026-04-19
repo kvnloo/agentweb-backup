@@ -1,9 +1,10 @@
 /**
- * Unit tests for DripCampaignDb (Lifecycle Drip Phase 3).
+ * Unit tests for DripCampaignDb (Phase A: multi-tenant refactor).
  *
  * Follows the LeadMagnetConfigDb mock pattern — stub `aws-sdk` at the module
  * level so no network calls happen and assertions focus on validation, merge
- * field parsing, and the optimistic-concurrency update path.
+ * field parsing, the optimistic-concurrency update path, and cross-tenant
+ * isolation.
  */
 import {
   DripCampaignDb,
@@ -23,6 +24,7 @@ const mockDelete = jest
   .fn()
   .mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 const mockScan = jest.fn();
+const mockQuery = jest.fn();
 
 jest.mock('aws-sdk', () => {
   return {
@@ -33,13 +35,18 @@ jest.mock('aws-sdk', () => {
         get: mockGet,
         delete: mockDelete,
         scan: mockScan,
+        query: mockQuery,
       })),
     },
   };
 });
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
+const OWNER = 'user-alice';
+const OTHER = 'user-bob';
+
 const validCampaign: Omit<DripCampaign, 'campaignId' | 'createdAt' | 'updatedAt'> = {
+  userId: OWNER,
   name: 'Brand step drop-off',
   segmentQuery: { stage: 'brand_skipped' },
   templateHtml:
@@ -50,7 +57,7 @@ const validCampaign: Omit<DripCampaign, 'campaignId' | 'createdAt' | 'updatedAt'
   maxSends: 3,
   isActive: true,
   killSwitch: false,
-  createdBy: 'admin-123',
+  createdBy: OWNER,
 };
 
 // ─── Pure-function tests ────────────────────────────────────────────────────
@@ -121,6 +128,12 @@ describe('DripCampaignDb', () => {
   });
 
   // ── Validation (FAIL cases) ────────────────────────────────────────────────
+  it('throws when userId is missing', async () => {
+    await expect(
+      db.create({ ...validCampaign, userId: '' as any }),
+    ).rejects.toThrow('userId is required');
+  });
+
   it('throws when name is empty', async () => {
     await expect(db.create({ ...validCampaign, name: '' })).rejects.toThrow(
       'name is required',
@@ -173,20 +186,24 @@ describe('DripCampaignDb', () => {
   });
 
   // ── CRUD happy paths ───────────────────────────────────────────────────────
-  it('creates a campaign with generated ID and timestamps', async () => {
+  it('creates a campaign with generated ID, timestamps, and userId preserved', async () => {
     mockPut.mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
 
     const result = await db.create(validCampaign);
 
     expect(result.campaignId).toBeDefined();
     expect(result.campaignId.length).toBeGreaterThan(0);
+    expect(result.userId).toBe(OWNER);
     expect(result.name).toBe('Brand step drop-off');
     expect(result.createdAt).toBeDefined();
     expect(result.updatedAt).toBeDefined();
     expect(mockPut).toHaveBeenCalledWith(
       expect.objectContaining({
         TableName: 'Test-AW-DripCampaigns',
-        Item: expect.objectContaining({ name: 'Brand step drop-off' }),
+        Item: expect.objectContaining({
+          name: 'Brand step drop-off',
+          userId: OWNER,
+        }),
       }),
     );
   });
@@ -195,11 +212,11 @@ describe('DripCampaignDb', () => {
     mockGet.mockReturnValueOnce({
       promise: jest.fn().mockResolvedValue({ Item: undefined }),
     });
-    const result = await db.getById('nope');
+    const result = await db.getById('nope', OWNER);
     expect(result).toBeNull();
   });
 
-  it('returns the item when getById finds it', async () => {
+  it('returns the item when getById finds it and caller owns it', async () => {
     const stored: DripCampaign = {
       ...validCampaign,
       campaignId: 'cmp-1',
@@ -209,33 +226,144 @@ describe('DripCampaignDb', () => {
     mockGet.mockReturnValueOnce({
       promise: jest.fn().mockResolvedValue({ Item: stored }),
     });
-    const result = await db.getById('cmp-1');
+    const result = await db.getById('cmp-1', OWNER);
     expect(result).toEqual(stored);
   });
 
-  it('listAll aggregates across paginated scans', async () => {
-    const pageA = [{ ...validCampaign, campaignId: 'a', createdAt: 'x', updatedAt: 'x' }];
-    const pageB = [{ ...validCampaign, campaignId: 'b', createdAt: 'x', updatedAt: 'x' }];
-    mockScan
+  // ── Cross-tenant isolation ─────────────────────────────────────────────────
+  it('getById returns null when caller is NOT the owner (cross-tenant read)', async () => {
+    const stored: DripCampaign = {
+      ...validCampaign,
+      campaignId: 'cmp-1',
+      createdAt: '2026-04-19T00:00:00Z',
+      updatedAt: '2026-04-19T00:00:00Z',
+    };
+    mockGet.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({ Item: stored }),
+    });
+    const result = await db.getById('cmp-1', OTHER);
+    expect(result).toBeNull();
+  });
+
+  it('update throws "Campaign not found" when caller does not own the row', async () => {
+    const stored: DripCampaign = {
+      ...validCampaign,
+      campaignId: 'cmp-42',
+      createdAt: '2026-04-10T00:00:00Z',
+      updatedAt: '2026-04-10T00:00:00Z',
+    };
+    mockGet.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({ Item: stored }),
+    });
+    await expect(
+      db.update('cmp-42', OTHER, { killSwitch: true }),
+    ).rejects.toThrow('Campaign not found: cmp-42');
+    // Must never issue a put — cross-tenant attempts never mutate.
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+
+  it('deleteById throws "Campaign not found" when caller does not own the row', async () => {
+    const stored: DripCampaign = {
+      ...validCampaign,
+      campaignId: 'cmp-99',
+      createdAt: '2026-04-10T00:00:00Z',
+      updatedAt: '2026-04-10T00:00:00Z',
+    };
+    mockGet.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({ Item: stored }),
+    });
+    await expect(db.deleteById('cmp-99', OTHER)).rejects.toThrow(
+      'Campaign not found: cmp-99',
+    );
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
+
+  // ── Listing by user ────────────────────────────────────────────────────────
+  it('listByUserId queries UserIdIndex GSI and paginates', async () => {
+    const pageA = [
+      { ...validCampaign, campaignId: 'a', createdAt: 'x', updatedAt: 'x' },
+    ];
+    const pageB = [
+      { ...validCampaign, campaignId: 'b', createdAt: 'x', updatedAt: 'x' },
+    ];
+    mockQuery
       .mockReturnValueOnce({
-        promise: jest
-          .fn()
-          .mockResolvedValue({ Items: pageA, LastEvaluatedKey: { campaignId: 'a' } }),
+        promise: jest.fn().mockResolvedValue({
+          Items: pageA,
+          LastEvaluatedKey: { campaignId: 'a' },
+        }),
       })
       .mockReturnValueOnce({
         promise: jest.fn().mockResolvedValue({ Items: pageB }),
       });
 
-    const all = await db.listAll();
+    const all = await db.listByUserId(OWNER);
     expect(all).toHaveLength(2);
-    expect(all.map((c) => c.campaignId)).toEqual(['a', 'b']);
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        IndexName: 'UserIdIndex',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: expect.objectContaining({
+          ':userId': OWNER,
+        }),
+      }),
+    );
   });
 
-  it('listActive filters by isActive=true AND killSwitch=false', async () => {
+  it('listByUserId falls back to filtered Scan when the GSI is missing', async () => {
+    mockQuery.mockReturnValueOnce({
+      promise: jest
+        .fn()
+        .mockRejectedValue(
+          Object.assign(new Error('Index not ready'), {
+            code: 'ResourceNotFoundException',
+          }),
+        ),
+    });
+    mockScan.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({
+        Items: [
+          {
+            ...validCampaign,
+            campaignId: 'c',
+            createdAt: 'x',
+            updatedAt: 'x',
+          },
+        ],
+      }),
+    });
+
+    const all = await db.listByUserId(OWNER);
+    expect(all).toHaveLength(1);
+    expect(mockScan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        FilterExpression: 'userId = :userId',
+      }),
+    );
+  });
+
+  it('listActiveByUserId adds the active-and-not-killswitch filter on top of userId', async () => {
+    mockQuery.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({ Items: [] }),
+    });
+    await db.listActiveByUserId(OWNER);
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        FilterExpression: 'isActive = :active AND killSwitch = :off',
+        ExpressionAttributeValues: expect.objectContaining({
+          ':userId': OWNER,
+          ':active': true,
+          ':off': false,
+        }),
+      }),
+    );
+  });
+
+  it('listActiveAllTenants scans the whole table for the drip executor cron', async () => {
     mockScan.mockReturnValueOnce({
       promise: jest.fn().mockResolvedValue({ Items: [] }),
     });
-    await db.listActive();
+    await db.listActiveAllTenants();
     expect(mockScan).toHaveBeenCalledWith(
       expect.objectContaining({
         FilterExpression: 'isActive = :active AND killSwitch = :off',
@@ -244,7 +372,7 @@ describe('DripCampaignDb', () => {
     );
   });
 
-  it('update merges fields, preserves createdBy / createdAt, and bumps updatedAt', async () => {
+  it('update merges fields, preserves createdBy / createdAt / userId, and bumps updatedAt', async () => {
     const existing: DripCampaign = {
       ...validCampaign,
       campaignId: 'cmp-42',
@@ -256,25 +384,29 @@ describe('DripCampaignDb', () => {
     });
     mockPut.mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
 
-    const updated = await db.update('cmp-42', {
+    const updated = await db.update('cmp-42', OWNER, {
       cadenceValue: 14,
       killSwitch: true,
-      // Attempt to tamper with createdBy should be ignored by the type but
-      // we cast the whole object to any to prove the runtime override still wins.
-      // Per-field `as any` does not suppress TS2353 (excess-property check runs
-      // before value-type resolution); whole-object cast does.
+      // Attempt to tamper with userId / createdBy — must be ignored.
+      userId: 'hijacker',
       createdBy: 'hijacker',
     } as any);
 
     expect(updated.cadenceValue).toBe(14);
     expect(updated.killSwitch).toBe(true);
-    expect(updated.createdBy).toBe('admin-123');
+    expect(updated.userId).toBe(OWNER);
+    expect(updated.createdBy).toBe(OWNER);
     expect(updated.createdAt).toBe('2026-04-10T00:00:00Z');
     expect(updated.updatedAt).not.toBe('2026-04-10T00:00:00Z');
-    // Optimistic concurrency guard must be present
+    // Optimistic concurrency + userId guard must both be present
     expect(mockPut).toHaveBeenCalledWith(
       expect.objectContaining({
-        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        ConditionExpression:
+          'updatedAt = :expectedUpdatedAt AND userId = :expectedUserId',
+        ExpressionAttributeValues: expect.objectContaining({
+          ':expectedUpdatedAt': '2026-04-10T00:00:00Z',
+          ':expectedUserId': OWNER,
+        }),
       }),
     );
   });
@@ -283,18 +415,39 @@ describe('DripCampaignDb', () => {
     mockGet.mockReturnValueOnce({
       promise: jest.fn().mockResolvedValue({ Item: undefined }),
     });
-    await expect(db.update('missing', { maxSends: 5 })).rejects.toThrow(
-      'Campaign not found: missing',
-    );
+    await expect(
+      db.update('missing', OWNER, { maxSends: 5 }),
+    ).rejects.toThrow('Campaign not found: missing');
   });
 
-  it('deleteById calls DynamoDB delete with the right key', async () => {
-    await db.deleteById('cmp-99');
+  it('deleteById calls DynamoDB delete with the right key + userId guard', async () => {
+    const existing: DripCampaign = {
+      ...validCampaign,
+      campaignId: 'cmp-99',
+      createdAt: 'x',
+      updatedAt: 'x',
+    };
+    mockGet.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({ Item: existing }),
+    });
+    await db.deleteById('cmp-99', OWNER);
     expect(mockDelete).toHaveBeenCalledWith(
       expect.objectContaining({
         TableName: 'Test-AW-DripCampaigns',
         Key: { campaignId: 'cmp-99' },
+        ConditionExpression: 'userId = :expectedUserId',
+        ExpressionAttributeValues: { ':expectedUserId': OWNER },
       }),
     );
+  });
+
+  it('deleteById throws Campaign not found when the row is missing', async () => {
+    mockGet.mockReturnValueOnce({
+      promise: jest.fn().mockResolvedValue({ Item: undefined }),
+    });
+    await expect(db.deleteById('gone', OWNER)).rejects.toThrow(
+      'Campaign not found: gone',
+    );
+    expect(mockDelete).not.toHaveBeenCalled();
   });
 });

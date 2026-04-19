@@ -2027,13 +2027,13 @@ Typical prompts this answers:
   },
 });
 
-// ─── Lifecycle Drip Phase 3: Campaign management (admin-only) ───────────────
+// ─── Drip Campaigns: customer-scoped management ────────────────────────────
 
 mcpToolRegistry.register({
   name: 'manage_drip_campaign',
   definition: {
     name: 'manage_drip_campaign',
-    description: `Create, update, pause, resume, list, or delete a lifecycle drip email campaign. Admin-only. Used by ops to stand up onboarding-revival and upgrade-nudge drips without clicking through the Partner Portal UI.
+    description: `Create, update, pause, resume, list, or delete a drip email campaign scoped to the caller's own CRM leads. Customer-facing (not admin-only).
 
 A drip campaign targets a segment (by onboarding stage / goal / inactivity cutoff), renders an email template with merge fields, and — once Phase 4 ships — sends it on a cadence with a per-user cap.
 
@@ -2093,6 +2093,8 @@ Example create for "Fangfang's brand-step recovery drip":
         kill_switch: { type: 'boolean' },
         segment_query: {
           type: 'object',
+          description:
+            'Segment filter. CRM-flavoured criteria (lifecycle, minHeatScore, utmSource, leadListId) target AW-Leads. Legacy onboarding criteria (stage, lastActivityBefore, goal) are retained for campaigns created before the multi-tenant refactor.',
           properties: {
             stage: {
               type: 'string',
@@ -2113,6 +2115,32 @@ Example create for "Fangfang's brand-step recovery drip":
               type: 'string',
               description:
                 'Onboarding goal filter (e.g. paid_ads, seo). Matches goal_selected event data.',
+            },
+            lifecycle: {
+              type: 'string',
+              enum: [
+                'unknown',
+                'inbox',
+                'signed_up',
+                'in_deal',
+                'trialing',
+                'paying',
+                'at_risk',
+                'churned',
+              ],
+              description: 'CRM lifecycle stage filter.',
+            },
+            minHeatScore: {
+              type: 'number',
+              description: 'Minimum heat score (0-100).',
+            },
+            utmSource: {
+              type: 'string',
+              description: 'Exact-match filter on lead attribution source.',
+            },
+            leadListId: {
+              type: 'string',
+              description: 'Scope campaign to a single lead list.',
             },
           },
           additionalProperties: false,
@@ -2145,7 +2173,7 @@ Example create for "Fangfang's brand-step recovery drip":
       case 'list': {
         const data = await mcpFetch({
           method: 'GET',
-          path: '/api/admin/drip-campaigns',
+          path: '/api/drip-campaigns',
           context: ctx(context),
         });
         return jsonResult(data);
@@ -2156,7 +2184,7 @@ Example create for "Fangfang's brand-step recovery drip":
         }
         const data = await mcpFetch({
           method: 'GET',
-          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          path: `/api/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
           context: ctx(context),
         });
         return jsonResult(data);
@@ -2164,7 +2192,7 @@ Example create for "Fangfang's brand-step recovery drip":
       case 'create': {
         const data = await mcpFetch({
           method: 'POST',
-          path: '/api/admin/drip-campaigns',
+          path: '/api/drip-campaigns',
           context: ctx(context),
           body: toBody(),
         });
@@ -2176,7 +2204,7 @@ Example create for "Fangfang's brand-step recovery drip":
         }
         const data = await mcpFetch({
           method: 'PATCH',
-          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          path: `/api/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
           context: ctx(context),
           body: toBody(),
         });
@@ -2188,7 +2216,7 @@ Example create for "Fangfang's brand-step recovery drip":
         }
         const data = await mcpFetch({
           method: 'PATCH',
-          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          path: `/api/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
           context: ctx(context),
           body: { killSwitch: true },
         });
@@ -2200,7 +2228,7 @@ Example create for "Fangfang's brand-step recovery drip":
         }
         const data = await mcpFetch({
           method: 'PATCH',
-          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          path: `/api/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
           context: ctx(context),
           body: { killSwitch: false },
         });
@@ -2212,7 +2240,7 @@ Example create for "Fangfang's brand-step recovery drip":
         }
         await mcpFetch({
           method: 'DELETE',
-          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          path: `/api/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
           context: ctx(context),
         });
         return jsonResult({ success: true, campaign_id: args.campaign_id });
@@ -2222,6 +2250,82 @@ Example create for "Fangfang's brand-step recovery drip":
           error: `Unknown action: ${action}. Valid: list|get|create|update|pause|resume|delete`,
         });
     }
+  },
+});
+
+// ─── CRM lead segmentation for drip campaigns ──────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'get_leads_by_crm_criteria',
+  definition: {
+    name: 'get_leads_by_crm_criteria',
+    description: `Preview which CRM leads (from AW-Leads, scoped to the caller's own lead lists) match a segment query. Use this before creating a drip campaign to confirm who will be targeted. Read-only — does not persist a campaign.
+
+Supported criteria (all optional; leaving a criterion unset means "any"):
+- \`lifecycle\`: lifecycle stage of the lead. One of \`unknown\`, \`inbox\`, \`signed_up\`, \`in_deal\`, \`trialing\`, \`paying\`, \`at_risk\`, \`churned\`.
+- \`min_heat_score\`: minimum heat score (0-100). Leads below this score are excluded. Missing heat scores count as 0.
+- \`utm_source\`: exact-match filter on the lead's attribution source (e.g. \`linkedin\`, \`google\`, \`newsletter\`).
+- \`lead_list_id\`: scope to a single lead list. If omitted, every list owned by the caller is searched.
+- \`limit\`: maximum number of sample leads to return (default 20, max 100). The \`total\` field always reflects the full matching count.
+
+Example:
+  action inputs: { lifecycle: "trialing", min_heat_score: 50, limit: 10 }
+  response: { total: 42, sampleSize: 10, leads: [...], criteria: {...} }`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        lifecycle: {
+          type: 'string',
+          enum: [
+            'unknown',
+            'inbox',
+            'signed_up',
+            'in_deal',
+            'trialing',
+            'paying',
+            'at_risk',
+            'churned',
+          ],
+          description: 'Lifecycle stage filter.',
+        },
+        min_heat_score: {
+          type: 'number',
+          description: 'Minimum heat score (0-100). Leads below this value are excluded.',
+        },
+        utm_source: {
+          type: 'string',
+          description: 'Exact-match filter on attribution source (e.g. linkedin, google).',
+        },
+        lead_list_id: {
+          type: 'string',
+          description: 'Restrict to a single lead list. Omit to search every list owned by caller.',
+        },
+        limit: {
+          type: 'integer',
+          description: 'Sample size to return. Default 20, max 100.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const body: Record<string, any> = {};
+    if (typeof args.lifecycle === 'string') body.lifecycle = args.lifecycle;
+    if (typeof args.min_heat_score === 'number')
+      body.minHeatScore = args.min_heat_score;
+    if (typeof args.utm_source === 'string') body.utmSource = args.utm_source;
+    if (typeof args.lead_list_id === 'string')
+      body.leadListId = args.lead_list_id;
+    if (typeof args.limit === 'number') body.limit = args.limit;
+
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/drip-campaigns/preview-segment',
+      context: ctx(context),
+      body,
+    });
+    return jsonResult(data);
   },
 });
 

@@ -1,7 +1,7 @@
 /**
  * Tests for `manage_drip_campaign` — Phase 3 of the Lifecycle Drip epic.
  * Verifies the MCP tool is registered, takes the expected args, and routes
- * each action to the right HTTP verb/path on /api/admin/drip-campaigns.
+ * each action to the right HTTP verb/path on /api/drip-campaigns.
  */
 
 jest.mock('../mcp/server/httpClient', () => ({
@@ -59,7 +59,7 @@ describe('manage_drip_campaign (admin MCP tool)', () => {
     );
   });
 
-  it('action=list issues GET /api/admin/drip-campaigns', async () => {
+  it('action=list issues GET /api/drip-campaigns', async () => {
     mockMcpFetch.mockResolvedValue({ campaigns: [] });
     await mcpToolRegistry.execute(
       'manage_drip_campaign',
@@ -69,7 +69,7 @@ describe('manage_drip_campaign (admin MCP tool)', () => {
     expect(mockMcpFetch).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'GET',
-        path: '/api/admin/drip-campaigns',
+        path: '/api/drip-campaigns',
       }),
     );
   });
@@ -84,7 +84,7 @@ describe('manage_drip_campaign (admin MCP tool)', () => {
     expect(mockMcpFetch).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'GET',
-        path: '/api/admin/drip-campaigns/abc',
+        path: '/api/drip-campaigns/abc',
       }),
     );
   });
@@ -119,7 +119,7 @@ describe('manage_drip_campaign (admin MCP tool)', () => {
     expect(mockMcpFetch).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'POST',
-        path: '/api/admin/drip-campaigns',
+        path: '/api/drip-campaigns',
         body: expect.objectContaining({
           name: 'Test drip',
           subjectLine: 'hi',
@@ -143,7 +143,7 @@ describe('manage_drip_campaign (admin MCP tool)', () => {
     expect(mockMcpFetch).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'PATCH',
-        path: '/api/admin/drip-campaigns/abc',
+        path: '/api/drip-campaigns/abc',
         body: { cadenceValue: 14 },
       }),
     );
@@ -189,7 +189,7 @@ describe('manage_drip_campaign (admin MCP tool)', () => {
     expect(mockMcpFetch).toHaveBeenCalledWith(
       expect.objectContaining({
         method: 'DELETE',
-        path: '/api/admin/drip-campaigns/abc',
+        path: '/api/drip-campaigns/abc',
       }),
     );
   });

@@ -1,25 +1,30 @@
 /**
- * Drip campaigns — Lifecycle Drip Phase 3 (config layer).
+ * Drip campaigns — customer-scoped HTTP surface.
  *
- * Admin-only HTTP surface for managing drip campaigns. Both entry points
- * (Partner Portal `/admin/drip-campaigns` page and Emma's
- * `manage_drip_campaign` tool via MCP bridge) target these endpoints so
- * there is exactly one schema and one auth boundary.
+ * Phase A (multi-tenant refactor): this router was admin-only in Phase 3.
+ * Every endpoint now scopes by `req.user.userId` so each customer manages
+ * their own drip campaigns against their own CRM leads. `isAdmin` is no
+ * longer applied; `authenticateToken` at the mount site is the only gate.
+ *
+ * Cross-tenant reads/updates/deletes return 404 (not 403) so the API never
+ * reveals the existence of another customer's campaigns. The DB layer
+ * enforces this; routes just translate "not found" into the right HTTP
+ * status.
  *
  * Endpoints
- *   GET    /                    — list all campaigns
- *   GET    /:id                 — fetch one
- *   POST   /                    — create
- *   PATCH  /:id                 — update (including kill-switch toggle)
- *   DELETE /:id                 — hard delete
+ *   GET    /                    — list caller's campaigns
+ *   GET    /:id                 — fetch one (caller must own it)
+ *   POST   /                    — create one for caller
+ *   PATCH  /:id                 — update (caller must own it)
+ *   DELETE /:id                 — hard delete (caller must own it)
  *   POST   /:id/preview         — render the template against a sample user
  *
- * Phase 4 adds the scheduler + send executor. This file stays config-only.
+ * Phase B moves the Customer Portal UI into this router's clients and
+ * deletes the Partner Portal admin page entirely.
  */
 
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { isAdmin } from '../middleware/admin';
 import {
   getDripCampaignDb,
   renderTemplate,
@@ -27,13 +32,15 @@ import {
   ALLOWED_MERGE_FIELDS,
   DripCampaign,
 } from '../services/dripCampaignDb';
+import { defaultListLeadsForCampaign } from '../cron/dripExecutor';
 
 const router = express.Router();
 
-// Every endpoint below is admin-only. Enforced twice: once at the app
-// mount site (see app.ts) and here, so removing the mount guard in a
-// refactor still leaves the handlers safe.
-router.use(authenticateToken, isAdmin);
+// Every endpoint requires an authenticated user. Enforced twice: once at
+// the app mount site (see app.ts) and here, so removing the mount guard
+// in a refactor still leaves the handlers safe. No admin gate — drip
+// campaigns are a customer-facing feature in Phase A+.
+router.use(authenticateToken);
 
 /** Shared request→DripCampaign coercion for create + update. Returns either
  * a validated partial payload or a 400-shaped error object. Kept separate
@@ -59,13 +66,27 @@ function parseCampaignPayload(
   if (typeof body.isActive === 'boolean') out.isActive = body.isActive;
   if (typeof body.killSwitch === 'boolean') out.killSwitch = body.killSwitch;
   if (body.segmentQuery && typeof body.segmentQuery === 'object') {
-    const { stage, lastActivityBefore, goal } = body.segmentQuery;
+    const {
+      stage,
+      lastActivityBefore,
+      goal,
+      lifecycle,
+      minHeatScore,
+      utmSource,
+      leadListId,
+    } = body.segmentQuery;
     out.segmentQuery = {
       ...(typeof stage === 'string' && stage ? { stage } : {}),
       ...(typeof lastActivityBefore === 'string' && lastActivityBefore
         ? { lastActivityBefore }
         : {}),
       ...(typeof goal === 'string' && goal ? { goal } : {}),
+      ...(typeof lifecycle === 'string' && lifecycle ? { lifecycle } : {}),
+      ...(typeof minHeatScore === 'number' && Number.isFinite(minHeatScore)
+        ? { minHeatScore }
+        : {}),
+      ...(typeof utmSource === 'string' && utmSource ? { utmSource } : {}),
+      ...(typeof leadListId === 'string' && leadListId ? { leadListId } : {}),
     };
   }
 
@@ -94,10 +115,24 @@ function parseCampaignPayload(
   return { ok: true, value: out };
 }
 
-/** GET / — list all campaigns (admin view). */
-router.get('/', async (_req: Request, res: Response) => {
+/** Pull the caller's userId off the request or send 401. Kept as a helper
+ * so every handler has an identical early-return shape. */
+function requireUser(req: Request, res: Response): string | null {
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) {
+    res.status(401).json({ message: 'User not authenticated' });
+    return null;
+  }
+  return userId;
+}
+
+/** GET / — list the caller's campaigns. */
+router.get('/', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
   try {
-    const campaigns = await getDripCampaignDb().listAll();
+    const campaigns = await getDripCampaignDb().listByUserId(userId);
     return res.json({ campaigns });
   } catch (error) {
     console.error('Error listing drip campaigns:', error);
@@ -107,10 +142,12 @@ router.get('/', async (_req: Request, res: Response) => {
   }
 });
 
-/** GET /:id — fetch one. */
+/** GET /:id — fetch one, scoped to caller. */
 router.get('/:id', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
   try {
-    const campaign = await getDripCampaignDb().getById(req.params.id);
+    const campaign = await getDripCampaignDb().getById(req.params.id, userId);
     if (!campaign) {
       return res.status(404).json({ message: 'Campaign not found' });
     }
@@ -123,15 +160,11 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
-/** POST / — create. */
+/** POST / — create for caller. */
 router.post('/', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
   try {
-    const authReq = req as AuthenticatedRequest;
-    const userId = authReq.user?.userId;
-    if (!userId) {
-      return res.status(401).json({ message: 'User not authenticated' });
-    }
-
     const parsed = parseCampaignPayload(req.body, 'create');
     if (!parsed.ok) return res.status(400).json({ message: parsed.error });
 
@@ -140,6 +173,7 @@ router.post('/', async (req: Request, res: Response) => {
         DripCampaign,
         'campaignId' | 'createdAt' | 'updatedAt'
       >),
+      userId,
       createdBy: userId,
     });
     return res.status(201).json({ campaign });
@@ -157,12 +191,18 @@ router.post('/', async (req: Request, res: Response) => {
   }
 });
 
-/** PATCH /:id — update (partial). */
+/** PATCH /:id — update (partial). Cross-tenant attempts map to 404. */
 router.patch('/:id', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
   try {
     const parsed = parseCampaignPayload(req.body, 'update');
     if (!parsed.ok) return res.status(400).json({ message: parsed.error });
-    const updated = await getDripCampaignDb().update(req.params.id, parsed.value);
+    const updated = await getDripCampaignDb().update(
+      req.params.id,
+      userId,
+      parsed.value,
+    );
     return res.json({ campaign: updated });
   } catch (error: any) {
     console.error('Error updating drip campaign:', error);
@@ -178,14 +218,21 @@ router.patch('/:id', async (req: Request, res: Response) => {
   }
 });
 
-/** DELETE /:id — hard delete. Phase 4's executor should treat missing
- * campaigns as a no-op so there's no race. */
+/** DELETE /:id — hard delete. Cross-tenant attempts map to 404. */
 router.delete('/:id', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
   try {
-    await getDripCampaignDb().deleteById(req.params.id);
+    await getDripCampaignDb().deleteById(req.params.id, userId);
     return res.status(204).send();
   } catch (error) {
     console.error('Error deleting drip campaign:', error);
+    if (
+      error instanceof Error &&
+      error.message.startsWith('Campaign not found')
+    ) {
+      return res.status(404).json({ message: error.message });
+    }
     return res
       .status(500)
       .json({ message: 'Failed to delete drip campaign' });
@@ -197,13 +244,15 @@ router.delete('/:id', async (req: Request, res: Response) => {
  * Body: { sampleUser?: { firstName?, companyName?, lastStep?, goal? } }
  *
  * Renders the template against a sample user (or a default one if omitted)
- * so the Partner Portal UI can show a live preview before save. Returns
+ * so the Customer Portal UI can show a live preview before save. Returns
  * the merged HTML plus the list of detected merge fields so the UI can
  * highlight any it needs to collect.
  */
 router.post('/:id/preview', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
   try {
-    const campaign = await getDripCampaignDb().getById(req.params.id);
+    const campaign = await getDripCampaignDb().getById(req.params.id, userId);
     if (!campaign) {
       return res.status(404).json({ message: 'Campaign not found' });
     }
@@ -227,6 +276,89 @@ router.post('/:id/preview', async (req: Request, res: Response) => {
     return res
       .status(500)
       .json({ message: 'Failed to preview drip campaign' });
+  }
+});
+
+/**
+ * POST /preview-segment
+ * Body: { lifecycle?, minHeatScore?, utmSource?, leadListId?, limit? }
+ *
+ * Preview the leads a drip campaign with these CRM criteria would target.
+ * Returns the first N matching leads (default 20, max 100) plus a total
+ * count for the UI. Read-only — doesn't persist a campaign. Callers
+ * typically use this in the Customer Portal "segment preview" step or via
+ * the `get_leads_by_crm_criteria` Emma tool.
+ *
+ * Scoped to caller's AW-Leads because `defaultListLeadsForCampaign`
+ * resolves lead lists via `getLeadListsByUserId(userId)` — cross-tenant
+ * leads are structurally unreachable from this endpoint.
+ */
+router.post('/preview-segment', async (req: Request, res: Response) => {
+  const userId = requireUser(req, res);
+  if (!userId) return;
+  try {
+    const body = (req.body ?? {}) as Record<string, any>;
+    const limitRaw = typeof body.limit === 'number' ? body.limit : 20;
+    const limit = Math.max(1, Math.min(100, Math.floor(limitRaw)));
+
+    // Build a throwaway campaign object — just enough for the segment
+    // filter to run. Never persisted.
+    const syntheticCampaign: DripCampaign = {
+      campaignId: '__preview__',
+      userId,
+      name: '__preview__',
+      segmentQuery: {
+        ...(typeof body.lifecycle === 'string' && body.lifecycle
+          ? { lifecycle: body.lifecycle }
+          : {}),
+        ...(typeof body.minHeatScore === 'number' &&
+        Number.isFinite(body.minHeatScore)
+          ? { minHeatScore: body.minHeatScore }
+          : {}),
+        ...(typeof body.utmSource === 'string' && body.utmSource
+          ? { utmSource: body.utmSource }
+          : {}),
+        ...(typeof body.leadListId === 'string' && body.leadListId
+          ? { leadListId: body.leadListId }
+          : {}),
+      },
+      templateHtml: '<p>preview</p>',
+      subjectLine: 'preview',
+      cadenceUnit: 'days',
+      cadenceValue: 1,
+      maxSends: 1,
+      isActive: false,
+      killSwitch: true,
+      createdBy: userId,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const leads = await defaultListLeadsForCampaign(syntheticCampaign);
+    const sample = leads.slice(0, limit).map((l) => ({
+      listId: l.listId,
+      leadId: l.leadId,
+      email: l.email ?? null,
+      firstName: l.firstName ?? null,
+      lastName: l.lastName ?? null,
+      company: l.company ?? null,
+      lifecycle: l.lifecycle ?? null,
+      heatScore: typeof l.heatScore === 'number' ? l.heatScore : null,
+      utmSource: l.utmSource ?? null,
+      contactStatus: l.contactStatus ?? null,
+    }));
+
+    return res.json({
+      total: leads.length,
+      sampleSize: sample.length,
+      leads: sample,
+      criteria: syntheticCampaign.segmentQuery,
+    });
+  } catch (error) {
+    console.error('Error previewing drip segment:', error);
+    return res
+      .status(500)
+      .json({ message: 'Failed to preview drip segment' });
   }
 });
 
