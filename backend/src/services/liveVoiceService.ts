@@ -14,7 +14,7 @@
  */
 
 import { GoogleGenAI, Modality, LiveServerMessage, Session, Transcription } from '@google/genai';
-import { chatbotDb } from './chatbotService';
+import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
 
@@ -50,6 +50,13 @@ Example: "[warm] Great question! [thoughtful] Your ad spend is trending up — [
 /** Callback used to push events back to the browser via Socket.IO */
 type EmitFn = (event: string, data: unknown) => void;
 
+/** A structured artifact surfaced from a tool result (URL, image, or file) */
+export interface LiveArtifact {
+  type: 'url' | 'image' | 'file';
+  label: string;
+  url: string;
+}
+
 interface LiveEntry {
   session: Session;
   socketId: string;
@@ -61,6 +68,14 @@ interface LiveEntry {
   pendingUserText: string;
   /** Tool call results for the current turn — saved to DynamoDB but NOT shown in chat UI */
   toolContextText: string;
+  /** Structured artifacts extracted from tool results this turn */
+  pendingArtifacts: LiveArtifact[];
+  /** Tool call records for the current turn — surfaced in chat UI as collapsible "Used N tools" block */
+  pendingToolCalls: Array<{ id: string; name: string; arguments: any; result?: any; error?: string }>;
+  /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
+  resumptionHandle?: string;
+  /** Cached function declarations so reconnects reuse the same tool config without reloading */
+  functionDeclarations: any[];
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +232,146 @@ async function loadGeminiFunctionDeclarations(userId: string): Promise<any[]> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Open (or re-open) a Gemini Live WebSocket for the given Agent Mode sessionId.
+ * Internal — callers should use startLiveSession (public) or reconnectLiveSession.
+ *
+ * @param historyContext  Optional history block appended to the system prompt on fresh starts.
+ *                        Not passed on code-1000 resumptions (Gemini already has context).
+ */
+async function openGeminiSession(
+  sessionId: string,
+  entry: LiveEntry,
+  resumptionHandle?: string,
+  historyContext?: string
+): Promise<void> {
+  const ai = await getGenAI();
+
+  const geminiSession = await ai.live.connect({
+    model: LIVE_MODEL,
+    config: {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: LIVE_VOICE_NAME,
+          },
+        },
+      },
+      systemInstruction: {
+        parts: [{ text: LIVE_SYSTEM_PROMPT + (historyContext ?? '') }],
+      },
+      // Enable automatic transcription so transcripts are available in audio-only mode
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      // Wire in agent mode tools (sanitized for Gemini Live schema requirements)
+      ...(entry.functionDeclarations.length > 0 ? { tools: [{ functionDeclarations: entry.functionDeclarations }] } : {}),
+      // Request session resumption tokens so we can reconnect transparently after code 1000 closes
+      sessionResumption: resumptionHandle ? { handle: resumptionHandle } : {},
+    },
+    callbacks: {
+      onopen: () => {
+        console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}${resumptionHandle ? ' (resumed)' : ''}`);
+      },
+      onmessage: (message: LiveServerMessage) => {
+        console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
+        handleIncomingMessage(sessionId, message).catch((err) => {
+          console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message, err?.stack?.split('\n').slice(0, 5).join(' | '));
+        });
+      },
+      onerror: (e: ErrorEvent) => {
+        console.error(`[liveVoiceService] Gemini ERROR on session ${sessionId}:`, e.message, e);
+        const currentEntry = activeSessions.get(sessionId);
+        if (currentEntry) {
+          currentEntry.emitFn('live:error', { sessionId, error: e.message });
+        }
+      },
+      onclose: (e: CloseEvent) => {
+        console.log(`[liveVoiceService] Gemini CLOSED session ${sessionId}, code=${e.code}, reason=${e.reason}`);
+        const currentEntry = activeSessions.get(sessionId);
+        if (!currentEntry) return;
+
+        // Code 1000 = normal closure by Gemini after a turn. Reconnect transparently
+        // using the latest resumption handle so the conversation continues.
+        if (e.code === 1000 && currentEntry.resumptionHandle) {
+          console.log(`[liveVoiceService] Auto-reconnecting session ${sessionId} with handle ${currentEntry.resumptionHandle.slice(0, 8)}...`);
+          openGeminiSession(sessionId, currentEntry, currentEntry.resumptionHandle)
+            .then(() => { currentEntry.session = activeSessions.get(sessionId)!.session; })
+            .catch((err) => {
+              console.error(`[liveVoiceService] Reconnect failed for ${sessionId}:`, err?.message);
+              activeSessions.delete(sessionId);
+              currentEntry.emitFn('live:closed', { sessionId });
+            });
+          return;
+        }
+
+        // Abnormal close or no handle — surface to client
+        activeSessions.delete(sessionId);
+        currentEntry.emitFn('live:closed', { sessionId });
+      },
+    },
+  });
+
+  entry.session = geminiSession;
+}
+
+/**
+ * Load prior chat messages from DynamoDB and format them as a conversation
+ * history block to embed in the system prompt. Uses the same filtering rules
+ * as agentModeService:
+ * - Slice to the 10th-most-recent user message (same context window)
+ * - Skip empty assistant messages and error messages
+ *
+ * Returns an empty string if there is no prior history.
+ */
+async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
+  try {
+    const allMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    if (!allMessages || allMessages.length === 0) return '';
+
+    // Slice to the 10th-most-recent user message (same window as agentModeService:2280-2292)
+    let userCount = 0;
+    let startIdx = 0;
+    for (let i = allMessages.length - 1; i >= 0; i--) {
+      if (allMessages[i].role === 'user') {
+        userCount++;
+        if (userCount === 10) { startIdx = i; break; }
+      }
+    }
+    const sliced = allMessages.slice(startIdx);
+
+    const lines: string[] = [];
+    for (const msg of sliced) {
+      if (msg.role === 'system') continue;
+      // Skip empty assistant messages (same as agentModeService:2297-2300)
+      if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) continue;
+      // Skip error messages (same as agentModeService:2302-2306)
+      if (msg.role === 'assistant' && (msg as any).metadata?.isErrorMessage) continue;
+
+      const text = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? (msg.content as any[]).map((c: any) => c?.text || '').filter(Boolean).join(' ')
+          : String(msg.content || '');
+
+      const trimmed = text.trim();
+      if (trimmed) {
+        const label = msg.role === 'user' ? 'User' : 'Emma';
+        // Truncate very long messages to avoid bloating the system prompt
+        const snippet = trimmed.length > 500 ? trimmed.slice(0, 500) + '…' : trimmed;
+        lines.push(`${label}: ${snippet}`);
+      }
+    }
+
+    if (lines.length === 0) return '';
+
+    return `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
+  } catch (err: any) {
+    console.warn('[liveVoiceService] Failed to load history for system prompt:', err?.message);
+    return '';
+  }
+}
+
+/**
  * Start a Gemini Live session for the given Agent Mode sessionId.
  * If a session already exists for this sessionId, it is closed first.
  *
@@ -235,6 +390,16 @@ export async function startLiveSession(
     closeLiveSession(sessionId);
   }
 
+  // Load tools and prior history in parallel
+  const [functionDeclarations, historyContext] = await Promise.all([
+    loadGeminiFunctionDeclarations(userId),
+    loadHistoryForSystemPrompt(sessionId),
+  ]);
+
+  if (historyContext) {
+    console.log(`[liveVoiceService] Injecting history into system prompt for ${sessionId}`);
+  }
+
   // Placeholder entry — filled after session resolves
   const entry: LiveEntry = {
     session: null as unknown as Session,
@@ -244,63 +409,15 @@ export async function startLiveSession(
     currentTurnText: '',
     pendingUserText: '',
     toolContextText: '',
+    pendingArtifacts: [],
+    pendingToolCalls: [],
+    functionDeclarations,
   };
   activeSessions.set(sessionId, entry);
 
-  // Load user's allowed tools converted to Gemini Live format
-  const functionDeclarations = await loadGeminiFunctionDeclarations(userId);
-
-  const ai = await getGenAI();
-
-  const geminiSession = await ai.live.connect({
-    model: LIVE_MODEL,
-    config: {
-      responseModalities: [Modality.AUDIO],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: {
-            voiceName: LIVE_VOICE_NAME,
-          },
-        },
-      },
-      systemInstruction: {
-        parts: [{ text: LIVE_SYSTEM_PROMPT }],
-      },
-      // Enable automatic transcription so transcripts are available in audio-only mode
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
-      // Wire in agent mode tools (sanitized for Gemini Live schema requirements)
-      ...(functionDeclarations.length > 0 ? { tools: [{ functionDeclarations }] } : {}),
-    },
-    callbacks: {
-      onopen: () => {
-        console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}`);
-      },
-      onmessage: (message: LiveServerMessage) => {
-        console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
-        handleIncomingMessage(sessionId, message).catch((err) => {
-          console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message);
-        });
-      },
-      onerror: (e: ErrorEvent) => {
-        console.error(`[liveVoiceService] Gemini ERROR on session ${sessionId}:`, e.message, e);
-        const currentEntry = activeSessions.get(sessionId);
-        if (currentEntry) {
-          currentEntry.emitFn('live:error', { sessionId, error: e.message });
-        }
-      },
-      onclose: (e: CloseEvent) => {
-        console.log(`[liveVoiceService] Gemini CLOSED session ${sessionId}, code=${e.code}, reason=${e.reason}`);
-        const currentEntry = activeSessions.get(sessionId);
-        if (currentEntry) {
-          currentEntry.emitFn('live:closed', { sessionId });
-        }
-        activeSessions.delete(sessionId);
-      },
-    },
-  });
-
-  entry.session = geminiSession;
+  // Pass history via system prompt on fresh starts. Code-1000 resumptions already
+  // carry Gemini's own in-memory context, so historyContext is not passed there.
+  await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
 }
 
 /**
@@ -369,6 +486,54 @@ function stripEmotionTags(text: string): string {
   return text.replace(EMOTION_TAG_RE, '').replace(/\s{2,}/g, ' ');
 }
 
+// Single-word affirmations/negations that are short but meaningful — always persist.
+const MEANINGFUL_SINGLE_WORDS = new Set([
+  'yes', 'no', 'ok', 'okay', 'sure', 'nope', 'yep', 'yeah', 'nah',
+  'stop', 'go', 'done', 'next', 'back', 'help',
+]);
+
+// Pure filler/noise tokens that Gemini STT emits for background sounds or
+// stray microphone pickup. These are never meaningful when they appear alone.
+const NOISE_TOKENS = new Set([
+  // Vocal fillers
+  'uh', 'um', 'mm', 'hmm', 'hm', 'ah', 'oh', 'er',
+  // Articles / conjunctions that Gemini often emits as isolated noise fragments
+  'the', 'a', 'an', 'and', 'but', 'or', 'so', 'i',
+]);
+
+/**
+ * Returns true if the user transcript looks like STT noise from background
+ * audio and should NOT be persisted to DynamoDB.
+ *
+ * Rules (all must hold to classify as noise):
+ *  1. After stripping punctuation and whitespace the text is ≤1 word, AND
+ *  2. That word is either a known noise token or the text is purely punctuation.
+ *
+ * Multi-word transcripts are always treated as real input even if they start
+ * with filler words ("uh how is my ad spend" is meaningful).
+ * Short meaningful words like "Yes" / "No" are explicitly allowed through.
+ */
+function isNoiseTurn(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  // Strip punctuation-only strings (e.g. "...", "???")
+  const stripped = trimmed.replace(/[.,!?;:\-\u2026"'()]+/g, '').trim();
+  if (!stripped) return true;
+
+  // Multi-word — always a real turn
+  const words = stripped.split(/\s+/).filter(Boolean);
+  if (words.length > 1) return false;
+
+  const word = words[0].toLowerCase();
+
+  // Allow through short but meaningful words
+  if (MEANINGFUL_SINGLE_WORDS.has(word)) return false;
+
+  // Single known noise token
+  return NOISE_TOKENS.has(word);
+}
+
 // ---------------------------------------------------------------------------
 // Internal: handle incoming Gemini messages
 // ---------------------------------------------------------------------------
@@ -421,6 +586,11 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     if (displayText) emitFn('live:user-transcript', { sessionId, text: displayText });
   }
 
+  // Capture resumption handle so onclose can reconnect transparently
+  if (message.sessionResumptionUpdate?.newHandle && message.sessionResumptionUpdate.resumable) {
+    entry.resumptionHandle = message.sessionResumptionUpdate.newHandle;
+  }
+
   // Tool call: execute the requested tool(s) and send results back to Gemini
   if (message.toolCall?.functionCalls?.length) {
     const functionCalls = message.toolCall.functionCalls;
@@ -444,9 +614,38 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
           entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
+          // Record for UI display (collapsible "Used N tools" block, like other models)
+          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, result });
+          // Extract artifacts (URLs, images, files) from tool results for UI display
+          if (typeof result === 'object' && result !== null) {
+            if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
+            const r = result as Record<string, unknown>;
+            // Social post preview page (create_social_media_posts)
+            if (typeof r.htmlUrl === 'string' && r.htmlUrl.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'url', label: 'View posts', url: r.htmlUrl });
+            }
+            // Direct LinkedIn/social publish (post_on_connected_account)
+            if (typeof r.post_url === 'string' && r.post_url.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'url', label: 'View post', url: r.post_url });
+            }
+            // Generated image (generate_image, generate_video_thumbnail, etc.)
+            if (typeof r.imageUrl === 'string' && r.imageUrl.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'image', label: 'Generated image', url: r.imageUrl });
+            }
+            // S3-hosted file or report (download_file, export tools, etc.)
+            if (typeof r.s3_url === 'string' && r.s3_url.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'file', label: 'Download file', url: r.s3_url });
+            }
+            if (typeof r.file_url === 'string' && r.file_url.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'file', label: 'Download file', url: r.file_url });
+            }
+          }
         } catch (err: any) {
           console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
           responseContent = { error: err?.message ?? 'Tool execution failed' };
+          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, error: err?.message ?? 'Tool execution failed' });
         }
         return { id: fc.id, name: fc.name!, response: responseContent } as any;
       })
@@ -464,24 +663,47 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
+    // Capture artifacts and tool calls before reset (guard against undefined)
+    const rawArtifacts: LiveArtifact[] = entry.pendingArtifacts ?? [];
+    const artifacts = rawArtifacts.length > 0 ? [...rawArtifacts] : undefined;
+    const toolCalls = (entry.pendingToolCalls ?? []).length > 0 ? [...entry.pendingToolCalls] : undefined;
+
     // Reset for next turn before async work
     entry.currentTurnText = '';
     entry.pendingUserText = '';
     entry.toolContextText = '';
+    entry.pendingArtifacts = [];
+    entry.pendingToolCalls = [];
 
-    // Emit turn-complete immediately so browser can update UI
-    // assistantText contains only the clean spoken transcript — no tool call output
-    emitFn('live:turn-complete', { sessionId, assistantText, userText });
+    // Append artifact markdown to the assistant message so it persists in DynamoDB
+    // and survives any subsequent session reload — no client-side re-apply needed.
+    const artifactSuffix = artifacts && artifacts.length > 0
+      ? '\n\n' + artifacts.map(a => a.type === 'image' ? `![${a.label}](${a.url})` : `[${a.label}](${a.url})`).join('\n')
+      : '';
+    const assistantContent = assistantText + artifactSuffix;
+
+    // Emit turn-complete with full content, artifacts, and tool calls for rich UI rendering
+    emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, artifacts, toolCalls });
 
     // Fire-and-forget save — never blocks the audio stream
-    // Save only the clean assistant transcript — Gemini Live maintains its own session
-    // context and does not need tool results re-injected from DynamoDB on the next turn.
-    if (assistantText) {
-      const messagesToSave = [];
-      if (userText) {
-        messagesToSave.push({ role: 'user' as const, content: userText });
+    if (assistantContent) {
+      const messagesToSave: Array<ChatMessage> = [];
+      // Skip saving user turns that are STT noise from background audio — persisting
+      // them corrupts the context window and causes repetitive/fragmented responses.
+      if (userText && !isNoiseTurn(userText)) {
+        messagesToSave.push({ role: 'user', content: userText });
       }
-      messagesToSave.push({ role: 'assistant' as const, content: assistantText });
+      const assistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: assistantContent,
+        ...(toolCalls && toolCalls.length > 0 ? {
+          metadata: {
+            timestamp: new Date().toISOString(),
+            toolCalls,
+          },
+        } : {}),
+      };
+      messagesToSave.push(assistantMessage);
 
       chatbotDb.addMessagesToSession(sessionId, messagesToSave).catch((err) => {
         console.warn(`[liveVoiceService] Failed to save transcript for session ${sessionId}:`, err?.message);
