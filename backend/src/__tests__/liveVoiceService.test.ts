@@ -40,6 +40,14 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue('fake-gemini-api-key'),
 }));
 
+const mockExecuteTool = jest.fn();
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    getFilteredTools: jest.fn().mockResolvedValue([]),
+    executeTool: mockExecuteTool,
+  },
+}));
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -809,5 +817,111 @@ describe('error handling', () => {
     expect(emitFn).toHaveBeenCalledWith('live:closed', {
       sessionId: 'session-drop',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool call surfacing in live:turn-complete and DynamoDB metadata
+// ---------------------------------------------------------------------------
+
+describe('tool call surfacing', () => {
+  const mockSession = {
+    sendClientContent: mockSessionSendClientContent,
+    sendRealtimeInput: mockSessionSendRealtimeInput,
+    sendToolResponse: jest.fn(),
+    close: mockSessionClose,
+  };
+
+  beforeEach(() => {
+    mockLiveConnect.mockImplementation(({ callbacks: cbs }: any) => {
+      Object.assign(makeCallbacks(), cbs);
+      return Promise.resolve(mockSession);
+    });
+  });
+
+  it('includes toolCalls in live:turn-complete payload when tools ran', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-tc-emit', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+    mockExecuteTool.mockResolvedValue({ post_url: 'https://linkedin.com/post/123' });
+    mockSession.sendToolResponse = jest.fn();
+
+    // Simulate tool call
+    await callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-1', name: 'post_on_connected_account', args: { content: 'Hello' } }],
+      },
+    });
+
+    // Simulate Gemini responding after tool
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Your post is live!' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await new Promise(resolve => setImmediate(resolve));
+
+    const turnCompleteCall = emitFn.mock.calls.find(([event]) => event === 'live:turn-complete');
+    expect(turnCompleteCall).toBeDefined();
+    expect(turnCompleteCall![1].toolCalls).toBeDefined();
+    expect(turnCompleteCall![1].toolCalls).toHaveLength(1);
+    expect(turnCompleteCall![1].toolCalls[0].name).toBe('post_on_connected_account');
+    expect(turnCompleteCall![1].toolCalls[0].result).toEqual({ post_url: 'https://linkedin.com/post/123' });
+  });
+
+  it('saves assistant message with metadata.toolCalls to DynamoDB when tools ran', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-tc-db', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+    mockExecuteTool.mockResolvedValue({ htmlUrl: 'https://s3.amazonaws.com/posts/abc' });
+    mockSession.sendToolResponse = jest.fn();
+
+    await callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-2', name: 'create_social_media_posts', args: { text: 'AI news' } }],
+      },
+    });
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: "Here are your posts." } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await new Promise(resolve => setImmediate(resolve));
+
+    const saveCall = mockAddMessagesToSession.mock.calls.find(
+      ([sid]: [string]) => sid === 'session-tc-db'
+    );
+    expect(saveCall).toBeDefined();
+    const messages: any[] = saveCall![1];
+    const assistantMsg = messages.find((m: any) => m.role === 'assistant');
+    expect(assistantMsg).toBeDefined();
+    expect(assistantMsg.metadata?.toolCalls).toBeDefined();
+    expect(assistantMsg.metadata.toolCalls[0].name).toBe('create_social_media_posts');
+  });
+
+  it('does not include toolCalls in payload or metadata when no tools ran', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-tc-none', 'socket-1', emitFn, 'test-user-id');
+    mockAddMessagesToSession.mockResolvedValue({});
+
+    callbacks['onmessage']?.({
+      serverContent: { outputTranscription: { text: 'Hello!' } },
+    });
+    callbacks['onmessage']?.({ serverContent: { turnComplete: true } });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const turnCompleteCall = emitFn.mock.calls.find(([event]) => event === 'live:turn-complete');
+    expect(turnCompleteCall).toBeDefined();
+    expect(turnCompleteCall![1].toolCalls).toBeUndefined();
+
+    const saveCall = mockAddMessagesToSession.mock.calls[0];
+    const messages: any[] = saveCall?.[1] ?? [];
+    const assistantMsg = messages.find((m: any) => m.role === 'assistant');
+    expect(assistantMsg?.metadata?.toolCalls).toBeUndefined();
   });
 });

@@ -14,7 +14,7 @@
  */
 
 import { GoogleGenAI, Modality, LiveServerMessage, Session, Transcription } from '@google/genai';
-import { chatbotDb } from './chatbotService';
+import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
 
@@ -70,6 +70,8 @@ interface LiveEntry {
   toolContextText: string;
   /** Structured artifacts extracted from tool results this turn */
   pendingArtifacts: LiveArtifact[];
+  /** Tool call records for the current turn — surfaced in chat UI as collapsible "Used N tools" block */
+  pendingToolCalls: Array<{ id: string; name: string; arguments: any; result?: any; error?: string }>;
   /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
   resumptionHandle?: string;
   /** Cached function declarations so reconnects reuse the same tool config without reloading */
@@ -408,6 +410,7 @@ export async function startLiveSession(
     pendingUserText: '',
     toolContextText: '',
     pendingArtifacts: [],
+    pendingToolCalls: [],
     functionDeclarations,
   };
   activeSessions.set(sessionId, entry);
@@ -611,6 +614,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
           entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
+          // Record for UI display (collapsible "Used N tools" block, like other models)
+          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, result });
           // Extract artifacts (URLs, images, files) from tool results for UI display
           if (typeof result === 'object' && result !== null) {
             if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
@@ -638,6 +644,8 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
         } catch (err: any) {
           console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
           responseContent = { error: err?.message ?? 'Tool execution failed' };
+          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, error: err?.message ?? 'Tool execution failed' });
         }
         return { id: fc.id, name: fc.name!, response: responseContent } as any;
       })
@@ -655,15 +663,17 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
-    // Capture artifacts before reset (guard against undefined in case of entry shape mismatch)
+    // Capture artifacts and tool calls before reset (guard against undefined)
     const rawArtifacts: LiveArtifact[] = entry.pendingArtifacts ?? [];
     const artifacts = rawArtifacts.length > 0 ? [...rawArtifacts] : undefined;
+    const toolCalls = (entry.pendingToolCalls ?? []).length > 0 ? [...entry.pendingToolCalls] : undefined;
 
     // Reset for next turn before async work
     entry.currentTurnText = '';
     entry.pendingUserText = '';
     entry.toolContextText = '';
     entry.pendingArtifacts = [];
+    entry.pendingToolCalls = [];
 
     // Append artifact markdown to the assistant message so it persists in DynamoDB
     // and survives any subsequent session reload — no client-side re-apply needed.
@@ -672,18 +682,28 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
       : '';
     const assistantContent = assistantText + artifactSuffix;
 
-    // Emit turn-complete with full content and structured artifacts for rich UI rendering
-    emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, artifacts });
+    // Emit turn-complete with full content, artifacts, and tool calls for rich UI rendering
+    emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, artifacts, toolCalls });
 
     // Fire-and-forget save — never blocks the audio stream
     if (assistantContent) {
-      const messagesToSave: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      const messagesToSave: Array<ChatMessage> = [];
       // Skip saving user turns that are STT noise from background audio — persisting
       // them corrupts the context window and causes repetitive/fragmented responses.
       if (userText && !isNoiseTurn(userText)) {
         messagesToSave.push({ role: 'user', content: userText });
       }
-      messagesToSave.push({ role: 'assistant', content: assistantContent });
+      const assistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: assistantContent,
+        ...(toolCalls && toolCalls.length > 0 ? {
+          metadata: {
+            timestamp: new Date().toISOString(),
+            toolCalls,
+          },
+        } : {}),
+      };
+      messagesToSave.push(assistantMessage);
 
       chatbotDb.addMessagesToSession(sessionId, messagesToSave).catch((err) => {
         console.warn(`[liveVoiceService] Failed to save transcript for session ${sessionId}:`, err?.message);
