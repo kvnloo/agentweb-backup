@@ -2027,6 +2027,204 @@ Typical prompts this answers:
   },
 });
 
+// ─── Lifecycle Drip Phase 3: Campaign management (admin-only) ───────────────
+
+mcpToolRegistry.register({
+  name: 'manage_drip_campaign',
+  definition: {
+    name: 'manage_drip_campaign',
+    description: `Create, update, pause, resume, list, or delete a lifecycle drip email campaign. Admin-only. Used by ops to stand up onboarding-revival and upgrade-nudge drips without clicking through the Partner Portal UI.
+
+A drip campaign targets a segment (by onboarding stage / goal / inactivity cutoff), renders an email template with merge fields, and — once Phase 4 ships — sends it on a cadence with a per-user cap.
+
+Actions:
+- \`list\`: no args needed. Returns every campaign.
+- \`get\`: requires \`campaign_id\`.
+- \`create\`: requires \`name\`, \`subject_line\`, \`template_html\`, \`cadence_unit\`, \`cadence_value\`, \`max_sends\`, \`segment_query\`. \`is_active\` defaults to true; \`kill_switch\` defaults to false.
+- \`update\`: requires \`campaign_id\`. All other fields are optional; only provided fields change.
+- \`pause\`: requires \`campaign_id\`. Sets \`kill_switch=true\` — stops sends immediately without losing config. Prefer this over \`delete\`.
+- \`resume\`: requires \`campaign_id\`. Sets \`kill_switch=false\`.
+- \`delete\`: requires \`campaign_id\`. Hard delete. Use sparingly — pause is almost always safer.
+
+Template merge fields (whitelisted): \`{{firstName}}\`, \`{{companyName}}\`, \`{{lastStep}}\`, \`{{goal}}\`. Any other \`{{...}}\` token will reject the template with a 400.
+
+Segment query shape: \`{ stage?, lastActivityBefore?, goal? }\`. Stages: signed_up_no_start, goal_selected, brand_submitted, brand_skipped, data_connected, channel_connected, onboarding_completed, active, stale.
+
+Example create for "Fangfang's brand-step recovery drip":
+  action=create
+  name="Emma is waiting — brand-step revival"
+  subject_line="Emma is waiting — 2 min setup"
+  template_html="<p>Hi {{firstName}}, Emma at {{companyName}} needs one more step.</p>"
+  cadence_unit="days" cadence_value=7 max_sends=3
+  segment_query={"stage":"brand_skipped"}`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'get', 'create', 'update', 'pause', 'resume', 'delete'],
+          description: 'The operation to perform.',
+        },
+        campaign_id: {
+          type: 'string',
+          description: 'Required for get/update/pause/resume/delete.',
+        },
+        name: { type: 'string' },
+        subject_line: { type: 'string' },
+        template_html: {
+          type: 'string',
+          description:
+            'HTML with optional merge fields: {{firstName}}, {{companyName}}, {{lastStep}}, {{goal}}. Any other token is rejected.',
+        },
+        cadence_unit: {
+          type: 'string',
+          enum: ['hours', 'days', 'weeks'],
+        },
+        cadence_value: {
+          type: 'integer',
+          description: 'Positive integer, combined with cadence_unit (e.g. unit=days value=7 → every 7 days).',
+        },
+        max_sends: {
+          type: 'integer',
+          description:
+            'Per-user lifetime cap for this campaign. Hard-capped at 100 server-side.',
+        },
+        is_active: { type: 'boolean' },
+        kill_switch: { type: 'boolean' },
+        segment_query: {
+          type: 'object',
+          properties: {
+            stage: {
+              type: 'string',
+              enum: [
+                'signed_up_no_start',
+                'goal_selected',
+                'brand_submitted',
+                'brand_skipped',
+                'data_connected',
+                'channel_connected',
+                'onboarding_completed',
+                'active',
+                'stale',
+              ],
+            },
+            lastActivityBefore: { type: 'string', description: 'ISO 8601 datetime.' },
+            goal: {
+              type: 'string',
+              description:
+                'Onboarding goal filter (e.g. paid_ads, seo). Matches goal_selected event data.',
+            },
+          },
+          additionalProperties: false,
+        },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const action = typeof args.action === 'string' ? args.action : '';
+    // snake_case → camelCase for the HTTP layer, which mirrors the Partner
+    // Portal UI payload shape.
+    const toBody = () => {
+      const body: Record<string, any> = {};
+      if (typeof args.name === 'string') body.name = args.name;
+      if (typeof args.subject_line === 'string') body.subjectLine = args.subject_line;
+      if (typeof args.template_html === 'string') body.templateHtml = args.template_html;
+      if (typeof args.cadence_unit === 'string') body.cadenceUnit = args.cadence_unit;
+      if (typeof args.cadence_value === 'number') body.cadenceValue = args.cadence_value;
+      if (typeof args.max_sends === 'number') body.maxSends = args.max_sends;
+      if (typeof args.is_active === 'boolean') body.isActive = args.is_active;
+      if (typeof args.kill_switch === 'boolean') body.killSwitch = args.kill_switch;
+      if (args.segment_query && typeof args.segment_query === 'object') {
+        body.segmentQuery = args.segment_query;
+      }
+      return body;
+    };
+
+    switch (action) {
+      case 'list': {
+        const data = await mcpFetch({
+          method: 'GET',
+          path: '/api/admin/drip-campaigns',
+          context: ctx(context),
+        });
+        return jsonResult(data);
+      }
+      case 'get': {
+        if (!args.campaign_id) {
+          return jsonResult({ error: 'campaign_id is required for action=get' });
+        }
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          context: ctx(context),
+        });
+        return jsonResult(data);
+      }
+      case 'create': {
+        const data = await mcpFetch({
+          method: 'POST',
+          path: '/api/admin/drip-campaigns',
+          context: ctx(context),
+          body: toBody(),
+        });
+        return jsonResult(data);
+      }
+      case 'update': {
+        if (!args.campaign_id) {
+          return jsonResult({ error: 'campaign_id is required for action=update' });
+        }
+        const data = await mcpFetch({
+          method: 'PATCH',
+          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          context: ctx(context),
+          body: toBody(),
+        });
+        return jsonResult(data);
+      }
+      case 'pause': {
+        if (!args.campaign_id) {
+          return jsonResult({ error: 'campaign_id is required for action=pause' });
+        }
+        const data = await mcpFetch({
+          method: 'PATCH',
+          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          context: ctx(context),
+          body: { killSwitch: true },
+        });
+        return jsonResult(data);
+      }
+      case 'resume': {
+        if (!args.campaign_id) {
+          return jsonResult({ error: 'campaign_id is required for action=resume' });
+        }
+        const data = await mcpFetch({
+          method: 'PATCH',
+          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          context: ctx(context),
+          body: { killSwitch: false },
+        });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        if (!args.campaign_id) {
+          return jsonResult({ error: 'campaign_id is required for action=delete' });
+        }
+        await mcpFetch({
+          method: 'DELETE',
+          path: `/api/admin/drip-campaigns/${encodeURIComponent(args.campaign_id)}`,
+          context: ctx(context),
+        });
+        return jsonResult({ success: true, campaign_id: args.campaign_id });
+      }
+      default:
+        return jsonResult({
+          error: `Unknown action: ${action}. Valid: list|get|create|update|pause|resume|delete`,
+        });
+    }
+  },
+});
+
 // ─── PR Digest (admin-only) ─────────────────────────────────────────────────
 
 mcpToolRegistry.register({
