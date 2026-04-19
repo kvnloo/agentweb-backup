@@ -61,6 +61,8 @@ interface LiveEntry {
   pendingUserText: string;
   /** Tool call results for the current turn — saved to DynamoDB but NOT shown in chat UI */
   toolContextText: string;
+  /** Actionable links extracted from tool results this turn (e.g. LinkedIn post URL) */
+  pendingLinks: Array<{ label: string; url: string }>;
   /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
   resumptionHandle?: string;
   /** Cached function declarations so reconnects reuse the same tool config without reloading */
@@ -223,11 +225,15 @@ async function loadGeminiFunctionDeclarations(userId: string): Promise<any[]> {
 /**
  * Open (or re-open) a Gemini Live WebSocket for the given Agent Mode sessionId.
  * Internal — callers should use startLiveSession (public) or reconnectLiveSession.
+ *
+ * @param historyContext  Optional history block appended to the system prompt on fresh starts.
+ *                        Not passed on code-1000 resumptions (Gemini already has context).
  */
 async function openGeminiSession(
   sessionId: string,
   entry: LiveEntry,
-  resumptionHandle?: string
+  resumptionHandle?: string,
+  historyContext?: string
 ): Promise<void> {
   const ai = await getGenAI();
 
@@ -243,7 +249,7 @@ async function openGeminiSession(
         },
       },
       systemInstruction: {
-        parts: [{ text: LIVE_SYSTEM_PROMPT }],
+        parts: [{ text: LIVE_SYSTEM_PROMPT + (historyContext ?? '') }],
       },
       // Enable automatic transcription so transcripts are available in audio-only mode
       inputAudioTranscription: {},
@@ -300,6 +306,63 @@ async function openGeminiSession(
 }
 
 /**
+ * Load prior chat messages from DynamoDB and format them as a conversation
+ * history block to embed in the system prompt. Uses the same filtering rules
+ * as agentModeService:
+ * - Slice to the 10th-most-recent user message (same context window)
+ * - Skip empty assistant messages and error messages
+ *
+ * Returns an empty string if there is no prior history.
+ */
+async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
+  try {
+    const allMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    if (!allMessages || allMessages.length === 0) return '';
+
+    // Slice to the 10th-most-recent user message (same window as agentModeService:2280-2292)
+    let userCount = 0;
+    let startIdx = 0;
+    for (let i = allMessages.length - 1; i >= 0; i--) {
+      if (allMessages[i].role === 'user') {
+        userCount++;
+        if (userCount === 10) { startIdx = i; break; }
+      }
+    }
+    const sliced = allMessages.slice(startIdx);
+
+    const lines: string[] = [];
+    for (const msg of sliced) {
+      if (msg.role === 'system') continue;
+      // Skip empty assistant messages (same as agentModeService:2297-2300)
+      if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) continue;
+      // Skip error messages (same as agentModeService:2302-2306)
+      if (msg.role === 'assistant' && (msg as any).metadata?.isErrorMessage) continue;
+
+      const text = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? (msg.content as any[]).map((c: any) => c?.text || '').filter(Boolean).join(' ')
+          : String(msg.content || '');
+
+      const trimmed = text.trim();
+      if (trimmed) {
+        const label = msg.role === 'user' ? 'User' : 'Emma';
+        // Truncate very long messages to avoid bloating the system prompt
+        const snippet = trimmed.length > 500 ? trimmed.slice(0, 500) + '…' : trimmed;
+        lines.push(`${label}: ${snippet}`);
+      }
+    }
+
+    if (lines.length === 0) return '';
+
+    return `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
+  } catch (err: any) {
+    console.warn('[liveVoiceService] Failed to load history for system prompt:', err?.message);
+    return '';
+  }
+}
+
+/**
  * Start a Gemini Live session for the given Agent Mode sessionId.
  * If a session already exists for this sessionId, it is closed first.
  *
@@ -318,8 +381,15 @@ export async function startLiveSession(
     closeLiveSession(sessionId);
   }
 
-  // Load user's allowed tools converted to Gemini Live format
-  const functionDeclarations = await loadGeminiFunctionDeclarations(userId);
+  // Load tools and prior history in parallel
+  const [functionDeclarations, historyContext] = await Promise.all([
+    loadGeminiFunctionDeclarations(userId),
+    loadHistoryForSystemPrompt(sessionId),
+  ]);
+
+  if (historyContext) {
+    console.log(`[liveVoiceService] Injecting history into system prompt for ${sessionId}`);
+  }
 
   // Placeholder entry — filled after session resolves
   const entry: LiveEntry = {
@@ -330,11 +400,14 @@ export async function startLiveSession(
     currentTurnText: '',
     pendingUserText: '',
     toolContextText: '',
+    pendingLinks: [],
     functionDeclarations,
   };
   activeSessions.set(sessionId, entry);
 
-  await openGeminiSession(sessionId, entry);
+  // Pass history via system prompt on fresh starts. Code-1000 resumptions already
+  // carry Gemini's own in-memory context, so historyContext is not passed there.
+  await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
 }
 
 /**
@@ -531,6 +604,18 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
           entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
+          // Extract actionable links so the UI can render them as clickable links
+          if (typeof result === 'object' && result !== null) {
+            const r = result as Record<string, unknown>;
+            // create_social_media_posts returns htmlUrl (S3 page with post content to copy)
+            if (typeof r.htmlUrl === 'string' && r.htmlUrl.startsWith('http')) {
+              entry.pendingLinks.push({ label: 'View posts', url: r.htmlUrl });
+            }
+            // post_on_connected_account (direct LinkedIn publish) returns post_url
+            if (typeof r.post_url === 'string' && r.post_url.startsWith('http')) {
+              entry.pendingLinks.push({ label: 'View post', url: r.post_url });
+            }
+          }
         } catch (err: any) {
           console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
           responseContent = { error: err?.message ?? 'Tool execution failed' };
@@ -551,14 +636,18 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
+    // Capture links before reset
+    const links = entry.pendingLinks.length > 0 ? [...entry.pendingLinks] : undefined;
+
     // Reset for next turn before async work
     entry.currentTurnText = '';
     entry.pendingUserText = '';
     entry.toolContextText = '';
+    entry.pendingLinks = [];
 
     // Emit turn-complete immediately so browser can update UI
-    // assistantText contains only the clean spoken transcript — no tool call output
-    emitFn('live:turn-complete', { sessionId, assistantText, userText });
+    // assistantText contains only the clean spoken transcript; links are tool result URLs
+    emitFn('live:turn-complete', { sessionId, assistantText, userText, links });
 
     // Fire-and-forget save — never blocks the audio stream
     // Save only the clean assistant transcript — Gemini Live maintains its own session
