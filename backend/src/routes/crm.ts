@@ -35,6 +35,7 @@ import {
   SavedViewScope as SavedViewScopeUtil,
 } from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
+import { normalizeAttribution } from '../types/attribution';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -1309,6 +1310,21 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const userId = authReq.user?.userId;
     const { listId } = req.params;
     const leadData = req.body;
+
+    // Attribution — accept the same `attribution` / legacy `utm` shape as the
+    // public forward-lead endpoint so the CRM "quick add" flow preserves source
+    // data when a rep pastes in a lead they got from a tracked link.
+    const attributionTouch =
+      normalizeAttribution(leadData?.attribution) ?? normalizeAttribution(leadData?.utm);
+    if (attributionTouch) {
+      leadData.firstTouch = attributionTouch;
+      leadData.lastTouch = attributionTouch;
+    }
+    // Strip the top-level `attribution` / `utm` envelopes — createLead doesn't
+    // know those keys and DynamoDB rejects extra attributes silently.
+    delete leadData.attribution;
+    delete leadData.utm;
+
     if (leadData?.selectedSenderId !== undefined) {
       const normalizedSenderId = normalizeSenderId(leadData.selectedSenderId);
       if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
