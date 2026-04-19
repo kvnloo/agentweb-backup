@@ -13,6 +13,7 @@ import chatbotRoutes from "./routes/chatbot";
 import growthGeniusRoutes from "./routes/growthGenius";
 import docsRoutes from "./routes/docs";
 import stripeRoutes from "./routes/stripe";
+import stripeConnectRoutes from "./routes/stripeConnect";
 import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
@@ -43,6 +44,10 @@ import linkedInAdsAuthRoutes from "./routes/linkedInAdsAuth";
 import youtubeAuthRoutes from "./routes/youtubeAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
+import hubspotAuthRoutes from "./routes/hubspotAuth";
+import attioAuthRoutes from "./routes/attioAuth";
+import crmSyncRoutes from "./routes/crmSync";
+import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -178,6 +183,8 @@ app.use((req, res, next) => {
 // Stripe webhook needs the raw body (Buffer) for signature verification.
 // This MUST come before express.json() which parses the body.
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
+// Stripe Connect webhook needs its own raw-body handler — also before express.json().
+app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -209,6 +216,7 @@ app.use("/api/chatbot", chatbotRoutes);
 app.use("/api/growth-genius", growthGeniusRoutes);
 app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
+app.use("/api/stripe/connect", stripeConnectRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
@@ -231,6 +239,7 @@ app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm/public", crmPublicRoutes);
+app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be after /public, before main crm routes
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
@@ -242,6 +251,9 @@ app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/fathom", fathomAuthRoutes);
+app.use("/api/oauth/hubspot", hubspotAuthRoutes);
+app.use("/api/oauth/attio", attioAuthRoutes);
+app.use("/api/crm-sync", crmSyncRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth/foreplay", foreplayAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);

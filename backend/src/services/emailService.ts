@@ -1,6 +1,6 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
-import { marked } from 'marked';
+
 import { resendService } from './resendService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
@@ -28,7 +28,7 @@ export const emailService = {
   // Escape HTML content to make it safe for emails
   escapeHtml(html: string): string {
     if (!html) return '';
-    
+
     return html
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
@@ -104,7 +104,7 @@ export const emailService = {
 
   async sendWelcomeEmail(email: string, temporaryPassword?: string) {
     const isUpgrade = !temporaryPassword;
-    
+
     const welcomeHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
         <div style="text-align: center; margin-bottom: 30px;">
@@ -115,10 +115,10 @@ export const emailService = {
         <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
           <h2 style="color: #1B2549; margin-top: 0;">Welcome to AgentWeb!</h2>
           <p style="color: #333; line-height: 1.6;">
-            ${isUpgrade 
-              ? 'Great news! Your account has been upgraded and you now have access to our premium features.'
-              : 'Your account has been created successfully. You can now access the AgentWeb Customer Portal.'
-            }
+            ${isUpgrade
+        ? 'Great news! Your account has been upgraded and you now have access to our premium features.'
+        : 'Your account has been created successfully. You can now access the AgentWeb Customer Portal.'
+      }
           </p>
           ${isUpgrade ? `
           <p style="color: #333; line-height: 1.6;">
@@ -157,10 +157,10 @@ export const emailService = {
           ` : ''}
           
           <p style="color: #666; font-size: 14px; margin-top: 20px;">
-            ${temporaryPassword 
-              ? '<strong>Important:</strong> Please change your password after your first login for security reasons.'
-              : ''
-            }
+            ${temporaryPassword
+        ? '<strong>Important:</strong> Please change your password after your first login for security reasons.'
+        : ''
+      }
           </p>
           
           <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
@@ -182,10 +182,10 @@ export const emailService = {
     const welcomeText = `
 AgentWeb Customer Portal - Welcome!
 
-${isUpgrade 
-  ? 'Great news! Your account has been upgraded and you now have access to our premium features.\n\nSince you already have an account, you can log in directly using your existing credentials.'
-  : 'Your account has been created successfully. You can now access the AgentWeb Customer Portal.'
-}
+${isUpgrade
+        ? 'Great news! Your account has been upgraded and you now have access to our premium features.\n\nSince you already have an account, you can log in directly using your existing credentials.'
+        : 'Your account has been created successfully. You can now access the AgentWeb Customer Portal.'
+      }
 
 ${temporaryPassword ? `
 Your Login Credentials:
@@ -200,10 +200,10 @@ What's New with Your Upgrade:
 You now have access to our full suite of AI-powered marketing automation tools, including Emma AI Assistant, advanced content creation, Meta Ads integration, and comprehensive analytics. Transform your marketing workflow with intelligent automation and data-driven insights.
 ` : ''}
 
-${temporaryPassword 
-  ? 'Important: Please change your password after your first login for security reasons.'
-  : ''
-}
+${temporaryPassword
+        ? 'Important: Please change your password after your first login for security reasons.'
+        : ''
+      }
 
 Getting Started with AgentWeb:
 Check out these resources to help you get the most out of AgentWeb:
@@ -313,10 +313,10 @@ You're receiving this because you just signed up for AgentWeb.
     try {
       // Import required services
       const { taskDb, userDb } = require('../services/db');
-      
+
       // Get environment variables
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      
+
       // Fetch task data
       const task = await taskDb.getTaskById(taskId);
       if (!task) {
@@ -330,7 +330,7 @@ You're receiving this because you just signed up for AgentWeb.
       }
 
       const taskName = task.name || 'this task';
-      
+
       const welcomeHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
           <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
@@ -362,11 +362,11 @@ You're receiving this automated email because you're subscribed to the email upd
 Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${taskId}&email=${encodeURIComponent(email)}`;
 
       const subject = `Welcome! You've subscribed to ${taskName}`;
-      
+
       // Determine email sender configuration with fallback to account-level (same as sendTaskExecutionEmail)
       let emailSender = task.emailSender;
       let fromName = task.fromName;
-      
+
       // If task doesn't have custom email sender, use account-level configuration
       if (!emailSender || !fromName) {
         if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
@@ -374,7 +374,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
           fromName = user.fromName;
         }
       }
-      
+
       if (emailSender && fromName) {
         // Use Resend service for custom email sender (task-level or account-level)
         const from = `${fromName} <${emailSender}>`;
@@ -409,7 +409,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
   ) {
     const subject = 'Task Ownership Change Notification';
     const taskUrl = `${siteDomain}/tasks/${taskId}`;
-    
+
     const text = `Task Ownership Change\n\n` +
       `The ownership of task "${taskName}" has been changed.\n\n` +
       `Previous Owner: ${oldOwnerEmail}\n` +
@@ -453,16 +453,16 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
     try {
       // Import required services
       const { taskDb, subscriberDb } = require('../services/db');
-      
+
       // Get environment variables
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      
+
       // Fetch execution data
       const execution = await taskDb.getTaskExecutionById(executionId);
       if (!execution) {
         throw new Error(`Execution not found: ${executionId}`);
       }
-      
+
       // Fetch task data
       const task = await taskDb.getTaskById(execution.taskId);
       if (!task) {
@@ -475,7 +475,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
       if (!user) {
         throw new Error(`User not found: ${task.userId}`);
       }
-      
+
 
       // If sendHtmlReportOnly is enabled, try to find HTML content and send only that
       if (task.sendHtmlReportOnly) {
@@ -484,10 +484,10 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
           console.log(`sendHtmlReportOnly enabled but no result files available for task ${task.taskId}, skipping email to ${toEmail}`);
           return;
         }
-        
+
         let htmlContentFromFile = '';
         let htmlContentUrl = '';
-        
+
         // Look for HTML files in result_files
         for (const file of execution.result_files) {
           if ((file.is_html || file.view_type === 'html') && file.url) {
@@ -495,10 +495,10 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
               // Import fetch
               const fetch = require('node-fetch');
               const response = await fetch(file.url);
-              
+
               if (response.ok) {
                 const fetchedHtmlContent = await response.text();
-                
+
                 if (task.sendHtmlReportOnly) {
                   // For sendHTMLReportOnly, use raw HTML content without enhancement
                   htmlContentFromFile = fetchedHtmlContent;
@@ -510,7 +510,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
                   </div>
                 `;
                 }
-                
+
                 htmlContentUrl = file.url; // Capture the URL for email history
                 console.log(`Successfully fetched HTML content from ${file.url}`);
                 break; // Use the first HTML file found
@@ -528,12 +528,12 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
 
         // Only send email if we successfully found and fetched HTML content
         if (htmlContentFromFile) {
-          const currentDate = new Date().toLocaleDateString('en-US', { 
-            year: 'numeric', 
-            month: 'short', 
-            day: 'numeric' 
+          const currentDate = new Date().toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric'
           });
-          
+
           // Create footer content
           const footerContent = `
             <div style="margin-top: 25px; font-size: 0.9em; padding: 20px; text-align: center;">
@@ -544,22 +544,22 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
               <p><small><a href="${customerFrontendUrl}/unsubscribe?taskId=${task.taskId}&email=${encodeURIComponent(toEmail)}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
             </div>
           `;
-          
+
           // For sendHTMLReportOnly, inject footer before closing </body> tag
           // For regular emails, inject before closing </body> tag
           const simplifiedHtml = htmlContentFromFile.replace('</body>', `${footerContent}</body>`);
 
           const subject = `${task.name} - ${currentDate}`;
           const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.${!task.sendHtmlReportOnly ? `\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
-          
+
           // Check if task has custom email sender configured
           let resendEmailId = null;
           let senderType: 'SMTP' | 'resend' = 'SMTP';
-          
+
           // Determine email sender configuration with fallback to account-level
           let emailSender = task.emailSender;
           let fromName = task.fromName;
-          
+
           // If task doesn't have custom email sender, use account-level configuration
           if (!emailSender || !fromName) {
             if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
@@ -567,7 +567,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
               fromName = user.fromName;
             }
           }
-          
+
           if (emailSender && fromName) {
             // Use Resend service for custom email sender (task-level or account-level)
             const from = `${fromName} <${emailSender}>`;
@@ -587,7 +587,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
             senderType = 'SMTP';
             console.log(`HTML-only task execution email sent via SMTP to: ${toEmail}`);
           }
-          
+
           // Add email history to subscriber
           try {
             const sentAt = new Date().toISOString();
@@ -605,7 +605,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
             console.error(`Failed to add email history for ${toEmail}:`, historyError);
             // Don't throw error, email was sent successfully
           }
-          
+
           return;
         } else {
           // HTML content not available, don't send email
@@ -613,76 +613,76 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
           return;
         }
       }
-      
+
       // Create execution start/end time strings
       const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';
       const completedTime = execution.completedAt ? new Date(execution.completedAt).toLocaleString() : 'Not available';
-    
-    // Calculate execution duration if both start and end times are available
-    let durationStr = '';
-    if (execution.startTime && execution.completedAt) {
-      const start = new Date(execution.startTime).getTime();
-      const end = new Date(execution.completedAt).getTime();
-      const durationMs = end - start;
-      const durationMinutes = Math.floor(durationMs / 60000);
-      const durationSeconds = Math.floor((durationMs % 60000) / 1000);
-      
-      if (durationMinutes > 0) {
-        durationStr = `<p><strong>Duration:</strong> ${durationMinutes} minutes ${durationSeconds} seconds</p>`;
-      } else {
-        durationStr = `<p><strong>Duration:</strong> ${durationSeconds} seconds</p>`;
+
+      // Calculate execution duration if both start and end times are available
+      let durationStr = '';
+      if (execution.startTime && execution.completedAt) {
+        const start = new Date(execution.startTime).getTime();
+        const end = new Date(execution.completedAt).getTime();
+        const durationMs = end - start;
+        const durationMinutes = Math.floor(durationMs / 60000);
+        const durationSeconds = Math.floor((durationMs % 60000) / 1000);
+
+        if (durationMinutes > 0) {
+          durationStr = `<p><strong>Duration:</strong> ${durationMinutes} minutes ${durationSeconds} seconds</p>`;
+        } else {
+          durationStr = `<p><strong>Duration:</strong> ${durationSeconds} seconds</p>`;
+        }
       }
-    }
-    
-    // Fetch HTML content from result_files
-    let htmlContentFromFile = '';
-    let htmlContentUrl = '';
-    if (execution.result_files && execution.result_files.length > 0) {
-      for (const file of execution.result_files) {
-        if ((file.is_html || file.view_type === 'html') && file.url) {
-          try {
-            // Import fetch
-            const fetch = require('node-fetch');
-            const response = await fetch(file.url);
-            
-            if (response.ok) {
-              const fetchedHtmlContent = await response.text();
-              htmlContentFromFile = `
+
+      // Fetch HTML content from result_files
+      let htmlContentFromFile = '';
+      let htmlContentUrl = '';
+      if (execution.result_files && execution.result_files.length > 0) {
+        for (const file of execution.result_files) {
+          if ((file.is_html || file.view_type === 'html') && file.url) {
+            try {
+              // Import fetch
+              const fetch = require('node-fetch');
+              const response = await fetch(file.url);
+
+              if (response.ok) {
+                const fetchedHtmlContent = await response.text();
+                htmlContentFromFile = `
                 <div class="html-result">
                   <h3>HTML Result File:</h3>
                   ${fetchedHtmlContent}
                 </div>
               `;
-              htmlContentUrl = file.url; // Capture the URL for email history
-              console.log(`Successfully fetched HTML content from ${file.url}`);
-              break; // Use the first HTML file found
-            } else {
-              console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
-              htmlContentFromFile = `
+                htmlContentUrl = file.url; // Capture the URL for email history
+                console.log(`Successfully fetched HTML content from ${file.url}`);
+                break; // Use the first HTML file found
+              } else {
+                console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
+                htmlContentFromFile = `
                 <div class="html-result">
                   <h3>HTML Result File:</h3>
                   <p><i>Error fetching HTML content: ${response.statusText}</i></p>
                 </div>
               `;
-            }
-          } catch (error) {
-            console.error(`Error fetching HTML content from ${file.url}:`, error);
-            htmlContentFromFile = `
+              }
+            } catch (error) {
+              console.error(`Error fetching HTML content from ${file.url}:`, error);
+              htmlContentFromFile = `
               <div class="html-result">
                 <h3>HTML Result File:</h3>
                 <p><i>Error fetching HTML content</i></p>
               </div>
             `;
+            }
+            break; // Process only the first HTML file found, even if error
           }
-          break; // Process only the first HTML file found, even if error
         }
       }
-    }
-    
 
-    
-        // Create HTML content for the email - matching agent-engine send_task_results style
-    const html = `
+
+
+      // Create HTML content for the email - matching agent-engine send_task_results style
+      const html = `
       <html>
       <head>
         <style>
@@ -742,63 +742,63 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
       </body></html>
     `;
 
-    const subject = `AgentWeb - Task Run Results: ${task.name}`;
-    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}${!task.sendHtmlReportOnly ? `\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
-    
-    // Check if task has custom email sender configured
-    let resendEmailId = null;
-    let senderType: 'SMTP' | 'resend' = 'SMTP';
-    
-    // Determine email sender configuration with fallback to account-level
-    let emailSender = task.emailSender;
-    let fromName = task.fromName;
-    
-    // If task doesn't have custom email sender, use account-level configuration
-    if (!emailSender || !fromName) {
-      if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
-        emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
-        fromName = user.fromName;
+      const subject = `AgentWeb - Task Run Results: ${task.name}`;
+      const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}${!task.sendHtmlReportOnly ? `\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
+
+      // Check if task has custom email sender configured
+      let resendEmailId = null;
+      let senderType: 'SMTP' | 'resend' = 'SMTP';
+
+      // Determine email sender configuration with fallback to account-level
+      let emailSender = task.emailSender;
+      let fromName = task.fromName;
+
+      // If task doesn't have custom email sender, use account-level configuration
+      if (!emailSender || !fromName) {
+        if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
+          emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
+          fromName = user.fromName;
+        }
       }
-    }
-    
-    if (emailSender && fromName) {
-      // Use Resend service for custom email sender (task-level or account-level)
-      const from = `${fromName} <${emailSender}>`;
-      const resendResult = await resendService.sendEmail({
-        from,
-        to: toEmail,
-        subject,
-        html,
-        text
-      });
-      resendEmailId = resendResult?.id || null;
-      senderType = 'resend';
-      console.log(`Task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
-    } else {
-      // Use default SMTP service
-      await this.sendEmail(toEmail, subject, text, html);
-      senderType = 'SMTP';
-      console.log(`Task execution email sent via SMTP to: ${toEmail}`);
-    }
-    
-    // Add email history to subscriber
-    try {
-      const sentAt = new Date().toISOString();
-      await subscriberDb.addEmailHistory(execution.taskId, toEmail, {
-        sentAt: sentAt,
-        subject: subject,
-        status: 'sent',
-        taskExecutionId: executionId,
-        htmlContentUrl: htmlContentUrl,
-        senderType: senderType,
-        emailId: resendEmailId || undefined
-      });
-      console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '(SMTP)');
-    } catch (historyError) {
-      console.error(`Failed to add email history for ${toEmail}:`, historyError);
-      // Don't throw error, email was sent successfully
-    }
-    
+
+      if (emailSender && fromName) {
+        // Use Resend service for custom email sender (task-level or account-level)
+        const from = `${fromName} <${emailSender}>`;
+        const resendResult = await resendService.sendEmail({
+          from,
+          to: toEmail,
+          subject,
+          html,
+          text
+        });
+        resendEmailId = resendResult?.id || null;
+        senderType = 'resend';
+        console.log(`Task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
+      } else {
+        // Use default SMTP service
+        await this.sendEmail(toEmail, subject, text, html);
+        senderType = 'SMTP';
+        console.log(`Task execution email sent via SMTP to: ${toEmail}`);
+      }
+
+      // Add email history to subscriber
+      try {
+        const sentAt = new Date().toISOString();
+        await subscriberDb.addEmailHistory(execution.taskId, toEmail, {
+          sentAt: sentAt,
+          subject: subject,
+          status: 'sent',
+          taskExecutionId: executionId,
+          htmlContentUrl: htmlContentUrl,
+          senderType: senderType,
+          emailId: resendEmailId || undefined
+        });
+        console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '(SMTP)');
+      } catch (historyError) {
+        console.error(`Failed to add email history for ${toEmail}:`, historyError);
+        // Don't throw error, email was sent successfully
+      }
+
     } catch (error) {
       console.error(`Error sending task execution email to ${toEmail}:`, error);
       throw error;
@@ -813,10 +813,10 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      
-      const currentDate = new Date().toLocaleDateString('en-US', { 
-        year: 'numeric', 
-        month: 'short', 
+
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
         day: 'numeric',
         hour: '2-digit',
         minute: '2-digit'
@@ -892,15 +892,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
       const subject = `❌ Scheduled Chat Error: ${scheduleName} - Function Calls Not Allowed`;
-      
+
       // Normalize to array for consistent handling
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
-      
+
       // Send ONE email to all recipients
       await this.sendEmail(emailList, subject, text, html);
-      
+
       console.log(`Scheduled chat error email sent to recipients: ${emailList.join(', ')}`);
-      
+
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat error emails to ${emailList.join(', ')}:`, error);
@@ -929,13 +929,13 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       });
       const expirationDate = expiresAt
         ? new Date(expiresAt).toLocaleString('en-US', {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-            timeZoneName: 'short'
-          })
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          timeZoneName: 'short'
+        })
         : null;
 
       const html = `
@@ -1032,26 +1032,27 @@ Schedule ID: ${scheduleId}
     summary?: string
   ) {
     try {
+      const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      
+
       // Create an interactive share for the session so user can access without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
       try {
         // Use the common function to create or reuse interactive share
         sessionUrl = await chatbotDb.createOrReuseInteractiveShare(result.sessionId);
-        
+
         console.log(`Created or reused interactive share for scheduled chat session ${result.sessionId}`);
       } catch (shareError) {
         console.error('Error creating interactive share for scheduled chat:', shareError);
         // Fall back to regular agent-mode URL if share creation fails
       }
-      
+
       const statusColor = result.passed ? '#28a745' : '#dc3545';
       const statusIcon = result.passed ? '✅' : '❌';
-      
-      const currentDate = new Date().toLocaleDateString('en-US', { 
-        year: 'numeric', 
-        month: 'short', 
+
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
         day: 'numeric',
         hour: '2-digit',
         minute: '2-digit'
@@ -1155,9 +1156,9 @@ It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at $
 
 ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
 Function Call Details:
-${Object.entries(result.functionCallDetails).map(([funcName, details]) => 
-  `- ${funcName}: ${details.actual}/${details.required} calls ${details.actual >= details.required ? '✅' : '❌'}`
-).join('\n')}
+${Object.entries(result.functionCallDetails).map(([funcName, details]) =>
+        `- ${funcName}: ${details.actual}/${details.required} calls ${details.actual >= details.required ? '✅' : '❌'}`
+      ).join('\n')}
 
 ` : ''}AI Response:
 ${result.actualResponse}
@@ -1170,15 +1171,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
       const subject = `${statusIcon} Scheduled Chat: ${scheduleName}${summary ? ` — ${summary}` : ''}`;
-      
+
       // Normalize to array for consistent handling
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
-      
+
       // Send ONE email to all recipients
       await this.sendEmail(emailList, subject, text, html);
-      
+
       console.log(`Scheduled chat result email sent to recipients: ${emailList.join(', ')}`);
-      
+
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat result emails to ${emailList.join(', ')}:`, error);
@@ -1193,6 +1194,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     subject?: string
   ) {
     try {
+      const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
       // Create or reuse interactive share so recipients can view without login
@@ -1292,14 +1294,14 @@ Sent via AgentWeb: ${customerFrontendUrl}
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      
+
       const displayDate = customDate || new Date();
-      const currentDate = displayDate.toLocaleDateString('en-US', { 
-        year: 'numeric', 
-        month: 'long', 
+      const currentDate = displayDate.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
         day: 'numeric'
       });
-      
+
       // Determine if this is for today or a different date
       const isToday = !customDate || displayDate.toDateString() === new Date().toDateString();
       const dateLabel = isToday ? "Today's Summary" : `${currentDate} Summary`;
@@ -1331,12 +1333,12 @@ Sent via AgentWeb: ${customerFrontendUrl}
       const resultsHtml = todaysResults.map((result, index) => {
         const statusIcon = result.passed ? '✅' : '❌';
         const statusColor = result.passed ? '#28a745' : '#dc3545';
-        const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', { 
-          hour: '2-digit', 
-          minute: '2-digit' 
+        const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
+          hour: '2-digit',
+          minute: '2-digit'
         });
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : '#';
-        
+
         return `
           <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${result.passed ? '#f8fff8' : '#fff8f8'};">
             <div class="result-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
@@ -1454,17 +1456,17 @@ ${dateLabel}:
 
 Individual Run Results:
 ${todaysResults.map((result, index) => {
-  const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', { 
-    hour: '2-digit', 
-    minute: '2-digit' 
-  });
-  const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : 'N/A';
-  return `
+        const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+        const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : 'N/A';
+        return `
 Run ${index + 1} at ${runTime} - ${result.passed ? 'PASSED' : 'FAILED'}
 Response: ${result.actualResponse.substring(0, 100)}${result.actualResponse.length > 100 ? '...' : ''}
 View Conversation: ${sessionUrl}
 `;
-}).join('\n')}
+      }).join('\n')}
 
 ---
 This is your daily digest for scheduled chat "${scheduleName}" for ${currentDate}.
@@ -1472,15 +1474,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
       const subject = `📊 Daily Digest: ${scheduleName} - ${currentDate} - ${totalRuns} runs (${Math.round((successfulRuns / totalRuns) * 100)}% success)`;
-      
+
       // Normalize to array for consistent handling
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
-      
+
       // Send ONE email to all recipients
       await this.sendEmail(emailList, subject, text, html);
-      
+
       console.log(`Daily digest email sent to recipients: ${emailList.join(', ')}`);
-      
+
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending daily digest emails to ${emailList.join(', ')}:`, error);
@@ -1667,11 +1669,11 @@ View Session: ${sessionUrl}`;
         // Full detail email (fallback when Notion creation failed)
         const contextHtml = context
           ? Object.entries(context)
-              .map(([key, value]) => {
-                const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
-                return `<tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f8f9fa;">${this.escapeHtml(key)}</td><td style="padding: 8px; border: 1px solid #ddd; white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(displayValue)}</td></tr>`;
-              })
-              .join('')
+            .map(([key, value]) => {
+              const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+              return `<tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f8f9fa;">${this.escapeHtml(key)}</td><td style="padding: 8px; border: 1px solid #ddd; white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(displayValue)}</td></tr>`;
+            })
+            .join('')
           : '';
 
         html = `

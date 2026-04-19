@@ -1,0 +1,754 @@
+import { ExternalCrmSyncService, ExternalCrmSyncConfig, FieldMapping } from '../services/externalCrmSyncService';
+
+// ─── Mock dependencies ────────────────────────────────────────────────────────
+
+jest.mock('../services/db', () => ({
+  crmDb: {
+    getLeadListById: jest.fn(),
+    getLeadsByListId: jest.fn(),
+    updateLead: jest.fn(),
+    batchCreateLeads: jest.fn(),
+    setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock('../utils/crypto', () => ({
+  encryptPassword: jest.fn((pw: string) => `enc:${pw}`),
+  decryptPassword: jest.fn((enc: string) => ({ password: enc.replace('enc:', ''), userId: 'user1' })),
+}));
+
+const mockHubSpotServiceInstance = {
+  testConnection: jest.fn().mockResolvedValue({ valid: true }),
+  ensureContactProperty: jest.fn().mockResolvedValue('aw_notes'),
+  ensureDealProperty: jest.fn().mockResolvedValue('amount'),
+  upsertContact: jest.fn().mockResolvedValue({ contactId: 'c1', isNew: true }),
+  createDeal: jest.fn().mockResolvedValue('d1'),
+  updateDeal: jest.fn().mockResolvedValue(undefined),
+  associateContactToDeal: jest.fn().mockResolvedValue(undefined),
+  listContactsPage: jest.fn().mockResolvedValue({ results: [], nextCursor: undefined }),
+  getContactDealAssociations: jest.fn().mockResolvedValue([]),
+  getDeal: jest.fn().mockResolvedValue(null),
+  getDealPipelineStages: jest.fn().mockResolvedValue([]),
+  createDealStage: jest.fn().mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } }),
+  listContactProperties: jest.fn().mockResolvedValue([]),
+  listDealProperties: jest.fn().mockResolvedValue([]),
+  deleteContact: jest.fn().mockResolvedValue(undefined),
+  deleteDeal: jest.fn().mockResolvedValue(undefined),
+};
+
+const mockAttioServiceInstance = {
+  testConnection: jest.fn().mockResolvedValue({ valid: true }),
+  loadAttributeTypes: jest.fn().mockResolvedValue(new Map()),
+  ensureListAttribute: jest.fn().mockResolvedValue('slug'),
+  upsertPersonByValues: jest.fn().mockResolvedValue({ recordId: 'p1', isNew: true }),
+  createPersonByValues: jest.fn().mockResolvedValue('p1'),
+  updatePersonByValues: jest.fn().mockResolvedValue(undefined),
+  getPersonValues: jest.fn().mockResolvedValue({}),
+  findListEntry: jest.fn().mockResolvedValue('e1'),
+  updateListEntry: jest.fn().mockResolvedValue(undefined),
+  addPersonToList: jest.fn().mockResolvedValue(undefined),
+  listListEntries: jest.fn().mockResolvedValue({ entries: [], nextCursor: undefined }),
+  findCompanyByName: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
+  createCompany: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
+  getCompanyById: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
+  getAllPeopleAttributes: jest.fn().mockResolvedValue([]),
+  listListAttributes: jest.fn().mockResolvedValue([]),
+  deletePerson: jest.fn().mockResolvedValue(undefined),
+};
+
+jest.mock('../services/hubspotService', () => ({
+  HubSpotService: {
+    create: jest.fn(),
+    fromToken: jest.fn(),
+  },
+}));
+
+jest.mock('../services/attioService', () => ({
+  AttioService: {
+    create: jest.fn(),
+    fromToken: jest.fn(),
+  },
+}));
+
+jest.mock('axios');
+const axios = require('axios');
+
+import { crmDb } from '../services/db';
+import { HubSpotService } from '../services/hubspotService';
+import { AttioService } from '../services/attioService';
+
+const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+const mockHubSpotCreate = HubSpotService.create as jest.Mock;
+const mockHubSpotFromToken = HubSpotService.fromToken as jest.Mock;
+const mockAttioCreate = AttioService.create as jest.Mock;
+const mockAttioFromToken = AttioService.fromToken as jest.Mock;
+
+/**
+ * Helper: configure crmDb.getLeadListById to return a list with
+ * externalCrmSyncConfigs[provider] = config (or null if config is null).
+ */
+function mockListWithConfig(config: ExternalCrmSyncConfig | null, provider = 'hubspot', extraListFields: Record<string, any> = {}) {
+  const externalCrmSyncConfigs = config ? { [provider]: config } : {};
+  mockCrmDb.getLeadListById.mockResolvedValue({
+    listId: 'list1',
+    userId: 'user1',
+    name: 'Test List',
+    externalCrmSyncConfigs,
+    ...extraListFields,
+  } as any);
+}
+
+function mockNoConfig() {
+  mockCrmDb.getLeadListById.mockResolvedValue({
+    listId: 'list1',
+    userId: 'user1',
+    name: 'Test List',
+    externalCrmSyncConfigs: {},
+  } as any);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makeConfig(overrides: Partial<ExternalCrmSyncConfig> = {}): ExternalCrmSyncConfig {
+  return {
+    provider: 'hubspot',
+    listId: 'list1',
+    userId: 'user1',
+    accountId: 'acct1',
+    autoSyncEnabled: false,
+    contactFieldMapping: [
+      { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+      { agentwebField: 'firstName', crmProperty: 'firstname', direction: 'both', enabled: true },
+    ],
+    dealFieldMapping: [
+      { agentwebField: 'dealValue', crmProperty: 'amount', direction: 'both', enabled: true },
+    ],
+    customFieldMapping: [],
+    createdAt: '2024-01-01T00:00:00.000Z',
+    updatedAt: '2024-01-01T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe('ExternalCrmSyncService', () => {
+  let service: ExternalCrmSyncService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+    mockHubSpotFromToken.mockReturnValue(mockHubSpotServiceInstance);
+    mockAttioCreate.mockResolvedValue(mockAttioServiceInstance);
+    mockAttioFromToken.mockReturnValue(mockAttioServiceInstance);
+    mockHubSpotServiceInstance.testConnection.mockResolvedValue({ valid: true });
+    mockHubSpotServiceInstance.ensureContactProperty.mockResolvedValue('aw_notes');
+    mockHubSpotServiceInstance.ensureDealProperty.mockResolvedValue('amount');
+    mockHubSpotServiceInstance.upsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
+    mockHubSpotServiceInstance.createDeal.mockResolvedValue('d1');
+    mockHubSpotServiceInstance.updateDeal.mockResolvedValue(undefined);
+    mockHubSpotServiceInstance.associateContactToDeal.mockResolvedValue(undefined);
+    mockHubSpotServiceInstance.listContactsPage.mockResolvedValue({ results: [], nextCursor: undefined });
+    mockHubSpotServiceInstance.getContactDealAssociations.mockResolvedValue([]);
+    mockHubSpotServiceInstance.getDeal.mockResolvedValue(null);
+    mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
+    mockHubSpotServiceInstance.createDealStage.mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } });
+    mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+    service = new ExternalCrmSyncService();
+  });
+
+  // ─── getConfig ────────────────────────────────────────────────────────────
+
+  describe('getConfig', () => {
+    it('returns null when list does not exist', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toBeNull();
+    });
+
+    it('returns null when no config for provider', async () => {
+      mockNoConfig();
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toBeNull();
+    });
+
+    it('returns null when userId does not match', async () => {
+      const config = makeConfig({ userId: 'other-user' });
+      mockListWithConfig(config);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toBeNull();
+    });
+
+    it('returns config when userId matches', async () => {
+      const config = makeConfig();
+      mockListWithConfig(config);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toMatchObject({ provider: 'hubspot', listId: 'list1', userId: 'user1' });
+    });
+
+  });
+
+  // ─── ensureWebhookSecret ──────────────────────────────────────────────────
+
+  describe('ensureWebhookSecret', () => {
+    it('generates a webhookSecret, sets it on the config in-place, and persists it', async () => {
+      const config = makeConfig();
+      delete (config as any).webhookSecret;
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.ensureWebhookSecret('user1', 'list1', 'hubspot', config);
+
+      expect(config.webhookSecret).toBeDefined();
+      expect(typeof config.webhookSecret).toBe('string');
+      expect(config.webhookSecret!.length).toBeGreaterThan(0);
+
+      expect(mockCrmDb.setLeadListCrmSyncConfig).toHaveBeenCalledWith(
+        'list1',
+        'hubspot',
+        expect.objectContaining({ webhookSecret: config.webhookSecret })
+      );
+    });
+  });
+
+  // ─── saveConfig ───────────────────────────────────────────────────────────
+
+  describe('saveConfig', () => {
+    it('creates new config with encrypted API key when no existing config', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { apiKey: 'my-token' });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.apiKeyEncrypted).toBe('enc:my-token');
+      expect(saved.provider).toBe('hubspot');
+      expect(saved.userId).toBe('user1');
+    });
+
+    it('preserves existing encrypted key when no new apiKey provided', async () => {
+      const existing = makeConfig({ apiKeyEncrypted: 'enc:old-token' });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { autoSyncEnabled: true });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.apiKeyEncrypted).toBe('enc:old-token');
+      expect(saved.autoSyncEnabled).toBe(true);
+    });
+
+    it('stores accountId when provided (OAuth path)', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'oauth-acct' });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.accountId).toBe('oauth-acct');
+      expect(saved.apiKeyEncrypted).toBeUndefined();
+    });
+
+    it('saves custom field mapping', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      const customMapping: FieldMapping[] = [
+        { agentwebField: 'source', crmProperty: 'lead_source', direction: 'push', enabled: true },
+      ];
+      await service.saveConfig('user1', 'list1', 'hubspot', { customFieldMapping: customMapping });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.customFieldMapping).toEqual(customMapping);
+    });
+
+    it('merges Attio deal mappings into custom mappings', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {
+        dealFieldMapping: [
+          { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
+        ],
+        customFieldMapping: [
+          { agentwebField: 'company', crmProperty: 'company_name', direction: 'push', enabled: true },
+        ],
+      });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.dealFieldMapping).toEqual([]);
+      expect(saved.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'status', crmProperty: 'deal_status' }),
+        expect.objectContaining({ agentwebField: 'company', crmProperty: 'company_name' }),
+      ]));
+    });
+
+    it('keeps the pipeline ID locked after first sync', async () => {
+      const existing = makeConfig({
+        provider: 'hubspot',
+        listName: 'Locked Pipeline',
+        externalPipelineId: 'pipeline-123',
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {
+        externalPipelineId: 'pipeline-999',
+        listName: 'Renamed Pipeline',
+      });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.externalPipelineId).toBe('pipeline-123');
+      expect(saved.listName).toBe('Locked Pipeline');
+    });
+  });
+
+  // ─── deleteConfig ─────────────────────────────────────────────────────────
+
+  describe('deleteConfig', () => {
+    it('does nothing when no config exists', async () => {
+      mockNoConfig();
+      await service.deleteConfig('user1', 'list1', 'hubspot');
+      expect(mockCrmDb.setLeadListCrmSyncConfig).not.toHaveBeenCalled();
+    });
+
+    it('calls setLeadListCrmSyncConfig with null when config exists', async () => {
+      mockListWithConfig(makeConfig());
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.deleteConfig('user1', 'list1', 'hubspot');
+      expect(mockCrmDb.setLeadListCrmSyncConfig).toHaveBeenCalledWith('list1', 'hubspot', null);
+    });
+  });
+
+  // ─── testConnection ───────────────────────────────────────────────────────
+
+  describe('testConnection', () => {
+    it('returns error when no config found', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      const result = await service.testConnection('user1', 'list1', 'hubspot');
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/no.*config/i);
+    });
+
+    it('returns error when config has no token or accountId', async () => {
+      const config = makeConfig({ accountId: undefined, apiKeyEncrypted: undefined });
+      mockListWithConfig(config);
+      const result = await service.testConnection('user1', 'list1', 'hubspot');
+      expect(result.valid).toBe(false);
+    });
+
+    it('returns valid=true on successful HubSpot API call (OAuth)', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      axios.create.mockReturnValue({
+        get: jest.fn().mockResolvedValue({ data: { results: [] } }),
+      });
+
+      const result = await service.testConnection('user1', 'list1', 'hubspot');
+      expect(result.valid).toBe(true);
+    });
+
+    it('returns valid=false when HubSpot API call fails', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockHubSpotServiceInstance.testConnection.mockResolvedValue({ valid: false, error: 'Unauthorized' });
+
+      const result = await service.testConnection('user1', 'list1', 'hubspot');
+      expect(result.valid).toBe(false);
+      expect(result.error).toBe('Unauthorized');
+    });
+
+    it('returns valid=true on successful Attio API call (manual token)', async () => {
+      const config = makeConfig({ provider: 'attio', accountId: undefined, apiKeyEncrypted: 'enc:attio-token' });
+      mockListWithConfig(config, 'attio');
+      axios.create.mockReturnValue({
+        get: jest.fn().mockResolvedValue({ data: { data: [] } }),
+      });
+
+      const result = await service.testConnection('user1', 'list1', 'attio');
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  // ─── getDistinctCustomFieldKeys ───────────────────────────────────────────
+
+  describe('getDistinctCustomFieldKeys', () => {
+    it('returns empty array if list or fieldNames is missing', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      const result = await service.getDistinctCustomFieldKeys('list1');
+      expect(result).toEqual([]);
+    });
+
+    it('filters standard fields regardless of provider', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({
+        listId: 'list1',
+        fieldNames: ['email', 'firstName', 'real_custom_field']
+      });
+      const result = await service.getDistinctCustomFieldKeys('list1', 'hubspot');
+      expect(result).toEqual(['real_custom_field']);
+    });
+
+    it('filters company_name for hubspot', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({
+        listId: 'list1',
+        fieldNames: ['company_name', 'real_custom_field']
+      });
+      const result = await service.getDistinctCustomFieldKeys('list1', 'hubspot');
+      expect(result).toEqual(['real_custom_field']);
+    });
+
+    it('does NOT filter company_name for attio', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({
+        listId: 'list1',
+        fieldNames: ['company_name', 'real_custom_field']
+      });
+      const result = await service.getDistinctCustomFieldKeys('list1', 'attio');
+      expect(result).toEqual(['company_name', 'real_custom_field']);
+    });
+
+    it('filters first_name and last_name for both providers', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({
+        listId: 'list1',
+        fieldNames: ['first_name', 'last_name', 'real_custom_field']
+      });
+
+      const hubspotResult = await service.getDistinctCustomFieldKeys('list1', 'hubspot');
+      expect(hubspotResult).toEqual(['real_custom_field']);
+
+      const attioResult = await service.getDistinctCustomFieldKeys('list1', 'attio');
+      expect(attioResult).toEqual(['real_custom_field']);
+    });
+
+    it('removes duplicates and sorts results', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({
+        listId: 'list1',
+        fieldNames: ['z_field', 'a_field', 'z_field']
+      });
+      const result = await service.getDistinctCustomFieldKeys('list1', 'hubspot');
+      expect(result).toEqual(['a_field', 'z_field']);
+    });
+
+    it('filters chatSessionCount as a standard field', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({
+        listId: 'list1',
+        fieldNames: ['chatSessionCount', 'real_custom_field']
+      });
+      const result = await service.getDistinctCustomFieldKeys('list1');
+      expect(result).toEqual(['real_custom_field']);
+    });
+  });
+
+  // ─── pushAllLeads (HubSpot) ───────────────────────────────────────────────
+
+  describe('pushAllLeads - HubSpot', () => {
+    it('throws when no config found', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      await expect(service.pushAllLeads('user1', 'list1', 'hubspot'))
+        .rejects.toThrow(/no.*config/i);
+    });
+
+    it('throws when no token or accountId configured', async () => {
+      const config = makeConfig({ accountId: undefined, apiKeyEncrypted: undefined });
+      mockListWithConfig(config);
+      await expect(service.pushAllLeads('user1', 'list1', 'hubspot'))
+        .rejects.toThrow(/no.*auth/i);
+    });
+
+    it('returns success result with zero errors for empty lead list', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
+
+      const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
+      expect(result.errorCount).toBe(0);
+      expect(result.successCount).toBe(0);
+    });
+
+    it('skips leads without email when pushing to HubSpot (no upsert possible)', async () => {
+      const config = makeConfig();
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', firstName: 'John' }], // no email
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const mockClient = { post: jest.fn(), patch: jest.fn(), get: jest.fn(), put: jest.fn() };
+      axios.create.mockReturnValue(mockClient);
+
+      const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
+      expect(result.successCount).toBe(0);
+      expect(mockClient.post).not.toHaveBeenCalled();
+    });
+
+    it('only syncs enabled field mappings', async () => {
+      const config = makeConfig({
+        contactFieldMapping: [
+          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+          { agentwebField: 'phone', crmProperty: 'phone', direction: 'both', enabled: false },
+        ],
+        dealFieldMapping: [],
+        customFieldMapping: [],
+      });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'test@test.com', phone: '1234' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+
+      const mockClient = {
+        post: jest.fn()
+          .mockResolvedValueOnce({ data: { results: [] } })  // search contact
+          .mockResolvedValueOnce({ data: { id: 'c1', properties: {} } }), // create contact
+        patch: jest.fn(),
+        get: jest.fn(),
+        put: jest.fn(),
+      };
+      axios.create.mockReturnValue(mockClient);
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      // The contact create call should NOT include phone
+      const createCall = mockClient.post.mock.calls.find(c => c[0].includes('/contacts') && !c[0].includes('search'));
+      if (createCall) {
+        expect(createCall[1].properties.phone).toBeUndefined();
+      }
+    });
+
+    it('only syncs enabled custom field mappings', async () => {
+      const config = makeConfig({
+        customFieldMapping: [
+          { agentwebField: 'source', crmProperty: 'lead_source', direction: 'push', enabled: true },
+          { agentwebField: 'userId', crmProperty: 'aw_user_id', direction: 'push', enabled: false },
+        ],
+      });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'test@test.com', customFields: { source: 'web', userId: 'u1' } }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+
+      const mockClient = {
+        post: jest.fn()
+          .mockResolvedValueOnce({ data: { results: [] } })  // search
+          .mockResolvedValueOnce({ data: { id: 'c1', properties: {} } }), // create
+        patch: jest.fn(),
+        get: jest.fn(),
+        put: jest.fn(),
+      };
+      axios.create.mockReturnValue(mockClient);
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      const createCall = mockClient.post.mock.calls.find(c => c[0].includes('/contacts') && !c[0].includes('search'));
+      if (createCall) {
+        expect(createCall[1].properties.lead_source).toBe('web');
+        expect(createCall[1].properties.aw_user_id).toBeUndefined();
+      }
+    });
+  });
+
+  // ─── pushAllLeads (Attio) ─────────────────────────────────────────────────
+
+  describe('pushAllLeads - Attio', () => {
+    it('throws when no config found for attio', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      await expect(service.pushAllLeads('user1', 'list1', 'attio'))
+        .rejects.toThrow(/no.*config/i);
+    });
+
+    it('returns success result with zero errors for empty lead list (Attio)', async () => {
+      const config = makeConfig({ provider: 'attio', accountId: 'attio-acct' });
+      mockListWithConfig(config, 'attio');
+      mockAttioCreate.mockResolvedValue({ testConnection: jest.fn().mockResolvedValue({ valid: true }) });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
+
+      const result = await service.pushAllLeads('user1', 'list1', 'attio');
+      expect(result.errorCount).toBe(0);
+      expect(result.successCount).toBe(0);
+    });
+  });
+
+  // ─── autoSyncLead ─────────────────────────────────────────────────────────
+
+  describe('autoSyncLead', () => {
+    it('does nothing when auto-sync is disabled', async () => {
+      const config = makeConfig({ autoSyncEnabled: false });
+      mockListWithConfig(config);
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created');
+
+      expect(mockHubSpotCreate).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when no config exists', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created');
+
+      expect(mockHubSpotCreate).not.toHaveBeenCalled();
+    });
+
+    it('does not throw on sync failure (fire-and-forget)', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockRejectedValue(new Error('token error'));
+
+      await expect(
+        service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created')
+      ).resolves.not.toThrow();
+    });
+  });
+
+  // ─── getExternalProperties ─────────────────────────────────────────────────
+
+  describe('getExternalProperties', () => {
+    const contactProps = [
+      { name: 'email', label: 'Email', type: 'string' },
+      { name: 'firstname', label: 'First Name', type: 'string' },
+      { name: 'custom_field', label: 'Custom Field', type: 'string' },
+    ];
+    const dealProps = [
+      { name: 'amount', label: 'Amount', type: 'number' },
+      { name: 'dealstage', label: 'Deal Stage', type: 'enumeration' },
+    ];
+    const attioAttrs = [
+      { api_slug: 'email_addresses', title: 'Email', type: 'email-address' },
+      { api_slug: 'first_name', title: 'First Name', type: 'personal-name' },
+      { api_slug: 'deal_value', title: 'Deal Value', type: 'currency' },
+    ];
+
+    beforeEach(() => {
+      (mockHubSpotServiceInstance as any).listContactProperties = jest.fn().mockResolvedValue(contactProps);
+      (mockHubSpotServiceInstance as any).listDealProperties = jest.fn().mockResolvedValue(dealProps);
+      (mockAttioServiceInstance as any).getAllPeopleAttributes = jest.fn().mockResolvedValue(attioAttrs);
+    });
+
+    it('throws for an unsupported provider', async () => {
+      await expect(
+        service.getExternalProperties('user1', 'list1', 'salesforce', {})
+      ).rejects.toThrow(/unsupported provider/i);
+    });
+
+    it('throws when no config and no credentials provided', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      await expect(
+        service.getExternalProperties('user1', 'list1', 'hubspot', {})
+      ).rejects.toThrow();
+    });
+
+    it('returns HubSpot contact properties when objectType=contact', async () => {
+      const config = makeConfig();
+      mockListWithConfig(config);
+
+      const result = await service.getExternalProperties('user1', 'list1', 'hubspot', { objectType: 'contact' });
+
+      expect((mockHubSpotServiceInstance as any).listContactProperties).toHaveBeenCalled();
+      expect((mockHubSpotServiceInstance as any).listDealProperties).not.toHaveBeenCalled();
+      expect(result.properties).toHaveLength(contactProps.length);
+      expect(result.properties[0]).toMatchObject({ name: 'email', label: 'Email' });
+    });
+
+    it('returns HubSpot deal properties when objectType=deal', async () => {
+      const config = makeConfig();
+      mockListWithConfig(config);
+
+      const result = await service.getExternalProperties('user1', 'list1', 'hubspot', { objectType: 'deal' });
+
+      expect((mockHubSpotServiceInstance as any).listDealProperties).toHaveBeenCalled();
+      expect((mockHubSpotServiceInstance as any).listContactProperties).not.toHaveBeenCalled();
+      expect(result.properties).toHaveLength(dealProps.length);
+      expect(result.properties[0]).toMatchObject({ name: 'amount', label: 'Amount' });
+    });
+
+    it('returns Attio people attributes for any objectType', async () => {
+      const config = makeConfig({ provider: 'attio' });
+      mockListWithConfig(config, 'attio');
+
+      const result = await service.getExternalProperties('user1', 'list1', 'attio', {});
+
+      expect((mockAttioServiceInstance as any).getAllPeopleAttributes).toHaveBeenCalled();
+      // The personal-name attribute expands into first_name:text, last_name:text, plus the original —
+      // so 3 input attrs → 5 output properties (email-address + 3 for personal-name + currency)
+      expect(result.properties).toHaveLength(5);
+      expect(result.properties).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'email_addresses', type: 'email-address' }),
+        expect.objectContaining({ name: 'first_name', type: 'text' }),
+        expect.objectContaining({ name: 'last_name', type: 'text' }),
+        expect.objectContaining({ name: 'deal_value', type: 'currency' }),
+      ]));
+    });
+
+    it('accepts inline accountId/apiKey without a saved config', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+
+      const result = await service.getExternalProperties('user1', 'list1', 'hubspot', {
+        accountId: 'inline-acct',
+        objectType: 'contact',
+      });
+
+      expect(result.properties).toHaveLength(contactProps.length);
+    });
+  });
+
+  // ─── deleteLeadFromCrm ─────────────────────────────────────────────────────
+
+  describe('deleteLeadFromCrm', () => {
+    beforeEach(() => {
+      (mockHubSpotServiceInstance as any).deleteContact = jest.fn().mockResolvedValue(undefined);
+      (mockHubSpotServiceInstance as any).deleteDeal = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it('throws when no config exists', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      await expect(
+        service.deleteLeadFromCrm('user1', 'list1', 'hubspot', { leadId: 'l1', email: 'a@b.com' })
+      ).rejects.toThrow(/no sync configuration/i);
+    });
+
+    it('no-ops when deleteOnPush is false', async () => {
+      const config = makeConfig({ deleteOnPush: false });
+      mockListWithConfig(config);
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'hubspot', { leadId: 'l1', email: 'a@b.com' });
+
+      expect((mockHubSpotServiceInstance as any).deleteContact).not.toHaveBeenCalled();
+    });
+
+    it('no-ops when lead has no external CRM ID', async () => {
+      const config = makeConfig({ deleteOnPush: true });
+      mockListWithConfig(config);
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'hubspot', {
+        leadId: 'l1', email: 'a@b.com', syncMetadata: {},
+      });
+
+      expect((mockHubSpotServiceInstance as any).deleteContact).not.toHaveBeenCalled();
+    });
+
+    it('calls HubSpot deleteContact when deleteOnPush=true and contactId exists', async () => {
+      const config = makeConfig({ deleteOnPush: true });
+      mockListWithConfig(config);
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'hubspot', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { hubspot_contact_id: 'c123' },
+      });
+
+      expect((mockHubSpotServiceInstance as any).deleteContact).toHaveBeenCalledWith('c123');
+    });
+  });
+});

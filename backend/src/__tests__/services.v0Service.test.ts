@@ -128,6 +128,7 @@ import {
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
+  ensurePageMetadataTitle,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -840,6 +841,119 @@ describe("v0Service - remapFilesForSubPage", () => {
   it("handles empty files array", () => {
     const result = remapFilesForSubPage([], "test");
     expect(result).toHaveLength(0);
+  });
+
+  // Regression: sub-pages inherited the root layout's stale <title>
+  // (e.g. "xCures® | HIMSS 2026 Digital Resource Package") because neither
+  // remapFilesForSubPage nor the generated page.tsx set per-page metadata.
+  // Fix injects an `export const metadata = { title }` into app/<slug>/page.tsx.
+  describe("metadata title injection (fix: sub-pages inherited stale layout <title>)", () => {
+    it("injects metadata.title into remapped page.tsx when pageTitle is provided", () => {
+      const files = [
+        { path: "app/page.tsx", content: buf('export default function Page() { return <div>Hi</div>; }') },
+      ];
+      const result = remapFilesForSubPage(files, "pricing", "Enterprise Pricing");
+      const page = result.find(f => f.path === "app/pricing/page.tsx");
+      expect(page).toBeDefined();
+      const src = page!.content.toString("utf-8");
+      expect(src).toContain('export const metadata');
+      expect(src).toContain('title: "Enterprise Pricing"');
+    });
+
+    it("rewrites an existing metadata.title rather than duplicating it", () => {
+      const pageContent = `export const metadata = { title: "Old Title", description: "keep me" };\nexport default function Page() { return <div/>; }`;
+      const files = [{ path: "app/page.tsx", content: buf(pageContent) }];
+      const result = remapFilesForSubPage(files, "about", "Fresh Title");
+      const src = result[0].content.toString("utf-8");
+      expect(src).toContain('title: "Fresh Title"');
+      expect(src).not.toContain('title: "Old Title"');
+      // Sibling fields preserved
+      expect(src).toContain('description: "keep me"');
+      // Only one metadata export
+      expect(src.match(/export const metadata/g)!.length).toBe(1);
+    });
+
+    it("does NOT inject metadata when pageTitle is omitted (backwards compatible)", () => {
+      const files = [
+        { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+      ];
+      const result = remapFilesForSubPage(files, "demo");
+      const src = result[0].content.toString("utf-8");
+      expect(src).not.toContain('export const metadata');
+    });
+
+    it("does NOT inject metadata when pageTitle is blank/whitespace", () => {
+      const files = [
+        { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+      ];
+      const result = remapFilesForSubPage(files, "demo", "   ");
+      const src = result[0].content.toString("utf-8");
+      expect(src).not.toContain('export const metadata');
+    });
+
+    it("escapes double quotes inside the title to avoid breaking the tsx", () => {
+      const files = [
+        { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+      ];
+      const result = remapFilesForSubPage(files, "x", 'Acme "Pro" Plan');
+      const src = result[0].content.toString("utf-8");
+      expect(src).toContain('title: "Acme \\"Pro\\" Plan"');
+    });
+  });
+});
+
+// =============================================================================
+// ensurePageMetadataTitle
+// =============================================================================
+describe("v0Service - ensurePageMetadataTitle", () => {
+  it("prepends metadata export when file has none", () => {
+    const input = `export default function Page() { return <div/>; }`;
+    const out = ensurePageMetadataTitle(input, "My Page");
+    expect(out.startsWith('export const metadata = { title: "My Page" };')).toBe(true);
+    expect(out).toContain('export default function Page');
+  });
+
+  it("adds title to existing metadata object that lacks one", () => {
+    const input = `export const metadata = { description: "desc" };\nexport default function Page() {}`;
+    const out = ensurePageMetadataTitle(input, "New");
+    expect(out).toContain('title: "New"');
+    expect(out).toContain('description: "desc"');
+    expect(out.match(/export const metadata/g)!.length).toBe(1);
+  });
+
+  it("replaces existing title (string literal)", () => {
+    const input = `export const metadata = { title: "Old" };`;
+    const out = ensurePageMetadataTitle(input, "New");
+    expect(out).toContain('title: "New"');
+    expect(out).not.toContain('"Old"');
+  });
+
+  it("replaces existing title (template literal)", () => {
+    const input = 'export const metadata = { title: `Old` };';
+    const out = ensurePageMetadataTitle(input, "New");
+    expect(out).toContain('title: "New"');
+    expect(out).not.toContain('`Old`');
+  });
+
+  it("handles typed metadata (export const metadata: Metadata = {...})", () => {
+    const input = `import type { Metadata } from "next";\nexport const metadata: Metadata = { title: "Old", robots: "index" };`;
+    const out = ensurePageMetadataTitle(input, "New");
+    expect(out).toContain('title: "New"');
+    expect(out).toContain('robots: "index"');
+  });
+
+  it("preserves 'use client' directive position", () => {
+    const input = `'use client'\n\nexport default function Page() {}`;
+    const out = ensurePageMetadataTitle(input, "Client Page");
+    // 'use client' must remain first line
+    expect(out.split("\n")[0]).toBe("'use client'");
+    expect(out).toContain('export const metadata = { title: "Client Page" };');
+  });
+
+  it("returns input unchanged when title is empty", () => {
+    const input = `export default function Page() {}`;
+    expect(ensurePageMetadataTitle(input, "")).toBe(input);
+    expect(ensurePageMetadataTitle(input, "   ")).toBe(input);
   });
 });
 

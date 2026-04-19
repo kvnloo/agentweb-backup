@@ -18,6 +18,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Selecting the Live Voice model and clicking Start now correctly preserves the selection for the new session instead of reverting to the default model',
       'Fix: New Chat Now Resets to the Default Model',
       '- Clicking New Chat while on a live voice session now correctly resets the model selector to the default (sonnet 4.6) instead of keeping the live model',
+      'Fix: CRM CSV Import Now Accepts Files Up to 50 MB',
+      '- The file size limit for importing leads via CSV has been raised from 10 MB to 50 MB',
+      '- Uploads that exceed the limit now return a clear error message instead of a generic server error',
     ],
   },
   {
@@ -63,10 +66,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-18',
     changes: [
+      'Fix: Voice Mode Now Works in iShare (Interactive Share) Sessions',
+      '- Clicking "Start" for voice mode in an iShare link now connects and activates the live session',
+      '- Previously the Start button had no effect — the socket connection was blocked because iShare users have no login token',
+      '- iShare voice sessions now authenticate via the conversable token instead of requiring a login',
       'Fix: CRM Enrichment No Longer Misidentifies Company for Personal Email Leads',
       '- Leads with personal email addresses (Gmail, Yahoo, Outlook, Hotmail, iCloud, ProtonMail, etc.) no longer get enriched with wrong company data',
       '- Previously, enrichment used the email domain (e.g. gmail.com) as a company search term, causing all Gmail leads to get "Google" as their company',
       '- Personal email domains are now detected and excluded from company lookups — these leads get "Unknown" for company fields instead of incorrect data',
+      'Fix: Image Generation No Longer Fails When Creating Multiple Images in One Session',
+      '- When Emma is asked to generate several images in a row (e.g. a batch of ad creatives), they are now generated one at a time instead of all simultaneously',
+      '- Previously, batched image generation triggered concurrent Gemini API calls that hit rate limits, causing some images to fail or time out',
+      '- Images and videos in a batch now execute sequentially, ensuring each generation completes successfully before the next begins',
     ],
   },
   {

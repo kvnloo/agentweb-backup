@@ -667,7 +667,7 @@ async function addPageToExistingRepo(
     // ── Step 4: Extract and remap files for the new page route ──
     const allFiles = await unzipBuffer(zipBuffer);
     autoFixV0Files(allFiles);
-    const filesToCommit = remapFilesForSubPage(allFiles, slug);
+    const filesToCommit = remapFilesForSubPage(allFiles, slug, name);
 
     console.log(`[V0 SERVICE] Extracted ${filesToCommit.length} files for /${slug}: ${filesToCommit.map(f => f.path).join(", ")}`);
 
@@ -808,6 +808,55 @@ async function addPageToExistingRepo(
 }
 
 /**
+ * Inject or replace a Next.js App Router `metadata` export in a page.tsx so the
+ * resolved `<title>` reflects the new page instead of inheriting the root
+ * layout's stale title (e.g. a hardcoded "xCures® | HIMSS 2026…" from an
+ * earlier generation). Next.js per-page metadata takes precedence over
+ * layout metadata, so this is sufficient to fix the rendered <title>.
+ *
+ * Behaviour:
+ * - If the file already exports a `metadata` object, rewrite its `title`
+ *   field (or insert one) to the provided title.
+ * - Otherwise, prepend a new `export const metadata = { title: "…" }` block
+ *   right after any leading `'use client'` directive (if present — though
+ *   `metadata` exports only work in server components, so this case is rare).
+ */
+export function ensurePageMetadataTitle(content: string, title: string): string {
+  if (!title || !title.trim()) return content;
+  const escaped = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+  // Case 1: existing `export const metadata = { ... }` — rewrite its title field
+  const existingMetadataRegex = /export\s+const\s+metadata\s*(?::\s*[^=]+)?=\s*\{([\s\S]*?)\}\s*;?/;
+  const match = content.match(existingMetadataRegex);
+  if (match) {
+    const body = match[1];
+    let newBody: string;
+    if (/\btitle\s*:/.test(body)) {
+      // Replace existing title field value (string or template literal)
+      newBody = body.replace(
+        /(\btitle\s*:\s*)(?:`[^`]*`|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/,
+        `$1"${escaped}"`
+      );
+    } else {
+      // Insert a title field at the top of the metadata object
+      newBody = `\n  title: "${escaped}",` + body;
+    }
+    const replacement = `export const metadata = {${newBody}}`;
+    return content.replace(existingMetadataRegex, replacement);
+  }
+
+  // Case 2: no existing metadata export — prepend a fresh one after any
+  // 'use client' directive. In practice page.tsx should be a server component
+  // so the directive is unusual here, but we handle it defensively.
+  const metadataBlock = `export const metadata = { title: "${escaped}" };\n\n`;
+  const useClientMatch = content.match(/^(\s*(?:'use client'|"use client");?\s*\n)/);
+  if (useClientMatch) {
+    return useClientMatch[1] + metadataBlock + content.slice(useClientMatch[1].length);
+  }
+  return metadataBlock + content;
+}
+
+/**
  * Remap files from a v0 zip for a sub-page route.
  * - app/page.tsx → app/<slug>/page.tsx
  * - components/*.tsx → app/<slug>/_components/*.tsx (avoids conflicts with root page)
@@ -815,10 +864,14 @@ async function addPageToExistingRepo(
  * - Config files, layout.tsx, globals.css → skipped (use existing project's)
  *
  * Also rewrites import paths in the page file to point to the relocated components.
+ * If `pageTitle` is provided, injects/overrides a Next.js `metadata.title` export
+ * on the remapped page.tsx so the rendered <title> reflects the new page rather
+ * than inheriting a stale title from the root layout.
  */
 export function remapFilesForSubPage(
   files: Array<{ path: string; content: Buffer }>,
-  slug: string
+  slug: string,
+  pageTitle?: string
 ): Array<{ path: string; content: Buffer }> {
   // Files to skip — the existing project already has these
   const skipPatterns = [
@@ -902,6 +955,17 @@ export function remapFilesForSubPage(
 
     if (changed) {
       file.content = Buffer.from(content);
+    }
+  }
+
+  // Inject per-page metadata title so sub-pages don't inherit the root
+  // layout's (possibly stale) <title>. See ensurePageMetadataTitle for details.
+  if (pageTitle && pageTitle.trim()) {
+    const pagePath = `app/${slug}/page.tsx`;
+    const pageFile = result.find((f) => f.path === pagePath);
+    if (pageFile) {
+      const updated = ensurePageMetadataTitle(pageFile.content.toString("utf-8"), pageTitle);
+      pageFile.content = Buffer.from(updated);
     }
   }
 

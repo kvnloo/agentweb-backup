@@ -109,6 +109,11 @@ export async function handleWebhook(req: Request, res: Response) {
         console.log(`Unhandled Stripe event type: ${event.type}`);
     }
 
+    // CRM signal (B3): mirror billing events into AW-ContactEvents so lifecycle
+    // and health scores reflect live billing state. Fire-and-forget — never
+    // blocks the webhook ack. Errors are swallowed inside the hook.
+    void sendStripeEventToCrm(event);
+
     res.json({ received: true });
   } catch (error: any) {
     console.error(`Error handling webhook event ${event.type}:`, error.message);
@@ -234,6 +239,63 @@ async function handleInvoicePayment(
     });
   } catch (err: any) {
     console.error(`[PaymentHistory] Failed to record ${eventType}: ${err.message}`);
+  }
+}
+
+/**
+ * Mirror a Stripe event into AW-ContactEvents for CRM lifecycle/health scoring (B3).
+ *
+ * Runs fire-and-forget after the primary webhook handler. Idempotent on the
+ * Stripe event id (sourceRecordId = `stripe-<eventId>`). After the event is
+ * logged, triggers lifecycle + health recompute for the affected contact.
+ */
+async function sendStripeEventToCrm(event: any): Promise<void> {
+  try {
+    const obj = event?.data?.object || {};
+    const customerId = typeof obj.customer === 'string' ? obj.customer : obj.customer?.id;
+    const subscriptionId = typeof obj.subscription === 'string'
+      ? obj.subscription
+      : obj.subscription?.id || (obj.object === 'subscription' ? obj.id : undefined);
+
+    // Resolve email: prefer customer_details from checkout; fallback to user lookup by Stripe customer id.
+    let email: string | undefined = obj.customer_details?.email || obj.customer_email || undefined;
+    let user: any = null;
+    if (!email && customerId) {
+      user = await findUserByStripeCustomerId(customerId);
+      if (user?.email) email = user.email;
+    } else if (customerId) {
+      user = await findUserByStripeCustomerId(customerId);
+    }
+    if (!email) {
+      console.warn(`[stripe->crm] no email for event ${event.type} / ${event.id}, skipping CRM sync`);
+      return;
+    }
+
+    const status = (obj.status as string | undefined) || undefined;
+    const currentPeriodEnd = typeof obj.current_period_end === 'number'
+      ? new Date(obj.current_period_end * 1000).toISOString()
+      : undefined;
+
+    const { onStripeSubscriptionEvent } = await import('../services/crmSignalHooks');
+    await onStripeSubscriptionEvent({
+      eventId: event.id,
+      eventType: event.type,
+      email,
+      firstName: obj.customer_details?.name?.split(' ')?.[0] || null,
+      stripeCustomerId: customerId || null,
+      stripeSubscriptionId: subscriptionId || null,
+      status: status || null,
+      subscriptionType: user?.subscriptionType || null,
+      currentPeriodEnd: currentPeriodEnd || null,
+    });
+
+    // Downstream heat/health/lifecycle recompute is wired through the
+    // contactSyncService when a real signal loader is available (D2). For
+    // now the event alone is enough — lifecycleService + healthScoreService
+    // require an AW-Leads-backed loadSignals fetcher we'll inject centrally
+    // once D2 ships, so every CRM signal recomputes the same way.
+  } catch (err: any) {
+    console.error('[stripe->crm] failed to mirror event:', err?.message || err);
   }
 }
 

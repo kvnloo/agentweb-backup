@@ -11,7 +11,7 @@
 
 import express, { Request, Response, NextFunction } from 'express';
 import { mcpOAuthService } from './oauthService';
-import { authenticateToken } from '../../middleware/auth';
+import { authenticateToken, getUserFromToken } from '../../middleware/auth';
 
 /**
  * Middleware: accept the user's JWT either from the Authorization header
@@ -139,26 +139,32 @@ export function setupMcpOAuth(app: express.Express) {
 
     const actualRedirectUri = redirect_uri || client.redirectUris[0];
 
-    // Dev mode auto-approve: skip consent page, generate code immediately
-    if (process.env.NODE_ENV === 'development') {
-      // In dev mode, we need a userId — use a dev fallback
-      const devUserId = (req as any).user?.userId || 'dev-user';
-      const { code } = await mcpOAuthService.createAuthorizationCode({
-        clientId: client_id,
-        userId: devUserId,
-        redirectUri: actualRedirectUri,
-        scope: scope || 'mcp:tools',
-        codeChallenge: code_challenge,
-        codeChallengeMethod: code_challenge_method || 'S256',
-      });
+    // Local-dev auto-approve: skip the consent page and issue a code directly.
+    // Gated behind an explicit opt-in flag (NOT NODE_ENV) so a forgotten staging
+    // env can never short-circuit consent. Also requires a real authenticated
+    // user — we refuse to mint anonymous tokens tied to a fake "dev-user" ID,
+    // which previously let any unauthenticated caller obtain mcp:tools tokens.
+    if (process.env.MCP_OAUTH_SKIP_CONSENT === 'true') {
+      const { user } = await getUserFromToken(req);
+      if (user) {
+        const { code } = await mcpOAuthService.createAuthorizationCode({
+          clientId: client_id,
+          userId: user.userId,
+          redirectUri: actualRedirectUri,
+          scope: scope || 'mcp:tools',
+          codeChallenge: code_challenge,
+          codeChallengeMethod: code_challenge_method || 'S256',
+        });
 
-      const redirectUrl = new URL(actualRedirectUri);
-      redirectUrl.searchParams.set('code', code);
-      if (state) redirectUrl.searchParams.set('state', state);
-      return res.redirect(302, redirectUrl.toString());
+        const redirectUrl = new URL(actualRedirectUri);
+        redirectUrl.searchParams.set('code', code);
+        if (state) redirectUrl.searchParams.set('state', state);
+        return res.redirect(302, redirectUrl.toString());
+      }
+      // Flag set but no authenticated user → fall through to consent page.
     }
 
-    // Production: redirect to customer portal consent page
+    // Default: redirect to customer portal consent page
     const consentUrl = new URL('/oauth/authorize', process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro');
     consentUrl.searchParams.set('client_id', client_id);
     consentUrl.searchParams.set('client_name', client.clientName);

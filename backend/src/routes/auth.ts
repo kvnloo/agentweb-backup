@@ -351,4 +351,59 @@ router.get('/:userId/chat-sessions', authenticateToken, async (req, res) => {
   }
 });
 
+// Allowed values for the onboarding "What would you like Emma to help with?" multi-select.
+// Keep in sync with the frontend OnboardingHelpSelect component.
+const ALLOWED_EMMA_HELP_INTERESTS = new Set<string>([
+  'brand',
+  'paid_ads',
+  'founder_led_sales',
+  'organic_content',
+  'outreach_smartlead',
+  'paid_plus_organic',
+  'not_sure',
+]);
+
+// Persist the user's onboarding interests. Called from the onboarding flow;
+// empty array = user skipped, still recorded so we don't re-prompt.
+router.patch('/onboarding-interests', authenticateToken, async (req, res) => {
+  try {
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'User not authenticated' });
+    }
+
+    const { interests } = req.body ?? {};
+    if (!Array.isArray(interests)) {
+      return res.status(400).json({ message: 'interests must be an array of strings' });
+    }
+    if (interests.length > ALLOWED_EMMA_HELP_INTERESTS.size) {
+      return res.status(400).json({ message: 'Too many interests' });
+    }
+    const invalid = interests.filter((i: unknown) => typeof i !== 'string' || !ALLOWED_EMMA_HELP_INTERESTS.has(i));
+    if (invalid.length > 0) {
+      return res.status(400).json({ message: `Invalid interest value(s): ${invalid.join(', ')}` });
+    }
+    // Dedup while preserving order
+    const deduped = Array.from(new Set<string>(interests as string[]));
+
+    const updated = await userDb.updateUser(userId, {
+      emmaHelpInterests: deduped,
+      emmaHelpInterestsSetAt: new Date().toISOString(),
+    } as any);
+
+    if (!updated) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    return res.json({
+      emmaHelpInterests: deduped,
+      emmaHelpInterestsSetAt: (updated as any).emmaHelpInterestsSetAt,
+    });
+  } catch (error) {
+    console.error('Error saving onboarding interests:', error);
+    return res.status(500).json({ message: 'Failed to save onboarding interests' });
+  }
+});
+
 export default router; 
