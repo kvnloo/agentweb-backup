@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-19',
+    changes: [
+      'Fix: CRM CSV Import Now Accepts Files Up to 50 MB',
+      '- The file size limit for importing leads via CSV has been raised from 10 MB to 50 MB',
+      '- Uploads that exceed the limit now return a clear error message instead of a generic server error',
+    ],
+  },
+  {
     date: '2026-04-17',
     changes: [
       'Fix: Emma Now Visually Verifies Screenshots Instead of Assuming Success',

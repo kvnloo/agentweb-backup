@@ -98,7 +98,7 @@ const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 50 * 1024 * 1024, // 50MB limit
   },
 });
 
@@ -1741,6 +1741,9 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`,
     });
   } catch (error: any) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ message: 'File too large. Maximum CSV size is 50 MB.' });
+    }
     console.error('Error importing leads:', error);
     res.status(500).json({ message: error.message || 'Failed to import leads' });
   }
