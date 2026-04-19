@@ -4,7 +4,8 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSchema";
+import type { AttributionTouch } from "../types/attribution";
 import { onUserSignup } from "./crmSignalHooks";
 
 // Load environment variables from .env file
@@ -3774,6 +3775,11 @@ export const crmDb = {
     dealIds?: string[];
     tenantId?: string;
     syncMetadata?: Record<string, any>;
+    // Attribution fields (mirror User schema — see types/attribution.ts)
+    firstTouch?: AttributionTouch;
+    lastTouch?: AttributionTouch;
+    utmSource?: string;
+    utmMedium?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3854,6 +3860,21 @@ export const crmDb = {
         tenantId: leadData.tenantId,
       });
       Object.assign(item, crmFields);
+
+      // Attribution fields (Lead UTM — mirrors User schema). firstTouch is
+      // stamped on creation and never mutated; lastTouch is refreshed on each
+      // touch. utmSource / utmMedium are denormalized from firstTouch for
+      // cheap channel-attribution filter queries.
+      const attributionFields = buildLeadAttributionFields({
+        firstTouch: leadData.firstTouch,
+        // On a brand-new Lead, if only firstTouch is supplied, treat it as
+        // lastTouch too — same contract as the User registration path in
+        // controllers/auth.ts.
+        lastTouch: leadData.lastTouch || leadData.firstTouch,
+        utmSource: leadData.utmSource,
+        utmMedium: leadData.utmMedium,
+      });
+      Object.assign(item, attributionFields);
 
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,

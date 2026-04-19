@@ -176,6 +176,97 @@ describe('CRM Database Service', () => {
       const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
       expect(putCall.Item.email).toBeUndefined();
     });
+
+    it('stamps firstTouch, lastTouch and denormalized utm fields from attribution', async () => {
+      const listId = 'list_123';
+      const firstTouch = {
+        timestamp: '2026-04-19T10:00:00.000Z',
+        utm: { source: 'linkedin', medium: 'social', campaign: 'launch' },
+        referrer: 'https://linkedin.com/feed',
+      };
+      const leadData = {
+        email: 'attribution@example.com',
+        firstName: 'Jane',
+        firstTouch,
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.firstTouch).toEqual(firstTouch);
+      // lastTouch defaults to firstTouch on a fresh lead when not supplied
+      expect(putCall.Item.lastTouch).toEqual(firstTouch);
+      expect(putCall.Item.utmSource).toBe('linkedin');
+      expect(putCall.Item.utmMedium).toBe('social');
+    });
+
+    it('leaves attribution fields absent when none supplied (CSV import path)', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        email: 'csv-row@example.com',
+        firstName: 'Bob',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.firstTouch).toBeUndefined();
+      expect(putCall.Item.lastTouch).toBeUndefined();
+      expect(putCall.Item.utmSource).toBeUndefined();
+      expect(putCall.Item.utmMedium).toBeUndefined();
+    });
+
+    it('accepts distinct firstTouch and lastTouch (repeat-touch scenarios)', async () => {
+      const listId = 'list_123';
+      const firstTouch = {
+        timestamp: '2026-04-01T10:00:00.000Z',
+        utm: { source: 'google', medium: 'cpc' },
+      };
+      const lastTouch = {
+        timestamp: '2026-04-19T10:00:00.000Z',
+        utm: { source: 'linkedin', medium: 'social' },
+      };
+      const leadData = { email: 'rt@example.com', firstTouch, lastTouch };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.firstTouch).toEqual(firstTouch);
+      expect(putCall.Item.lastTouch).toEqual(lastTouch);
+      // Top-level utm* is denormalized from firstTouch (the origin of the lead)
+      expect(putCall.Item.utmSource).toBe('google');
+      expect(putCall.Item.utmMedium).toBe('cpc');
+    });
   });
 
   describe('getLeadsByListId', () => {
