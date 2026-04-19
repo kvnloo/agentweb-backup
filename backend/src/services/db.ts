@@ -4,7 +4,9 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSchema";
+import type { AttributionTouch } from "../types/attribution";
+import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 
 // Load environment variables from .env file
@@ -3774,6 +3776,11 @@ export const crmDb = {
     dealIds?: string[];
     tenantId?: string;
     syncMetadata?: Record<string, any>;
+    // Attribution fields (mirror User schema — see types/attribution.ts)
+    firstTouch?: AttributionTouch;
+    lastTouch?: AttributionTouch;
+    utmSource?: string;
+    utmMedium?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3855,6 +3862,21 @@ export const crmDb = {
       });
       Object.assign(item, crmFields);
 
+      // Attribution fields (Lead UTM — mirrors User schema). firstTouch is
+      // stamped on creation and never mutated; lastTouch is refreshed on each
+      // touch. utmSource / utmMedium are denormalized from firstTouch for
+      // cheap channel-attribution filter queries.
+      const attributionFields = buildLeadAttributionFields({
+        firstTouch: leadData.firstTouch,
+        // On a brand-new Lead, if only firstTouch is supplied, treat it as
+        // lastTouch too — same contract as the User registration path in
+        // controllers/auth.ts.
+        lastTouch: leadData.lastTouch || leadData.firstTouch,
+        utmSource: leadData.utmSource,
+        utmMedium: leadData.utmMedium,
+      });
+      Object.assign(item, attributionFields);
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Item: item,
@@ -3888,6 +3910,38 @@ export const crmDb = {
 
       // Increment lead count
       await this.incrementLeadCount(listId, 1);
+
+      // Attribution event — fire once per Lead when any attribution signal is
+      // captured. Dedupe via sourceRecordId (`attribution:lead:{leadId}`) so
+      // retries on the same lead create a single row.
+      if (leadData.firstTouch) {
+        const contactId = emailValue || `nocontact:${leadId}`;
+        try {
+          await contactEventsDb.logEvent({
+            contactId: normalizeContactId(contactId),
+            source: 'lead_form',
+            eventType: 'attribution.first_touch',
+            sourceRecordId: `attribution:lead:${leadId}`,
+            payload: {
+              leadId,
+              listId,
+              firstTouch: leadData.firstTouch,
+              // Denormalized for cheap dashboard queries — same shape the
+              // User signup event emits.
+              utmSource: leadData.firstTouch.utm?.source,
+              utmMedium: leadData.firstTouch.utm?.medium,
+              utmCampaign: leadData.firstTouch.utm?.campaign,
+              referrer: leadData.firstTouch.referrer,
+              landingUrl: leadData.firstTouch.landingUrl,
+            },
+            ...(leadData.tenantId ? { tenantId: leadData.tenantId } : {}),
+          });
+        } catch (eventErr) {
+          // Never fail lead creation on an event-log write error — the lead
+          // row has already been persisted above. Log and continue.
+          console.error('[createLead] attribution.first_touch logEvent failed:', eventErr);
+        }
+      }
 
       return params.Item;
     } catch (error) {

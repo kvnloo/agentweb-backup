@@ -660,5 +660,92 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         );
       });
     });
+
+    describe('Attribution (UTM) capture', () => {
+      const mockLeadList = {
+        listId: 'list_123',
+        userId: 'user_123',
+        name: 'Test List',
+        publicAccessEnabled: true,
+        autoDraftEnabled: false,
+      };
+
+      beforeEach(() => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_123',
+          listId: 'list_123',
+          email: 'utm@example.com',
+        });
+      });
+
+      it('stamps firstTouch and lastTouch from the new `attribution` shape', async () => {
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'utm@example.com',
+            attribution: {
+              timestamp: '2026-04-19T10:00:00.000Z',
+              utm: { source: 'linkedin', medium: 'social', campaign: 'launch' },
+              referrer: 'https://linkedin.com/feed',
+              landingUrl: 'https://agentweb.pro/?utm_source=linkedin',
+            },
+          });
+
+        expect(response.status).toBe(201);
+        expect(crmDb.createLead).toHaveBeenCalledWith(
+          'list_123',
+          expect.objectContaining({
+            email: 'utm@example.com',
+            firstTouch: expect.objectContaining({
+              utm: expect.objectContaining({ source: 'linkedin', medium: 'social' }),
+            }),
+            lastTouch: expect.objectContaining({
+              utm: expect.objectContaining({ source: 'linkedin' }),
+            }),
+          })
+        );
+      });
+
+      it('stamps firstTouch from the legacy flat `utm` shape', async () => {
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'utm@example.com',
+            utm: {
+              utm_source: 'google',
+              utm_medium: 'cpc',
+              utm_campaign: 'branded',
+            },
+          });
+
+        expect(response.status).toBe(201);
+        expect(crmDb.createLead).toHaveBeenCalledWith(
+          'list_123',
+          expect.objectContaining({
+            firstTouch: expect.objectContaining({
+              utm: expect.objectContaining({ source: 'google', medium: 'cpc' }),
+            }),
+          })
+        );
+      });
+
+      it('does not stamp attribution when none is provided (no-op)', async () => {
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'noutm@example.com',
+          });
+
+        expect(response.status).toBe(201);
+        const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
+        expect(call.firstTouch).toBeUndefined();
+        expect(call.lastTouch).toBeUndefined();
+      });
+    });
   });
 });

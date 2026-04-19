@@ -52,11 +52,11 @@ export type ContactEventType =
   | 'deal.created'
   | 'deal.stage_changed'
   | 'deal.primary_rotated'
+  // Attribution — fired once per contact when UTM / referrer / landingUrl
+  // is first captured. Dedupe via sourceRecordId so repeat signals on the
+  // same lead create a single row. Payload holds the full AttributionTouch.
+  | 'attribution.first_touch'
   // Activity timeline additions (see natural-language timeline task).
-  // NOTE: `attribution.first_touch` was added inline by the UTM backend PR
-  // via the permissive string fallback below — intentionally not duplicated
-  // here to avoid collisions with that PR's final merge. When both PRs land,
-  // add it to this union in a follow-up cleanup.
   | 'form.submitted'
   | 'page.visited'
   | 'user.registered'

@@ -1,18 +1,20 @@
 /**
- * Lifecycle Drip Phase 4 — Execution + Safety.
+ * Drip campaigns — Execution + Safety (Phase A: multi-tenant, CRM-scoped).
  *
  * Cron-driven drip email executor. Runs every 15 minutes in prod/dev, reads
- * active campaigns from `AW-DripCampaigns`, segments users with the Phase 1/2
- * helpers (`getAllUsers` + `deriveOnboardingStage`), applies safety gates, and
- * dispatches emails via the existing `emailService`.
+ * active campaigns from `AW-DripCampaigns`, and for each campaign segments
+ * its owner's CRM leads (AW-Leads, scoped to the campaign's userId) instead
+ * of broadcasting across AW-Users. That makes drip a customer-facing
+ * product feature — each tenant runs their own campaigns against their
+ * own leads.
  *
  * Safety gates (in order — short-circuit on first fail):
  *   1. Global kill switch — `DRIP_CAMPAIGNS_ENABLED=false` in env disables all sends.
  *   2. Per-campaign kill switch — `killSwitch=true` on the campaign record.
  *   3. Per-campaign active flag — `isActive=false` → skip.
- *   4. maxSends cap — user already received `maxSends` of this campaign.
- *   5. Cadence gate — user's last send for this campaign was within cadence window.
- *   6. Unsubscribe flag — `user.dripUnsubscribed === true`.
+ *   4. maxSends cap — lead already received `maxSends` of this campaign.
+ *   5. Cadence gate — lead's last send for this campaign was within cadence window.
+ *   6. Unsubscribe flag — `lead.contactStatus === 'unsubscribed'` or `do-not-contact`.
  *   7. Hourly rate limit — campaign already sent `DRIP_MAX_PER_HOUR` emails in
  *      the last 60 minutes.
  *   8. Dry-run flag — `DRIP_DRY_RUN=true` (default) records DripSend rows with
@@ -20,14 +22,13 @@
  *
  * Dry-run is the DEFAULT. Real sends require `DRIP_DRY_RUN=false` AND
  * `DRIP_CAMPAIGNS_ENABLED=true` — two explicit env flips, because this writes
- * to real user inboxes. Getting only one right leaves us safe.
+ * to real user inboxes.
  *
  * See Phase 3 config surface: backend/src/services/dripCampaignDb.ts
- * See Phase 2 segmentation: backend/src/routes/onboardingEvents.ts
- * See Notion: Lifecycle drip Phase 4 — Execution + Safety
+ * See Notion: https://www.notion.so/34709247c951814f90d8f109e5883882
  */
 
-import { userDb, User } from "../services/db";
+import { userDb } from "../services/db";
 import {
   getDripCampaignDb,
   DripCampaign,
@@ -35,11 +36,10 @@ import {
 } from "../services/dripCampaignDb";
 import { getDripSendsDb } from "../services/dripSendsDb";
 import { emailService } from "../services/emailService";
-import { deriveOnboardingStage } from "../utils/onboardingStage";
 
 /**
  * Default per-campaign per-hour rate cap. Keeps a misconfigured cron from
- * blasting the entire user base in one tick. Override with `DRIP_MAX_PER_HOUR`.
+ * blasting the entire lead base in one tick. Override with `DRIP_MAX_PER_HOUR`.
  */
 export const DEFAULT_MAX_PER_HOUR = 50;
 
@@ -56,16 +56,44 @@ export interface ExecutorRunSummary {
   globalKillSwitch: boolean;
 }
 
+/**
+ * Minimal Lead shape the executor cares about. Matches the AW-Leads row
+ * fields used by segmentation + merge-field rendering. Declared locally so
+ * this file doesn't depend on a full DB type, which keeps the DI surface
+ * tiny and tests trivial.
+ */
+export interface DripLead {
+  listId: string;
+  leadId: string;
+  userId?: string;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+  company?: string;
+  lifecycle?: string;
+  heatScore?: number;
+  utmSource?: string;
+  contactStatus?: "active" | "do-not-contact" | "unsubscribed" | string;
+  [key: string]: any;
+}
+
 /** Dependency-injection surface — makes unit tests trivial. */
 export interface ExecutorDeps {
+  /** All currently-active, non-paused campaigns across all tenants. */
   listActiveCampaigns: () => Promise<DripCampaign[]>;
-  listAllUsers: () => Promise<User[]>;
+  /**
+   * Load the candidate leads for a single campaign. Implementation queries
+   * AW-Leads via the owner's lead lists and applies the CRM-criteria
+   * segment filter. Returning only candidates (not every lead) keeps the
+   * tick budget in check on large tenants.
+   */
+  listLeadsForCampaign: (campaign: DripCampaign) => Promise<DripLead[]>;
   countSendsForUserCampaign: (
-    userId: string,
+    leadKey: string,
     campaignId: string,
   ) => Promise<number>;
   getMostRecentSendAt: (
-    userId: string,
+    leadKey: string,
     campaignId: string,
   ) => Promise<string | null>;
   countSendsInWindow: (
@@ -96,15 +124,70 @@ export interface ExecutorDeps {
   };
 }
 
+/**
+ * Load leads for a campaign by pulling its owner's lead lists and filtering
+ * by the CRM criteria in `segmentQuery`. If `leadListId` is set, only that
+ * list is scanned. Exported for test seams.
+ *
+ * Kept pure-ish: `userDb.getLeadListsByUserId` + `userDb.getLeadsByListId`
+ * are the only DB touches; the rest is in-memory filter. No cross-tenant
+ * reads possible here because lead lists are indexed by `userId` (see
+ * `getLeadListsByUserId` + `userId-index` GSI on AW-LeadLists).
+ */
+export async function defaultListLeadsForCampaign(
+  campaign: DripCampaign,
+): Promise<DripLead[]> {
+  if (!campaign.userId) return [];
+  const q = campaign.segmentQuery ?? {};
+
+  // Resolve candidate lead lists — all the user's lists unless narrowed.
+  let listIds: string[] = [];
+  if (q.leadListId) {
+    // Confirm the caller actually owns this list — otherwise bail with
+    // empty set so cross-tenant misconfigurations are silent no-ops,
+    // not a leak.
+    const ownerLists = await (userDb as any).getLeadListsByUserId(
+      campaign.userId,
+    );
+    const owned = (ownerLists as Array<{ listId: string }>).some(
+      (l) => l.listId === q.leadListId,
+    );
+    if (!owned) return [];
+    listIds = [q.leadListId];
+  } else {
+    const lists = (await (userDb as any).getLeadListsByUserId(
+      campaign.userId,
+    )) as Array<{ listId: string }>;
+    listIds = lists.map((l) => l.listId);
+  }
+
+  // Pull every lead in those lists (paginate).
+  const leads: DripLead[] = [];
+  for (const listId of listIds) {
+    let lastEvaluatedKey: any = undefined;
+    do {
+      const page = (await (userDb as any).getLeadsByListId(
+        listId,
+        undefined,
+        lastEvaluatedKey,
+      )) as { items: DripLead[]; lastEvaluatedKey: any };
+      leads.push(...(page.items ?? []));
+      lastEvaluatedKey = page.lastEvaluatedKey;
+    } while (lastEvaluatedKey);
+  }
+
+  return leads.filter((lead) => leadMatchesSegment(lead, campaign));
+}
+
 /** Default real-world deps wired to production services. */
 function defaultDeps(): ExecutorDeps {
   return {
-    listActiveCampaigns: () => getDripCampaignDb().listActive(),
-    listAllUsers: () => userDb.getAllUsers(),
-    countSendsForUserCampaign: (userId, campaignId) =>
-      getDripSendsDb().countSendsForUserCampaign(userId, campaignId),
-    getMostRecentSendAt: (userId, campaignId) =>
-      getDripSendsDb().getMostRecentSendAt(userId, campaignId),
+    listActiveCampaigns: () => getDripCampaignDb().listActiveAllTenants(),
+    listLeadsForCampaign: (campaign) => defaultListLeadsForCampaign(campaign),
+    countSendsForUserCampaign: (leadKey, campaignId) =>
+      getDripSendsDb().countSendsForUserCampaign(leadKey, campaignId),
+    getMostRecentSendAt: (leadKey, campaignId) =>
+      getDripSendsDb().getMostRecentSendAt(leadKey, campaignId),
     countSendsInWindow: (campaignId, sinceIso) =>
       getDripSendsDb().countSendsInWindow(campaignId, sinceIso),
     recordSend: async (args) => {
@@ -116,7 +199,6 @@ function defaultDeps(): ExecutorDeps {
       // swallows errors and returns void, which would let the executor record
       // status='sent' for an email that never left the box. For an audited,
       // compliance-adjacent send path like drip, ground truth matters.
-      // Text body = stripped HTML (minimal — mail client fallback).
       const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
       const { messageId } = await emailService.sendEmailStrict(
         to,
@@ -135,8 +217,7 @@ function defaultDeps(): ExecutorDeps {
  * Is global kill switch engaged?
  *
  * Defaults to DISABLED (kill switch engaged) unless env explicitly says
- * `true` or `1`. This is a hard no-send default — operators have to opt in
- * per-env to actually send drip emails.
+ * `true` or `1`.
  */
 export function isGloballyEnabled(env: ExecutorDeps["env"]): boolean {
   const raw = (env.DRIP_CAMPAIGNS_ENABLED ?? "").toLowerCase().trim();
@@ -166,87 +247,57 @@ export function getMaxPerHour(env: ExecutorDeps["env"]): number {
 }
 
 /**
- * Check whether `user` matches `campaign.segmentQuery`. Reproduces the Phase 2
- * HTTP-endpoint filter logic in-process so the executor doesn't need to
- * self-HTTP-call for every tick.
+ * Check whether `lead` matches `campaign.segmentQuery`. CRM criteria only in
+ * Phase A — lifecycle / minHeatScore / utmSource are the supported filters.
+ * Exported so tests + the `get_leads_by_crm_criteria` tool share one code path.
  */
-export function userMatchesSegment(
-  user: User,
+export function leadMatchesSegment(
+  lead: DripLead,
   campaign: DripCampaign,
 ): boolean {
   const q = campaign.segmentQuery ?? {};
 
-  // Stage filter
-  if (q.stage) {
-    const derivedStage =
-      (user as any).onboardingStage ||
-      deriveOnboardingStage(
-        ((user as any).onboardingEvents ?? []) as any,
-        { lastActiveAt: user.lastActiveAt },
-      );
-    if (derivedStage !== q.stage) return false;
+  if (q.lifecycle) {
+    if (lead.lifecycle !== q.lifecycle) return false;
   }
 
-  // Activity cutoff — user's lastActiveAt must be strictly before the cutoff.
-  // Users with no lastActiveAt are EXCLUDED (same rule as Phase 2).
-  if (q.lastActivityBefore) {
-    const cutoff = Date.parse(q.lastActivityBefore);
-    if (Number.isNaN(cutoff)) return false;
-    if (typeof user.lastActiveAt !== "string" || !user.lastActiveAt) {
-      return false;
-    }
-    const la = Date.parse(user.lastActiveAt);
-    if (Number.isNaN(la) || la >= cutoff) return false;
+  if (typeof q.minHeatScore === "number") {
+    const score =
+      typeof lead.heatScore === "number" && Number.isFinite(lead.heatScore)
+        ? lead.heatScore
+        : 0;
+    if (score < q.minHeatScore) return false;
   }
 
-  // Goal filter — pull latest `goal_selected` event's data.goal
-  if (q.goal) {
-    const events = ((user as any).onboardingEvents ?? []) as Array<{
-      event: string;
-      ts: string;
-      data?: any;
-    }>;
-    const goalEvents = events
-      .filter((e) => e?.event === "goal_selected")
-      .slice()
-      .sort((a, b) => Date.parse(b.ts || "") - Date.parse(a.ts || ""));
-    const latestGoal = goalEvents
-      .map((e) => (typeof e.data?.goal === "string" ? e.data.goal : null))
-      .find((g) => !!g);
-    if (latestGoal !== q.goal) return false;
+  if (q.utmSource) {
+    if (lead.utmSource !== q.utmSource) return false;
+  }
+
+  // leadListId is enforced at the DB-read layer (we only pull leads from
+  // that list), but re-check here for defense-in-depth.
+  if (q.leadListId) {
+    if (lead.listId !== q.leadListId) return false;
   }
 
   return true;
 }
 
 /**
- * Extract merge-field values for a user. Kept small + pure — no DB calls.
- * Uses the same field allowlist as the Phase 3 preview endpoint.
+ * Extract merge-field values for a lead. Kept small + pure — no DB calls.
+ * Uses the same field allowlist as the Phase 3 preview endpoint. For leads
+ * (vs users), `lastStep` / `goal` are not applicable and default to empty.
  */
-export function buildMergeFields(user: User): {
+export function buildMergeFields(lead: DripLead): {
   firstName: string;
   companyName: string;
   lastStep: string;
   goal: string;
 } {
-  const display = user.displayName || "";
-  const firstName = display.trim().split(/\s+/)[0] || "";
-  const companyName = (user as any).companyName || "";
-  const events = ((user as any).onboardingEvents ?? []) as Array<{
-    event: string;
-    ts: string;
-    data?: any;
-  }>;
-  const sortedDesc = events
-    .slice()
-    .sort((a, b) => Date.parse(b.ts || "") - Date.parse(a.ts || ""));
-  const lastStep = sortedDesc[0]?.event || "";
-  const goalEvent = sortedDesc.find((e) => e.event === "goal_selected");
-  const goal =
-    (goalEvent?.data?.goal && typeof goalEvent.data.goal === "string"
-      ? goalEvent.data.goal
-      : "") || "";
-  return { firstName, companyName, lastStep, goal };
+  const firstName = (lead.firstName || "").trim();
+  const companyName = (lead.company || "").trim();
+  // lastStep / goal are user-onboarding concepts. Leads do not have them,
+  // so they render as empty strings (renderTemplate handles that safely).
+  return { firstName, companyName, lastStep: "", goal: "" };
 }
 
 function cadenceWindowMs(c: DripCampaign): number {
@@ -265,7 +316,7 @@ function cadenceWindowMs(c: DripCampaign): number {
  * If one tick runs longer than DRIP_INTERVAL_MS (15 min) — slow scans over a
  * large audit table, DynamoDB throttling, provider back-pressure — the next
  * `setInterval` callback fires while the previous one is still running. Two
- * concurrent ticks can both pass the same user's maxSends / cadence gate and
+ * concurrent ticks can both pass the same lead's maxSends / cadence gate and
  * then both record a send, because the idempotency guarantee of the safety
  * gates assumes serialized execution.
  *
@@ -356,13 +407,8 @@ async function _runDripExecutorBody(
     return summary;
   }
 
-  const allUsers = await deps.listAllUsers();
-  const nonDeletedUsers = allUsers.filter(
-    (u) => !u.userId?.startsWith("deleted_"),
-  );
-
   for (const campaign of campaigns) {
-    // Gate 2+3 — per-campaign active + killSwitch (belt-and-braces; listActive
+    // Gate 2+3 — per-campaign active + killSwitch (belt-and-braces; list
     // should already filter these, but don't trust it blindly).
     if (!campaign.isActive || campaign.killSwitch) {
       summary.campaignsSkipped += 1;
@@ -385,36 +431,43 @@ async function _runDripExecutorBody(
       continue;
     }
 
-    // Segment users
-    const candidates = nonDeletedUsers.filter((u) =>
-      userMatchesSegment(u, campaign),
-    );
+    // Pull candidate leads for this campaign (owner's AW-Leads, filtered
+    // by CRM criteria).
+    const candidates = await deps.listLeadsForCampaign(campaign);
     summary.candidatesConsidered += candidates.length;
 
-    for (const user of candidates) {
+    for (const lead of candidates) {
       if (remainingInWindow <= 0) {
         bump("rate_limit_exceeded");
         summary.emailsSkipped += 1;
         continue;
       }
 
-      // Gate 6 — unsubscribe
-      if ((user as any).dripUnsubscribed === true) {
+      // Gate 6 — unsubscribe / do-not-contact flag on the lead
+      if (
+        lead.contactStatus === "unsubscribed" ||
+        lead.contactStatus === "do-not-contact"
+      ) {
         bump("unsubscribed");
         summary.emailsSkipped += 1;
         continue;
       }
 
-      // Sanity — user needs an email address
-      if (!user.email) {
+      // Sanity — lead needs an email address
+      if (!lead.email) {
         bump("no_email");
         summary.emailsSkipped += 1;
         continue;
       }
 
+      // DripSends rows are keyed by (listId, leadId) instead of user userId
+      // now. Build a stable per-lead key so cadence + maxSends queries still
+      // hit the right index.
+      const leadKey = `${lead.listId}:${lead.leadId}`;
+
       // Gate 4 — maxSends
       const prior = await deps.countSendsForUserCampaign(
-        user.userId,
+        leadKey,
         campaign.campaignId,
       );
       if (prior >= campaign.maxSends) {
@@ -425,7 +478,7 @@ async function _runDripExecutorBody(
 
       // Gate 5 — cadence
       const lastSentIso = await deps.getMostRecentSendAt(
-        user.userId,
+        leadKey,
         campaign.campaignId,
       );
       if (lastSentIso) {
@@ -441,7 +494,7 @@ async function _runDripExecutorBody(
       }
 
       // Build merge fields + render
-      const merge = buildMergeFields(user);
+      const merge = buildMergeFields(lead);
       const html = renderTemplate(campaign.templateHtml, merge);
       const subject = renderTemplate(campaign.subjectLine, merge);
 
@@ -450,8 +503,8 @@ async function _runDripExecutorBody(
         try {
           await deps.recordSend({
             campaignId: campaign.campaignId,
-            userId: user.userId,
-            email: user.email,
+            userId: leadKey,
+            email: lead.email,
             templateSnapshot: html,
             subjectSnapshot: subject,
             messageId: null,
@@ -462,7 +515,7 @@ async function _runDripExecutorBody(
           remainingInWindow -= 1;
         } catch (err) {
           console.error(
-            `[DripExecutor] Failed to record dry-run for user ${user.userId} campaign ${campaign.campaignId}:`,
+            `[DripExecutor] Failed to record dry-run for lead ${leadKey} campaign ${campaign.campaignId}:`,
             err,
           );
           summary.emailsFailed += 1;
@@ -473,14 +526,14 @@ async function _runDripExecutorBody(
       // Real send
       try {
         const { messageId } = await deps.sendEmail({
-          to: user.email,
+          to: lead.email,
           subject,
           html,
         });
         await deps.recordSend({
           campaignId: campaign.campaignId,
-          userId: user.userId,
-          email: user.email,
+          userId: leadKey,
+          email: lead.email,
           templateSnapshot: html,
           subjectSnapshot: subject,
           messageId,
@@ -493,15 +546,15 @@ async function _runDripExecutorBody(
         summary.emailsFailed += 1;
         const msg = err instanceof Error ? err.message : String(err);
         console.error(
-          `[DripExecutor] Send failed for user ${user.userId} campaign ${campaign.campaignId}:`,
+          `[DripExecutor] Send failed for lead ${leadKey} campaign ${campaign.campaignId}:`,
           msg,
         );
         // Best-effort record the failure so support can trace it
         try {
           await deps.recordSend({
             campaignId: campaign.campaignId,
-            userId: user.userId,
-            email: user.email,
+            userId: leadKey,
+            email: lead.email,
             templateSnapshot: html,
             subjectSnapshot: subject,
             messageId: null,

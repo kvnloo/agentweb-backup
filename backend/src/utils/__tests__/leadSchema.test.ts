@@ -7,9 +7,11 @@ import {
   validateLeadCrmExtensions,
   buildLeadCrmFields,
   buildLeadCrmUpdateFragments,
+  buildLeadAttributionFields,
   LEAD_LIFECYCLES,
   LEAD_ROLES,
 } from '../leadSchema';
+import type { AttributionTouch } from '../../types/attribution';
 
 describe('extractDomainFromEmail', () => {
   it('pulls the domain from a plain business email', () => {
@@ -223,5 +225,71 @@ describe('buildLeadCrmUpdateFragments', () => {
 
   it('validates before building fragments', () => {
     expect(() => buildLeadCrmUpdateFragments({ heatScore: 200 })).toThrow(/heatScore/);
+  });
+});
+
+describe('buildLeadAttributionFields', () => {
+  const fullTouch: AttributionTouch = {
+    timestamp: '2026-04-19T10:00:00.000Z',
+    utm: { source: 'linkedin', medium: 'social', campaign: 'launch' },
+    referrer: 'https://linkedin.com/feed',
+    landingUrl: 'https://agentweb.pro/?utm_source=linkedin',
+  };
+
+  it('writes firstTouch and lastTouch when both provided', () => {
+    const fields = buildLeadAttributionFields({ firstTouch: fullTouch, lastTouch: fullTouch });
+    expect(fields.firstTouch).toEqual(fullTouch);
+    expect(fields.lastTouch).toEqual(fullTouch);
+  });
+
+  it('denormalizes utmSource and utmMedium from firstTouch', () => {
+    const fields = buildLeadAttributionFields({ firstTouch: fullTouch });
+    expect(fields.utmSource).toBe('linkedin');
+    expect(fields.utmMedium).toBe('social');
+  });
+
+  it('prefers explicit utmSource/utmMedium over derived values', () => {
+    const fields = buildLeadAttributionFields({
+      firstTouch: fullTouch,
+      utmSource: 'meta',
+      utmMedium: 'cpc',
+    });
+    expect(fields.utmSource).toBe('meta');
+    expect(fields.utmMedium).toBe('cpc');
+  });
+
+  it('returns empty object when no attribution provided', () => {
+    expect(buildLeadAttributionFields({})).toEqual({});
+    expect(buildLeadAttributionFields({ firstTouch: undefined })).toEqual({});
+  });
+
+  it('omits utmSource/utmMedium when firstTouch has no utm block', () => {
+    const noUtm: AttributionTouch = {
+      timestamp: '2026-04-19T10:00:00.000Z',
+      referrer: 'https://example.com',
+    };
+    const fields = buildLeadAttributionFields({ firstTouch: noUtm });
+    expect(fields.firstTouch).toEqual(noUtm);
+    expect('utmSource' in fields).toBe(false);
+    expect('utmMedium' in fields).toBe(false);
+  });
+
+  it('accepts lastTouch without firstTouch', () => {
+    const fields = buildLeadAttributionFields({ lastTouch: fullTouch });
+    expect(fields.lastTouch).toEqual(fullTouch);
+    expect('firstTouch' in fields).toBe(false);
+    // No firstTouch -> no denormalized utmSource/utmMedium
+    expect('utmSource' in fields).toBe(false);
+  });
+
+  it('ignores empty-string utmSource/utmMedium', () => {
+    const fields = buildLeadAttributionFields({
+      firstTouch: fullTouch,
+      utmSource: '   ',
+      utmMedium: '',
+    });
+    // Falls back to derived values from firstTouch
+    expect(fields.utmSource).toBe('linkedin');
+    expect(fields.utmMedium).toBe('social');
   });
 });

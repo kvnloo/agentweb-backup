@@ -1,12 +1,25 @@
 /**
- * Lifecycle Drip Phase 3 — DripCampaign DB service.
+ * Drip campaigns — DB service (multi-tenant, customer-scoped).
  *
- * Config-layer CRUD for drip campaigns. Both entry points (Partner Portal
- * admin UI and Emma's `manage_drip_campaign` tool) write through here so
- * there is exactly one schema and one validation surface.
+ * Config-layer CRUD for drip campaigns. Every campaign belongs to a single
+ * customer (`userId`). The table uses a GSI `UserIdIndex` (hash=userId,
+ * range=createdAt) so `listByUserId` and `listActiveByUserId` are Query,
+ * not Scan.
  *
- * Phase 3 is configuration only — the scheduler/executor is Phase 4.
- * See Notion: https://www.notion.so/34709247c951815d97b0c6b8be74e365
+ * Phase A (this refactor) migrates from Partner-Portal admin-only to
+ * customer-scoped so each user can run their own drip campaigns against
+ * their own AW-Leads in Customer Portal. Cross-tenant reads (passing a
+ * `userId` that does not own the campaign) return null / throw
+ * `Campaign not found` exactly like a missing row — callers map to 404.
+ *
+ * Segment query in Phase A is still the onboarding-flavoured
+ * `{ stage, lastActivityBefore, goal }` shape for backward compatibility
+ * with existing campaigns. Phase B layers on CRM-flavoured criteria
+ * (`lifecycle`, `heatScore`, `utm_source`, `leadListId`) via the new
+ * `get_leads_by_crm_criteria` Emma tool and a follow-on segmentQuery
+ * extension.
+ *
+ * See Notion: https://www.notion.so/34709247c951814f90d8f109e5883882
  */
 
 import AWS from 'aws-sdk';
@@ -16,6 +29,13 @@ export type DripCadenceUnit = 'hours' | 'days' | 'weeks';
 
 export interface DripCampaign {
   campaignId: string;
+  /**
+   * Owner of this campaign. Every CRUD call scopes by userId so one
+   * customer cannot see, update, or delete another customer's campaigns.
+   * Indexed by `UserIdIndex` GSI (hash=userId, range=createdAt) for cheap
+   * list queries.
+   */
+  userId: string;
   name: string;
   /**
    * Segment query — a structured filter fed to the Phase 2 segmentation API
@@ -26,6 +46,19 @@ export interface DripCampaign {
     stage?: string;
     lastActivityBefore?: string; // ISO datetime
     goal?: string; // Phase 2 `onboardingGoal` filter
+    /**
+     * CRM lifecycle stage — Phase A extension. Matches `AW-Leads.lifecycle`
+     * (unknown | inbox | signed_up | in_deal | trialing | paying | at_risk
+     * | churned). Optional; campaigns that still target onboarding stages
+     * use the original `stage` field above.
+     */
+    lifecycle?: string;
+    /** Minimum heat score (0-100) a lead needs to qualify. Optional. */
+    minHeatScore?: number;
+    /** Filter leads whose `utmSource` matches this value. Optional. */
+    utmSource?: string;
+    /** Scope the campaign to a single lead list (belongs to the same user). Optional. */
+    leadListId?: string;
   };
   templateHtml: string;
   subjectLine: string;
@@ -40,7 +73,12 @@ export interface DripCampaign {
    * without losing its config.
    */
   killSwitch: boolean;
-  createdBy: string; // userId of creator (admin or Emma's session user)
+  /**
+   * User/session id of whoever created the campaign. For customer-created
+   * campaigns this is the same as `userId`; we keep a separate field so
+   * audit trails survive future ownership transfer.
+   */
+  createdBy: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -123,6 +161,9 @@ export class DripCampaignDb {
 
   /** Field-by-field validation shared by create + update. */
   private validate(campaign: Partial<DripCampaign>): void {
+    if (!campaign.userId || typeof campaign.userId !== 'string') {
+      throw new Error('userId is required');
+    }
     if (!campaign.name || typeof campaign.name !== 'string') {
       throw new Error('name is required');
     }
@@ -197,7 +238,18 @@ export class DripCampaignDb {
     return campaign;
   }
 
-  async getById(campaignId: string): Promise<DripCampaign | null> {
+  /**
+   * Fetch one campaign, scoped to the caller's userId.
+   *
+   * Returns null for BOTH "no such campaignId" AND "campaign exists but
+   * belongs to a different user" — callers map both to 404 so the API
+   * never reveals the existence of another tenant's resources. This is
+   * the single chokepoint for cross-tenant isolation on reads.
+   */
+  async getById(
+    campaignId: string,
+    userId: string,
+  ): Promise<DripCampaign | null> {
     const result = await this.docClient
       .get({
         TableName: this.tableName,
@@ -205,7 +257,11 @@ export class DripCampaignDb {
       })
       .promise();
 
-    return (result.Item as DripCampaign) || null;
+    const item = result.Item as DripCampaign | undefined;
+    if (!item) return null;
+    // Cross-tenant guard — treat as not found so the API returns 404.
+    if (item.userId !== userId) return null;
+    return item;
   }
 
   private async scanAll(
@@ -228,11 +284,80 @@ export class DripCampaignDb {
     return items;
   }
 
-  async listAll(): Promise<DripCampaign[]> {
-    return this.scanAll({ TableName: this.tableName });
+  /**
+   * Paginate every item returned by a GSI Query (here: `UserIdIndex`).
+   * Used by `listByUserId` and `listActiveByUserId`. Falls back to a
+   * filtered Scan if the index is missing (dev / non-migrated envs).
+   */
+  private async queryAllByUser(
+    userId: string,
+    extra?: {
+      filterExpression?: string;
+      expressionAttributeValues?: Record<string, any>;
+    },
+  ): Promise<DripCampaign[]> {
+    const items: DripCampaign[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+    try {
+      do {
+        const result = await this.docClient
+          .query({
+            TableName: this.tableName,
+            IndexName: 'UserIdIndex',
+            KeyConditionExpression: 'userId = :userId',
+            ExpressionAttributeValues: {
+              ':userId': userId,
+              ...(extra?.expressionAttributeValues ?? {}),
+            },
+            ...(extra?.filterExpression
+              ? { FilterExpression: extra.filterExpression }
+              : {}),
+            ExclusiveStartKey: lastKey,
+          })
+          .promise();
+
+        if (result.Items) {
+          items.push(...(result.Items as DripCampaign[]));
+        }
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+
+      return items;
+    } catch (error: any) {
+      // GSI missing in dev / LocalStack — fall back to Scan + filter.
+      // Same pattern as `getLeadListsByUserId`. Safe because this file is
+      // not on a hot path (drip executor runs every 15 min).
+      if (
+        error?.code === 'ResourceNotFoundException' ||
+        /index/i.test(error?.message ?? '')
+      ) {
+        return this.scanAll({
+          TableName: this.tableName,
+          FilterExpression: extra?.filterExpression
+            ? `userId = :userId AND (${extra.filterExpression})`
+            : 'userId = :userId',
+          ExpressionAttributeValues: {
+            ':userId': userId,
+            ...(extra?.expressionAttributeValues ?? {}),
+          },
+        });
+      }
+      throw error;
+    }
   }
 
-  async listActive(): Promise<DripCampaign[]> {
+  /** List all campaigns owned by `userId`. Used by the Customer-Portal UI. */
+  async listByUserId(userId: string): Promise<DripCampaign[]> {
+    return this.queryAllByUser(userId);
+  }
+
+  /**
+   * List every active, non-paused campaign across all users. Used by the
+   * drip executor cron — one query, then in-process iteration per campaign.
+   * Stays a scan because it's system-wide and runs every 15 minutes.
+   */
+  async listActiveAllTenants(): Promise<DripCampaign[]> {
     return this.scanAll({
       TableName: this.tableName,
       FilterExpression: 'isActive = :active AND killSwitch = :off',
@@ -240,13 +365,28 @@ export class DripCampaignDb {
     });
   }
 
+  /** List active, non-paused campaigns for a single user. */
+  async listActiveByUserId(userId: string): Promise<DripCampaign[]> {
+    return this.queryAllByUser(userId, {
+      filterExpression: 'isActive = :active AND killSwitch = :off',
+      expressionAttributeValues: { ':active': true, ':off': false },
+    });
+  }
+
+  /**
+   * Update a campaign, scoped to the caller's userId. Throws
+   * `Campaign not found` for both missing and cross-tenant attempts —
+   * caller maps to 404. The `userId` on the row is immutable: re-applying
+   * the existing value every write.
+   */
   async update(
     campaignId: string,
+    userId: string,
     updates: Partial<
-      Omit<DripCampaign, 'campaignId' | 'createdAt' | 'createdBy'>
+      Omit<DripCampaign, 'campaignId' | 'createdAt' | 'createdBy' | 'userId'>
     >,
   ): Promise<DripCampaign> {
-    const existing = await this.getById(campaignId);
+    const existing = await this.getById(campaignId, userId);
     if (!existing) {
       throw new Error(`Campaign not found: ${campaignId}`);
     }
@@ -255,6 +395,7 @@ export class DripCampaignDb {
       ...existing,
       ...updates,
       campaignId: existing.campaignId,
+      userId: existing.userId, // immutable — never honour an override
       createdAt: existing.createdAt,
       createdBy: existing.createdBy,
       updatedAt: new Date().toISOString(),
@@ -266,9 +407,14 @@ export class DripCampaignDb {
       .put({
         TableName: this.tableName,
         Item: merged,
-        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        // Belt-and-braces — even if somehow a row with a different owner
+        // slipped past the getById guard, the conditional write prevents
+        // the tenant swap.
+        ConditionExpression:
+          'updatedAt = :expectedUpdatedAt AND userId = :expectedUserId',
         ExpressionAttributeValues: {
           ':expectedUpdatedAt': existing.updatedAt,
+          ':expectedUserId': existing.userId,
         },
       })
       .promise();
@@ -276,11 +422,26 @@ export class DripCampaignDb {
     return merged;
   }
 
-  async deleteById(campaignId: string): Promise<void> {
+  /**
+   * Delete a campaign, scoped to the caller's userId. No-op when the row
+   * exists under a different owner — mirrors read-side cross-tenant 404
+   * behaviour so the caller can safely treat "deleted" as "gone".
+   */
+  async deleteById(campaignId: string, userId: string): Promise<void> {
+    // Load first to confirm ownership. `getById` already handles the
+    // cross-tenant case. Delete is a no-op if the row is not ours.
+    const existing = await this.getById(campaignId, userId);
+    if (!existing) {
+      throw new Error(`Campaign not found: ${campaignId}`);
+    }
     await this.docClient
       .delete({
         TableName: this.tableName,
         Key: { campaignId },
+        ConditionExpression: 'userId = :expectedUserId',
+        ExpressionAttributeValues: {
+          ':expectedUserId': userId,
+        },
       })
       .promise();
   }

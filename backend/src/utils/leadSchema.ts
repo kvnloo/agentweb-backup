@@ -11,7 +11,29 @@
  * Task: https://www.notion.so/34209247c9518101bd58fe20939ad2ca
  */
 
+import type { AttributionTouch } from '../types/attribution';
+
 export type LeadPriority = 'Low' | 'Medium' | 'High';
+
+/**
+ * Attribution fields layered onto AW-Leads rows. Mirrors the User schema so
+ * channel-attribution queries work identically across Users and Leads.
+ *
+ * See backend/src/types/attribution.ts for AttributionTouch shape.
+ */
+export interface LeadAttributionFields {
+  /** Captured once at first lead creation; never mutated afterward. */
+  firstTouch?: AttributionTouch;
+  /** Refreshed on any repeat touch with a new attribution payload. */
+  lastTouch?: AttributionTouch;
+  /**
+   * Denormalized from firstTouch.utm.source for cheap channel-attribution
+   * queries without scanning the blob. Explicit override wins.
+   */
+  utmSource?: string;
+  /** Denormalized from firstTouch.utm.medium. */
+  utmMedium?: string;
+}
 
 export const LEAD_LIFECYCLES = [
   'unknown',
@@ -230,4 +252,52 @@ export function buildLeadCrmUpdateFragments(ext: LeadCrmExtensions): {
   }
 
   return { setFields, removeFields };
+}
+
+/**
+ * Build the DynamoDB-ready fragment for Lead attribution fields.
+ *
+ * Mirrors the User attribution shape (see services/db.ts User type) so the
+ * "same email on both tables" case has identical semantics:
+ * - firstTouch: set once, never overwritten by callers
+ * - lastTouch: refreshed on each touch
+ * - utmSource / utmMedium: denormalized from firstTouch.utm for cheap queries
+ *
+ * Omits every field that isn't populated — DynamoDB rejects undefined values
+ * and empty strings are useless for GSI queries we might add later.
+ *
+ * Explicit utmSource / utmMedium passed in the extension win over the values
+ * derived from firstTouch (useful for admin overrides). Whitespace-only
+ * overrides fall back to the derived values.
+ */
+export function buildLeadAttributionFields(
+  ext: LeadAttributionFields
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+
+  if (ext.firstTouch) {
+    out.firstTouch = ext.firstTouch;
+  }
+  if (ext.lastTouch) {
+    out.lastTouch = ext.lastTouch;
+  }
+
+  // Denormalize utmSource / utmMedium from firstTouch unless an explicit
+  // non-empty override is supplied. This matches the User shape written by
+  // controllers/auth.ts and makes "all my leadgen from linkedin" queries a
+  // single-key lookup instead of a scan.
+  const explicitSource =
+    typeof ext.utmSource === 'string' ? ext.utmSource.trim() : '';
+  const explicitMedium =
+    typeof ext.utmMedium === 'string' ? ext.utmMedium.trim() : '';
+  const derivedSource = ext.firstTouch?.utm?.source?.trim() || '';
+  const derivedMedium = ext.firstTouch?.utm?.medium?.trim() || '';
+
+  const finalSource = explicitSource || derivedSource;
+  const finalMedium = explicitMedium || derivedMedium;
+
+  if (finalSource) out.utmSource = finalSource;
+  if (finalMedium) out.utmMedium = finalMedium;
+
+  return out;
 }
