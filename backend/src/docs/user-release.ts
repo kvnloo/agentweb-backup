@@ -9,6 +9,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-19',
+    changes: [
+      'Fix: Voice Mode Tool Results Now Show in Chat History',
+      '- When Emma calls a tool during a live voice session (e.g. creating a LinkedIn post, searching the web), the tool details now appear as a collapsible "Used N tools ▸" block above her response — matching the behavior of all other models',
+      '- URLs, images, and files returned by tools are included directly in Emma\'s response text so they persist across page reloads',
+      'Fix: Voice Mode Model No Longer Resets When Clicking Start',
+      '- Selecting the Live Voice model and clicking Start now correctly preserves the selection for the new session instead of reverting to the default model',
+      'Fix: New Chat Now Resets to the Default Model',
+      '- Clicking New Chat while on a live voice session now correctly resets the model selector to the default (sonnet 4.6) instead of keeping the live model',
+    ],
+  },
+  {
     date: '2026-04-17',
     changes: [
       'Fix: Emma Now Visually Verifies Screenshots Instead of Assuming Success',
