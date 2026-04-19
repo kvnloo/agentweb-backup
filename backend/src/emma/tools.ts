@@ -6247,6 +6247,95 @@ emmaToolRegistry.register({
   }
 });
 
+emmaToolRegistry.register({
+  name: 'log_contact_event',
+  definition: {
+    name: 'log_contact_event',
+    description:
+      "Log a natural-language activity event on a CRM contact's timeline. Use this when the user dictates a note like 'add a note that I called Jane and left a voicemail' or 'log that Acme sent over the signed contract'. The event shows up in the contact's Activity Timeline alongside auto-captured events (form submits, payments, meetings). Input: contactId (normalized email, e.g. 'jane@acme.com'), eventType (pick from known types — use 'manual.note' for freeform notes, 'meeting.attended' for calls, 'support.opened' for issues, etc), summary (1-line human-readable description), details (optional structured data).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contactId: {
+          type: 'string',
+          description:
+            "The contact to log against. Almost always the contact's lowercase email (e.g. 'jane@acme.com'). For leads without an email, use the fallback form 'nocontact:<leadId>'.",
+        },
+        eventType: {
+          type: 'string',
+          description:
+            "Event type. Use 'manual.note' for freeform notes; 'meeting.attended' for call/meeting logs; 'support.opened' / 'support.resolved' for issues; 'engagement.email_clicked' etc for engagement events you know happened but weren't auto-captured. Defaults to 'manual.note' if omitted.",
+        },
+        summary: {
+          type: 'string',
+          description:
+            "Short 1-line human-readable summary of the event. Shown verbatim on the timeline. E.g. 'Left voicemail — asked about enterprise pricing'.",
+        },
+        details: {
+          type: 'object',
+          description:
+            'Optional structured data to attach to the event (duration, source, references, etc). Shown as metadata under the summary on the timeline.',
+        },
+      },
+      required: ['contactId', 'summary'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId: string | undefined = context?.userId || context?.agentUserId;
+    if (!userId) {
+      return { error: 'Authentication required: no user context' };
+    }
+
+    const contactId = typeof args.contactId === 'string' ? args.contactId.trim() : '';
+    const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+    const eventType =
+      typeof args.eventType === 'string' && args.eventType ? args.eventType : 'manual.note';
+
+    if (!contactId) {
+      return { error: 'contactId is required' };
+    }
+    if (!summary) {
+      return { error: 'summary is required' };
+    }
+
+    const { logManualEvent, isKnownContactEventType } = await import(
+      '../services/contactCaptureHooks'
+    );
+
+    // Accept unknown types (forward-compat) but surface a warning so the user
+    // knows the timeline renderer may not have a template for it yet.
+    const warning = isKnownContactEventType(eventType)
+      ? undefined
+      : `Unknown eventType "${eventType}" — logged, but the timeline renderer may show it as a generic row.`;
+
+    const details =
+      args.details && typeof args.details === 'object' && !Array.isArray(args.details)
+        ? (args.details as Record<string, unknown>)
+        : undefined;
+
+    const result = await logManualEvent({
+      contactId,
+      eventType,
+      summary,
+      details,
+      loggedByUserId: userId,
+    });
+
+    if (!result) {
+      return { error: 'Failed to log contact event' };
+    }
+
+    return {
+      success: true,
+      eventId: result.event.eventId,
+      eventType: result.event.eventType,
+      contactId: result.event.contactId,
+      deduplicated: result.deduplicated,
+      ...(warning ? { warning } : {}),
+    };
+  },
+});
+
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {

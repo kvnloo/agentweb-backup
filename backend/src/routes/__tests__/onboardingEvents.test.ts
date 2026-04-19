@@ -32,6 +32,14 @@ jest.mock("../../services/db", () => ({
   orgDb: { getOrgById: jest.fn() },
 }));
 
+// Mock the capture hooks — our test asserts that a stage transition fires
+// onOnboardingStageChanged. We intentionally don't mock the other hooks here
+// since the route doesn't call them.
+const mockOnOnboardingStageChanged = jest.fn();
+jest.mock("../../services/contactCaptureHooks", () => ({
+  onOnboardingStageChanged: (...args: any[]) => mockOnOnboardingStageChanged(...args),
+}));
+
 import onboardingEventsRouter from "../onboardingEvents";
 
 function makeApp() {
@@ -54,6 +62,9 @@ beforeEach(() => {
     email: "user@example.com",
     ...updates,
   }));
+  // Default no-op for the capture hook — the route calls .catch() on the
+  // returned promise, so the mock must return a thenable.
+  mockOnOnboardingStageChanged.mockResolvedValue(null);
 });
 
 describe("POST /api/onboarding/events", () => {
@@ -531,5 +542,65 @@ describe("GET /api/onboarding/users (admin)", () => {
       expect(res.status).toBe(200);
       expect(res.body.users[0].onboardingGoal).toBe("paid_ads");
     });
+  });
+});
+
+describe("POST /api/onboarding/events — contact activity timeline capture", () => {
+  beforeEach(() => {
+    // Default: the user starts with no prior stage so every POST is a transition.
+    mockGetUserById.mockResolvedValue({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingEvents: [],
+      onboardingStage: null,
+    });
+    mockUpdateUser.mockImplementation(async (_id: string, updates: any) => ({
+      userId: "user-123",
+      email: "user@example.com",
+      ...updates,
+    }));
+    mockOnOnboardingStageChanged.mockResolvedValue(null);
+  });
+
+  it("fires onOnboardingStageChanged when the derived stage changes", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "goal_selected" });
+
+    expect(res.status).toBe(200);
+    expect(mockOnOnboardingStageChanged).toHaveBeenCalledTimes(1);
+    const call = mockOnOnboardingStageChanged.mock.calls[0][0];
+    expect(call.userId).toBe("user-123");
+    expect(call.email).toBe("user@example.com");
+    expect(call.fromStage).toBeNull();
+    expect(call.toStage).toBe(res.body.onboardingStage);
+    expect(call.triggeredByEvent).toBe("goal_selected");
+  });
+
+  it("does NOT fire when the stage does not actually change", async () => {
+    // Seed the user's existing stage so the derived stage equals it.
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingEvents: [
+        { event: "goal_selected", ts: "2026-04-01T00:00:00Z" },
+      ],
+      onboardingStage: "goal_selected",
+    });
+
+    const app = makeApp();
+    await request(app).post("/api/onboarding/events").send({ event: "goal_selected" });
+    expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+  });
+
+  it("does not break the handler if capture hook rejects", async () => {
+    mockOnOnboardingStageChanged.mockRejectedValueOnce(new Error("downstream boom"));
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "goal_selected" });
+    // The route returned 200 successfully; the hook failure was fire-and-forget.
+    expect(res.status).toBe(200);
   });
 });
