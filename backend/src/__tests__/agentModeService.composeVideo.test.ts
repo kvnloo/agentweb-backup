@@ -1,0 +1,216 @@
+// Unit tests for composeVideo function in agentModeService
+
+import { AgentModeService } from '../services/agentModeService';
+import * as remotionServiceModule from '../services/remotionService';
+
+jest.mock('../services/remotionService', () => ({
+  remotionService: {
+    compose: jest.fn(),
+  },
+  RemotionComposeParams: {},
+}));
+
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    addToolCostToSession: jest.fn().mockResolvedValue({}),
+  }
+}));
+
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn().mockImplementation(() => ({
+    initialize: jest.fn(),
+    getTools: jest.fn().mockReturnValue([]),
+  })),
+}));
+
+const mockRemotionService = (remotionServiceModule as any).remotionService;
+
+describe('AgentModeService - composeVideo', () => {
+  let agentModeService: AgentModeService;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    agentModeService = new AgentModeService();
+    await agentModeService.initialize();
+  });
+
+  const baseComposeParams = {
+    brandName: 'TestBrand',
+    primaryColor: '#123456',
+    secondaryColor: '#abcdef',
+  };
+
+  describe('Invalid inputs', () => {
+    it('should fail when clip_urls is empty', async () => {
+      const result = await (agentModeService as any).composeVideo(
+        [],
+        'out.mp4',
+        'user1',
+        'session1',
+        baseComposeParams
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('missing_clip_urls');
+    });
+
+    it('should fail when clip_urls is null', async () => {
+      const result = await (agentModeService as any).composeVideo(
+        null,
+        'out.mp4',
+        'user1',
+        'session1',
+        baseComposeParams
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('missing_clip_urls');
+    });
+
+    it('should return failure when remotionService.compose fails', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: false,
+        error: 'Remotion render error',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'out.mp4',
+        'user1',
+        'session1',
+        baseComposeParams
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Remotion render error');
+    });
+  });
+
+  describe('Successful composition', () => {
+    it('should compose a single clip with brand overlays', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        videoUrl: 'https://s3.example.com/final.mp4',
+        filename: 'final.mp4',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'final.mp4',
+        'user1',
+        'session1',
+        baseComposeParams
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.videoUrl).toBe('https://s3.example.com/final.mp4');
+      expect(mockRemotionService.compose).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clipUrl: 'https://s3.example.com/clip1.mp4',
+          extraClipUrls: [],
+          brandName: 'TestBrand',
+          primaryColor: '#123456',
+          secondaryColor: '#abcdef',
+          filename: 'final.mp4',
+          userId: 'user1',
+        })
+      );
+    });
+
+    it('should stitch multiple clips correctly (first clip → clipUrl, rest → extraClipUrls)', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        videoUrl: 'https://s3.example.com/stitched.mp4',
+        filename: 'stitched.mp4',
+      });
+
+      const clips = [
+        'https://s3.example.com/clip1.mp4',
+        'https://s3.example.com/clip2.mp4',
+        'https://s3.example.com/clip3.mp4',
+      ];
+
+      await (agentModeService as any).composeVideo(
+        clips,
+        'stitched.mp4',
+        'user1',
+        'session1',
+        baseComposeParams,
+        8
+      );
+
+      expect(mockRemotionService.compose).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clipUrl: 'https://s3.example.com/clip1.mp4',
+          extraClipUrls: [
+            'https://s3.example.com/clip2.mp4',
+            'https://s3.example.com/clip3.mp4',
+          ],
+          clipDurationSeconds: 8,
+        })
+      );
+    });
+
+    it('should default clipDurationSeconds to 8 when not provided', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        videoUrl: 'https://s3.example.com/out.mp4',
+        filename: 'out.mp4',
+      });
+
+      await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'out.mp4',
+        'user1',
+        'session1',
+        baseComposeParams
+        // no clipDurationSeconds
+      );
+
+      expect(mockRemotionService.compose).toHaveBeenCalledWith(
+        expect.objectContaining({ clipDurationSeconds: 8 })
+      );
+    });
+
+    it('should pass optional brand fields (tagline, logoUrl, ctaText, ctaUrl)', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        videoUrl: 'https://s3.example.com/out.mp4',
+        filename: 'out.mp4',
+      });
+
+      await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'out.mp4',
+        'user1',
+        'session1',
+        {
+          ...baseComposeParams,
+          tagline: 'Our tagline',
+          logoUrl: 'https://cdn.example.com/logo.png',
+          ctaText: 'Start free trial',
+          ctaUrl: 'example.com',
+        }
+      );
+
+      expect(mockRemotionService.compose).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tagline: 'Our tagline',
+          logoUrl: 'https://cdn.example.com/logo.png',
+          ctaText: 'Start free trial',
+          ctaUrl: 'example.com',
+        })
+      );
+    });
+  });
+
+  describe('Tool registration', () => {
+    it('should have compose_video tool registered', () => {
+      const tools = agentModeService.getAvailableTools();
+      const tool = tools.find((t: any) => t.function?.name === 'compose_video');
+      expect(tool).toBeDefined();
+      expect(tool!.function.parameters.properties.clip_urls).toBeDefined();
+      expect(tool!.function.parameters.properties.brand_name).toBeDefined();
+      expect(tool!.function.parameters.properties.primary_color).toBeDefined();
+      expect(tool!.function.parameters.properties.secondary_color).toBeDefined();
+    });
+  });
+});

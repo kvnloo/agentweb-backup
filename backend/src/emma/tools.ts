@@ -6,6 +6,7 @@ import { askCrm, AskCrmLead } from '../services/askCrmService';
 import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
+import { chatbotDb } from '../services/chatbotService';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -1068,6 +1069,7 @@ emmaToolRegistry.register({
           properties: {
             brandName: { type: 'string', description: 'Brand name' },
             tagline: { type: 'string', description: 'Brand tagline or slogan' },
+            domain: { type: 'string', description: 'Website domain (e.g. example.com)' },
             primaryColor: { type: 'string', description: 'Primary brand color (hex code)' },
             primaryColorEnd: { type: 'string', description: 'End color for gradient (hex code)' },
             secondaryColor: { type: 'string', description: 'Secondary brand color (hex code)' },
@@ -3839,7 +3841,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation.',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3856,6 +3858,14 @@ emmaToolRegistry.register({
           description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
           enum: ['veo-3.1-generate-preview']
         },
+        durationSeconds: {
+          type: 'number',
+          description: 'Optional: Requested total duration of the generated video in seconds. For durations up to 8s, a single Veo clip is generated. For durations 9–32s, multiple 8s clips are generated in parallel and concatenated by Remotion. Defaults to 8 if not specified. Common values: 8 (default), 16 (2 clips), 24 (3 clips). Requires compose:true for multi-clip videos.'
+        },
+        useKeyframes: {
+          type: 'boolean',
+          description: 'Optional: When true and durationSeconds > 8 (multiple clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so Veo interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
+        },
         startFrame: {
           type: 'string',
           description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
@@ -3863,13 +3873,141 @@ emmaToolRegistry.register({
         endFrame: {
           type: 'string',
           description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
+        },
+        compose: {
+          type: 'boolean',
+          description: 'Optional: When true, post-process the generated clip with Remotion to add branded overlays (brand name headline, tagline, logo, and optional CTA card). Requires composeParams. Use this when the user wants a polished, branded video rather than the raw AI-generated clip.'
+        },
+        composeParams: {
+          type: 'object',
+          description: 'Optional: Brand overlay configuration for Remotion post-processing. Required when compose is true.',
+          properties: {
+            brandName: {
+              type: 'string',
+              description: 'Brand display name shown as the headline overlay on the video'
+            },
+            tagline: {
+              type: 'string',
+              description: 'Optional tagline or subtitle shown under the brand name'
+            },
+            primaryColor: {
+              type: 'string',
+              description: 'Primary hex color for the gradient bar and background tint (e.g. "#1a73e8")'
+            },
+            secondaryColor: {
+              type: 'string',
+              description: 'Secondary hex color for accent elements like the divider line (e.g. "#fbbc04")'
+            },
+            logoUrl: {
+              type: 'string',
+              description: 'Optional URL of the brand logo image to display in the overlay'
+            },
+            ctaText: {
+              type: 'string',
+              description: 'Optional call-to-action text for the outro card (e.g. "Get started today")'
+            },
+            ctaUrl: {
+              type: 'string',
+              description: 'Optional URL shown alongside the CTA text (e.g. "agentweb.pro")'
+            },
+            clipDurationSeconds: {
+              type: 'number',
+              description: 'Optional: Duration of the source clip in seconds. Defaults to 8 (Veo default). Used to set correct composition duration.'
+            }
+          },
+          required: ['brandName', 'primaryColor', 'secondaryColor']
         }
       },
       required: ['prompt', 'filename']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.generateVideo(args.prompt, args.filename, context?.userId, context?.sessionId, args.videoModel, args.startFrame, args.endFrame);
+    return await agentModeService.generateVideo(
+      args.prompt,
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      args.videoModel,
+      args.startFrame,
+      args.endFrame,
+      args.compose,
+      args.composeParams,
+      args.durationSeconds,
+      args.useKeyframes
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'compose_video',
+  definition: {
+    name: 'compose_video',
+    description: 'Stitch pre-existing video clips together and add brand overlays using Remotion. Use this when you have already generated individual clips and need to combine them into a single branded video. For new multi-clip videos, prefer a single generate_video call with durationSeconds instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        clip_urls: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Ordered list of S3/HTTPS URLs of the pre-generated video clips to stitch together (first to last)'
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename for the composed video (e.g. "final_branded_video.mp4")'
+        },
+        clip_duration_seconds: {
+          type: 'number',
+          description: 'Duration of each individual clip in seconds (all clips must have the same duration). Defaults to 8.'
+        },
+        brand_name: {
+          type: 'string',
+          description: 'Brand display name shown as the headline overlay'
+        },
+        tagline: {
+          type: 'string',
+          description: 'Optional tagline or subtitle shown under the brand name'
+        },
+        primary_color: {
+          type: 'string',
+          description: 'Primary hex color for the gradient bar and background tint (e.g. "#1a73e8")'
+        },
+        secondary_color: {
+          type: 'string',
+          description: 'Secondary hex color for accent elements (e.g. "#fbbc04")'
+        },
+        logo_url: {
+          type: 'string',
+          description: 'Optional URL of the brand logo image'
+        },
+        cta_text: {
+          type: 'string',
+          description: 'Optional call-to-action text for the outro card'
+        },
+        cta_url: {
+          type: 'string',
+          description: 'Optional website URL shown alongside the CTA text'
+        }
+      },
+      required: ['clip_urls', 'filename', 'brand_name', 'primary_color', 'secondary_color']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.composeVideo(
+      args.clip_urls,
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      {
+        brandName: args.brand_name,
+        tagline: args.tagline,
+        primaryColor: args.primary_color,
+        secondaryColor: args.secondary_color,
+        logoUrl: args.logo_url,
+        ctaText: args.cta_text,
+        ctaUrl: args.cta_url,
+      },
+      args.clip_duration_seconds
+    );
   }
 });
 
@@ -6058,6 +6196,51 @@ emmaToolRegistry.register({
       filters: { lifecycle: lifecycleFilter, minHeatScore: minHeat, ownerFilter },
     };
   },
+});
+
+emmaToolRegistry.register({
+  name: 'search_user_assets',
+  definition: {
+    name: 'search_user_assets',
+    description: "Search for assets (images, videos, HTML reports) that were generated in the user's Agent Mode sessions. Returns matching assets with their URLs, filenames, creation dates, asset type, and the session they came from (sessionId + title). Use this when the user asks to find images, videos, reports, or files they've created.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: {
+          type: 'string',
+          enum: ['images', 'videos', 'htmlReports', 'all'],
+          description: "Filter by asset type. Use 'all' or omit to return every type."
+        },
+        query: {
+          type: 'string',
+          description: 'Optional keyword to filter by filename (case-insensitive partial match).'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const assets = await chatbotDb.searchUserAssets(userId, args.type, args.query);
+
+    if (assets.length === 0) {
+      return { message: 'No assets found matching your criteria.', assets: [] };
+    }
+
+    return {
+      count: assets.length,
+      assets: assets.map(a => ({
+        url: a.url,
+        filename: a.filename,
+        assetType: a.assetType,
+        generatedAt: a.generatedAt,
+        sessionId: a.sessionId,
+        sessionTitle: a.sessionTitle,
+      })),
+    };
+  }
 });
 
 for (const toolName of adminToolNames) {

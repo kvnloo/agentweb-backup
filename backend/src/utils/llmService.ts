@@ -33,6 +33,10 @@ export class LLMService {
           accessKeyId: process.env.AWS_ACCESS_KEY_ID,
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
         } : undefined,
+        requestHandler: {
+          connectionTimeout: 10_000,
+          requestTimeout: 5 * 60 * 1000, // 5 minutes, matching agentModeService
+        } as any,
       });
 
       // Map model IDs to inference profile ARNs for cross-region access
@@ -43,6 +47,8 @@ export class LLMService {
         modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6';
       } else if (model === 'anthropic.claude-opus-4-6-v1') {
         modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1';
+      } else if (model === 'anthropic.claude-opus-4-7') {
+        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7';
       }
 
       this.chatModel = new ChatBedrockConverse({

@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -159,7 +159,19 @@ export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
   scopes?: string[];
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig; // | TwitterConfig
+export interface HubSpotConfig extends BaseOAuthConfig {
+  account_type: 'oauth';
+  hub_id: number;        // HubSpot portal ID
+  hub_domain: string;    // e.g. "mycompany.hubspot.com"
+}
+
+export interface AttioConfig extends BaseOAuthConfig {
+  account_type: 'oauth';
+  workspace_id: string;
+  workspace_name: string;
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig; // | TwitterConfig
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -222,7 +234,7 @@ export const createAccount = async (
 
   const now = new Date().toISOString();
   const existingAccounts = normalizeAccounts((user as User).connected_accounts);
-  
+
   // Find existing account for this platform AND account_id (to support multiple accounts per platform)
   const existingIndex = existingAccounts.findIndex(
     acc => acc.platform === platform && acc.account_id === input.account_id
@@ -282,7 +294,7 @@ export const getAccountByPlatform = async (
 
   const accounts = normalizeAccounts((user as User).connected_accounts);
   const account = accounts.find(acc => acc.platform === platform);
-  
+
   if (!account) {
     return null;
   }
@@ -452,11 +464,11 @@ export const getAccountById = async (
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
     const user = await userDb.getUserById(userId);
-    
+
     if (user) {
       const accounts = normalizeAccounts((user as User).connected_accounts);
       const account = accounts.find(acc => acc.account_id === accountId);
-      
+
       if (account) {
         return {
           ...account,
@@ -464,10 +476,39 @@ export const getAccountById = async (
         };
       }
     }
-    
+
     return null;
   } catch (error) {
     console.error('Error in getAccountById:', error);
+    return null;
+  }
+};
+
+/**
+ * Find the User ID that owns a specific HubSpot Portal.
+ * Required for mapping HubSpot webhooks back to local users.
+ */
+export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
+  try {
+    // Note: If you have millions of users, you'd want a GSI on connected_accounts.
+    // For now, scanning or iterating is necessary to find the nested config property.
+    // The most efficient way right now is using userDb.scanAllItems
+    // Wait, let's just scan the users table where connected_accounts contains the given portalId
+    const { userDb } = await import('./db');
+    const users = await userDb.getAllUsers();
+
+    for (const user of users) {
+      if (user.connected_accounts) {
+        for (const account of user.connected_accounts) {
+          if (account.platform === 'hubspot' && (account.config as any).hub_id === portalId) {
+            return user.userId;
+          }
+        }
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error('Error resolving HubSpot Portal ID to User ID:', error);
     return null;
   }
 };
@@ -478,7 +519,7 @@ export const getAccountById = async (
  */
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();
-  
+
   // First check: is the token expired based on timestamp?
   if (account.config.token_expires_at <= now) {
     // LinkedIn with refresh token can attempt refresh via API verification
@@ -488,7 +529,7 @@ export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> 
     }
     // For LinkedIn with refresh token, fall through to API verification which handles refresh
   }
-  
+
   // Second check: verify via API (only for LinkedIn for now)
   if (account.platform === 'linkedin') {
     try {
@@ -505,7 +546,7 @@ export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> 
       return true; // Assume valid if API check fails but timestamp is okay (network error)
     }
   }
-  
+
   // For other platforms, just use timestamp check
   return true;
 };

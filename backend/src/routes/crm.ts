@@ -34,6 +34,7 @@ import {
   SavedView as SavedViewUtil,
   SavedViewScope as SavedViewScopeUtil,
 } from '../utils/savedViews';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -1337,6 +1338,12 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     }
 
     const lead = await crmDb.createLead(listId, leadData);
+
+    void Promise.allSettled([
+      externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
+      externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
+    ]);
+
     res.status(201).json(lead);
   } catch (error: any) {
     console.error('Error creating lead:', error);
@@ -1576,6 +1583,12 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     }
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
+
+    void Promise.allSettled([
+      externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'hubspot', 'updated'),
+      externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'attio', 'updated'),
+    ]);
+
     res.json(updatedLead);
   } catch (error: any) {
     console.error('Error updating lead:', error);

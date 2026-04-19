@@ -152,6 +152,8 @@ function pdfPageRender(pageData: any): Promise<string> {
 interface LLMModelConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
+  /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
+  isLive?: boolean;
 }
 
 // Type for LLM call options
@@ -813,6 +815,7 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+      'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -997,10 +1000,39 @@ export class AgentModeService {
       } else if (msg.role === 'tool') {
         // Tool results become user messages with toolResult blocks
         role = 'user';
+        // Content may be a string or a multipart array (e.g. screenshot with image)
+        let toolResultContent: any[];
+        if (Array.isArray(msg.content)) {
+          toolResultContent = [];
+          for (const item of msg.content) {
+            if (item.type === 'text') {
+              toolResultContent.push({ text: item.text });
+            } else if (item.type === 'image_url') {
+              const url = item.image_url?.url || '';
+              if (url.startsWith('data:')) {
+                const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
+                if (dataUriMatch) {
+                  const rawFormat = dataUriMatch[1].toLowerCase();
+                  const format = (rawFormat === 'jpg' ? 'jpeg' : rawFormat) as string;
+                  const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
+                  toolResultContent.push({
+                    image: {
+                      format: VALID_BEDROCK_FORMATS.has(format) ? format : 'jpeg',
+                      source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
+                    }
+                  });
+                }
+              }
+            }
+          }
+          if (toolResultContent.length === 0) toolResultContent = [{ text: '' }];
+        } else {
+          toolResultContent = [{ text: String(msg.content || '') }];
+        }
         contentBlocks.push({
           toolResult: {
             toolUseId: msg.tool_call_id,
-            content: [{ text: String(msg.content || '') }],
+            content: toolResultContent,
           }
         });
       } else {
@@ -1090,10 +1122,13 @@ export class AgentModeService {
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-flash-lite-preview': { client: null, supportsTemperature: true },
+    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
+    'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
+    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -1161,10 +1196,15 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
+    // Live models use WebSocket via liveVoiceService — callLLM is not applicable
+    if (this.llmModels[model].isLive) {
+      throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
+    }
+
     // Get the client - lazy-load Gemini or Bedrock client if needed
     let client = this.llmModels[model].client;
     if (!client) {
-      if (model === 'gemini-3-pro-preview' || model === 'gemini-3-flash-preview' || model === 'gemini-3.1-pro-preview' || model === 'gemini-3.1-flash-lite-preview') {
+      if (model.startsWith('gemini-')) {
         client = await this.getGeminiClient();
         // Update the cached client for future use
         this.llmModels[model].client = client;
@@ -1804,12 +1844,18 @@ export class AgentModeService {
         // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
         // Sequential is required when wait_seconds is in the batch so the wait happens
         // in the correct order relative to the tools before/after it.
+        // Also run sequentially when multiple generate_image or generate_video calls are batched
+        // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
         const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
+        const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
+          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video'
+        );
 
         let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
 
-        if (hasWaitTool) {
-          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools
+        if (hasWaitTool || hasMultipleMediaGenTools) {
+          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
+          // and prevents rate-limit throttling when batching multiple image/video generation calls
           toolResults = [];
           for (const { toolCall, functionArgs } of preparedCalls) {
             const toolStart = Date.now();
@@ -1862,7 +1908,8 @@ export class AgentModeService {
                   const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
                   const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
                   if (uploadResult) {
-                    processedResult = { screenshotUrl: uploadResult.url, success: true };
+                    // Keep dataUrl so the LLM can visually analyze the screenshot
+                    processedResult = { screenshotUrl: uploadResult.url, dataUrl, success: true };
                   }
                 } catch (e) {
                   console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
@@ -1887,12 +1934,16 @@ export class AgentModeService {
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
-            // For playwright screenshots, send a simple confirmation to the LLM (not the URL).
-            // The screenshot is displayed to the user via the tool call card in the frontend.
-            // We intentionally omit the URL so the LLM doesn't embed it in markdown responses.
+            // For playwright screenshots, pass the image back to the LLM as a vision input
+            // so it can visually analyze the result (e.g. verify mobile layout, check for UI issues).
+            // The screenshot is also displayed to the user via the tool call card in the frontend.
+            // We use a text prefix to discourage embedding the raw URL in markdown responses.
             let toolContent: any;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
-              toolContent = `Screenshot captured successfully and displayed to the user.`;
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl) {
+              toolContent = [
+                { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
+                { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
+              ];
             } else {
               toolContent = extractToolContent(result);
             }
@@ -4647,7 +4698,8 @@ export class AgentModeService {
           headers: {
             'x-goog-api-key': geminiApiKey,
             'Content-Type': 'application/json'
-          }
+          },
+          timeout: 20 * 60 * 1000, // 20 minutes — code execution can be slow but must not hang indefinitely
         }
       );
 
@@ -6778,6 +6830,18 @@ export class AgentModeService {
       }
 
       await crmDb.updateLead(listId, leadId, dbUpdates);
+
+      void (async () => {
+        try {
+          const { externalCrmSyncService } = await import('./externalCrmSyncService');
+          await Promise.allSettled([
+            externalCrmSyncService.autoSyncLead(userId, listId, { ...lead, ...dbUpdates }, 'hubspot', 'updated'),
+            externalCrmSyncService.autoSyncLead(userId, listId, { ...lead, ...dbUpdates }, 'attio', 'updated'),
+          ]);
+        } catch (syncError) {
+          console.error('AgentMode: Error triggering external CRM auto-sync:', syncError);
+        }
+      })();
 
       return {
         success: true,
@@ -14380,10 +14444,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     videoModel?: string,
     startFrame?: string,
-    endFrame?: string
+    endFrame?: string,
+    compose?: boolean,
+    composeParams?: Record<string, any>,
+    durationSeconds?: number,
+    useKeyframes?: boolean
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('./videoGeneration');
@@ -14405,7 +14473,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         userId,
         videoModel,
         startFrame,
-        endFrame
+        endFrame,
+        durationSeconds,
+        useKeyframes,
+        compose,
+        composeParams: composeParams as any,
       });
 
       if (result.success && result.videoUrl) {
@@ -14440,13 +14512,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.warn('Failed to store video generation metadata:', error);
         }
 
+        const isComposed = Boolean((result as any).composedVideoUrl);
         return {
           success: true,
-          message: `✅ Video "${result.filename}" generated successfully!`,
+          message: isComposed
+            ? `✅ Video "${result.filename}" generated and composed with brand overlays!`
+            : `✅ Video "${result.filename}" generated successfully!`,
           videoUrl: result.videoUrl,
+          ...(isComposed && { composedVideoUrl: (result as any).composedVideoUrl }),
           filename: result.filename,
           prompt: prompt,
-          model: videoModel || 'veo-3.1-generate-preview'
+          model: videoModel || 'veo-3.1-generate-preview',
+          composed: isComposed,
         };
       } else {
         return {
@@ -14463,6 +14540,61 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: 'Failed to generate video',
         error: error.message
       };
+    }
+  }
+
+  /**
+   * Compose pre-existing video clips into a branded final video using Remotion.
+   * Use this when clips have already been generated and need to be stitched + branded.
+   */
+  public async composeVideo(
+    clipUrls: string[],
+    filename: string,
+    userId: string,
+    sessionId: string,
+    composeParams: Record<string, any>,
+    clipDurationSeconds?: number
+  ): Promise<any> {
+    try {
+      if (!clipUrls || clipUrls.length === 0) {
+        return { success: false, message: 'At least one clip URL is required', error: 'missing_clip_urls' };
+      }
+
+      console.log(`AgentMode: Composing ${clipUrls.length} pre-existing clip(s) for user ${userId}`);
+
+      const { remotionService } = await import('./remotionService');
+      const composeResult = await remotionService.compose({
+        brandName: composeParams.brandName,
+        tagline: composeParams.tagline,
+        primaryColor: composeParams.primaryColor,
+        secondaryColor: composeParams.secondaryColor,
+        logoUrl: composeParams.logoUrl,
+        ctaText: composeParams.ctaText,
+        ctaUrl: composeParams.ctaUrl,
+        clipUrl: clipUrls[0],
+        extraClipUrls: clipUrls.slice(1),
+        clipDurationSeconds: clipDurationSeconds ?? 8,
+        filename,
+        userId,
+      });
+
+      if (composeResult.success && composeResult.videoUrl) {
+        return {
+          success: true,
+          message: `✅ ${clipUrls.length} clip(s) composed into branded video!`,
+          videoUrl: composeResult.videoUrl,
+          filename: composeResult.filename ?? filename,
+        };
+      }
+
+      return {
+        success: false,
+        message: composeResult.error || 'Composition failed',
+        error: composeResult.error,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error composing video:', error);
+      return { success: false, message: 'Failed to compose video', error: error.message };
     }
   }
 
@@ -17385,7 +17517,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      // Use max model limit for HTML generation — reports like GTM audits can be large
+      // Use high token limit for HTML generation — reports like GTM audits can be large
       const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
 
       // Build system prompt for HTML generation
@@ -19087,6 +19219,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             success: false,
             message: 'Commenting is not supported for this platform'
           };
+        }
+
+        // Check for existing comment by this actor to prevent duplicates
+        try {
+          const existingComments = await (adapter as any).getComments(account, postUrn, userId);
+          const alreadyCommented = existingComments.some((c: any) => c.actorUrn === account.account_id);
+          if (alreadyCommented) {
+            console.warn('[AgentMode] commentOnLinkedInPost: actor already has a comment on this post, skipping to prevent duplicate');
+            return {
+              success: true,
+              message: 'Already commented on this post — skipping to avoid duplicate.',
+              already_commented: true
+            };
+          }
+        } catch (checkError: any) {
+          // If the check fails, log and proceed — better to risk a duplicate than silently fail
+          console.warn('[AgentMode] commentOnLinkedInPost: could not check existing comments, proceeding anyway:', checkError.message);
         }
 
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');

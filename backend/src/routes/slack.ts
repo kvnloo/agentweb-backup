@@ -724,6 +724,13 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             if (isTriggered) {
               // Monitored (email-only) session — continue it and send email, do NOT post to Slack
               if (text) {
+                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
+                const replySenderEmail = await getSlackUserEmail(slackUserId);
+                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
+                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
+                  return;
+                }
+
                 console.log('📨 Thread reply in monitored session (email-only):', { channel, threadTs, slackUserId });
                 const { chatbotDb } = await import('../services/chatbotService');
                 const { generateSessionResponse } = await import('../controllers/agentModeController');

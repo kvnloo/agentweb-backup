@@ -1819,6 +1819,59 @@ export class ChatbotDB {
   }
 
   /**
+   * Search assets (images, videos, HTML reports) across all agent mode sessions for a user.
+   * Returns assets grouped by type with sessionId and session title for context.
+   */
+  async searchUserAssets(
+    userId: string,
+    type?: 'images' | 'videos' | 'htmlReports' | 'all',
+    query?: string
+  ): Promise<Array<{
+    url: string;
+    filename: string;
+    generatedAt: string;
+    assetType: 'image' | 'video' | 'htmlReport';
+    sessionId: string;
+    sessionTitle: string;
+  }>> {
+    const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
+    const results: Array<{
+      url: string;
+      filename: string;
+      generatedAt: string;
+      assetType: 'image' | 'video' | 'htmlReport';
+      sessionId: string;
+      sessionTitle: string;
+    }> = [];
+
+    const assetTypeFilter = type === 'all' || !type ? null : type;
+    const lowerQuery = query?.toLowerCase();
+
+    for (const session of sessions) {
+      if (!session.assetCache) continue;
+      const sessionId = session.sessionId;
+      const sessionTitle = session.title || 'Untitled session';
+
+      const pushAssets = (
+        assets: Array<{ url: string; filename: string; generatedAt: string }>,
+        assetType: 'image' | 'video' | 'htmlReport'
+      ) => {
+        for (const asset of assets) {
+          if (lowerQuery && !asset.filename.toLowerCase().includes(lowerQuery) && !asset.url.toLowerCase().includes(lowerQuery)) continue;
+          results.push({ ...asset, assetType, sessionId, sessionTitle });
+        }
+      };
+
+      if (!assetTypeFilter || assetTypeFilter === 'images') pushAssets(session.assetCache.images ?? [], 'image');
+      if (!assetTypeFilter || assetTypeFilter === 'videos') pushAssets(session.assetCache.videos ?? [], 'video');
+      if (!assetTypeFilter || assetTypeFilter === 'htmlReports') pushAssets(session.assetCache.htmlReports ?? [], 'htmlReport');
+    }
+
+    // Sort newest first
+    return results.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+  }
+
+  /**
    * Get messages starting from a given messageIndex (inclusive).
    * Used for delta scanning when asset cache needs updating.
    */

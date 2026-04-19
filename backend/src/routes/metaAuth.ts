@@ -8,32 +8,13 @@ import { getMetaFlowConfig, INTEGRATION_CONFIG, MetaFlowType } from '../config/i
 import { metaService } from '../services/metaService';
 import { instagramService } from '../services/instagramService';
 import { createAccount } from '../services/connectedAccountsDb';
+import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 
 const router = express.Router();
 
-// ============================================
-// Server-side token session storage (10-minute TTL)
-// ============================================
-const tokenSessions = new Map<string, {
-    userId: string;
-    access_token: string;
-    expires_in?: number;
-    scopes: string[];
-    flow: MetaFlowType;
-    timestamp: number;
-}>();
-
-// Cleanup expired sessions every 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    const TEN_MINUTES = 10 * 60 * 1000;
-    for (const [sessionId, session] of tokenSessions.entries()) {
-        if (now - session.timestamp > TEN_MINUTES) {
-            tokenSessions.delete(sessionId);
-        }
-    }
-}, 5 * 60 * 1000);
+// Token sessions are stored in DynamoDB (AW-OAuthSessions) with a 10-minute TTL
+// to survive across multiple backend instances behind the load balancer.
 
 // ============================================
 // Helpers
@@ -66,32 +47,18 @@ function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; red
     return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
-function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; flow: MetaFlowType }): string {
+async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; flow: MetaFlowType }): Promise<string> {
     const sessionId = crypto.randomBytes(32).toString('hex');
-    tokenSessions.set(sessionId, { userId, ...tokens, timestamp: Date.now() });
+    await oauthSessionDb.save({ sessionId, userId, ...tokens });
     return sessionId;
 }
 
-function retrieveTokenSession(sessionId: string, userId: string) {
-    const session = tokenSessions.get(sessionId);
+async function retrieveTokenSession(sessionId: string, userId: string) {
+    const session = await oauthSessionDb.get(sessionId, userId);
     if (!session) {
-        console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... not found`);
+        console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... not found or userId mismatch`);
         return null;
     }
-    if (session.userId !== userId) {
-        console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... userId mismatch`);
-        return null;
-    }
-    const TEN_MINUTES = 10 * 60 * 1000;
-    if (Date.now() - session.timestamp > TEN_MINUTES) {
-        console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... expired`);
-        tokenSessions.delete(sessionId);
-        return null;
-    }
-
-    // DO NOT delete the session here. Connecting multiple pages or ad-accounts
-    // sequentially may need to look up this session multiple times.
-    // The session will be naturally cleaned up by the 5-minute interval.
     console.log(`[TokenSession] Retrieved session ${sessionId.substring(0, 8)}...`);
     return session;
 }
@@ -263,7 +230,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             }
         }
 
-        const tokenSessionId = storeTokenSession(userId, {
+        const tokenSessionId = await storeTokenSession(userId, {
             access_token,
             expires_in,
             scopes: flowCfg.scopes,
@@ -275,8 +242,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             let adAccounts: MetaAdAccount[] = [];
             try {
                 adAccounts = await metaService.getAdAccounts(access_token);
-            } catch (error) {
-                console.log('[Meta Finalize] No ad accounts or permission denied');
+                console.log(`[Meta Finalize] Found ${adAccounts.length} ad account(s) for user ${userId}`);
+            } catch (error: any) {
+                const structured = error?.structuredError;
+                console.warn(`[Meta Finalize] getAdAccounts failed — code=${structured?.code ?? 'n/a'} classification=${structured?.classification ?? 'n/a'} message=${error?.message ?? error}`);
             }
 
             return res.json({ success: true, flow, adAccounts: adAccounts.length > 0 ? adAccounts : undefined, tokenSessionId });
@@ -324,7 +293,7 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             return res.status(400).json({ error: 'Missing token session ID' });
         }
 
-        const session = retrieveTokenSession(tokenSessionId, userId);
+        const session = await retrieveTokenSession(tokenSessionId, userId);
         if (!session) {
             return res.status(400).json({ error: 'Invalid or expired token session' });
         }
@@ -371,7 +340,7 @@ router.post('/connect-instagram', authenticateToken, async (req: any, res) => {
             return res.status(400).json({ error: 'Missing token session ID' });
         }
 
-        const session = retrieveTokenSession(tokenSessionId, userId);
+        const session = await retrieveTokenSession(tokenSessionId, userId);
         if (!session) {
             return res.status(400).json({ error: 'Invalid or expired token session' });
         }

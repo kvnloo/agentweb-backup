@@ -23,6 +23,8 @@ import {
   getVercelToken,
   getStripeCredentials,
   getFathomCredentials,
+  getHubSpotCredentials,
+  getAttioCredentials,
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -1351,6 +1353,148 @@ describe('secretsManager utils', () => {
 
       await expect(getFathomCredentials()).rejects.toThrow(
         'Failed to fetch Fathom credentials from Secrets Manager'
+      );
+    });
+  });
+
+  describe('getHubSpotCredentials', () => {
+    it('should return HubSpot credentials in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'hs-id', clientSecret: 'hs-secret' })
+        })
+      });
+
+      const result = await getHubSpotCredentials();
+      expect(result).toEqual({ clientId: 'hs-id', clientSecret: 'hs-secret' });
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/HubSpot' });
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'hs-id', clientSecret: 'hs-secret' })
+        })
+      });
+
+      await getHubSpotCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/HubSpot' });
+    });
+
+    it('should throw when credentials are missing clientId', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientSecret: 'hs-secret' })
+        })
+      });
+
+      await expect(getHubSpotCredentials()).rejects.toThrow(
+        'Failed to fetch HubSpot credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw when secret string is whitespace only', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getHubSpotCredentials()).rejects.toThrow(
+        'Failed to fetch HubSpot credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw when credentials are missing clientSecret', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'hs-id' })
+        })
+      });
+
+      await expect(getHubSpotCredentials()).rejects.toThrow(
+        'Failed to fetch HubSpot credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw when Secrets Manager fails', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getHubSpotCredentials()).rejects.toThrow(
+        'Failed to fetch HubSpot credentials from Secrets Manager'
+      );
+    });
+  });
+
+  describe('getAttioCredentials', () => {
+    it('should return Attio credentials in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'att-id', clientSecret: 'att-secret' })
+        })
+      });
+
+      const result = await getAttioCredentials();
+      expect(result).toEqual({ clientId: 'att-id', clientSecret: 'att-secret' });
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/Attio' });
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'att-id', clientSecret: 'att-secret' })
+        })
+      });
+
+      await getAttioCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/Attio' });
+    });
+
+    it('should throw when credentials are missing clientSecret', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'att-id' })
+        })
+      });
+
+      await expect(getAttioCredentials()).rejects.toThrow(
+        'Failed to fetch Attio credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw when secret string is whitespace only', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getAttioCredentials()).rejects.toThrow(
+        'Failed to fetch Attio credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw when credentials are missing clientId', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientSecret: 'att-secret' })
+        })
+      });
+
+      await expect(getAttioCredentials()).rejects.toThrow(
+        'Failed to fetch Attio credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw when Secrets Manager fails', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getAttioCredentials()).rejects.toThrow(
+        'Failed to fetch Attio credentials from Secrets Manager'
       );
     });
   });

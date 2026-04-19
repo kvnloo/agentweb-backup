@@ -146,6 +146,28 @@ export class CrmEnrichmentService {
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
   private static readonly SUGGEST_MODEL = 'gemini-3.1-flash-lite-preview';
 
+  // Free/personal email providers — using their domain as a company identifier produces wrong results
+  private static readonly PERSONAL_EMAIL_DOMAINS = new Set([
+    'gmail.com', 'googlemail.com',
+    'yahoo.com', 'yahoo.co.uk', 'yahoo.co.jp', 'yahoo.fr', 'yahoo.de', 'yahoo.es', 'yahoo.it',
+    'hotmail.com', 'hotmail.co.uk', 'hotmail.fr', 'hotmail.de', 'hotmail.es',
+    'outlook.com', 'outlook.co.uk', 'live.com', 'live.co.uk',
+    'msn.com',
+    'aol.com',
+    'icloud.com', 'me.com', 'mac.com',
+    'protonmail.com', 'proton.me',
+    'mail.com', 'email.com',
+    'zoho.com',
+    'yandex.com', 'yandex.ru',
+    'qq.com', '163.com', '126.com',
+    'inbox.com', 'fastmail.com', 'tutanota.com',
+  ]);
+
+  static isPersonalEmailDomain(email: string): boolean {
+    const domain = (email.split('@')[1] || '').toLowerCase().trim();
+    return CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(domain);
+  }
+
   /**
    * Substitute {{placeholder}} tokens in a search query template with actual lead field values.
    * Multi-space gaps left by empty substitutions are collapsed to a single space.
@@ -177,8 +199,13 @@ export class CrmEnrichmentService {
       return /linkedin|profile|contact|title|role|position|seniority|department/.test(fl);
     });
 
+    const isPersonalDomain = emailDomain
+      ? CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)
+      : false;
+    const businessDomain = isPersonalDomain ? '' : emailDomain;
+
     if (isPersonField && personName) {
-      const companyCtx = companyName || emailDomain;
+      const companyCtx = companyName || businessDomain;
       // Simple query — Google Custom Search API doesn't handle OR well
       return companyCtx
         ? `${personName} ${companyCtx} linkedin`
@@ -186,7 +213,7 @@ export class CrmEnrichmentService {
     }
 
     // Company-level fields: use company name with targeted suffix
-    const companyTerm = companyName || emailDomain;
+    const companyTerm = companyName || businessDomain;
     if (!companyTerm) return '';
 
     const fieldSuffixes: [RegExp, string][] = [
@@ -276,7 +303,7 @@ export class CrmEnrichmentService {
           const personName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
           const fallbackQuery = personName
             ? `${personName} ${lead.company || ''}`.trim()
-            : `${lead.company || lead.email?.split('@')[1] || ''} company overview`;
+            : `${lead.company || (!CrmEnrichmentService.isPersonalEmailDomain(lead.email || '') ? lead.email?.split('@')[1] : '') || ''} company overview`.trim();
           if (fallbackQuery && fallbackQuery !== query) {
             result = await agentModeService.searchWeb(fallbackQuery, 5);
           }

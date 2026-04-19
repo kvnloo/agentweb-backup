@@ -715,6 +715,25 @@ router.put("/users/:userId/email-sender", async (req, res) => {
   }
 });
 
+// Get Slack channel info by ID (for admin double-check)
+router.get("/slack/channel-info", async (req, res) => {
+  try {
+    const { channelId } = req.query;
+    if (!channelId || typeof channelId !== "string") {
+      return res.status(400).json({ message: "channelId query param required" });
+    }
+    const { getSlackChannelInfo } = await import("../services/slackService");
+    const info = await getSlackChannelInfo(channelId.trim());
+    if (!info) {
+      return res.status(404).json({ message: "Channel not found or bot not a member" });
+    }
+    res.json(info);
+  } catch (error: any) {
+    console.error("Error fetching Slack channel info:", error);
+    res.status(500).json({ message: "Error fetching channel info", details: error.message });
+  }
+});
+
 // Update user slack channels (accepts an array)
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
