@@ -5408,6 +5408,8 @@ const adminToolNames = [
   'freeze_user_account',
   'manage_scoring_judges',
   'manage_user_notes',
+  // Lifecycle Drip Phase 2: segment users by onboarding stage for drip campaigns
+  'get_users_by_lifecycle_stage',
 ];
 
 for (const toolName of bridgedToolNames) {
