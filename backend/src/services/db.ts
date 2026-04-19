@@ -4,6 +4,8 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
+import { buildLeadCrmFields } from "../utils/leadSchema";
+import { onUserSignup } from "./crmSignalHooks";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -92,6 +94,8 @@ export interface User {
   companyName?: string;
   memoryEnabled?: boolean; // Whether Emma's long-term memory is enabled (default: true)
   useCaseCategories?: string[];
+  emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
+  emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -170,6 +174,20 @@ export interface User {
   current_period_end?: string; // ISO date of current billing period end
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
+  /**
+   * Stripe Connect OAuth — customer-authorized read-only access to their own
+   * Stripe account. Used to enrich CRM contacts with the customer's live
+   * billing data (not AgentWeb's platform billing).
+   *
+   * Tokens are encrypted at rest via utils/stripeConnectCrypto.encryptConnectToken.
+   * Never log or return the encrypted values to the client.
+   */
+  stripeConnectedAccountId?: string; // acct_xxx of the connected Stripe account
+  stripeConnectedAt?: string; // ISO datetime when OAuth was completed
+  stripeConnectAccessToken?: string; // AES-256-GCM encrypted
+  stripeConnectRefreshToken?: string; // AES-256-GCM encrypted
+  stripeConnectScope?: string; // Granted scope, expected: "read_only"
+  stripeConnectMode?: 'live' | 'test'; // Which Stripe mode the connection was made in
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
     | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'youtube' | 'clickup';
@@ -241,6 +259,22 @@ export interface User {
   lastTouch?: import("../types/attribution").AttributionTouch;
   utmSource?: string;
   utmMedium?: string;
+  /**
+   * Saved CRM views — user's customized filter+sort combinations applied
+   * to the /crm dashboard tabs. Built-in presets are injected by the
+   * savedViews route and NOT persisted here (isPreset views are returned
+   * from code, never written). Only user-saved views are stored.
+   * See `backend/src/routes/crm.ts` saved-views endpoints.
+   */
+  savedViews?: Array<{
+    viewId: string;
+    name: string;
+    scope: 'inbox' | 'working' | 'paying' | 'all';
+    filters?: Record<string, any>;
+    sort?: string;
+    isPreset?: false; // user-saved views are never preset
+    createdAt: string;
+  }>;
 }
 
 export interface Organization {
@@ -484,6 +518,16 @@ class UserDB {
 
     try {
       await this.docClient.put(params).promise();
+      // Fire-and-forget CRM signal (B2). Never awaited — signup latency must not
+      // depend on AW-ContactEvents. Errors are swallowed inside onUserSignup.
+      void onUserSignup({
+        userId,
+        email: itemToCreate.email,
+        displayName,
+        companyName,
+        isOAuthUser,
+        createdAt: itemToCreate.createdAt,
+      });
       return params.Item as User;
     } catch (error) {
       handleDynamoDbError(error, "createUser");
@@ -546,6 +590,29 @@ class UserDB {
       return (result.Items?.[0] as User) || null;
     } catch (error) {
       console.error("Error in getUserByStripeCustomerId:", error);
+      throw error;
+    }
+  }
+
+  async getUserByStripeConnectedAccountId(connectedAccountId: string): Promise<User | null> {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: "stripeConnectedAccountId = :cid",
+        ExpressionAttributeValues: {
+          ":cid": connectedAccountId,
+        },
+      };
+      // Full table scan — small user base today, add a GSI if this becomes hot.
+      const result = await this.docClient.scan(params).promise();
+      if (result.Items && result.Items.length > 1) {
+        console.warn(
+          `getUserByStripeConnectedAccountId: found ${result.Items.length} users with stripeConnectedAccountId=${connectedAccountId} — expected 1. Using first match.`
+        );
+      }
+      return (result.Items?.[0] as User) || null;
+    } catch (error) {
+      console.error("Error in getUserByStripeConnectedAccountId:", error);
       throw error;
     }
   }
@@ -3128,7 +3195,8 @@ export const crmDb = {
     autoDraftInstruction?: string,
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
-    listType?: 'sales' | 'customers'
+    listType?: 'sales' | 'customers',
+    isSystemManaged?: boolean
   ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3172,6 +3240,7 @@ export const crmDb = {
             { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
           ]),
           ...(listType ? { listType } : {}),
+          ...(isSystemManaged ? { isSystemManaged: true } : {}),
         },
       };
 
@@ -3666,6 +3735,19 @@ export const crmDb = {
     contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
     contactStatusUpdatedBy?: string;
+    // CRM Unification v1 extensions (A1)
+    domain?: string;
+    accountOwnerUserId?: string;
+    priority?: 'Low' | 'Medium' | 'High';
+    expectedClose?: string;
+    closedDate?: string;
+    heatScore?: number;
+    healthScore?: number;
+    lifecycle?: 'unknown' | 'inbox' | 'signed_up' | 'in_deal' | 'trialing' | 'paying' | 'at_risk' | 'churned';
+    role?: 'KDM' | 'Champion' | 'Blocker' | 'Influencer' | 'Other';
+    isPrimary?: boolean;
+    dealIds?: string[];
+    tenantId?: string;
     syncMetadata?: Record<string, any>;
   }) {
     try {
@@ -3728,6 +3810,25 @@ export const crmDb = {
       if (leadData.syncMetadata && Object.keys(leadData.syncMetadata).length > 0) {
         item.syncMetadata = leadData.syncMetadata;
       }
+
+      // CRM Unification v1 extensions (A1): domain (derived), lifecycle (defaulted
+      // to 'inbox' when email present), heatScore/healthScore, priority, role,
+      // isPrimary, dealIds[], accountOwnerUserId, expectedClose, closedDate.
+      const crmFields = buildLeadCrmFields(emailValue, {
+        domain: leadData.domain,
+        accountOwnerUserId: leadData.accountOwnerUserId,
+        priority: leadData.priority,
+        expectedClose: leadData.expectedClose,
+        closedDate: leadData.closedDate,
+        heatScore: leadData.heatScore,
+        healthScore: leadData.healthScore,
+        lifecycle: leadData.lifecycle,
+        role: leadData.role,
+        isPrimary: leadData.isPrimary,
+        dealIds: leadData.dealIds,
+        tenantId: leadData.tenantId,
+      });
+      Object.assign(item, crmFields);
 
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
@@ -3998,6 +4099,7 @@ export const crmDb = {
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
+    accountOwnerUserId?: string | null;
     syncMetadata?: Record<string, any>;
   }) {
     try {
@@ -4005,6 +4107,16 @@ export const crmDb = {
       const removeExpressions: string[] = [];
       const expressionAttributeValues: any = {};
       const expressionAttributeNames: Record<string, string> = {};
+
+      // CRM extension: accountOwnerUserId. Supports null => REMOVE.
+      if (updates.accountOwnerUserId !== undefined) {
+        if (updates.accountOwnerUserId === null || updates.accountOwnerUserId === '') {
+          removeExpressions.push('accountOwnerUserId');
+        } else {
+          setExpressions.push('accountOwnerUserId = :accountOwnerUserId');
+          expressionAttributeValues[':accountOwnerUserId'] = String(updates.accountOwnerUserId);
+        }
+      }
 
       if (updates.email !== undefined) {
         const emailValue = updates.email.trim().toLowerCase();

@@ -13,7 +13,33 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { syncContact, SyncInput } from '../services/contactSyncService';
+import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
+import { dedupContactsForUser } from '../services/contactDedupService';
+import {
+  dealDb,
+  DealAuthError,
+  DealNotFoundError,
+  DEAL_STAGES,
+  DealStage,
+  ContactRef,
+} from '../services/dealDb';
+import Stripe from 'stripe';
+import {
+  buildBuiltInPresets,
+  validateCreateInput,
+  generateViewId,
+  VALID_SCOPES,
+  isPresetViewId,
+  SavedView as SavedViewUtil,
+  SavedViewScope as SavedViewScopeUtil,
+} from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
+
+const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const d1StripeClient = d1StripeSecretKey
+  ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
+  : null;
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -394,6 +420,298 @@ const fetchAllLeadsByStatusIndex = async (
 // Lead List Routes
 
 /**
+ * @route POST /api/crm/sync
+ * @desc Unified sync endpoint — the single entry point for all inbound CRM
+ *       signals (signup, Stripe, lead_form, emma_session, fathom, manual).
+ *       Enforces idempotency, identity resolution, event logging, and score
+ *       recompute. See `contactSyncService.ts` for details.
+ * @access Private (JWT)
+ */
+router.post('/sync', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user?.userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const body = req.body as Partial<SyncInput>;
+
+    if (!body || !body.source || !body.sourceRecordId || !body.eventType || !body.identity) {
+      return res.status(400).json({
+        message:
+          'Invalid body. Required: source, sourceRecordId, eventType, identity.',
+      });
+    }
+
+    const result = await syncContact(body as SyncInput);
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error in POST /api/crm/sync:', error);
+    const msg = typeof error?.message === 'string' ? error.message : 'Sync failed';
+    const status = /required|no email|no sourceRecordId/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ message: msg });
+  }
+});
+
+// --------------------------------------------------------------------------
+// Saved Views (H1) — user-customized filter/sort combos over /crm tabs.
+// Built-in presets are returned from code (can't be edited/deleted); user
+// views are persisted on the User record via db.ts User.savedViews.
+// Pure logic (validation, preset shapes, id gen) lives in utils/savedViews.ts
+// and is unit-tested there.
+// --------------------------------------------------------------------------
+
+/**
+ * @route GET /api/crm/saved-views
+ * @desc Return built-in presets + user's saved views.
+ * @access Private
+ */
+router.get('/saved-views', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    const user = await userDb.getUserById(userId);
+    const userViews: SavedViewUtil[] = Array.isArray(user?.savedViews)
+      ? user!.savedViews!.map((v) => ({
+          viewId: v.viewId,
+          name: v.name,
+          scope: v.scope,
+          filters: v.filters,
+          sort: v.sort,
+          isPreset: false,
+          createdAt: v.createdAt,
+        }))
+      : [];
+    const presets = buildBuiltInPresets(userId);
+    return res.json({ views: [...presets, ...userViews] });
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/saved-views:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to fetch saved views' });
+  }
+});
+
+/**
+ * @route POST /api/crm/saved-views
+ * @desc Create a new user-saved view.
+ * @access Private
+ */
+router.post('/saved-views', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const parsed = validateCreateInput(req.body || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ message: parsed.error });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const newView = {
+      viewId: generateViewId(),
+      name: parsed.value.name,
+      scope: parsed.value.scope as SavedViewScopeUtil,
+      filters: parsed.value.filters,
+      sort: parsed.value.sort,
+      isPreset: false as const,
+      createdAt: new Date().toISOString(),
+    };
+
+    const existingViews = Array.isArray(user.savedViews) ? user.savedViews : [];
+    const nextViews = [...existingViews, newView];
+    await userDb.updateUser(userId, { savedViews: nextViews } as any);
+    return res.status(201).json(newView);
+  } catch (error: any) {
+    console.error('Error in POST /api/crm/saved-views:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to create saved view' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/saved-views/:viewId
+ * @desc Update a user-saved view. Presets are immutable (returns 400).
+ * @access Private
+ */
+router.put('/saved-views/:viewId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    const { viewId } = req.params;
+    if (isPresetViewId(viewId)) {
+      return res.status(400).json({ message: 'Built-in presets cannot be modified' });
+    }
+
+    const { name, scope, filters, sort } = req.body || {};
+    if (scope !== undefined && !VALID_SCOPES.includes(scope)) {
+      return res.status(400).json({ message: `scope must be one of ${VALID_SCOPES.join(', ')}` });
+    }
+
+    const user = await userDb.getUserById(userId);
+    const existingViews = Array.isArray(user?.savedViews) ? user!.savedViews! : [];
+    const idx = existingViews.findIndex((v) => v.viewId === viewId);
+    if (idx === -1) {
+      return res.status(404).json({ message: 'View not found' });
+    }
+    const updated = {
+      ...existingViews[idx],
+      ...(name !== undefined ? { name: String(name).trim() } : {}),
+      ...(scope !== undefined ? { scope } : {}),
+      ...(filters !== undefined ? { filters } : {}),
+      ...(sort !== undefined ? { sort } : {}),
+    };
+    const nextViews = [...existingViews];
+    nextViews[idx] = updated;
+    await userDb.updateUser(userId, { savedViews: nextViews } as any);
+    return res.json(updated);
+  } catch (error: any) {
+    console.error('Error in PUT /api/crm/saved-views/:viewId:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to update saved view' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/saved-views/:viewId
+ * @desc Delete a user-saved view. Presets are immutable (returns 400).
+ * @access Private
+ */
+router.delete('/saved-views/:viewId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    const { viewId } = req.params;
+    if (isPresetViewId(viewId)) {
+      return res.status(400).json({ message: 'Built-in presets cannot be deleted' });
+    }
+    const user = await userDb.getUserById(userId);
+    const existingViews = Array.isArray(user?.savedViews) ? user!.savedViews! : [];
+    const idx = existingViews.findIndex((v) => v.viewId === viewId);
+    if (idx === -1) {
+      return res.status(404).json({ message: 'View not found' });
+    }
+    const nextViews = existingViews.filter((v) => v.viewId !== viewId);
+    await userDb.updateUser(userId, { savedViews: nextViews } as any);
+    return res.json({ success: true, viewId });
+  } catch (error: any) {
+    console.error('Error in DELETE /api/crm/saved-views/:viewId:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to delete saved view' });
+  }
+});
+
+/**
+ * @route GET /api/crm/leads/:leadId/enrichment
+ * @desc Internal enrichment endpoint (D1) — joins AW-Users + Stripe for a
+ *       single Contact at read time. Caches per-email for 1h.
+ *       Requires ?listId=<id> because AW-Leads composite key is (listId, leadId).
+ * @access Private (owner only)
+ */
+router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { leadId } = req.params;
+    const listId = typeof req.query.listId === 'string' ? req.query.listId : '';
+    if (!listId) {
+      return res.status(400).json({ message: 'listId query parameter is required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || list.userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    const email = lead.email ? String(lead.email).toLowerCase().trim() : '';
+    if (!email) {
+      return res.json({
+        isUser: false,
+        signupDate: null,
+        subscriptionType: null,
+        stripeStatus: null,
+        mrr: 0,
+        currentPeriodEnd: null,
+        stripeCustomerId: null,
+      });
+    }
+
+    const deps: EnrichmentDeps = {
+      getUserByEmail: async (e: string) => {
+        const u = await userDb.getUserByEmail(e);
+        return u ? (u as any) : null;
+      },
+      getStripeSubscriptionForCustomer: async (customerId: string) => {
+        try {
+          if (!d1StripeClient) return null;
+          const subs = await d1StripeClient.subscriptions.list({
+            customer: customerId,
+            status: 'all',
+            limit: 10,
+          });
+          if (!subs.data || subs.data.length === 0) return null;
+          const statusPriority: Record<string, number> = {
+            active: 0, trialing: 1, past_due: 2, canceled: 3,
+          };
+          const sorted = [...subs.data].sort(
+            (a: any, b: any) =>
+              (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
+          );
+          const sub: any = sorted[0];
+          const priceId = sub.items?.data?.[0]?.price?.id;
+          const price = sub.items?.data?.[0]?.price;
+          const mrrCents = price?.unit_amount
+            ? (price.recurring?.interval === 'year'
+                ? Math.round(price.unit_amount / 12)
+                : price.unit_amount)
+            : 0;
+          const cpe = (sub as any).current_period_end;
+          const currentPeriodEnd = cpe
+            ? new Date(typeof cpe === 'number' ? cpe * 1000 : cpe).toISOString()
+            : null;
+          return {
+            id: sub.id,
+            status: sub.status,
+            currentPeriodEnd,
+            mrrCents,
+            priceId,
+          };
+        } catch (err) {
+          console.warn('[enrichment] Stripe list failed:', (err as any)?.message);
+          return null;
+        }
+      },
+    };
+
+    const result = await enrichContact(email, deps, defaultEnrichmentCache);
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/leads/:leadId/enrichment:', error);
+    return res.status(500).json({ message: error.message || 'Enrichment failed' });
+  }
+});
+
+/**
  * @route GET /api/crm/lists
  * @desc Get all lead lists for the authenticated user
  * @access Private
@@ -412,6 +730,72 @@ router.get('/lists', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error fetching lead lists:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead lists' });
+  }
+});
+
+/**
+ * @route GET /api/crm/contacts
+ * @desc Return all of the user's leads deduped by lowercased email.
+ *       Powers the /crm Inbox tab — replaces client-side per-list fetch+dedup
+ *       which was 30-90s on 5000+ lead accounts.
+ * @access Private
+ * @query listType? "sales" | "customers" — restrict to a list type (default: all)
+ * @query listIds? comma-separated listIds to restrict to a subset
+ * @query limit? max deduped rows to return (default: all)
+ * @query sort? "heat" | "recent" (default: heat)
+ */
+router.get('/contacts', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { listType, listIds, limit, sort } = req.query as Record<string, string | undefined>;
+
+    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
+      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+    }
+
+    if (sort !== undefined && sort !== 'heat' && sort !== 'recent') {
+      return res.status(400).json({ message: 'sort must be "heat" or "recent"' });
+    }
+
+    let parsedLimit: number | undefined;
+    if (limit !== undefined) {
+      const n = Number(limit);
+      if (!Number.isFinite(n) || n < 1 || n > 10000) {
+        return res.status(400).json({ message: 'limit must be a number between 1 and 10000' });
+      }
+      parsedLimit = Math.floor(n);
+    }
+
+    const parsedListIds = listIds
+      ? listIds.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+
+    const started = Date.now();
+    const result = await dedupContactsForUser({
+      userId,
+      listType: listType as 'sales' | 'customers' | undefined,
+      listIds: parsedListIds,
+      limit: parsedLimit,
+      sort: sort as 'heat' | 'recent' | undefined,
+    });
+    const durationMs = Date.now() - started;
+
+    return res.json({
+      contacts: result.contacts,
+      total: result.total,
+      rawCount: result.rawCount,
+      listsCount: result.listsCount,
+      durationMs,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/crm/contacts:', error?.message || error);
+    return res.status(500).json({ message: error?.message || 'Failed to load contacts' });
   }
 });
 
@@ -3855,6 +4239,180 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error in CRM analyze endpoint:', error.message || error);
     return res.status(500).json({ message: 'Failed to analyze CRM data' });
+  }
+});
+
+// ============================================================================
+// Deals Routes (CRM Unification v1 — A2)
+// ============================================================================
+
+/**
+ * Helper: translate dealDb errors to HTTP responses. Keeps route bodies tight.
+ */
+function handleDealError(res: Response, err: any): Response {
+  if (err instanceof DealNotFoundError) {
+    return res.status(404).json({ message: err.message });
+  }
+  if (err instanceof DealAuthError) {
+    return res.status(403).json({ message: err.message });
+  }
+  if (err instanceof Error && /Invalid|required|must be|cannot be empty/i.test(err.message)) {
+    return res.status(400).json({ message: err.message });
+  }
+  console.error('Deals route error:', err);
+  return res.status(500).json({ message: 'Internal error' });
+}
+
+// GET /api/crm/deals — list deals owned by the current user, optional filters
+router.get('/deals', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const { companyDomain, stage, limit } = req.query as Record<string, string | undefined>;
+    const lim = limit ? Math.min(parseInt(limit, 10) || 100, 500) : 100;
+
+    if (companyDomain) {
+      if (stage && !DEAL_STAGES.includes(stage as DealStage)) {
+        return res.status(400).json({ message: `Invalid stage: ${stage}` });
+      }
+      const deals = await dealDb.getDealsByDomain(companyDomain, {
+        stage: stage as DealStage | undefined,
+        limit: lim,
+      });
+      // Scope to the caller's own deals — domain lookups cross tenants otherwise.
+      const mine = deals.filter(
+        d => d.ownerUserId === userId || d.accountOwnerUserId === userId
+      );
+      return res.json({ deals: mine });
+    }
+
+    const deals = await dealDb.getDealsByOwner(userId, { limit: lim });
+    const filtered = stage ? deals.filter(d => d.stage === stage) : deals;
+    return res.json({ deals: filtered });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// POST /api/crm/deals — create a new deal
+router.post('/deals', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const {
+      primaryContactId,
+      contactIds,
+      accountOwnerUserId,
+      companyDomain,
+      stage,
+      dealValue,
+      dealCurrency,
+      expectedClose,
+      heatScore,
+      source,
+      notes,
+      tenantId,
+    } = req.body || {};
+
+    if (!primaryContactId) {
+      return res.status(400).json({ message: 'primaryContactId required' });
+    }
+
+    const deal = await dealDb.createDeal({
+      ownerUserId: userId,
+      primaryContactId,
+      contactIds,
+      accountOwnerUserId,
+      companyDomain,
+      stage,
+      dealValue,
+      dealCurrency,
+      expectedClose,
+      heatScore,
+      source,
+      notes,
+      tenantId,
+    });
+    return res.status(201).json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// GET /api/crm/deals/:dealId
+router.get('/deals/:dealId', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const deal = await dealDb.getDeal(req.params.dealId);
+    if (!deal) return res.status(404).json({ message: 'Deal not found' });
+    if (deal.ownerUserId !== userId && deal.accountOwnerUserId !== userId) {
+      return res.status(403).json({ message: 'Not authorized to view this deal' });
+    }
+    return res.json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// PUT /api/crm/deals/:dealId
+router.put('/deals/:dealId', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const deal = await dealDb.updateDeal(req.params.dealId, userId, req.body || {});
+    return res.json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// DELETE /api/crm/deals/:dealId
+router.delete('/deals/:dealId', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    await dealDb.deleteDeal(req.params.dealId, userId);
+    return res.json({ success: true });
+  } catch (err) {
+    return handleDealError(res, err);
+  }
+});
+
+// POST /api/crm/deals/:dealId/rotate-primary  { newPrimaryContactId, oldPrimaryRef?, newPrimaryRef? }
+router.post('/deals/:dealId/rotate-primary', async (req: Request, res: Response) => {
+  const authReq = req as unknown as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const { newPrimaryContactId, oldPrimaryRef, newPrimaryRef } = req.body || {};
+    if (!newPrimaryContactId) {
+      return res.status(400).json({ message: 'newPrimaryContactId required' });
+    }
+    const refs: { oldPrimary?: ContactRef; newPrimary?: ContactRef } = {};
+    if (oldPrimaryRef?.listId && oldPrimaryRef?.leadId) refs.oldPrimary = oldPrimaryRef;
+    if (newPrimaryRef?.listId && newPrimaryRef?.leadId) refs.newPrimary = newPrimaryRef;
+
+    const deal = await dealDb.rotatePrimary(
+      req.params.dealId,
+      userId,
+      newPrimaryContactId,
+      Object.keys(refs).length > 0 ? refs : undefined
+    );
+    return res.json({ deal });
+  } catch (err) {
+    return handleDealError(res, err);
   }
 });
 

@@ -1,7 +1,11 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb, userDb } from '../services/db';
+import { crmDb } from '../services/db';
+import { askCrm, AskCrmLead } from '../services/askCrmService';
 import { getAccountSummary } from '../services/accountSummaryService';
+import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
+import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
 
 // Register browser cookie persistence tools
@@ -2731,6 +2735,89 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'ask_crm',
+  definition: {
+    name: 'ask_crm',
+    description: 'Answer a free-form question about the CRM (hot leads, at-risk customers, deals closing, paying customers, specific contact). Returns a structured answer with intent classification, a summary line, and a ranked list of relevant leads with citation URLs. Use this when the user asks strategic pipeline questions like "who should I reach out to today", "which deals are about to close", "who is at risk", or "is Jane at Acme paying us". For single-list browsing, prefer get_leads/search_leads.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The free-form question to answer. Examples: "Who should I reach out to today?", "Which deals are close to closing?", "Is Jane at Acme paying us?", "Who are my at-risk customers?"'
+        },
+        limit: {
+          type: 'number',
+          description: 'Max number of leads in the response list (default 10, max 25)'
+        },
+        load_limit: {
+          type: 'number',
+          description: 'Max number of leads to scan across the user\'s lists (default 500). Rarely needed — only raise if the user has tons of lists.'
+        }
+      },
+      required: ['question']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId: string | undefined = context?.userId;
+    if (!userId) {
+      return { error: 'Missing userId context. ask_crm is only available inside an authenticated Emma session.' };
+    }
+
+    const resultLimit = Math.min(Math.max(args.limit ?? 10, 1), 25);
+    const loadLimit = Math.max(args.load_limit ?? 500, 1);
+
+    // Lazy lead iteration across all of the user's lists. We flatten into the
+    // AskCrmLead shape so askCrm doesn't have to know about the underlying
+    // storage layout.
+    const loadLeadsForUser = async (uid: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
+      const lists = (await crmDb.getLeadListsByUserId(uid)) || [];
+      const out: AskCrmLead[] = [];
+      for (const list of lists as any[]) {
+        if (out.length >= opts.limit) break;
+        const remaining = opts.limit - out.length;
+        const page = await crmDb.getLeadsByListId(list.listId, Math.min(remaining, 200));
+        const items: any[] = (page && (page as any).items) || [];
+        for (const it of items) {
+          out.push({
+            leadId: it.leadId,
+            listId: it.listId,
+            email: it.email || null,
+            firstName: it.firstName || null,
+            lastName: it.lastName || null,
+            company: it.company || null,
+            title: it.title || null,
+            status: it.status || null,
+            dealValue: typeof it.dealValue === 'number' ? it.dealValue : null,
+            lifecycle: it.lifecycle || null,
+            heatScore: typeof it.heatScore === 'number' ? it.heatScore : null,
+            healthScore: typeof it.healthScore === 'number' ? it.healthScore : null,
+            isICP: typeof it.isICP === 'boolean' ? it.isICP : null,
+            lastEngagementAt: it.lastEngagementAt || null,
+            openDealStages: Array.isArray(it.openDealStages) ? it.openDealStages : null,
+            contactStatus: it.contactStatus || null,
+          });
+          if (out.length >= opts.limit) break;
+        }
+      }
+      return out;
+    };
+
+    try {
+      const answer = await askCrm(
+        String(args.question || ''),
+        userId,
+        { loadLeadsForUser },
+        { resultLimit, loadLimit }
+      );
+      return answer;
+    } catch (err: any) {
+      return { error: err?.message || 'ask_crm failed' };
+    }
+  }
+});
+
+emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
@@ -5179,6 +5266,98 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
   }
 });
 
+emmaToolRegistry.register({
+  name: 'enrich_lead_custom',
+  definition: {
+    name: 'enrich_lead_custom',
+    description: `Enrich a single CRM lead with custom fields on demand, without needing to kick off a whole-list enrichment job.
+
+Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
+
+Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The tool returns the enriched values directly and also persists them to the lead's customFields in DynamoDB.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID containing the lead.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The specific lead to enrich.'
+        },
+        custom_field_prompts: {
+          type: 'array',
+          description: 'One entry per custom field to populate. Each entry has a field_name (snake_case) and a prompt describing what to find.',
+          items: {
+            type: 'object',
+            properties: {
+              field_name: { type: 'string', description: 'Snake_case custom field name to populate, e.g. "company_size".' },
+              prompt: { type: 'string', description: 'Natural language description of what to find for this field.' },
+              data_type: { type: 'string', enum: ['text', 'number', 'date'], description: 'Expected data type. Defaults to text.' }
+            },
+            required: ['field_name', 'prompt']
+          },
+          minItems: 1
+        },
+        sources: {
+          type: 'array',
+          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
+          description: 'Data sources to use. Defaults to ["web_search", "linkedin"] if omitted.'
+        },
+        force_overwrite: {
+          type: 'boolean',
+          description: 'If true, re-enrich fields that are already populated. Default true (custom enrichment is intentional).'
+        }
+      },
+      required: ['list_id', 'lead_id', 'custom_field_prompts']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    const prompts: Array<{ field_name: string; prompt: string; data_type?: string }> = args.custom_field_prompts || [];
+    if (!Array.isArray(prompts) || prompts.length === 0) {
+      throw new Error('custom_field_prompts must be a non-empty array');
+    }
+
+    const outputFields = prompts.map(p => p.field_name);
+    const instruction = prompts
+      .map(p => {
+        const type = p.data_type && p.data_type !== 'text' ? ` (${p.data_type})` : '';
+        return `- ${p.field_name}${type}: ${p.prompt}`;
+      })
+      .join('\n');
+    const sources = Array.isArray(args.sources) && args.sources.length > 0
+      ? args.sources
+      : ['web_search', 'linkedin'];
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    const result = await service.execute({
+      listId: args.list_id,
+      userId: context.userId,
+      instruction,
+      outputFields,
+      sources,
+      leadIds: [args.lead_id],
+      forceOverwrite: args.force_overwrite !== false,
+    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
+
+    return {
+      leadId: args.lead_id,
+      listId: args.list_id,
+      outputFields,
+      processedCount: result.processedCount,
+      failedCount: result.failedCount,
+      failureBreakdown: result.failureBreakdown,
+      warnings: result.warnings,
+      jobId: result.jobId,
+    };
+  }
+});
+
 // ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
 // These tools wrap REST endpoints via mcpFetch. Rather than duplicating
 // definitions, we re-register them from the MCP server registry.
@@ -5671,6 +5850,352 @@ emmaToolRegistry.register({
       subscriptionType: user.subscriptionType || null,
     };
   }
+});
+
+// ---------------------------------------------------------------------------
+// G2: CRM action tools — assign_lead, promote_to_deal, rotate_primary,
+// get_hot_leads. These complement ask_crm (G1) by giving Emma the ability
+// to actually mutate CRM state instead of just reading it.
+// ---------------------------------------------------------------------------
+
+async function resolveLeadForAction(
+  listId: string,
+  leadId: string,
+  userId: string
+): Promise<{ lead: any; list: any } | { error: string }> {
+  if (!listId || !leadId) return { error: 'list_id and lead_id are required' };
+  const list = await crmDb.getLeadListById(listId);
+  if (!list) return { error: `Lead list ${listId} not found` };
+  if ((list as any).userId && (list as any).userId !== userId) {
+    return { error: 'Not authorized for this lead list' };
+  }
+  const lead = await crmDb.getLeadById(listId, leadId);
+  if (!lead) return { error: `Lead ${leadId} not found in list ${listId}` };
+  return { lead, list };
+}
+
+emmaToolRegistry.register({
+  name: 'assign_lead',
+  definition: {
+    name: 'assign_lead',
+    description: "Assign a lead (contact) to an account owner by setting the lead's accountOwnerUserId. Logs a contact.updated event so the timeline shows the reassignment. Use this when the user says things like 'give that lead to Matt' or 'reassign Acme to me'.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The lead list containing the lead' },
+        lead_id: { type: 'string', description: 'The ID of the lead to reassign' },
+        account_owner_user_id: {
+          type: 'string',
+          description: 'The userId of the new account owner. Pass the same userId as the caller to assign to self.'
+        },
+      },
+      required: ['list_id', 'lead_id', 'account_owner_user_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId: string | undefined = context?.userId || context?.agentUserId;
+    if (!userId) return { error: 'Authentication required' };
+
+    const resolved = await resolveLeadForAction(args.list_id, args.lead_id, userId);
+    if ('error' in resolved) return resolved;
+    const { lead } = resolved;
+
+    const newOwner = String(args.account_owner_user_id || '').trim();
+    if (!newOwner) return { error: 'account_owner_user_id is required' };
+
+    const previousOwner = lead.accountOwnerUserId || null;
+    if (previousOwner === newOwner) {
+      return { success: true, noop: true, leadId: lead.leadId, accountOwnerUserId: newOwner };
+    }
+
+    try {
+      await crmDb.updateLead(args.list_id, args.lead_id, { accountOwnerUserId: newOwner });
+    } catch (err: any) {
+      return { error: err?.message || 'Failed to update lead' };
+    }
+
+    // Best-effort event logging — never fail the assignment on log errors.
+    try {
+      const contactKey = lead.email ? normalizeContactId(lead.email) : `nocontact:${lead.leadId}`;
+      await contactEventsDb.logEvent({
+        contactId: contactKey,
+        source: 'emma_session',
+        eventType: 'contact.updated',
+        sourceRecordId: `assign_lead:${lead.leadId}:${Date.now()}`,
+        payload: {
+          action: 'assign_lead',
+          previousAccountOwnerUserId: previousOwner,
+          accountOwnerUserId: newOwner,
+          leadId: lead.leadId,
+          listId: args.list_id,
+          actorUserId: userId,
+        },
+      });
+    } catch (err: any) {
+      console.error('[assign_lead] event log failed', err?.message || err);
+    }
+
+    return {
+      success: true,
+      leadId: lead.leadId,
+      accountOwnerUserId: newOwner,
+      previousAccountOwnerUserId: previousOwner,
+    };
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'promote_to_deal',
+  definition: {
+    name: 'promote_to_deal',
+    description: "Promote one or more leads (contacts) into a new Deal in the AW-Deals table. The first lead in `lead_ids` becomes the primary contact unless `primary_lead_id` is passed. Returns the created deal. Use this when the user says 'turn Acme into a deal', 'create a deal for these contacts', or similar.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The lead list that contains the leads being promoted' },
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'The leadIds to add to the new deal. Must be non-empty.',
+        },
+        primary_lead_id: { type: 'string', description: 'Optional — which leadId is the primary contact. Defaults to the first entry in lead_ids.' },
+        deal_name: { type: 'string', description: 'Optional deal name / label (stored in notes for now).' },
+        deal_value: { type: 'number', description: 'Optional dollar value of the deal' },
+        expected_close: { type: 'string', description: 'Optional expected close date (ISO 8601 or YYYY-MM-DD)' },
+        stage: {
+          type: 'string',
+          enum: [...DEAL_STAGES],
+          description: "Optional initial stage. Defaults to 'Lead'.",
+        },
+      },
+      required: ['list_id', 'lead_ids'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId: string | undefined = context?.userId || context?.agentUserId;
+    if (!userId) return { error: 'Authentication required' };
+
+    const listId: string = String(args.list_id || '').trim();
+    const leadIds: string[] = Array.isArray(args.lead_ids) ? args.lead_ids.filter(Boolean) : [];
+    if (!listId) return { error: 'list_id is required' };
+    if (leadIds.length === 0) return { error: 'lead_ids must be a non-empty array' };
+
+    // Validate leads exist + ownership, and collect company domains.
+    const refs: { listId: string; leadId: string }[] = [];
+    let companyDomain: string | undefined;
+    for (const leadId of leadIds) {
+      const resolved = await resolveLeadForAction(listId, leadId, userId);
+      if ('error' in resolved) return resolved;
+      refs.push({ listId, leadId });
+      if (!companyDomain) {
+        const raw = resolved.lead.email || '';
+        const at = raw.indexOf('@');
+        if (at > -1) companyDomain = raw.slice(at + 1).toLowerCase();
+      }
+    }
+
+    const primary = args.primary_lead_id && leadIds.includes(args.primary_lead_id)
+      ? args.primary_lead_id
+      : leadIds[0];
+
+    const stage: DealStage | undefined = args.stage;
+    if (stage && !DEAL_STAGES.includes(stage)) {
+      return { error: `Invalid stage '${stage}'. Must be one of ${DEAL_STAGES.join(', ')}` };
+    }
+
+    try {
+      const notes = args.deal_name ? `name: ${String(args.deal_name).slice(0, 200)}` : undefined;
+      const deal = await dealDb.promoteContactsToDeal(refs, {
+        ownerUserId: userId,
+        primaryContactId: primary,
+        ...(companyDomain ? { companyDomain } : {}),
+        ...(typeof args.deal_value === 'number' ? { dealValue: args.deal_value } : {}),
+        ...(args.expected_close ? { expectedClose: String(args.expected_close) } : {}),
+        ...(stage ? { stage } : {}),
+        ...(notes ? { notes } : {}),
+        source: 'emma_session',
+      } as any);
+
+      try {
+        await contactEventsDb.logEvent({
+          contactId: `deal:${deal.dealId}`,
+          source: 'emma_session',
+          eventType: 'deal.created',
+          sourceRecordId: `promote_to_deal:${deal.dealId}`,
+          dealId: deal.dealId,
+          payload: {
+            action: 'promote_to_deal',
+            leadIds,
+            primaryContactId: primary,
+            dealName: args.deal_name || null,
+            dealValue: typeof args.deal_value === 'number' ? args.deal_value : null,
+            stage: deal.stage,
+            actorUserId: userId,
+          },
+        });
+      } catch (err: any) {
+        console.error('[promote_to_deal] event log failed', err?.message || err);
+      }
+
+      return { success: true, deal };
+    } catch (err: any) {
+      return { error: err?.message || 'promote_to_deal failed' };
+    }
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'rotate_primary',
+  definition: {
+    name: 'rotate_primary',
+    description: "Change the primary contact on an existing deal. The new primary must already be a contact on the deal OR a valid lead the caller owns; the tool adds them to the deal's contactIds if needed. Use this when the user says 'the main contact on Acme changed to Jane' or 'make Pat the primary on that deal'.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'The dealId to update' },
+        new_primary_contact_id: { type: 'string', description: 'The leadId of the new primary contact' },
+        list_id: { type: 'string', description: 'Optional — the lead list containing the new primary contact, used to mirror the isPrimary flag onto the lead row.' },
+        old_primary_list_id: { type: 'string', description: 'Optional — the lead list containing the OLD primary contact, used to clear its isPrimary flag.' },
+      },
+      required: ['deal_id', 'new_primary_contact_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId: string | undefined = context?.userId || context?.agentUserId;
+    if (!userId) return { error: 'Authentication required' };
+
+    const dealId = String(args.deal_id || '').trim();
+    const newPrimary = String(args.new_primary_contact_id || '').trim();
+    if (!dealId) return { error: 'deal_id is required' };
+    if (!newPrimary) return { error: 'new_primary_contact_id is required' };
+
+    try {
+      const existing = await dealDb.getDeal(dealId);
+      if (!existing) return { error: `Deal ${dealId} not found` };
+
+      const refs: any = {};
+      if (args.old_primary_list_id && existing.primaryContactId) {
+        refs.oldPrimary = { listId: args.old_primary_list_id, leadId: existing.primaryContactId };
+      }
+      if (args.list_id) {
+        refs.newPrimary = { listId: args.list_id, leadId: newPrimary };
+      }
+
+      const updated = await dealDb.rotatePrimary(dealId, userId, newPrimary, refs);
+
+      try {
+        await contactEventsDb.logEvent({
+          contactId: `deal:${dealId}`,
+          source: 'emma_session',
+          eventType: 'deal.primary_rotated',
+          sourceRecordId: `rotate_primary:${dealId}:${Date.now()}`,
+          dealId,
+          payload: {
+            action: 'rotate_primary',
+            previousPrimaryContactId: existing.primaryContactId,
+            newPrimaryContactId: newPrimary,
+            actorUserId: userId,
+          },
+        });
+      } catch (err: any) {
+        console.error('[rotate_primary] event log failed', err?.message || err);
+      }
+
+      return { success: true, deal: updated };
+    } catch (err: any) {
+      if (err instanceof DealAuthError) return { error: 'Not authorized for this deal' };
+      if (err instanceof DealNotFoundError) return { error: `Deal ${dealId} not found` };
+      return { error: err?.message || 'rotate_primary failed' };
+    }
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'get_hot_leads',
+  definition: {
+    name: 'get_hot_leads',
+    description: "Return the user's highest-scoring leads across all their lists, ranked by heatScore (0-100). Optional filters for lifecycle stage, minimum heat score, and account-owner scope. Use this when the user asks 'who are my hottest leads', 'top prospects today', 'show me my MQLs with heat > 70'.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        lifecycle: {
+          type: 'string',
+          description: "Optional lifecycle filter (e.g. 'Lead', 'MQL', 'SQL', 'Customer'). Matches the lead's lifecycle field exactly.",
+        },
+        min_heat_score: {
+          type: 'number',
+          description: 'Optional minimum heatScore (0-100). Leads below this score are filtered out. Defaults to 0.',
+        },
+        owner_filter: {
+          type: 'string',
+          description: "Optional accountOwnerUserId filter. Pass a userId to only return leads owned by that user, or 'me' to filter to the caller.",
+        },
+        limit: {
+          type: 'number',
+          description: 'Max number of leads to return (default 20, max 100).',
+        },
+      },
+      required: [],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId: string | undefined = context?.userId || context?.agentUserId;
+    if (!userId) return { error: 'Authentication required' };
+
+    const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
+    const minHeat = typeof args.min_heat_score === 'number' ? args.min_heat_score : 0;
+    const lifecycleFilter = args.lifecycle ? String(args.lifecycle) : null;
+    let ownerFilter: string | null = null;
+    if (args.owner_filter) {
+      ownerFilter = args.owner_filter === 'me' ? userId : String(args.owner_filter);
+    }
+
+    // Scan caller's lists and collect candidates. Ranking by heatScore desc.
+    let lists: any[] = [];
+    try {
+      lists = (await crmDb.getLeadListsByUserId(userId)) || [];
+    } catch (err: any) {
+      return { error: err?.message || 'Failed to load lead lists' };
+    }
+
+    const candidates: any[] = [];
+    const scanCap = 500; // cap total leads we scan so this stays cheap
+    let scanned = 0;
+    for (const list of lists) {
+      if (scanned >= scanCap) break;
+      const page = await crmDb.getLeadsByListId((list as any).listId, Math.min(200, scanCap - scanned));
+      const items: any[] = (page && (page as any).items) || [];
+      scanned += items.length;
+      for (const it of items) {
+        const heat = typeof it.heatScore === 'number' ? it.heatScore : 0;
+        if (heat < minHeat) continue;
+        if (lifecycleFilter && it.lifecycle !== lifecycleFilter) continue;
+        if (ownerFilter && it.accountOwnerUserId !== ownerFilter) continue;
+        candidates.push({
+          leadId: it.leadId,
+          listId: it.listId,
+          listName: (list as any).name || null,
+          email: it.email || null,
+          firstName: it.firstName || null,
+          lastName: it.lastName || null,
+          company: it.company || null,
+          title: it.title || null,
+          heatScore: heat,
+          lifecycle: it.lifecycle || null,
+          accountOwnerUserId: it.accountOwnerUserId || null,
+          lastEngagementAt: it.lastEngagementAt || null,
+        });
+      }
+    }
+
+    candidates.sort((a, b) => (b.heatScore || 0) - (a.heatScore || 0));
+    return {
+      leads: candidates.slice(0, limit),
+      count: Math.min(candidates.length, limit),
+      scanned,
+      filters: { lifecycle: lifecycleFilter, minHeatScore: minHeat, ownerFilter },
+    };
+  },
 });
 
 emmaToolRegistry.register({
