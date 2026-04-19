@@ -273,7 +273,7 @@ async function openGeminiSession(
       onmessage: (message: LiveServerMessage) => {
         console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
         handleIncomingMessage(sessionId, message).catch((err) => {
-          console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message);
+          console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message, err?.stack?.split('\n').slice(0, 5).join(' | '));
         });
       },
       onerror: (e: ErrorEvent) => {
@@ -613,6 +613,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
           // Extract artifacts (URLs, images, files) from tool results for UI display
           if (typeof result === 'object' && result !== null) {
+            if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
             const r = result as Record<string, unknown>;
             // Social post preview page (create_social_media_posts)
             if (typeof r.htmlUrl === 'string' && r.htmlUrl.startsWith('http')) {
@@ -654,8 +655,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
-    // Capture artifacts before reset
-    const artifacts = entry.pendingArtifacts.length > 0 ? [...entry.pendingArtifacts] : undefined;
+    // Capture artifacts before reset (guard against undefined in case of entry shape mismatch)
+    const rawArtifacts: LiveArtifact[] = entry.pendingArtifacts ?? [];
+    const artifacts = rawArtifacts.length > 0 ? [...rawArtifacts] : undefined;
 
     // Reset for next turn before async work
     entry.currentTurnText = '';
@@ -675,13 +677,13 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     // Fire-and-forget save — never blocks the audio stream
     if (assistantContent) {
-      const messagesToSave = [];
+      const messagesToSave: Array<{ role: 'user' | 'assistant'; content: string }> = [];
       // Skip saving user turns that are STT noise from background audio — persisting
       // them corrupts the context window and causes repetitive/fragmented responses.
       if (userText && !isNoiseTurn(userText)) {
-        messagesToSave.push({ role: 'user' as const, content: userText });
+        messagesToSave.push({ role: 'user', content: userText });
       }
-      messagesToSave.push({ role: 'assistant' as const, content: assistantContent });
+      messagesToSave.push({ role: 'assistant', content: assistantContent });
 
       chatbotDb.addMessagesToSession(sessionId, messagesToSave).catch((err) => {
         console.warn(`[liveVoiceService] Failed to save transcript for session ${sessionId}:`, err?.message);
