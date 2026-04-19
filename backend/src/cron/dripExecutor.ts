@@ -111,16 +111,20 @@ function defaultDeps(): ExecutorDeps {
       await getDripSendsDb().record(args);
     },
     sendEmail: async ({ to, subject, html }) => {
-      // emailService.sendEmail swallows errors internally; we re-wrap so the
-      // executor still has a chance to record a failed send if something
-      // leaks through. Text body = stripped HTML (minimal — mail client
-      // fallback, not a replacement for a real text template).
+      // Use `sendEmailStrict` — it throws on transporter failure and returns
+      // the real provider messageId. The non-strict `emailService.sendEmail`
+      // swallows errors and returns void, which would let the executor record
+      // status='sent' for an email that never left the box. For an audited,
+      // compliance-adjacent send path like drip, ground truth matters.
+      // Text body = stripped HTML (minimal — mail client fallback).
       const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-      await emailService.sendEmail(to, subject, text, html);
-      // emailService doesn't return a message id; synthesise one so the audit
-      // row has a handle for support lookups. Prefixed with `drip-` so
-      // operators can grep the logs.
-      return { messageId: `drip-${Date.now()}-${Math.random().toString(36).slice(2, 10)}` };
+      const { messageId } = await emailService.sendEmailStrict(
+        to,
+        subject,
+        text,
+        html,
+      );
+      return { messageId };
     },
     now: () => new Date(),
     env: process.env as any,
@@ -256,13 +260,38 @@ function cadenceWindowMs(c: DripCampaign): number {
 }
 
 /**
+ * Module-level in-flight guard.
+ *
+ * If one tick runs longer than DRIP_INTERVAL_MS (15 min) — slow scans over a
+ * large audit table, DynamoDB throttling, provider back-pressure — the next
+ * `setInterval` callback fires while the previous one is still running. Two
+ * concurrent ticks can both pass the same user's maxSends / cadence gate and
+ * then both record a send, because the idempotency guarantee of the safety
+ * gates assumes serialized execution.
+ *
+ * This guard serializes ticks at the process level: if a tick is already in
+ * flight when `runDripExecutor` is invoked, log and return a no-op summary.
+ * Tests with `{ skipInFlightGuard: true }` for direct invocation without
+ * touching global state.
+ */
+let tickInFlight = false;
+export function _resetInFlightGuardForTests(): void {
+  tickInFlight = false;
+}
+
+/**
  * Main entry — runs one executor tick. Returns a summary that the caller
  * (cron setInterval callback) can log.
  */
 export async function runDripExecutor(
-  overrideDeps?: Partial<ExecutorDeps>,
+  overrideDeps?: Partial<ExecutorDeps> & { skipInFlightGuard?: boolean },
 ): Promise<ExecutorRunSummary> {
-  const deps: ExecutorDeps = { ...defaultDeps(), ...overrideDeps };
+  const skipInFlightGuard = overrideDeps?.skipInFlightGuard === true;
+  // Strip the flag before merging — it's not part of ExecutorDeps.
+  const { skipInFlightGuard: _ignored, ...depOverrides } =
+    overrideDeps ?? ({} as Partial<ExecutorDeps> & { skipInFlightGuard?: boolean });
+  void _ignored;
+  const deps: ExecutorDeps = { ...defaultDeps(), ...depOverrides };
   const now = deps.now();
   const summary: ExecutorRunSummary = {
     campaignsConsidered: 0,
@@ -281,6 +310,33 @@ export async function runDripExecutor(
     summary.skippedReasons[reason] = (summary.skippedReasons[reason] ?? 0) + 1;
   };
 
+  // In-flight guard — serialize ticks at the process level.
+  if (!skipInFlightGuard) {
+    if (tickInFlight) {
+      console.log(
+        "[DripExecutor] Previous tick still in flight. Skipping this tick.",
+      );
+      bump("tick_in_flight");
+      return summary;
+    }
+    tickInFlight = true;
+  }
+
+  try {
+    return await _runDripExecutorBody(deps, now, summary, bump);
+  } finally {
+    if (!skipInFlightGuard) {
+      tickInFlight = false;
+    }
+  }
+}
+
+async function _runDripExecutorBody(
+  deps: ExecutorDeps,
+  now: Date,
+  summary: ExecutorRunSummary,
+  bump: (reason: string) => void,
+): Promise<ExecutorRunSummary> {
   // Gate 1: global kill switch.
   if (!isGloballyEnabled(deps.env)) {
     console.log(

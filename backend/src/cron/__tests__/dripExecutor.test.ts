@@ -15,6 +15,7 @@ import {
   buildMergeFields,
   DEFAULT_MAX_PER_HOUR,
   ExecutorDeps,
+  _resetInFlightGuardForTests,
 } from "../dripExecutor";
 import { DripCampaign } from "../../services/dripCampaignDb";
 import { User } from "../../services/db";
@@ -504,5 +505,177 @@ describe("runDripExecutor — no-ops", () => {
     expect(result.campaignsConsidered).toBe(0);
     expect(result.emailsSent).toBe(0);
     expect(deps.listAllUsers).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Senior Reviewer must-fixes / concerns (PR #1219) ──────────────────────
+
+describe("runDripExecutor — in-flight guard (Concern A)", () => {
+  beforeEach(() => {
+    _resetInFlightGuardForTests();
+  });
+
+  it("skips re-entrant invocations while a previous tick is running", async () => {
+    // First tick's listActiveCampaigns hangs on a promise we control so we
+    // can fire the second tick mid-flight.
+    let release: () => void = () => {};
+    const firstTickHangs = new Promise<DripCampaign[]>((resolve) => {
+      release = () => resolve([]);
+    });
+
+    const depsA = makeDeps({
+      listActiveCampaigns: jest.fn(() => firstTickHangs),
+      listAllUsers: jest.fn(async () => [makeUser()]),
+    });
+    const depsB = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => [makeUser()]),
+    });
+
+    const firstPromise = runDripExecutor(depsA);
+    // Second tick invoked while first is still awaiting listActiveCampaigns.
+    const secondResult = await runDripExecutor(depsB);
+
+    // Second tick short-circuits: never touches its own listActiveCampaigns.
+    expect(depsB.listActiveCampaigns).not.toHaveBeenCalled();
+    expect(secondResult.skippedReasons.tick_in_flight).toBe(1);
+    expect(secondResult.emailsSent).toBe(0);
+    expect(secondResult.dryRuns).toBe(0);
+
+    // Unblock the first tick and let it complete cleanly.
+    release();
+    await firstPromise;
+  });
+
+  it("releases the guard after the tick completes, allowing a subsequent run", async () => {
+    const depsFirst = makeDeps({
+      listActiveCampaigns: jest.fn(async () => []),
+    });
+    await runDripExecutor(depsFirst);
+
+    const depsSecond = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => [makeUser()]),
+    });
+    const result = await runDripExecutor(depsSecond);
+    // Second tick fully runs (real-send per makeDeps default env)
+    expect(depsSecond.listActiveCampaigns).toHaveBeenCalled();
+    expect(result.emailsSent).toBe(1);
+    expect(result.skippedReasons.tick_in_flight).toBeUndefined();
+  });
+
+  it("releases the guard even when the tick throws unexpectedly", async () => {
+    const depsBroken = makeDeps({
+      // Throw inside the tick to prove the `finally` resets the guard.
+      listActiveCampaigns: jest.fn(async () => {
+        throw new Error("DynamoDB outage");
+      }),
+    });
+    await expect(runDripExecutor(depsBroken)).rejects.toThrow(
+      "DynamoDB outage",
+    );
+
+    // Subsequent tick should not be blocked by a leaked in-flight=true.
+    const depsRecovered = makeDeps({
+      listActiveCampaigns: jest.fn(async () => []),
+    });
+    const result = await runDripExecutor(depsRecovered);
+    expect(result.skippedReasons.tick_in_flight).toBeUndefined();
+    expect(depsRecovered.listActiveCampaigns).toHaveBeenCalled();
+  });
+});
+
+describe("runDripExecutor — real-send audit fidelity (Concern B)", () => {
+  beforeEach(() => {
+    _resetInFlightGuardForTests();
+  });
+
+  it("records status='sent' with the REAL messageId, not a synthesized one", async () => {
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => [makeUser()]),
+      sendEmail: jest.fn(async () => ({ messageId: "real-provider-id-42" })),
+    });
+    const result = await runDripExecutor(deps);
+    expect(result.emailsSent).toBe(1);
+    const recorded = (deps.recordSend as jest.Mock).mock.calls[0][0];
+    expect(recorded.status).toBe("sent");
+    expect(recorded.messageId).toBe("real-provider-id-42");
+    // Must NOT match the old `drip-${ts}-${rand}` synthesized shape.
+    expect(recorded.messageId).not.toMatch(/^drip-\d+-[a-z0-9]+$/);
+  });
+
+  it("records status='failed' (not 'sent') when the underlying sender throws", async () => {
+    // This is the defense against the old "emailService.sendEmail silently
+    // swallows + we synthesize a fake messageId" bug. The default sendEmail
+    // wrapper now uses emailService.sendEmailStrict, which throws on failure.
+    // We simulate that at the DI layer — the executor contract is "throw or
+    // return a real messageId" and the audit must reflect failure.
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => [makeUser()]),
+      sendEmail: jest.fn(async () => {
+        throw new Error("SMTP: connection refused");
+      }),
+    });
+    const result = await runDripExecutor(deps);
+    expect(result.emailsSent).toBe(0);
+    expect(result.emailsFailed).toBe(1);
+    const recorded = (deps.recordSend as jest.Mock).mock.calls[0][0];
+    expect(recorded.status).toBe("failed");
+    expect(recorded.messageId).toBeNull();
+    expect(recorded.error).toContain("SMTP: connection refused");
+  });
+});
+
+describe("runDripExecutor — cheap-first gate ordering (Must-fix #2 verification)", () => {
+  beforeEach(() => {
+    _resetInFlightGuardForTests();
+  });
+
+  it("skips unsubscribed users WITHOUT calling scan-based checks", async () => {
+    const user = makeUser({ dripUnsubscribed: true } as any);
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => [user]),
+    });
+    await runDripExecutor(deps);
+    expect(deps.countSendsForUserCampaign).not.toHaveBeenCalled();
+    expect(deps.getMostRecentSendAt).not.toHaveBeenCalled();
+  });
+
+  it("skips no-email users WITHOUT calling scan-based checks", async () => {
+    const user = makeUser({ email: "" });
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => [user]),
+    });
+    await runDripExecutor(deps);
+    expect(deps.countSendsForUserCampaign).not.toHaveBeenCalled();
+    expect(deps.getMostRecentSendAt).not.toHaveBeenCalled();
+  });
+
+  it("stops calling scan-based checks once in-loop rate-cap is exhausted", async () => {
+    const users = Array.from({ length: 10 }, (_, i) =>
+      makeUser({ userId: `u-${i}`, email: `u${i}@example.com` }),
+    );
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listAllUsers: jest.fn(async () => users),
+      // already sent 48/50 — only 2 sends available
+      countSendsInWindow: jest.fn(async () => 48),
+      env: { DRIP_CAMPAIGNS_ENABLED: "true", DRIP_DRY_RUN: "false" },
+    });
+    const result = await runDripExecutor(deps);
+    expect(result.emailsSent).toBe(2);
+    // After 2 sends, remainingInWindow hits 0 and remaining 8 candidates skip
+    // before hitting the scan-based gates. So scan is called at most once per
+    // sent user (2 times), never 10.
+    expect(
+      (deps.countSendsForUserCampaign as jest.Mock).mock.calls.length,
+    ).toBeLessThanOrEqual(2);
+    expect(
+      (deps.getMostRecentSendAt as jest.Mock).mock.calls.length,
+    ).toBeLessThanOrEqual(2);
   });
 });

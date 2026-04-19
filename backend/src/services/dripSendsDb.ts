@@ -21,13 +21,22 @@
  *   error:      string — only populated when status='failed'
  *   dryRun:     boolean — true when the send was simulated (no real email)
  *
- * GSIs:
- *   CampaignIndex: campaignId (PK), sentAt (SK) — for rate-limit queries
- *   UserCampaignIndex: `${userId}#${campaignId}` (PK), sentAt (SK) —
- *       for maxSends + cadence lookups
+ * Query pattern (current, Phase 4):
+ *   All reads (`countSendsForUserCampaign`, `getMostRecentSendAt`,
+ *   `countSendsInWindow`, `listForCampaign`) use `docClient.scan` with
+ *   `FilterExpression`. Scan cost is proportional to total table size, not the
+ *   filtered subset — this is OK for dry-run + early low-volume real sends but
+ *   will not scale. Before enabling real sends at production volume, add:
+ *     CampaignIndex:      campaignId (PK), sentAt (SK) — rate-limit queries
+ *     UserCampaignIndex:  `${userId}#${campaignId}` (PK), sentAt (SK) —
+ *                         maxSends + cadence lookups
+ *   …and switch the four read paths above to `query` on the corresponding
+ *   index. Tracked as a Phase-5 task before `DRIP_DRY_RUN=false` + real
+ *   volume. Shipping as scan keeps Phase 4 isolated.
  *
- * Table auto-provisions with `Dev-` prefix in non-prod (matches the rest of
- * the codebase). See reference at AW-DripCampaigns in dripCampaignDb.ts.
+ * Table is pre-provisioned in `us-west-2` as `Dev-AW-DripSends` (prod:
+ * `AW-DripSends`). No auto-create — see dripCampaignDb.ts for the same
+ * pattern.
  */
 
 import AWS from "aws-sdk";
