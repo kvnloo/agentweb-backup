@@ -50,6 +50,13 @@ Example: "[warm] Great question! [thoughtful] Your ad spend is trending up — [
 /** Callback used to push events back to the browser via Socket.IO */
 type EmitFn = (event: string, data: unknown) => void;
 
+/** A structured artifact surfaced from a tool result (URL, image, or file) */
+export interface LiveArtifact {
+  type: 'url' | 'image' | 'file';
+  label: string;
+  url: string;
+}
+
 interface LiveEntry {
   session: Session;
   socketId: string;
@@ -61,8 +68,8 @@ interface LiveEntry {
   pendingUserText: string;
   /** Tool call results for the current turn — saved to DynamoDB but NOT shown in chat UI */
   toolContextText: string;
-  /** Actionable links extracted from tool results this turn (e.g. LinkedIn post URL) */
-  pendingLinks: Array<{ label: string; url: string }>;
+  /** Structured artifacts extracted from tool results this turn */
+  pendingArtifacts: LiveArtifact[];
   /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
   resumptionHandle?: string;
   /** Cached function declarations so reconnects reuse the same tool config without reloading */
@@ -400,7 +407,7 @@ export async function startLiveSession(
     currentTurnText: '',
     pendingUserText: '',
     toolContextText: '',
-    pendingLinks: [],
+    pendingArtifacts: [],
     functionDeclarations,
   };
   activeSessions.set(sessionId, entry);
@@ -604,16 +611,27 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
           entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
-          // Extract actionable links so the UI can render them as clickable links
+          // Extract artifacts (URLs, images, files) from tool results for UI display
           if (typeof result === 'object' && result !== null) {
             const r = result as Record<string, unknown>;
-            // create_social_media_posts returns htmlUrl (S3 page with post content to copy)
+            // Social post preview page (create_social_media_posts)
             if (typeof r.htmlUrl === 'string' && r.htmlUrl.startsWith('http')) {
-              entry.pendingLinks.push({ label: 'View posts', url: r.htmlUrl });
+              entry.pendingArtifacts.push({ type: 'url', label: 'View posts', url: r.htmlUrl });
             }
-            // post_on_connected_account (direct LinkedIn publish) returns post_url
+            // Direct LinkedIn/social publish (post_on_connected_account)
             if (typeof r.post_url === 'string' && r.post_url.startsWith('http')) {
-              entry.pendingLinks.push({ label: 'View post', url: r.post_url });
+              entry.pendingArtifacts.push({ type: 'url', label: 'View post', url: r.post_url });
+            }
+            // Generated image (generate_image, generate_video_thumbnail, etc.)
+            if (typeof r.imageUrl === 'string' && r.imageUrl.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'image', label: 'Generated image', url: r.imageUrl });
+            }
+            // S3-hosted file or report (download_file, export tools, etc.)
+            if (typeof r.s3_url === 'string' && r.s3_url.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'file', label: 'Download file', url: r.s3_url });
+            }
+            if (typeof r.file_url === 'string' && r.file_url.startsWith('http')) {
+              entry.pendingArtifacts.push({ type: 'file', label: 'Download file', url: r.file_url });
             }
           }
         } catch (err: any) {
@@ -636,24 +654,24 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     console.log(`[liveVoiceService] turnComplete for ${sessionId}: assistantText="${assistantText.slice(0, 100)}", userText="${userText.slice(0, 100)}"`);
 
-    // Capture links before reset
-    const links = entry.pendingLinks.length > 0 ? [...entry.pendingLinks] : undefined;
+    // Capture artifacts before reset
+    const artifacts = entry.pendingArtifacts.length > 0 ? [...entry.pendingArtifacts] : undefined;
 
     // Reset for next turn before async work
     entry.currentTurnText = '';
     entry.pendingUserText = '';
     entry.toolContextText = '';
-    entry.pendingLinks = [];
+    entry.pendingArtifacts = [];
 
-    // Append link markdown to the assistant message so it persists in DynamoDB
+    // Append artifact markdown to the assistant message so it persists in DynamoDB
     // and survives any subsequent session reload — no client-side re-apply needed.
-    const linkSuffix = links && links.length > 0
-      ? '\n\n' + links.map(l => `[${l.label}](${l.url})`).join('\n')
+    const artifactSuffix = artifacts && artifacts.length > 0
+      ? '\n\n' + artifacts.map(a => a.type === 'image' ? `![${a.label}](${a.url})` : `[${a.label}](${a.url})`).join('\n')
       : '';
-    const assistantContent = assistantText + linkSuffix;
+    const assistantContent = assistantText + artifactSuffix;
 
-    // Emit turn-complete with the full content (transcript + links)
-    emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, links });
+    // Emit turn-complete with full content and structured artifacts for rich UI rendering
+    emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, artifacts });
 
     // Fire-and-forget save — never blocks the audio stream
     if (assistantContent) {
