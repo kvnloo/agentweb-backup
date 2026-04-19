@@ -1,5 +1,11 @@
 /**
- * Unit tests for the Lifecycle Drip Phase 4 executor.
+ * Unit tests for the drip executor (Phase A: multi-tenant, CRM-scoped).
+ *
+ * Phase A moves segmentation from AW-Users to AW-Leads. Campaigns target
+ * each tenant's own CRM leads, not onboarding users. This test file pins
+ * that new contract: `listLeadsForCampaign` DI instead of `listAllUsers`,
+ * lead fields for merge rendering, lead `contactStatus` as unsubscribe
+ * signal, and lead-keyed (listId:leadId) dripSends history.
  *
  * Uses full dependency injection (see `ExecutorDeps`) so no real DynamoDB,
  * no real email provider, and no real time are involved. All safety gates
@@ -11,48 +17,51 @@ import {
   isGloballyEnabled,
   isDryRun,
   getMaxPerHour,
-  userMatchesSegment,
+  leadMatchesSegment,
   buildMergeFields,
   DEFAULT_MAX_PER_HOUR,
   ExecutorDeps,
+  DripLead,
   _resetInFlightGuardForTests,
 } from "../dripExecutor";
 import { DripCampaign } from "../../services/dripCampaignDb";
-import { User } from "../../services/db";
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
 
 function makeCampaign(overrides: Partial<DripCampaign> = {}): DripCampaign {
   return {
     campaignId: "camp-1",
-    name: "Brand skip drip",
-    segmentQuery: { stage: "brand_skipped" },
-    templateHtml: "<p>Hey {{firstName}}, Emma awaits at {{companyName}}.</p>",
+    userId: "tenant-1",
+    name: "Trialing nudge",
+    segmentQuery: { lifecycle: "trialing" },
+    templateHtml:
+      "<p>Hey {{firstName}}, your trial at {{companyName}} is waiting.</p>",
     subjectLine: "Hi {{firstName}}",
     cadenceUnit: "days",
     cadenceValue: 7,
     maxSends: 3,
     isActive: true,
     killSwitch: false,
-    createdBy: "admin-1",
+    createdBy: "tenant-1",
     createdAt: "2026-04-01T00:00:00Z",
     updatedAt: "2026-04-01T00:00:00Z",
     ...overrides,
   };
 }
 
-function makeUser(overrides: Partial<User> = {}): User {
+function makeLead(overrides: Partial<DripLead> = {}): DripLead {
   return {
-    userId: "u-1",
+    listId: "list-A",
+    leadId: "lead-1",
+    userId: "tenant-1",
     email: "bob@example.com",
-    password: "x",
-    isOAuthUser: false,
-    isAdmin: false,
-    isActive: true,
-    createdAt: "2026-04-01T00:00:00Z",
-    displayName: "Bob Smith",
-    lastActiveAt: "2026-04-02T00:00:00Z",
-    onboardingStage: "brand_skipped",
+    firstName: "Bob",
+    lastName: "Smith",
+    company: "Acme Co",
+    lifecycle: "trialing",
+    heatScore: 80,
+    utmSource: "linkedin",
+    contactStatus: "active",
     ...overrides,
   };
 }
@@ -60,7 +69,7 @@ function makeUser(overrides: Partial<User> = {}): User {
 function makeDeps(over: Partial<ExecutorDeps> = {}): ExecutorDeps {
   return {
     listActiveCampaigns: jest.fn(async () => []),
-    listAllUsers: jest.fn(async () => []),
+    listLeadsForCampaign: jest.fn(async () => []),
     countSendsForUserCampaign: jest.fn(async () => 0),
     getMostRecentSendAt: jest.fn(async () => null),
     countSendsInWindow: jest.fn(async () => 0),
@@ -128,112 +137,123 @@ describe("getMaxPerHour", () => {
   });
 });
 
-describe("userMatchesSegment", () => {
-  it("returns true when stage + goal match", () => {
-    const user = makeUser({
-      onboardingStage: "brand_skipped",
-      onboardingEvents: [
-        { event: "goal_selected", ts: "2026-04-01", data: { goal: "paid_ads" } },
-      ] as any,
-    });
+describe("leadMatchesSegment", () => {
+  it("returns true when no segment criteria are set (empty segmentQuery matches everything)", () => {
+    const lead = makeLead();
+    const campaign = makeCampaign({ segmentQuery: {} });
+    expect(leadMatchesSegment(lead, campaign)).toBe(true);
+  });
+
+  it("matches on lifecycle when equal", () => {
+    const lead = makeLead({ lifecycle: "paying" });
     const campaign = makeCampaign({
-      segmentQuery: { stage: "brand_skipped", goal: "paid_ads" },
+      segmentQuery: { lifecycle: "paying" },
     });
-    expect(userMatchesSegment(user, campaign)).toBe(true);
+    expect(leadMatchesSegment(lead, campaign)).toBe(true);
   });
 
-  it("returns false when stage differs", () => {
-    const user = makeUser({ onboardingStage: "active" });
-    const campaign = makeCampaign({ segmentQuery: { stage: "brand_skipped" } });
-    expect(userMatchesSegment(user, campaign)).toBe(false);
+  it("rejects when lifecycle differs", () => {
+    const lead = makeLead({ lifecycle: "churned" });
+    const campaign = makeCampaign({
+      segmentQuery: { lifecycle: "paying" },
+    });
+    expect(leadMatchesSegment(lead, campaign)).toBe(false);
   });
 
-  it("excludes users with no lastActiveAt when lastActivityBefore is set", () => {
-    const user = makeUser({ lastActiveAt: undefined });
+  it("enforces minHeatScore floor", () => {
+    const cold = makeLead({ heatScore: 20 });
+    const hot = makeLead({ heatScore: 90 });
+    const campaign = makeCampaign({
+      segmentQuery: { minHeatScore: 50 },
+    });
+    expect(leadMatchesSegment(cold, campaign)).toBe(false);
+    expect(leadMatchesSegment(hot, campaign)).toBe(true);
+  });
+
+  it("treats missing heatScore as zero for minHeatScore purposes", () => {
+    const unscored = makeLead({ heatScore: undefined });
+    const campaign = makeCampaign({
+      segmentQuery: { minHeatScore: 1 },
+    });
+    expect(leadMatchesSegment(unscored, campaign)).toBe(false);
+  });
+
+  it("matches utmSource exactly", () => {
+    const ok = makeLead({ utmSource: "linkedin" });
+    const bad = makeLead({ utmSource: "google" });
+    const campaign = makeCampaign({
+      segmentQuery: { utmSource: "linkedin" },
+    });
+    expect(leadMatchesSegment(ok, campaign)).toBe(true);
+    expect(leadMatchesSegment(bad, campaign)).toBe(false);
+  });
+
+  it("enforces leadListId as defense-in-depth", () => {
+    const inList = makeLead({ listId: "list-A" });
+    const outOfList = makeLead({ listId: "list-B" });
+    const campaign = makeCampaign({
+      segmentQuery: { leadListId: "list-A" },
+    });
+    expect(leadMatchesSegment(inList, campaign)).toBe(true);
+    expect(leadMatchesSegment(outOfList, campaign)).toBe(false);
+  });
+
+  it("combines multiple criteria as AND", () => {
+    const qualified = makeLead({
+      lifecycle: "trialing",
+      heatScore: 70,
+      utmSource: "linkedin",
+    });
+    const missesUtm = makeLead({
+      lifecycle: "trialing",
+      heatScore: 70,
+      utmSource: "organic",
+    });
     const campaign = makeCampaign({
       segmentQuery: {
-        stage: "brand_skipped",
-        lastActivityBefore: "2026-04-10T00:00:00Z",
+        lifecycle: "trialing",
+        minHeatScore: 50,
+        utmSource: "linkedin",
       },
     });
-    expect(userMatchesSegment(user, campaign)).toBe(false);
-  });
-
-  it("includes users with lastActiveAt strictly before cutoff", () => {
-    const user = makeUser({ lastActiveAt: "2026-04-01T00:00:00Z" });
-    const campaign = makeCampaign({
-      segmentQuery: {
-        stage: "brand_skipped",
-        lastActivityBefore: "2026-04-10T00:00:00Z",
-      },
-    });
-    expect(userMatchesSegment(user, campaign)).toBe(true);
-  });
-
-  it("excludes users whose lastActiveAt equals or exceeds cutoff", () => {
-    const user = makeUser({ lastActiveAt: "2026-04-10T00:00:00Z" });
-    const campaign = makeCampaign({
-      segmentQuery: {
-        stage: "brand_skipped",
-        lastActivityBefore: "2026-04-10T00:00:00Z",
-      },
-    });
-    expect(userMatchesSegment(user, campaign)).toBe(false);
-  });
-
-  it("derives stage from events when onboardingStage is missing", () => {
-    // a user with only `goal_selected` event → derived stage is 'goal_selected'
-    const user = makeUser({
-      onboardingStage: undefined,
-      onboardingEvents: [
-        { event: "goal_selected", ts: "2026-04-01", data: { goal: "seo" } },
-      ] as any,
-    });
-    const campaign = makeCampaign({ segmentQuery: { stage: "goal_selected" } });
-    expect(userMatchesSegment(user, campaign)).toBe(true);
+    expect(leadMatchesSegment(qualified, campaign)).toBe(true);
+    expect(leadMatchesSegment(missesUtm, campaign)).toBe(false);
   });
 });
 
 describe("buildMergeFields", () => {
-  it("pulls firstName from displayName", () => {
-    const user = makeUser({ displayName: "Jane Doe" });
-    expect(buildMergeFields(user).firstName).toBe("Jane");
+  it("pulls firstName + companyName from the lead", () => {
+    const lead = makeLead({ firstName: "Jane", company: "WidgetCo" });
+    const merge = buildMergeFields(lead);
+    expect(merge.firstName).toBe("Jane");
+    expect(merge.companyName).toBe("WidgetCo");
   });
 
-  it("falls back to empty string when displayName is missing", () => {
-    const user = makeUser({ displayName: undefined });
-    expect(buildMergeFields(user).firstName).toBe("");
+  it("returns empty strings when firstName / company are missing", () => {
+    const lead = makeLead({ firstName: undefined, company: undefined });
+    const merge = buildMergeFields(lead);
+    expect(merge.firstName).toBe("");
+    expect(merge.companyName).toBe("");
   });
 
-  it("uses latest goal_selected event's data.goal", () => {
-    const user = makeUser({
-      onboardingEvents: [
-        { event: "goal_selected", ts: "2026-04-01", data: { goal: "old" } },
-        { event: "goal_selected", ts: "2026-04-05", data: { goal: "new" } },
-      ] as any,
-    });
-    expect(buildMergeFields(user).goal).toBe("new");
-  });
-
-  it("lastStep is the newest event by ts", () => {
-    const user = makeUser({
-      onboardingEvents: [
-        { event: "goal_selected", ts: "2026-04-01" },
-        { event: "brand_skipped", ts: "2026-04-05" },
-      ] as any,
-    });
-    expect(buildMergeFields(user).lastStep).toBe("brand_skipped");
+  it("lastStep and goal are always empty for leads (user-only concepts)", () => {
+    const lead = makeLead();
+    const merge = buildMergeFields(lead);
+    expect(merge.lastStep).toBe("");
+    expect(merge.goal).toBe("");
   });
 });
 
 // ─── End-to-end executor tick ──────────────────────────────────────────────
 
 describe("runDripExecutor — global kill switch", () => {
+  beforeEach(() => _resetInFlightGuardForTests());
+
   it("short-circuits when DRIP_CAMPAIGNS_ENABLED is unset", async () => {
     const deps = makeDeps({
       env: { DRIP_DRY_RUN: "false" }, // enabled flag missing
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
     const result = await runDripExecutor(deps);
     expect(result.globalKillSwitch).toBe(true);
@@ -247,7 +267,7 @@ describe("runDripExecutor — global kill switch", () => {
     const deps = makeDeps({
       env: { DRIP_CAMPAIGNS_ENABLED: "false", DRIP_DRY_RUN: "false" },
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
     const result = await runDripExecutor(deps);
     expect(result.globalKillSwitch).toBe(true);
@@ -256,13 +276,15 @@ describe("runDripExecutor — global kill switch", () => {
 });
 
 describe("runDripExecutor — dry-run default safety", () => {
+  beforeEach(() => _resetInFlightGuardForTests());
+
   it("records dry_run status and does NOT call sendEmail when DRIP_DRY_RUN unset", async () => {
-    const user = makeUser();
     const campaign = makeCampaign();
+    const lead = makeLead();
     const deps = makeDeps({
       env: { DRIP_CAMPAIGNS_ENABLED: "true" }, // dry-run defaults to true
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => [user]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
     });
     const result = await runDripExecutor(deps);
     expect(result.dryRun).toBe(true);
@@ -278,26 +300,28 @@ describe("runDripExecutor — dry-run default safety", () => {
 });
 
 describe("runDripExecutor — real send path", () => {
-  it("sends email, records sent, renders merge fields in subject + body", async () => {
-    const user = makeUser({
-      displayName: "Alice Jones",
-      companyName: "Acme Co" as any,
-      email: "alice@acme.test",
+  beforeEach(() => _resetInFlightGuardForTests());
+
+  it("sends email to the LEAD, records sent, renders merge fields in subject + body", async () => {
+    const lead = makeLead({
+      firstName: "Alice",
+      company: "Widget Co",
+      email: "alice@widget.test",
     });
     const campaign = makeCampaign();
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => [user]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
     });
     const result = await runDripExecutor(deps);
     expect(result.emailsSent).toBe(1);
     expect(result.dryRuns).toBe(0);
     expect(deps.sendEmail).toHaveBeenCalledTimes(1);
     const sentArgs = (deps.sendEmail as jest.Mock).mock.calls[0][0];
-    expect(sentArgs.to).toBe("alice@acme.test");
+    expect(sentArgs.to).toBe("alice@widget.test");
     expect(sentArgs.subject).toBe("Hi Alice");
     expect(sentArgs.html).toContain("Hey Alice");
-    expect(sentArgs.html).toContain("Acme Co");
+    expect(sentArgs.html).toContain("Widget Co");
 
     const recorded = (deps.recordSend as jest.Mock).mock.calls[0][0];
     expect(recorded.status).toBe("sent");
@@ -307,11 +331,13 @@ describe("runDripExecutor — real send path", () => {
 });
 
 describe("runDripExecutor — safety gates", () => {
+  beforeEach(() => _resetInFlightGuardForTests());
+
   it("skips paused campaigns", async () => {
     const paused = makeCampaign({ isActive: false });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [paused]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
     const result = await runDripExecutor(deps);
     expect(result.campaignsSkipped).toBe(1);
@@ -323,18 +349,18 @@ describe("runDripExecutor — safety gates", () => {
     const killed = makeCampaign({ killSwitch: true });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [killed]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
     const result = await runDripExecutor(deps);
     expect(result.campaignsSkipped).toBe(1);
     expect(result.skippedReasons.campaign_paused).toBe(1);
   });
 
-  it("skips users who already hit maxSends", async () => {
+  it("skips leads who already hit maxSends", async () => {
     const campaign = makeCampaign({ maxSends: 3 });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       countSendsForUserCampaign: jest.fn(async () => 3),
     });
     const result = await runDripExecutor(deps);
@@ -343,13 +369,12 @@ describe("runDripExecutor — safety gates", () => {
     expect(result.skippedReasons.max_sends_reached).toBe(1);
   });
 
-  it("skips users inside the cadence window", async () => {
+  it("skips leads inside the cadence window", async () => {
     const campaign = makeCampaign({ cadenceUnit: "days", cadenceValue: 7 });
-    // most recent send was 2 days ago → still inside the 7-day window
     const twoDaysAgo = new Date("2026-04-16T06:00:00Z").toISOString();
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       getMostRecentSendAt: jest.fn(async () => twoDaysAgo),
     });
     const result = await runDripExecutor(deps);
@@ -359,33 +384,43 @@ describe("runDripExecutor — safety gates", () => {
 
   it("allows send after cadence window elapses", async () => {
     const campaign = makeCampaign({ cadenceUnit: "days", cadenceValue: 7 });
-    // last send was 10 days ago
     const tenDaysAgo = new Date("2026-04-08T06:00:00Z").toISOString();
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       getMostRecentSendAt: jest.fn(async () => tenDaysAgo),
     });
     const result = await runDripExecutor(deps);
     expect(result.emailsSent).toBe(1);
   });
 
-  it("skips unsubscribed users", async () => {
-    const user = makeUser({ dripUnsubscribed: true } as any);
+  it("skips leads with contactStatus='unsubscribed'", async () => {
+    const lead = makeLead({ contactStatus: "unsubscribed" });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [user]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
     });
     const result = await runDripExecutor(deps);
     expect(result.emailsSent).toBe(0);
     expect(result.skippedReasons.unsubscribed).toBe(1);
   });
 
-  it("skips users without an email", async () => {
-    const user = makeUser({ email: "" });
+  it("skips leads with contactStatus='do-not-contact'", async () => {
+    const lead = makeLead({ contactStatus: "do-not-contact" });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [user]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
+    });
+    const result = await runDripExecutor(deps);
+    expect(result.emailsSent).toBe(0);
+    expect(result.skippedReasons.unsubscribed).toBe(1);
+  });
+
+  it("skips leads without an email", async () => {
+    const lead = makeLead({ email: "" });
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
     });
     const result = await runDripExecutor(deps);
     expect(result.emailsSent).toBe(0);
@@ -394,13 +429,12 @@ describe("runDripExecutor — safety gates", () => {
 
   it("enforces per-campaign hourly rate limit", async () => {
     const campaign = makeCampaign();
-    const users = Array.from({ length: 5 }, (_, i) =>
-      makeUser({ userId: `u-${i}`, email: `u${i}@example.com` }),
+    const leads = Array.from({ length: 5 }, (_, i) =>
+      makeLead({ leadId: `l-${i}`, email: `u${i}@example.com` }),
     );
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => users),
-      // already sent 49 in last hour; only 1 slot left out of default 50
+      listLeadsForCampaign: jest.fn(async () => leads),
       countSendsInWindow: jest.fn(async () => 49),
       env: {
         DRIP_CAMPAIGNS_ENABLED: "true",
@@ -409,7 +443,6 @@ describe("runDripExecutor — safety gates", () => {
     });
     const result = await runDripExecutor(deps);
     expect(result.emailsSent).toBe(1);
-    // 4 more users filtered by rate cap
     expect(result.skippedReasons.rate_limit_exceeded).toBe(4);
   });
 
@@ -417,7 +450,7 @@ describe("runDripExecutor — safety gates", () => {
     const campaign = makeCampaign();
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       countSendsInWindow: jest.fn(async () => 100),
     });
     const result = await runDripExecutor(deps);
@@ -426,41 +459,59 @@ describe("runDripExecutor — safety gates", () => {
     expect(result.skippedReasons.rate_limit_exceeded).toBe(1);
   });
 
-  it("filters non-matching segments (doesn't send to active users for a brand_skipped campaign)", async () => {
-    const campaign = makeCampaign({ segmentQuery: { stage: "brand_skipped" } });
-    const users = [
-      makeUser({ userId: "u-match", onboardingStage: "brand_skipped" }),
-      makeUser({ userId: "u-no-match", onboardingStage: "active" }),
-    ];
-    const deps = makeDeps({
-      listActiveCampaigns: jest.fn(async () => [campaign]),
-      listAllUsers: jest.fn(async () => users),
+  it("each campaign pulls its OWN tenant leads (cross-tenant isolation)", async () => {
+    const campaignA = makeCampaign({
+      campaignId: "camp-A",
+      userId: "tenant-1",
     });
-    const result = await runDripExecutor(deps);
-    expect(result.emailsSent).toBe(1);
-    const sentTo = (deps.sendEmail as jest.Mock).mock.calls[0][0].to;
-    expect(sentTo).toBe("bob@example.com"); // u-match has default email
-  });
+    const campaignB = makeCampaign({
+      campaignId: "camp-B",
+      userId: "tenant-2",
+    });
+    const leadForA = makeLead({
+      leadId: "l-A",
+      userId: "tenant-1",
+      email: "a@a.test",
+    });
+    const leadForB = makeLead({
+      leadId: "l-B",
+      userId: "tenant-2",
+      email: "b@b.test",
+    });
 
-  it("excludes deleted users (userId starts with 'deleted_')", async () => {
-    const users = [
-      makeUser({ userId: "deleted_u-1" }),
-      makeUser({ userId: "u-2" }),
-    ];
+    // The DI indirection lets us prove that each call gets a fresh
+    // per-tenant lead set. If the executor ever accidentally shared a
+    // single lead list across campaigns, tenant-2's leads would show up
+    // under tenant-1 — this test would catch it.
+    const leadFetcher = jest.fn(
+      async (c: DripCampaign) =>
+        c.userId === "tenant-1" ? [leadForA] : [leadForB],
+    );
+
     const deps = makeDeps({
-      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => users),
+      listActiveCampaigns: jest.fn(async () => [campaignA, campaignB]),
+      listLeadsForCampaign: leadFetcher,
     });
     const result = await runDripExecutor(deps);
-    expect(result.emailsSent).toBe(1);
+    expect(result.emailsSent).toBe(2);
+    // Order is campaign-order-preserving; proves listLeadsForCampaign was
+    // called with each campaign separately.
+    expect(leadFetcher).toHaveBeenNthCalledWith(1, campaignA);
+    expect(leadFetcher).toHaveBeenNthCalledWith(2, campaignB);
+    const recipients = (deps.sendEmail as jest.Mock).mock.calls.map(
+      (c) => c[0].to,
+    );
+    expect(recipients.sort()).toEqual(["a@a.test", "b@b.test"].sort());
   });
 });
 
 describe("runDripExecutor — failure handling", () => {
+  beforeEach(() => _resetInFlightGuardForTests());
+
   it("records a failed send when sendEmail throws", async () => {
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       sendEmail: jest.fn(async () => {
         throw new Error("SMTP down");
       }),
@@ -468,16 +519,15 @@ describe("runDripExecutor — failure handling", () => {
     const result = await runDripExecutor(deps);
     expect(result.emailsFailed).toBe(1);
     expect(result.emailsSent).toBe(0);
-    // recordSend should have been called once with status='failed'
     const recorded = (deps.recordSend as jest.Mock).mock.calls[0][0];
     expect(recorded.status).toBe("failed");
     expect(recorded.error).toContain("SMTP down");
   });
 
-  it("continues to the next user when one send fails", async () => {
-    const users = [
-      makeUser({ userId: "u-1", email: "a@example.com" }),
-      makeUser({ userId: "u-2", email: "b@example.com" }),
+  it("continues to the next lead when one send fails", async () => {
+    const leads = [
+      makeLead({ leadId: "l-1", email: "a@example.com" }),
+      makeLead({ leadId: "l-2", email: "b@example.com" }),
     ];
     const sendMock = jest
       .fn()
@@ -487,7 +537,7 @@ describe("runDripExecutor — failure handling", () => {
       .mockImplementationOnce(async () => ({ messageId: "msg-2" }));
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => users),
+      listLeadsForCampaign: jest.fn(async () => leads),
       sendEmail: sendMock,
     });
     const result = await runDripExecutor(deps);
@@ -497,6 +547,8 @@ describe("runDripExecutor — failure handling", () => {
 });
 
 describe("runDripExecutor — no-ops", () => {
+  beforeEach(() => _resetInFlightGuardForTests());
+
   it("returns empty summary when no campaigns exist", async () => {
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => []),
@@ -504,11 +556,11 @@ describe("runDripExecutor — no-ops", () => {
     const result = await runDripExecutor(deps);
     expect(result.campaignsConsidered).toBe(0);
     expect(result.emailsSent).toBe(0);
-    expect(deps.listAllUsers).not.toHaveBeenCalled();
+    expect(deps.listLeadsForCampaign).not.toHaveBeenCalled();
   });
 });
 
-// ─── Senior Reviewer must-fixes / concerns (PR #1219) ──────────────────────
+// ─── Carry-over Senior Reviewer concerns (PR #1219) ───────────────────────
 
 describe("runDripExecutor — in-flight guard (Concern A)", () => {
   beforeEach(() => {
@@ -516,8 +568,6 @@ describe("runDripExecutor — in-flight guard (Concern A)", () => {
   });
 
   it("skips re-entrant invocations while a previous tick is running", async () => {
-    // First tick's listActiveCampaigns hangs on a promise we control so we
-    // can fire the second tick mid-flight.
     let release: () => void = () => {};
     const firstTickHangs = new Promise<DripCampaign[]>((resolve) => {
       release = () => resolve([]);
@@ -525,24 +575,21 @@ describe("runDripExecutor — in-flight guard (Concern A)", () => {
 
     const depsA = makeDeps({
       listActiveCampaigns: jest.fn(() => firstTickHangs),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
     const depsB = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
 
     const firstPromise = runDripExecutor(depsA);
-    // Second tick invoked while first is still awaiting listActiveCampaigns.
     const secondResult = await runDripExecutor(depsB);
 
-    // Second tick short-circuits: never touches its own listActiveCampaigns.
     expect(depsB.listActiveCampaigns).not.toHaveBeenCalled();
     expect(secondResult.skippedReasons.tick_in_flight).toBe(1);
     expect(secondResult.emailsSent).toBe(0);
     expect(secondResult.dryRuns).toBe(0);
 
-    // Unblock the first tick and let it complete cleanly.
     release();
     await firstPromise;
   });
@@ -555,10 +602,9 @@ describe("runDripExecutor — in-flight guard (Concern A)", () => {
 
     const depsSecond = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
     });
     const result = await runDripExecutor(depsSecond);
-    // Second tick fully runs (real-send per makeDeps default env)
     expect(depsSecond.listActiveCampaigns).toHaveBeenCalled();
     expect(result.emailsSent).toBe(1);
     expect(result.skippedReasons.tick_in_flight).toBeUndefined();
@@ -566,7 +612,6 @@ describe("runDripExecutor — in-flight guard (Concern A)", () => {
 
   it("releases the guard even when the tick throws unexpectedly", async () => {
     const depsBroken = makeDeps({
-      // Throw inside the tick to prove the `finally` resets the guard.
       listActiveCampaigns: jest.fn(async () => {
         throw new Error("DynamoDB outage");
       }),
@@ -575,7 +620,6 @@ describe("runDripExecutor — in-flight guard (Concern A)", () => {
       "DynamoDB outage",
     );
 
-    // Subsequent tick should not be blocked by a leaked in-flight=true.
     const depsRecovered = makeDeps({
       listActiveCampaigns: jest.fn(async () => []),
     });
@@ -593,7 +637,7 @@ describe("runDripExecutor — real-send audit fidelity (Concern B)", () => {
   it("records status='sent' with the REAL messageId, not a synthesized one", async () => {
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       sendEmail: jest.fn(async () => ({ messageId: "real-provider-id-42" })),
     });
     const result = await runDripExecutor(deps);
@@ -601,19 +645,13 @@ describe("runDripExecutor — real-send audit fidelity (Concern B)", () => {
     const recorded = (deps.recordSend as jest.Mock).mock.calls[0][0];
     expect(recorded.status).toBe("sent");
     expect(recorded.messageId).toBe("real-provider-id-42");
-    // Must NOT match the old `drip-${ts}-${rand}` synthesized shape.
     expect(recorded.messageId).not.toMatch(/^drip-\d+-[a-z0-9]+$/);
   });
 
   it("records status='failed' (not 'sent') when the underlying sender throws", async () => {
-    // This is the defense against the old "emailService.sendEmail silently
-    // swallows + we synthesize a fake messageId" bug. The default sendEmail
-    // wrapper now uses emailService.sendEmailStrict, which throws on failure.
-    // We simulate that at the DI layer — the executor contract is "throw or
-    // return a real messageId" and the audit must reflect failure.
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [makeUser()]),
+      listLeadsForCampaign: jest.fn(async () => [makeLead()]),
       sendEmail: jest.fn(async () => {
         throw new Error("SMTP: connection refused");
       }),
@@ -628,27 +666,27 @@ describe("runDripExecutor — real-send audit fidelity (Concern B)", () => {
   });
 });
 
-describe("runDripExecutor — cheap-first gate ordering (Must-fix #2 verification)", () => {
+describe("runDripExecutor — cheap-first gate ordering", () => {
   beforeEach(() => {
     _resetInFlightGuardForTests();
   });
 
-  it("skips unsubscribed users WITHOUT calling scan-based checks", async () => {
-    const user = makeUser({ dripUnsubscribed: true } as any);
+  it("skips unsubscribed leads WITHOUT calling scan-based checks", async () => {
+    const lead = makeLead({ contactStatus: "unsubscribed" });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [user]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
     });
     await runDripExecutor(deps);
     expect(deps.countSendsForUserCampaign).not.toHaveBeenCalled();
     expect(deps.getMostRecentSendAt).not.toHaveBeenCalled();
   });
 
-  it("skips no-email users WITHOUT calling scan-based checks", async () => {
-    const user = makeUser({ email: "" });
+  it("skips no-email leads WITHOUT calling scan-based checks", async () => {
+    const lead = makeLead({ email: "" });
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => [user]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
     });
     await runDripExecutor(deps);
     expect(deps.countSendsForUserCampaign).not.toHaveBeenCalled();
@@ -656,26 +694,45 @@ describe("runDripExecutor — cheap-first gate ordering (Must-fix #2 verificatio
   });
 
   it("stops calling scan-based checks once in-loop rate-cap is exhausted", async () => {
-    const users = Array.from({ length: 10 }, (_, i) =>
-      makeUser({ userId: `u-${i}`, email: `u${i}@example.com` }),
+    const leads = Array.from({ length: 10 }, (_, i) =>
+      makeLead({ leadId: `l-${i}`, email: `u${i}@example.com` }),
     );
     const deps = makeDeps({
       listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
-      listAllUsers: jest.fn(async () => users),
-      // already sent 48/50 — only 2 sends available
+      listLeadsForCampaign: jest.fn(async () => leads),
       countSendsInWindow: jest.fn(async () => 48),
       env: { DRIP_CAMPAIGNS_ENABLED: "true", DRIP_DRY_RUN: "false" },
     });
     const result = await runDripExecutor(deps);
     expect(result.emailsSent).toBe(2);
-    // After 2 sends, remainingInWindow hits 0 and remaining 8 candidates skip
-    // before hitting the scan-based gates. So scan is called at most once per
-    // sent user (2 times), never 10.
     expect(
       (deps.countSendsForUserCampaign as jest.Mock).mock.calls.length,
     ).toBeLessThanOrEqual(2);
     expect(
       (deps.getMostRecentSendAt as jest.Mock).mock.calls.length,
     ).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("dripSends are keyed by (listId:leadId)", () => {
+  beforeEach(() => _resetInFlightGuardForTests());
+
+  it("passes listId:leadId as the dripSends userId field so cadence + cap queries are per-lead, not per-tenant", async () => {
+    const lead = makeLead({ listId: "L1", leadId: "LD1" });
+    const deps = makeDeps({
+      listActiveCampaigns: jest.fn(async () => [makeCampaign()]),
+      listLeadsForCampaign: jest.fn(async () => [lead]),
+    });
+    await runDripExecutor(deps);
+    expect(deps.countSendsForUserCampaign).toHaveBeenCalledWith(
+      "L1:LD1",
+      "camp-1",
+    );
+    expect(deps.getMostRecentSendAt).toHaveBeenCalledWith(
+      "L1:LD1",
+      "camp-1",
+    );
+    const recorded = (deps.recordSend as jest.Mock).mock.calls[0][0];
+    expect(recorded.userId).toBe("L1:LD1");
   });
 });
