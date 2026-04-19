@@ -72,6 +72,7 @@ import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
+import dripCampaignsRoutes from "./routes/dripCampaigns";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -273,6 +274,7 @@ app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api/test-accounts", testAccountsRoutes);
 app.use("/api/onboarding", onboardingEventsRoutes);
+app.use("/api/admin/drip-campaigns", authenticateToken, isAdmin, dripCampaignsRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
