@@ -31,6 +31,11 @@ import {
   computeBackfillScores,
   isLeadAlreadyBackfilled,
 } from '../src/utils/crmBackfill';
+import {
+  BackfillDeal,
+  BackfillEvent,
+  buildBackfillSignalsExtension,
+} from '../src/utils/crmBackfillSignals';
 
 const argv = process.argv.slice(2);
 const APPLY = argv.includes('--apply');
@@ -45,6 +50,15 @@ const LEAD_LISTS_TABLE = `${TABLE_PREFIX}AW-LeadLists`;
 const LEADS_TABLE = `${TABLE_PREFIX}AW-Leads`;
 const USERS_TABLE = `${TABLE_PREFIX}AW-Users`;
 const CONTACT_EVENTS_TABLE = `${TABLE_PREFIX}AW-ContactEvents`;
+const DEALS_TABLE = `${TABLE_PREFIX}AW-Deals`;
+
+/**
+ * How many most-recent ContactEvents rows we pull per lead. All the scoring
+ * signals are "latest timestamp of type X" so more than this doesn't change
+ * the compute result — it just burns RCUs. 200 easily covers a year of heavy
+ * engagement for one contact.
+ */
+const CONTACT_EVENTS_PAGE_SIZE = 200;
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || 'us-west-2',
@@ -139,6 +153,84 @@ async function getUserByEmail(email: string): Promise<UserRow | null> {
 }
 
 /**
+ * Fetch the most-recent ContactEvents rows for a contactId (lowercased email),
+ * used to populate lastEngagementAt / lastEmmaSessionAt / etc. signals for
+ * scoring. Returns an empty list when the table is missing or the contact has
+ * no events — prospect-only leads are expected to have zero events.
+ */
+async function getContactEventsForLead(lead: LeadRow): Promise<BackfillEvent[]> {
+  if (!lead.email || typeof lead.email !== 'string') return [];
+  const contactId = lead.email.trim().toLowerCase();
+  if (!contactId) return [];
+  try {
+    const res = await dynamodb
+      .query({
+        TableName: CONTACT_EVENTS_TABLE,
+        KeyConditionExpression: 'contactId = :cid',
+        ExpressionAttributeValues: { ':cid': contactId },
+        // Descending on eventTimestamp — most recent first, which is all the
+        // scoring compute cares about. Cap pages so heavy contacts don't
+        // starve the concurrency slot.
+        ScanIndexForward: false,
+        Limit: CONTACT_EVENTS_PAGE_SIZE,
+      })
+      .promise();
+    return (res.Items || []).map(it => ({
+      eventType: typeof it.eventType === 'string' ? it.eventType : '',
+      eventTimestamp: typeof it.eventTimestamp === 'string' ? it.eventTimestamp : '',
+      payload: (it.payload as Record<string, unknown>) ?? null,
+    }));
+  } catch (err: any) {
+    // Event table may not exist in minimal test envs — zero events is the
+    // honest answer rather than crashing the whole backfill.
+    if (
+      err?.code === 'ResourceNotFoundException' ||
+      err?.name === 'ResourceNotFoundException' ||
+      err?.code === 'ValidationException' ||
+      err?.name === 'ValidationException'
+    ) {
+      return [];
+    }
+    throw err;
+  }
+}
+
+/**
+ * Resolve `lead.dealIds` to the stages on those deal rows. N round-trips per
+ * lead, but N is tiny in practice (most leads have 0-1 deals) and the
+ * concurrency cap bounds the total RCU draw. Malformed / missing deals are
+ * silently skipped — the backfill must not block on a stale pointer.
+ */
+async function getOpenDealsForLead(lead: LeadRow): Promise<BackfillDeal[]> {
+  const ids = Array.isArray(lead.dealIds) ? lead.dealIds.filter(Boolean) : [];
+  if (ids.length === 0) return [];
+  const out: BackfillDeal[] = [];
+  for (const dealId of ids) {
+    try {
+      const res = await dynamodb
+        .get({ TableName: DEALS_TABLE, Key: { dealId } })
+        .promise();
+      const item = res.Item as { dealId?: string; stage?: string | null } | undefined;
+      if (item && typeof item.dealId === 'string') {
+        out.push({ dealId: item.dealId, stage: item.stage ?? null });
+      }
+    } catch (err: any) {
+      if (
+        err?.code === 'ResourceNotFoundException' ||
+        err?.name === 'ResourceNotFoundException' ||
+        err?.code === 'ValidationException' ||
+        err?.name === 'ValidationException'
+      ) {
+        // Deals table missing — no deal signal, keep going.
+        continue;
+      }
+      throw err;
+    }
+  }
+  return out;
+}
+
+/**
  * Apply the computed scores to a single lead row. Dry-run unless APPLY=true.
  * Returns whether it wrote (or would write) and whether it logged (or would
  * log) an event.
@@ -153,7 +245,15 @@ async function backfillOneLead(lead: LeadRow): Promise<{ wroteLead: boolean; log
     user = await getUserByEmail(lead.email);
   }
 
-  const scores = computeBackfillScores({ lead, user });
+  // Fetch per-lead timeline signals + open-deal stages in parallel. Both are
+  // bounded (event page cap + small dealIds[]) so this is cheap.
+  const [events, deals] = await Promise.all([
+    getContactEventsForLead(lead),
+    getOpenDealsForLead(lead),
+  ]);
+
+  const signalsExtension = buildBackfillSignalsExtension(events, deals);
+  const scores = computeBackfillScores({ lead, user, ...signalsExtension });
 
   if (!APPLY) {
     return { wroteLead: true, loggedEvent: true };
