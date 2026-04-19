@@ -115,6 +115,12 @@ export interface User {
    * Persisted so Dynamo queries can filter by stage without replaying the log.
    */
   onboardingStage?: string;
+  /**
+   * Lifecycle Drip — Phase 4. When `true`, the drip executor MUST NOT send
+   * this user any drip campaign email, regardless of segment match. Set by
+   * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
+   */
+  dripUnsubscribed?: boolean;
   brandGuidelines?: {
     brandData: {
       brandName: string;

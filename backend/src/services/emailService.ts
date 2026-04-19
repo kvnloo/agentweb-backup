@@ -59,6 +59,48 @@ export const emailService = {
     }
   },
 
+  /**
+   * Strict variant — throws on transporter failure, returns the real provider
+   * messageId so the caller's audit row reflects ground truth. Use this for
+   * any flow where "did this email actually leave the box?" has to be
+   * answerable from the audit log (e.g. the drip executor).
+   *
+   * Do NOT swap callers of `sendEmail` to this blindly — most existing
+   * callers (welcome emails, task execution notifications, etc.) intentionally
+   * tolerate silent failure so they don't crash user-facing flows. The split
+   * is on purpose: the old shape for best-effort UX notifications, this one
+   * for audited, compliance-adjacent sends.
+   */
+  async sendEmailStrict(
+    to: string | string[],
+    subject: string,
+    text: string,
+    html: string,
+    cc?: string | string[]
+  ): Promise<{ messageId: string }> {
+    const mailOptions = {
+      from: process.env.FROM_EMAIL,
+      replyTo: 'support@agentweb.pro',
+      to,
+      cc,
+      subject,
+      text,
+      html
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    const messageId = (info && typeof (info as any).messageId === 'string')
+      ? (info as any).messageId
+      : null;
+    if (!messageId) {
+      throw new Error('sendEmailStrict: transporter returned no messageId');
+    }
+    const toList = Array.isArray(to) ? to.join(', ') : to;
+    const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
+    console.log('Email sent successfully (strict) to:', toList, cc ? `CC: ${ccList}` : '', `(messageId: ${messageId})`);
+    return { messageId };
+  },
+
   async sendInvitation(email: string) {
     const mailOptions = {
       from: process.env.FROM_EMAIL,
