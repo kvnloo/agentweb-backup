@@ -96,6 +96,25 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  /**
+   * Onboarding event log — appended to by POST /api/onboarding/events. Used
+   * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each
+   * entry is the event name, server-side timestamp, and optional payload.
+   * Capped to the last 50 events to keep the User record bounded; older
+   * events are dropped FIFO.
+   */
+  onboardingEvents?: Array<{
+    event: string;
+    ts: string;
+    data?: Record<string, unknown>;
+  }>;
+  /**
+   * Derived onboarding stage, recomputed from `onboardingEvents` every time
+   * a new event is recorded. Not stored as source-of-truth — rebuildable
+   * from the event log via `deriveOnboardingStage` (utils/onboardingStage).
+   * Persisted so Dynamo queries can filter by stage without replaying the log.
+   */
+  onboardingStage?: string;
   brandGuidelines?: {
     brandData: {
       brandName: string;
