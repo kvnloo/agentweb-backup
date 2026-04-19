@@ -260,9 +260,11 @@ describe('DripCampaignDb', () => {
       cadenceValue: 14,
       killSwitch: true,
       // Attempt to tamper with createdBy should be ignored by the type but
-      // we cast to any to prove the runtime override still wins.
-      createdBy: 'hijacker' as any,
-    });
+      // we cast the whole object to any to prove the runtime override still wins.
+      // Per-field `as any` does not suppress TS2353 (excess-property check runs
+      // before value-type resolution); whole-object cast does.
+      createdBy: 'hijacker',
+    } as any);
 
     expect(updated.cadenceValue).toBe(14);
     expect(updated.killSwitch).toBe(true);
