@@ -357,4 +357,179 @@ describe("GET /api/onboarding/users (admin)", () => {
     const res = await request(app).get("/api/onboarding/users");
     expect(res.status).toBe(500);
   });
+
+  // ─── Phase 2: segmentation query params ───────────────────────────────
+  describe("Phase 2 segmentation (lastActivityBefore, limit, onboardingGoal)", () => {
+    it("filters users whose lastActiveAt is before the given ISO date", async () => {
+      mockGetAllUsers.mockResolvedValueOnce([
+        {
+          userId: "fresh",
+          email: "fresh@example.com",
+          onboardingStage: "goal_selected",
+          lastActiveAt: "2026-04-17T10:00:00Z",
+        },
+        {
+          userId: "stale",
+          email: "stale@example.com",
+          onboardingStage: "goal_selected",
+          lastActiveAt: "2026-04-10T10:00:00Z",
+        },
+        {
+          userId: "never",
+          email: "never@example.com",
+          onboardingStage: "goal_selected",
+          // no lastActiveAt — NOT returned because we can't prove it's before the cutoff
+        },
+      ]);
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected&lastActivityBefore=2026-04-15T00:00:00Z",
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.count).toBe(1);
+      expect(res.body.users[0].userId).toBe("stale");
+    });
+
+    it("rejects an invalid lastActivityBefore date", async () => {
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected&lastActivityBefore=not-a-date",
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/lastActivityBefore/);
+    });
+
+    it("applies limit to cap the returned list size", async () => {
+      mockGetAllUsers.mockResolvedValueOnce(
+        Array.from({ length: 12 }, (_, i) => ({
+          userId: `u${i}`,
+          email: `u${i}@example.com`,
+          onboardingStage: "goal_selected",
+        })),
+      );
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected&limit=5",
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.count).toBe(5);
+      expect(res.body.users).toHaveLength(5);
+    });
+
+    it("rejects a non-numeric limit", async () => {
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected&limit=abc",
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/limit/);
+    });
+
+    it("rejects a limit that is <= 0", async () => {
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected&limit=0",
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/limit/);
+    });
+
+    it("caps limit at 500 to prevent abuse", async () => {
+      mockGetAllUsers.mockResolvedValueOnce(
+        Array.from({ length: 600 }, (_, i) => ({
+          userId: `u${i}`,
+          email: `u${i}@example.com`,
+          onboardingStage: "goal_selected",
+        })),
+      );
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected&limit=9999",
+      );
+      expect(res.status).toBe(200);
+      // Server-side cap at 500
+      expect(res.body.count).toBe(500);
+    });
+
+    it("exposes onboardingGoal derived from goal_selected event", async () => {
+      mockGetAllUsers.mockResolvedValueOnce([
+        {
+          userId: "u1",
+          email: "a@example.com",
+          onboardingStage: "goal_selected",
+          onboardingEvents: [
+            {
+              event: "goal_selected",
+              ts: "2026-04-18T10:00:00Z",
+              data: { goal: "paid_ads" },
+            },
+          ],
+        },
+        {
+          userId: "u2",
+          email: "b@example.com",
+          onboardingStage: "goal_selected",
+          onboardingEvents: [
+            // goal_selected without data.goal
+            { event: "goal_selected", ts: "2026-04-18T10:00:00Z" },
+          ],
+        },
+      ]);
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected",
+      );
+      expect(res.status).toBe(200);
+      const byId = Object.fromEntries(
+        res.body.users.map((u: any) => [u.userId, u]),
+      );
+      expect(byId.u1.onboardingGoal).toBe("paid_ads");
+      expect(byId.u2.onboardingGoal).toBeNull();
+    });
+
+    it("includes companyName in slim output", async () => {
+      mockGetAllUsers.mockResolvedValueOnce([
+        {
+          userId: "u1",
+          email: "a@example.com",
+          companyName: "Acme",
+          onboardingStage: "goal_selected",
+        },
+      ]);
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected",
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.users[0].companyName).toBe("Acme");
+    });
+
+    it("uses latest goal_selected event when there are multiple", async () => {
+      mockGetAllUsers.mockResolvedValueOnce([
+        {
+          userId: "u1",
+          email: "a@example.com",
+          onboardingStage: "goal_selected",
+          onboardingEvents: [
+            {
+              event: "goal_selected",
+              ts: "2026-04-18T10:00:00Z",
+              data: { goal: "seo" },
+            },
+            {
+              event: "goal_selected",
+              ts: "2026-04-18T11:00:00Z",
+              data: { goal: "paid_ads" },
+            },
+          ],
+        },
+      ]);
+      const app = makeApp();
+      const res = await request(app).get(
+        "/api/onboarding/users?stage=goal_selected",
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.users[0].onboardingGoal).toBe("paid_ads");
+    });
+  });
 });

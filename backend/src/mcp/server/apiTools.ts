@@ -1951,6 +1951,82 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
   }
 });
 
+// ─── Lifecycle Drip segmentation (admin-only) ───────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'get_users_by_lifecycle_stage',
+  definition: {
+    name: 'get_users_by_lifecycle_stage',
+    description: `List users filtered by their onboarding lifecycle stage. Admin-only tool — used to segment users for the Lifecycle Drip campaign engine.
+
+Stages in order of engagement:
+- \`signed_up_no_start\` — account exists but no onboarding events recorded
+- \`goal_selected\` — picked a goal (e.g. paid_ads, seo) but no brand yet
+- \`brand_submitted\` / \`brand_skipped\` — completed or skipped the brand step
+- \`data_connected\` — connected CRM / data source
+- \`channel_connected\` — connected an outbound channel
+- \`onboarding_completed\` — finished onboarding (no recent activity)
+- \`active\` — finished onboarding AND recently active
+- \`stale\` — finished onboarding but no activity for 30+ days
+
+Returns a structured list (NOT markdown) with: \`userId\`, \`email\`, \`displayName\`, \`companyName\`, \`onboardingStage\`, \`onboardingGoal\` (from the goal_selected event, if present), \`lastActiveAt\`, \`createdAt\`, \`onboardingEventCount\`, \`emmaHelpInterests\`. The drip campaign UI consumes this list directly.
+
+Typical prompts this answers:
+- "show me everyone who dropped at the brand step" → stage=brand_skipped or signed_up_no_start
+- "who hasn't logged in for 7 days?" → lastActivityBefore=<now-7d>
+- "list stale users with completed onboarding" → stage=stale`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stage: {
+          type: 'string',
+          enum: [
+            'signed_up_no_start',
+            'goal_selected',
+            'brand_submitted',
+            'brand_skipped',
+            'data_connected',
+            'channel_connected',
+            'onboarding_completed',
+            'active',
+            'stale',
+          ],
+          description: 'Onboarding stage to filter by. Omit to return all users with any stage set.',
+        },
+        lastActivityBefore: {
+          type: 'string',
+          description: 'ISO 8601 date. Only return users whose lastActiveAt is before this timestamp. Users with no lastActiveAt at all are excluded (we cannot prove they were inactive). Example: "2026-04-10T00:00:00Z".',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 500,
+          description: 'Cap the number of users returned (max 500). Omit to return up to 500 by default.',
+        },
+      },
+      required: [],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const queryParams: Record<string, string> = {};
+    if (typeof args.stage === 'string' && args.stage) queryParams.stage = args.stage;
+    if (typeof args.lastActivityBefore === 'string' && args.lastActivityBefore) {
+      queryParams.lastActivityBefore = args.lastActivityBefore;
+    }
+    if (typeof args.limit === 'number' && Number.isFinite(args.limit)) {
+      queryParams.limit = String(Math.max(1, Math.floor(args.limit)));
+    }
+
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/onboarding/users',
+      context: ctx(context),
+      queryParams: Object.keys(queryParams).length > 0 ? queryParams : undefined,
+    });
+    return jsonResult(data);
+  },
+});
+
 // ─── PR Digest (admin-only) ─────────────────────────────────────────────────
 
 mcpToolRegistry.register({

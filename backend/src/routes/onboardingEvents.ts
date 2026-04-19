@@ -162,15 +162,50 @@ router.get("/events/me", authenticateToken, async (req, res) => {
   }
 });
 
+/** Phase 2: server-side cap on `limit` to prevent abuse + DynamoDB scan blowups. */
+const MAX_USERS_LIMIT = 500;
+
 /**
- * GET /api/onboarding/users?stage=<stage>
+ * Pull the user's most recent `goal_selected` event's `data.goal` out of their
+ * onboarding event log. Returns null if no `goal_selected` event was seen or
+ * the event had no `goal` field. Phase 2 — used by Emma segmentation so the
+ * drip engine can pick a goal-specific template (e.g. "paid_ads" → ads drip).
+ */
+function extractOnboardingGoal(
+  events: OnboardingEvent[] | undefined,
+): string | null {
+  if (!Array.isArray(events) || events.length === 0) return null;
+  // Iterate newest-first. Events may arrive out of order so sort defensively.
+  const goalEvents = events
+    .filter((e) => e?.event === "goal_selected")
+    .slice()
+    .sort((a, b) => {
+      const ta = a?.ts ? Date.parse(a.ts) : 0;
+      const tb = b?.ts ? Date.parse(b.ts) : 0;
+      return tb - ta;
+    });
+  for (const e of goalEvents) {
+    const goal = (e?.data as any)?.goal;
+    if (typeof goal === "string" && goal.length > 0) return goal;
+  }
+  return null;
+}
+
+/**
+ * GET /api/onboarding/users
+ *   ?stage=<stage>
+ *   ?lastActivityBefore=<ISO date>   (Phase 2: inactive-cutoff filter)
+ *   ?limit=<n>                        (Phase 2: cap result count, max 500)
  *
  * Admin-only: list users filtered by `onboardingStage`. Used by Emma tools
  * and the drip campaign segmentation UI. Returns a slim view — `userId`,
- * `email`, `onboardingStage`, plus a handful of signal fields the drip
- * campaign needs to pick a template.
+ * `email`, `companyName`, `onboardingStage`, `onboardingGoal`, plus a handful
+ * of signal fields the drip campaign needs to pick a template.
  *
  * If `stage` is omitted we return all users with any stage set.
+ * If `lastActivityBefore` is provided, users with no `lastActiveAt` are
+ * EXCLUDED (we can't prove they were inactive before the cutoff — safer to
+ * skip than to spam cold users).
  */
 router.get(
   "/users",
@@ -183,6 +218,36 @@ router.get(
         return res.status(400).json({
           message: `Invalid stage. Must be one of: ${ALL_ONBOARDING_STAGES.join(", ")}`,
         });
+      }
+
+      // Phase 2: parse optional `lastActivityBefore` (ISO date).
+      let activityCutoff: number | null = null;
+      if (typeof req.query.lastActivityBefore === "string" && req.query.lastActivityBefore) {
+        const parsed = Date.parse(req.query.lastActivityBefore);
+        if (Number.isNaN(parsed)) {
+          return res.status(400).json({
+            message:
+              "Invalid lastActivityBefore. Must be an ISO 8601 date string (e.g. 2026-04-10T00:00:00Z).",
+          });
+        }
+        activityCutoff = parsed;
+      }
+
+      // Phase 2: parse optional `limit`, cap at MAX_USERS_LIMIT.
+      let limit: number | null = null;
+      if (typeof req.query.limit === "string" && req.query.limit) {
+        const parsedLimit = Number(req.query.limit);
+        if (!Number.isFinite(parsedLimit) || !Number.isInteger(parsedLimit)) {
+          return res.status(400).json({
+            message: "Invalid limit. Must be a positive integer.",
+          });
+        }
+        if (parsedLimit <= 0) {
+          return res.status(400).json({
+            message: "Invalid limit. Must be a positive integer.",
+          });
+        }
+        limit = Math.min(parsedLimit, MAX_USERS_LIMIT);
       }
 
       // Full-table scan + JS filter. Scale caveat matches getAllUsers()
@@ -202,11 +267,33 @@ router.get(
         );
       }
 
+      if (activityCutoff !== null) {
+        items = items.filter((u) => {
+          const la = (u as any).lastActiveAt;
+          if (typeof la !== "string" || !la) return false; // skip unknown-activity users
+          const ts = Date.parse(la);
+          if (Number.isNaN(ts)) return false;
+          return ts < (activityCutoff as number);
+        });
+      }
+
+      if (limit !== null) {
+        items = items.slice(0, limit);
+      } else if (items.length > MAX_USERS_LIMIT) {
+        // Hard safety cap even if caller didn't ask, so Emma / drip UI never
+        // accidentally blasts 10k users.
+        items = items.slice(0, MAX_USERS_LIMIT);
+      }
+
       const slim = items.map((u) => ({
         userId: u.userId,
         email: u.email,
         displayName: u.displayName,
+        companyName: (u as any).companyName,
         onboardingStage: u.onboardingStage,
+        onboardingGoal: extractOnboardingGoal(
+          (u as any).onboardingEvents as OnboardingEvent[] | undefined,
+        ),
         onboardingEventCount: Array.isArray(u.onboardingEvents)
           ? u.onboardingEvents.length
           : 0,
