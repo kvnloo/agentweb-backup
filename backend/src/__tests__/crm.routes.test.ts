@@ -631,7 +631,7 @@ describe('CRM Routes', () => {
         selectedSenderId: 'missing-sender',
       };
 
-      const handler = router.stack.find((r: any) => 
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
       );
       if (handler && handler.route) {
@@ -641,6 +641,76 @@ describe('CRM Routes', () => {
       expect(crmDb.createLead).not.toHaveBeenCalled();
       expect(mockResponse.status).toHaveBeenCalledWith(400);
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'selectedSenderId must reference a configured sender' });
+    });
+
+    it('converts body.attribution into firstTouch + lastTouch, strips envelope', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'attr@example.com',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {
+        email: 'attr@example.com',
+        firstName: 'Ada',
+        attribution: {
+          timestamp: '2026-04-19T10:00:00.000Z',
+          utm: { source: 'meta', medium: 'cpc', campaign: 'spring-2026' },
+          landingUrl: 'https://agentweb.pro/?utm_source=meta',
+        },
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.createLead).toHaveBeenCalledWith(
+        'list1',
+        expect.objectContaining({
+          email: 'attr@example.com',
+          firstName: 'Ada',
+          firstTouch: expect.objectContaining({
+            utm: expect.objectContaining({ source: 'meta', medium: 'cpc' }),
+          }),
+          lastTouch: expect.objectContaining({
+            utm: expect.objectContaining({ source: 'meta' }),
+          }),
+        })
+      );
+      // Envelope stripped so createLead doesn't see an unknown `attribution` key
+      const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
+      expect('attribution' in call).toBe(false);
+      expect('utm' in call).toBe(false);
+    });
+
+    it('leaves firstTouch/lastTouch absent when no attribution is posted', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'plain@example.com',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'plain@example.com' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
+      expect(call.firstTouch).toBeUndefined();
+      expect(call.lastTouch).toBeUndefined();
     });
   });
 
