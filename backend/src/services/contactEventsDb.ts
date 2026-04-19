@@ -52,6 +52,10 @@ export type ContactEventType =
   | 'deal.created'
   | 'deal.stage_changed'
   | 'deal.primary_rotated'
+  // Attribution — fired once per contact when UTM / referrer / landingUrl
+  // is first captured. Dedupe via sourceRecordId so repeat signals on the
+  // same lead create a single row. Payload holds the full AttributionTouch.
+  | 'attribution.first_touch'
   | string; // allow future-unknown types — keep flexible rather than locked
 
 export interface ContactEvent {
