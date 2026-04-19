@@ -1113,6 +1113,8 @@ export class AgentModeService {
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
+    // Gemini Live voice model — first so it's the default in the UI
+    'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List openai models - create client dynamically for each deployment
     'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false },
@@ -1122,8 +1124,6 @@ export class AgentModeService {
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-flash-lite-preview': { client: null, supportsTemperature: true },
-    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
-    'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
@@ -1133,12 +1133,16 @@ export class AgentModeService {
 
   async getSupportedModels(isAdmin: boolean = false) {
     const models = Object.keys(this.llmModels).filter(m => isAdmin || !m.includes('opus'));
+    // Live model is always first; default model from settings comes second if different
+    const liveModel = 'gemini-3.1-flash-live-preview';
     const defaultModel = await this.getDefaultModel();
-    // Put the default model first so frontends that use [0] pick the right one
-    if (defaultModel && models.includes(defaultModel)) {
-      return [defaultModel, ...models.filter(m => m !== defaultModel)];
-    }
-    return models;
+    const rest = models.filter(m => m !== liveModel && m !== defaultModel);
+    const ordered = [
+      ...(models.includes(liveModel) ? [liveModel] : []),
+      ...(defaultModel && models.includes(defaultModel) && defaultModel !== liveModel ? [defaultModel] : []),
+      ...rest,
+    ];
+    return ordered;
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
