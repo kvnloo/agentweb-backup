@@ -645,21 +645,25 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     entry.toolContextText = '';
     entry.pendingLinks = [];
 
-    // Emit turn-complete immediately so browser can update UI
-    // assistantText contains only the clean spoken transcript; links are tool result URLs
-    emitFn('live:turn-complete', { sessionId, assistantText, userText, links });
+    // Append link markdown to the assistant message so it persists in DynamoDB
+    // and survives any subsequent session reload — no client-side re-apply needed.
+    const linkSuffix = links && links.length > 0
+      ? '\n\n' + links.map(l => `[${l.label}](${l.url})`).join('\n')
+      : '';
+    const assistantContent = assistantText + linkSuffix;
+
+    // Emit turn-complete with the full content (transcript + links)
+    emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, links });
 
     // Fire-and-forget save — never blocks the audio stream
-    // Save only the clean assistant transcript — Gemini Live maintains its own session
-    // context and does not need tool results re-injected from DynamoDB on the next turn.
-    if (assistantText) {
+    if (assistantContent) {
       const messagesToSave = [];
       // Skip saving user turns that are STT noise from background audio — persisting
       // them corrupts the context window and causes repetitive/fragmented responses.
       if (userText && !isNoiseTurn(userText)) {
         messagesToSave.push({ role: 'user' as const, content: userText });
       }
-      messagesToSave.push({ role: 'assistant' as const, content: assistantText });
+      messagesToSave.push({ role: 'assistant' as const, content: assistantContent });
 
       chatbotDb.addMessagesToSession(sessionId, messagesToSave).catch((err) => {
         console.warn(`[liveVoiceService] Failed to save transcript for session ${sessionId}:`, err?.message);
