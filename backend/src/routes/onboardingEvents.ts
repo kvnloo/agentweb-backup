@@ -23,6 +23,7 @@ import {
   isOnboardingStage,
   OnboardingEvent,
 } from "../utils/onboardingStage";
+import { onOnboardingStageChanged } from "../services/contactCaptureHooks";
 
 const router = express.Router();
 
@@ -101,6 +102,7 @@ router.post("/events", authenticateToken, async (req, res) => {
     const newStage = deriveOnboardingStage(appended, {
       lastActiveAt: (user as any).lastActiveAt,
     });
+    const previousStage = (user as any).onboardingStage ?? null;
 
     const updated = await userDb.updateUser(userId, {
       onboardingEvents: appended,
@@ -109,6 +111,19 @@ router.post("/events", authenticateToken, async (req, res) => {
 
     if (!updated) {
       return res.status(404).json({ message: "User not found after update" });
+    }
+
+    // Mirror stage transitions into the contact activity timeline.
+    // Fire-and-forget — must never break the onboarding event handler.
+    if (newStage && newStage !== previousStage && user.email) {
+      onOnboardingStageChanged({
+        userId,
+        email: user.email,
+        fromStage: previousStage,
+        toStage: newStage,
+        triggeredByEvent: event,
+        changedAt: newEvent.ts,
+      }).catch(() => {});
     }
 
     return res.status(200).json({
