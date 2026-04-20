@@ -267,6 +267,13 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
             },
           ],
         },
+        // Tool result must follow for the tool_calls to be preserved (orphaned calls get stripped)
+        {
+          role: 'tool' as any,
+          content: 'result',
+          timestamp: '2025-01-01T00:02:01.000Z',
+          tool_call_id: 'call_123',
+        } as any,
       ];
 
       const messageContent = 'Great!';
@@ -416,6 +423,71 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
         (msg: any) => msg.role === 'user' && msg.content === messageContent
       );
       expect(taskStatusIndex).toBeLessThan(lastUserMessageIndex);
+    });
+
+    it('should strip orphaned tool_calls with no matching tool result', () => {
+      const sessionHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'System prompt',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'Do something',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+        // Assistant fires tool calls but no tool result follows (e.g. session crashed)
+        {
+          role: 'assistant',
+          content: '',
+          timestamp: '2025-01-01T00:02:00.000Z',
+          tool_calls: [
+            { id: 'orphan_1', type: 'function', function: { name: 'browse', arguments: '{}' } },
+          ],
+        } as any,
+      ];
+
+      const result = (agentModeService as any).buildMarketingContext('try again', sessionHistory, []);
+
+      // Orphaned assistant message should be removed entirely (empty content + stripped tool_calls)
+      const orphanedMsg = result.find((m: any) => m.role === 'assistant' && m.tool_calls?.some((tc: any) => tc.id === 'orphan_1'));
+      expect(orphanedMsg).toBeUndefined();
+    });
+
+    it('should preserve tool_calls that have matching tool results', () => {
+      const sessionHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'System prompt',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'Do something',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: '',
+          timestamp: '2025-01-01T00:02:00.000Z',
+          tool_calls: [
+            { id: 'valid_1', type: 'function', function: { name: 'browse', arguments: '{}' } },
+          ],
+        } as any,
+        {
+          role: 'tool' as any,
+          content: 'result text',
+          timestamp: '2025-01-01T00:02:01.000Z',
+          tool_call_id: 'valid_1',
+        } as any,
+      ];
+
+      const result = (agentModeService as any).buildMarketingContext('continue', sessionHistory, []);
+
+      const assistantMsg = result.find((m: any) => m.role === 'assistant' && m.tool_calls?.some((tc: any) => tc.id === 'valid_1'));
+      expect(assistantMsg).toBeDefined();
+      expect(assistantMsg.tool_calls).toHaveLength(1);
     });
   });
 });
