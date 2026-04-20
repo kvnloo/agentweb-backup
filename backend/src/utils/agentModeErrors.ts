@@ -40,6 +40,13 @@ export function isWorkerShutdownError(error: unknown): boolean {
 
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
 
+// Bedrock also returns ModelTimeoutException with a 500-class status — treat any
+// numeric httpStatusCode (from $metadata) that maps to a transient code as transient.
+const TRANSIENT_ERROR_NAMES = new Set(['TimeoutError', 'AbortError', 'ModelTimeoutException']);
+
+// String error codes (e.g. ETIMEDOUT from node-http-handler) treated as transient.
+const TRANSIENT_STRING_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED']);
+
 const TRANSIENT_MESSAGE_PATTERNS = [
   /throttl/i,
   /too many requests/i,
@@ -51,6 +58,8 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /socket hang up/i,
   /aborted.*timeout/i,
   /TimeoutError/i,
+  /request aborted/i,
+  /exceeded.*requestTimeout/i,
   /500/,
   /502/,
   /503/,
@@ -63,14 +72,21 @@ export function isTransientLLMError(error: unknown): boolean {
   // Don't retry context-limit errors — they need message trimming, not retries
   if (isContextLimitError(error)) return false;
 
+  const e = error as any;
   const message = error instanceof Error ? error.message : String(error);
   // Also check originalMessage from wrapped errors (generateMarketingResponse preserves it)
-  const originalMessage = (error as any)?.originalMessage || '';
-  const statusCode = (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status;
+  const originalMessage = e?.originalMessage || '';
 
-  if (typeof statusCode === 'number' && TRANSIENT_STATUS_CODES.includes(statusCode)) {
-    return true;
-  }
+  // Check by error name (TimeoutError from smithy requestTimeout, AbortError from AbortSignal,
+  // ModelTimeoutException from Bedrock)
+  if (e?.name && TRANSIENT_ERROR_NAMES.has(e.name)) return true;
+
+  // Check numeric HTTP status (standard status property, numeric code, Bedrock $metadata.httpStatusCode)
+  const httpStatus = e?.status ?? (typeof e?.code === 'number' ? e.code : undefined) ?? e?.$metadata?.httpStatusCode ?? e?.response?.status;
+  if (typeof httpStatus === 'number' && TRANSIENT_STATUS_CODES.includes(httpStatus)) return true;
+
+  // Check string error codes (ETIMEDOUT, ECONNRESET, etc.)
+  if (typeof e?.code === 'string' && TRANSIENT_STRING_CODES.has(e.code)) return true;
 
   return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
 }
