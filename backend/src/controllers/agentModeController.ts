@@ -1376,6 +1376,15 @@ export async function generateSessionResponse(
     throw new Error('Session not found');
   }
 
+  // Check message limit before starting a new turn so in-progress writes (e.g. tool
+  // system messages) that pushed the count over the limit don't silently drop the
+  // final assistant response. The check is intentionally at turn-start so writes during
+  // a turn are never blocked mid-flight.
+  const currentMessageCount = (await chatbotDb.getMessagesFromMessagesTable(sessionId)).length;
+  if (currentMessageCount >= MAX_MESSAGE_SIZE_PER_SESSION) {
+    throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`);
+  }
+
   // Process attachments and include URLs in message content for LLM
   let messageContent = userMessage;
   if (attachments && attachments.length > 0) {
