@@ -576,9 +576,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "stripe_customer_id = :scid",
+        FilterExpression: "stripe_customer_id = :scid AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":scid": stripeCustomerId,
+          ":tombstone": "deleted_",
         },
       };
 
@@ -598,9 +599,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "stripeConnectedAccountId = :cid",
+        FilterExpression: "stripeConnectedAccountId = :cid AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":cid": connectedAccountId,
+          ":tombstone": "deleted_",
         },
       };
       // Full table scan — small user base today, add a GSI if this becomes hot.
@@ -626,9 +628,10 @@ class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain',
+          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
+            ':tombstone': 'deleted_',
           },
           ExclusiveStartKey: lastEvaluatedKey,
         };
@@ -707,12 +710,13 @@ class UserDB {
     filterExpression: string,
     expressionAttributeValues: Record<string, any>,
   ): Promise<any[]> {
-    const hasValues = Object.keys(expressionAttributeValues).length > 0;
+    const combinedFilter = `NOT begins_with(userId, :_tombstone_prefix) AND (${filterExpression})`;
+    const combinedValues = { ...expressionAttributeValues, ':_tombstone_prefix': 'deleted_' };
     const result = await this.docClient
       .scan({
         TableName: this.tableName,
-        FilterExpression: filterExpression,
-        ...(hasValues && { ExpressionAttributeValues: expressionAttributeValues }),
+        FilterExpression: combinedFilter,
+        ExpressionAttributeValues: combinedValues,
       })
       .promise();
     return result.Items || [];
@@ -947,9 +951,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "resetPasswordToken = :token",
+        FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":token": resetToken,
+          ":tombstone": "deleted_",
         },
       };
 
