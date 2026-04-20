@@ -451,6 +451,43 @@ export async function sendTextTurn(sessionId: string, text: string): Promise<voi
 }
 
 /**
+ * Recursively walk a tool result object and collect URL artifacts.
+ * Field name patterns determine artifact type (image / file / url).
+ * Internal API URLs (containing /api/ paths or localhost) are skipped.
+ */
+function extractUrlArtifacts(
+  obj: Record<string, unknown>,
+  seen: Set<string>,
+  out: LiveArtifact[],
+  depth = 0,
+): void {
+  if (depth > 4) return; // avoid infinite recursion on deep objects
+  for (const [key, val] of Object.entries(obj)) {
+    if (typeof val === 'string' && val.startsWith('http')) {
+      if (!seen.has(val) && !val.includes('localhost') && !/\/api\//.test(val)) {
+        seen.add(val);
+        const k = key.toLowerCase();
+        if (k.includes('image') || k.includes('img') || k.includes('photo') || k.includes('thumbnail')) {
+          out.push({ type: 'image', label: 'Generated image', url: val });
+        } else if (k.includes('file') || k.includes('download') || k.includes('s3') || k.includes('export') || k.includes('report') || k.includes('csv') || k.includes('pdf')) {
+          out.push({ type: 'file', label: 'Download file', url: val });
+        } else if (k.includes('url') || k.includes('link') || k.includes('href') || k.includes('page') || k.includes('post') || k.includes('profile') || k.includes('html')) {
+          out.push({ type: 'url', label: 'View link', url: val });
+        }
+      }
+    } else if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
+      extractUrlArtifacts(val as Record<string, unknown>, seen, out, depth + 1);
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === 'object' && item !== null) {
+          extractUrlArtifacts(item as Record<string, unknown>, seen, out, depth + 1);
+        }
+      }
+    }
+  }
+}
+
+/**
  * Close the Gemini Live session for the given sessionId.
  */
 export function closeLiveSession(sessionId: string): void {
@@ -596,6 +633,13 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     const functionCalls = message.toolCall.functionCalls;
     console.log(`[liveVoiceService] Tool calls for ${sessionId}:`, functionCalls.map(fc => fc.name));
 
+    // Notify frontend so InlineToolExecutions cards appear while tools run
+    emitFn('live:tool-progress', {
+      sessionId,
+      status: 'executing',
+      toolNames: functionCalls.map(fc => fc.name!),
+    });
+
     // Execute all function calls in parallel
     const responses: any[] = await Promise.all(
       functionCalls.map(async (fc) => {
@@ -620,26 +664,8 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           // Extract artifacts (URLs, images, files) from tool results for UI display
           if (typeof result === 'object' && result !== null) {
             if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
-            const r = result as Record<string, unknown>;
-            // Social post preview page (create_social_media_posts)
-            if (typeof r.htmlUrl === 'string' && r.htmlUrl.startsWith('http')) {
-              entry.pendingArtifacts.push({ type: 'url', label: 'View posts', url: r.htmlUrl });
-            }
-            // Direct LinkedIn/social publish (post_on_connected_account)
-            if (typeof r.post_url === 'string' && r.post_url.startsWith('http')) {
-              entry.pendingArtifacts.push({ type: 'url', label: 'View post', url: r.post_url });
-            }
-            // Generated image (generate_image, generate_video_thumbnail, etc.)
-            if (typeof r.imageUrl === 'string' && r.imageUrl.startsWith('http')) {
-              entry.pendingArtifacts.push({ type: 'image', label: 'Generated image', url: r.imageUrl });
-            }
-            // S3-hosted file or report (download_file, export tools, etc.)
-            if (typeof r.s3_url === 'string' && r.s3_url.startsWith('http')) {
-              entry.pendingArtifacts.push({ type: 'file', label: 'Download file', url: r.s3_url });
-            }
-            if (typeof r.file_url === 'string' && r.file_url.startsWith('http')) {
-              entry.pendingArtifacts.push({ type: 'file', label: 'Download file', url: r.file_url });
-            }
+            const seen = new Set(entry.pendingArtifacts.map(a => a.url));
+            extractUrlArtifacts(result as Record<string, unknown>, seen, entry.pendingArtifacts);
           }
         } catch (err: any) {
           console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);

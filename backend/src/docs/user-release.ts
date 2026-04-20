@@ -4670,6 +4670,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Improved: Emma Now Shows Tool Progress and Links When Using the Live Voice Model',
+      '- When Emma calls a tool during a live voice session (e.g. searching the web, writing a blog), spinning progress cards now appear in real time',
+      '- URLs returned by tools (post links, generated images, files) are now reliably surfaced as clickable links after the turn completes',
+      '- Emma\'s in-app chat sidebar now correctly shows the tool name (e.g. "search_web") while a tool is running, instead of always showing "Thinking..."',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Improved: Context Limit Errors Are Now Automatically Reported',
       '- When a conversation exceeds the model context window, an issue is automatically filed so the team can follow up',
       '- If the same session hits the limit multiple times, only one report is filed',
