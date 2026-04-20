@@ -2370,6 +2370,29 @@ export class AgentModeService {
       messages.push(messageObj);
     }
 
+    // Strip orphaned tool_calls — assistant messages whose tool IDs have no matching
+    // tool_call_id in the history. This happens when a prior LLM (e.g. Gemini) fired
+    // tool calls but the session crashed before results were stored. Sending these
+    // to Bedrock causes a 400 ValidationException.
+    const seenToolResultIds = new Set(
+      messages
+        .filter((m: any) => m.role === 'tool' && m.tool_call_id)
+        .map((m: any) => m.tool_call_id as string)
+    );
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role === 'assistant' && msg.tool_calls?.length > 0) {
+        const validCalls = msg.tool_calls.filter((tc: any) => seenToolResultIds.has(tc.id));
+        if (validCalls.length < msg.tool_calls.length) {
+          msg.tool_calls = validCalls.length > 0 ? validCalls : undefined;
+          // If nothing left, remove the whole message
+          if (!msg.tool_calls && !msg.content) {
+            messages.splice(i, 1);
+          }
+        }
+      }
+    }
+
     // Insert current task statuses as an assistant message before the final user message
     const statusEmoji: Record<string, string> = {
       pending: '⏳',
