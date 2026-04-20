@@ -4709,6 +4709,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When an admin changes a user\'s email address, the old record is tombstoned (marked as deleted) in the database',
       '- Previously, Stripe webhook processing could land on the tombstoned record instead of the live account, causing subscription status updates to be silently lost',
       '- Tombstoned records are now excluded from all database lookups used by Stripe webhooks, reset-password flows, and domain-based queries',
+      'Fixed: Scheduled Playwright Sessions No Longer Fail After Many Screenshots',
+      '- Scheduled health checks and automation sessions that take 10+ screenshots no longer crash with a request error',
+      '- Previously, base64 screenshot images accumulated in the conversation context during a long session, eventually exceeding the API request size limit',
+      '- Now only the most recent screenshot image is sent to the AI; earlier screenshots are replaced with lightweight text placeholders',
     ],
   },
   {
