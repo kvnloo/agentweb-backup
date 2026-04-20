@@ -193,6 +193,26 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       expect(messages[1].content).toEqual([{ text: '' }]);
     });
 
+    it('should handle tool_calls stored as a JSON string (legacy/corrupt data)', () => {
+      const { messages } = AgentModeService.convertToBedrockConverse([
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: JSON.stringify([{
+            id: 'call_1',
+            function: { name: 'test_tool', arguments: '{"key":"value"}' },
+          }]),
+        },
+      ]);
+
+      // Should parse the string and emit a toolUse block rather than crashing
+      const toolUseBlock = messages[1].content.find((b: any) => b.toolUse);
+      expect(toolUseBlock).toBeDefined();
+      expect(toolUseBlock.toolUse.name).toBe('test_tool');
+      expect(toolUseBlock.toolUse.input).toEqual({ key: 'value' });
+    });
+
     it('should handle malformed tool call arguments gracefully', () => {
       const { messages } = AgentModeService.convertToBedrockConverse([
         { role: 'user', content: 'go' },

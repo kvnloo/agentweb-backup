@@ -991,8 +991,13 @@ export class AgentModeService {
           if (textContent) contentBlocks.push({ text: textContent });
         }
         // Tool use blocks
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          for (const tc of msg.tool_calls) {
+        // Guard against tool_calls stored as a JSON string (legacy/corrupt data)
+        const toolCallsArray = typeof msg.tool_calls === 'string'
+          ? (() => { try { return JSON.parse(msg.tool_calls); } catch { return []; } })()
+          : msg.tool_calls;
+        if (toolCallsArray && toolCallsArray.length > 0) {
+          for (const tc of toolCallsArray) {
+            if (!tc?.function) continue;
             let input: any;
             try {
               input = typeof tc.function.arguments === 'string'
