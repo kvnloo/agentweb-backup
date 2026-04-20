@@ -23,8 +23,8 @@ import { agentModeService } from './agentModeService';
 // ---------------------------------------------------------------------------
 
 export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
-const LIVE_VOICE_NAME = 'Zephyr';
-const AUDIO_MIME_TYPE = 'audio/pcm;rate=16000';
+// Kore: warm and smooth female voice — less shaky than Zephyr in live sessions
+const LIVE_VOICE_NAME = 'Kore';
 
 /**
  * System prompt that instructs Gemini to use emotion tags for expressive TTS.
@@ -71,7 +71,7 @@ interface LiveEntry {
   /** Structured artifacts extracted from tool results this turn */
   pendingArtifacts: LiveArtifact[];
   /** Tool call records for the current turn — surfaced in chat UI as collapsible "Used N tools" block */
-  pendingToolCalls: Array<{ id: string; name: string; arguments: any; result?: any; error?: string }>;
+  pendingToolCalls: Array<{ id: string; name: string; arguments: any; result?: any; error?: string; narrative?: string }>;
   /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
   resumptionHandle?: string;
   /** Cached function declarations so reconnects reuse the same tool config without reloading */
@@ -450,40 +450,70 @@ export async function sendTextTurn(sessionId: string, text: string): Promise<voi
   });
 }
 
+const ARTIFACT_EXTRACT_MODEL = 'gemini-3.1-flash-lite-preview';
+
 /**
- * Recursively walk a tool result object and collect URL artifacts.
- * Field name patterns determine artifact type (image / file / url).
- * Internal API URLs (containing /api/ paths or localhost) are skipped.
+ * Use a fast LLM to both summarize a tool result in natural language and extract
+ * meaningful URLs. Both happen in one call to minimize latency.
+ *
+ * Returns a natural-language narrative (1-2 sentences describing what the tool did)
+ * and appends any content-quality URLs to `out`.
  */
-function extractUrlArtifacts(
-  obj: Record<string, unknown>,
+async function summarizeToolResult(
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  toolResult: Record<string, unknown>,
   seen: Set<string>,
   out: LiveArtifact[],
-  depth = 0,
-): void {
-  if (depth > 4) return; // avoid infinite recursion on deep objects
-  for (const [key, val] of Object.entries(obj)) {
-    if (typeof val === 'string' && val.startsWith('http')) {
-      if (!seen.has(val) && !val.includes('localhost') && !/\/api\//.test(val)) {
-        seen.add(val);
-        const k = key.toLowerCase();
-        if (k.includes('image') || k.includes('img') || k.includes('photo') || k.includes('thumbnail')) {
-          out.push({ type: 'image', label: 'Generated image', url: val });
-        } else if (k.includes('file') || k.includes('download') || k.includes('s3') || k.includes('export') || k.includes('report') || k.includes('csv') || k.includes('pdf')) {
-          out.push({ type: 'file', label: 'Download file', url: val });
-        } else if (k.includes('url') || k.includes('link') || k.includes('href') || k.includes('page') || k.includes('post') || k.includes('profile') || k.includes('html')) {
-          out.push({ type: 'url', label: 'View link', url: val });
-        }
-      }
-    } else if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
-      extractUrlArtifacts(val as Record<string, unknown>, seen, out, depth + 1);
-    } else if (Array.isArray(val)) {
-      for (const item of val) {
-        if (typeof item === 'object' && item !== null) {
-          extractUrlArtifacts(item as Record<string, unknown>, seen, out, depth + 1);
-        }
+): Promise<string | undefined> {
+  const resultJson = JSON.stringify(toolResult).slice(0, 3000);
+  const argsJson = JSON.stringify(toolArgs).slice(0, 500);
+
+  const prompt = `You are a concise result interpreter for an AI assistant. Given a tool call and its result, produce two things:
+
+1. "narrative": A 1-2 sentence natural-language summary of what was accomplished. Be specific and human-readable. Use past tense. Examples:
+   - "Found 12 leads matching the criteria. The top result is Acme Corp with 250 employees."
+   - "Published the blog post 'Q1 Marketing Trends' to the website."
+   - "Retrieved the last 30 days of ad spend: $4,230 total across 3 campaigns."
+   - "No results found for the search query."
+
+2. "artifacts": A JSON array of meaningful URLs to surface to the user. Include only content pages, articles, posts, profiles, reports, downloads, or generated images. SKIP icons, favicons, tracking pixels, CDN assets, nav/UI links, and internal API paths.
+   Each artifact: {"type": "url"|"image"|"file", "label": "<short label>", "url": "<full url>"}
+
+Return ONLY valid JSON in this exact shape:
+{"narrative": "...", "artifacts": [...]}
+
+Tool name: ${toolName}
+Tool arguments: ${argsJson}
+Tool result: ${resultJson}`;
+
+  try {
+    const response = await agentModeService.callLLM(
+      ARTIFACT_EXTRACT_MODEL,
+      [{ role: 'user', content: prompt }],
+      { max_completion_tokens: 600, temperature: 0 },
+    );
+    const text = (response as any)?.choices?.[0]?.message?.content?.trim() ?? '';
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return undefined;
+    const parsed: { narrative?: string; artifacts?: Array<{ type: string; label: string; url: string }> } = JSON.parse(match[0]);
+
+    // Extract artifacts
+    for (const item of parsed.artifacts ?? []) {
+      if (typeof item.url === 'string' && item.url.startsWith('http') && !seen.has(item.url)) {
+        seen.add(item.url);
+        out.push({
+          type: (item.type === 'image' || item.type === 'file') ? item.type : 'url',
+          label: item.label || 'View link',
+          url: item.url,
+        });
       }
     }
+
+    return parsed.narrative || undefined;
+  } catch (err: any) {
+    console.warn('[liveVoiceService] LLM tool summarization failed, skipping:', err?.message);
+    return undefined;
   }
 }
 
@@ -658,15 +688,16 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
           entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
+          // Summarize result in natural language and extract artifacts in one LLM call
+          if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
+          const seenUrls = new Set(entry.pendingArtifacts.map(a => a.url));
+          const resultObj = typeof result === 'object' && result !== null
+            ? result as Record<string, unknown>
+            : { result: text };
+          const narrative = await summarizeToolResult(fc.name!, fc.args ?? {}, resultObj, seenUrls, entry.pendingArtifacts);
           // Record for UI display (collapsible "Used N tools" block, like other models)
           if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
-          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, result });
-          // Extract artifacts (URLs, images, files) from tool results for UI display
-          if (typeof result === 'object' && result !== null) {
-            if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
-            const seen = new Set(entry.pendingArtifacts.map(a => a.url));
-            extractUrlArtifacts(result as Record<string, unknown>, seen, entry.pendingArtifacts);
-          }
+          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, result, narrative });
         } catch (err: any) {
           console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
           responseContent = { error: err?.message ?? 'Tool execution failed' };
