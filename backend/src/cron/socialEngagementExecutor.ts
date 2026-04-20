@@ -283,8 +283,8 @@ export class SocialEngagementExecutor {
             const comments = await adapter.getComments(engagingConnection, targetUrn, engagingUserId);
             return comments.some((c) => c.actorUrn === engagingConnection.account_id);
         } catch (err) {
-            console.warn(`[Executor] Could not fetch comments for dedup check on ${targetUrn}:`, err);
-            return false; // Fail open — don't block commenting if the check fails
+            console.warn(`[Executor] Could not fetch comments for dedup check on ${targetUrn}, assuming already commented to prevent duplicates:`, err);
+            return true; // Fail closed — skip commenting when check fails to prevent duplicate posts
         }
     }
 
