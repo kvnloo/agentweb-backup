@@ -96,6 +96,8 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
+  onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
   brandGuidelines?: {
     brandData: {
       brandName: string;
