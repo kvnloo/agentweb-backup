@@ -26,6 +26,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When Emma calls get_website_analytics or get_seo_metrics, the tool response now explicitly reports the integration status and lists all configured properties/domains',
       '- Previously, if audit.agentweb.pro pages showed 0 sessions, Emma would ask the user for a GA4 Measurement ID — not realising GA4 was already connected but the subdomain wasn\'t tracked by that property',
       '- Emma can now distinguish "not configured" from "configured but missing tracking on this subdomain", and will offer to add tracking rather than asking for credentials',
+      'Fix: Onboarding Checklist Progress Now Persists Across Devices',
+      '- Onboarding checklist state (completed steps and dismissed status) is now saved to your account instead of browser storage only',
+      '- Your progress is restored correctly when you log in on a new device or browser',
     ],
   },
   {
