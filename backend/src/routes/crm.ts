@@ -753,7 +753,7 @@ router.get('/contacts', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { listType, listIds, limit, sort } = req.query as Record<string, string | undefined>;
+    const { listType, listIds, limit, sort, cursor } = req.query as Record<string, string | undefined>;
 
     if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
       return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
@@ -772,6 +772,15 @@ router.get('/contacts', async (req: Request, res: Response) => {
       parsedLimit = Math.floor(n);
     }
 
+    if (cursor !== undefined) {
+      try {
+        const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error();
+      } catch {
+        return res.status(400).json({ message: 'Invalid cursor' });
+      }
+    }
+
     const parsedListIds = listIds
       ? listIds.split(',').map((s) => s.trim()).filter(Boolean)
       : undefined;
@@ -783,6 +792,8 @@ router.get('/contacts', async (req: Request, res: Response) => {
       listIds: parsedListIds,
       limit: parsedLimit,
       sort: sort as 'heat' | 'recent' | undefined,
+      cursor,
+      rawFetchLimit: 5000,
     });
     const durationMs = Date.now() - started;
 
@@ -791,6 +802,8 @@ router.get('/contacts', async (req: Request, res: Response) => {
       total: result.total,
       rawCount: result.rawCount,
       listsCount: result.listsCount,
+      nextCursor: result.nextCursor,
+      hasMore: result.hasMore,
       durationMs,
     });
   } catch (error: any) {

@@ -193,5 +193,82 @@ describe('contactDedupService', () => {
       expect(result.total).toBe(1);
       expect(result.contacts[0].email).toBe('ok@x.com');
     });
+
+    // ── cursor + rawFetchLimit ────────────────────────────────────────────────
+
+    it('throws when rawFetchLimit is less than 1', async () => {
+      await expect(
+        dedupContactsForUser({ userId: 'u1', rawFetchLimit: 0 }),
+      ).rejects.toThrow(/rawFetchLimit/);
+    });
+
+    it('throws when cursor is not valid base64-encoded JSON', async () => {
+      await expect(
+        dedupContactsForUser({ userId: 'u1', cursor: '!!!not-base64' }),
+      ).rejects.toThrow(/cursor/i);
+    });
+
+    it('throws when cursor decodes to non-object JSON', async () => {
+      const badCursor = Buffer.from('["not","an","object"]').toString('base64');
+      await expect(
+        dedupContactsForUser({ userId: 'u1', cursor: badCursor }),
+      ).rejects.toThrow(/cursor/i);
+    });
+
+    it('returns hasMore: false and no nextCursor when all lists are exhausted', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
+        { listId: 'L1', name: 'Sales', listType: 'sales' },
+      ]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [{ leadId: '1', email: 'a@x.com', engagementCount: 1 }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+      expect(result.hasMore).toBe(false);
+      expect(result.nextCursor).toBeUndefined();
+    });
+
+    it('returns hasMore: true and a decodable nextCursor when a list has more leads', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
+        { listId: 'L1', name: 'Sales', listType: 'sales' },
+      ]);
+      const resumeKey = { listId: 'L1', leadId: 'cursor-key' };
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [{ leadId: '1', email: 'a@x.com', engagementCount: 1 }],
+        lastEvaluatedKey: resumeKey,
+        hasMore: true,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1', rawFetchLimit: 1 });
+      expect(result.hasMore).toBe(true);
+      expect(result.nextCursor).toBeDefined();
+      const decoded = JSON.parse(
+        Buffer.from(result.nextCursor!, 'base64').toString('utf8'),
+      );
+      expect(decoded['L1']).toEqual(resumeKey);
+    });
+
+    it('passes the decoded per-list key from cursor to getLeadsByListId', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
+        { listId: 'L1', name: 'Sales', listType: 'sales' },
+      ]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const startKey = { listId: 'L1', leadId: 'some-lead-id' };
+      const cursor = Buffer.from(JSON.stringify({ L1: startKey })).toString('base64');
+
+      await dedupContactsForUser({ userId: 'u1', cursor });
+      expect(crmDb.getLeadsByListId).toHaveBeenCalledWith(
+        'L1',
+        expect.any(Number),
+        startKey,
+      );
+    });
   });
 });

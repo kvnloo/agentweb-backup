@@ -52,6 +52,7 @@ jest.spyOn(CrmEnrichmentService.prototype, 'execute').mockResolvedValue({
   jobId: 'job-123',
   processedCount: 80,
   failedCount: 0,
+  skippedCount: 0,
   totalToProcess: 80,
   outputFields: ['industry'],
   failureBreakdown: { searchWebFailed: 0, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },

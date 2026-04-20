@@ -54,6 +54,7 @@ interface EnrichmentExecuteResult {
   jobId: string;
   processedCount: number;
   failedCount: number;
+  skippedCount: number;
   totalToProcess: number;
   outputFields: string[];
   failureBreakdown: {
@@ -143,8 +144,8 @@ export class CrmEnrichmentService {
     return linkedInOutreachService.resolveAccountId(userId);
   }
 
-  private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
-  private static readonly SUGGEST_MODEL = 'gemini-3.1-flash-lite-preview';
+  private static readonly ENRICH_MODEL = 'gemini-3-flash-preview';
+  private static readonly SUGGEST_MODEL = 'gemini-3-flash-preview';
 
   // Free/personal email providers — using their domain as a company identifier produces wrong results
   private static readonly PERSONAL_EMAIL_DOMAINS = new Set([
@@ -245,25 +246,25 @@ export class CrmEnrichmentService {
     for (const field of outputFields) {
       const fl = field.toLowerCase();
       if (/company_linkedin|company.*linkedin|linkedin.*company/.test(fl)) {
-        lines.push(`- "${field}": Return ONLY the official LinkedIn company page URL in the format "https://www.linkedin.com/company/<slug>" (e.g. "https://www.linkedin.com/company/acme-corp"). Search for it in the web search results. This is a company page, not a personal profile — the URL path must start with /company/. Return "Unknown" if no valid /company/ URL is found.`);
+        lines.push(`- "${field}": ONLY copy a LinkedIn company page URL that appears verbatim in the web search results above. The URL must start with "https://www.linkedin.com/company/". Do NOT construct, guess, or complete a URL. Return "Unknown" if no exact /company/ URL is present in the data.`);
       } else if (/linkedin/.test(fl)) {
-        lines.push(`- "${field}": Return ONLY a full linkedin.com/in/ profile URL (e.g. "https://www.linkedin.com/in/john-doe-123"). Look in "LinkedIn profile URLs found in search results" first. If a /pub/dir/ or /search/ URL appears, do NOT use it — those are directory pages, not profiles. Return "Unknown" if no valid /in/ URL is found.`);
+        lines.push(`- "${field}": ONLY copy a linkedin.com/in/ URL that appears verbatim in the provided data (look in "LinkedIn profile URLs found in search results" and "Resolved LinkedIn profile URL"). Do NOT construct, guess, or complete a URL — even if you think you know the person's LinkedIn handle. Do NOT use /pub/dir/ or /search/ URLs. Return "Unknown" if no exact /in/ URL is present in the data.`);
       } else if (/employee|headcount|team_size|staff|workforce/.test(fl)) {
-        lines.push(`- "${field}": Prefer an exact number if found. A LinkedIn range (e.g. "11-50 employees") is also acceptable. If no explicit count is found, estimate a range based on how the company is described (solo/boutique → "1-10", early-stage startup → "11-50", growth-stage → "51-200", mid-market → "201-1000"). Only return "Unknown" if the company itself cannot be identified at all.`);
+        lines.push(`- "${field}": Return only an explicit headcount or range stated in the provided data (e.g. "11-50 employees", "~200"). Do NOT estimate or infer from company descriptions. Return "Unknown" if no figure is stated.`);
       } else if (/funding|invest|raised|series|venture|round/.test(fl)) {
-        lines.push(`- "${field}": Look for VC rounds, grants, or angel investment mentions. If found, state the stage and amount (e.g. "Seed - $1.5M", "Series A - $8M"). If no funding info is found anywhere, return "Bootstrapped / Not publicly funded". Only return "Unknown" if the company cannot be confirmed to exist.`);
+        lines.push(`- "${field}": Look for VC rounds, grants, or angel investment mentions explicitly stated in the data. If found, state the stage and amount (e.g. "Seed - $1.5M", "Series A - $8M"). If no funding info is present anywhere, return "Bootstrapped / Not publicly funded". Return "Unknown" only if the company cannot be confirmed to exist.`);
       } else if (/revenue|arr|mrr|income|sales/.test(fl)) {
-        lines.push(`- "${field}": Look for revenue or ARR/MRR figures. If not publicly available, return "Not publicly disclosed".`);
+        lines.push(`- "${field}": Return only revenue or ARR/MRR figures explicitly stated in the data. If not present, return "Not publicly disclosed".`);
       } else if (/tech_stack|technology/.test(fl)) {
-        lines.push(`- "${field}": Look for technology mentions in search results or job postings. If not explicit, infer from product category. Return "Not publicly disclosed" if no signals found.`);
+        lines.push(`- "${field}": Return only technologies explicitly mentioned in the search results or LinkedIn data. Do NOT infer from product category. Return "Not publicly disclosed" if no signals are found.`);
       } else if (/industry|sector|vertical/.test(fl)) {
-        lines.push(`- "${field}": Always infer from the company description — never return "Unknown" for industry.`);
+        lines.push(`- "${field}": Extract from the company description in the provided data. Return "Unknown" if the company's industry cannot be clearly determined.`);
       } else {
-        lines.push(`- "${field}": If not found directly, use the best available context to infer a reasonable value. Return "Unknown" only if no inference is possible.`);
+        lines.push(`- "${field}": Return only what is explicitly stated in the provided data. Return "Unknown" if not present.`);
       }
     }
     if (lines.length === 0) {
-      return 'If you cannot determine a field\'s value from the provided data, use "Unknown" as the value.';
+      return 'If a field\'s value is not present in the provided data, return "Unknown".';
     }
     return `Field-specific guidance (follow these rules strictly):\n${lines.join('\n')}`;
   }
@@ -273,6 +274,16 @@ export class CrmEnrichmentService {
     spec: EnrichmentJobSpec,
     linkedInAccountId?: string | null,
   ): Promise<{ fields: Record<string, string> }> {
+    // Skip leads with personal email and no company — nothing reliable to search against
+    const isPersonal = CrmEnrichmentService.isPersonalEmailDomain(lead.email || '');
+    const hasCompanyId = !!(lead.company?.trim());
+    if (isPersonal && !hasCompanyId) {
+      throw Object.assign(
+        new Error(`Skipped: personal email (${lead.email}) with no company identification`),
+        { step: 'skipped_personal' }
+      );
+    }
+
     let webContext = '';
     let linkedinContext = '';
 
@@ -413,16 +424,18 @@ export class CrmEnrichmentService {
     // Substitute {{placeholder}} tokens in instruction with actual lead values
     const resolvedInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
 
-    const systemPrompt = `You are a data enrichment analyst.
+    const systemPrompt = `You are a data extraction assistant. Your job is to extract factual information from the provided sources — not to infer, guess, or fabricate.
+
+CRITICAL RULE: Only return values that are explicitly stated in the provided Lead context, Web search results, or LinkedIn data. If a value is not present in the provided data, return "Unknown". Do NOT construct, guess, or invent any value — especially URLs.
 
 Your task: ${resolvedInstruction}
 
 Return ONLY a JSON object with these exact keys: ${JSON.stringify(spec.outputFields)}
-Each value should be a string.
+Each value must be a string.
 
 JSON formatting rules (mandatory):
 - Output must be valid JSON parsable by JSON.parse
-- Use double quotes for keys and string values
+- Use double quotes for all keys and string values
 - Do not wrap output in markdown or code fences
 - Do not include any text before or after the JSON object
 
@@ -432,16 +445,17 @@ ${CrmEnrichmentService.buildFieldGuidance(spec.outputFields)}`;
 ${JSON.stringify(leadContext, null, 2)}
 ${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}
 
-Extract the requested fields now.`;
+Extract only what is explicitly present in the sources above. Do not infer or fabricate any value. Return "Unknown" for any field not found in the data.`;
 
-
+console.log("userPrompt:::", userPrompt);
+console.log("systemPrompt:::", systemPrompt);
     // Call Gemini via the shared OpenAI-compatible client
     const geminiClient = await agentModeService.getGeminiClient();
     let response: Record<string, string> | null = null;
     try {
       const completion = await geminiClient.chat.completions.create({
         model: CrmEnrichmentService.ENRICH_MODEL,
-        temperature: 1,
+        temperature: 0,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -462,7 +476,7 @@ Valid example:
 
       const retry = await geminiClient.chat.completions.create({
         model: CrmEnrichmentService.ENRICH_MODEL,
-        temperature: 1,
+        temperature: 0,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: strictRetryPrompt },
@@ -607,6 +621,7 @@ Valid example:
         jobId,
         processedCount: 0,
         failedCount: 0,
+        skippedCount: 0,
         totalToProcess: 0,
         outputFields: spec.outputFields,
         failureBreakdown: { searchWebFailed: 0, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },
@@ -654,6 +669,7 @@ Valid example:
 
     let totalProcessedCount = 0;
     let totalFailedCount = 0;
+    let totalSkippedCount = 0;
     const failureBreakdown = {
       searchWebFailed: 0,
       linkedinFailed: 0,
@@ -680,24 +696,28 @@ Valid example:
           totalProcessedCount++;
         } catch (error: any) {
           const step = error?.step || 'unknown';
-          if (step === 'search') {
-            failureBreakdown.searchWebFailed++;
-          } else if (step === 'linkedin') {
-            failureBreakdown.linkedinFailed++;
-          } else if (step === 'llm') {
-            failureBreakdown.llmOrParseFailed++;
+          if (step === 'skipped_personal') {
+            totalSkippedCount++;
+            console.log(`[CrmEnrichment] Skipped lead ${lead?.leadId}: ${error.message}`);
           } else {
-            // Check if it's an update error or llm error
-            failureBreakdown.llmOrParseFailed++;
+            if (step === 'search') {
+              failureBreakdown.searchWebFailed++;
+            } else if (step === 'linkedin') {
+              failureBreakdown.linkedinFailed++;
+            } else if (step === 'llm') {
+              failureBreakdown.llmOrParseFailed++;
+            } else {
+              failureBreakdown.llmOrParseFailed++;
+            }
+            totalFailedCount++;
+            console.error(`[CrmEnrichment] Failed to enrich lead ${lead?.leadId}:`, error);
           }
-          totalFailedCount++;
-          console.error(`[CrmEnrichment] Failed to enrich lead ${lead?.leadId}:`, error);
         }
 
-        const completed = totalProcessedCount + totalFailedCount;
+        const completed = totalProcessedCount + totalFailedCount + totalSkippedCount;
         const progress = Math.min((completed / leadsToProcess.length) * 100, 100);
         emitProgress(
-          `Enriching ${completed}/${leadsToProcess.length} (${totalProcessedCount} enriched, ${totalFailedCount} failed)`,
+          `Enriching ${completed}/${leadsToProcess.length} (${totalProcessedCount} enriched, ${totalFailedCount} failed, ${totalSkippedCount} skipped)`,
           progress,
           totalProcessedCount,
           totalFailedCount,
@@ -714,12 +734,17 @@ Valid example:
       console.error('[CrmEnrichment] Failed to update field names:', err);
     }
 
+    if (totalSkippedCount > 0) {
+      warnings.push(`${totalSkippedCount} lead(s) skipped — personal email with no company identification`);
+    }
+
     // Emit completion event
     const completionPayload = {
       jobId,
       listId: spec.listId,
       processedCount: totalProcessedCount,
       failedCount: totalFailedCount,
+      skippedCount: totalSkippedCount,
       outputFields: spec.outputFields,
       failureBreakdown,
     };
@@ -734,6 +759,7 @@ Valid example:
       jobId,
       processedCount: totalProcessedCount,
       failedCount: totalFailedCount,
+      skippedCount: totalSkippedCount,
       totalToProcess: leadsToProcess.length,
       outputFields: spec.outputFields,
       failureBreakdown,

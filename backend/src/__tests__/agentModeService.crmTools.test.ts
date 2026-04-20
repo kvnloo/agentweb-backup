@@ -172,17 +172,74 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.leads).toHaveLength(2);
     });
 
-    it('should cap limit at 50', async () => {
-      const leads = Array.from({ length: 60 }, (_, i) => ({ ...mockLead, leadId: `lead-${i}` }));
+    it('should cap limit at 100', async () => {
+      const leads = Array.from({ length: 110 }, (_, i) => ({ ...mockLead, leadId: `lead-${i}` }));
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: leads,
         lastEvaluatedKey: undefined,
       } as any);
 
-      const result = await service.getLeads(listId, userId, { limit: 100 });
+      const result = await service.getLeads(listId, userId, { limit: 200 });
 
-      expect(result.leads.length).toBeLessThanOrEqual(50);
+      expect(result.leads.length).toBeLessThanOrEqual(100);
+    });
+
+    it('should return next_cursor and has_more when more results exist', async () => {
+      const dynKey = { pk: 'lead-xyz', sk: 'list-abc' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: dynKey,
+      } as any);
+
+      const result = await service.getLeads(listId, userId, { limit: 1 });
+
+      expect(result.success).toBe(true);
+      expect(result.has_more).toBe(true);
+      expect(result.next_cursor).toBe(Buffer.from(JSON.stringify(dynKey)).toString('base64'));
+    });
+
+    it('should return has_more false and no next_cursor when no more results', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.getLeads(listId, userId, {});
+
+      expect(result.has_more).toBe(false);
+      expect(result.next_cursor).toBeUndefined();
+    });
+
+    it('should accept cursor input and pass decoded key to DB', async () => {
+      const dynKey = { pk: 'lead-xyz' };
+      const encodedCursor = Buffer.from(JSON.stringify(dynKey)).toString('base64');
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.getLeads(listId, userId, { cursor: encodedCursor });
+
+      expect(result.success).toBe(true);
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledWith(listId, expect.any(Number), dynKey);
+    });
+
+    it('should ignore invalid cursor and start from beginning', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.getLeads(listId, userId, { cursor: 'not-valid-base64!!!' });
+
+      expect(result.success).toBe(true);
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledWith(listId, expect.any(Number), undefined);
     });
 
     it('should search custom fields', async () => {
@@ -362,6 +419,168 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(true);
       expect(result.leads).toHaveLength(1);
       expect(result.leads[0].icpScore).toBe(30);
+    });
+
+    it('should support ilike operator with contains pattern (%text%)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, { ...mockLead, leadId: 'lead-2', company: 'Beta LLC' }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'ilike', value: '%Acme%' }
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].company).toBe('Acme Corp');
+    });
+
+    it('should support ilike operator with starts_with pattern (text%)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, { ...mockLead, leadId: 'lead-2', email: 'jane@other.com' }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'email', operator: 'ilike', value: 'john%' }
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].email).toBe('john@acme.com');
+    });
+
+    it('should support ilike operator with ends_with pattern (%text)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, { ...mockLead, leadId: 'lead-2', email: 'jane@gmail.com' }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'email', operator: 'ilike', value: '%@acme.com' }
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].email).toBe('john@acme.com');
+    });
+
+    it('should support ilike operator case-insensitively', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, { ...mockLead, leadId: 'lead-2', company: 'Beta LLC' }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'ilike', value: '%acme%' }
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+    });
+
+    it('should support cross-field keyword search', async () => {
+      const lead2 = { ...mockLead, leadId: 'lead-2', email: 'jane@beta.com', firstName: 'Jane', company: 'Beta LLC' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, lead2],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'equals', value: 'Acme Corp' }
+      ], userId, undefined, { search: 'Acme' });
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].company).toBe('Acme Corp');
+    });
+
+    it('should apply search AND filters together', async () => {
+      const lead2 = { ...mockLead, leadId: 'lead-2', title: 'Designer', company: 'Acme Corp' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, lead2],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      // Search for "Acme" AND filter title contains "VP"
+      const result = await service.searchLeads(listId, [
+        { field: 'title', operator: 'contains', value: 'VP' }
+      ], userId, undefined, { search: 'Acme' });
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].leadId).toBe(leadId);
+    });
+
+    it('should return next_cursor and has_more when more results exist', async () => {
+      const dynKey = { pk: 'lead-xyz' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: dynKey,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'equals', value: 'Acme Corp' }
+      ], userId, 1);
+
+      expect(result.success).toBe(true);
+      expect(result.has_more).toBe(true);
+      expect(result.next_cursor).toBe(Buffer.from(JSON.stringify(dynKey)).toString('base64'));
+    });
+
+    it('should return has_more false when no more results', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'equals', value: 'Acme Corp' }
+      ], userId);
+
+      expect(result.has_more).toBe(false);
+      expect(result.next_cursor).toBeUndefined();
+    });
+
+    it('should accept cursor input and pass decoded key to DB', async () => {
+      const dynKey = { pk: 'lead-xyz' };
+      const encodedCursor = Buffer.from(JSON.stringify(dynKey)).toString('base64');
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      await service.searchLeads(listId, [
+        { field: 'email', operator: 'contains', value: 'john' }
+      ], userId, undefined, { cursor: encodedCursor });
+
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledWith(listId, 200, dynKey);
+    });
+
+    it('should cap limit at 100', async () => {
+      const leads = Array.from({ length: 110 }, (_, i) => ({ ...mockLead, leadId: `lead-${i}` }));
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: leads,
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'email', operator: 'is_not_empty' }
+      ], userId, 200);
+
+      expect(result.leads.length).toBeLessThanOrEqual(100);
     });
   });
 

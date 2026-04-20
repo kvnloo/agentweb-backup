@@ -2670,7 +2670,11 @@ emmaToolRegistry.register({
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of leads to return (default 20, max 50)'
+          description: 'Maximum number of leads to return (default 20, max 100)'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
         }
       },
       required: ['list_id']
@@ -2682,7 +2686,8 @@ emmaToolRegistry.register({
       status: args.status,
       icpOnly: args.icp_only,
       engagedOnly: args.engaged_only,
-      limit: args.limit
+      limit: args.limit,
+      cursor: args.cursor
     });
   }
 });
@@ -2691,7 +2696,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic.',
+    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2710,8 +2715,8 @@ emmaToolRegistry.register({
               },
               operator: {
                 type: 'string',
-                enum: ['equals', 'contains', 'starts_with', 'greater_than', 'less_than', 'not_equals', 'is_empty', 'is_not_empty'],
-                description: 'Comparison operator'
+                enum: ['equals', 'contains', 'starts_with', 'greater_than', 'less_than', 'not_equals', 'is_empty', 'is_not_empty', 'ilike'],
+                description: 'Comparison operator. ilike supports SQL-style wildcards: % matches any sequence of characters, _ matches any single character (case-insensitive). Example: "%@gmail.com" matches any Gmail address.'
               },
               value: {
                 description: 'The value to compare against (not required for is_empty/is_not_empty)'
@@ -2721,16 +2726,27 @@ emmaToolRegistry.register({
           },
           description: 'Array of filter criteria (AND logic — all must match)'
         },
+        search: {
+          type: 'string',
+          description: 'Optional keyword search across all fields (name, email, company, title, notes, custom fields, etc.). Applied in addition to filters (AND logic).'
+        },
         limit: {
           type: 'number',
-          description: 'Maximum number of matching leads to return (default 20, max 50)'
+          description: 'Maximum number of matching leads to return (default 20, max 100)'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
         }
       },
       required: ['list_id', 'filters']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit);
+    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
+      search: args.search,
+      cursor: args.cursor
+    });
   }
 });
 
