@@ -29,7 +29,7 @@ function buildStartingMessage(images: ImageReportImage[], reportType: string, cu
 3. Tone & voice analysis
 4. Platform recommendations (Facebook/Instagram/Google/LinkedIn) with copy length guidance
 5. Key messaging themes extracted from the visuals
-Embed each image in the report using its URL in an <img> tag so readers can see the images inline.`,
+Embed each image in the report using an img tag with the provided URL as src, so readers can see the images inline.`,
 
     'social-media-captions': `Create a Social Media Caption Pack report that includes:
 1. For each image: 3 caption variants for Instagram, 2 for LinkedIn, 2 for Twitter/X, 1 for Facebook
@@ -37,7 +37,7 @@ Embed each image in the report using its URL in an <img> tag so readers can see 
 3. Posting time recommendations
 4. Engagement hooks and CTA suggestions
 5. A/B testing recommendations
-Embed each image in the report using its URL in an <img> tag so readers can see the images inline.`,
+Embed each image in the report using an img tag with the provided URL as src, so readers can see the images inline.`,
 
     'brand-consistency': `Create a Brand Consistency Review report that includes:
 1. Brand identity audit: color palette analysis, typography observations, visual style notes
@@ -45,7 +45,7 @@ Embed each image in the report using its URL in an <img> tag so readers can see 
 3. Inconsistencies identified and actionable recommendations
 4. Brand strength highlights — what is working well
 5. Priority fixes with specific, actionable guidance
-Embed each image in the report using its URL in an <img> tag so readers can see the images inline.`,
+Embed each image in the report using an img tag with the provided URL as src, so readers can see the images inline.`,
   };
 
   if (reportType === 'custom' && customInstruction) {
@@ -56,7 +56,7 @@ Custom instructions: ${customInstruction}
 Images:
 ${imageList}
 
-Important: Embed each image in the report using its URL in an <img> tag so readers can see the images inline. Use create_html_file to save the final report.`;
+Important: Do NOT call describe_image or any vision tool — work directly from the image filenames and URLs provided above. Embed the images using img tags with the provided URLs as src. Use create_html_file to save the final report.`;
   }
 
   const instructions = typeInstructions[reportType] || typeInstructions['ad-copy'];
@@ -67,6 +67,7 @@ ${instructions}
 Images:
 ${imageList}
 
+Important: Do NOT call describe_image or any vision tool — work directly from the image filenames and URLs provided above. Embed the images using img tags with the provided URLs as src.
 Use create_html_file to save the final report with title "${label}".`;
 }
 
@@ -113,8 +114,6 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
       undefined,
       'report_generation',
     );
-    await chatbotDb.updateSessionTitle(session.sessionId, reportTitle);
-
     const { runVerifiedChat } = await import('../controllers/agentModeController');
 
     const startingMessage = buildStartingMessage(images, reportType, customInstruction);
@@ -129,6 +128,9 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
       keywords: [],
       maxAttempts: 5,
     });
+
+    // Set title after agent completes — agent auto-titles the session during the run
+    await chatbotDb.updateSessionTitle(session.sessionId, reportTitle);
 
     console.log(`ImageReports: agent completed. Success: ${result.success}, tool calls: ${result.toolCalls.length}`);
 
