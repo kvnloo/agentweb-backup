@@ -15,11 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When a user\'s invoice payment succeeded, the subscription amount was not being saved to the database — so the admin Users tab showed "Paid" but no dollar amount',
       '- The Stripe webhook handler now correctly updates the subscription amount on each successful payment',
       '- Users on $0 plans now also show $0/mo in the admin Users tab instead of a blank amount',
-    ],
-  },
-  {
-    date: '2026-04-20',
-    changes: [
+      'New: Create AI Reports from Selected Images',
+      '- On the Images page, select one or more images and click "Create Report" to generate an AI-written HTML report',
+      '- Choose from Ad Copy Analysis (headlines, CTAs, copy variants), Social Media Caption Pack (captions and hashtags per platform), Brand Consistency Review (color audit, consistency scores, recommendations), or Custom (write your own instructions)',
+      '- Generated reports appear automatically on the Reports page',
       'Fix: Video Generation Error Reason Now Shown to Emma',
       '- When video generation fails (e.g. network error, content policy filter), the specific error message is now passed through to Emma so she can communicate the exact reason — previously the error field was silently dropped and Emma only received a generic failure indicator',
       'Fix: Emma Now Knows When GA4 and Google Search Console Are Already Configured',
