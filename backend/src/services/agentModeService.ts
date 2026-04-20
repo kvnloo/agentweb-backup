@@ -948,7 +948,21 @@ export class AgentModeService {
     const system: any[] = [];
     const messages: any[] = [];
 
-    for (const msg of openaiMessages) {
+    // Find the index of the last screenshot tool message so we only include the image
+    // for the most recent screenshot. Earlier screenshots are pruned to a text placeholder
+    // to prevent Bedrock 400 errors from request payload size exceeding limits (~6MB for 20 screenshots).
+    let lastScreenshotMsgIdx = -1;
+    for (let i = openaiMessages.length - 1; i >= 0; i--) {
+      const m = openaiMessages[i];
+      if (m.role === 'tool' && Array.isArray(m.content) &&
+          m.content.some((c: any) => c.type === 'image_url')) {
+        lastScreenshotMsgIdx = i;
+        break;
+      }
+    }
+
+    for (let msgIdx = 0; msgIdx < openaiMessages.length; msgIdx++) {
+      const msg = openaiMessages[msgIdx];
       if (msg.role === 'system') {
         const text = typeof msg.content === 'string'
           ? msg.content
@@ -977,8 +991,13 @@ export class AgentModeService {
           if (textContent) contentBlocks.push({ text: textContent });
         }
         // Tool use blocks
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          for (const tc of msg.tool_calls) {
+        // Guard against tool_calls stored as a JSON string (legacy/corrupt data)
+        const toolCallsArray = typeof msg.tool_calls === 'string'
+          ? (() => { try { return JSON.parse(msg.tool_calls); } catch { return []; } })()
+          : msg.tool_calls;
+        if (toolCallsArray && toolCallsArray.length > 0) {
+          for (const tc of toolCallsArray) {
+            if (!tc?.function) continue;
             let input: any;
             try {
               input = typeof tc.function.arguments === 'string'
@@ -1004,10 +1023,19 @@ export class AgentModeService {
         let toolResultContent: any[];
         if (Array.isArray(msg.content)) {
           toolResultContent = [];
+          // Only include the screenshot image for the most recent screenshot message.
+          // Earlier screenshots are replaced with a text placeholder to prevent Bedrock
+          // 400 errors from accumulated base64 payloads in long sessions.
+          const includeImage = msgIdx === lastScreenshotMsgIdx;
           for (const item of msg.content) {
             if (item.type === 'text') {
               toolResultContent.push({ text: item.text });
             } else if (item.type === 'image_url') {
+              if (!includeImage) {
+                // Older screenshot — replace with text placeholder to save payload space
+                toolResultContent.push({ text: '[Screenshot captured — image omitted from context to reduce payload size]' });
+                continue;
+              }
               const url = item.image_url?.url || '';
               if (url.startsWith('data:')) {
                 const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
