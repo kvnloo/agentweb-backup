@@ -4687,6 +4687,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Improved: Agent Chats Can Now Run Much Longer Before Needing a New Session',
+      '- The session message limit has been increased from 300 to 500 messages',
+      '- Fixed: Long image-generation sessions no longer lose the final summary response — previously, tool-generated messages (one per image) could push the count over the limit mid-turn, causing the AI\'s closing response to be silently dropped',
+      '- The session limit is now enforced at the start of a new turn instead of during writes, so in-progress work is never interrupted',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Fixed: Auto Engagement No Longer Posts Multiple Comments on the Same Post',
       '- LinkedIn auto engagement will no longer comment on the same post more than once per account',
       '- Previously, LinkedIn could return the same post under two different internal IDs, causing duplicate comment actions to be scheduled and executed',
