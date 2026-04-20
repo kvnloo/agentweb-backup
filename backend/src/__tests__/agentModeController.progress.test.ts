@@ -15,7 +15,8 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     addMessageToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
-    incrementCalledFunctions: jest.fn()
+    incrementCalledFunctions: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn()
   }
 }));
 
@@ -97,6 +98,7 @@ describe('AgentMode Progress SSE Endpoints', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (getLatestProgress as jest.Mock).mockReturnValue(undefined);
   });
 

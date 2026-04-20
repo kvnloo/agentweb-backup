@@ -14,6 +14,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
@@ -419,6 +420,7 @@ describe('Scheduled Chat Variable Types', () => {
     beforeEach(() => {
       mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
       mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
       mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
       mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
       mockAgentModeService.generateSessionTitle.mockResolvedValue('Test Title');

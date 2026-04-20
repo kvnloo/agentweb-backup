@@ -8,6 +8,7 @@ jest.mock('../services/subscriptionService', () => ({
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
