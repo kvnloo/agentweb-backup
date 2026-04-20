@@ -4736,4 +4736,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- A "Hide bots" checkbox in the filter bar lets admins toggle this filter on or off and re-fetch the list from the API',
     ],
   },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Agent Mode No Longer Shows "Working In Progress" After Responding',
+      '- The thinking/progress indicator now correctly disappears once Emma finishes responding',
+      '- Previously, if the response involved tool use (e.g. web search, content creation), the indicator would stay visible indefinitely until the page was reloaded',
+      '- Tool execution state is now properly cleared when the agent completes its response',
+    ],
+  },
 ];
