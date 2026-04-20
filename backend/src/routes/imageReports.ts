@@ -79,13 +79,16 @@ Produce a thorough, professional HTML report with modern styling. Output ONLY th
 
 function buildUserPrompt(images: ImageReportImage[], reportType: string, customInstruction?: string): string {
   const label = REPORT_TYPE_LABELS[reportType] || 'Report';
-  const imageList = images.map((img, i) => `Image ${i + 1}: ${img.filename}`).join('\n');
+  // Include S3 URLs so the LLM can embed <img> tags in the generated HTML
+  const imageList = images.map((img, i) => `Image ${i + 1}: ${img.filename} (URL: ${img.url})`).join('\n');
+
+  const embedNote = `\n\nIMPORTANT: When referencing the images in your HTML report, use their exact URLs as <img> src attributes so they render inline in the report.`;
 
   if (reportType === 'custom' && customInstruction) {
-    return `Please analyze the ${images.length} image(s) I've provided and create the custom report as instructed.\n\nImages:\n${imageList}`;
+    return `Please analyze the ${images.length} image(s) I've provided and create the custom report as instructed.\n\nImages:\n${imageList}${embedNote}`;
   }
 
-  return `Please analyze the ${images.length} image(s) I've provided and create a "${label}".\n\nImages:\n${imageList}`;
+  return `Please analyze the ${images.length} image(s) I've provided and create a "${label}".\n\nImages:\n${imageList}${embedNote}`;
 }
 
 // POST /api/image-reports/generate
@@ -184,7 +187,7 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
       throw new Error(uploadResult.error || 'S3 upload failed');
     }
 
-    // Store the HTML URL in a new agent-mode session's assetCache so it appears on the Reports page
+    // Store the HTML URL in a new agent-mode session so it appears on the Reports page
     const chatbotDb = new ChatbotDB();
     const session = await chatbotDb.createChatSession(
       userId,
@@ -198,14 +201,37 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
       'report_generation',
     );
 
-    // Update session title
     await chatbotDb.updateSessionTitle(session.sessionId, reportTitle);
 
     const generatedAt = new Date().toISOString();
+
+    // Add a user message summarising what was requested
+    const imageListText = images.map((img, i) => `- Image ${i + 1}: ${img.filename}`).join('\n');
+    await chatbotDb.addMessageToSession(session.sessionId, {
+      role: 'user',
+      content: `Create a ${REPORT_TYPE_LABELS[reportType] || 'report'} for the following images:\n${imageListText}`,
+      metadata: { timestamp: generatedAt },
+    } as any);
+
+    // Add an assistant message that contains the S3 URL — this acts as both a human-readable
+    // summary and the source for scanMessagesForAssets to pick up the URL as a backup.
+    await chatbotDb.addMessageToSession(session.sessionId, {
+      role: 'assistant',
+      content: `I've analysed the ${images.length} image(s) and generated your **${REPORT_TYPE_LABELS[reportType] || 'report'}**. You can view it here: ${uploadResult.url}`,
+      metadata: {
+        timestamp: generatedAt,
+        toolCalls: [{
+          name: 'create_html_file',
+          result: { success: true, s3_url: uploadResult.url, filename, title: reportTitle },
+        }],
+      },
+    } as any);
+
+    // Pre-populate assetCache so the report appears immediately without a message rescan
     await chatbotDb.updateAssetCache(
       session.sessionId,
       { images: [], videos: [], htmlReports: [{ url: uploadResult.url, filename, generatedAt }] },
-      1,
+      2,
     );
 
     console.log(`ImageReports: report stored in session ${session.sessionId}`);
