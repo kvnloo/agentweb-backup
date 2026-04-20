@@ -3470,3 +3470,32 @@ When ready to transfer formal ownership to the Goalden Hour Business Manager:
 ### Decision
 
 **Short term:** Grant the Goalden Hour contact Admin access so they have full operational control immediately. **Long term:** Initiate a formal ownership transfer/claim into their Business Manager when they are ready to do so.
+
+## Meta Account Connection Failure — karthy@goaldenhour.com (2026-04-20)
+
+### Context
+
+karthy@goaldenhour.com (userId: `4027bc5c-0f89-4236-b63e-b0186c634a1c`) reported that connecting their Meta ad account failed.
+
+### Root Cause
+
+Production logs at `Apr 19 00:55:35` showed:
+
+```
+[Meta Finalize] getAdAccounts failed — code=n/a classification=n/a
+message=Meta API Error: (#200) Requires business_management permission to manage the object
+```
+
+The OAuth flow (`flow=marketing`) exchanges the code and gets a valid access token, but the subsequent `/me/adaccounts` API call requires the `business_management` permission. Our current `marketingScopes` in `backend/src/config/integrations.ts` only requests `ads_management`, `ads_read`, and `pages_show_list`. The error is silently caught (`metaAuth.ts:248`) and returns 0 ad accounts, leaving the user unable to connect.
+
+### Why `business_management` Was Not Added
+
+Adding `business_management` to `marketingScopes` would fix the API error, but Meta only allows this permission under **Advanced Access** for customer-facing apps. Standard Access (which we currently have, status Active with 561 users) restricts the permission to users who have a developer/admin/tester role on the Facebook App — it does not work for general customers. Obtaining Advanced Access requires a Meta App Review with a detailed use-case submission and is slow/difficult to get. Decision made after discussion with Harshit@Argusoft.
+
+### Short-Term Fix (Implemented)
+
+The Goaldenhour ad account is now under our (AgentWeb's) control. **We granted karthy@goaldenhour.com full access to the ad account directly through Facebook Business Manager.** This means their user token already has access to the account without needing `business_management` — they can connect successfully today.
+
+### Long-Term Fix
+
+Pursue **transfer of ownership** of the Goaldenhour ad account to Goaldenhour itself via Facebook Business Manager. Once Goaldenhour owns the account, karthy (as an admin of that business) will be able to grant `ads_management` and `ads_read` access through normal OAuth without needing `business_management`. No code changes required for this path either.
