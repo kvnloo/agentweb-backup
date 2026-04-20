@@ -109,16 +109,28 @@ export class SocialEngagementScanner {
                 return ts >= cutoff;
             });
 
-            // De-duplicate posts by content — LinkedIn can return the same physical post
-            // under multiple URN formats (e.g. urn:li:share:X and urn:li:ugcPost:Y) in a
-            // single listPosts response, which would cause the same engager accounts to be
-            // scheduled to comment twice on what is actually one post.
+            // De-duplicate posts by content AND by normalized URN ID — LinkedIn can return
+            // the same physical post under multiple URN formats (e.g. urn:li:share:X and
+            // urn:li:ugcPost:X share the same numeric ID) in a single listPosts response,
+            // which would cause the same engager accounts to be scheduled to comment twice.
+            // Empty-content posts are deduplicated by URN ID; posts with content use the
+            // content text as a fallback for cross-URN-format matching.
             const seenContent = new Set<string>();
+            const seenUrnIds = new Set<string>();
             const dedupedPosts = recentPosts.filter((p: any) => {
+                const postUrn: string = p.id || p.urn || '';
+                const urnId = postUrn.match(/:(\d+)$/)?.[1] ?? '';
+                if (urnId) {
+                    if (seenUrnIds.has(urnId)) {
+                        console.log(`[Scanner/Posts] Dedup: skipping post ${postUrn} — same URN ID ${urnId} as another post in this response`);
+                        return false;
+                    }
+                    seenUrnIds.add(urnId);
+                }
                 const content = (p.commentary || p.content || '').trim();
-                if (!content) return true; // keep posts without parseable content
+                if (!content) return true; // URN ID dedup above covers empty-content posts
                 if (seenContent.has(content)) {
-                    console.log(`[Scanner/Posts] Dedup: skipping post ${p.id || p.urn} — same content as another post in this response`);
+                    console.log(`[Scanner/Posts] Dedup: skipping post ${postUrn} — same content as another post in this response`);
                     return false;
                 }
                 seenContent.add(content);
