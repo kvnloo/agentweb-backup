@@ -4615,6 +4615,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Emma Now Shows the Correct Error When Your Monthly Limit Is Reached',
+      '- Emma will now display "Monthly token limit reached. Please contact support or upgrade your plan." when an account has used up its monthly allowance',
+      '- Previously, Emma showed a generic error message instead of the specific limit notification',
+    ],
+  },
+  {
     date: '2026-04-17',
     changes: [
       'Fixed: Emma No Longer Suggests Replies for AgentWeb Team Messages',
