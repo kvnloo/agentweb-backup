@@ -4670,6 +4670,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Improved: Context Limit Errors Are Now Automatically Reported',
+      '- When a conversation exceeds the model context window, an issue is automatically filed so the team can follow up',
+      '- If the same session hits the limit multiple times, only one report is filed',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Fixed: Auto Engagement No Longer Posts Multiple Comments on the Same Post',
       '- LinkedIn auto engagement will no longer comment on the same post more than once per account',
       '- Previously, LinkedIn could return the same post under two different internal IDs, causing duplicate comment actions to be scheduled and executed',

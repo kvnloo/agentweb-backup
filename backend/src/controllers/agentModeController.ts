@@ -18,6 +18,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { createOncallItem } from '../services/notionService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
@@ -44,6 +45,40 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
   if (share.expiresAt) return new Date(share.expiresAt);
   if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
   return new Date(0); // No dates at all — treat as expired
+}
+
+/**
+ * Auto-files a Notion "Customer Reported" issue for context-limit errors.
+ * Skips if the session already has contextLimitReported set (dedup).
+ */
+async function autoReportContextLimitToNotion(
+  sessionId: string | undefined,
+  userEmail: string | undefined,
+  userId: string | undefined,
+  llmModel: string | undefined,
+  session: import('../services/chatbotService').ChatSession | null
+): Promise<void> {
+  if (!sessionId || session?.contextLimitReported) return;
+  try {
+    await createOncallItem({
+      title: `Context limit reached - session ${sessionId}`,
+      description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
+      additionalTags: ['Customer Reported', 'Context Limit'],
+      context: {
+        'User ID': userId || 'N/A',
+        'User Email': userEmail || 'N/A',
+        'Session ID': sessionId,
+        'LLM Model': llmModel || 'Not specified',
+        'Session Message Count': session?.messages?.length ?? 'N/A',
+        'Session Title': session?.title || 'N/A',
+      },
+    });
+    chatbotDb.updateSessionContextLimitReported(sessionId).catch(err =>
+      console.error('Failed to set contextLimitReported flag:', err)
+    );
+  } catch (err) {
+    console.error('Failed to create context-limit Notion item:', err);
+  }
 }
 
 /** Classify an error for the diagnosis agent. */
@@ -2085,6 +2120,9 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
+          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
+
           res.status(413).json({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
@@ -2656,6 +2694,9 @@ export const agentModeController = {
               'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
+
+          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
