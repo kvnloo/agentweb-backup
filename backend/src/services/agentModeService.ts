@@ -3000,7 +3000,8 @@ export class AgentModeService {
         success: actualResult.success,
         message: actualResult.message,
         videoUrl: actualResult.videoUrl,
-        filename: actualResult.filename
+        filename: actualResult.filename,
+        ...(actualResult.error && { error: actualResult.error })
       };
     }
 
