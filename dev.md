@@ -3432,3 +3432,41 @@ All 10 LinkedIn outreach actions (`search-people`, `get-profile`, `send-invite`,
 ### Decision
 
 **Finding email from LinkedIn is not supported and will not be added to the LinkedIn outreach feature.** Email discovery is an enrichment concern, not an outreach concern. If email finding from a LinkedIn profile is needed, it should be implemented as part of the CRM enrichment feature (`crmEnrichmentService.ts`) using a third-party enrichment provider (e.g. Apollo.io, which accepts LinkedIn profile URLs and returns verified business emails). This keeps outreach and enrichment concerns cleanly separated.
+
+
+## Goalden Hour Meta Ad Account — Ownership Investigation (2026-04-20)
+
+### Context
+
+Investigated who owns the Goalden Hour ad account in Meta (Facebook) Business Manager, and what steps are needed to transfer or grant access.
+
+### Findings
+
+The Goalden Hour Meta ad account is currently **owned by individual people**, not by a Business Manager. Only the AgentWeb team has full (Admin) control at this time.
+
+### Short-Term Action: Grant Goalden Hour Admin Access
+
+To give the Goalden Hour team full operational control without transferring ownership:
+
+1. Go to [business.facebook.com](https://business.facebook.com) → **Business Settings**
+2. Click **Accounts** → **Ad Accounts** → select the Goalden Hour ad account
+3. Click **Add People** → search for the Goalden Hour contact by name or email
+4. Set their role to **Admin** (full control: manage people, billing, settings, run ads)
+5. Click **Confirm**
+
+This gives them full operational access while ownership stays with the current individual.
+
+### Future Action: Transfer Ownership to Business Manager
+
+When ready to transfer formal ownership to the Goalden Hour Business Manager:
+
+1. The current individual owner must be cooperative
+2. **Option A (preferred):** In Meta Business Manager → Business Settings → Ad Accounts → Add → **Claim an Ad Account** → enter the account ID. The individual owner approves the claim.
+3. **Option B:** The individual goes to their Ad Account Settings → Ad Account Roles → adds the Goalden Hour Business Manager as Admin, then initiates a transfer.
+4. **Option C (last resort):** Contact Meta Support with proof of business ownership if the individual is unreachable.
+
+> **Caveat:** Once an ad account is claimed by a Business Manager, it cannot be moved to another Business. Confirm the correct Business Manager before claiming.
+
+### Decision
+
+**Short term:** Grant the Goalden Hour contact Admin access so they have full operational control immediately. **Long term:** Initiate a formal ownership transfer/claim into their Business Manager when they are ready to do so.
