@@ -3967,7 +3967,7 @@ export default function AdminDashboard() {
                           {paymentStatus === "free" && (
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
-                          {user.subscription_amount != null && user.subscription_amount > 0 && (
+                          {user.subscription_amount != null && (
                             <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
                               ${(user.subscription_amount / 100).toFixed(0)}/mo
                             </Typography>
