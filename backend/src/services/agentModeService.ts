@@ -2134,10 +2134,14 @@ export class AgentModeService {
 
       // Determine user-friendly message based on error type
       let userMessage: string;
+      const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.name === 'ModelTimeoutException'
+        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (error?.status === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
+      } else if (isTimeout) {
+        userMessage = 'Your request took longer than expected. Please try again.';
       } else if (error?.status === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
       } else {
@@ -2327,8 +2331,23 @@ export class AgentModeService {
 
 
 
+    // Identify which assistant tool_call message indices have their tool_results resolved.
+    // An assistant message's tool_calls are "resolved" if the very next non-assistant message
+    // is a 'tool' role message (i.e. a tool_result follows immediately).
+    const resolvedToolCallIndices = new Set<number>();
+    for (let i = 0; i < sliced.length; i++) {
+      const m = sliced[i] as any;
+      if (m.role === 'assistant' && m.tool_calls?.length) {
+        // Look for the immediately-following tool result
+        if (i + 1 < sliced.length && (sliced[i + 1] as any).role === 'tool') {
+          resolvedToolCallIndices.add(i);
+        }
+      }
+    }
+
     // Copy all sliced messages as-is
-    for (const msg of sliced) {
+    for (let sliceIdx = 0; sliceIdx < sliced.length; sliceIdx++) {
+      const msg = sliced[sliceIdx];
       // Skip empty assistant messages (no content and no tool_calls) — these are artifacts
       // from failed LLM responses where content was lost (e.g. Gemini safety filter)
       if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
@@ -2376,7 +2395,7 @@ export class AgentModeService {
       if ((msg as any).tool_call_id) {
         messageObj.tool_call_id = (msg as any).tool_call_id;
       }
-      if ((msg as any).tool_calls) {
+      if ((msg as any).tool_calls && resolvedToolCallIndices.has(sliceIdx)) {
         messageObj.tool_calls = (msg as any).tool_calls;
       }
 
