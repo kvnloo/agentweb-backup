@@ -2644,6 +2644,21 @@ router.post("/announcements/load-from-url", async (req, res) => {
 // Add the chat sessions route
 router.get("/chat-sessions", async (req, res) => {
   try {
+    const sessionIdSearch = typeof req.query.sessionId === "string" && req.query.sessionId.trim()
+      ? req.query.sessionId.trim()
+      : undefined;
+
+    // Fast-path: direct lookup by session ID
+    if (sessionIdSearch) {
+      const session = await chatbotDb.getChatSession(sessionIdSearch);
+      const results = session &&
+        Array.isArray(session.messages) &&
+        session.messages.some((msg: any) => msg.role === "user")
+        ? [session]
+        : [];
+      return res.json({ sessions: results, nextCursor: null });
+    }
+
     const startTime = typeof req.query.startTime === "string" ? req.query.startTime : undefined;
     const endTime = typeof req.query.endTime === "string" ? req.query.endTime : undefined;
     const timeRange = startTime && endTime ? { startTime, endTime } : undefined;

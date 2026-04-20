@@ -4650,6 +4650,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Improved: Admin Chat History Now Supports Search by Session ID',
+      '- Admins can now search for a specific chat session by pasting its session ID into the new search box on the Chat History tab',
+      '- Previously, finding a specific session required scrolling through the entire paginated list',
+      '- The search bypasses pagination entirely and returns the matching session instantly',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Fixed: Auto Engagement No Longer Posts Multiple Comments on the Same Post',
       '- LinkedIn auto engagement will no longer comment on the same post more than once per account',
       '- Previously, LinkedIn could return the same post under two different internal IDs, causing duplicate comment actions to be scheduled and executed',
