@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Fixed: Admin Users Tab Now Shows Subscription Amount for $499/mo Plans',
+      '- When a user\'s invoice payment succeeded, the subscription amount was not being saved to the database — so the admin Users tab showed "Paid" but no dollar amount',
+      '- The Stripe webhook handler now correctly updates the subscription amount on each successful payment',
+      '- Users on $0 plans now also show $0/mo in the admin Users tab instead of a blank amount',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Fix: Video Generation Error Reason Now Shown to Emma',
       '- When video generation fails (e.g. network error, content policy filter), the specific error message is now passed through to Emma so she can communicate the exact reason — previously the error field was silently dropped and Emma only received a generic failure indicator',
       'Fix: Emma Now Knows When GA4 and Google Search Console Are Already Configured',
