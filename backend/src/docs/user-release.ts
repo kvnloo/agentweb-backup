@@ -9,6 +9,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-20',
+    changes: [
+      'Fix: Video Generation Error Reason Now Shown to Emma',
+      '- When video generation fails (e.g. network error, content policy filter), the specific error message is now passed through to Emma so she can communicate the exact reason — previously the error field was silently dropped and Emma only received a generic failure indicator',
+    ],
+  },
+  {
     date: '2026-04-19',
     changes: [
       'Fix: Voice Mode Tool Results Now Show in Chat History',
