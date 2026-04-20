@@ -4639,4 +4639,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Token sessions are now stored in a shared database so all server instances can look them up',
     ],
   },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Auto Engagement No Longer Posts Multiple Comments on the Same Post',
+      '- LinkedIn auto engagement will no longer comment on the same post more than once per account',
+      '- Previously, LinkedIn could return the same post under two different internal IDs, causing duplicate comment actions to be scheduled and executed',
+      '- The system now deduplicates posts by their numeric ID before scheduling, and skips commenting when the duplicate-check API call fails rather than proceeding',
+    ],
+  },
 ];
