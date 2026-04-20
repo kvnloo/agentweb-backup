@@ -4679,6 +4679,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Fixed: Agent Mode Sessions No Longer Break After a Tool Call Failure',
+      '- Sessions that previously failed with an internal error after a browser tool crash are now automatically healed on the next message',
+      '- The root cause was orphaned tool_use blocks in the message history — when a tool call fired but the session crashed before results were saved, Bedrock would reject the entire conversation on subsequent requests',
+      '- The history is now sanitized at context-build time: any tool calls without matching results are stripped before sending to the LLM',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Improved: Admin Users Tab Now Hides Bot-Like Accounts by Default',
       '- The Users tab in the admin dashboard now filters out bot-like accounts automatically, making it easier to focus on real users',
       '- Bot detection covers Gmail dot-trick accounts (3+ dots in the local part) and internal test accounts',
