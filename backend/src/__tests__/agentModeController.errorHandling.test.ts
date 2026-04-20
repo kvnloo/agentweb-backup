@@ -15,6 +15,7 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionContextLimitReported: jest.fn().mockResolvedValue(undefined),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -88,6 +89,7 @@ describe('AgentModeController - Error Handling', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('http://ishare.test/session');
     mockEmailService.sendOncallAlert.mockResolvedValue(undefined);

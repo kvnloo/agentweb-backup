@@ -10,6 +10,7 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
@@ -91,6 +92,7 @@ describe('AgentModeController - Verified Generate', () => {
     
     // Setup default mocks
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('http://ishare.test/session');
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);

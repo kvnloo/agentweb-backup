@@ -7,6 +7,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
@@ -92,6 +93,7 @@ describe('AgentModeController - ishare Model Selection', () => {
   describe('getSharedConversation', () => {
     it('should return session with llmModel when session has model set', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
 
       const mockReq = {
         params: { shareId: mockSessionId },

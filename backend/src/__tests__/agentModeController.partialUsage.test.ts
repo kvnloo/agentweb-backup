@@ -11,6 +11,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -98,6 +99,7 @@ describe('AgentModeController - Partial Usage on Error', () => {
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('http://ishare.test/session');
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
   });
 
   it('should persist partial usage messages when worker error includes them', async () => {
