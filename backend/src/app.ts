@@ -71,6 +71,7 @@ import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import testAccountsRoutes from "./routes/testAccounts";
+import usersRoutes from "./routes/users";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -205,6 +206,7 @@ fileRoutes.post("/presign-batch", authenticateToken, batchPresignUrls);
 
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
