@@ -124,11 +124,12 @@ export class CrmEnrichmentService {
       });
     }
 
-    // Determine already-enriched leads (have ALL output fields populated)
+    // Determine already-enriched leads (have ALL output fields populated with real values)
+    // "Unknown" is treated as not enriched — it means the previous run found nothing
     const hasAllFields = (lead: any) =>
       spec.outputFields.every(field => {
         const value = lead?.customFields?.[field];
-        return typeof value === 'string' && value.trim().length > 0;
+        return typeof value === 'string' && value.trim().length > 0 && value.trim() !== 'Unknown';
       });
 
     const alreadyEnriched = filtered.filter(hasAllFields).length;
@@ -331,6 +332,37 @@ export class CrmEnrichmentService {
       }
     }
 
+    // 1b. Dedicated LinkedIn company page search — runs a separate site:linkedin.com/company
+    // query when company_linkedin_url (or equivalent) is in the output fields.
+    // A general web search rarely surfaces /company/ URLs; this targeted query does.
+    const hasCompanyLinkedinField = webSearchFields.some(f =>
+      /company_linkedin|company.*linkedin|linkedin.*company/.test(f.toLowerCase())
+    );
+    if (hasCompanyLinkedinField) {
+      const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
+      const isPersonalDomain = emailDomain
+        ? CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)
+        : false;
+      const companyTerm = (!isPersonalDomain && emailDomain) || String(lead.company || '').trim();
+      if (companyTerm) {
+        try {
+          const linkedinCompanyQuery = `${companyTerm} site:linkedin.com/company`;
+          const linkedinCompanyResult = await agentModeService.searchWeb(linkedinCompanyQuery, 5);
+          if (linkedinCompanyResult?.success && Array.isArray(linkedinCompanyResult.results) && linkedinCompanyResult.results.length > 0) {
+            const companyUrls = linkedinCompanyResult.results
+              .map((r: any) => r.url || '')
+              .filter((url: string) => /linkedin\.com\/company\//i.test(url));
+            webContext += `\n\nDedicated LinkedIn company page search results:\n${JSON.stringify(linkedinCompanyResult.results, null, 2)}`;
+            if (companyUrls.length > 0) {
+              webContext += `\n\nLinkedIn company page URLs found in dedicated search (use these first):\n${companyUrls.join('\n')}`;
+            }
+          }
+        } catch (err: any) {
+          console.warn(`[CrmEnrichment] LinkedIn company page search failed for lead ${lead?.leadId}: ${err.message}`);
+        }
+      }
+    }
+
     // 2. LinkedIn source — only run if at least one field needs it
     if (linkedinFields.length > 0 && linkedInAccountId) {
       try {
@@ -447,8 +479,6 @@ ${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `
 
 Extract only what is explicitly present in the sources above. Do not infer or fabricate any value. Return "Unknown" for any field not found in the data.`;
 
-console.log("userPrompt:::", userPrompt);
-console.log("systemPrompt:::", systemPrompt);
     // Call Gemini via the shared OpenAI-compatible client
     const geminiClient = await agentModeService.getGeminiClient();
     let response: Record<string, string> | null = null;
@@ -508,6 +538,26 @@ Valid example:
     const fields: Record<string, string> = {};
     for (const field of spec.outputFields) {
       fields[field] = typeof response?.[field] === 'string' ? response[field].trim() : 'Unknown';
+    }
+
+    // Post-process: reject any LinkedIn URL not present verbatim in source data.
+    // Prevents the LLM from constructing plausible-looking but fabricated URLs.
+    const allContext = (webContext + linkedinContext).toLowerCase();
+    for (const field of spec.outputFields) {
+      if (!/linkedin/i.test(field)) continue;
+      const value = fields[field];
+      if (!value || value === 'Unknown') continue;
+      const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
+      if (slugMatch) {
+        const slug = slugMatch[2].toLowerCase();
+        if (!allContext.includes(slug)) {
+          console.warn(`[CrmEnrichment] Rejected hallucinated LinkedIn URL "${value}" for field "${field}" — slug not in source data`);
+          fields[field] = 'Unknown';
+        }
+      } else {
+        // Returned value doesn't match a valid LinkedIn URL pattern
+        fields[field] = 'Unknown';
+      }
     }
 
     return { fields };
@@ -830,13 +880,15 @@ Given a user's enrichment goal or instruction, produce:
    - CONSISTENCY RULE: if you set a linkedinSearchTemplate, you MUST include at least one output field with source ["linkedin"] — typically "linkedin_url". Never generate a linkedinSearchTemplate without a matching linkedin output field.
 
 3. A webSearchTemplate string — ONE search query template used for ALL web_search fields combined. Uses {{placeholder}} tokens: {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{emailDomain}}, {{title}}.
-   - Build a comprehensive query that covers ALL the web_search output fields in one shot
+   - Prefer {{emailDomain}} over {{company}} as the company identifier — domains are unique and unambiguous; company names like "Apple" or "CWS" match thousands of unrelated results
+   - CRITICAL: Do NOT include field names or data types as search keywords. Words like "funding stage", "employee count", "linkedin", "business model", "industry" are metadata — they pollute the query and cause irrelevant results
+   - Add only 1-2 topic keywords that help Google find the right page category (e.g. "company", "startup", "funding", "investors")
+   - Keep it 3-5 words total after placeholder substitution
    - Examples:
-     - Company profile + LinkedIn URL: "{{company}} company overview industry employees linkedin"
-     - Company fields only: "{{company}} company overview employees funding industry"
-     - Person + company fields: "{{firstName}} {{lastName}} {{company}} profile overview funding"
-     - Funding focused: "{{company}} funding rounds investors total raised"
-   - Keep it concise — 4-8 words after placeholder substitution
+     - Company research (default): "{{emailDomain}} company overview"
+     - Funding focused: "{{emailDomain}} funding investors"
+     - Person lookup: "{{firstName}} {{lastName}} {{emailDomain}}"
+     - When no email domain available: "{{company}} company overview"
 
 4. A linkedinSearchTemplate string — ONE LinkedIn search query for person-level LinkedIn lookup (only set if any field needs LinkedIn). Format: "{{firstName}} {{lastName}} {{company}}"
    - Omit (null) if no field requires LinkedIn

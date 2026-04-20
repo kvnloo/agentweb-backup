@@ -2722,6 +2722,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
             : `Successfully enriched ${result.processedCount} leads`,
         processedCount: result.processedCount,
         failedCount: result.failedCount,
+        skippedCount: result.skippedCount,
         totalLeadsProcessed: result.totalToProcess,
         failureBreakdown: result.failureBreakdown,
       };
