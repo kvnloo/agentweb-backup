@@ -2,6 +2,7 @@
  * Tests for getEmmaSessions (ChatbotDB) and getEmmaSystemContext
  */
 import { chatbotDb, getEmmaSystemContext, __resetEmmaSystemContextCache } from '../services/chatbotService';
+import { buildUserAnalyticsContext } from '../utils/userConfigContext';
 
 // Track individual mock functions so we can control per-test behaviour
 const queryPromiseMock = jest.fn();
@@ -179,5 +180,79 @@ describe('getEmmaSystemContext', () => {
 
   it('__resetEmmaSystemContextCache is a no-op (kept for backwards compatibility)', () => {
     expect(() => __resetEmmaSystemContextCache()).not.toThrow();
+  });
+
+});
+
+describe('buildUserAnalyticsContext', () => {
+  it('returns empty string for null user', () => {
+    expect(buildUserAnalyticsContext(null)).toBe('');
+  });
+
+  it('returns empty string for user with no analytics config', () => {
+    expect(buildUserAnalyticsContext({})).toBe('');
+  });
+
+  it('includes GA4 properties when configured', () => {
+    const result = buildUserAnalyticsContext({
+      googleAnalyticsProperties: [
+        { propertyId: '123456789', label: 'Main Site' },
+        { propertyId: '987654321', label: 'Audit Site' },
+      ],
+    });
+    expect(result).toContain('Google Analytics (GA4)');
+    expect(result).toContain('123456789');
+    expect(result).toContain('Main Site');
+    expect(result).toContain('987654321');
+    expect(result).toContain('Audit Site');
+    expect(result).toContain('do NOT ask them to provide IDs');
+  });
+
+  it('includes Search Console domains when configured', () => {
+    const result = buildUserAnalyticsContext({
+      seoDomains: ['audit.agentweb.pro', 'agentweb.pro'],
+    });
+    expect(result).toContain('Google Search Console');
+    expect(result).toContain('audit.agentweb.pro');
+    expect(result).toContain('agentweb.pro');
+    expect(result).toContain('do NOT ask them to provide IDs');
+  });
+
+  it('includes Clarity projects when configured', () => {
+    const result = buildUserAnalyticsContext({
+      clarityProjects: [{ projectId: 'ul13e4f7fe', label: 'Main App' }],
+    });
+    expect(result).toContain('Microsoft Clarity');
+    expect(result).toContain('ul13e4f7fe');
+    expect(result).toContain('Main App');
+  });
+
+  it('includes gaFilteredDomains when present alongside GA4', () => {
+    const result = buildUserAnalyticsContext({
+      googleAnalyticsProperties: [{ propertyId: 'P-1', label: 'Site' }],
+      gaFilteredDomains: ['app.agentweb.pro', 'partner.agentweb.pro'],
+    });
+    expect(result).toContain('app.agentweb.pro');
+    expect(result).toContain('partner.agentweb.pro');
+  });
+
+  it('includes all sections when all analytics are configured', () => {
+    const result = buildUserAnalyticsContext({
+      googleAnalyticsProperties: [{ propertyId: 'P-1', label: 'Main' }],
+      seoDomains: ['agentweb.pro'],
+      clarityProjects: [{ projectId: 'c1', label: 'Clarity Main' }],
+    });
+    expect(result).toContain('Google Analytics');
+    expect(result).toContain('Google Search Console');
+    expect(result).toContain('Microsoft Clarity');
+  });
+
+  it('returns empty string for user with empty arrays', () => {
+    const result = buildUserAnalyticsContext({
+      googleAnalyticsProperties: [],
+      seoDomains: [],
+      clarityProjects: [],
+    });
+    expect(result).toBe('');
   });
 });
