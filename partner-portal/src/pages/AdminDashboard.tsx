@@ -717,6 +717,7 @@ export default function AdminDashboard() {
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
+  const [userFilterHideBotLike, setUserFilterHideBotLike] = useState(true);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
   const [userActivitiesLoading, setUserActivitiesLoading] = useState<Record<string, boolean>>({});
@@ -913,7 +914,7 @@ export default function AdminDashboard() {
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
     if (tabValue === 2) {
-      loadUsers();
+      loadUsers(userFilterHideBotLike);
       loadSubscriptionTypes();
       // Load admin Slack channel setting
       axios.get(buildApiUrl('/api/settings/slack_admin_channel'), {
@@ -968,7 +969,7 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 3) {
       loadWaitlist();
-      loadUsers(); // Also load users to check if waitlist entries are registered
+      loadUsers(userFilterHideBotLike); // Also load users to check if waitlist entries are registered
     }
   }, [tabValue]);
 
@@ -1828,7 +1829,7 @@ export default function AdminDashboard() {
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      await loadUsers(); // Reload users list
+      await loadUsers(userFilterHideBotLike); // Reload users list
       setSuccess(`User ${selectedUser.email} has been deactivated`);
     } catch (error: any) {
       setError(error.response?.data?.message || "Failed to deactivate user");
@@ -1855,7 +1856,7 @@ export default function AdminDashboard() {
         setLoading(true);
         await deleteUser(userIdToDelete);
         setSuccess(`User ${userIdToDelete} deleted successfully.`); // Consider showing email or a more user-friendly identifier
-        await loadUsers(); // Ensure user list is refreshed
+        await loadUsers(userFilterHideBotLike); // Ensure user list is refreshed
         handleCloseUserDeleteConfirm();
       } catch (error) {
         let errorMessage = "Failed to delete user";
@@ -3789,8 +3790,22 @@ export default function AdminDashboard() {
               label={<Typography variant="body2">Has usage</Typography>}
               sx={{ ml: 0 }}
             />
-            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage) && (
-              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={userFilterHideBotLike}
+                  onChange={(e) => {
+                    setUserFilterHideBotLike(e.target.checked);
+                    loadUsers(e.target.checked);
+                  }}
+                />
+              }
+              label={<Typography variant="body2">Hide bots</Typography>}
+              sx={{ ml: 0 }}
+            />
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
