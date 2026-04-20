@@ -4687,6 +4687,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-20',
     changes: [
+      'Fixed: Email-Change No Longer Causes Webhook Updates to Hit the Wrong Account',
+      '- When an admin changes a user\'s email address, the old record is tombstoned (marked as deleted) in the database',
+      '- Previously, Stripe webhook processing could land on the tombstoned record instead of the live account, causing subscription status updates to be silently lost',
+      '- Tombstoned records are now excluded from all database lookups used by Stripe webhooks, reset-password flows, and domain-based queries',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
       'Improved: Admin Users Tab Now Hides Bot-Like Accounts by Default',
       '- The Users tab in the admin dashboard now filters out bot-like accounts automatically, making it easier to focus on real users',
       '- Bot detection covers Gmail dot-trick accounts (3+ dots in the local part) and internal test accounts',
