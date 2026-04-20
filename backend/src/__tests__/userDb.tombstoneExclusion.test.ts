@@ -38,8 +38,8 @@ jest.mock('aws-sdk', () => ({
 
 import { userDb } from '../services/db';
 
-function lastScanParams() {
-  const calls = mockScan.mock.calls;
+function lastScanParams(): Record<string, any> | null {
+  const calls = mockScan.mock.calls as unknown as Array<[Record<string, any>]>;
   return calls.length > 0 ? calls[calls.length - 1][0] : null;
 }
 
@@ -55,7 +55,7 @@ describe('UserDB tombstone exclusion', () => {
     it('prepends NOT begins_with(userId, :_tombstone_prefix) to caller filter', async () => {
       await (userDb as any).scanWithFilter('stripe_customer_id = :cid', { ':cid': 'cus_abc' });
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params).not.toBeNull();
       expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :_tombstone_prefix\)/);
       expect(params.ExpressionAttributeValues[':_tombstone_prefix']).toBe('deleted_');
@@ -64,7 +64,7 @@ describe('UserDB tombstone exclusion', () => {
     it('preserves the caller filter expression alongside the tombstone guard', async () => {
       await (userDb as any).scanWithFilter('stripe_customer_id = :cid', { ':cid': 'cus_abc' });
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/stripe_customer_id = :cid/);
       expect(params.ExpressionAttributeValues[':cid']).toBe('cus_abc');
     });
@@ -85,7 +85,7 @@ describe('UserDB tombstone exclusion', () => {
     it('includes NOT begins_with tombstone guard in FilterExpression', async () => {
       await userDb.getUserByStripeCustomerId('cus_xyz');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
       expect(params.ExpressionAttributeValues[':tombstone']).toBe('deleted_');
     });
@@ -93,7 +93,7 @@ describe('UserDB tombstone exclusion', () => {
     it('filters by stripe_customer_id', async () => {
       await userDb.getUserByStripeCustomerId('cus_xyz');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/stripe_customer_id = :scid/);
       expect(params.ExpressionAttributeValues[':scid']).toBe('cus_xyz');
     });
@@ -109,7 +109,7 @@ describe('UserDB tombstone exclusion', () => {
     it('includes NOT begins_with tombstone guard in FilterExpression', async () => {
       await userDb.getUserByStripeConnectedAccountId('acct_abc');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
       expect(params.ExpressionAttributeValues[':tombstone']).toBe('deleted_');
     });
@@ -117,7 +117,7 @@ describe('UserDB tombstone exclusion', () => {
     it('filters by stripeConnectedAccountId', async () => {
       await userDb.getUserByStripeConnectedAccountId('acct_abc');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/stripeConnectedAccountId = :cid/);
       expect(params.ExpressionAttributeValues[':cid']).toBe('acct_abc');
     });
@@ -128,9 +128,9 @@ describe('UserDB tombstone exclusion', () => {
     it('includes NOT begins_with tombstone guard in FilterExpression', async () => {
       await userDb.getUserByResetToken('some-token');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
-      expect(params.ExpressionAttributeValues[':tombstone']).toBe('deleted_');
+      expect(params.ExpressionAttributeValues![':tombstone']).toBe('deleted_');
     });
 
     it('returns null when token belongs to tombstoned account', async () => {
@@ -145,17 +145,17 @@ describe('UserDB tombstone exclusion', () => {
     it('includes NOT begins_with tombstone guard in FilterExpression', async () => {
       await userDb.getUsersByEmailDomain('okareo.com');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
-      expect(params.ExpressionAttributeValues[':tombstone']).toBe('deleted_');
+      expect(params.ExpressionAttributeValues![':tombstone']).toBe('deleted_');
     });
 
     it('filters by emailDomain', async () => {
       await userDb.getUsersByEmailDomain('okareo.com');
 
-      const params = lastScanParams();
+      const params = lastScanParams()!;
       expect(params.FilterExpression).toMatch(/emailDomain = :emailDomain/);
-      expect(params.ExpressionAttributeValues[':emailDomain']).toBe('okareo.com');
+      expect(params.ExpressionAttributeValues![':emailDomain']).toBe('okareo.com');
     });
   });
 });
