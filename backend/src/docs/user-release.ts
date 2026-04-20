@@ -13,6 +13,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Fix: Video Generation Error Reason Now Shown to Emma',
       '- When video generation fails (e.g. network error, content policy filter), the specific error message is now passed through to Emma so she can communicate the exact reason — previously the error field was silently dropped and Emma only received a generic failure indicator',
+      'Fix: Emma Now Knows When GA4 and Google Search Console Are Already Configured',
+      '- When Emma calls get_website_analytics or get_seo_metrics, the tool response now explicitly reports the integration status and lists all configured properties/domains',
+      '- Previously, if audit.agentweb.pro pages showed 0 sessions, Emma would ask the user for a GA4 Measurement ID — not realising GA4 was already connected but the subdomain wasn\'t tracked by that property',
+      '- Emma can now distinguish "not configured" from "configured but missing tracking on this subdomain", and will offer to add tracking rather than asking for credentials',
     ],
   },
   {
