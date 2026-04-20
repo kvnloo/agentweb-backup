@@ -173,6 +173,7 @@ export interface ChatSession {
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
+  contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -2552,6 +2553,20 @@ export class ChatbotDB {
     } catch (updateError) {
       console.error("Error updating session error:", updateError);
       // Don't throw - we don't want error logging to fail the entire operation
+    }
+  }
+
+  async updateSessionContextLimitReported(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: 'SET contextLimitReported = :val',
+      ExpressionAttributeValues: { ':val': true },
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (updateError) {
+      console.error('Error setting contextLimitReported flag:', updateError);
     }
   }
 
