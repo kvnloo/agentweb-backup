@@ -739,6 +739,7 @@ export default function AdminDashboard() {
   const [chatSessionsCursor, setChatSessionsCursor] = useState<string | null>(null);
   const [chatSessionsHasMore, setChatSessionsHasMore] = useState(true);
   const [chatSessionsInitialized, setChatSessionsInitialized] = useState(false);
+  const [chatSessionIdSearch, setChatSessionIdSearch] = useState("");
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
@@ -1045,20 +1046,27 @@ export default function AdminDashboard() {
   }, [tabValue, token]);
 
   const loadChatSessions = React.useCallback(
-    async (options?: { reset?: boolean }) => {
+    async (options?: { reset?: boolean; sessionIdOverride?: string }) => {
       if (!token || chatSessionsLoading) {
         return;
       }
 
       const shouldReset = options?.reset ?? false;
       const cursor = shouldReset ? null : chatSessionsCursor;
+      const searchId = options?.sessionIdOverride !== undefined
+        ? options.sessionIdOverride
+        : chatSessionIdSearch;
 
       try {
         setChatSessionsLoading(true);
         const params = new URLSearchParams();
-        params.set("limit", "30");
-        if (cursor) {
-          params.set("cursor", cursor);
+        if (searchId.trim()) {
+          params.set("sessionId", searchId.trim());
+        } else {
+          params.set("limit", "30");
+          if (cursor) {
+            params.set("cursor", cursor);
+          }
         }
 
         const response = await axios.get(
@@ -1076,7 +1084,7 @@ export default function AdminDashboard() {
         };
 
         setChatSessions((prev) => {
-          if (shouldReset) {
+          if (shouldReset || searchId.trim()) {
             return sessions;
           }
           const seen = new Set(prev.map((session) => session.sessionId));
@@ -1090,7 +1098,7 @@ export default function AdminDashboard() {
           return merged;
         });
         setChatSessionsCursor(nextCursor);
-        setChatSessionsHasMore(Boolean(nextCursor));
+        setChatSessionsHasMore(Boolean(nextCursor) && !searchId.trim());
         setChatSessionsInitialized(true);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
@@ -1098,7 +1106,7 @@ export default function AdminDashboard() {
         setChatSessionsLoading(false);
       }
     },
-    [token, chatSessionsCursor, chatSessionsLoading]
+    [token, chatSessionsCursor, chatSessionsLoading, chatSessionIdSearch]
   );
 
   useEffect(() => {
@@ -5123,6 +5131,40 @@ export default function AdminDashboard() {
               </Button>
             </Box>
           )}
+          <Box sx={{ display: 'flex', gap: 1, mb: 2, alignItems: 'center' }}>
+            <TextField
+              label="Search by Session ID"
+              size="small"
+              value={chatSessionIdSearch}
+              onChange={(e) => setChatSessionIdSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch });
+                }
+              }}
+              sx={{ width: 380 }}
+              placeholder="Paste a session ID and press Enter or Search"
+            />
+            <Button
+              variant="contained"
+              size="small"
+              onClick={() => loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch })}
+            >
+              Search
+            </Button>
+            {chatSessionIdSearch && (
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => {
+                  setChatSessionIdSearch("");
+                  loadChatSessions({ reset: true, sessionIdOverride: "" });
+                }}
+              >
+                Clear
+              </Button>
+            )}
+          </Box>
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
