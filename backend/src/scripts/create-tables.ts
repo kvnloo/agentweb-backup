@@ -1803,40 +1803,6 @@ const createTempEmailsTable = async () => {
   }
 };
 
-const createImageReportsTable = async () => {
-  const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: `${TABLE_PREFIX}AW-ImageReports`,
-    AttributeDefinitions: [
-      { AttributeName: 'reportId', AttributeType: 'S' },
-      { AttributeName: 'userId', AttributeType: 'S' },
-      { AttributeName: 'createdAt', AttributeType: 'S' },
-    ],
-    KeySchema: [{ AttributeName: 'reportId', KeyType: 'HASH' }],
-    GlobalSecondaryIndexes: [
-      {
-        IndexName: 'UserIdCreatedAtIndex',
-        KeySchema: [
-          { AttributeName: 'userId', KeyType: 'HASH' },
-          { AttributeName: 'createdAt', KeyType: 'RANGE' },
-        ],
-        Projection: { ProjectionType: 'ALL' },
-        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
-      },
-    ],
-    ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
-  };
-
-  try {
-    const result = await dynamodb.createTable(params).promise();
-    console.log(`Created ${params.TableName} table:`, result);
-  } catch (error: any) {
-    if (error.code === 'ResourceInUseException') {
-      console.log(`${params.TableName} table already exists`);
-    } else {
-      throw error;
-    }
-  }
-};
 
 const main = async () => {
   try {
@@ -1883,7 +1849,6 @@ const main = async () => {
     await createTestAccountsTable();
     await createDealsTable();
     await createOAuthSessionsTable();
-    await createImageReportsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

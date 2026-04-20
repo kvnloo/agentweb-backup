@@ -1,14 +1,19 @@
 import express, { Request, Response } from 'express';
-import { authenticateToken } from '../middleware/auth';
-import { AuthenticatedRequest } from '../middleware/auth';
-import { imageReportDb, ImageReportImage } from '../services/imageReportDb';
+import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { ChatbotDB } from '../services/chatbotService';
 import axios from 'axios';
 import sharp from 'sharp';
 
 const router = express.Router();
 
-// Report type labels shown to the LLM
+interface ImageReportImage {
+  url: string;
+  filename: string;
+  executionId: string;
+  taskId?: string;
+}
+
 const REPORT_TYPE_LABELS: Record<string, string> = {
   'ad-copy': 'Ad Copy Analysis',
   'social-media-captions': 'Social Media Caption Pack',
@@ -27,8 +32,7 @@ async function fetchImageAsBase64(url: string): Promise<{ base64: string; mimeTy
       .jpeg({ quality: 82 })
       .toBuffer();
 
-    const base64 = buf.toString('base64');
-    return { base64, mimeType: 'image/jpeg' };
+    return { base64: buf.toString('base64'), mimeType: 'image/jpeg' };
   } catch {
     return null;
   }
@@ -75,9 +79,7 @@ Produce a thorough, professional HTML report with modern styling. Output ONLY th
 
 function buildUserPrompt(images: ImageReportImage[], reportType: string, customInstruction?: string): string {
   const label = REPORT_TYPE_LABELS[reportType] || 'Report';
-  const imageList = images
-    .map((img, i) => `Image ${i + 1}: ${img.filename}`)
-    .join('\n');
+  const imageList = images.map((img, i) => `Image ${i + 1}: ${img.filename}`).join('\n');
 
   if (reportType === 'custom' && customInstruction) {
     return `Please analyze the ${images.length} image(s) I've provided and create the custom report as instructed.\n\nImages:\n${imageList}`;
@@ -87,13 +89,12 @@ function buildUserPrompt(images: ImageReportImage[], reportType: string, customI
 }
 
 // POST /api/image-reports/generate
-// Generates a report for selected images, saves HTML to S3, stores metadata in DynamoDB
+// Generates a report for selected images, saves HTML to S3, stores it as an agent-mode session
+// so it appears automatically on the Reports page.
 router.post('/generate', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   const userId = authReq.user?.userId;
-  if (!userId) {
-    return res.status(401).json({ success: false, message: 'Unauthorized' });
-  }
+  if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
   const { images, reportType, customInstruction, title } = req.body as {
     images: ImageReportImage[];
@@ -116,154 +117,102 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
 
   const reportTitle = title || `${REPORT_TYPE_LABELS[reportType]} — ${new Date().toLocaleDateString()}`;
 
-  // Create initial DB record (status: generating) and return reportId immediately
-  const placeholder = `https://s3.placeholder/pending`;
-  const report = await imageReportDb.createReport({
-    userId,
-    title: reportTitle,
-    reportType: reportType as any,
-    customInstruction,
-    images,
-    htmlUrl: placeholder,
-  });
+  try {
+    console.log(`ImageReports: starting generation, ${images.length} images`);
 
-  // Respond immediately with reportId so the frontend can poll
-  res.json({ success: true, reportId: report.reportId, status: 'generating' });
+    // Fetch images as base64 for vision input (up to 6 to avoid token limits)
+    const imageSlice = images.slice(0, 6);
+    const imageData = await Promise.all(imageSlice.map(img => fetchImageAsBase64(img.url)));
+    console.log(`ImageReports: fetched ${imageData.filter(Boolean).length}/${imageSlice.length} images`);
 
-  // Generate asynchronously
-  (async () => {
-    try {
-      console.log(`ImageReports: starting generation for ${report.reportId}, ${images.length} images`);
-      // Fetch images as base64 for vision input (up to 6 to avoid token limits)
-      const imageSlice = images.slice(0, 6);
-      const imageData = await Promise.all(imageSlice.map(img => fetchImageAsBase64(img.url)));
-      console.log(`ImageReports: fetched ${imageData.filter(Boolean).length}/${imageSlice.length} images`);
+    const systemPrompt = buildSystemPrompt(reportType, customInstruction);
+    const userPrompt = buildUserPrompt(images, reportType, customInstruction);
 
-      const systemPrompt = buildSystemPrompt(reportType, customInstruction);
-      const userPrompt = buildUserPrompt(images, reportType, customInstruction);
+    // Use Bedrock Converse API directly for proper multimodal support
+    const { BedrockRuntimeClient, ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
 
-      // Use Bedrock Converse API directly for proper multimodal support
-      const { BedrockRuntimeClient, ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
+    const bedrockClient = new BedrockRuntimeClient({
+      region: process.env.AWS_REGION || 'us-west-2',
+      credentials: process.env.AWS_ACCESS_KEY_ID ? {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+      } : undefined,
+      requestHandler: { requestTimeout: 5 * 60 * 1000 } as any,
+    });
 
-      const bedrockClient = new BedrockRuntimeClient({
-        region: process.env.AWS_REGION || 'us-west-2',
-        credentials: process.env.AWS_ACCESS_KEY_ID ? {
-          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-        } : undefined,
-        requestHandler: { requestTimeout: 5 * 60 * 1000 } as any,
-      });
-
-      // Build vision message content using Bedrock Converse format
-      const userContentBlocks: any[] = [{ text: userPrompt }];
-      for (const data of imageData) {
-        if (data) {
-          userContentBlocks.push({
-            image: {
-              format: 'jpeg',
-              source: { bytes: Buffer.from(data.base64, 'base64') },
-            },
-          });
-        }
+    const userContentBlocks: any[] = [{ text: userPrompt }];
+    for (const data of imageData) {
+      if (data) {
+        userContentBlocks.push({
+          image: {
+            format: 'jpeg',
+            source: { bytes: Buffer.from(data.base64, 'base64') },
+          },
+        });
       }
-
-      const converseResponse = await bedrockClient.send(new ConverseCommand({
-        modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-        system: [{ text: systemPrompt }],
-        messages: [{ role: 'user', content: userContentBlocks }],
-        inferenceConfig: { maxTokens: 8000, temperature: 0.7 },
-      }));
-
-      console.log(`ImageReports: Bedrock response received for ${report.reportId}`);
-      const outputContent = converseResponse.output?.message?.content || [];
-      let htmlContent = outputContent.map((b: any) => b.text || '').join('');
-
-      // Strip markdown code fences (with or without closing fence)
-      const fenceMatch = htmlContent.match(/^```(?:html)?\r?\n([\s\S]*?)(?:```\s*)?$/m);
-      if (fenceMatch) {
-        htmlContent = fenceMatch[1].trim();
-      } else {
-        // Also strip just a leading ```html line
-        htmlContent = htmlContent.replace(/^```(?:html)?\r?\n/, '').replace(/\n```\s*$/, '').trim();
-      }
-
-      // Ensure we have a valid HTML document
-      if (!htmlContent.includes('<!DOCTYPE') && !htmlContent.includes('<html')) {
-        htmlContent = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${reportTitle}</title></head><body>${htmlContent}</body></html>`;
-      }
-
-      // Upload HTML to S3: (content, filename, userId, contentType)
-      const filename = `image-report-${report.reportId}.html`;
-      const uploadResult = await uploadFileToS3(
-        Buffer.from(htmlContent, 'utf-8'),
-        filename,
-        userId,
-        'text/html',
-      );
-
-      if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'S3 upload failed');
-      }
-
-      await imageReportDb.updateReport(report.reportId, {
-        htmlUrl: uploadResult.url,
-        status: 'ready',
-      });
-    } catch (err: any) {
-      console.error('ImageReports: generation error:', err);
-      await imageReportDb.updateReport(report.reportId, {
-        status: 'error',
-        errorMessage: err.message || 'Generation failed',
-      });
     }
-  })();
-});
 
-// GET /api/image-reports — list user's reports
-router.get('/', authenticateToken, async (req: Request, res: Response) => {
-  const authReq = req as AuthenticatedRequest;
-  const userId = authReq.user?.userId;
-  if (!userId) return res.status(401).json({ success: false });
+    const converseResponse = await bedrockClient.send(new ConverseCommand({
+      modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
+      system: [{ text: systemPrompt }],
+      messages: [{ role: 'user', content: userContentBlocks }],
+      inferenceConfig: { maxTokens: 8000, temperature: 0.7 },
+    }));
 
-  try {
-    const reports = await imageReportDb.getReportsByUser(userId);
-    return res.json({ success: true, reports });
-  } catch (err: any) {
-    console.error('ImageReports: list error:', err);
-    return res.status(500).json({ success: false, message: err.message });
-  }
-});
+    console.log('ImageReports: Bedrock response received');
+    const outputContent = converseResponse.output?.message?.content || [];
+    let htmlContent = outputContent.map((b: any) => b.text || '').join('');
 
-// GET /api/image-reports/:reportId — get single report (for polling)
-router.get('/:reportId', authenticateToken, async (req: Request, res: Response) => {
-  const authReq = req as AuthenticatedRequest;
-  const userId = authReq.user?.userId;
-  if (!userId) return res.status(401).json({ success: false });
+    // Strip markdown code fences
+    htmlContent = htmlContent.replace(/^```(?:html)?\r?\n/, '').replace(/\n```\s*$/, '').trim();
 
-  try {
-    const report = await imageReportDb.getReport(req.params.reportId);
-    if (!report) return res.status(404).json({ success: false, message: 'Not found' });
-    if (report.userId !== userId) return res.status(403).json({ success: false, message: 'Forbidden' });
-    return res.json({ success: true, report });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
-  }
-});
+    if (!htmlContent.includes('<!DOCTYPE') && !htmlContent.includes('<html')) {
+      htmlContent = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${reportTitle}</title></head><body>${htmlContent}</body></html>`;
+    }
 
-// DELETE /api/image-reports/:reportId
-router.delete('/:reportId', authenticateToken, async (req: Request, res: Response) => {
-  const authReq = req as AuthenticatedRequest;
-  const userId = authReq.user?.userId;
-  if (!userId) return res.status(401).json({ success: false });
+    // Upload HTML to S3
+    const timestamp = Date.now();
+    const filename = `image-report-${timestamp}.html`;
+    const uploadResult = await uploadFileToS3(
+      Buffer.from(htmlContent, 'utf-8'),
+      filename,
+      userId,
+      'text/html',
+    );
 
-  try {
-    const report = await imageReportDb.getReport(req.params.reportId);
-    if (!report) return res.status(404).json({ success: false, message: 'Not found' });
-    if (report.userId !== userId) return res.status(403).json({ success: false, message: 'Forbidden' });
-    await imageReportDb.deleteReport(req.params.reportId);
+    if (!uploadResult.success || !uploadResult.url) {
+      throw new Error(uploadResult.error || 'S3 upload failed');
+    }
+
+    // Store the HTML URL in a new agent-mode session's assetCache so it appears on the Reports page
+    const chatbotDb = new ChatbotDB();
+    const session = await chatbotDb.createChatSession(
+      userId,
+      undefined,
+      'agent',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'report_generation',
+    );
+
+    // Update session title
+    await chatbotDb.updateSessionTitle(session.sessionId, reportTitle);
+
+    const generatedAt = new Date().toISOString();
+    await chatbotDb.updateAssetCache(
+      session.sessionId,
+      { images: [], videos: [], htmlReports: [{ url: uploadResult.url, filename, generatedAt }] },
+      1,
+    );
+
+    console.log(`ImageReports: report stored in session ${session.sessionId}`);
     return res.json({ success: true });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    console.error('ImageReports: generation error:', err);
+    return res.status(500).json({ success: false, message: err.message || 'Generation failed' });
   }
 });
 
