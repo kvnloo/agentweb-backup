@@ -23,8 +23,7 @@ import { agentModeService } from './agentModeService';
 // ---------------------------------------------------------------------------
 
 export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
-// Kore: warm and smooth female voice — less shaky than Zephyr in live sessions
-const LIVE_VOICE_NAME = 'Kore';
+const LIVE_VOICE_NAME = 'Zephyr';
 
 /**
  * System prompt that instructs Gemini to use emotion tags for expressive TTS.
