@@ -390,7 +390,8 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 // Get all users
 router.get("/users", async (req, res) => {
   try {
-    const users = await userDb.getAllUsers();
+    const hideBotLike = req.query.hideBotLike !== "false";
+    const users = await userDb.getAllUsers(hideBotLike);
     // Transform: replace encrypted secrets map with just key names for the frontend
     const sanitized = users.map((user: any) => {
       const { secrets, ...rest } = user;

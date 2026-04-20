@@ -82,7 +82,7 @@ interface AdminContextType {
   agentModeAnalytics: any;
   gtmAnalytics: any;
   crmAnalytics: any;
-  loadUsers: () => Promise<void>;
+  loadUsers: (hideBotLike?: boolean) => Promise<void>;
   loadWaitlist: () => Promise<void>;
   loadAnalytics: (startDate: string, endDate: string) => Promise<void>;
   updateWaitlistStatus: (email: string, status: string) => Promise<void>;
@@ -137,10 +137,12 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     },
   });
 
-  const loadUsers = useCallback(async () => {
+  const loadUsers = useCallback(async (hideBotLike = true) => {
     try {
       setLoading(true);
-      const response = await api.get("/api/admin/users");
+      const response = await api.get("/api/admin/users", {
+        params: { hideBotLike: hideBotLike ? "true" : "false" },
+      });
       setUsers(response.data);
       setError(null);
     } catch (err: any) {

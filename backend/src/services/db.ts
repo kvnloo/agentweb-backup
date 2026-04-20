@@ -645,7 +645,22 @@ class UserDB {
     }
   }
 
-  async getAllUsers(): Promise<UserWithCounts[]> {
+  static isBotLikeEmail(email: string): boolean {
+    if (!email) return false;
+    const [local, domain] = email.split("@");
+    if (!domain) return false;
+    // Gmail dot-trick bots: 3+ dots in the local part
+    if (domain === "gmail.com" && (local.match(/\./g) || []).length >= 3) return true;
+    // Internal test/smoke accounts
+    const testDomains = ["test.com", "onb.com"];
+    if (testDomains.includes(domain)) return true;
+    const ownDomain = "agentweb.pro";
+    if (domain === ownDomain && /^(test|smoketest|attrtest)/.test(local)) return true;
+    if (domain === `updates.${ownDomain}`) return true;
+    return false;
+  }
+
+  async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
     try {
       const params = {
         TableName: this.tableName,
@@ -654,7 +669,9 @@ class UserDB {
 
       const result = await this.docClient.scan(params).promise();
       const users = (result.Items || []).filter(
-        (u) => !u.userId?.startsWith("deleted_")
+        (u) =>
+          !u.userId?.startsWith("deleted_") &&
+          (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
       );
 
       // Get task and workflow counts for each user

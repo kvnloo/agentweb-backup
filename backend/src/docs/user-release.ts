@@ -4672,4 +4672,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The system now deduplicates posts by their numeric ID before scheduling, and skips commenting when the duplicate-check API call fails rather than proceeding',
     ],
   },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Improved: Admin Users Tab Now Hides Bot-Like Accounts by Default',
+      '- The Users tab in the admin dashboard now filters out bot-like accounts automatically, making it easier to focus on real users',
+      '- Bot detection covers Gmail dot-trick accounts (3+ dots in the local part) and internal test accounts',
+      '- A "Hide bots" checkbox in the filter bar lets admins toggle this filter on or off and re-fetch the list from the API',
+    ],
+  },
 ];
