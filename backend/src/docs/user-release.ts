@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-21',
     changes: [
+      'Improved: Reports Page Search Now Searches Report Content',
+      '- Search on the Reports page now searches inside the body text of HTML reports, not just task names and filenames',
+      '- You can also search by date (e.g. "April 2026"), approval status ("approved", "pending"), publish status ("published", "draft"), and source ("agent-mode")',
+      '- Reports within a task that don\'t match the search term are now hidden — only matching reports are shown',
+    ],
+  },
+  {
+    date: '2026-04-21',
+    changes: [
       'Improved: Auto-Engagement Comments Now Sound Like a Real Person, Not a Bot',
       '- LinkedIn auto-engagement comments and replies are now written to sound natural and specific rather than generic',
       '- Comments now reference something concrete from the post (a number, an idea, a phrase) instead of commenting in general terms',
