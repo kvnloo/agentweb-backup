@@ -17,6 +17,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: Social Media Post Creation No Longer Crashes on Missing Post Type',
       '- Creating social media posts with a missing or undefined post type field no longer throws a TypeError crash',
       '- Affected scheduled sessions (e.g. LinkedIn Post Factory) that retried and recovered, but the fix eliminates unnecessary errors and wasted retries',
+      'Improved: Connect Account Button Stays in Chat After Closing the Popup',
+      '- When Emma asks you to connect an account (e.g. LinkedIn), a "Connect" card now appears permanently in the chat message',
+      '- Closing the connect popup no longer loses the option — you can scroll back and click "Connect" in the message to re-open it at any time',
     ],
   },
   {
