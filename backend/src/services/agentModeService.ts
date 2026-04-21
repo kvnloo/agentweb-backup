@@ -2046,6 +2046,11 @@ export class AgentModeService {
               toolContent = extractToolContent(result);
             }
 
+            // When the response exceeds the S3 threshold: upload full content to S3 so the LLM
+            // can retrieve specific fields later via search_tool_response, then cap the in-memory
+            // copy at MAX_TOOL_CONTENT_SIZE to prevent worker OOM on sessions with many large tool
+            // calls (e.g. multiple read_page_source + search_web calls in a single work plan step).
+            const S3_IN_MEMORY_CAP = 20_000; // Keep only 20KB in memory after S3 upload
             if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
               try {
                 const uploadResult = await uploadFileToS3WithPath(
@@ -2056,7 +2061,10 @@ export class AgentModeService {
                 );
                 if (uploadResult.success && uploadResult.key) {
                   const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-                  toolContent = header + toolContent;
+                  const preview = toolContent.length > S3_IN_MEMORY_CAP
+                    ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
+                    : toolContent;
+                  toolContent = header + preview;
                 }
               } catch (e) {
                 console.error('AgentMode: Failed to save large tool response to S3:', e);
