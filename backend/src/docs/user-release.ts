@@ -33,6 +33,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: CRM Lead Lists Now Show Associated Landing Page',
       '- When Emma calls get_lead_lists, each list now includes the name and URL of its linked landing page (if one exists)',
       '- This prevents Emma from confusing similarly-named lead lists when reporting campaign performance against CRM data',
+      'Fixed: Emma No Longer Retries Image Generation After All Work Plan Steps Complete',
+      '- When a large work plan finishes (e.g. generating many ad images), Emma would sometimes retry completed steps instead of delivering the final summary',
+      '- This happened when some image-generation calls timed out asynchronously — Emma still saw the work plan as "in progress" on the next message',
+      '- Emma now recognises when all steps are done and responds with a plain-text summary instead of re-running tool calls',
     ],
   },
   {
