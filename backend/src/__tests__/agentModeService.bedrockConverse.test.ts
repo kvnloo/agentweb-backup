@@ -539,4 +539,117 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       expect(result.choices[0].finish_reason).toBe('length');
     });
   });
+
+  describe('sanitizeSchemaForBedrock', () => {
+    it('should pass through simple schemas unchanged', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query' },
+          count: { type: 'integer', minimum: 1, maximum: 20 },
+        },
+        required: ['query'],
+      };
+      const result = AgentModeService.sanitizeSchemaForBedrock(schema);
+      expect(result).toEqual(schema);
+    });
+
+    it('should strip $schema and $ref/$defs', () => {
+      const schema = {
+        type: 'object',
+        '$schema': 'http://json-schema.org/draft-07/schema#',
+        properties: { query: { type: 'string' } },
+        required: ['query'],
+      };
+      const result = AgentModeService.sanitizeSchemaForBedrock(schema);
+      expect(result['$schema']).toBeUndefined();
+      expect(result.properties.query).toEqual({ type: 'string' });
+    });
+
+    it('should flatten anyOf with all-const branches to enum', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          units: {
+            anyOf: [
+              { type: 'string', const: 'metric' },
+              { type: 'string', const: 'imperial' },
+            ],
+            description: 'Measurement units',
+          },
+        },
+      };
+      const result = AgentModeService.sanitizeSchemaForBedrock(schema);
+      expect(result.properties.units).toEqual({ type: 'string', enum: ['metric', 'imperial'], description: 'Measurement units' });
+    });
+
+    it('should convert anyOf with const+open string branch to plain string type', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          freshness: {
+            anyOf: [
+              { type: 'string', const: 'pd' },
+              { type: 'string', const: 'pw' },
+              { type: 'string' },
+            ],
+          },
+        },
+      };
+      const result = AgentModeService.sanitizeSchemaForBedrock(schema);
+      expect(result.properties.freshness).toEqual({ type: 'string' });
+    });
+
+    it('should drop anyOf when it cannot be safely converted', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          mixed: {
+            anyOf: [{ type: 'string' }, { type: 'number' }],
+            description: 'Either string or number',
+          },
+        },
+      };
+      const result = AgentModeService.sanitizeSchemaForBedrock(schema);
+      expect(result.properties.mixed.anyOf).toBeUndefined();
+      expect(result.properties.mixed.description).toBe('Either string or number');
+    });
+
+    it('should handle the full bravesearch_brave_web_search schema without throwing', () => {
+      const braveSchema = {
+        type: 'object',
+        '$schema': 'http://json-schema.org/draft-07/schema#',
+        properties: {
+          query: { type: 'string', maxLength: 400, description: 'Search query' },
+          units: {
+            anyOf: [{ type: 'string', const: 'metric' }, { type: 'string', const: 'imperial' }],
+            description: 'Measurement units',
+          },
+          freshness: {
+            type: 'string',
+            enum: ['pd', 'pw', 'pm', 'py', 'YYYY-MM-DDtoYYYY-MM-DD'],
+          },
+          result_filter: {
+            type: 'array',
+            items: { type: 'string', enum: ['web', 'news', 'query'] },
+          },
+        },
+        required: ['query'],
+      };
+      const result = AgentModeService.sanitizeSchemaForBedrock(braveSchema);
+      expect(result['$schema']).toBeUndefined();
+      expect(result.properties.units).toEqual({ type: 'string', enum: ['metric', 'imperial'], description: 'Measurement units' });
+      expect(result.properties.query.maxLength).toBe(400);
+      expect(result.required).toEqual(['query']);
+      const resultStr = JSON.stringify(result);
+      expect(resultStr).not.toContain('anyOf');
+      expect(resultStr).not.toContain('$schema');
+      expect(resultStr).not.toContain('"const"');
+    });
+
+    it('should handle null/undefined input gracefully', () => {
+      expect(AgentModeService.sanitizeSchemaForBedrock(null)).toBeNull();
+      expect(AgentModeService.sanitizeSchemaForBedrock(undefined)).toBeUndefined();
+    });
+  });
 });
