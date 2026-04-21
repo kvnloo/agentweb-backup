@@ -14,6 +14,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Video Cost Tracking Now Accounts for Video Duration',
       '- Videos longer than 8 seconds require multiple AI generation calls (one per 8-second clip), but cost tracking was only charging for a single clip regardless of length',
       '- Cost tracking now correctly charges per clip: a 16s video costs $5.60 (2 clips), a 24s video costs $8.40 (3 clips), etc.',
+      'Fixed: Social Media Post Creation No Longer Crashes on Missing Post Type',
+      '- Creating social media posts with a missing or undefined post type field no longer throws a TypeError crash',
+      '- Affected scheduled sessions (e.g. LinkedIn Post Factory) that retried and recovered, but the fix eliminates unnecessary errors and wasted retries',
     ],
   },
   {

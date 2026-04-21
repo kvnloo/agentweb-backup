@@ -16113,7 +16113,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           'facebook': 'Facebook',
           'custom': 'Custom'
         };
-        const typeLabel = typeLabelMap[post.type] || post.type.charAt(0).toUpperCase() + post.type.slice(1);
+        const typeLabel = (post.type && typeLabelMap[post.type]) || (post.type ? post.type.charAt(0).toUpperCase() + post.type.slice(1) : 'Post');
 
         // Convert markdown content to HTML
         const htmlContent = processor.processSync(post.content || '').toString();
