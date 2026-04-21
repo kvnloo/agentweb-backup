@@ -20,6 +20,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improved: Connect Account Button Stays in Chat After Closing the Popup',
       '- When Emma asks you to connect an account (e.g. LinkedIn), a "Connect" card now appears permanently in the chat message',
       '- Closing the connect popup no longer loses the option — you can scroll back and click "Connect" in the message to re-open it at any time',
+      'Fix: CRM Lead Lists Now Show Associated Landing Page',
+      '- When Emma calls get_lead_lists, each list now includes the name and URL of its linked landing page (if one exists)',
+      '- This prevents Emma from confusing similarly-named lead lists when reporting campaign performance against CRM data',
     ],
   },
   {
