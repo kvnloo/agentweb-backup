@@ -1341,13 +1341,18 @@ export class AgentModeService {
     return pricing[model] ?? 0.04;
   }
 
-  /** Cost per video generation in USD (fixed per-generation pricing, based on ~8s clip). */
-  private estimateVideoGenerationCost(model: string): number {
-    const pricing: Record<string, number> = {
+  /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
+  private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
+    const pricePerClip: Record<string, number> = {
       'veo-3.1-generate-preview': 2.80,
       'veo-3.1-fast-generate-preview': 1.40,
     };
-    return pricing[model] ?? 2.80;
+    const clipPrice = pricePerClip[model] ?? 2.80;
+    const VEO_MAX_SECONDS = 8;
+    const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
+      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+      : 1;
+    return clipPrice * clipCount;
   }
 
   /** Returns an onUsage callback that records LLM token usage for a named tool. */
@@ -14535,8 +14540,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per generation, not per token)
-        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview');
+        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more)
+        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
         incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
           console.error('AgentMode: Failed to track token usage for generateVideo:', err)
         );
