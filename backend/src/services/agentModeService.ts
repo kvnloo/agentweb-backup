@@ -815,6 +815,9 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+      // NOTE: claude-opus-4-7 is registered but NOT available on this Bedrock account as of 2026-04-21.
+      // Kept in registry because: (1) admin-only so no user-facing risk, (2) may become available later.
+      // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
       'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
@@ -1156,6 +1159,7 @@ export class AgentModeService {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
+    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability)
     'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true },
   };
 
@@ -2136,13 +2140,15 @@ export class AgentModeService {
       let userMessage: string;
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.name === 'ModelTimeoutException'
         || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
+      // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
+      const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
-      } else if (error?.status === 429) {
+      } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
       } else if (isTimeout) {
         userMessage = 'Your request took longer than expected. Please try again.';
-      } else if (error?.status === 400) {
+      } else if (httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';

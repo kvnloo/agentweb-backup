@@ -341,6 +341,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-opus-4-7'].client).not.toBeNull();
     });
+
   });
 
   describe('Gemini client lazy-loading', () => {
@@ -460,6 +461,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         })
       );
     });
+
   });
 
   describe('callLLM rejects unknown models', () => {
