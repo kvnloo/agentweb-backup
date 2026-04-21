@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-21',
+    changes: [
+      'Fix: Video Cost Tracking Now Accounts for Video Duration',
+      '- Videos longer than 8 seconds require multiple AI generation calls (one per 8-second clip), but cost tracking was only charging for a single clip regardless of length',
+      '- Cost tracking now correctly charges per clip: a 16s video costs $5.60 (2 clips), a 24s video costs $8.40 (3 clips), etc.',
+    ],
+  },
+  {
     date: '2026-04-20',
     changes: [
       'Fixed: Admin Users Tab Now Shows Subscription Amount for $499/mo Plans',
