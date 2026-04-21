@@ -815,6 +815,10 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+      // NOTE: claude-opus-4-7 is registered but NOT available on this Bedrock account as of 2026-04-21.
+      // Kept in registry because: (1) admin-only so no user-facing risk, (2) may become available later.
+      // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
+      'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -1155,6 +1159,8 @@ export class AgentModeService {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
+    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability)
+    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {

@@ -1,3 +1,32 @@
+# April 21, 2026: Investigation — Agent Mode "Unknown Error" with claude-opus-4-7
+
+## Context
+
+User `ftan@agentweb.pro` hit the generic "I apologize, but I encountered an error processing your request" error in Agent Mode when using model `anthropic.claude-opus-4-7`. This triggered an "Unknown Error in Generate Response" oncall alert.
+
+## Root Cause
+
+`anthropic.claude-opus-4-7` is registered in the model registry but **not provisioned on this AWS Bedrock account**. Bedrock returns:
+
+```
+ValidationException: anthropic.claude-opus-4-7 is not available for this account.
+You can explore other available models on Amazon Bedrock.
+```
+
+This is a 400-class error, but the AWS SDK surfaces the HTTP status on `error.$metadata.httpStatusCode` rather than a top-level `error.status` field. The existing error classifier in `generateMarketingResponse` only checked `error.status === 400`, so the Bedrock ValidationException fell through to the generic catch-all and triggered the oncall alert instead of showing a sensible "issue processing your request" message.
+
+## Fix
+
+- Added `error.$metadata.httpStatusCode` as a fallback when reading the HTTP status in the error classifier (`agentModeService.ts`). Going forward, Bedrock validation errors will map to the correct user-facing message.
+- The model is kept in the registry because: (1) it is admin-only (`getSupportedModels` filters out any model with "opus" for non-admins), so regular users are never exposed to it; (2) it may become available on this account in the future, at which point it will work automatically.
+- If AWS provisions the model on this account, no code changes are needed — the inference profile ARN is already configured.
+
+## Decision
+
+**Do not remove `claude-opus-4-7` from the registry.** It is safely gated behind admin-only access, and the error classification fix means any future Bedrock unavailability errors will show a proper message rather than triggering a generic alert.
+
+---
+
 # April 8, 2026: Investigation — Lead Tech Stack Enrichment Options
 
 ## Context
