@@ -2529,8 +2529,8 @@ export class AgentModeService {
         const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
         const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
         workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
-        workPlanContent += `DO NOT call generate_image or any other tool. DO NOT retry failed steps. `;
-        workPlanContent += `Your ONLY task now is to write a plain-text final summary response.`;
+        workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
+        workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
         console.log('workPlanContent', workPlanContent);
         messages.push({ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` });
       } else {

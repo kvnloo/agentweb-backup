@@ -584,8 +584,8 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
         );
         expect(workPlanMsg).toBeDefined();
         expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
-        expect(workPlanMsg.content).toContain('DO NOT call generate_image');
-        expect(workPlanMsg.content).toContain('final summary response');
+        expect(workPlanMsg.content).toContain('DO NOT retry or re-execute any work plan steps');
+        expect(workPlanMsg.content).toContain('help them with that new request normally');
         // Step details are NOT listed when all done (avoids LLM retrying them)
         expect(workPlanMsg.content).not.toContain('Step 1');
         expect(workPlanMsg.content).not.toContain('You MUST continue working');
