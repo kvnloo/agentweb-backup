@@ -17,11 +17,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Generic openers like "Great post!", "Absolutely!", and "Thanks for sharing" are now explicitly avoided',
       '- Personality presets configured in Engagement Settings (e.g. Curious, Expert, Conversational) are now applied when generating comments and replies',
       '- Fallback comments (used if the AI call fails) are now varied and human-sounding instead of fixed bot phrases',
-    ],
-  },
-  {
-    date: '2026-04-21',
-    changes: [
+      'Fix: Work Plan Sessions with Brave Search No Longer Fail Immediately',
+      '- Work plan sessions using the AI GTM Positioning Audit skill (and any skill with Brave Search) were failing on every attempt with "please try rephrasing your question"',
+      '- Root cause: the Brave Search MCP tool schemas use JSON Schema features (anyOf, $schema) that Amazon Bedrock rejects with a 400 error',
+      '- The agent engine now sanitizes tool schemas before sending them to Bedrock, converting anyOf-with-const patterns to enum arrays and stripping unsupported keywords',
       'Fix: Video Cost Tracking Now Accounts for Video Duration',
       '- Videos longer than 8 seconds require multiple AI generation calls (one per 8-second clip), but cost tracking was only charging for a single clip regardless of length',
       '- Cost tracking now correctly charges per clip: a 16s video costs $5.60 (2 clips), a 24s video costs $8.40 (3 clips), etc.',
