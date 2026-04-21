@@ -3500,6 +3500,37 @@ When ready to transfer formal ownership to the Goalden Hour Business Manager:
 
 **Short term:** Grant the Goalden Hour contact Admin access so they have full operational control immediately. **Long term:** Initiate a formal ownership transfer/claim into their Business Manager when they are ready to do so.
 
+## Security Breach Investigation — Lovable & Vercel (2026-04-21)
+
+### Context
+
+Investigated whether AgentWeb is impacted by two security incidents:
+1. **Lovable security breach** — Lovable (vibe coding platform) disclosed a broken object-level authorization flaw in their API that allowed unauthorized access to user projects, source code, database credentials, and AI chat histories. The vulnerability was unpatched for 48 days after discovery on March 3, 2026.
+2. **Vercel security breach** — Vercel disclosed a security incident. Vercel sent official email communication confirming: *"At this time, we do not have reason to believe that your Vercel credentials or personal data have been compromised."* **Status: Safe, no action required.**
+
+### Lovable Exposure Analysis
+
+The customer-portal repo originated as a Lovable project and remains connected to it. Artifacts found:
+
+**1. External CDN script in `index.html:70`**
+```html
+<script src="https://cdn.gpteng.co/gptengineer.js" type="module"></script>
+```
+Loaded on every page, runs with full browser context. If Lovable's infrastructure is compromised this is a vector for client-side code execution. **Highest priority to remove.**
+
+**2. `lovable-tagger` npm package (`package.json:112`, `vite.config.ts:4,38`)**
+Sends component metadata to Lovable during dev builds. Not evidence of npm compromise, but is telemetry going to a breached vendor. Remove as hygiene.
+
+**3. Fallback URL in `src/config.ts:9`** pointing to `https://preview--agentweb-customer-portal.lovable.app` — cosmetic, but should be cleaned up.
+
+**Key clarification:** The Lovable breach is a **platform data leak** (their API exposed stored project data), not a CDN/supply chain attack. The primary risk to us is: if any real credentials (API keys, env vars, secrets) were ever entered into the Lovable project editor, those may have been exfiltrated.
+
+### Status & Next Steps
+
+- **Vercel:** Confirmed safe per official Vercel email. No action required.
+- **Lovable:** Awaiting Lovable's official email notification to determine whether our specific project was accessed during the breach. Once received, assess whether any credentials need rotation.
+- **Code cleanup (planned):** Remove CDN script, lovable-tagger, and Lovable URL fallback from customer-portal regardless of breach outcome — these are unnecessary Lovable dependencies.
+
 ## Meta Account Connection Failure — karthy@goaldenhour.com (2026-04-20)
 
 ### Context
