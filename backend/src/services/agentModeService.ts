@@ -2515,40 +2515,57 @@ export class AgentModeService {
         pending: '○',
         skipped: '⊘'
       };
+
+      // Check if all steps are terminal (completed or skipped) — no pending work remains
+      const allStepsDone = workPlan.steps.length > 0 &&
+        workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+
       let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
-      workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
 
-      // If autocomplete is enabled, add instruction to auto-complete steps
-      if (workPlan.autocomplete) {
-        workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+      if (allStepsDone) {
+        // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
+        // Use a user-role message so it appears as a direct instruction right before the assistant responds.
+        const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
+        const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
+        workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
+        workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
+        workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+        console.log('workPlanContent', workPlanContent);
+        messages.push({ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` });
+      } else {
+        workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+
+        // If autocomplete is enabled, add instruction to auto-complete steps
+        if (workPlan.autocomplete) {
+          workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+        }
+
+        workPlan.steps.forEach((step: any) => {
+          const icon = statusIcons[step.status as keyof typeof statusIcons];
+          workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
+
+          // Include step description if available
+          if (step.description) {
+            workPlanContent += `   Description: ${step.description}\n`;
+          }
+
+          // Include required function calls if available
+          if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+            workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+          }
+
+          // Include skill IDs if available (for awareness)
+          if (step.skillIds && step.skillIds.length > 0) {
+            workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+          }
+
+          workPlanContent += '\n';
+        });
+
+        console.log('workPlanContent', workPlanContent);
+        messages.push({ role: 'assistant', content: workPlanContent.trim() });
       }
-
-      workPlan.steps.forEach((step: any) => {
-        const icon = statusIcons[step.status as keyof typeof statusIcons];
-        workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
-
-        // Include step description if available
-        if (step.description) {
-          workPlanContent += `   Description: ${step.description}\n`;
-        }
-
-        // Include required function calls if available
-        if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
-        }
-
-        // Include skill IDs if available (for awareness)
-        if (step.skillIds && step.skillIds.length > 0) {
-          workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
-        }
-
-        workPlanContent += '\n';
-      });
-
-      console.log('workPlanContent', workPlanContent);
-
-      messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)

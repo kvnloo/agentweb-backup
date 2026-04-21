@@ -546,6 +546,174 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
       );
       expect(taskStatusIndex).toBeLessThan(lastUserMessageIndex);
     });
+
+    describe('work plan all-steps-complete detection', () => {
+      const baseHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'continue',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+      ];
+
+      it('should inject ALL STEPS COMPLETE as a user message when every step is completed', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'completed' },
+            { stepCount: 3, title: 'Step 3', status: 'completed' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        // Guard uses user role so it appears as a direct instruction right before the response
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+        expect(workPlanMsg.content).toContain('DO NOT retry or re-execute any work plan steps');
+        expect(workPlanMsg.content).toContain('help them with that new request normally');
+        // Step details are NOT listed when all done (avoids LLM retrying them)
+        expect(workPlanMsg.content).not.toContain('Step 1');
+        expect(workPlanMsg.content).not.toContain('You MUST continue working');
+      });
+
+      it('should inject ALL STEPS COMPLETE when all steps are skipped', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'skipped' },
+            { stepCount: 2, title: 'Step 2', status: 'skipped' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+      });
+
+      it('should inject ALL STEPS COMPLETE when steps are a mix of completed and skipped', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'skipped' },
+            { stepCount: 3, title: 'Step 3', status: 'completed' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+        // Should show correct counts
+        expect(workPlanMsg.content).toContain('2 completed');
+        expect(workPlanMsg.content).toContain('1 skipped');
+      });
+
+      it('should NOT inject ALL STEPS COMPLETE when a pending step remains', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'pending' },
+            { stepCount: 3, title: 'Step 3', status: 'pending' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'assistant' && msg.content.includes('WORK PLAN')
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).not.toContain('ALL STEPS COMPLETE');
+        expect(workPlanMsg.content).toContain('You MUST continue working');
+      });
+
+      it('should not show autocomplete instruction when all steps are done', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          autocomplete: true,
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+        expect(workPlanMsg.content).not.toContain('AUTOCOMPLETE MODE');
+      });
+
+      it('should still show autocomplete instruction when steps remain and autocomplete is true', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          autocomplete: true,
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'pending' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'assistant' && msg.content.includes('WORK PLAN')
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toContain('AUTOCOMPLETE MODE');
+      });
+    });
   });
 });
 
