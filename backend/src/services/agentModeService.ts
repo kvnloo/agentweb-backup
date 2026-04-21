@@ -849,7 +849,7 @@ export class AgentModeService {
                 toolSpec: {
                   name: tool.function.name,
                   description: tool.function.description || tool.function.name,
-                  inputSchema: { json: tool.function.parameters },
+                  inputSchema: { json: AgentModeService.sanitizeSchemaForBedrock(tool.function.parameters) },
                 }
               }))
             } : undefined;
@@ -941,6 +941,67 @@ export class AgentModeService {
         },
       },
     };
+  }
+
+  /**
+   * Sanitize a JSON Schema for Bedrock Converse API compatibility.
+   * Bedrock rejects schemas with anyOf/oneOf/allOf, $schema, const, $ref/$defs.
+   * anyOf/oneOf with const values are flattened to enum; others are stripped.
+   */
+  static sanitizeSchemaForBedrock(schema: any): any {
+    if (!schema || typeof schema !== 'object') return schema;
+
+    const sanitizeNode = (node: any): any => {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+
+      const result: any = {};
+
+      for (const [key, value] of Object.entries(node)) {
+        // Drop JSON Schema meta fields and unsupported keywords
+        if (key === '$schema' || key === '$defs' || key === '$ref' || key === 'const') continue;
+
+        if ((key === 'anyOf' || key === 'oneOf') && Array.isArray(value)) {
+          // If all branches are {type: string, const: X}, flatten to enum
+          const consts = (value as any[]).filter((b: any) => b && b.const !== undefined).map((b: any) => b.const);
+          const nonConst = (value as any[]).filter((b: any) => !b || b.const === undefined);
+          if (consts.length > 0 && nonConst.length === 0) {
+            result.type = 'string';
+            result.enum = consts;
+          } else if (consts.length > 0 && nonConst.length === 1 && nonConst[0]?.type === 'string') {
+            // Mix of consts + plain string (open-ended enum): just use type string
+            result.type = 'string';
+          }
+          // else: drop the anyOf/oneOf entirely (no safe representation for Bedrock)
+          continue;
+        }
+
+        if (key === 'allOf' && Array.isArray(value)) {
+          // Merge allOf branches into the result object
+          for (const branch of value as any[]) {
+            Object.assign(result, sanitizeNode(branch));
+          }
+          continue;
+        }
+
+        if (key === 'properties' && typeof value === 'object' && value !== null) {
+          result.properties = Object.fromEntries(
+            Object.entries(value as object).map(([k, v]) => [k, sanitizeNode(v)])
+          );
+          continue;
+        }
+
+        if (key === 'items') {
+          result.items = sanitizeNode(value);
+          continue;
+        }
+
+        result[key] = value;
+      }
+
+      return result;
+    };
+
+    return sanitizeNode(schema);
   }
 
   /**
