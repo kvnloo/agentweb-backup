@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-21',
     changes: [
+      'Improved: Auto-Engagement Comments Now Sound Like a Real Person, Not a Bot',
+      '- LinkedIn auto-engagement comments and replies are now written to sound natural and specific rather than generic',
+      '- Comments now reference something concrete from the post (a number, an idea, a phrase) instead of commenting in general terms',
+      '- Generic openers like "Great post!", "Absolutely!", and "Thanks for sharing" are now explicitly avoided',
+      '- Personality presets configured in Engagement Settings (e.g. Curious, Expert, Conversational) are now applied when generating comments and replies',
+      '- Fallback comments (used if the AI call fails) are now varied and human-sounding instead of fixed bot phrases',
+    ],
+  },
+  {
+    date: '2026-04-21',
+    changes: [
       'Fix: Video Cost Tracking Now Accounts for Video Duration',
       '- Videos longer than 8 seconds require multiple AI generation calls (one per 8-second clip), but cost tracking was only charging for a single clip regardless of length',
       '- Cost tracking now correctly charges per clip: a 16s video costs $5.60 (2 clips), a 24s video costs $8.40 (3 clips), etc.',
