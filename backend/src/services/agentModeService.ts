@@ -2515,12 +2515,22 @@ export class AgentModeService {
         pending: '○',
         skipped: '⊘'
       };
+
+      // Check if all steps are terminal (completed or skipped) — no pending work remains
+      const allStepsDone = workPlan.steps.length > 0 &&
+        workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+
       let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
-      workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+
+      if (allStepsDone) {
+        workPlanContent += `✅ ALL STEPS COMPLETE. Every step in this work plan has been completed or skipped. DO NOT start new work or retry any steps. Write your final summary response to the user now.\n\n`;
+      } else {
+        workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+      }
 
       // If autocomplete is enabled, add instruction to auto-complete steps
-      if (workPlan.autocomplete) {
+      if (workPlan.autocomplete && !allStepsDone) {
         workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
       }
 
