@@ -2524,41 +2524,48 @@ export class AgentModeService {
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
 
       if (allStepsDone) {
-        workPlanContent += `✅ ALL STEPS COMPLETE. Every step in this work plan has been completed or skipped. DO NOT start new work or retry any steps. Write your final summary response to the user now.\n\n`;
+        // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
+        // Use a user-role message so it appears as a direct instruction right before the assistant responds.
+        const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
+        const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
+        workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
+        workPlanContent += `DO NOT call generate_image or any other tool. DO NOT retry failed steps. `;
+        workPlanContent += `Your ONLY task now is to write a plain-text final summary response.`;
+        console.log('workPlanContent', workPlanContent);
+        messages.push({ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` });
       } else {
         workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+
+        // If autocomplete is enabled, add instruction to auto-complete steps
+        if (workPlan.autocomplete) {
+          workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+        }
+
+        workPlan.steps.forEach((step: any) => {
+          const icon = statusIcons[step.status as keyof typeof statusIcons];
+          workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
+
+          // Include step description if available
+          if (step.description) {
+            workPlanContent += `   Description: ${step.description}\n`;
+          }
+
+          // Include required function calls if available
+          if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+            workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+          }
+
+          // Include skill IDs if available (for awareness)
+          if (step.skillIds && step.skillIds.length > 0) {
+            workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+          }
+
+          workPlanContent += '\n';
+        });
+
+        console.log('workPlanContent', workPlanContent);
+        messages.push({ role: 'assistant', content: workPlanContent.trim() });
       }
-
-      // If autocomplete is enabled, add instruction to auto-complete steps
-      if (workPlan.autocomplete && !allStepsDone) {
-        workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
-      }
-
-      workPlan.steps.forEach((step: any) => {
-        const icon = statusIcons[step.status as keyof typeof statusIcons];
-        workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
-
-        // Include step description if available
-        if (step.description) {
-          workPlanContent += `   Description: ${step.description}\n`;
-        }
-
-        // Include required function calls if available
-        if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
-        }
-
-        // Include skill IDs if available (for awareness)
-        if (step.skillIds && step.skillIds.length > 0) {
-          workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
-        }
-
-        workPlanContent += '\n';
-      });
-
-      console.log('workPlanContent', workPlanContent);
-
-      messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
