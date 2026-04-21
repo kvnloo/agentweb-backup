@@ -6359,18 +6359,39 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const lists = await crmDb.getLeadListsByUserId(userId);
+      const { listLandingPages } = await import('./v0Service');
+
+      const [lists, landingPages] = await Promise.all([
+        crmDb.getLeadListsByUserId(userId),
+        listLandingPages(userId).catch(() => [] as any[])
+      ]);
+
+      // Build map: leadListId → landing page info
+      const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
+      for (const page of landingPages) {
+        if (page.leadListId) {
+          pageByListId.set(page.leadListId, {
+            pageId: page.id,
+            name: page.name || '',
+            url: page.deployedUrl || page.customDomainUrl || ''
+          });
+        }
+      }
 
       return {
         success: true,
         message: `Found ${lists.length} lead list(s)`,
-        lists: lists.map((list: any) => ({
-          listId: list.listId,
-          name: list.name,
-          description: list.description || '',
-          leadCount: list.leadCount || 0,
-          createdAt: list.createdAt
-        })),
+        lists: lists.map((list: any) => {
+          const page = pageByListId.get(list.listId);
+          return {
+            listId: list.listId,
+            name: list.name,
+            description: list.description || '',
+            leadCount: list.leadCount || 0,
+            createdAt: list.createdAt,
+            ...(page ? { associatedLandingPage: page } : {})
+          };
+        }),
         totalLists: lists.length
       };
     } catch (error) {
