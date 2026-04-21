@@ -4728,6 +4728,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-21',
+    changes: [
+      'Fixed: Work Plan Sessions No Longer Fail With Unexpected Errors on Heavy Research Tasks',
+      '- Work plan sessions that perform many web searches and page reads (e.g. AI GTM Positioning Audit) no longer crash mid-way through',
+      '- Previously, large tool responses were kept fully in memory even after being saved to storage, which could exhaust available memory and cause the session to be killed',
+      '- Large tool responses are now trimmed to a compact in-memory preview once stored, keeping memory usage stable across long multi-step sessions',
+    ],
+  },
+  {
     date: '2026-04-20',
     changes: [
       'Improved: Context Limit Errors Are Now Automatically Reported',
