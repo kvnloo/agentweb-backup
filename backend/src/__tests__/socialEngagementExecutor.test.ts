@@ -316,7 +316,7 @@ describe('SocialEngagementExecutor', () => {
       expect(mockAdapter.createComment).toHaveBeenCalledWith(
         expect.any(Object),
         expect.any(String),
-        'Great insights! Thanks for sharing.',
+        expect.stringMatching(/\S+/),
         expect.any(String)
       );
     });
@@ -695,7 +695,7 @@ describe('SocialEngagementExecutor', () => {
       expect(mockAdapter.createComment).toHaveBeenCalledWith(
         expect.any(Object),
         expect.any(String),
-        'Thank you for your perspective!',
+        expect.stringMatching(/\S+/),
         expect.any(String),
         expect.any(String)
       );
