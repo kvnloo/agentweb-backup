@@ -4804,6 +4804,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-22',
     changes: [
+      'Fixed: LinkedIn Outreach Reconnect Now Works Correctly',
+      '- Reconnecting a LinkedIn Outreach account in Settings > Connected Accounts now immediately shows the account as active',
+      '- Previously, the connection would appear as inactive after reconnecting, requiring users to delete and re-create the connection as a workaround',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
       'New: Convert HTML Files to PDF with a Single Request',
       '- Emma can now convert any HTML file to a PDF and share a download link directly in the chat',
       '- Ask Emma to "convert [file URL] to PDF" or "export this as a PDF" and she will render it server-side and upload the result to your file storage',
