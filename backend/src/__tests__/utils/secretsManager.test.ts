@@ -25,6 +25,7 @@ import {
   getFathomCredentials,
   getHubSpotCredentials,
   getAttioCredentials,
+  get2CaptchaApiKey,
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -1496,6 +1497,65 @@ describe('secretsManager utils', () => {
       await expect(getAttioCredentials()).rejects.toThrow(
         'Failed to fetch Attio credentials from Secrets Manager'
       );
+    });
+  });
+
+  describe('get2CaptchaApiKey', () => {
+    it('should return 2captcha API key in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'abc123apikey' })
+      });
+
+      const result = await get2CaptchaApiKey();
+      expect(result).toBe('abc123apikey');
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/2Captcha' });
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'prodapikey' })
+      });
+
+      const result = await get2CaptchaApiKey();
+      expect(result).toBe('prodapikey');
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/2Captcha' });
+    });
+
+    it('should trim whitespace from the key', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '  trimmedkey  ' })
+      });
+
+      const result = await get2CaptchaApiKey();
+      expect(result).toBe('trimmedkey');
+    });
+
+    it('should throw when key is empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(get2CaptchaApiKey()).rejects.toThrow('2captcha API key is empty');
+    });
+
+    it('should throw when Secrets Manager fails', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(get2CaptchaApiKey()).rejects.toThrow('Failed to fetch secret');
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'devkey' })
+      });
+
+      await get2CaptchaApiKey();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/2Captcha' });
     });
   });
 });
