@@ -363,7 +363,9 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     stripe_subscription_id: stripeSubscriptionId,
     subscription_status: actualStatus,
     has_payment_method: true, // completed checkout = has payment method
-    has_used_trial: true, // Mark trial as used so future upgrades don't offer trial
+    // has_used_trial was used to gate the 14-day trial. Trials were removed
+    // (product decision, 2026-04). Existing `true` values in DynamoDB are
+    // harmless residue; we just stop writing the flag on new checkouts.
   };
   // Only write tier-related fields when derivation succeeded. Otherwise
   // leave the user's existing tier alone — much better than overwriting
@@ -912,9 +914,19 @@ export async function reconcileAllStripeUsers(): Promise<{
       const updates: Record<string, any> = {};
       const changes: string[] = [];
 
-      if (user.subscription_status !== sub.status) {
-        updates.subscription_status = sub.status;
-        changes.push(`status ${user.subscription_status || 'null'} -> ${sub.status}`);
+      // Mirror handleSubscriptionUpdated's effectiveStatus derivation so the
+      // reconcile sweep does not clobber the "canceling" pseudo-status that
+      // /api/stripe/cancel-subscription writes. Without this, any admin
+      // triggered /reconcile run would flip a canceling user back to
+      // "active" and the UI would lose the "Canceling" badge.
+      const effectiveStatus =
+        sub.cancel_at_period_end &&
+        (sub.status === 'active' || sub.status === 'trialing')
+          ? 'canceling'
+          : sub.status;
+      if (user.subscription_status !== effectiveStatus) {
+        updates.subscription_status = effectiveStatus;
+        changes.push(`status ${user.subscription_status || 'null'} -> ${effectiveStatus}`);
       }
       if (user.stripe_subscription_id !== sub.id) {
         updates.stripe_subscription_id = sub.id;
