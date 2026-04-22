@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: HubSpot and Attio CRM Sync Now Accessible in CRM',
+      '- The "External CRM Sync" option was missing from the CRM settings menu due to a merge conflict that accidentally dropped the UI wiring',
+      '- The option now appears under the settings (⚙️) button when viewing any lead list',
+      '- Clicking it opens the configuration dialog to connect HubSpot or Attio, map fields, and push/pull leads',
+    ],
+  },
+  {
     date: '2026-04-21',
     changes: [
       'Improved: Reports Page Search Now Searches Report Content',
