@@ -4847,6 +4847,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-22',
     changes: [
+      'Fixed: Shared Session (iShare) Now Shows Error Feedback When a Slack-Triggered Response Fails',
+      '- When Emma responds to a Slack message that is linked to a shared conversation (iShare), a generation error would be reported in Slack but no error message was saved to the session',
+      '- Visitors viewing the shared link would see an unanswered user message with no explanation',
+      '- Emma now saves an error message to the session in all Slack error cases, so iShare viewers see what went wrong instead of a stalled conversation',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
       'Improved: Chat History Now Shows Session Summaries',
       '- Each session in the Chat History sidebar now displays a short AI-generated summary of what was accomplished, shown below the session title',
       '- Summaries are generated automatically in the background and cached — no extra loading time',
