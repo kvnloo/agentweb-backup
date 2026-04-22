@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-22',
     changes: [
+      'Fix: Attio CRM Sync No Longer Fails with Field Mapping Errors',
+      '- Attio push now succeeds even when stored field mappings use legacy property names (e.g. "email" → "email_addresses", "firstname" → "first_name")',
+      '- Placeholder values like "Unknown" and "n/a" in phone/email fields are now filtered out before sending to Attio, preventing format validation errors',
+      '- If an Attio contact record was previously deleted, the next push now recreates it instead of failing with "record not found"',
+      '- Attio API keys that are not exactly 64 characters are now rejected immediately on save with a clear error message',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
       'New: Login Credentials — Save Website Logins for Browser Automation',
       '- A new "Login Credentials" tab is now available in Settings, letting you securely store login credentials for any website',
       '- Emma can now retrieve these credentials automatically when she needs to log into a site during browser automation tasks — no more pasting passwords in chat',
