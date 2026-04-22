@@ -575,14 +575,31 @@ router.post(
       }
 
       if (result.kind === "downgrade_scheduled") {
-        // User stays on current tier until period end — DON'T touch DB here.
-        // When Stripe's subscription_schedule fires at period end, it emits
-        // customer.subscription.updated which our webhook handler will sync.
+        // User stays on current tier until period end — we do NOT write the
+        // new tier to DB here. When Stripe's subscription_schedule fires at
+        // period end, it emits customer.subscription.updated which our
+        // webhook handler will sync the new tier.
+        //
+        // BUT we DO cache the scheduled change itself (schedule id, target
+        // price/tier, effectiveAt) so the UI can surface "your plan changes
+        // on X" without re-querying Stripe on every /auth/me. This cached
+        // hint is cleared by subscription_schedule.{completed,released,
+        // canceled} webhooks or an explicit cancel call.
         const currentTierName = currentPriceId
           ? deriveSubscriptionTypeFromPriceId(currentPriceId)
           : null;
+        const toTier = deriveSubscriptionTypeFromPriceId(resolvedPriceId) ?? 'unknown';
+        const scheduleId = (result as any).schedule?.id ?? '';
+        await userDb.updateUser(userId, {
+          scheduledChange: {
+            stripeScheduleId: scheduleId,
+            toPriceId: resolvedPriceId,
+            toTier,
+            effectiveAt: result.effectiveAt!,
+          },
+        });
         console.log(
-          `[STRIPE DOWNGRADE] User ${userId} scheduled downgrade to ${plan || resolvedPriceId} at ${result.effectiveAt}`
+          `[STRIPE DOWNGRADE] User ${userId} scheduled downgrade to ${plan || resolvedPriceId} at ${result.effectiveAt} (schedule=${scheduleId})`
         );
         return res.json({
           message: `Your plan will change to ${plan || "the selected plan"} at the end of the current period.`,
@@ -639,6 +656,71 @@ router.post(
     } catch (error: any) {
       console.error("Error upgrading subscription:", error.message);
       res.status(500).json({ error: "Failed to upgrade subscription." });
+    }
+  }
+);
+
+/**
+ * @route POST /api/stripe/cancel-scheduled-downgrade
+ * @desc Release an active subscription_schedule (user changed their mind
+ *       about their queued downgrade). Returns to the plain subscription at
+ *       its current price. No proration because we're not changing prices
+ *       yet — the scheduled change just gets torn down before it fires.
+ *
+ *       Stripe fires subscription_schedule.released in response to this,
+ *       which our webhook handler uses to clear the cached scheduledChange
+ *       on the user record. We also clear it optimistically here so the
+ *       next /auth/me doesn't show a stale pending change if the webhook
+ *       races or drops.
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/cancel-scheduled-downgrade",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const stripe = getStripe();
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    try {
+      const user = await userDb.getUserById(userId);
+      if (!user?.scheduledChange?.stripeScheduleId) {
+        return res
+          .status(404)
+          .json({ error: "No scheduled change to cancel." });
+      }
+
+      await stripe.subscriptionSchedules.release(
+        user.scheduledChange.stripeScheduleId
+      );
+      // Optimistic clear — webhook (subscription_schedule.released) will
+      // also clear this, but clearing here prevents a race where /auth/me
+      // returns the stale scheduledChange before the webhook lands.
+      await userDb.updateUser(userId, { scheduledChange: null });
+
+      console.log(
+        `[STRIPE] User ${userId} canceled scheduled downgrade (schedule=${user.scheduledChange.stripeScheduleId})`
+      );
+      res.json({
+        message: "Scheduled change canceled. You stay on your current plan.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Error canceling scheduled downgrade:",
+        error.message
+      );
+      res
+        .status(500)
+        .json({ error: "Failed to cancel scheduled change." });
     }
   }
 );

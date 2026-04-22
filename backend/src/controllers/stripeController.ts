@@ -10,6 +10,7 @@ import {
   handleInvoicePaymentSucceeded,
   handleInvoicePaymentFailed,
   handleChargeRefunded,
+  handleSubscriptionScheduleEnded,
   reconcileAllStripeUsers,
 } from '../services/stripeService';
 
@@ -119,6 +120,16 @@ export async function handleWebhook(req: Request, res: Response) {
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
+        break;
+      // subscription_schedule lifecycle: clear any cached scheduledChange
+      // on the user record when the schedule reaches a terminal state. See
+      // handleSubscriptionScheduleEnded for details on each event.
+      // NOTE: requires these events to be enabled on the Stripe webhook
+      // endpoint (Developers → Webhooks → edit → tick the 3 boxes).
+      case 'subscription_schedule.released':
+      case 'subscription_schedule.canceled':
+      case 'subscription_schedule.completed':
+        await handleSubscriptionScheduleEnded(event.data.object);
         break;
       default:
         console.log(`Unhandled Stripe event type: ${event.type}`);

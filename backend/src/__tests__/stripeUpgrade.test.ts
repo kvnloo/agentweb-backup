@@ -305,9 +305,19 @@ describe('Stripe subscription upgrade', () => {
       expect(mockStripe.subscriptionSchedules.update).toHaveBeenCalledTimes(1);
       // And it must NOT hit the immediate-update path (that's the $299 bug)
       expect(mockStripe.subscriptions.update).not.toHaveBeenCalled();
-      // DB MUST NOT be updated — current tier persists until period end.
-      // Webhook will sync when the schedule fires.
-      expect(mockUpdateUser).not.toHaveBeenCalled();
+      // DB IS updated — but ONLY with the scheduledChange hint so the UI
+      // can surface "plan changes on X". The actual tier flip happens when
+      // the schedule fires (webhook → subscription.updated). The user's
+      // subscriptionType/stripe_subscription_id fields are NOT touched here.
+      expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+      expect(mockUpdateUser).toHaveBeenCalledWith('user-123', {
+        scheduledChange: {
+          stripeScheduleId: 'sub_sched_xyz',
+          toPriceId: 'price_starter_123',
+          toTier: 'Starter',
+          effectiveAt: new Date(1700000000 * 1000).toISOString(),
+        },
+      });
     });
 
     it('should accept newPriceId directly', async () => {

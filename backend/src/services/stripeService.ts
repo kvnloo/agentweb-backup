@@ -199,6 +199,7 @@ export async function changeSubscriptionPrice(
   kind: 'upgrade_immediate' | 'downgrade_scheduled' | 'same_price';
   effectiveAt?: string; // ISO — only for scheduled downgrades
   subscription: any;
+  schedule?: any; // Stripe subscription_schedule — only set on downgrade_scheduled
 }> {
   if (!subscriptionId) throw new Error('subscriptionId is required');
   if (!newPriceId) throw new Error('newPriceId is required');
@@ -242,7 +243,7 @@ export async function changeSubscriptionPrice(
   });
   const currentPhase = schedule.phases[0];
 
-  await stripe.subscriptionSchedules.update(schedule.id, {
+  const updated = await stripe.subscriptionSchedules.update(schedule.id, {
     phases: [
       {
         items: currentPhase.items.map((i: any) => ({
@@ -263,6 +264,7 @@ export async function changeSubscriptionPrice(
     kind: 'downgrade_scheduled',
     effectiveAt: new Date(periodEnd * 1000).toISOString(),
     subscription: current, // Return current sub — it stays unchanged until period end
+    schedule: updated, // Updated schedule (with id) so callers can cache scheduledChange
   };
 }
 
@@ -850,6 +852,49 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
   console.log(
     `[STRIPE] Charge refunded: user ${user.userId}, charge=${charge.id}, amount_refunded=${charge.amount_refunded}`
   );
+}
+
+/**
+ * Handle subscription_schedule lifecycle termination. Clears any cached
+ * scheduledChange on the user record regardless of which terminal state the
+ * schedule hit: `completed` (phase 2 fired), `released` (user canceled the
+ * queued change or the schedule's end_behavior=release executed), or
+ * `canceled` (the whole schedule was torn down).
+ *
+ * Note: `.completed` means phase 2 fired successfully → a parallel
+ * `customer.subscription.updated` webhook will sync the new tier to DB. We
+ * only clear the scheduled-change hint here so the UI stops advertising a
+ * pending change that has already happened.
+ *
+ * Only clears if the schedule ID on the user matches the one in the event —
+ * prevents a stale / out-of-order webhook from clobbering a newer scheduled
+ * change the user queued right after.
+ */
+export async function handleSubscriptionScheduleEnded(schedule: any): Promise<void> {
+  const customerId = typeof schedule.customer === 'string'
+    ? schedule.customer
+    : schedule.customer?.id;
+  if (!customerId) {
+    console.warn('[STRIPE] subscription_schedule event missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for subscription_schedule event. customer=${customerId}`);
+    return;
+  }
+
+  if (user.scheduledChange?.stripeScheduleId === schedule.id) {
+    await userDb.updateUser(user.userId, { scheduledChange: null });
+    console.log(
+      `[STRIPE] Cleared scheduledChange for user ${user.userId} — schedule ${schedule.id} ended (${schedule.status})`
+    );
+  } else {
+    console.log(
+      `[STRIPE] Schedule ${schedule.id} ended (${schedule.status}) but user ${user.userId} has ${user.scheduledChange?.stripeScheduleId || 'no'} cached — no-op`
+    );
+  }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

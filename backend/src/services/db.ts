@@ -204,6 +204,20 @@ export interface User {
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   /**
+   * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
+   * from Pro to Starter that takes effect at period_end). Cached here from
+   * subscription_schedules so the UI can surface it without hitting Stripe on
+   * every /auth/me. Cleared when: (a) the schedule fires (webhook → schedule.completed),
+   * (b) the user explicitly cancels it via /api/stripe/cancel-scheduled-downgrade,
+   * or (c) the schedule is released/canceled for any other reason (webhook).
+   */
+  scheduledChange?: {
+    stripeScheduleId: string;
+    toPriceId: string;
+    toTier: string; // e.g., "Starter"
+    effectiveAt: string; // ISO 8601
+  } | null;
+  /**
    * Stripe Connect OAuth — customer-authorized read-only access to their own
    * Stripe account. Used to enrich CRM contacts with the customer's live
    * billing data (not AgentWeb's platform billing).
