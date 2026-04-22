@@ -421,8 +421,16 @@ router.post(
       // creating a new one — prevents duplicate customer records piling up
       // (the cus_ABC vs cus_DEF orphan problem).
       if (!customerId) {
+        // Escape backslash first, then double-quote, before interpolating into
+        // Stripe's search DSL. Without this, an attacker who registered with a
+        // crafted email (registration allows `"` and `\`) could inject
+        // additional search clauses and link another user's Stripe customer
+        // to their DB row — e.g. `foo" OR metadata["userId"]:"victim"`.
+        const escapedEmail = userEmail
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"');
         const searchResult = await stripe.customers.search({
-          query: `email:"${userEmail}"`,
+          query: `email:"${escapedEmail}"`,
           limit: 1,
         });
         const existingByEmail = searchResult.data.find(
@@ -440,9 +448,11 @@ router.post(
         await userDb.updateUser(userId, { stripe_customer_id: customerId });
       }
 
-      // Check if user has already used a trial — don't offer trial again
-      const hasUsedTrial = !!(user as any)?.has_used_trial;
-
+      // Free trials removed (product decision, 2026-04). New users pay on
+      // first checkout. Refunds are handled manually by Harsha for
+      // dissatisfied users. Do NOT reintroduce trial_period_days here.
+      // Any existing `has_used_trial: true` values in DynamoDB are harmless
+      // residue and can be ignored.
       const sessionParams: any = {
         ui_mode: "embedded",
         customer: customerId,
@@ -450,13 +460,6 @@ router.post(
         mode: "subscription",
         return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       };
-
-      // Only offer trial if user hasn't used one before
-      if (!hasUsedTrial) {
-        sessionParams.subscription_data = {
-          trial_period_days: 14,
-        };
-      }
 
       const session = await stripe.checkout.sessions.create(sessionParams);
 
@@ -517,6 +520,20 @@ router.post(
     const resolvedPriceId = newPriceId || (plan ? planPriceMap[plan.toLowerCase()] : null);
     if (!resolvedPriceId) {
       return res.status(400).json({ error: "A valid plan or newPriceId is required." });
+    }
+
+    // Whitelist against known env-configured price IDs. Without this,
+    // an authenticated user could pass an arbitrary newPriceId and
+    // downgrade their billing to any active price in the Stripe account
+    // (legacy $1 dev/test prices in particular are dangerous to expose).
+    // `plan` goes through planPriceMap which is already safe; `newPriceId`
+    // is the unsafe override and must match a known env value.
+    const KNOWN_PRICE_IDS = [
+      process.env.STRIPE_STARTER_PRICE_ID,
+      process.env.STRIPE_COMPLETE_PRICE_ID,
+    ].filter(Boolean);
+    if (!KNOWN_PRICE_IDS.includes(resolvedPriceId)) {
+      return res.status(400).json({ error: "Invalid plan or price ID." });
     }
 
     try {
@@ -776,7 +793,10 @@ router.post(
           .json({ error: "No subscription found for this account." });
       }
 
-      // Find the user's subscription (could be active with cancel_at_period_end=true)
+      // Find the user's subscription (could be active with
+      // cancel_at_period_end=true). Mirror /cancel-subscription's logic and
+      // fall back to status=trialing if no active sub is found — otherwise
+      // a user who hit cancel during a free trial cannot reactivate.
       const subscriptions = await stripe.subscriptions.list({
         customer: user.stripe_customer_id,
         status: "active",
@@ -784,9 +804,19 @@ router.post(
       });
 
       if (subscriptions.data.length === 0) {
-        return res
-          .status(404)
-          .json({ error: "No active subscription found to reactivate." });
+        const trialingSubscriptions = await stripe.subscriptions.list({
+          customer: user.stripe_customer_id,
+          status: "trialing",
+          limit: 1,
+        });
+
+        if (trialingSubscriptions.data.length === 0) {
+          return res
+            .status(404)
+            .json({ error: "No active subscription found to reactivate." });
+        }
+
+        subscriptions.data = trialingSubscriptions.data;
       }
 
       const subscription = subscriptions.data[0];
@@ -802,12 +832,23 @@ router.post(
         cancel_at_period_end: false,
       });
 
-      // Update user record
-      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
-      await userDb.updateUser(userId, {
-        subscription_status: "active",
-        current_period_end: periodEnd,
-      });
+      // Read current_period_end defensively — same pattern as PR #1262
+      // applied to /cancel-subscription. The 2025-05-28.basil API moved
+      // this field from subscription.current_period_end to
+      // subscription.items.data[0].current_period_end, and trialing subs
+      // have null until trial ends. Without this the endpoint crashes with
+      // "Invalid time value" when the top-level field is null.
+      const periodEndUnix =
+        (updated as any).current_period_end ??
+        (updated as any).items?.data?.[0]?.current_period_end ??
+        null;
+      const periodEnd = periodEndUnix
+        ? new Date(periodEndUnix * 1000).toISOString()
+        : null;
+
+      const updateData: Record<string, any> = { subscription_status: "active" };
+      if (periodEnd) updateData.current_period_end = periodEnd;
+      await userDb.updateUser(userId, updateData);
 
       res.json({
         message: "Subscription reactivated successfully.",
