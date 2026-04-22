@@ -2056,10 +2056,15 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
-        // Skip diagnosis for errors that already have specific handling below (context limit, worker shutdown, etc.)
-        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
-          const userMessage = req.body?.userMessage || '';
-          diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+        // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          if (error instanceof Error && isWorkerShutdownError(error)) {
+            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else {
+            const userMessage = req.body?.userMessage || '';
+            diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+          }
         }
 
         const errorAssistantMessage: ChatMessage = {
@@ -2596,6 +2601,18 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
+      // Reject concurrent requests for the same session (synchronous check before any await)
+      if (activeSessionGenerations.has(session.sessionId)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+      activeSessionGenerations.add(session.sessionId);
+
+      try {
+
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
@@ -2626,6 +2643,9 @@ export const agentModeController = {
         skills: response.skills,
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+      } finally {
+        activeSessionGenerations.delete(session.sessionId);
+      }
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
 
@@ -2641,9 +2661,15 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
-        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
-          const userMessage = req.body?.userMessage || '';
-          diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+        // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          if (error instanceof Error && isWorkerShutdownError(error)) {
+            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else {
+            const userMessage = req.body?.userMessage || '';
+            diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+          }
         }
 
         const errorAssistantMessage: ChatMessage = {

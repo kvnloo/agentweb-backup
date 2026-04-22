@@ -21,6 +21,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-22',
     changes: [
+      'Fix: Messages Sent via Shared Sessions No Longer Get Stuck Without a Response',
+      '- When a shared session (ishare) request was processed by a server instance that was later terminated by auto-scaling, the user\'s message was saved but Emma\'s response was never written — leaving the message orphaned',
+      '- Emma now always writes an error reply when the server shuts down mid-generation, so users see "The server restarted while processing your request. Please send your message again." instead of silence',
+      '- The shared session endpoint now also rejects concurrent duplicate requests, preventing a second send from interfering with an in-progress generation',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
       'New: Login Credentials — Save Website Logins for Browser Automation',
       '- A new "Login Credentials" tab is now available in Settings, letting you securely store login credentials for any website',
       '- Emma can now retrieve these credentials automatically when she needs to log into a site during browser automation tasks — no more pasting passwords in chat',
