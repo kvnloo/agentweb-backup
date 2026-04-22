@@ -4826,4 +4826,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- If a visitor on a shared link asks Emma to connect their LinkedIn Outreach account, Emma now explains that account connections are not available in shared sessions and directs them to open Agent Mode in their own account to connect from there',
     ],
   },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Improved: Chat History Now Shows Session Summaries',
+      '- Each session in the Chat History sidebar now displays a short AI-generated summary of what was accomplished, shown below the session title',
+      '- Summaries are generated automatically in the background and cached — no extra loading time',
+      '- The full summary also appears in the hover tooltip alongside the session title',
+      '- Session search now matches against the summary text, making it easier to find past sessions by what was done rather than just the title',
+    ],
+  },
 ];
