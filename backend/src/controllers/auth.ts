@@ -293,6 +293,12 @@ export const googleCallback = async (
           isAdmin: false,
           subscriptionType: "Free",
         }).catch(() => {});
+
+        if (process.env.NODE_ENV !== "development") {
+          emailService.sendTeamIntroductionEmail(email, finalDisplayName)
+            .then(() => userDb.updateUser(user!.userId, { introductionEmailSent: new Date().toISOString() }))
+            .catch((err) => console.error("Failed to send team introduction email:", err));
+        }
       } else {
         // For other portals, look up waitlist for bonus data (no gate)
         const waitlistEntry = await waitlistDb.getByEmail(email);
@@ -353,6 +359,12 @@ export const googleCallback = async (
           stripe_customer_id,
           subscriptionType: "Free",
         }).catch(() => {});
+
+        if (process.env.NODE_ENV !== "development") {
+          emailService.sendTeamIntroductionEmail(email, finalDisplayName)
+            .then(() => userDb.updateUser(user!.userId, { introductionEmailSent: new Date().toISOString() }))
+            .catch((err) => console.error("Failed to send team introduction email:", err));
+        }
       }
     }
 
