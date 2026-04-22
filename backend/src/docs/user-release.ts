@@ -4818,4 +4818,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Useful for lead magnets, checklists, reports, and any other HTML documents that need to be shared as PDFs',
     ],
   },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: LinkedIn Outreach Connect Button Now Works Correctly on Shared Links',
+      '- On iShare (shared conversation) pages, the "Connect LinkedIn Outreach" button is no longer shown since account connections require being logged in',
+      '- If a visitor on a shared link asks Emma to connect their LinkedIn Outreach account, Emma now explains that account connections are not available in shared sessions and directs them to open Agent Mode in their own account to connect from there',
+    ],
+  },
 ];

@@ -1907,6 +1907,17 @@ export class AgentModeService {
               continue;
             }
 
+            if (isInteractiveShare && toolCall.function.name === 'connect_account') {
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.' }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
