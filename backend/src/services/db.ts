@@ -483,7 +483,8 @@ class UserDB {
     googleId?: string,
     stripe_customer_id?: string,
     companyName?: string,
-    useCaseCategories?: string[]
+    useCaseCategories?: string[],
+    attribution?: import("../types/attribution").AttributionTouch
   ): Promise<User | undefined> {
     const itemToCreate: any = {
       userId,
@@ -529,6 +530,7 @@ class UserDB {
         companyName,
         isOAuthUser,
         createdAt: itemToCreate.createdAt,
+        ...(attribution && { attribution }),
       });
       return params.Item as User;
     } catch (error) {

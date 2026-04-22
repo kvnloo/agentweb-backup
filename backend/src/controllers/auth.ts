@@ -68,6 +68,12 @@ export const register = async (req: Request, res: Response) => {
     const finalDisplayName =
       reqDisplayName || displayNameFromWaitlist || email.split("@")[0];
 
+    // Compute attribution up-front so createUser can thread it through the
+    // onUserSignup hook → signupAutoEnrollService → lead.customFields. If we
+    // compute after createUser like before, the signup hook fires BEFORE
+    // attribution is known and the enrolled lead is missing UTM data.
+    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
+
     const newUser = await userDb.createUser(
       email,
       userId,
@@ -79,12 +85,12 @@ export const register = async (req: Request, res: Response) => {
       undefined, // googleId
       stripe_customer_id, // from waitlist
       companyNameFromWaitlist, // from waitlist
-      useCaseCategoriesFromWaitlist // from waitlist
+      useCaseCategoriesFromWaitlist, // from waitlist
+      touch // attribution — passes through onUserSignup hook
     );
 
     // Set Free tier defaults for new registrations (subscription upgrades happen via Stripe checkout)
     const freeTierConfig = await getTierConfig("Free");
-    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
     await userDb.updateUser(userId, {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
