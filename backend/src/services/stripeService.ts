@@ -437,8 +437,21 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     return;
   }
 
+  // When a user has requested cancel-at-period-end, Stripe keeps the raw
+  // subscription status as "active" (or "trialing") until the period
+  // closes. Expose that intent to the UI as status="canceling" so the
+  // customer sees "Canceling" instead of "Active" right after they hit
+  // cancel. Without this, the subscription.updated webhook that fires
+  // ~2 seconds after /api/stripe/cancel-subscription would overwrite
+  // our "canceling" marker with the raw Stripe status.
+  const effectiveStatus =
+    subscription.cancel_at_period_end &&
+    (subscription.status === "active" || subscription.status === "trialing")
+      ? "canceling"
+      : subscription.status;
+
   const updateData: Record<string, any> = {
-    subscription_status: subscription.status,
+    subscription_status: effectiveStatus,
   };
 
   // Backfill stripe_subscription_id if it was never written (e.g., missed checkout webhook).

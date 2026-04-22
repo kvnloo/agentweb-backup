@@ -88,6 +88,13 @@ export async function handleWebhook(req: Request, res: Response) {
         await handleCheckoutSessionCompleted(event.data.object);
         await recordSubscriptionEvent(event.data.object, 'subscription_created');
         break;
+      // Handle subs created OUTSIDE Checkout (admin provisioning, API,
+      // reconciliation). handleSubscriptionUpdated derives tier from the
+      // subscription object + syncs status/period_end/payment_method.
+      case 'customer.subscription.created':
+        await handleSubscriptionUpdated(event.data.object);
+        await recordSubscriptionEvent(event.data.object, 'subscription_created');
+        break;
       case 'customer.subscription.updated':
         await handleSubscriptionUpdated(event.data.object);
         await recordSubscriptionEvent(event.data.object, 'subscription_updated');
@@ -96,6 +103,11 @@ export async function handleWebhook(req: Request, res: Response) {
         await handleSubscriptionDeleted(event.data.object);
         await recordSubscriptionEvent(event.data.object, 'subscription_canceled');
         break;
+      // Stripe sends both `invoice.paid` (current) and
+      // `invoice.payment_succeeded` (legacy) for the same event. Handle
+      // both so renewal cycles sync regardless of which wire format the
+      // webhook endpoint was configured with.
+      case 'invoice.paid':
       case 'invoice.payment_succeeded':
         await handleInvoicePayment(event.data.object, 'payment_succeeded');
         break;
