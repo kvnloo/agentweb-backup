@@ -4785,6 +4785,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-21',
+    changes: [
+      'New: Emma Can Now Solve CAPTCHAs Automatically',
+      '- When Emma encounters a reCAPTCHA v2, reCAPTCHA v3, hCaptcha, or Cloudflare Turnstile during browser automation, she can now solve it automatically using a CAPTCHA-solving service',
+      '- For simple image or text CAPTCHAs that require human judgement, Emma will take a screenshot and ask the user to type the answer',
+    ],
+  },
+  {
     date: '2026-04-20',
     changes: [
       'Fixed: Agent Mode No Longer Shows "Working In Progress" After Responding',

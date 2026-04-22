@@ -417,6 +417,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/solveRecaptchaTool');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
