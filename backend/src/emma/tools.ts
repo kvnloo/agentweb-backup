@@ -4563,6 +4563,31 @@ emmaToolRegistry.register({
   }
 });
 
+emmaToolRegistry.register({
+  name: 'convert_to_pdf',
+  definition: {
+    name: 'convert_to_pdf',
+    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_url: {
+          type: 'string',
+          description: 'The URL of the HTML file to convert to PDF (e.g. an S3 URL from a previously saved HTML file)',
+        },
+        output_filename: {
+          type: 'string',
+          description: 'Desired filename for the PDF (without extension, e.g. "sentriq-readiness-checklist-v5")',
+        },
+      },
+      required: ['source_url', 'output_filename'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId);
+  },
+});
+
 // --- Tools from workflowTools.ts ---
 emmaToolRegistry.register({
   name: 'create_work_plan',

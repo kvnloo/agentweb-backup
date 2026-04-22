@@ -14344,6 +14344,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  public async convertToPdf(sourceUrl: string, outputFilename: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Converting to PDF:', sourceUrl, 'for user:', userId);
+
+      if (!sourceUrl || typeof sourceUrl !== 'string') {
+        throw new Error('source_url is required and must be a string');
+      }
+      if (!sourceUrl.startsWith('http://') && !sourceUrl.startsWith('https://')) {
+        throw new Error('source_url must be an HTTP or HTTPS URL');
+      }
+
+      const puppeteer = await import('puppeteer-core');
+      let browser: any = null;
+      try {
+        browser = await puppeteer.default.launch({
+          executablePath: '/usr/bin/google-chrome',
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+          headless: true,
+        });
+        const page = await browser.newPage();
+        await page.goto(sourceUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+        const pdfBuffer = await page.pdf({
+          format: 'A4',
+          printBackground: true,
+          margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
+        });
+        await browser.close();
+        browser = null;
+
+        const pdfFilename = (outputFilename || 'export')
+          .replace(/\.html?$/i, '')
+          .replace(/[^a-zA-Z0-9_\-]/g, '_') + '.pdf';
+
+        const uploadResult = await uploadFileToS3(Buffer.from(pdfBuffer), pdfFilename, userId, 'application/pdf');
+
+        if (!uploadResult.success || !uploadResult.url) {
+          throw new Error(uploadResult.error || 'Failed to upload PDF to S3');
+        }
+
+        return {
+          success: true,
+          pdf_url: uploadResult.url,
+          filename: pdfFilename,
+          message: `PDF created and saved. Download: ${uploadResult.url}`,
+        };
+      } finally {
+        if (browser) {
+          try { await browser.close(); } catch {}
+        }
+      }
+    } catch (error) {
+      console.error('AgentMode: Error converting to PDF:', error);
+      return {
+        success: false,
+        message: 'Failed to convert to PDF.',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
   // Read file content from URL with support for various file types
   public async readFileContent(fileUrl: string): Promise<any> {
     try {

@@ -1,4 +1,5 @@
 import express from "express";
+import nodePath from "path";
 import cors from "cors";
 import passport from "passport";
 import authRoutes from "./routes/auth";
@@ -85,6 +86,7 @@ import {
   saveHtmlContent,
   getPresignedFileUrl,
   batchPresignUrls,
+  exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
 
@@ -204,6 +206,7 @@ fileRoutes.get("/content", authenticateToken, getFileContent);
 fileRoutes.post("/html", authenticateToken, saveHtmlContent);
 fileRoutes.get("/presign", authenticateToken, getPresignedFileUrl);
 fileRoutes.post("/presign-batch", authenticateToken, batchPresignUrls);
+fileRoutes.post("/export-pdf", authenticateToken, exportHtmlToPdf);
 
 // Routes
 app.use("/api/auth", authRoutes);
@@ -343,5 +346,12 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Temporary static exports — for one-off file downloads (files in backend/tmp-exports/)
+app.use("/tmp-exports", express.static(nodePath.join(__dirname, "../tmp-exports"), {
+  setHeaders: (res, filePath) => {
+    res.setHeader("Content-Disposition", `attachment; filename="${nodePath.basename(filePath)}"`);
+  },
+}));
 
 export default app;
