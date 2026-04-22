@@ -24,6 +24,7 @@ import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
+import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
@@ -1751,6 +1752,21 @@ export const agentModeController = {
         lastEvaluatedKey: result.lastEvaluatedKey,
         hasMore: !!result.lastEvaluatedKey
       });
+
+      // Fire-and-forget: update stale/missing session summaries in background
+      // so they're available on the next load (cache-aware — skips up-to-date ones)
+      for (const session of result.sessions) {
+        const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+        const needsSummary = messageCount > 0 && (
+          !session.sessionSummary ||
+          session.sessionSummary.evaluatedMessageIndex < messageCount
+        );
+        if (needsSummary) {
+          summarizeSessionIfNeeded(session).catch((err) => {
+            console.error(`AgentMode: Background summarization failed for ${session.sessionId}:`, err);
+          });
+        }
+      }
     } catch (error) {
       console.error('AgentMode: Get sessions error:', error);
       res.status(500).json({ error: 'Failed to get sessions' });

@@ -1590,8 +1590,8 @@ export class ChatbotDB {
       params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
     }
     if (searchTerm) {
-      filterParts.push('contains(#title, :searchTerm)');
-      params.ExpressionAttributeNames = { '#title': 'title' };
+      filterParts.push('(contains(#title, :searchTerm) OR contains(sessionSummary.#summary, :searchTerm))');
+      params.ExpressionAttributeNames = { '#title': 'title', '#summary': 'summary' };
       params.ExpressionAttributeValues[':searchTerm'] = searchTerm;
     }
     if (filterParts.length > 0) {
