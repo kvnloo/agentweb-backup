@@ -703,12 +703,28 @@ router.post(
         cancel_at_period_end: true,
       });
 
-      // Update user record
-      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
-      await userDb.updateUser(userId, {
+      // Read current_period_end defensively. The 2025-05-28.basil API
+      // moved this field from subscription.current_period_end to
+      // subscription.items.data[0].current_period_end. Prior code crashed
+      // with "Invalid time value" when the top-level field was null.
+      // Trialing subs also have null on both fields until trial ends.
+      const periodEndUnix =
+        (updated as any).current_period_end ??
+        (updated as any).items?.data?.[0]?.current_period_end ??
+        null;
+      const periodEnd = periodEndUnix
+        ? new Date(periodEndUnix * 1000).toISOString()
+        : null;
+
+      // Update user record. `subscription_status: "canceling"` is a
+      // pseudo-status for the UI. Stripe keeps the sub active/trialing
+      // until period end; then customer.subscription.deleted fires and
+      // the webhook handler clears the fields.
+      const updateData: Record<string, any> = {
         subscription_status: "canceling",
-        current_period_end: periodEnd,
-      });
+      };
+      if (periodEnd) updateData.current_period_end = periodEnd;
+      await userDb.updateUser(userId, updateData);
 
       res.json({
         message: "Subscription will be canceled at the end of the billing period.",
