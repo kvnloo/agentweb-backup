@@ -368,6 +368,19 @@ async function handleSlackSessionResponse(params: {
       await deleteSlackMessage(channel, thinkingTs);
     }
     await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
+
+    // Save error message to session so ishare viewers see the failure rather than an orphaned user message
+    try {
+      const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
+      await chatbotDbForError.addMessageToSession(session.sessionId, {
+        role: 'assistant',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        timestamp: new Date().toISOString(),
+        metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+      });
+    } catch (saveError) {
+      console.error('❌ Error saving error message to session:', saveError);
+    }
   }
 }
 
@@ -831,6 +844,18 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                 console.error('❌ Error generating thread response:', genError);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
                 await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+                // Save error message to session so ishare viewers see the failure rather than an orphaned user message
+                try {
+                  const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
+                  await chatbotDbForError.addMessageToSession(sessionId, {
+                    role: 'assistant',
+                    content: 'Sorry, I encountered an error processing your request. Please try again.',
+                    timestamp: new Date().toISOString(),
+                    metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+                  });
+                } catch (saveError) {
+                  console.error('❌ Error saving error message to session:', saveError);
+                }
               }
             }
           } catch (parseError) {
