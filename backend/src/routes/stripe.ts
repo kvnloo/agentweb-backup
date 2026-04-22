@@ -387,15 +387,52 @@ router.post(
 
     try {
       // Find or create Stripe customer
+      // Find or reuse Stripe customer — defensive against stale DB IDs
+      // (customer deleted from Stripe dashboard) and duplicate customers
+      // (multiple records for the same email because DB lost track).
       const user = await userDb.getUserById(userId);
-      let customerId = user?.stripe_customer_id;
+      let customerId: string | null = user?.stripe_customer_id || null;
 
+      // Step 1: if DB has a customer ID, verify it still exists in Stripe.
+      // Treat "deleted" or "No such customer" as missing so we don't pass a
+      // dead ID to checkout.sessions.create and 500.
+      if (customerId) {
+        try {
+          const existing = await stripe.customers.retrieve(customerId);
+          if ((existing as any).deleted) {
+            customerId = null;
+          }
+        } catch (err: any) {
+          const code = err?.code || err?.raw?.code;
+          const status = err?.statusCode || err?.raw?.statusCode;
+          if (code === "resource_missing" || status === 404) {
+            customerId = null;
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      // Step 2: no valid customer on file. Search Stripe by email BEFORE
+      // creating a new one — prevents duplicate customer records piling up
+      // (the cus_ABC vs cus_DEF orphan problem).
       if (!customerId) {
-        const customer = await stripe.customers.create({
-          email: userEmail,
-          metadata: { userId },
+        const searchResult = await stripe.customers.search({
+          query: `email:"${userEmail}"`,
+          limit: 1,
         });
-        customerId = customer.id;
+        const existingByEmail = searchResult.data.find(
+          (c) => !(c as any).deleted
+        );
+        if (existingByEmail) {
+          customerId = existingByEmail.id;
+        } else {
+          const customer = await stripe.customers.create({
+            email: userEmail,
+            metadata: { userId },
+          });
+          customerId = customer.id;
+        }
         await userDb.updateUser(userId, { stripe_customer_id: customerId });
       }
 
