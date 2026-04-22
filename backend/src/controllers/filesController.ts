@@ -2,6 +2,8 @@ import { Request, Response } from "express";
 import http from "http"; // Import Node.js http module
 import https from "https"; // Import Node.js https module
 import axios from "axios";
+import puppeteer from "puppeteer-core";
+import path from "path";
 import {
   uploadFileToS3WithPath,
   extractS3KeyFromUrl,
@@ -368,5 +370,44 @@ export const saveHtmlContent = async (req: Request, res: Response) => {
       message: "Failed to save HTML content.",
       error: error.message,
     });
+  }
+};
+
+export const exportHtmlToPdf = async (req: Request, res: Response) => {
+  const { html, filename } = req.body as { html?: string; filename?: string };
+
+  if (!html || typeof html !== "string") {
+    return res.status(400).json({ success: false, message: "html is required and must be a string." });
+  }
+
+  const safeFilename = (filename || "export").replace(/[^a-zA-Z0-9_\-]/g, "_").replace(/\.html$/i, "") + ".pdf";
+
+  let browser: any = null;
+  try {
+    browser = await puppeteer.launch({
+      executablePath: "/usr/bin/google-chrome",
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      headless: true,
+    });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      margin: { top: "20mm", bottom: "20mm", left: "15mm", right: "15mm" },
+    });
+    await browser.close();
+    browser = null;
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    return res.send(Buffer.from(pdfBuffer));
+  } catch (error: any) {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
+    console.error("Error generating PDF:", error);
+    return res.status(500).json({ success: false, message: "Failed to generate PDF.", error: error.message });
   }
 };

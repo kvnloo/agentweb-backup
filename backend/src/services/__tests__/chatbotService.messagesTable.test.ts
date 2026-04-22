@@ -330,7 +330,7 @@ describe('ChatbotDB - Messages Table', () => {
       expect(result!.messages[0].content).toBe('New message');
     });
 
-    it('should throw error when message limit is exceeded', async () => {
+    it('should allow writing even when message count is at or over the limit', async () => {
       const existingMessages = Array.from({ length: MAX_MESSAGE_SIZE_PER_SESSION }, (_, i) => ({
         sessionId,
         messageIndex: i,
@@ -348,19 +348,23 @@ describe('ChatbotDB - Messages Table', () => {
         }),
       });
 
-      // Mock query messages table - returns 150 messages
+      // Mock query messages table - returns MAX messages (at limit)
       mockDocClient.query.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
           Items: existingMessages,
         }),
       });
 
-      await expect(chatbotDb.addMessageToSession(sessionId, newMessage)).rejects.toThrow(
-        'SESSION_MESSAGE_LIMIT_EXCEEDED'
-      );
+      mockDocClient.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ UnprocessedItems: {} }),
+      });
+      mockDocClient.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
 
-      // Verify message was NOT added
-      expect(mockDocClient.batchWrite).not.toHaveBeenCalled();
+      // Should succeed — the limit is enforced at turn-start, not during writes
+      await expect(chatbotDb.addMessageToSession(sessionId, newMessage)).resolves.toBeDefined();
+      expect(mockDocClient.batchWrite).toHaveBeenCalled();
     });
 
     it('should throw error when session not found', async () => {
@@ -459,7 +463,7 @@ describe('ChatbotDB - Messages Table', () => {
       expect(result!.messages).toHaveLength(2);
     });
 
-    it('should throw error when adding messages would exceed limit', async () => {
+    it('should allow writing even when messages would push count over the limit', async () => {
       const existingMessages = Array.from({ length: MAX_MESSAGE_SIZE_PER_SESSION - 1 }, (_, i) => ({
         sessionId,
         messageIndex: i,
@@ -477,20 +481,23 @@ describe('ChatbotDB - Messages Table', () => {
         }),
       });
 
-      // Mock query messages table - returns 149 messages
+      // Mock query messages table - returns MAX-1 messages
       mockDocClient.query.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
           Items: existingMessages,
         }),
       });
 
-      // Try to add 2 messages (would make 151 total)
-      await expect(chatbotDb.addMessagesToSession(sessionId, newMessages)).rejects.toThrow(
-        'SESSION_MESSAGE_LIMIT_EXCEEDED'
-      );
+      mockDocClient.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ UnprocessedItems: {} }),
+      });
+      mockDocClient.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
 
-      // Verify messages were NOT added
-      expect(mockDocClient.batchWrite).not.toHaveBeenCalled();
+      // Should succeed — the limit is enforced at turn-start, not during writes
+      await expect(chatbotDb.addMessagesToSession(sessionId, newMessages)).resolves.toBeDefined();
+      expect(mockDocClient.batchWrite).toHaveBeenCalled();
     });
 
     it('should return session unchanged when messages array is empty', async () => {

@@ -11,6 +11,7 @@ jest.mock('../../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   }
 }));
 
@@ -75,6 +76,7 @@ describe('AgentMode Sharing Controller', () => {
     jest.clearAllMocks();
     jest.clearAllTimers();
     jest.useRealTimers();
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
   });
 
   afterEach(() => {

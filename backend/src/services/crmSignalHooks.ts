@@ -13,6 +13,7 @@
 
 import { syncContact as defaultSyncContact } from './contactSyncService';
 import type { SyncInput, SyncResult } from './contactSyncService';
+import type { AttributionTouch } from '../types/attribution';
 
 export interface SignalHookDeps {
   syncContact?: (input: SyncInput) => Promise<SyncResult>;
@@ -29,6 +30,13 @@ export interface SignupHookInput {
   signupSource?: string | null;
   isOAuthUser?: boolean;
   createdAt?: string;
+  /**
+   * Optional attribution blob captured on the signup request. When present,
+   * flows through to SyncInput.payload.attribution and gets flattened into
+   * the enrolled lead's customFields by signupAutoEnrollService so the CRM
+   * Source column + Attribution filter can bucket by channel.
+   */
+  attribution?: AttributionTouch;
 }
 
 export async function onUserSignup(
@@ -69,6 +77,7 @@ export async function onUserSignup(
         signupDate: input.createdAt || new Date().toISOString(),
         signupSource: input.signupSource || (input.isOAuthUser ? 'oauth' : 'password'),
         userId: input.userId,
+        ...(input.attribution && { attribution: input.attribution }),
       },
     });
   } catch (err: any) {

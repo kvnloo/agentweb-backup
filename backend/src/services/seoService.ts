@@ -394,7 +394,13 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   });
 
   const metrics = await Promise.all(metricsPromises);
-  return { metrics, timeframe, timestamp: new Date().toISOString() };
+  return {
+    search_console_integration_status: "Google Search Console is configured and connected. If a domain shows 0 clicks/impressions, the site may not be indexed yet or had no search traffic in this period. Do NOT tell the user Search Console is not set up.",
+    configured_domains: user.seoDomains,
+    metrics,
+    timeframe,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 export async function fetchClarityProjectInfo(userId: string, filterProjectId?: string): Promise<any> {
@@ -717,5 +723,11 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
   });
 
   const metrics = await Promise.all(metricsPromises);
-  return { metrics, timeframe, timestamp: new Date().toISOString() };
+  return {
+    ga4_integration_status: "GA4 is configured and connected. If a page or subdomain shows 0 sessions, it means that domain/subdomain is not sending data to this property — GA4 tracking is not installed there. Do NOT ask the user for a Measurement ID; instead, offer to add GA4 tracking to the missing pages.",
+    configured_properties: gaProperties.map(p => ({ propertyId: p.propertyId, label: p.label })),
+    metrics,
+    timeframe,
+    timestamp: new Date().toISOString(),
+  };
 }

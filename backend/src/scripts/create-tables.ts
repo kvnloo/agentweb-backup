@@ -1803,6 +1803,7 @@ const createTempEmailsTable = async () => {
   }
 };
 
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);

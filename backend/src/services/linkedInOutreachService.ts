@@ -152,6 +152,10 @@ export class LinkedInOutreachService {
    * Returns true if connected, false if disconnected or any error occurs.
    * Results are cached for 10 minutes to avoid redundant per-request API calls.
    */
+  clearStatusCache(accountId: string): void {
+    this.connectedStatusCache.delete(accountId);
+  }
+
   async isAccountConnected(accountId: string): Promise<boolean> {
     const cached = this.connectedStatusCache.get(accountId);
     if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.CONNECTED_STATUS_TTL_MS) {

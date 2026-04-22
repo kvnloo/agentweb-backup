@@ -263,6 +263,50 @@ describe('agentModeErrors utils', () => {
       });
       expect(isTransientLLMError(wrappedError)).toBe(true);
     });
+
+    it('should detect TimeoutError by error.name (smithy requestTimeout)', () => {
+      // @smithy/node-http-handler sets name="TimeoutError" on requestTimeout errors
+      const err = Object.assign(new Error('@smithy/node-http-handler - [ERROR] a request has exceeded the configured 300000 ms requestTimeout.'), {
+        name: 'TimeoutError',
+        code: 'ETIMEDOUT',
+      });
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should detect AbortError by error.name (AbortSignal.timeout)', () => {
+      // AWS SDK builds AbortError with name="AbortError" when AbortSignal fires
+      const err = Object.assign(new Error('Request aborted'), { name: 'AbortError' });
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should detect ModelTimeoutException by error.name (Bedrock model timeout)', () => {
+      const err = Object.assign(new Error('Model request timed out'), { name: 'ModelTimeoutException' });
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should detect ETIMEDOUT by string code property', () => {
+      const err = Object.assign(new Error('connection timed out'), { code: 'ETIMEDOUT' });
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should detect ECONNRESET by string code property', () => {
+      const err = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should detect transient errors via Bedrock $metadata.httpStatusCode', () => {
+      const err = Object.assign(new Error('Service unavailable'), {
+        $metadata: { httpStatusCode: 503 },
+      });
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should not treat non-transient $metadata.httpStatusCode as transient', () => {
+      const err = Object.assign(new Error('Bad request'), {
+        $metadata: { httpStatusCode: 400 },
+      });
+      expect(isTransientLLMError(err)).toBe(false);
+    });
   });
 
   describe('isContextLimitError — originalMessage path', () => {

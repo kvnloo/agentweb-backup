@@ -18,11 +18,13 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { createOncallItem } from '../services/notionService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
+import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
@@ -44,6 +46,40 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
   if (share.expiresAt) return new Date(share.expiresAt);
   if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
   return new Date(0); // No dates at all — treat as expired
+}
+
+/**
+ * Auto-files a Notion "Customer Reported" issue for context-limit errors.
+ * Skips if the session already has contextLimitReported set (dedup).
+ */
+async function autoReportContextLimitToNotion(
+  sessionId: string | undefined,
+  userEmail: string | undefined,
+  userId: string | undefined,
+  llmModel: string | undefined,
+  session: import('../services/chatbotService').ChatSession | null
+): Promise<void> {
+  if (!sessionId || session?.contextLimitReported) return;
+  try {
+    await createOncallItem({
+      title: `Context limit reached - session ${sessionId}`,
+      description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
+      additionalTags: ['Customer Reported', 'Context Limit'],
+      context: {
+        'User ID': userId || 'N/A',
+        'User Email': userEmail || 'N/A',
+        'Session ID': sessionId,
+        'LLM Model': llmModel || 'Not specified',
+        'Session Message Count': session?.messages?.length ?? 'N/A',
+        'Session Title': session?.title || 'N/A',
+      },
+    });
+    chatbotDb.updateSessionContextLimitReported(sessionId).catch(err =>
+      console.error('Failed to set contextLimitReported flag:', err)
+    );
+  } catch (err) {
+    console.error('Failed to create context-limit Notion item:', err);
+  }
 }
 
 /** Classify an error for the diagnosis agent. */
@@ -1341,6 +1377,15 @@ export async function generateSessionResponse(
     throw new Error('Session not found');
   }
 
+  // Check message limit before starting a new turn so in-progress writes (e.g. tool
+  // system messages) that pushed the count over the limit don't silently drop the
+  // final assistant response. The check is intentionally at turn-start so writes during
+  // a turn are never blocked mid-flight.
+  const currentMessageCount = (await chatbotDb.getMessagesFromMessagesTable(sessionId)).length;
+  if (currentMessageCount >= MAX_MESSAGE_SIZE_PER_SESSION) {
+    throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`);
+  }
+
   // Process attachments and include URLs in message content for LLM
   let messageContent = userMessage;
   if (attachments && attachments.length > 0) {
@@ -1707,6 +1752,21 @@ export const agentModeController = {
         lastEvaluatedKey: result.lastEvaluatedKey,
         hasMore: !!result.lastEvaluatedKey
       });
+
+      // Fire-and-forget: update stale/missing session summaries in background
+      // so they're available on the next load (cache-aware — skips up-to-date ones)
+      for (const session of result.sessions) {
+        const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+        const needsSummary = messageCount > 0 && (
+          !session.sessionSummary ||
+          session.sessionSummary.evaluatedMessageIndex < messageCount
+        );
+        if (needsSummary) {
+          summarizeSessionIfNeeded(session).catch((err) => {
+            console.error(`AgentMode: Background summarization failed for ${session.sessionId}:`, err);
+          });
+        }
+      }
     } catch (error) {
       console.error('AgentMode: Get sessions error:', error);
       res.status(500).json({ error: 'Failed to get sessions' });
@@ -2084,6 +2144,9 @@ export const agentModeController = {
               'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
+
+          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -2656,6 +2719,9 @@ export const agentModeController = {
               'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
+
+          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',

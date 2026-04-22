@@ -417,6 +417,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/solveRecaptchaTool');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -815,6 +816,9 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+      // NOTE: claude-opus-4-7 is registered but NOT available on this Bedrock account as of 2026-04-21.
+      // Kept in registry because: (1) admin-only so no user-facing risk, (2) may become available later.
+      // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
       'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
@@ -846,7 +850,7 @@ export class AgentModeService {
                 toolSpec: {
                   name: tool.function.name,
                   description: tool.function.description || tool.function.name,
-                  inputSchema: { json: tool.function.parameters },
+                  inputSchema: { json: AgentModeService.sanitizeSchemaForBedrock(tool.function.parameters) },
                 }
               }))
             } : undefined;
@@ -941,6 +945,67 @@ export class AgentModeService {
   }
 
   /**
+   * Sanitize a JSON Schema for Bedrock Converse API compatibility.
+   * Bedrock rejects schemas with anyOf/oneOf/allOf, $schema, const, $ref/$defs.
+   * anyOf/oneOf with const values are flattened to enum; others are stripped.
+   */
+  static sanitizeSchemaForBedrock(schema: any): any {
+    if (!schema || typeof schema !== 'object') return schema;
+
+    const sanitizeNode = (node: any): any => {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+
+      const result: any = {};
+
+      for (const [key, value] of Object.entries(node)) {
+        // Drop JSON Schema meta fields and unsupported keywords
+        if (key === '$schema' || key === '$defs' || key === '$ref' || key === 'const') continue;
+
+        if ((key === 'anyOf' || key === 'oneOf') && Array.isArray(value)) {
+          // If all branches are {type: string, const: X}, flatten to enum
+          const consts = (value as any[]).filter((b: any) => b && b.const !== undefined).map((b: any) => b.const);
+          const nonConst = (value as any[]).filter((b: any) => !b || b.const === undefined);
+          if (consts.length > 0 && nonConst.length === 0) {
+            result.type = 'string';
+            result.enum = consts;
+          } else if (consts.length > 0 && nonConst.length === 1 && nonConst[0]?.type === 'string') {
+            // Mix of consts + plain string (open-ended enum): just use type string
+            result.type = 'string';
+          }
+          // else: drop the anyOf/oneOf entirely (no safe representation for Bedrock)
+          continue;
+        }
+
+        if (key === 'allOf' && Array.isArray(value)) {
+          // Merge allOf branches into the result object
+          for (const branch of value as any[]) {
+            Object.assign(result, sanitizeNode(branch));
+          }
+          continue;
+        }
+
+        if (key === 'properties' && typeof value === 'object' && value !== null) {
+          result.properties = Object.fromEntries(
+            Object.entries(value as object).map(([k, v]) => [k, sanitizeNode(v)])
+          );
+          continue;
+        }
+
+        if (key === 'items') {
+          result.items = sanitizeNode(value);
+          continue;
+        }
+
+        result[key] = value;
+      }
+
+      return result;
+    };
+
+    return sanitizeNode(schema);
+  }
+
+  /**
    * Convert OpenAI-format messages to Bedrock Converse API format.
    * Handles system extraction, role alternation, and tool call/result grouping.
    */
@@ -948,7 +1013,21 @@ export class AgentModeService {
     const system: any[] = [];
     const messages: any[] = [];
 
-    for (const msg of openaiMessages) {
+    // Find the index of the last screenshot tool message so we only include the image
+    // for the most recent screenshot. Earlier screenshots are pruned to a text placeholder
+    // to prevent Bedrock 400 errors from request payload size exceeding limits (~6MB for 20 screenshots).
+    let lastScreenshotMsgIdx = -1;
+    for (let i = openaiMessages.length - 1; i >= 0; i--) {
+      const m = openaiMessages[i];
+      if (m.role === 'tool' && Array.isArray(m.content) &&
+          m.content.some((c: any) => c.type === 'image_url')) {
+        lastScreenshotMsgIdx = i;
+        break;
+      }
+    }
+
+    for (let msgIdx = 0; msgIdx < openaiMessages.length; msgIdx++) {
+      const msg = openaiMessages[msgIdx];
       if (msg.role === 'system') {
         const text = typeof msg.content === 'string'
           ? msg.content
@@ -977,8 +1056,13 @@ export class AgentModeService {
           if (textContent) contentBlocks.push({ text: textContent });
         }
         // Tool use blocks
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          for (const tc of msg.tool_calls) {
+        // Guard against tool_calls stored as a JSON string (legacy/corrupt data)
+        const toolCallsArray = typeof msg.tool_calls === 'string'
+          ? (() => { try { return JSON.parse(msg.tool_calls); } catch { return []; } })()
+          : msg.tool_calls;
+        if (toolCallsArray && toolCallsArray.length > 0) {
+          for (const tc of toolCallsArray) {
+            if (!tc?.function) continue;
             let input: any;
             try {
               input = typeof tc.function.arguments === 'string'
@@ -1004,10 +1088,19 @@ export class AgentModeService {
         let toolResultContent: any[];
         if (Array.isArray(msg.content)) {
           toolResultContent = [];
+          // Only include the screenshot image for the most recent screenshot message.
+          // Earlier screenshots are replaced with a text placeholder to prevent Bedrock
+          // 400 errors from accumulated base64 payloads in long sessions.
+          const includeImage = msgIdx === lastScreenshotMsgIdx;
           for (const item of msg.content) {
             if (item.type === 'text') {
               toolResultContent.push({ text: item.text });
             } else if (item.type === 'image_url') {
+              if (!includeImage) {
+                // Older screenshot — replace with text placeholder to save payload space
+                toolResultContent.push({ text: '[Screenshot captured — image omitted from context to reduce payload size]' });
+                continue;
+              }
               const url = item.image_url?.url || '';
               if (url.startsWith('data:')) {
                 const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
@@ -1128,6 +1221,7 @@ export class AgentModeService {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
+    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability)
     'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true },
   };
 
@@ -1309,13 +1403,18 @@ export class AgentModeService {
     return pricing[model] ?? 0.04;
   }
 
-  /** Cost per video generation in USD (fixed per-generation pricing, based on ~8s clip). */
-  private estimateVideoGenerationCost(model: string): number {
-    const pricing: Record<string, number> = {
+  /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
+  private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
+    const pricePerClip: Record<string, number> = {
       'veo-3.1-generate-preview': 2.80,
       'veo-3.1-fast-generate-preview': 1.40,
     };
-    return pricing[model] ?? 2.80;
+    const clipPrice = pricePerClip[model] ?? 2.80;
+    const VEO_MAX_SECONDS = 8;
+    const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
+      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+      : 1;
+    return clipPrice * clipCount;
   }
 
   /** Returns an onUsage callback that records LLM token usage for a named tool. */
@@ -1808,6 +1907,17 @@ export class AgentModeService {
               continue;
             }
 
+            if (isInteractiveShare && toolCall.function.name === 'connect_account') {
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.' }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
@@ -1948,6 +2058,11 @@ export class AgentModeService {
               toolContent = extractToolContent(result);
             }
 
+            // When the response exceeds the S3 threshold: upload full content to S3 so the LLM
+            // can retrieve specific fields later via search_tool_response, then cap the in-memory
+            // copy at MAX_TOOL_CONTENT_SIZE to prevent worker OOM on sessions with many large tool
+            // calls (e.g. multiple read_page_source + search_web calls in a single work plan step).
+            const S3_IN_MEMORY_CAP = 20_000; // Keep only 20KB in memory after S3 upload
             if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
               try {
                 const uploadResult = await uploadFileToS3WithPath(
@@ -1958,7 +2073,10 @@ export class AgentModeService {
                 );
                 if (uploadResult.success && uploadResult.key) {
                   const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-                  toolContent = header + toolContent;
+                  const preview = toolContent.length > S3_IN_MEMORY_CAP
+                    ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
+                    : toolContent;
+                  toolContent = header + preview;
                 }
               } catch (e) {
                 console.error('AgentMode: Failed to save large tool response to S3:', e);
@@ -2106,11 +2224,17 @@ export class AgentModeService {
 
       // Determine user-friendly message based on error type
       let userMessage: string;
+      const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.name === 'ModelTimeoutException'
+        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
+      // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
+      const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
-      } else if (error?.status === 429) {
+      } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
-      } else if (error?.status === 400) {
+      } else if (isTimeout) {
+        userMessage = 'Your request took longer than expected. Please try again.';
+      } else if (httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
@@ -2299,8 +2423,23 @@ export class AgentModeService {
 
 
 
+    // Identify which assistant tool_call message indices have their tool_results resolved.
+    // An assistant message's tool_calls are "resolved" if the very next non-assistant message
+    // is a 'tool' role message (i.e. a tool_result follows immediately).
+    const resolvedToolCallIndices = new Set<number>();
+    for (let i = 0; i < sliced.length; i++) {
+      const m = sliced[i] as any;
+      if (m.role === 'assistant' && m.tool_calls?.length) {
+        // Look for the immediately-following tool result
+        if (i + 1 < sliced.length && (sliced[i + 1] as any).role === 'tool') {
+          resolvedToolCallIndices.add(i);
+        }
+      }
+    }
+
     // Copy all sliced messages as-is
-    for (const msg of sliced) {
+    for (let sliceIdx = 0; sliceIdx < sliced.length; sliceIdx++) {
+      const msg = sliced[sliceIdx];
       // Skip empty assistant messages (no content and no tool_calls) — these are artifacts
       // from failed LLM responses where content was lost (e.g. Gemini safety filter)
       if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
@@ -2348,7 +2487,7 @@ export class AgentModeService {
       if ((msg as any).tool_call_id) {
         messageObj.tool_call_id = (msg as any).tool_call_id;
       }
-      if ((msg as any).tool_calls) {
+      if ((msg as any).tool_calls && resolvedToolCallIndices.has(sliceIdx)) {
         messageObj.tool_calls = (msg as any).tool_calls;
       }
 
@@ -2396,40 +2535,57 @@ export class AgentModeService {
         pending: '○',
         skipped: '⊘'
       };
+
+      // Check if all steps are terminal (completed or skipped) — no pending work remains
+      const allStepsDone = workPlan.steps.length > 0 &&
+        workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+
       let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
-      workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
 
-      // If autocomplete is enabled, add instruction to auto-complete steps
-      if (workPlan.autocomplete) {
-        workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+      if (allStepsDone) {
+        // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
+        // Use a user-role message so it appears as a direct instruction right before the assistant responds.
+        const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
+        const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
+        workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
+        workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
+        workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+        console.log('workPlanContent', workPlanContent);
+        messages.push({ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` });
+      } else {
+        workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+
+        // If autocomplete is enabled, add instruction to auto-complete steps
+        if (workPlan.autocomplete) {
+          workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+        }
+
+        workPlan.steps.forEach((step: any) => {
+          const icon = statusIcons[step.status as keyof typeof statusIcons];
+          workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
+
+          // Include step description if available
+          if (step.description) {
+            workPlanContent += `   Description: ${step.description}\n`;
+          }
+
+          // Include required function calls if available
+          if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+            workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+          }
+
+          // Include skill IDs if available (for awareness)
+          if (step.skillIds && step.skillIds.length > 0) {
+            workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+          }
+
+          workPlanContent += '\n';
+        });
+
+        console.log('workPlanContent', workPlanContent);
+        messages.push({ role: 'assistant', content: workPlanContent.trim() });
       }
-
-      workPlan.steps.forEach((step: any) => {
-        const icon = statusIcons[step.status as keyof typeof statusIcons];
-        workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
-
-        // Include step description if available
-        if (step.description) {
-          workPlanContent += `   Description: ${step.description}\n`;
-        }
-
-        // Include required function calls if available
-        if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
-        }
-
-        // Include skill IDs if available (for awareness)
-        if (step.skillIds && step.skillIds.length > 0) {
-          workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
-        }
-
-        workPlanContent += '\n';
-      });
-
-      console.log('workPlanContent', workPlanContent);
-
-      messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
@@ -3000,7 +3156,8 @@ export class AgentModeService {
         success: actualResult.success,
         message: actualResult.message,
         videoUrl: actualResult.videoUrl,
-        filename: actualResult.filename
+        filename: actualResult.filename,
+        ...(actualResult.error && { error: actualResult.error })
       };
     }
 
@@ -6300,18 +6457,39 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const lists = await crmDb.getLeadListsByUserId(userId);
+      const { listLandingPages } = await import('./v0Service');
+
+      const [lists, landingPages] = await Promise.all([
+        crmDb.getLeadListsByUserId(userId),
+        listLandingPages(userId).catch(() => [] as any[])
+      ]);
+
+      // Build map: leadListId → landing page info
+      const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
+      for (const page of landingPages) {
+        if (page.leadListId) {
+          pageByListId.set(page.leadListId, {
+            pageId: page.id,
+            name: page.name || '',
+            url: page.deployedUrl || page.customDomainUrl || ''
+          });
+        }
+      }
 
       return {
         success: true,
         message: `Found ${lists.length} lead list(s)`,
-        lists: lists.map((list: any) => ({
-          listId: list.listId,
-          name: list.name,
-          description: list.description || '',
-          leadCount: list.leadCount || 0,
-          createdAt: list.createdAt
-        })),
+        lists: lists.map((list: any) => {
+          const page = pageByListId.get(list.listId);
+          return {
+            listId: list.listId,
+            name: list.name,
+            description: list.description || '',
+            leadCount: list.leadCount || 0,
+            createdAt: list.createdAt,
+            ...(page ? { associatedLandingPage: page } : {})
+          };
+        }),
         totalLists: lists.length
       };
     } catch (error) {
@@ -14177,6 +14355,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  public async convertToPdf(sourceUrl: string, outputFilename: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Converting to PDF:', sourceUrl, 'for user:', userId);
+
+      if (!sourceUrl || typeof sourceUrl !== 'string') {
+        throw new Error('source_url is required and must be a string');
+      }
+      if (!sourceUrl.startsWith('http://') && !sourceUrl.startsWith('https://')) {
+        throw new Error('source_url must be an HTTP or HTTPS URL');
+      }
+
+      const puppeteer = await import('puppeteer-core');
+      let browser: any = null;
+      try {
+        browser = await puppeteer.default.launch({
+          executablePath: '/usr/bin/google-chrome',
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+          headless: true,
+        });
+        const page = await browser.newPage();
+        await page.goto(sourceUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+        const pdfBuffer = await page.pdf({
+          format: 'A4',
+          printBackground: true,
+          margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
+        });
+        await browser.close();
+        browser = null;
+
+        const pdfFilename = (outputFilename || 'export')
+          .replace(/\.html?$/i, '')
+          .replace(/[^a-zA-Z0-9_\-]/g, '_') + '.pdf';
+
+        const uploadResult = await uploadFileToS3(Buffer.from(pdfBuffer), pdfFilename, userId, 'application/pdf');
+
+        if (!uploadResult.success || !uploadResult.url) {
+          throw new Error(uploadResult.error || 'Failed to upload PDF to S3');
+        }
+
+        return {
+          success: true,
+          pdf_url: uploadResult.url,
+          filename: pdfFilename,
+          message: `PDF created and saved. Download: ${uploadResult.url}`,
+        };
+      } finally {
+        if (browser) {
+          try { await browser.close(); } catch {}
+        }
+      }
+    } catch (error) {
+      console.error('AgentMode: Error converting to PDF:', error);
+      return {
+        success: false,
+        message: 'Failed to convert to PDF.',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
   // Read file content from URL with support for various file types
   public async readFileContent(fileUrl: string): Promise<any> {
     try {
@@ -14481,8 +14719,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per generation, not per token)
-        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview');
+        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more)
+        const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
         incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
           console.error('AgentMode: Failed to track token usage for generateVideo:', err)
         );
@@ -16054,7 +16292,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           'facebook': 'Facebook',
           'custom': 'Custom'
         };
-        const typeLabel = typeLabelMap[post.type] || post.type.charAt(0).toUpperCase() + post.type.slice(1);
+        const typeLabel = (post.type && typeLabelMap[post.type]) || (post.type ? post.type.charAt(0).toUpperCase() + post.type.slice(1) : 'Post');
 
         // Convert markdown content to HTML
         const htmlContent = processor.processSync(post.content || '').toString();

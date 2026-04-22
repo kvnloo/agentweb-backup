@@ -90,6 +90,7 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  searchableText?: string;
   feedback?: {
     type: 'like' | 'dislike';
     reasons?: string[];
@@ -2123,7 +2124,55 @@ async function getExecutionsWithAssets(
     console.error(`Error fetching Agent Mode ${assetType}:`, error);
   }
 
+  // Enrich HTML report result files with searchable text content
+  if (assetType === 'html-reports') {
+    await enrichHtmlReportsWithSearchableText(result);
+  }
+
   return result;
+}
+
+/**
+ * Fetch HTML content for report files that lack searchableText and attach extracted plain text.
+ * Runs concurrently (up to 10 at a time) so it doesn't block the response for long.
+ */
+async function enrichHtmlReportsWithSearchableText(result: Record<string, any>): Promise<void> {
+  const CONCURRENCY = 10;
+  const MAX_TEXT_LENGTH = 3000;
+
+  // Collect all result files that need enrichment
+  const filesToEnrich: Array<{ file: any }> = [];
+  for (const task of Object.values(result) as any[]) {
+    for (const execution of task.executions || []) {
+      for (const file of execution.result_files || []) {
+        if (!file.searchableText && file.url && (file.is_html || (file.filename || '').toLowerCase().endsWith('.html'))) {
+          filesToEnrich.push({ file });
+        }
+      }
+    }
+  }
+
+  // Process in batches
+  for (let i = 0; i < filesToEnrich.length; i += CONCURRENCY) {
+    const batch = filesToEnrich.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async ({ file }) => {
+      try {
+        const response = await axios.get(file.url, { timeout: 5000, responseType: 'text' });
+        const html: string = typeof response.data === 'string' ? response.data : '';
+        // Strip tags, collapse whitespace, truncate
+        const text = html
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, MAX_TEXT_LENGTH);
+        file.searchableText = text;
+      } catch {
+        // Non-fatal — leave searchableText absent if fetch fails
+      }
+    }));
+  }
 }
 
 /**

@@ -1,6 +1,7 @@
 import { googleCallback } from '../controllers/auth';
 import { userDb } from '../services/db';
 import { waitlistDb } from '../services/waitlistDb';
+import { emailService } from '../services/emailService';
 import { Profile } from 'passport-google-oauth20';
 import { Request } from 'express';
 import jwt from 'jsonwebtoken';
@@ -8,10 +9,19 @@ import jwt from 'jsonwebtoken';
 // Mock the dependencies
 jest.mock('../services/db');
 jest.mock('../services/waitlistDb');
+jest.mock('../services/emailService');
+jest.mock('../services/subscriptionService', () => ({
+  getTierConfig: jest.fn().mockResolvedValue({ allowedPages: [], allowedSkills: [] }),
+  DEFAULT_PAGES: [],
+}));
+jest.mock('../services/crmAutoSyncService', () => ({
+  syncNewUserToLeadList: jest.fn().mockResolvedValue(undefined),
+}));
 jest.mock('jsonwebtoken');
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
+const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockJwt = jwt as jest.Mocked<typeof jwt>;
 
 describe('OAuth Callback - Customer Role Addition for Invited Users', () => {
@@ -437,6 +447,121 @@ describe('OAuth Callback - Customer Role Addition for Invited Users', () => {
       expect(doneCall[0]).toBeNull(); // No error = access granted
       expect(doneCall[1]).toBeDefined(); // User object returned
       expect(doneCall[1]?.roles).toContain('customer');
+    });
+  });
+
+  describe('Introduction email auto-send for new OAuth users', () => {
+    const newUser = (userId: string, email: string, displayName: string) => ({
+      userId,
+      email,
+      displayName,
+      roles: ['free'] as ('free' | 'customer' | 'partner')[],
+      isOAuthUser: true,
+      isAdmin: false,
+      password: 'placeholder',
+      isActive: true,
+      createdAt: new Date().toISOString()
+    });
+
+    beforeEach(() => {
+      mockEmailService.sendTeamIntroductionEmail.mockResolvedValue(undefined as any);
+    });
+
+    it('should send intro email to new user signing up via genius portal (NODE_ENV=test)', async () => {
+      const email = 'newgenius@example.com';
+      const userId = 'user-genius-1';
+      const displayName = 'Genius User';
+
+      mockUserDb.getUserByEmail.mockResolvedValue(null as any);
+      mockUserDb.createUser.mockResolvedValue(newUser(userId, email, displayName) as any);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+
+      const profile = createMockProfile(email, displayName);
+      const req = createMockRequest('genius');
+      const done = createMockDone();
+
+      await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
+
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(mockEmailService.sendTeamIntroductionEmail).toHaveBeenCalledWith(email, displayName);
+    });
+
+    it('should send intro email to new user signing up via customer portal (NODE_ENV=test)', async () => {
+      const email = 'newcustomer@example.com';
+      const userId = 'user-customer-1';
+      const displayName = 'Customer User';
+
+      mockUserDb.getUserByEmail.mockResolvedValue(null as any);
+      mockUserDb.createUser.mockResolvedValue(newUser(userId, email, displayName) as any);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+
+      const profile = createMockProfile(email, displayName);
+      const req = createMockRequest('customer');
+      const done = createMockDone();
+
+      await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
+
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(mockEmailService.sendTeamIntroductionEmail).toHaveBeenCalledWith(email, displayName);
+    });
+
+    it('should update introductionEmailSent timestamp after sending intro email', async () => {
+      const email = 'newtimestamp@example.com';
+      const userId = 'user-ts-1';
+      const displayName = 'Timestamp User';
+
+      mockUserDb.getUserByEmail.mockResolvedValue(null as any);
+      mockUserDb.createUser.mockResolvedValue(newUser(userId, email, displayName) as any);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+
+      const profile = createMockProfile(email, displayName);
+      const req = createMockRequest('customer');
+      const done = createMockDone();
+
+      await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
+
+      await new Promise(resolve => setImmediate(resolve));
+
+      const updateCalls = (mockUserDb as any).updateUser.mock.calls;
+      const introEmailUpdate = updateCalls.find((call: any[]) =>
+        call[1] && call[1].introductionEmailSent !== undefined
+      );
+      expect(introEmailUpdate).toBeDefined();
+      expect(introEmailUpdate[0]).toBe(userId);
+      expect(introEmailUpdate[1].introductionEmailSent).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    });
+
+    it('should not send intro email to existing OAuth users who log in again', async () => {
+      const email = 'existing@example.com';
+      const existingUser = {
+        userId: 'user-existing-1',
+        email,
+        roles: ['free'],
+        isOAuthUser: true,
+        isAdmin: false,
+        password: 'placeholder',
+        isActive: true,
+        createdAt: new Date().toISOString()
+      };
+
+      mockUserDb.getUserByEmail.mockResolvedValue(existingUser);
+      mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+
+      const profile = createMockProfile(email);
+      const req = createMockRequest('customer');
+      const done = createMockDone();
+
+      await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
+
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(mockEmailService.sendTeamIntroductionEmail).not.toHaveBeenCalled();
     });
   });
 });

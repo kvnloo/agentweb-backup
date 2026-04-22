@@ -173,6 +173,7 @@ export interface ChatSession {
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
+  contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -803,11 +804,6 @@ export class ChatbotDB {
     const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
     const currentMessageCount = currentMessages.length;
 
-    // Check if adding this message would exceed the limit
-    if (currentMessageCount >= MAX_MESSAGE_SIZE_PER_SESSION) {
-      throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`);
-    }
-
     const messageIndex = currentMessageCount;
 
     // Add message to AW-ChatMessages table
@@ -852,12 +848,6 @@ export class ChatbotDB {
     // Get current message count from AW-ChatMessages
     const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
     const currentMessageCount = currentMessages.length;
-
-    // Check if adding these messages would exceed the limit
-    const totalMessageCount = currentMessageCount + messages.length;
-    if (totalMessageCount > MAX_MESSAGE_SIZE_PER_SESSION) {
-      throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: Adding ${messages.length} message(s) would exceed the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages per session (current: ${currentMessageCount}). Please start a new session to continue the conversation.`);
-    }
 
     const messageIndex = currentMessageCount;
 
@@ -1600,8 +1590,8 @@ export class ChatbotDB {
       params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
     }
     if (searchTerm) {
-      filterParts.push('contains(#title, :searchTerm)');
-      params.ExpressionAttributeNames = { '#title': 'title' };
+      filterParts.push('(contains(#title, :searchTerm) OR contains(sessionSummary.#summary, :searchTerm))');
+      params.ExpressionAttributeNames = { '#title': 'title', '#summary': 'summary' };
       params.ExpressionAttributeValues[':searchTerm'] = searchTerm;
     }
     if (filterParts.length > 0) {
@@ -2552,6 +2542,20 @@ export class ChatbotDB {
     } catch (updateError) {
       console.error("Error updating session error:", updateError);
       // Don't throw - we don't want error logging to fail the entire operation
+    }
+  }
+
+  async updateSessionContextLimitReported(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: 'SET contextLimitReported = :val',
+      ExpressionAttributeValues: { ':val': true },
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (updateError) {
+      console.error('Error setting contextLimitReported flag:', updateError);
     }
   }
 

@@ -266,7 +266,14 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
               },
             },
           ],
-        },
+        } as any,
+        // tool result immediately follows — tool_calls should be preserved
+        {
+          role: 'tool',
+          content: 'Done',
+          timestamp: '2025-01-01T00:02:30.000Z',
+          tool_call_id: 'call_123',
+        } as any,
       ];
 
       const messageContent = 'Great!';
@@ -375,6 +382,128 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
       expect(lastUserMessage.content).toContain('[file.pdf](https://example.com/file.pdf)');
     });
 
+    it('should strip tool_calls from assistant message not followed by a tool result', () => {
+      // Reproduces the ValidationException when a session was aborted mid-tool-call:
+      // orphaned tool_use blocks cause Bedrock to return 400.
+      const sessionHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'Run the weekly report',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: '',
+          timestamp: '2025-01-01T00:02:00.000Z',
+          tool_calls: [
+            { id: 'orphan_1', type: 'function', function: { name: 'run_task', arguments: '{}' } },
+          ],
+        } as any,
+        // No tool result follows — the session was aborted
+        {
+          role: 'user',
+          content: 'continue',
+          timestamp: '2025-01-01T00:03:00.000Z',
+        },
+      ];
+
+      const result = (agentModeService as any).buildMarketingContext('continue', sessionHistory, []);
+
+      const assistantMsg = result.find((msg: any) => msg.role === 'assistant');
+      expect(assistantMsg).toBeDefined();
+      expect(assistantMsg.tool_calls).toBeUndefined();
+    });
+
+    it('should preserve tool_calls when immediately followed by a tool result', () => {
+      const sessionHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'Run the weekly report',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: '',
+          timestamp: '2025-01-01T00:02:00.000Z',
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'run_task', arguments: '{}' } },
+          ],
+        } as any,
+        {
+          role: 'tool',
+          content: 'Task completed successfully',
+          timestamp: '2025-01-01T00:02:30.000Z',
+          tool_call_id: 'call_1',
+        } as any,
+        {
+          role: 'assistant',
+          content: 'The task is done.',
+          timestamp: '2025-01-01T00:03:00.000Z',
+        },
+      ];
+
+      const result = (agentModeService as any).buildMarketingContext('What next?', sessionHistory, []);
+
+      const assistantMsg = result.find((msg: any) => msg.role === 'assistant' && (msg as any).tool_calls);
+      expect(assistantMsg).toBeDefined();
+      expect(assistantMsg.tool_calls).toHaveLength(1);
+      expect(assistantMsg.tool_calls[0].id).toBe('call_1');
+    });
+
+    it('should strip multiple orphaned tool_call messages', () => {
+      const sessionHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'Do something',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: '',
+          timestamp: '2025-01-01T00:02:00.000Z',
+          tool_calls: [
+            { id: 'orphan_a', type: 'function', function: { name: 'tool_a', arguments: '{}' } },
+          ],
+        } as any,
+        // Second orphaned assistant tool call (no tool result between them either)
+        {
+          role: 'assistant',
+          content: '',
+          timestamp: '2025-01-01T00:02:10.000Z',
+          tool_calls: [
+            { id: 'orphan_b', type: 'function', function: { name: 'tool_b', arguments: '{}' } },
+          ],
+        } as any,
+        {
+          role: 'user',
+          content: 'continue',
+          timestamp: '2025-01-01T00:03:00.000Z',
+        },
+      ];
+
+      const result = (agentModeService as any).buildMarketingContext('continue', sessionHistory, []);
+
+      const assistantsWithToolCalls = result.filter(
+        (msg: any) => msg.role === 'assistant' && msg.tool_calls
+      );
+      expect(assistantsWithToolCalls).toHaveLength(0);
+    });
+
     it('should include task statuses before the current user message', () => {
       const sessionHistory: ChatMessage[] = [
         {
@@ -416,6 +545,174 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
         (msg: any) => msg.role === 'user' && msg.content === messageContent
       );
       expect(taskStatusIndex).toBeLessThan(lastUserMessageIndex);
+    });
+
+    describe('work plan all-steps-complete detection', () => {
+      const baseHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'user',
+          content: 'continue',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+      ];
+
+      it('should inject ALL STEPS COMPLETE as a user message when every step is completed', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'completed' },
+            { stepCount: 3, title: 'Step 3', status: 'completed' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        // Guard uses user role so it appears as a direct instruction right before the response
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+        expect(workPlanMsg.content).toContain('DO NOT retry or re-execute any work plan steps');
+        expect(workPlanMsg.content).toContain('help them with that new request normally');
+        // Step details are NOT listed when all done (avoids LLM retrying them)
+        expect(workPlanMsg.content).not.toContain('Step 1');
+        expect(workPlanMsg.content).not.toContain('You MUST continue working');
+      });
+
+      it('should inject ALL STEPS COMPLETE when all steps are skipped', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'skipped' },
+            { stepCount: 2, title: 'Step 2', status: 'skipped' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+      });
+
+      it('should inject ALL STEPS COMPLETE when steps are a mix of completed and skipped', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'skipped' },
+            { stepCount: 3, title: 'Step 3', status: 'completed' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+        // Should show correct counts
+        expect(workPlanMsg.content).toContain('2 completed');
+        expect(workPlanMsg.content).toContain('1 skipped');
+      });
+
+      it('should NOT inject ALL STEPS COMPLETE when a pending step remains', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'pending' },
+            { stepCount: 3, title: 'Step 3', status: 'pending' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'assistant' && msg.content.includes('WORK PLAN')
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).not.toContain('ALL STEPS COMPLETE');
+        expect(workPlanMsg.content).toContain('You MUST continue working');
+      });
+
+      it('should not show autocomplete instruction when all steps are done', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          autocomplete: true,
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'user' && /ALL \d+ STEPS ARE DONE/.test(msg.content)
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toMatch(/ALL \d+ STEPS ARE DONE/);
+        expect(workPlanMsg.content).not.toContain('AUTOCOMPLETE MODE');
+      });
+
+      it('should still show autocomplete instruction when steps remain and autocomplete is true', () => {
+        const workPlan = {
+          title: 'Ad Image Generation',
+          autocomplete: true,
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'completed' },
+            { stepCount: 2, title: 'Step 2', status: 'pending' },
+          ],
+        };
+
+        const result = (agentModeService as any).buildMarketingContext(
+          'continue',
+          baseHistory,
+          [],
+          workPlan
+        );
+
+        const workPlanMsg = result.find(
+          (msg: any) => msg.role === 'assistant' && msg.content.includes('WORK PLAN')
+        );
+        expect(workPlanMsg).toBeDefined();
+        expect(workPlanMsg.content).toContain('AUTOCOMPLETE MODE');
+      });
     });
   });
 });

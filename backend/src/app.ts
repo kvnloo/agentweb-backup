@@ -1,4 +1,5 @@
 import express from "express";
+import nodePath from "path";
 import cors from "cors";
 import passport from "passport";
 import authRoutes from "./routes/auth";
@@ -67,12 +68,14 @@ import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import domainRoutes from "./routes/domains";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
+import imageReportsRoutes from "./routes/imageReports";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
 import dripCampaignsRoutes from "./routes/dripCampaigns";
+import usersRoutes from "./routes/users";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -85,6 +88,7 @@ import {
   saveHtmlContent,
   getPresignedFileUrl,
   batchPresignUrls,
+  exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
 
@@ -204,9 +208,11 @@ fileRoutes.get("/content", authenticateToken, getFileContent);
 fileRoutes.post("/html", authenticateToken, saveHtmlContent);
 fileRoutes.get("/presign", authenticateToken, getPresignedFileUrl);
 fileRoutes.post("/presign-batch", authenticateToken, batchPresignUrls);
+fileRoutes.post("/export-pdf", authenticateToken, exportHtmlToPdf);
 
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
@@ -285,6 +291,7 @@ app.get("/asset/:assetHash", serveAsset);
 app.use("/review", reviewRouter);
 app.use("/api/batch-review", batchReviewRoutes);
 app.use("/batch-review", batchReviewPublicRouter);
+app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
 
@@ -346,5 +353,12 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Temporary static exports — for one-off file downloads (files in backend/tmp-exports/)
+app.use("/tmp-exports", express.static(nodePath.join(__dirname, "../tmp-exports"), {
+  setHeaders: (res, filePath) => {
+    res.setHeader("Content-Disposition", `attachment; filename="${nodePath.basename(filePath)}"`);
+  },
+}));
 
 export default app;

@@ -240,4 +240,64 @@ describe('enrollSignupIntoFoundersList', () => {
     expect(outcome.reason).toBe('error');
     expect(deps.logger.error).toHaveBeenCalled();
   });
+
+  it('flattens attribution from payload.attribution into lead.customFields', async () => {
+    const { deps, mocks } = makeCrmDbStub();
+    const outcome = await enrollSignupIntoFoundersList(
+      makeSignupCtx({
+        payload: {
+          signupDate: '2026-04-21T22:19:08Z',
+          signupSource: 'password',
+          userId: 'u_1',
+          attribution: {
+            timestamp: '2026-04-21T22:19:08Z',
+            sessionId: 'sess_test',
+            utm: { source: 'meta', medium: 'cpc', campaign: 'launch' },
+            clickIds: { fbclid: 'fb_abc' },
+            referrer: 'https://facebook.com/',
+            landingUrl: 'http://app.example.com/register?utm_source=meta',
+          },
+        },
+      }),
+      deps
+    );
+    expect(outcome.enrolled).toBe(true);
+    expect(outcome.reason).toBe('created');
+    expect(mocks.createLead).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        email: 'new@example.com',
+        lifecycle: 'signed_up',
+        customFields: expect.objectContaining({
+          utm_source: 'meta',
+          utm_medium: 'cpc',
+          utm_campaign: 'launch',
+          fbclid: 'fb_abc',
+          referrer: 'https://facebook.com/',
+          landing_url: 'http://app.example.com/register?utm_source=meta',
+        }),
+      })
+    );
+  });
+
+  it('omits customFields when payload has no attribution blob', async () => {
+    const { deps, mocks } = makeCrmDbStub();
+    await enrollSignupIntoFoundersList(makeSignupCtx({ payload: { userId: 'u_1' } }), deps);
+    const createLeadArg = mocks.createLead.mock.calls[0][1];
+    expect(createLeadArg.customFields).toBeUndefined();
+  });
+
+  it('partial attribution (utm.source only) passes through, missing keys are not written', async () => {
+    const { deps, mocks } = makeCrmDbStub();
+    await enrollSignupIntoFoundersList(
+      makeSignupCtx({
+        payload: {
+          attribution: { timestamp: 't', sessionId: 's', utm: { source: 'google' } },
+        },
+      }),
+      deps
+    );
+    const createLeadArg = mocks.createLead.mock.calls[0][1];
+    expect(createLeadArg.customFields).toEqual({ utm_source: 'google' });
+  });
 });

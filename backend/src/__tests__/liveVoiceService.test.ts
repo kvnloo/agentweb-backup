@@ -41,10 +41,14 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 const mockExecuteTool = jest.fn();
+const mockCallLLM = jest.fn().mockResolvedValue({
+  choices: [{ message: { content: '{"narrative":"Tool completed successfully.","artifacts":[]}' } }],
+});
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getFilteredTools: jest.fn().mockResolvedValue([]),
     executeTool: mockExecuteTool,
+    callLLM: mockCallLLM,
   },
 }));
 
@@ -848,11 +852,15 @@ describe('tool call surfacing', () => {
     mockSession.sendToolResponse = jest.fn();
 
     // Simulate tool call
-    await callbacks['onmessage']?.({
+    callbacks['onmessage']?.({
       toolCall: {
         functionCalls: [{ id: 'fc-1', name: 'post_on_connected_account', args: { content: 'Hello' } }],
       },
     });
+
+    // Flush async work: tool execution + summarizeToolResult LLM call
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
 
     // Simulate Gemini responding after tool
     callbacks['onmessage']?.({
@@ -878,11 +886,16 @@ describe('tool call surfacing', () => {
     mockExecuteTool.mockResolvedValue({ htmlUrl: 'https://s3.amazonaws.com/posts/abc' });
     mockSession.sendToolResponse = jest.fn();
 
-    await callbacks['onmessage']?.({
+    callbacks['onmessage']?.({
       toolCall: {
         functionCalls: [{ id: 'fc-2', name: 'create_social_media_posts', args: { text: 'AI news' } }],
       },
     });
+
+    // Flush async work: tool execution + summarizeToolResult LLM call
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
     callbacks['onmessage']?.({
       serverContent: { outputTranscription: { text: "Here are your posts." } },
     });

@@ -110,9 +110,11 @@ export async function handleWebhook(req: Request, res: Response) {
       // webhook endpoint was configured with.
       case 'invoice.paid':
       case 'invoice.payment_succeeded':
+        await handleInvoicePaymentSucceeded(event.data.object);
         await handleInvoicePayment(event.data.object, 'payment_succeeded');
         break;
       case 'invoice.payment_failed':
+        await handleInvoicePaymentFailed(event.data.object);
         await handleInvoicePayment(event.data.object, 'payment_failed');
         break;
       case 'charge.refunded':
