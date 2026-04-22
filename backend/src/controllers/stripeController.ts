@@ -89,10 +89,11 @@ export async function handleWebhook(req: Request, res: Response) {
         await recordSubscriptionEvent(event.data.object, 'subscription_created');
         break;
       // Handle subs created OUTSIDE Checkout (admin provisioning, API,
-      // reconciliation). handleSubscriptionUpdated derives tier from the
-      // subscription object + syncs status/period_end/payment_method.
+      // reconciliation). Pass { isNew: true } so the stale-webhook guard
+      // is bypassed — this IS the authoritative new sub and any canceled
+      // stripe_subscription_id in the DB should be overwritten.
       case 'customer.subscription.created':
-        await handleSubscriptionUpdated(event.data.object);
+        await handleSubscriptionUpdated(event.data.object, { isNew: true });
         await recordSubscriptionEvent(event.data.object, 'subscription_created');
         break;
       case 'customer.subscription.updated':

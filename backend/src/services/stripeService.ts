@@ -416,8 +416,17 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
 
 /**
  * Handle customer.subscription.updated — sync subscription status.
+ *
+ * When `options.isNew` is true (called from customer.subscription.created),
+ * the stale-subscription guard is bypassed because the event IS the authoritative
+ * new subscription — the user's DB may still carry a canceled/old stripe_sub_id
+ * and we want to overwrite it. For normal .updated events the guard prevents
+ * stale/duplicate webhooks from clobbering the latest state.
  */
-export async function handleSubscriptionUpdated(subscription: any): Promise<void> {
+export async function handleSubscriptionUpdated(
+  subscription: any,
+  options: { isNew?: boolean } = {}
+): Promise<void> {
   const customerId = typeof subscription.customer === 'string'
     ? subscription.customer
     : subscription.customer?.id;
@@ -428,9 +437,15 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     return;
   }
 
-  // Only process this webhook if it's for the user's current subscription
-  // (prevents stale/duplicate subscription webhooks from overwriting the latest state)
-  if (user.stripe_subscription_id && user.stripe_subscription_id !== subscription.id) {
+  // Stale-webhook guard: for .updated events, only process when the sub id
+  // matches the user's current one. Skip for .created — that event IS the
+  // new authoritative subscription and the DB's stripe_subscription_id may
+  // still point to an old canceled sub.
+  if (
+    !options.isNew &&
+    user.stripe_subscription_id &&
+    user.stripe_subscription_id !== subscription.id
+  ) {
     console.log(
       `[STRIPE] Ignoring subscription update for ${subscription.id} — user ${user.userId} has current subscription ${user.stripe_subscription_id}`
     );
@@ -454,9 +469,12 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     subscription_status: effectiveStatus,
   };
 
-  // Backfill stripe_subscription_id if it was never written (e.g., missed checkout webhook).
-  // Only write when null to preserve the line 362 guard against stale webhooks.
-  if (!user.stripe_subscription_id) {
+  // Write stripe_subscription_id when:
+  //  - It's a new subscription (created event) — overwrite any stale canceled ID
+  //  - It was never written (null) — backfill for missed checkout webhooks
+  // For .updated events with an existing sub, don't touch it (the guard above
+  // already ensures we only run when subscription.id matches the DB value).
+  if (options.isNew || !user.stripe_subscription_id) {
     updateData.stripe_subscription_id = subscription.id;
   }
 
