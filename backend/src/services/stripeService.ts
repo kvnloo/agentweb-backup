@@ -331,36 +331,49 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     return;
   }
 
-  // Derive subscription tier from the price ID in the checkout session
-  const subscriptionType = deriveSubscriptionType(session);
-  const tierConfig = await getTierConfig(subscriptionType);
-
-  // Fetch the actual subscription to get accurate status and period end
+  // Fetch the subscription FIRST. We need it for status AND for the price
+  // ID that drives tier derivation. Stripe webhook events for
+  // checkout.session.completed do NOT include line_items by default, so
+  // deriving the tier from `session.line_items` would always yield
+  // undefined → silently promote every user to the fallback tier.
   let actualStatus = 'active';
   let currentPeriodEnd: string | undefined;
+  let subscription: any = null;
   if (stripeSubscriptionId) {
     try {
       const s = getStripeOrThrow();
-      const sub = await s.subscriptions.retrieve(stripeSubscriptionId) as any;
-      actualStatus = sub.status; // Could be 'trialing', 'active', etc.
-      if (sub.current_period_end) {
-        currentPeriodEnd = new Date(sub.current_period_end * 1000).toISOString();
+      subscription = await s.subscriptions.retrieve(stripeSubscriptionId);
+      actualStatus = subscription.status; // Could be 'trialing', 'active', etc.
+      if (subscription.current_period_end) {
+        currentPeriodEnd = new Date(subscription.current_period_end * 1000).toISOString();
       }
     } catch (err) {
       console.warn(`Could not fetch subscription ${stripeSubscriptionId} for status:`, err);
     }
   }
 
+  // Derive subscription tier — prefer subscription.items over session.line_items.
+  // Returns null when the price ID is unknown/missing; we refuse to silently
+  // promote the user in that case (see deriveSubscriptionType notes).
+  const subscriptionType = deriveSubscriptionType(session, subscription);
+  const tierConfig = subscriptionType ? await getTierConfig(subscriptionType) : null;
+
   const updateData: Record<string, any> = {
     stripe_customer_id: stripeCustomerId,
     stripe_subscription_id: stripeSubscriptionId,
-    subscriptionType,
     subscription_status: actualStatus,
     has_payment_method: true, // completed checkout = has payment method
     has_used_trial: true, // Mark trial as used so future upgrades don't offer trial
-    allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
-    allowedSkills: tierConfig?.allowedSkills ?? ['*'],
   };
+  // Only write tier-related fields when derivation succeeded. Otherwise
+  // leave the user's existing tier alone — much better than overwriting
+  // them with a wrong one (historically we defaulted to 'Super Premium',
+  // silently upgrading every checkout with an unrecognised price).
+  if (subscriptionType) {
+    updateData.subscriptionType = subscriptionType;
+    updateData.allowedPages = tierConfig?.allowedPages ?? [...DEFAULT_PAGES];
+    updateData.allowedSkills = tierConfig?.allowedSkills ?? ['*'];
+  }
   if (currentPeriodEnd) {
     updateData.current_period_end = currentPeriodEnd;
   }
@@ -725,29 +738,52 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
 
 /**
  * Derive the subscription type from the checkout session's line items price ID.
- * Maps: Starter plan → "Basic", Pro/Complete plan → "Super Premium".
- * Falls back to "Super Premium" if the price cannot be determined.
+ * Maps: Starter plan → "Starter" tier, Pro/Complete plan → "Pro" tier.
+ * Super Premium is an internal-only tier and is never assigned via paid
+ * checkout — unknown prices now return null (caller should preserve
+ * existing tier) rather than silently promoting the user.
  */
 export function deriveSubscriptionTypeFromPriceId(priceId: string): string | null {
-  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Basic';
-  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Super Premium';
+  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Starter';
+  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Pro';
   return null;
 }
 
-function deriveSubscriptionType(session: any): string {
-  const priceId = session.line_items?.data?.[0]?.price?.id
+function deriveSubscriptionType(session: any, subscription?: any): string | null {
+  // Stripe webhook events for checkout.session.completed do NOT expand
+  // line_items by default, so session.line_items is typically undefined
+  // inside a webhook handler. Prefer subscription.items (which the caller
+  // fetches explicitly) and fall back to session.line_items only when a
+  // caller happens to have expanded them (e.g. an admin-invoked flow that
+  // retrieves the session with { expand: ['line_items'] }).
+  const priceId = subscription?.items?.data?.[0]?.price?.id
+    || session.line_items?.data?.[0]?.price?.id
     || session.display_items?.[0]?.price?.id;
 
-  if (priceId) {
-    if (priceId === process.env.STRIPE_STARTER_PRICE_ID) {
-      return 'Basic';
-    }
-    if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) {
-      return 'Super Premium';
-    }
+  if (!priceId) {
+    console.error(
+      `[STRIPE] No priceId in checkout session ${session.id} or subscription — cannot derive tier. Skipping tier update.`
+    );
+    return null;
   }
+  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Starter';
+  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Pro';
 
-  return 'Super Premium';
+  // Unknown price: do NOT silently default. Previously this path returned
+  // 'Super Premium', which meant every checkout with a price the backend
+  // didn't recognise (misconfigured env var, new price in Stripe, stale
+  // dev config) got a free upgrade to the top tier. Return null so the
+  // handler keeps the user's existing tier untouched and we get a loud log.
+  const starterHint = process.env.STRIPE_STARTER_PRICE_ID
+    ? `…${process.env.STRIPE_STARTER_PRICE_ID.slice(-10)}`
+    : '(unset)';
+  const completeHint = process.env.STRIPE_COMPLETE_PRICE_ID
+    ? `…${process.env.STRIPE_COMPLETE_PRICE_ID.slice(-10)}`
+    : '(unset)';
+  console.error(
+    `[STRIPE] Unknown priceId '${priceId}' in session ${session.id}. Expected STARTER=${starterHint} or COMPLETE=${completeHint}. Not writing subscriptionType.`
+  );
+  return null;
 }
 
 /**
