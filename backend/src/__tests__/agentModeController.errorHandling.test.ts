@@ -519,6 +519,136 @@ describe('AgentModeController - Error Handling', () => {
 
       expect(mockRes.status).toHaveBeenCalledWith(500);
     });
+
+    it('should persist error message for worker-shutdown error in shared response', async () => {
+      const workerShutdownError = new Error('Worker shutdown');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(workerShutdownError);
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: 'test-token' },
+        body: {
+          userMessage: 'Test message',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/ishare/test-session-123/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          expiresAt: '2099-01-01T00:00:00Z',
+        },
+      } as any);
+
+      await agentModeController.generateSharedResponse(mockReq, mockRes);
+
+      // Should persist an error message so the orphaned user message has a response
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![0]).toBe(mockSessionId);
+      expect(errorCall![1].content).toContain('server restarted');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+
+      // Should return 503
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+    });
+
+    it('should persist error message for worker-shutdown error in generateResponse', async () => {
+      const workerShutdownError = new Error('Worker shutdown');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(workerShutdownError);
+
+      // Use a session with existing messages so isFirstMessage=false (no system msg call)
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+      } as any);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      // Should persist an error message so the orphaned user message has a response
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![0]).toBe(mockSessionId);
+      expect(errorCall![1].content).toContain('server restarted');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+
+      // Should return 503
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+    });
+
+    it('should reject concurrent requests to generateSharedResponse with 409', async () => {
+      const { activeSessionGenerations } = require('../controllers/agentModeController');
+      activeSessionGenerations.add(mockSessionId);
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: 'test-token' },
+        body: { userMessage: 'Test message' },
+        method: 'POST',
+        path: '/api/agent-mode/ishare/test-session-123/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          expiresAt: '2099-01-01T00:00:00Z',
+        },
+      } as any);
+
+      await agentModeController.generateSharedResponse(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(409);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'SESSION_BUSY',
+      }));
+
+      // Cleanup
+      activeSessionGenerations.delete(mockSessionId);
+    });
   });
 
   describe('generateResponse - Claude 4.6+ Content Format', () => {
