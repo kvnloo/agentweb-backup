@@ -84,6 +84,10 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
 
     const account = await createAccount(userId, 'unipile', accountInput);
 
+    // Invalidate the cached connectivity status so the next GET /connected-accounts
+    // re-checks Unipile rather than returning the stale "disconnected" result.
+    linkedInOutreachService.clearStatusCache(unipileAccountId);
+
     console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} for user ${userId}`);
     res.json({ success: true, account });
 
