@@ -563,14 +563,41 @@ router.post(
         });
       }
 
-      // Perform the upgrade via Stripe's subscription update API
-      const updated = await stripeService.upgradeSubscription(currentSub.id, resolvedPriceId);
+      // Route upgrade vs downgrade: upgrades apply immediately with
+      // proration, downgrades are scheduled for period-end to avoid
+      // generating a confusing prorated-credit line on the next invoice.
+      const { changeSubscriptionPrice, deriveSubscriptionTypeFromPriceId } =
+        await import("../services/stripeService");
+      const result = await changeSubscriptionPrice(currentSub.id, resolvedPriceId);
 
-      // Derive the new subscription type from the price
-      const { deriveSubscriptionTypeFromPriceId } = await import("../services/stripeService");
+      if (result.kind === "same_price") {
+        return res.status(400).json({ error: "You are already on this plan." });
+      }
+
+      if (result.kind === "downgrade_scheduled") {
+        // User stays on current tier until period end — DON'T touch DB here.
+        // When Stripe's subscription_schedule fires at period end, it emits
+        // customer.subscription.updated which our webhook handler will sync.
+        const currentTierName = currentPriceId
+          ? deriveSubscriptionTypeFromPriceId(currentPriceId)
+          : null;
+        console.log(
+          `[STRIPE DOWNGRADE] User ${userId} scheduled downgrade to ${plan || resolvedPriceId} at ${result.effectiveAt}`
+        );
+        return res.json({
+          message: `Your plan will change to ${plan || "the selected plan"} at the end of the current period.`,
+          kind: "downgrade_scheduled",
+          effectiveAt: result.effectiveAt,
+          // Echo current state for UI — nothing has actually changed yet
+          subscriptionType: currentTierName,
+          subscription_status: currentSub.status,
+        });
+      }
+
+      // kind === 'upgrade_immediate' — mirror existing DB-write logic
+      const updated = result.subscription;
       const newTierName = deriveSubscriptionTypeFromPriceId(resolvedPriceId);
 
-      // Update user record with new subscription details
       const { getTierConfig } = await import("../services/subscriptionService");
       const tierConfig = newTierName ? await getTierConfig(newTierName) : null;
 
@@ -587,21 +614,24 @@ router.post(
         updateData.allowedSkills = tierConfig.allowedSkills;
       }
 
-      const periodEnd = (updated as any).current_period_end;
+      const periodEnd =
+        (updated.items?.data?.[0] as any)?.current_period_end ??
+        (updated as any).current_period_end;
       if (periodEnd) {
         updateData.current_period_end = new Date(
-          typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
+          typeof periodEnd === "number" ? periodEnd * 1000 : periodEnd
         ).toISOString();
       }
 
       await userDb.updateUser(userId, updateData);
 
       console.log(
-        `[STRIPE UPGRADE] User ${userId} upgraded to ${newTierName || 'unknown tier'} (price=${resolvedPriceId})`
+        `[STRIPE UPGRADE] User ${userId} upgraded to ${newTierName || "unknown tier"} (price=${resolvedPriceId})`
       );
 
       res.json({
         message: "Subscription upgraded successfully.",
+        kind: "upgrade_immediate",
         subscriptionType: newTierName,
         subscription_status: updated.status,
         current_period_end: updateData.current_period_end,

@@ -181,6 +181,91 @@ export const stripeService = {
   },
 };
 
+/**
+ * Change a subscription's price. Upgrade = immediate with proration,
+ * downgrade = scheduled for period-end (clean accounting, user keeps
+ * paid tier until period closes, then auto-switches).
+ *
+ * Rationale: Stripe's default `subscriptions.update` with a cheaper price
+ * prorates the unused time into an account-balance credit ($299 refund-
+ * looking line on their invoice). Most SaaS (Vercel, Linear, Stripe
+ * Billing's own dashboard) instead defer downgrades to period end —
+ * cleaner ledger, cleaner UX.
+ */
+export async function changeSubscriptionPrice(
+  subscriptionId: string,
+  newPriceId: string
+): Promise<{
+  kind: 'upgrade_immediate' | 'downgrade_scheduled' | 'same_price';
+  effectiveAt?: string; // ISO — only for scheduled downgrades
+  subscription: any;
+}> {
+  if (!subscriptionId) throw new Error('subscriptionId is required');
+  if (!newPriceId) throw new Error('newPriceId is required');
+
+  const stripe = getStripeOrThrow();
+  const current = await stripe.subscriptions.retrieve(subscriptionId);
+  const currentItem = current.items.data[0];
+  if (!currentItem) throw new Error(`Subscription ${subscriptionId} has no items`);
+
+  if (newPriceId === currentItem.price.id) {
+    return { kind: 'same_price', subscription: current };
+  }
+
+  const currentAmount = currentItem.price.unit_amount ?? 0;
+  const newPrice = await stripe.prices.retrieve(newPriceId);
+  const newAmount = newPrice.unit_amount ?? 0;
+
+  if (newAmount > currentAmount) {
+    // Upgrade — immediate with proration
+    const updated = await stripe.subscriptions.update(subscriptionId, {
+      items: [{ id: currentItem.id, price: newPriceId }],
+      proration_behavior: 'create_prorations',
+    });
+    return { kind: 'upgrade_immediate', subscription: updated };
+  }
+
+  // Downgrade — schedule for period end using Subscription Schedules.
+  // Read period_end defensively: in newer Stripe API versions, per-period
+  // billing info lives on the item; older responses keep it on the sub root.
+  const periodEnd =
+    (currentItem as any).current_period_end ??
+    (current as any).current_period_end;
+  if (!periodEnd) {
+    throw new Error('Cannot schedule downgrade: no current_period_end on subscription');
+  }
+
+  // Create a schedule from the current subscription. Stripe materializes
+  // the current phase so we can append a second phase for the new price.
+  const schedule = await stripe.subscriptionSchedules.create({
+    from_subscription: subscriptionId,
+  });
+  const currentPhase = schedule.phases[0];
+
+  await stripe.subscriptionSchedules.update(schedule.id, {
+    phases: [
+      {
+        items: currentPhase.items.map((i: any) => ({
+          price: i.price,
+          quantity: i.quantity ?? 1,
+        })),
+        start_date: currentPhase.start_date,
+        end_date: currentPhase.end_date ?? periodEnd,
+      },
+      {
+        items: [{ price: newPriceId, quantity: 1 }],
+      },
+    ],
+    end_behavior: 'release', // After phase 2, drop back to a plain subscription
+  });
+
+  return {
+    kind: 'downgrade_scheduled',
+    effectiveAt: new Date(periodEnd * 1000).toISOString(),
+    subscription: current, // Return current sub — it stays unchanged until period end
+  };
+}
+
 // ─── On-Demand Sync ───────────────────────────────────────────────────
 
 /**

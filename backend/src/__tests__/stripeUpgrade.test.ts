@@ -15,6 +15,13 @@ const mockStripe = {
     retrieve: jest.fn(),
     search: jest.fn().mockResolvedValue({ data: [] }),
   },
+  prices: {
+    retrieve: jest.fn(),
+  },
+  subscriptionSchedules: {
+    create: jest.fn(),
+    update: jest.fn(),
+  },
   checkout: {
     sessions: {
       create: jest.fn(),
@@ -192,16 +199,24 @@ describe('Stripe subscription upgrade', () => {
           items: { data: [{ id: 'si_item1', price: { id: 'price_starter_123' } }] },
         }],
       });
-      // upgradeSubscription: retrieve then update
+      // changeSubscriptionPrice: retrieve current sub, retrieve new price, then update
       mockStripe.subscriptions.retrieve.mockResolvedValue({
         id: 'sub_existing',
-        items: { data: [{ id: 'si_item1', price: { id: 'price_starter_123' } }] },
+        current_period_end: 1700000000,
+        items: {
+          data: [{
+            id: 'si_item1',
+            price: { id: 'price_starter_123', unit_amount: 2900 },
+            current_period_end: 1700000000,
+          }],
+        },
       });
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_complete_456', unit_amount: 9900 });
       mockStripe.subscriptions.update.mockResolvedValue({
         id: 'sub_existing',
         status: 'active',
         current_period_end: 1700000000,
-        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' } }] },
+        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' }, current_period_end: 1700000000 }] },
       });
       mockUpdateUser.mockResolvedValue({});
 
@@ -213,12 +228,86 @@ describe('Stripe subscription upgrade', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.message).toMatch(/upgraded successfully/i);
-      expect(res.body.subscriptionType).toBe('Super Premium');
+      expect(res.body.kind).toBe('upgrade_immediate');
+      expect(res.body.subscriptionType).toBe('Pro');
+      // Upgrade: proration must be on
+      expect(mockStripe.subscriptions.update).toHaveBeenCalledWith('sub_existing', {
+        items: [{ id: 'si_item1', price: 'price_complete_456' }],
+        proration_behavior: 'create_prorations',
+      });
+      // Upgrade path must NOT touch subscription schedules
+      expect(mockStripe.subscriptionSchedules.create).not.toHaveBeenCalled();
       expect(mockUpdateUser).toHaveBeenCalledWith('user-123', expect.objectContaining({
         stripe_subscription_id: 'sub_existing',
         subscription_status: 'active',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
       }));
+    });
+
+    it('should SCHEDULE a downgrade from pro to starter (period-end) and NOT touch the DB', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      // findActiveSubscription returns Pro subscription
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_existing',
+          status: 'active',
+          items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' } }] },
+        }],
+      });
+      // Full retrieve: Pro @ $99, period end in future
+      mockStripe.subscriptions.retrieve.mockResolvedValue({
+        id: 'sub_existing',
+        status: 'active',
+        current_period_end: 1700000000,
+        items: {
+          data: [{
+            id: 'si_item1',
+            price: { id: 'price_complete_456', unit_amount: 9900 },
+            current_period_end: 1700000000,
+          }],
+        },
+      });
+      // New price is cheaper -> downgrade path
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_starter_123', unit_amount: 2900 });
+      mockStripe.subscriptionSchedules.create.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [{
+          start_date: 1_697_400_000,
+          end_date: 1700000000,
+          items: [{ price: 'price_complete_456', quantity: 1 }],
+        }],
+      });
+      mockStripe.subscriptionSchedules.update.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [
+          { items: [{ price: 'price_complete_456', quantity: 1 }] },
+          { items: [{ price: 'price_starter_123', quantity: 1 }] },
+        ],
+      });
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/upgrade')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ plan: 'starter' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('downgrade_scheduled');
+      expect(res.body.effectiveAt).toBe(new Date(1700000000 * 1000).toISOString());
+      expect(res.body.message).toMatch(/end of the current period/i);
+      // Scheduled downgrade must create a subscription schedule
+      expect(mockStripe.subscriptionSchedules.create).toHaveBeenCalledWith({
+        from_subscription: 'sub_existing',
+      });
+      expect(mockStripe.subscriptionSchedules.update).toHaveBeenCalledTimes(1);
+      // And it must NOT hit the immediate-update path (that's the $299 bug)
+      expect(mockStripe.subscriptions.update).not.toHaveBeenCalled();
+      // DB MUST NOT be updated — current tier persists until period end.
+      // Webhook will sync when the schedule fires.
+      expect(mockUpdateUser).not.toHaveBeenCalled();
     });
 
     it('should accept newPriceId directly', async () => {
@@ -235,13 +324,21 @@ describe('Stripe subscription upgrade', () => {
       });
       mockStripe.subscriptions.retrieve.mockResolvedValue({
         id: 'sub_existing',
-        items: { data: [{ id: 'si_item1', price: { id: 'price_starter_123' } }] },
+        current_period_end: 1700000000,
+        items: {
+          data: [{
+            id: 'si_item1',
+            price: { id: 'price_starter_123', unit_amount: 2900 },
+            current_period_end: 1700000000,
+          }],
+        },
       });
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_complete_456', unit_amount: 9900 });
       mockStripe.subscriptions.update.mockResolvedValue({
         id: 'sub_existing',
         status: 'active',
         current_period_end: 1700000000,
-        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' } }] },
+        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' }, current_period_end: 1700000000 }] },
       });
       mockUpdateUser.mockResolvedValue({});
 
@@ -252,6 +349,7 @@ describe('Stripe subscription upgrade', () => {
         .send({ newPriceId: 'price_complete_456' });
 
       expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('upgrade_immediate');
     });
   });
 
@@ -358,7 +456,9 @@ describe('Stripe subscription upgrade', () => {
       expect(res.body.error).toMatch(/invalid/i);
     });
 
-    it('should accept whitelisted STRIPE_STARTER_PRICE_ID', async () => {
+    it('should accept whitelisted STRIPE_STARTER_PRICE_ID (schedules downgrade)', async () => {
+      // complete -> starter is a downgrade, so this now exercises the
+      // scheduled-for-period-end path rather than an immediate update.
       mockGetUserById.mockResolvedValue({
         userId: 'user-123',
         stripe_customer_id: 'cus_abc123',
@@ -372,15 +472,32 @@ describe('Stripe subscription upgrade', () => {
       });
       mockStripe.subscriptions.retrieve.mockResolvedValue({
         id: 'sub_existing',
-        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' } }] },
-      });
-      mockStripe.subscriptions.update.mockResolvedValue({
-        id: 'sub_existing',
         status: 'active',
         current_period_end: 1700000000,
-        items: { data: [{ id: 'si_item1', price: { id: 'price_starter_123' } }] },
+        items: {
+          data: [{
+            id: 'si_item1',
+            price: { id: 'price_complete_456', unit_amount: 9900 },
+            current_period_end: 1700000000,
+          }],
+        },
       });
-      mockUpdateUser.mockResolvedValue({});
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_starter_123', unit_amount: 2900 });
+      mockStripe.subscriptionSchedules.create.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [{
+          start_date: 1_697_400_000,
+          end_date: 1700000000,
+          items: [{ price: 'price_complete_456', quantity: 1 }],
+        }],
+      });
+      mockStripe.subscriptionSchedules.update.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [
+          { items: [{ price: 'price_complete_456', quantity: 1 }] },
+          { items: [{ price: 'price_starter_123', quantity: 1 }] },
+        ],
+      });
 
       const app = createApp();
       const res = await request(app)
@@ -388,6 +505,7 @@ describe('Stripe subscription upgrade', () => {
         .set('Authorization', 'Bearer valid-token')
         .send({ newPriceId: 'price_starter_123' });
       expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('downgrade_scheduled');
     });
   });
 });
