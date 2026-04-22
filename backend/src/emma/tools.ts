@@ -6280,3 +6280,79 @@ for (const toolName of adminToolNames) {
     console.warn(`[emma/tools] Failed to bridge admin tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }
+
+// Login credentials tool — lets Emma retrieve saved website credentials for browser automation
+emmaToolRegistry.register({
+  name: 'get_login_credentials',
+  definition: {
+    name: 'get_login_credentials',
+    description: 'Retrieve saved login credentials for a website domain. Use this when you need to log into a website during browser automation. Credentials must be pre-saved by the user in Settings > Login Credentials. Never ask the user to paste passwords in chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        domain: {
+          type: 'string',
+          description: 'The domain of the website to get credentials for (e.g. "linkedin.com", "app.hubspot.com")'
+        }
+      },
+      required: ['domain']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const domain = (args.domain || '').toLowerCase().trim();
+    if (!domain) return { error: 'domain is required' };
+
+    const { DynamoDB } = await import('aws-sdk');
+    const { decryptPassword } = await import('../utils/crypto');
+    const dynamodb = new DynamoDB.DocumentClient();
+    const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+    // Extract base domain for fuzzy matching (strip www. and subdomains down to registrable domain)
+    const baseDomain = domain.replace(/^www\./, '');
+
+    const result = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'attribute_not_exists(isApiConfig) OR isApiConfig = :false',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+        ':false': false
+      }
+    }).promise();
+
+    const items = result.Items || [];
+
+    // Match by exact domain or base domain suffix
+    const match = items.find((c: any) => {
+      const w = (c.website || '').toLowerCase();
+      return w === domain || w === baseDomain || domain.endsWith('.' + w) || baseDomain.endsWith('.' + w);
+    });
+
+    if (!match) {
+      const saved = items.filter((c: any) => !c.isApiConfig).map((c: any) => c.website).join(', ');
+      return {
+        error: `No credentials saved for "${domain}". Please go to Settings > Login Credentials to save them first.`,
+        savedDomains: saved || 'none'
+      };
+    }
+
+    const encrypted = match.encryptedPassword || match.password;
+    if (!encrypted) {
+      return { error: `Credentials found for "${match.website}" but no password is stored.` };
+    }
+
+    try {
+      const { password } = decryptPassword(encrypted);
+      return {
+        username: match.username,
+        password,
+        domain: match.website
+      };
+    } catch {
+      return { error: `Failed to decrypt credentials for "${match.website}". The saved credentials may be corrupted.` };
+    }
+  }
+});

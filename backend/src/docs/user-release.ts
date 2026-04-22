@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-22',
+    changes: [
+      'New: Login Credentials — Save Website Logins for Browser Automation',
+      '- A new "Login Credentials" tab is now available in Settings, letting you securely store login credentials for any website',
+      '- Emma can now retrieve these credentials automatically when she needs to log into a site during browser automation tasks — no more pasting passwords in chat',
+      '- Credentials are stored encrypted and never exposed in the chat history',
+      '- The Browser Automation skill now correctly uses saved credentials instead of refusing login requests',
+    ],
+  },
+  {
     date: '2026-04-21',
     changes: [
       'Improved: Reports Page Search Now Searches Report Content',
