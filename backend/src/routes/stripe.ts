@@ -10,25 +10,27 @@ dotenv.config();
 
 const router = express.Router();
 
-// Ensure STRIPE_SECRET_KEY is set in your .env file
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const CUSTOMER_FRONTEND_URL =
   process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174"; // For return URL
 
-if (!stripeSecretKey) {
-  console.error(
-    "Stripe secret key (STRIPE_SECRET_KEY) is not set in the environment variables."
-  );
-  // Optionally, you could throw an error here to prevent the app from starting
-  // or handle it in a way that doesn't expose uninitialized Stripe functionality.
+// Lazy Stripe client — must be a getter, NOT a module-level const. The
+// async `getStripeCredentials()` bootstrap in server.ts runs AFTER this
+// module is imported, so `process.env.STRIPE_SECRET_KEY` is still
+// undefined at import time. Reading it here with a function instead of at
+// module load lets each request see the now-populated env var and return
+// a valid Stripe SDK instance. Previously this was a module-level const
+// that captured `null` forever, turning every checkout call into
+// "Stripe integration is not configured correctly" on dev/test envs.
+let stripeClient: Stripe | null = null;
+function getStripe(): Stripe | null {
+  if (stripeClient) return stripeClient;
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) return null;
+  stripeClient = new Stripe(key, {
+    apiVersion: "2025-05-28.basil",
+  });
+  return stripeClient;
 }
-
-// Initialize Stripe with a check for the key
-const stripe = stripeSecretKey
-  ? new Stripe(stripeSecretKey, {
-      apiVersion: "2025-05-28.basil", // Using the version suggested by the linter
-    })
-  : null;
 
 /**
  * @route GET /api/stripe/session/:sessionId
@@ -36,6 +38,7 @@ const stripe = stripeSecretKey
  * @access Public (consider adding authentication if needed)
  */
 router.get("/session/:sessionId", async (req: Request, res: Response) => {
+  const stripe = getStripe();
   if (!stripe) {
     console.error("Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.");
     return res
@@ -354,7 +357,8 @@ router.post(
   "/create-checkout-session",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -449,7 +453,8 @@ router.post(
   "/upgrade",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -563,7 +568,8 @@ router.post(
   "/create-customer-portal-session",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       console.error("Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.");
       return res
         .status(500)
@@ -614,7 +620,8 @@ router.post(
   "/cancel-subscription",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -694,7 +701,8 @@ router.post(
   "/reactivate-subscription",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
