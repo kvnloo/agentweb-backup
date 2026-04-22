@@ -4856,6 +4856,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-22',
     changes: [
+      'Fixed: External CRM Sync Settings Now Load Reliably',
+      '- Opening the External CRM Sync dialog no longer shows "Failed to load your sync configuration" due to a transient backend error during webhook secret backfill',
+      '- The sync configuration is now always returned even if the one-time webhook secret write encounters a temporary issue',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
       'Improved: Chat History Now Shows Session Summaries',
       '- Each session in the Chat History sidebar now displays a short AI-generated summary of what was accomplished, shown below the session title',
       '- Summaries are generated automatically in the background and cached — no extra loading time',
