@@ -2201,12 +2201,14 @@ export const agentModeController = {
         const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
+        const originalMessageForAlert = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
           subject: 'Agent Mode: Unknown Error in Generate Response',
-          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${originalMessageForAlert || error.message || 'Unknown error'}`,
           sessionId,
           context: {
             'Error Message': error.message || 'Unknown error',
+            'Original Error': originalMessageForAlert || 'Not available',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'User ID': user?.userId || 'Not available',
@@ -2807,12 +2809,14 @@ export const agentModeController = {
         const session = shareId ? await chatbotDb.getChatSession(shareId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
+        const originalMessage = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
           subject: 'Agent Mode: Unknown Error in Generate Shared Response',
-          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${originalMessage || error.message || 'Unknown error'}`,
           sessionId: shareId,
           context: {
             'Error Message': error.message || 'Unknown error',
+            'Original Error': originalMessage || 'Not available',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'Session ID (Share ID)': shareId || 'Not provided',
