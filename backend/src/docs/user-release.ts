@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-23',
     changes: [
+      'Fix: Emma Now Installs All Skills in a Single Call Instead of Multiple Separate Calls',
+      '- Emma was calling install_skills once per skill group (e.g. 3 calls when 3 skills were needed), adding unnecessary latency at the start of each session',
+      '- Updated the install_skills tool description and system prompt to explicitly instruct Emma to batch all needed skill IDs into one call',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
       'Improvement: Account Summary Now Includes Connected Accounts and Active Scheduled Chats',
       '- The account_summary tool used by Emma now returns an account section with the count of connected accounts and active scheduled chats',
       '- This gives Emma immediate context about the account setup without requiring separate tool calls',
