@@ -73,6 +73,8 @@ import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import testAccountsRoutes from "./routes/testAccounts";
+import onboardingEventsRoutes from "./routes/onboardingEvents";
+import dripCampaignsRoutes from "./routes/dripCampaigns";
 import usersRoutes from "./routes/users";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
@@ -277,6 +279,11 @@ app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api/test-accounts", testAccountsRoutes);
+app.use("/api/onboarding", onboardingEventsRoutes);
+// Phase A: drip campaigns are now customer-facing. Each user manages
+// their own campaigns scoped to their CRM leads. No isAdmin gate —
+// authenticateToken is the only middleware. See routes/dripCampaigns.ts.
+app.use("/api/drip-campaigns", authenticateToken, dripCampaignsRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);

@@ -4,7 +4,9 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSchema";
+import type { AttributionTouch } from "../types/attribution";
+import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 
 // Load environment variables from .env file
@@ -96,6 +98,31 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  /**
+   * Onboarding event log — appended to by POST /api/onboarding/events. Used
+   * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each
+   * entry is the event name, server-side timestamp, and optional payload.
+   * Capped to the last 50 events to keep the User record bounded; older
+   * events are dropped FIFO.
+   */
+  onboardingEvents?: Array<{
+    event: string;
+    ts: string;
+    data?: Record<string, unknown>;
+  }>;
+  /**
+   * Derived onboarding stage, recomputed from `onboardingEvents` every time
+   * a new event is recorded. Not stored as source-of-truth — rebuildable
+   * from the event log via `deriveOnboardingStage` (utils/onboardingStage).
+   * Persisted so Dynamo queries can filter by stage without replaying the log.
+   */
+  onboardingStage?: string;
+  /**
+   * Lifecycle Drip — Phase 4. When `true`, the drip executor MUST NOT send
+   * this user any drip campaign email, regardless of segment match. Set by
+   * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
+   */
+  dripUnsubscribed?: boolean;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
   brandGuidelines?: {
@@ -176,6 +203,20 @@ export interface User {
   current_period_end?: string; // ISO date of current billing period end
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
+  /**
+   * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
+   * from Pro to Starter that takes effect at period_end). Cached here from
+   * subscription_schedules so the UI can surface it without hitting Stripe on
+   * every /auth/me. Cleared when: (a) the schedule fires (webhook → schedule.completed),
+   * (b) the user explicitly cancels it via /api/stripe/cancel-scheduled-downgrade,
+   * or (c) the schedule is released/canceled for any other reason (webhook).
+   */
+  scheduledChange?: {
+    stripeScheduleId: string;
+    toPriceId: string;
+    toTier: string; // e.g., "Starter"
+    effectiveAt: string; // ISO 8601
+  } | null;
   /**
    * Stripe Connect OAuth — customer-authorized read-only access to their own
    * Stripe account. Used to enrich CRM contacts with the customer's live
@@ -3775,6 +3816,11 @@ export const crmDb = {
     dealIds?: string[];
     tenantId?: string;
     syncMetadata?: Record<string, any>;
+    // Attribution fields (mirror User schema — see types/attribution.ts)
+    firstTouch?: AttributionTouch;
+    lastTouch?: AttributionTouch;
+    utmSource?: string;
+    utmMedium?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3856,6 +3902,21 @@ export const crmDb = {
       });
       Object.assign(item, crmFields);
 
+      // Attribution fields (Lead UTM — mirrors User schema). firstTouch is
+      // stamped on creation and never mutated; lastTouch is refreshed on each
+      // touch. utmSource / utmMedium are denormalized from firstTouch for
+      // cheap channel-attribution filter queries.
+      const attributionFields = buildLeadAttributionFields({
+        firstTouch: leadData.firstTouch,
+        // On a brand-new Lead, if only firstTouch is supplied, treat it as
+        // lastTouch too — same contract as the User registration path in
+        // controllers/auth.ts.
+        lastTouch: leadData.lastTouch || leadData.firstTouch,
+        utmSource: leadData.utmSource,
+        utmMedium: leadData.utmMedium,
+      });
+      Object.assign(item, attributionFields);
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Item: item,
@@ -3889,6 +3950,38 @@ export const crmDb = {
 
       // Increment lead count
       await this.incrementLeadCount(listId, 1);
+
+      // Attribution event — fire once per Lead when any attribution signal is
+      // captured. Dedupe via sourceRecordId (`attribution:lead:{leadId}`) so
+      // retries on the same lead create a single row.
+      if (leadData.firstTouch) {
+        const contactId = emailValue || `nocontact:${leadId}`;
+        try {
+          await contactEventsDb.logEvent({
+            contactId: normalizeContactId(contactId),
+            source: 'lead_form',
+            eventType: 'attribution.first_touch',
+            sourceRecordId: `attribution:lead:${leadId}`,
+            payload: {
+              leadId,
+              listId,
+              firstTouch: leadData.firstTouch,
+              // Denormalized for cheap dashboard queries — same shape the
+              // User signup event emits.
+              utmSource: leadData.firstTouch.utm?.source,
+              utmMedium: leadData.firstTouch.utm?.medium,
+              utmCampaign: leadData.firstTouch.utm?.campaign,
+              referrer: leadData.firstTouch.referrer,
+              landingUrl: leadData.firstTouch.landingUrl,
+            },
+            ...(leadData.tenantId ? { tenantId: leadData.tenantId } : {}),
+          });
+        } catch (eventErr) {
+          // Never fail lead creation on an event-log write error — the lead
+          // row has already been persisted above. Log and continue.
+          console.error('[createLead] attribution.first_touch logEvent failed:', eventErr);
+        }
+      }
 
       return params.Item;
     } catch (error) {

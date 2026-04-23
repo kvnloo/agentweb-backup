@@ -61,10 +61,15 @@ jest.mock('../services/waitlistDb', () => ({
 }));
 
 // Mock settingsService for tier config
+//
+// PR #1261 renamed the Stripe price → tier mapping so the derived tier names
+// ("Starter" / "Pro") now match what the pricing page already shows the user.
+// The fixture below uses those canonical names so getTierConfig(derivedType)
+// resolves correctly in the downgrade/update handlers under test.
 const mockSubscriptionTypes = [
   { name: 'Free', allowedPages: ['/', '/agent-mode', '/settings', '/guide'], allowedSkills: [] },
-  { name: 'Basic', allowedPages: ['/', '/agent-mode', '/settings', '/guide', '/brand-guidelines', '/market-strategy', '/knowledge-base', '/email-templates', '/tasks', '/research-reports'], allowedSkills: ['*'] },
-  { name: 'Super Premium', allowedPages: ['*'], allowedSkills: ['*'] },
+  { name: 'Starter', allowedPages: ['/', '/agent-mode', '/settings', '/guide', '/brand-guidelines', '/market-strategy', '/knowledge-base', '/email-templates', '/tasks', '/research-reports'], allowedSkills: ['*'] },
+  { name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'] },
 ];
 
 jest.mock('../services/settingsService', () => ({
@@ -110,7 +115,7 @@ describe('Stripe subscription downgrade handling', () => {
         userId: 'user-goalden',
         email: 'goalden@example.com',
         stripe_customer_id: 'cus_goalden',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         stripe_subscription_id: 'sub_old_expensive',
       };
@@ -142,7 +147,7 @@ describe('Stripe subscription downgrade handling', () => {
       expect(mockUpdateUser).toHaveBeenCalledWith('user-goalden', expect.objectContaining({
         subscription_status: 'active',
         stripe_subscription_id: 'sub_new_cheaper',
-        subscriptionType: 'Basic',
+        subscriptionType: 'Starter',
       }));
 
       // Should NOT contain 'canceled' or 'Free'
@@ -156,7 +161,7 @@ describe('Stripe subscription downgrade handling', () => {
         userId: 'user-trial',
         email: 'trial@example.com',
         stripe_customer_id: 'cus_trial',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         stripe_subscription_id: 'sub_old',
       };
@@ -190,16 +195,16 @@ describe('Stripe subscription downgrade handling', () => {
       expect(mockUpdateUser).toHaveBeenCalledWith('user-trial', expect.objectContaining({
         subscription_status: 'trialing',
         stripe_subscription_id: 'sub_new_trial',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
       }));
     });
 
-    it('should update tier-specific allowedPages when downgrading from Super Premium to Basic', async () => {
+    it('should update tier-specific allowedPages when downgrading from Pro to Starter', async () => {
       const mockUser = {
         userId: 'user-downgrade',
         email: 'downgrade@example.com',
         stripe_customer_id: 'cus_downgrade',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         stripe_subscription_id: 'sub_premium',
       };
@@ -227,7 +232,7 @@ describe('Stripe subscription downgrade handling', () => {
       });
 
       const updateCall = mockUpdateUser.mock.calls[0][1];
-      expect(updateCall.subscriptionType).toBe('Basic');
+      expect(updateCall.subscriptionType).toBe('Starter');
       expect(updateCall.allowedPages).toEqual(expect.arrayContaining(['/brand-guidelines', '/market-strategy']));
       expect(updateCall.allowedPages).not.toContain('*'); // No longer has wildcard access
     });
@@ -241,7 +246,7 @@ describe('Stripe subscription downgrade handling', () => {
         userId: 'user-cancel',
         email: 'cancel@example.com',
         stripe_customer_id: 'cus_cancel',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         stripe_subscription_id: 'sub_canceled',
       };
@@ -273,7 +278,7 @@ describe('Stripe subscription downgrade handling', () => {
         userId: 'user-pricechange',
         email: 'pricechange@example.com',
         stripe_customer_id: 'cus_pricechange',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         stripe_subscription_id: 'sub_same',
       };
@@ -291,7 +296,7 @@ describe('Stripe subscription downgrade handling', () => {
 
       expect(mockUpdateUser).toHaveBeenCalledWith('user-pricechange', expect.objectContaining({
         subscription_status: 'active',
-        subscriptionType: 'Basic', // Downgraded tier
+        subscriptionType: 'Starter', // Downgraded tier
       }));
 
       // Should NOT be canceled

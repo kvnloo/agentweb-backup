@@ -75,7 +75,15 @@ const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 
-// DB-driven subscription types (simulates what admin portal stores in DynamoDB)
+// DB-driven subscription types (simulates what admin portal stores in DynamoDB).
+//
+// The admin portal can name tiers anything. PR #1261 renamed the Stripe
+// price → tier derivation to "Starter"/"Pro" so the names written to a user
+// record match what they see on the pricing page. The fixture keeps the
+// legacy "Basic"/"Super Premium" entries (to keep the getTierConfig lookup
+// tests honest — they verify the admin-managed lookup works for any name)
+// and adds "Starter"/"Pro" entries so the Stripe checkout handlers can
+// resolve tier config for the newly-derived names.
 const DB_SUBSCRIPTION_TYPES = [
   {
     name: 'Free',
@@ -92,7 +100,21 @@ const DB_SUBSCRIPTION_TYPES = [
     allowedSkills: ['*'],
   },
   {
+    name: 'Starter',
+    allowedPages: [
+      '/', '/agent-mode', '/settings', '/guide',
+      '/brand-guidelines', '/market-strategy', '/tasks',
+      '/knowledge-base', '/research-reports', '/email-templates',
+    ],
+    allowedSkills: ['*'],
+  },
+  {
     name: 'Super Premium',
+    allowedPages: ['*'],
+    allowedSkills: ['*'],
+  },
+  {
+    name: 'Pro',
     allowedPages: ['*'],
     allowedSkills: ['*'],
   },
@@ -239,7 +261,7 @@ describe('Tier-based Access Control', () => {
       process.env.STRIPE_COMPLETE_PRICE_ID = 'price_pro_456';
     });
 
-    it('upgrades to Basic tier for Starter plan checkout', async () => {
+    it('upgrades to Starter tier for Starter plan checkout', async () => {
       mockUserDb.getUserById.mockResolvedValue({
         userId: 'user-1',
         email: 'test@example.com',
@@ -259,24 +281,26 @@ describe('Tier-based Access Control', () => {
 
       await handleCheckoutSessionCompleted(session);
 
+      // PR #1261: Starter price derives to the user-facing "Starter" name
+      // (previously "Basic") so it matches the pricing page.
       expect(mockUserDb.updateUser).toHaveBeenCalledWith(
         'user-1',
         expect.objectContaining({
-          subscriptionType: 'Basic',
+          subscriptionType: 'Starter',
           subscription_status: 'active',
           stripe_customer_id: 'cus_123',
           stripe_subscription_id: 'sub_123',
         })
       );
 
-      // Verify allowedPages is set for Basic tier
+      // Verify allowedPages is set for Starter tier
       const updateCall = mockUserDb.updateUser.mock.calls[0];
       const updateData = updateCall[1] as any;
       expect(updateData.allowedPages).toBeDefined();
       expect(updateData.allowedPages.length).toBeGreaterThan(4);
     });
 
-    it('upgrades to Super Premium tier for Pro plan checkout', async () => {
+    it('upgrades to Pro tier for Pro plan checkout', async () => {
       mockUserDb.getUserById.mockResolvedValue({
         userId: 'user-2',
         email: 'pro@example.com',
@@ -296,10 +320,12 @@ describe('Tier-based Access Control', () => {
 
       await handleCheckoutSessionCompleted(session);
 
+      // PR #1261: Complete/pro price derives to the user-facing "Pro" name
+      // (previously "Super Premium") so it matches the pricing page.
       expect(mockUserDb.updateUser).toHaveBeenCalledWith(
         'user-2',
         expect.objectContaining({
-          subscriptionType: 'Super Premium',
+          subscriptionType: 'Pro',
           subscription_status: 'active',
           allowedPages: ['*'],
           allowedSkills: ['*'],
@@ -307,10 +333,15 @@ describe('Tier-based Access Control', () => {
       );
     });
 
-    it('defaults to Super Premium for unknown price IDs', async () => {
+    it('does NOT write subscriptionType for unknown price IDs', async () => {
+      // PR #1261 also hardened the unknown-price path: rather than silently
+      // promoting the user to the top tier (the old "Super Premium" default),
+      // the handler now leaves the user's existing tier untouched so a
+      // misconfigured price ID cannot silently grant wildcard access.
       mockUserDb.getUserById.mockResolvedValue({
         userId: 'user-3',
         email: 'unknown@example.com',
+        subscriptionType: 'Free',
       } as any);
       mockUserDb.updateUser.mockResolvedValue(undefined as any);
 
@@ -326,14 +357,17 @@ describe('Tier-based Access Control', () => {
 
       await handleCheckoutSessionCompleted(session);
 
-      expect(mockUserDb.updateUser).toHaveBeenCalledWith(
-        'user-3',
-        expect.objectContaining({
-          subscriptionType: 'Super Premium',
-          allowedPages: ['*'],
-          allowedSkills: ['*'],
-        })
-      );
+      // Still writes the Stripe IDs and status (so the subscription is
+      // linked to the user) but does NOT write subscriptionType /
+      // allowedPages / allowedSkills — the user's existing tier stands.
+      expect(mockUserDb.updateUser).toHaveBeenCalledTimes(1);
+      const updateCall = mockUserDb.updateUser.mock.calls[0];
+      const updateData = updateCall[1] as any;
+      expect(updateData.stripe_customer_id).toBe('cus_789');
+      expect(updateData.stripe_subscription_id).toBe('sub_789');
+      expect(updateData).not.toHaveProperty('subscriptionType');
+      expect(updateData).not.toHaveProperty('allowedPages');
+      expect(updateData).not.toHaveProperty('allowedSkills');
     });
   });
 

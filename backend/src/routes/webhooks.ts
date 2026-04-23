@@ -15,6 +15,7 @@ import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { normalizeAttribution } from '../types/attribution';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -267,7 +268,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       notes,
       linkedin,
       source,
-      customFields
+      customFields,
+      attribution,
+      utm,
     } = req.body;
 
     // Validate required field (email)
@@ -289,6 +292,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       notes: notes?.trim() || '',
       linkedin: linkedin?.trim() || '',
     };
+
+    // Attribution — accept either the new `attribution` shape or the legacy
+    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
+    // If the client sends nothing, we stamp nothing; the CSV import and other
+    // internal paths won't carry attribution.
+    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
+    if (touch) {
+      leadData.firstTouch = touch;
+      leadData.lastTouch = touch;
+    }
 
     // Add custom fields with source tracking
     const incomingCustomFields: Record<string, any> = {

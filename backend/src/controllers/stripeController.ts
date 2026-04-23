@@ -10,6 +10,7 @@ import {
   handleInvoicePaymentSucceeded,
   handleInvoicePaymentFailed,
   handleChargeRefunded,
+  handleSubscriptionScheduleEnded,
   reconcileAllStripeUsers,
 } from '../services/stripeService';
 
@@ -88,6 +89,14 @@ export async function handleWebhook(req: Request, res: Response) {
         await handleCheckoutSessionCompleted(event.data.object);
         await recordSubscriptionEvent(event.data.object, 'subscription_created');
         break;
+      // Handle subs created OUTSIDE Checkout (admin provisioning, API,
+      // reconciliation). Pass { isNew: true } so the stale-webhook guard
+      // is bypassed — this IS the authoritative new sub and any canceled
+      // stripe_subscription_id in the DB should be overwritten.
+      case 'customer.subscription.created':
+        await handleSubscriptionUpdated(event.data.object, { isNew: true });
+        await recordSubscriptionEvent(event.data.object, 'subscription_created');
+        break;
       case 'customer.subscription.updated':
         await handleSubscriptionUpdated(event.data.object);
         await recordSubscriptionEvent(event.data.object, 'subscription_updated');
@@ -96,6 +105,11 @@ export async function handleWebhook(req: Request, res: Response) {
         await handleSubscriptionDeleted(event.data.object);
         await recordSubscriptionEvent(event.data.object, 'subscription_canceled');
         break;
+      // Stripe sends both `invoice.paid` (current) and
+      // `invoice.payment_succeeded` (legacy) for the same event. Handle
+      // both so renewal cycles sync regardless of which wire format the
+      // webhook endpoint was configured with.
+      case 'invoice.paid':
       case 'invoice.payment_succeeded':
         await handleInvoicePaymentSucceeded(event.data.object);
         await handleInvoicePayment(event.data.object, 'payment_succeeded');
@@ -106,6 +120,16 @@ export async function handleWebhook(req: Request, res: Response) {
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
+        break;
+      // subscription_schedule lifecycle: clear any cached scheduledChange
+      // on the user record when the schedule reaches a terminal state. See
+      // handleSubscriptionScheduleEnded for details on each event.
+      // NOTE: requires these events to be enabled on the Stripe webhook
+      // endpoint (Developers → Webhooks → edit → tick the 3 boxes).
+      case 'subscription_schedule.released':
+      case 'subscription_schedule.canceled':
+      case 'subscription_schedule.completed':
+        await handleSubscriptionScheduleEnded(event.data.object);
         break;
       default:
         console.log(`Unhandled Stripe event type: ${event.type}`);

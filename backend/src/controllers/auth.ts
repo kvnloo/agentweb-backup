@@ -10,6 +10,7 @@ import crypto from "crypto";
 import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
+import { onUserRegistered } from "../services/contactCaptureHooks";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -114,6 +115,17 @@ export const register = async (req: Request, res: Response) => {
       stripe_customer_id,
       subscriptionType: "Free",
       attribution: touch,
+    }).catch(() => {});
+
+    // Fire user.registered timeline event (fire-and-forget).
+    // Distinct from crmSignalHooks.onUserSignup (contact.created + scoring)
+    // — this populates the contact activity timeline specifically.
+    onUserRegistered({
+      userId,
+      email,
+      displayName: finalDisplayName,
+      signupSource: "password",
+      createdAt: new Date().toISOString(),
     }).catch(() => {});
 
     if (process.env.NODE_ENV !== "development") {
