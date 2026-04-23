@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-23',
     changes: [
+      'Fix: Emma Now Correctly Solves reCAPTCHA When Logging Into Websites',
+      '- Emma was failing silently when asked to log into sites protected by reCAPTCHA v2 (e.g. rankai.ai), calling the solve_captcha tool without the required site key or captcha type',
+      '- The tool now detects missing parameters immediately and returns the exact browser_evaluate code needed to extract the site key, so Emma retries with the correct inputs',
+      '- The tool description was also updated to explicitly instruct Emma to extract the data-sitekey attribute before calling the tool, preventing the issue from recurring',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
       'Improvement: Account Summary Now Includes Connected Accounts and Active Scheduled Chats',
       '- The account_summary tool used by Emma now returns an account section with the count of connected accounts and active scheduled chats',
       '- This gives Emma immediate context about the account setup without requiring separate tool calls',
