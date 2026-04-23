@@ -32,6 +32,10 @@ export interface DedupedContact {
   primaryLead: any;
 }
 
+/** Safety cap on raw lead rows fetched across all lists. Prevents OOM on
+ *  large accounts (e.g. 130k-lead lists). Inbox only needs a useful top-N. */
+const DEFAULT_MAX_RAW_LEADS = 50_000;
+
 export interface DedupQuery {
   userId: string;
   /** Optional: restrict to a specific listType (e.g. "sales"). */
@@ -42,6 +46,9 @@ export interface DedupQuery {
   limit?: number;
   /** Optional sort order. Defaults to heatScore desc then lastContactAt desc. */
   sort?: 'heat' | 'recent';
+  /** Optional: max raw lead rows to load across all lists before stopping.
+   *  Defaults to DEFAULT_MAX_RAW_LEADS. Prevents OOM on very large accounts. */
+  maxRawLeads?: number;
 }
 
 export interface DedupResult {
@@ -109,8 +116,15 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
     filteredLists = filteredLists.filter((l: any) => allowed.has(l.listId));
   }
 
-  // Fetch all leads for each list in parallel. Individual list failures
-  // are swallowed and tracked so one bad list doesn't kill the whole call.
+  const maxRawLeads = query.maxRawLeads ?? DEFAULT_MAX_RAW_LEADS;
+  // Distribute the raw-lead cap evenly across lists so no single huge list
+  // starves out others.
+  const perListCap = filteredLists.length > 0
+    ? Math.ceil(maxRawLeads / filteredLists.length)
+    : maxRawLeads;
+
+  // Fetch leads for each list in parallel. Individual list failures are
+  // swallowed so one bad list doesn't kill the whole call.
   const perListResults = await Promise.all(
     filteredLists.map(async (list: any) => {
       try {
@@ -118,11 +132,13 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
         let lastKey: any = undefined;
         let safety = 0;
         do {
-          const page: any = await crmDb.getLeadsByListId(list.listId, 500, lastKey);
+          const pageSize = Math.min(500, perListCap - leads.length);
+          const page: any = await crmDb.getLeadsByListId(list.listId, pageSize, lastKey);
           if (Array.isArray(page?.items)) leads.push(...page.items);
           lastKey = page?.lastEvaluatedKey;
           safety += 1;
-          if (safety > 50) break; // hard cap: 500 * 50 = 25k per list
+          if (safety > 50) break; // hard safety: 500 * 50 = 25k absolute max per list
+          if (leads.length >= perListCap) break; // per-list cap hit
         } while (lastKey);
         return { list, leads };
       } catch (err) {
