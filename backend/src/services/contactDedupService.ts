@@ -117,6 +117,15 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
   }
 
   const maxRawLeads = query.maxRawLeads ?? DEFAULT_MAX_RAW_LEADS;
+
+  // Sort lists by updatedAt desc so recently-active lists get their leads
+  // fetched first when the cap would otherwise leave some lists unread.
+  filteredLists = [...filteredLists].sort((a: any, b: any) => {
+    const at = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const bt = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return bt - at;
+  });
+
   // Distribute the raw-lead cap evenly across lists so no single huge list
   // starves out others.
   const perListCap = filteredLists.length > 0
