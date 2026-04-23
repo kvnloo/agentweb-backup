@@ -221,7 +221,7 @@ export interface ChatSession {
   assetCache?: {
     images: Array<{ url: string; filename: string; generatedAt: string }>;
     videos: Array<{ url: string; filename: string; generatedAt: string }>;
-    htmlReports: Array<{ url: string; filename: string; generatedAt: string }>;
+    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>;
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
@@ -1924,6 +1924,81 @@ export class ChatbotDB {
     } catch (error) {
       // Non-critical: log but don't fail the request
       console.error(`Error updating asset cache for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Persist searchableText values for specific htmlReport entries in a session's assetCache.
+   * Uses a list_append / update approach: patches only the matching entries by URL.
+   * Called after enrichHtmlReportsWithSearchableText to avoid repeated S3 fetches.
+   */
+  async persistSearchableTexts(
+    sessionId: string,
+    updates: Array<{ url: string; searchableText: string }>
+  ): Promise<void> {
+    if (updates.length === 0) return;
+
+    try {
+      // Fetch current assetCache, patch the matching entries, write back
+      const result = await dynamodb.get({
+        TableName: this.tableName,
+        Key: { sessionId },
+        ProjectionExpression: 'assetCache, assetScanIndex',
+      }).promise();
+
+      const item = result.Item as any;
+      if (!item || !item.assetCache) return;
+
+      const cache = item.assetCache as ChatSession['assetCache'];
+      if (!cache) return;
+
+      const updateMap = new Map(updates.map(u => [u.url, u.searchableText]));
+      let changed = false;
+
+      for (const report of cache.htmlReports || []) {
+        const text = updateMap.get(report.url);
+        if (text && !report.searchableText) {
+          report.searchableText = text;
+          changed = true;
+        }
+      }
+
+      if (!changed) return;
+
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET assetCache = :cache',
+        ExpressionAttributeValues: { ':cache': cache },
+      }).promise();
+    } catch (error) {
+      console.error(`Error persisting searchableTexts for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Remove cached searchableText for a specific URL across all agent sessions for a user.
+   * Called after saveHtmlContent overwrites an HTML file in-place at the same URL.
+   */
+  async clearSearchableTextByUrl(userId: string, url: string): Promise<void> {
+    try {
+      const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
+      await Promise.all(sessions.map(async (session) => {
+        if (!session.assetCache) return;
+        const reports = session.assetCache.htmlReports || [];
+        const match = reports.find(r => r.url === url);
+        if (!match || !match.searchableText) return;
+
+        delete match.searchableText;
+        await dynamodb.update({
+          TableName: this.tableName,
+          Key: { sessionId: session.sessionId },
+          UpdateExpression: 'SET assetCache = :cache',
+          ExpressionAttributeValues: { ':cache': session.assetCache },
+        }).promise();
+      }));
+    } catch (error) {
+      console.error(`Error clearing searchableText for url ${url}:`, error);
     }
   }
 

@@ -2044,8 +2044,9 @@ async function getExecutionsWithAssets(
   });
 
   // Search Agent Mode sessions for assets using incremental caching
+  const chatbotDbForEnrich = new ChatbotDB();
   try {
-    const chatbotDb = new ChatbotDB();
+    const chatbotDb = chatbotDbForEnrich;
     // Load sessions metadata only (no messages) — single DynamoDB query
     const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
 
@@ -2126,7 +2127,7 @@ async function getExecutionsWithAssets(
 
   // Enrich HTML report result files with searchable text content
   if (assetType === 'html-reports') {
-    await enrichHtmlReportsWithSearchableText(result);
+    await enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich);
   }
 
   return result;
@@ -2134,19 +2135,21 @@ async function getExecutionsWithAssets(
 
 /**
  * Fetch HTML content for report files that lack searchableText and attach extracted plain text.
+ * Persists newly-fetched searchableText back to DynamoDB (session assetCache or task execution
+ * result_files) so subsequent loads skip the S3 fetch entirely.
  * Runs concurrently (up to 10 at a time) so it doesn't block the response for long.
  */
-async function enrichHtmlReportsWithSearchableText(result: Record<string, any>): Promise<void> {
+async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
   const CONCURRENCY = 10;
   const MAX_TEXT_LENGTH = 3000;
 
-  // Collect all result files that need enrichment
-  const filesToEnrich: Array<{ file: any }> = [];
+  // Collect all result files that need enrichment, tagging each with its execution context
+  const filesToEnrich: Array<{ file: any; executionId: string; sessionId?: string }> = [];
   for (const task of Object.values(result) as any[]) {
     for (const execution of task.executions || []) {
       for (const file of execution.result_files || []) {
         if (!file.searchableText && file.url && (file.is_html || (file.filename || '').toLowerCase().endsWith('.html'))) {
-          filesToEnrich.push({ file });
+          filesToEnrich.push({ file, executionId: execution.executionId, sessionId: file.sessionId });
         }
       }
     }
@@ -2172,6 +2175,45 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>):
         // Non-fatal — leave searchableText absent if fetch fails
       }
     }));
+  }
+
+  // Persist newly-fetched searchableTexts back to DynamoDB so future loads skip S3 fetches.
+  // Group successful enrichments by sessionId (agent-mode) or executionId (task).
+  // For agent-mode sessions, cap at MAX_CACHE_PER_SESSION most-recent reports to keep
+  // assetCache item size bounded; older reports are fetched live on demand.
+  const MAX_CACHE_PER_SESSION = 10;
+  const sessionUpdates = new Map<string, Array<{ url: string; searchableText: string; generatedAt?: string }>>();
+  const executionUpdates = new Map<string, any[]>();
+
+  for (const { file, executionId, sessionId } of filesToEnrich) {
+    if (!file.searchableText) continue; // fetch failed, skip
+
+    if (sessionId) {
+      if (!sessionUpdates.has(sessionId)) sessionUpdates.set(sessionId, []);
+      sessionUpdates.get(sessionId)!.push({ url: file.url, searchableText: file.searchableText, generatedAt: file.generatedAt });
+    } else {
+      if (!executionUpdates.has(executionId)) executionUpdates.set(executionId, []);
+      executionUpdates.get(executionId)!.push(file);
+    }
+  }
+
+  // Fire-and-forget persistence (non-critical, don't delay the response)
+  for (const [sessionId, updates] of sessionUpdates) {
+    // Keep only the most recent MAX_CACHE_PER_SESSION entries to bound item size
+    const toCache = updates
+      .sort((a, b) => (b.generatedAt || '').localeCompare(a.generatedAt || ''))
+      .slice(0, MAX_CACHE_PER_SESSION)
+      .map(({ url, searchableText }) => ({ url, searchableText }));
+    chatbotDb.persistSearchableTexts(sessionId, toCache).catch(() => {/* already logged inside */});
+  }
+  for (const [execId, files] of executionUpdates) {
+    for (const task of Object.values(result) as any[]) {
+      const exec = (task.executions || []).find((e: any) => e.executionId === execId);
+      if (exec) {
+        taskDb.updateTaskExecutionResultFiles(execId, exec.result_files).catch(() => {/* non-critical */});
+        break;
+      }
+    }
   }
 }
 
@@ -2398,6 +2440,7 @@ function addCachedHtmlReportsToResult(
         is_favorited: isFavorited,
         is_archived: false,
         feedback,
+        ...(asset.searchableText ? { searchableText: asset.searchableText } : {}),
       });
     }
   }
