@@ -4873,6 +4873,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-23',
+    changes: [
+      'Improved: Emma Handles Large Knowledge Bases More Efficiently',
+      '- Emma can now filter Google Drive knowledge base files by date range and type before loading them, avoiding the previous issue where large folders would overflow context and prevent her from finding recent files',
+      '- When asked to find meeting notes or files from a specific period, Emma now calls list_knowledge_base_files with modified_after / modified_before / kb_type parameters instead of loading all 100+ files at once',
+      '- Pagination support (limit / offset) added so Emma can browse large folders page-by-page',
+      '- Results include a hasMore flag and appliedFilters summary so Emma knows when more files are available and what filtering was applied',
+    ],
+  },
+  {
     date: '2026-04-22',
     changes: [
       'Fixed: External CRM Sync Settings Now Load Reliably',
