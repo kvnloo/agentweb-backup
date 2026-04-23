@@ -4094,15 +4094,43 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List all available knowledge base files for the current user, including private (user-specific), public (shared by all users) knowledge bases, Google Drive shared folders, and ClickUp docs. Google Drive entries have identifiers starting with "gdrive:" followed by the folder ID. ClickUp entries have identifiers starting with "clickup:" followed by the workspace ID. Returns a list of files with their unique identifiers, names, sizes, types (public/private/google-drive/clickup), and last updated timestamps.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp entries start with "clickup:". Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        modified_after: {
+          type: "string",
+          description: 'Only return files modified on or after this date. ISO 8601 date string, e.g. "2026-04-15". Applies to Google Drive files.'
+        },
+        modified_before: {
+          type: "string",
+          description: 'Only return files modified on or before this date. ISO 8601 date string, e.g. "2026-04-22". Applies to Google Drive files.'
+        },
+        limit: {
+          type: "number",
+          description: 'Maximum number of files to return per knowledge base source (default: 100). Use with offset for pagination.'
+        },
+        offset: {
+          type: "number",
+          description: 'Number of files to skip within each knowledge base source (default: 0). Use with limit for pagination.'
+        },
+        kb_type: {
+          type: "string",
+          enum: ["google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"],
+          description: 'Filter to only return a specific type of knowledge base. Omit to return all types.'
+        }
+      },
       required: []
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listKnowledgeBaseFiles(context?.userId);
+    return await agentModeService.listKnowledgeBaseFiles(context?.userId, {
+      modified_after: args?.modified_after,
+      modified_before: args?.modified_before,
+      limit: args?.limit,
+      offset: args?.offset,
+      kb_type: args?.kb_type,
+    });
   }
 });
 
