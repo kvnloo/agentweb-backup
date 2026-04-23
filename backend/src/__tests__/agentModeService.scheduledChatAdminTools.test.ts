@@ -82,7 +82,21 @@ jest.mock('../services/emailService', () => ({
     sendDailyDigestEmail: jest.fn(),
     sendScheduledChatVariableRequestEmail: jest.fn(),
     sendScheduledChatErrorEmail: jest.fn(),
+    sendScheduledChatTokenLimitEmail: jest.fn(),
   },
+}));
+
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(async () => ({
+    allowed: true,
+    warning: false,
+    used: 100000,
+    allowance: 1000000,
+    bonus: 0,
+    effectiveAllowance: 1000000,
+    percentUsed: 10,
+    month: '2026-04',
+  })),
 }));
 
 jest.mock('../services/skillService', () => ({
