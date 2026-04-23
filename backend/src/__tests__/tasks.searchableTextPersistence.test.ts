@@ -120,7 +120,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       expect(file.searchableText).toBe('already cached text');
     });
 
-    it('should fetch from S3 and persist searchableText for agent-mode report without cached text', async () => {
+    it('should background-fetch from S3 and persist searchableText for agent-mode report without cached text', async () => {
       const sessionId = 'session-no-text';
       const reportUrl = 'https://s3.example.com/reports/new-report.html';
 
@@ -152,7 +152,10 @@ describe('Tasks Routes - searchableText persistence', () => {
         .get('/api/tasks/executions/with-html-reports')
         .expect(200);
 
-      // Should have fetched the HTML
+      // Flush fire-and-forget microtasks
+      await new Promise(resolve => setImmediate(resolve));
+
+      // Should have fetched the HTML in the background
       expect(mockedAxios.get).toHaveBeenCalledWith(reportUrl, expect.objectContaining({ timeout: 5000 }));
 
       // Should have persisted the searchableText back to the assetCache
@@ -161,12 +164,11 @@ describe('Tasks Routes - searchableText persistence', () => {
         expect.arrayContaining([expect.objectContaining({ url: reportUrl, searchableText: expect.any(String) })])
       );
 
-      // The response file should contain searchableText
+      // The immediate response does NOT include searchableText (enrichment is async)
       const taskKey = `agent-mode-${sessionId}`;
       const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
       expect(file).toBeDefined();
-      expect(file.searchableText).toBeTruthy();
     });
 
     it('should persist searchableTexts for multiple agent-mode sessions in one call per session', async () => {
@@ -195,6 +197,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
 
       await request(app).get('/api/tasks/executions/with-html-reports').expect(200);
+      await new Promise(resolve => setImmediate(resolve));
 
       // Called once per session that has new searchableTexts
       expect(ChatbotDB.prototype.persistSearchableTexts).toHaveBeenCalledTimes(2);
@@ -212,6 +215,63 @@ describe('Tasks Routes - searchableText persistence', () => {
           expect.objectContaining({ url: 'https://s3.example.com/session-b/r2.html' }),
         ])
       );
+    });
+
+    it('should skip uncached sessions in main path and not block the response', async () => {
+      // Uncached session (no assetCache/assetScanIndex) — should NOT be fetched synchronously
+      const uncachedSessionId = 'session-no-cache';
+      const cachedSessionId = 'session-with-cache';
+      const cachedReportUrl = 'https://s3.example.com/cached/report.html';
+
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([
+        {
+          sessionId: uncachedSessionId,
+          userId: 'user123',
+          title: 'Uncached Session',
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T12:00:00Z',
+          archived: false,
+          messageCount: 50,
+          // No assetCache / assetScanIndex
+          messages: [],
+        },
+        {
+          sessionId: cachedSessionId,
+          userId: 'user123',
+          title: 'Cached Session',
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T12:00:00Z',
+          archived: false,
+          messageCount: 2,
+          assetScanIndex: 2,
+          assetCache: {
+            images: [],
+            videos: [],
+            htmlReports: [{ url: cachedReportUrl, filename: 'report.html', generatedAt: '2024-01-01T12:00:00Z', searchableText: 'cached text' }],
+          },
+          messages: [],
+        },
+      ]);
+
+      (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
+      (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
+
+      const response = await request(app)
+        .get('/api/tasks/executions/with-html-reports')
+        .expect(200);
+
+      // The uncached session should NOT appear in the response (no assets known yet)
+      expect(response.body[`agent-mode-${uncachedSessionId}`]).toBeUndefined();
+
+      // The cached session should appear with its known assets
+      const taskKey = `agent-mode-${cachedSessionId}`;
+      const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
+      expect(files.find((f: any) => f.url === cachedReportUrl)).toBeDefined();
+
+      // Background warm should have been triggered for the uncached session
+      // (getMessagesFromMessagesTable called in fire-and-forget)
+      await new Promise(resolve => setImmediate(resolve));
+      expect(ChatbotDB.prototype.getMessagesFromMessagesTable).toHaveBeenCalledWith(uncachedSessionId);
     });
 
     it('should cap persisted entries at 10 most-recent per session when session has >10 reports', async () => {
@@ -240,6 +300,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
 
       await request(app).get('/api/tasks/executions/with-html-reports').expect(200);
+      await new Promise(resolve => setImmediate(resolve));
 
       expect(ChatbotDB.prototype.persistSearchableTexts).toHaveBeenCalledTimes(1);
       const [, persistedUpdates] = (ChatbotDB.prototype.persistSearchableTexts as jest.Mock).mock.calls[0];
@@ -290,7 +351,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       expect(file?.searchableText).toBe('already cached task text');
     });
 
-    it('should fetch from S3 and persist searchableText for task execution report without cached text', async () => {
+    it('should background-fetch from S3 and persist searchableText for task execution report without cached text', async () => {
       const reportUrl = 'https://s3.example.com/task-reports/new-exec.html';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([]);
@@ -318,6 +379,9 @@ describe('Tasks Routes - searchableText persistence', () => {
         .get('/api/tasks/executions/with-html-reports')
         .expect(200);
 
+      // Flush fire-and-forget microtasks
+      await new Promise(resolve => setImmediate(resolve));
+
       expect(mockedAxios.get).toHaveBeenCalledWith(reportUrl, expect.objectContaining({ timeout: 5000 }));
 
       // Should persist back to the execution
@@ -326,9 +390,10 @@ describe('Tasks Routes - searchableText persistence', () => {
         expect.arrayContaining([expect.objectContaining({ url: reportUrl, searchableText: expect.any(String) })])
       );
 
+      // Immediate response has the file but without searchableText (enrichment is async)
       const files = response.body['task-2']?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
-      expect(file?.searchableText).toBeTruthy();
+      expect(file).toBeDefined();
     });
 
     it('should persist searchableTexts grouped by executionId', async () => {
@@ -364,6 +429,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       }]);
 
       await request(app).get('/api/tasks/executions/with-html-reports').expect(200);
+      await new Promise(resolve => setImmediate(resolve));
 
       expect(taskDb.updateTaskExecutionResultFiles).toHaveBeenCalledTimes(2);
       expect(taskDb.updateTaskExecutionResultFiles).toHaveBeenCalledWith(
