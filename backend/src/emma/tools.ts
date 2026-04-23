@@ -5025,7 +5025,7 @@ emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
     name: 'account_summary',
-    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    description: 'Get a full account overview. Returns: (1) account state — connected account count, knowledge base file count, saved config count, task count, active schedule count; (2) activity over the time period — sessions, assets (images, videos, reports, social posts, blogs), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
     inputSchema: {
       type: 'object',
       properties: {
