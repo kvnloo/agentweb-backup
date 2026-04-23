@@ -67,7 +67,7 @@ describe('Tasks Routes - searchableText persistence', () => {
     app.use(express.json());
     app.use('/api/tasks', router);
 
-    mockedAxios.get.mockResolvedValue({ data: HTML_CONTENT });
+    mockedAxios.get.mockResolvedValue({ data: HTML_CONTENT, status: 200, statusText: 'OK', headers: {}, config: {} as any });
     (ChatbotDB.prototype.getMessagesFromIndex as jest.Mock).mockResolvedValue([]);
     (ChatbotDB.prototype.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);

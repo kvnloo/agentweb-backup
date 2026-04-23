@@ -2224,10 +2224,10 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
 function scanMessagesForAssets(
   messages: any[],
   session: ChatSession
-): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string }> } {
+): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }> } {
   const images: Array<{ url: string; filename: string; generatedAt: string }> = [];
   const videos: Array<{ url: string; filename: string; generatedAt: string }> = [];
-  const htmlReports: Array<{ url: string; filename: string; generatedAt: string }> = [];
+  const htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }> = [];
 
   const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
   const seenUrls = new Set<string>();
