@@ -45,11 +45,13 @@ Review your currently installed tools. If you already have what you need, procee
 ### Step 3: INSTALL (if needed)
 If you lack required tools, identify the skill(s) from "Available Skills" and install them.
 - Read the skill descriptions carefully - they list key tools
-- Install ALL needed skills in ONE call
+- **CRITICAL: Scan the ENTIRE request upfront and install ALL needed skills in ONE single install_skills call** — never call install_skills more than once per response
 - Skills persist for the entire conversation
+- Example: if you need web browsing AND social posting, call install_skills once with both skill IDs: ["skill-id-1", "skill-id-2"]
 
 ### Step 4: EXECUTE
 Use your tools to complete the request. Don't ask for permission after installing.
+- If mid-task you realize you need another skill, you may call install_skills ONCE more — but prefer scanning upfront to avoid this
 
 ## When to Ask Questions
 - BEFORE installing: If you're unsure WHICH skill to install
