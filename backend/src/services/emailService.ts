@@ -950,6 +950,99 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     }
   },
 
+  async sendScheduledChatTokenLimitEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    usageStatus: { used: number; allowance: number | null; percentUsed?: number }
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+      const usedFormatted = usageStatus.used.toLocaleString();
+      const allowanceFormatted = usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .error-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .error-section h3 { margin-top: 0; color: #856404; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>❌ Scheduled Chat Error</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+            </div>
+            <div class="content">
+              <div class="error-section">
+                <h3>⚠️ Monthly Token Limit Reached</h3>
+                <p style="margin: 0; line-height: 1.6;">
+                  Your scheduled chat <strong>"${scheduleName}"</strong> was scheduled to run at <strong>${currentDate}</strong>,
+                  but it cannot execute because you have reached your monthly token limit.
+                </p>
+                <p style="margin: 10px 0 0 0; line-height: 1.6;">
+                  <strong>Usage:</strong> ${usedFormatted} / ${allowanceFormatted} tokens used this month.
+                </p>
+                <p style="margin: 10px 0 0 0; line-height: 1.6;">
+                  Your token allowance resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                </p>
+              </div>
+            </div>
+            <div class="footer">
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                This is an automated email from your scheduled chat.
+                <a href="${customerFrontendUrl}/agent-mode" style="color: #1976d2;">Manage your schedules</a>
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Scheduled Chat Error: ${scheduleName}
+
+Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your monthly token limit.
+
+Usage: ${usedFormatted} / ${allowanceFormatted} tokens used this month.
+
+Your token allowance resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+
+---
+This is an automated email from your scheduled chat.
+Manage your schedules: ${customerFrontendUrl}/agent-mode
+      `;
+
+      const subject = `❌ Scheduled Chat Error: ${scheduleName} - Monthly Token Limit Reached`;
+
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+
+      console.log(`Scheduled chat token limit email sent to: ${emailList.join(', ')}`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled chat token limit email to ${emailList.join(', ')}:`, error);
+    }
+  },
+
   async sendScheduledChatVariableRequestEmail(
     toEmails: string | string[],
     scheduleName: string,
