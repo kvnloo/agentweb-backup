@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-23',
     changes: [
+      'Improvement: Account Summary Now Includes Connected Accounts and Active Scheduled Chats',
+      '- The account_summary tool used by Emma now returns an account section with the count of connected accounts and active scheduled chats',
+      '- This gives Emma immediate context about the account setup without requiring separate tool calls',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
       'New: Email Sequences — Automated Drip Campaigns in CRM',
       '- A new "Sequences" tab in CRM lets you build multi-step email sequences that send automatically on a delay to convert and nurture leads',
       '- Supports multiple campaign types: Free → Paid Conversion, Onboarding, Re-engagement, Nurture, Upsell, and Custom',
