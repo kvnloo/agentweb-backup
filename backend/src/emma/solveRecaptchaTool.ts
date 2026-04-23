@@ -145,11 +145,13 @@ emmaToolRegistry.register({
     name: 'solve_captcha',
     description:
       'Automatically solve a CAPTCHA challenge using the 2captcha service. ' +
-      'Use this for token-based CAPTCHAs that have a data-sitekey attribute: ' +
-      'reCAPTCHA v2 (checkbox or invisible), reCAPTCHA v3 (score-based, no visible widget), ' +
-      'hCaptcha (common on Cloudflare-protected sites), and Cloudflare Turnstile. ' +
-      'For reCAPTCHA v2 / hCaptcha / Turnstile: the token is automatically injected into the page — just submit the form after. ' +
-      'For reCAPTCHA v3: the token is returned and you must inject it where the site expects. ' +
+      'IMPORTANT: Before calling this tool, you MUST first extract the site_key and captcha_type from the page using browser_evaluate. ' +
+      'Use this JS to find them: document.querySelector(\'[data-sitekey]\')?.getAttribute(\'data-sitekey\') — the site_key is the data-sitekey attribute value. ' +
+      'Determine captcha_type by checking: .g-recaptcha or #recaptcha-anchor → "recaptcha_v2"; .h-captcha → "hcaptcha"; .cf-turnstile → "turnstile". ' +
+      'Note: reCAPTCHA widgets often render inside an iframe — look for the data-sitekey on the outer div in the main document, not inside the iframe. ' +
+      'Use this for token-based CAPTCHAs: reCAPTCHA v2 (checkbox or invisible), reCAPTCHA v3 (score-based), hCaptcha, Cloudflare Turnstile. ' +
+      'For reCAPTCHA v2 / hCaptcha / Turnstile: the token is automatically injected — just submit the form after. ' +
+      'For reCAPTCHA v3: the token is returned and you must inject it manually. ' +
       'Takes ~15–60 seconds. ' +
       'NOTE: For simple image/text CAPTCHAs (distorted letters, math puzzles, custom image grids without a standard library), ' +
       'use request_user_captcha_solution instead.',
@@ -191,9 +193,27 @@ emmaToolRegistry.register({
   },
   internal: true,
   execute: async (args: any, context: any) => {
-    const { captcha_type, site_key, page_url, invisible = false, action = 'verify', min_score = 0.7 } = args;
+    const { captcha_type, site_key, page_url, invisible = false, action = 'verify', min_score = 0.7 } = args ?? {};
     const userId = context?.userId;
     if (!userId) throw new Error('Authentication required');
+
+    const missing: string[] = [];
+    if (!captcha_type) missing.push('captcha_type');
+    if (!site_key) missing.push('site_key');
+    if (!page_url) missing.push('page_url');
+    if (missing.length > 0) {
+      return {
+        success: false,
+        error: `Missing required parameters: ${missing.join(', ')}. ` +
+          `You must extract these from the page BEFORE calling solve_captcha. ` +
+          `Use browser_evaluate with this code to find them:\n` +
+          `document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') + ' | type: ' + ` +
+          `(document.querySelector('.g-recaptcha, [data-sitekey]') ? 'recaptcha_v2' : ` +
+          `document.querySelector('.h-captcha') ? 'hcaptcha' : ` +
+          `document.querySelector('.cf-turnstile') ? 'turnstile' : 'unknown') + ` +
+          `' | url: ' + window.location.href`
+      };
+    }
 
     const apiKey = await get2CaptchaApiKey();
     console.log(`[solveCaptcha] Solving ${captcha_type} for ${page_url}`);
