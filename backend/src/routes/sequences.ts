@@ -345,6 +345,13 @@ router.post(
         leads = Array.isArray(leadsResult)
           ? leadsResult
           : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
+      } else if (req.params.sequenceId && req.params.sequenceId !== 'test') {
+        // Verify against the sequence's enrolled leads
+        const enrollments = await dripSequenceDb.listEnrollmentsForSequence(req.params.sequenceId);
+        const leadFetches = enrollments.map((e) =>
+          crmDb.getLeadById(e.listId, e.leadId).catch(() => null),
+        );
+        leads = (await Promise.all(leadFetches)).filter(Boolean);
       }
 
       const variableCoverage: Record<string, { present: number; missing: number }> = {};
