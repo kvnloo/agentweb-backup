@@ -2407,11 +2407,23 @@ export class AgentModeService {
       return true;
     });
 
+    // Merge consecutive user messages into one — keeps the 10-message window from dropping
+    // the original task when many retry messages ("Please try again...") pile up behind it.
+    const mergedHistory: ChatMessage[] = [];
+    for (const msg of filteredHistory) {
+      const last = mergedHistory[mergedHistory.length - 1];
+      if (last && last.role === 'user' && msg.role === 'user') {
+        last.content = `${last.content}\n\n${msg.content}`;
+      } else {
+        mergedHistory.push({ ...msg });
+      }
+    }
+
     // Determine slice starting at the 10th most recent user message over full history
     let userCount = 0;
     let startIdx = 1; // Assume the first message is the system message
-    for (let i = filteredHistory.length - 1; i >= 0; i--) {
-      if (filteredHistory[i].role === 'user') {
+    for (let i = mergedHistory.length - 1; i >= 0; i--) {
+      if (mergedHistory[i].role === 'user') {
         userCount++;
         if (userCount === 10) {
           startIdx = i;
@@ -2419,7 +2431,7 @@ export class AgentModeService {
         }
       }
     }
-    const sliced = filteredHistory.slice(startIdx);
+    const sliced = mergedHistory.slice(startIdx);
 
 
 
