@@ -1480,6 +1480,22 @@ export const taskDb = {
     }
   },
 
+  async updateTaskExecutionResultFiles(
+    executionId: string,
+    resultFiles: Array<{ url: string; filename: string; token: string; is_html?: boolean; searchableText?: string; [key: string]: any }>
+  ) {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: { executionId },
+        UpdateExpression: 'SET result_files = :files',
+        ExpressionAttributeValues: { ':files': resultFiles },
+      }).promise();
+    } catch (error) {
+      console.error(`Error updating result_files for execution ${executionId}:`, error);
+    }
+  },
+
   async getPendingTaskExecutions() {
     try {
       const params = {

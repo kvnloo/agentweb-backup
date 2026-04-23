@@ -11,6 +11,8 @@ import {
   getS3ObjectStream,
   getS3ObjectMetadata,
 } from "../utils/s3Utils";
+import { ChatbotDB } from "../services/chatbotService";
+import { AuthenticatedRequest } from "../middleware/auth";
 
 const DEFAULT_BUCKET = process.env.AWS_S3_BUCKET || "agentweb-user-files";
 
@@ -355,6 +357,12 @@ export const saveHtmlContent = async (req: Request, res: Response) => {
         success: false,
         message: uploadResult.error || "Failed to save HTML content.",
       });
+    }
+
+    // Invalidate cached searchableText — the file content changed but URL is the same
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (userId) {
+      new ChatbotDB().clearSearchableTextByUrl(userId, url).catch(() => {/* non-critical */});
     }
 
     return res.json({
