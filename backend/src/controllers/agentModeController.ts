@@ -2056,10 +2056,15 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
-        // Skip diagnosis for errors that already have specific handling below (context limit, worker shutdown, etc.)
-        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
-          const userMessage = req.body?.userMessage || '';
-          diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+        // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          if (error instanceof Error && isWorkerShutdownError(error)) {
+            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else {
+            const userMessage = req.body?.userMessage || '';
+            diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+          }
         }
 
         const errorAssistantMessage: ChatMessage = {
@@ -2196,12 +2201,14 @@ export const agentModeController = {
         const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
+        const originalMessageForAlert = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
           subject: 'Agent Mode: Unknown Error in Generate Response',
-          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${originalMessageForAlert || error.message || 'Unknown error'}`,
           sessionId,
           context: {
             'Error Message': error.message || 'Unknown error',
+            'Original Error': originalMessageForAlert || 'Not available',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'User ID': user?.userId || 'Not available',
@@ -2596,6 +2603,18 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
+      // Reject concurrent requests for the same session (synchronous check before any await)
+      if (activeSessionGenerations.has(session.sessionId)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+      activeSessionGenerations.add(session.sessionId);
+
+      try {
+
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
@@ -2626,6 +2645,9 @@ export const agentModeController = {
         skills: response.skills,
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+      } finally {
+        activeSessionGenerations.delete(session.sessionId);
+      }
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
 
@@ -2641,9 +2663,15 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
-        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
-          const userMessage = req.body?.userMessage || '';
-          diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+        // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          if (error instanceof Error && isWorkerShutdownError(error)) {
+            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else {
+            const userMessage = req.body?.userMessage || '';
+            diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+          }
         }
 
         const errorAssistantMessage: ChatMessage = {
@@ -2781,12 +2809,14 @@ export const agentModeController = {
         const session = shareId ? await chatbotDb.getChatSession(shareId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
+        const originalMessage = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
           subject: 'Agent Mode: Unknown Error in Generate Shared Response',
-          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${originalMessage || error.message || 'Unknown error'}`,
           sessionId: shareId,
           context: {
             'Error Message': error.message || 'Unknown error',
+            'Original Error': originalMessage || 'Not available',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'Session ID (Share ID)': shareId || 'Not provided',

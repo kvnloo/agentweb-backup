@@ -139,6 +139,14 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
     } = req.body;
+
+    // Validate Attio API key length before encrypting and storing it.
+    if (apiKey && provider === 'attio' && apiKey.trim().length !== 64) {
+      return res.status(400).json({
+        error: `Invalid Attio API key: keys must be exactly 64 characters (yours is ${apiKey.trim().length}). Copy the full key from Attio Settings → API Keys.`,
+      });
+    }
+
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping,
