@@ -58,6 +58,7 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         account_handle: (acc.config as any).account_handle,
         follower_count: (acc.config as any).follower_count,
         created_at: acc.created_at,
+        sharedWithOrg: (acc as any).sharedWithOrg ?? false,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
