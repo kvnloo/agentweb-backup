@@ -28,6 +28,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Scheduled Chats No Longer Run When Monthly Token Limit Is Exceeded',
+      '- Free users who had reached their monthly token limit could still have scheduled chats execute automatically — this has been fixed',
+      '- Scheduled chats now check the token limit before running; if the limit is exceeded, the run is recorded as failed and a notification email is sent',
+    ],
+  },
+  {
     date: '2026-04-22',
     changes: [
       'Fix: Attio CRM Sync No Longer Fails with Field Mapping Errors',
