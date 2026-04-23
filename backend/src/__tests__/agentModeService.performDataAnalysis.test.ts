@@ -193,4 +193,82 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.analysis).toContain('**Analysis:** Analysis includes chart output.');
     expect(result.analysis).toContain('![Analysis Result](');
   });
+
+  test('skips inlineData with non-image mimeType (e.g. Vega-Lite JSON from altair)', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Here is the chart specification.' },
+                {
+                  inlineData: {
+                    data: Buffer.from('{"$schema":"https://vega.github.io/schema/vega-lite/v5.json"}').toString('base64'),
+                    mimeType: 'application/json'
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Create a chart.', 'user-1');
+
+    expect(mockedUploadFileToS3).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.analysis).not.toContain('![Analysis Result]');
+  });
+
+  test('skips inline_data (snake_case) with non-image mimeType', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Chart spec generated.' },
+                {
+                  inline_data: {
+                    data: Buffer.from('{"type":"chart"}').toString('base64'),
+                    mime_type: 'application/json'
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Create a chart.', 'user-1');
+
+    expect(mockedUploadFileToS3).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.analysis).not.toContain('![Analysis Result]');
+  });
+
+  test('prompt instructs Gemini to use matplotlib, not altair', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: 'Done.' }]
+            }
+          }
+        ]
+      }
+    });
+
+    await (service as any).performDataAnalysis([], 'Generate a bar chart.', 'user-1');
+
+    const postBody = mockedAxiosPost.mock.calls[0][1];
+    const promptText = postBody.contents[0].parts[postBody.contents[0].parts.length - 1].text as string;
+    expect(promptText).toContain('matplotlib');
+    expect(promptText).toContain('altair');
+    expect(promptText.toLowerCase()).toContain('do not use altair');
+  });
 });

@@ -4849,7 +4849,7 @@ export class AgentModeService {
 
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.`
+        text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
       });
 
       // Call Gemini API directly via REST to enable code execution
@@ -4894,55 +4894,65 @@ export class AgentModeService {
         }
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
-          try {
-            const imageData = (part as any).inlineData.data;
-            const mimeType = (part as any).inlineData.mimeType || 'image/png';
+          const mimeType = (part as any).inlineData.mimeType || 'image/png';
+          if (!mimeType.startsWith('image/')) {
+            // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
+            console.warn(`AgentMode: performDataAnalysis skipping non-image inlineData with mimeType=${mimeType}`);
+          } else {
+            try {
+              const imageData = (part as any).inlineData.data;
 
-            // Convert base64 string to Buffer for S3 upload
-            const imageBuffer = Buffer.from(imageData, 'base64');
+              // Convert base64 string to Buffer for S3 upload
+              const imageBuffer = Buffer.from(imageData, 'base64');
 
-            // Upload image to S3
-            const { uploadFileToS3 } = await import('../utils/s3Utils');
-            const imageFilename = `analysis_chart_${Date.now()}.png`;
-            const uploadResult = await uploadFileToS3(
-              imageBuffer,
-              imageFilename,
-              userId,
-              mimeType
-            );
+              // Upload image to S3
+              const { uploadFileToS3 } = await import('../utils/s3Utils');
+              const imageFilename = `analysis_chart_${Date.now()}.png`;
+              const uploadResult = await uploadFileToS3(
+                imageBuffer,
+                imageFilename,
+                userId,
+                mimeType
+              );
 
-            if (uploadResult.success && uploadResult.url) {
-              resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
+              if (uploadResult.success && uploadResult.url) {
+                resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
+              }
+            } catch (error) {
+              console.error('Error uploading inline data to S3:', error);
+              resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
             }
-          } catch (error) {
-            console.error('Error uploading inline data to S3:', error);
-            resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
           }
         } else if ((part as any).inline_data && (part as any).inline_data.data) {
           // Handle snake_case format
-          try {
-            const imageData = (part as any).inline_data.data;
-            const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
+          const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
+          if (!mimeType.startsWith('image/')) {
+            // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
+            console.warn(`AgentMode: performDataAnalysis skipping non-image inline_data with mimeType=${mimeType}`);
+          } else {
+            try {
+              const imageData = (part as any).inline_data.data;
 
-            // Convert base64 string to Buffer for S3 upload
-            const imageBuffer = Buffer.from(imageData, 'base64');
+              // Convert base64 string to Buffer for S3 upload
+              const imageBuffer = Buffer.from(imageData, 'base64');
 
-            // Upload image to S3
-            const { uploadFileToS3 } = await import('../utils/s3Utils');
-            const imageFilename = `analysis_chart_${Date.now()}.png`;
-            const uploadResult = await uploadFileToS3(
-              imageBuffer,
-              imageFilename,
-              userId,
-              mimeType
-            );
+              // Upload image to S3
+              const { uploadFileToS3 } = await import('../utils/s3Utils');
+              const imageFilename = `analysis_chart_${Date.now()}.png`;
+              const uploadResult = await uploadFileToS3(
+                imageBuffer,
+                imageFilename,
+                userId,
+                mimeType
+              );
 
-            if (uploadResult.success && uploadResult.url) {
-              resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
+              if (uploadResult.success && uploadResult.url) {
+                resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
+              }
+            } catch (error) {
+              console.error('Error uploading inline_data (snake_case) to S3:', error);
+              resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
             }
-          } catch (error) {
-            console.error('Error uploading inline_data (snake_case) to S3:', error);
-            resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
           }
         }
       }
