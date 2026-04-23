@@ -420,7 +420,7 @@ const fetchAllLeadsByStatusIndex = async (
 
 // ─── Org-aware access control ────────────────────────────────────────────────
 // Returns true if userId owns the list OR is a member of the same org as the owner.
-async function canAccessCrmList(userId: string, list: { userId: string }): Promise<boolean> {
+async function canAccessCrmList(userId: string, list: { userId: string } | Record<string, any>): Promise<boolean> {
   if (list.userId === userId) return true;
   const [user, owner] = await Promise.all([
     userDb.getUserById(userId),

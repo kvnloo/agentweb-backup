@@ -467,7 +467,7 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
 
     const accounts = user.connected_accounts || [];
     const idx = accounts.findIndex(
-      (a) => a.platform === platform && a.account_id === accountId
+      (a: any) => a.platform === platform && a.account_id === accountId
     );
     if (idx === -1) {
       return res.status(404).json({ error: "Connected account not found" });
