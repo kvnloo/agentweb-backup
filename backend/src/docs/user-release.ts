@@ -11,6 +11,19 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-23',
     changes: [
+      'New: Email Sequences — Automated Drip Campaigns in CRM',
+      '- A new "Sequences" tab in CRM lets you build multi-step email sequences that send automatically on a delay to convert and nurture leads',
+      '- Supports multiple campaign types: Free → Paid Conversion, Onboarding, Re-engagement, Nurture, Upsell, and Custom',
+      '- Enroll leads individually or in bulk from any lead list; leads can also be enrolled automatically when they reach a specific lifecycle stage',
+      '- Configure exit conditions: stop a sequence when a lead converts, engages with an email (opens, clicks, replies), unsubscribes, or reaches a specific lifecycle stage',
+      '- Each step has a configurable delay (in days) and a full email editor with variable support (e.g. {{firstName}})',
+      '- Per-step utilities: Send Test Email, Verify Variables (checks coverage against enrolled leads), and Load from URL (import email body from a web page)',
+      '- Verification gate before saving: the Save button runs a pre-flight check — hard failures (no sender, missing subject/body) block saving; variable coverage warnings are shown with per-lead counts',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
       'Fix: Scheduled Website Scans Now Complete the Full Audit After Navigation',
       '- Scheduled scans were navigating to the target site but then asking "what should I do next?" instead of running the audit',
       '- Root cause: after 10+ retry attempts, consecutive retry messages filled the context window and pushed the original task instruction out of the messages sent to the LLM',
