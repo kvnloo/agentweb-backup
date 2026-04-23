@@ -60,6 +60,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-23',
     changes: [
+      'Fix: Emma Chart Generation Now Produces Real Images Instead of Broken Placeholders',
+      '- Charts created by Emma\'s data analysis tool were sometimes saving as unrenderable JSON files (Vega-Lite specs from the altair library) instead of actual PNG images',
+      '- These files appeared as broken image placeholders in reports and chat responses',
+      '- Emma now explicitly uses matplotlib/seaborn for chart rendering, which produces real rasterized PNG images',
+      '- The system also validates that any data returned by the AI is an actual image before uploading it, so non-image responses are discarded rather than saved as broken files',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
       'Fix: Ad Report Charts Now Render Correctly With Accurate Data',
       '- Charts in HTML ad performance reports were showing "Chart error: Unexpected identifier" due to malformed JSON in chart configurations (missing closing quotes in property values)',
       '- The HTML report generator now enforces valid JSON syntax rules and explicit Chart.js version pinning, preventing broken chart URLs',
