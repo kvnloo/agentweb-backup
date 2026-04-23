@@ -997,6 +997,53 @@ export async function runScheduledChat(
       }
     }
 
+    // Check token usage limits before creating the session
+    const usageStatus = await checkTokenUsage(userId);
+    if (!usageStatus.allowed) {
+      const emailNotifications = schedule.emailNotifications || [];
+      let notifyEmails: string[] = emailNotifications;
+      if (notifyEmails.length === 0) {
+        const { userDb: tokenUserDb } = await import('../services/db');
+        const tokenUser = await tokenUserDb.getUserById(userId);
+        if (tokenUser?.email) notifyEmails = [tokenUser.email];
+      }
+
+      if (notifyEmails.length > 0) {
+        const { emailService } = await import('../services/emailService');
+        await emailService.sendScheduledChatTokenLimitEmail(
+          notifyEmails,
+          schedule.scheduleName,
+          schedule.scheduleId,
+          usageStatus
+        );
+      }
+
+      const tokenLimitResult = {
+        scheduleId: schedule.scheduleId,
+        runId: require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString()
+      };
+
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, tokenLimitResult);
+      } catch (error) {
+        console.error('Error saving token limit run result:', error);
+      }
+
+      return tokenLimitResult;
+    }
+
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const pageIdentifier = `${sessionTitle}|scheduleId:${schedule.scheduleId}`;
