@@ -31,6 +31,7 @@ import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
+import sequenceRoutes from "./routes/sequences";
 import crmPublicRoutes from "./routes/crmPublic";
 import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
@@ -248,6 +249,7 @@ app.use("/api/funnels", funnelRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm/public", crmPublicRoutes);
 app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be after /public, before main crm routes
+app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
