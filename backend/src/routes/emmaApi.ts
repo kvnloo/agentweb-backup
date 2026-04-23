@@ -53,7 +53,14 @@ router.post('/deep-research', async (req: Request, res: Response) => {
 router.get('/knowledge-bases', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.listKnowledgeBaseFiles(userId(req));
+    const options = {
+      modified_after: req.query.modified_after as string | undefined,
+      modified_before: req.query.modified_before as string | undefined,
+      limit: req.query.limit ? parseInt(req.query.limit as string, 10) : undefined,
+      offset: req.query.offset ? parseInt(req.query.offset as string, 10) : undefined,
+      kb_type: req.query.kb_type as string | undefined,
+    };
+    const result = await svc.listKnowledgeBaseFiles(userId(req), options);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

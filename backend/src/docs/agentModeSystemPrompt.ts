@@ -304,6 +304,8 @@ When a user refers to a page or feature by name, use the corresponding tools —
 - "images", "ad images", "image generation", "images page" → **generate_image**, **get_visual_context**
 - "videos", "ad videos", "video generation", "videos page" → **generate_video**
 - "knowledge base", "KB", "knowledge files", "knowledge base page" → **list_knowledge_base_files**, **read_knowledge_base_files**
+  - Use **list_knowledge_base_files** (not search_knowledge_base) when browsing files by name or date. Pass modified_after/modified_before to filter by date range. Pass kb_type="google-drive" to skip unrelated sources. Use limit/offset to paginate large folders.
+  - Use **search_knowledge_base** only to search document *content* by topic or keyword — not to list files.
 - "templates", "email templates", "landing pages", "templates page" → **list_html_templates**
 - "books", "ebook", "book", "books page" → **list_books**, **get_book_content**
 - "research", "reports", "research reports", "deep research" → **perform_deep_research**

@@ -12952,9 +12952,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // List all knowledge base files for a user
-  public async listKnowledgeBaseFiles(userId: string): Promise<any> {
+  public async listKnowledgeBaseFiles(userId: string, options?: {
+    modified_after?: string;  // ISO 8601 date string, e.g. "2026-04-15"
+    modified_before?: string; // ISO 8601 date string, e.g. "2026-04-22"
+    limit?: number;           // max files per Drive KB (default 100)
+    offset?: number;          // file offset within Drive KB for pagination (default 0)
+    kb_type?: string;         // filter to specific KB type: "google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"
+  }): Promise<any> {
     try {
-      console.log('AgentMode: Listing knowledge base files for user:', userId);
+      console.log('AgentMode: Listing knowledge base files for user:', userId, 'options:', options);
 
       // Get user's private knowledge bases
       const userKnowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
@@ -12980,7 +12986,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
-      const knowledgeBases = (allKnowledgeBaseTasks || []).map((task: any) => {
+      // If kb_type filter is set and doesn't include platform KBs, skip them entirely
+      const skipPlatformKBs = options?.kb_type && !['private', 'public'].includes(options.kb_type);
+
+      const knowledgeBases: any[] = skipPlatformKBs ? [] : (allKnowledgeBaseTasks || []).map((task: any) => {
         const taskId = task.taskId;
         const taskName = task.name;
         const kbType = task.knowledgeBaseType || 'private';
@@ -13009,20 +13018,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       // Include Google Drive shared folders
-      try {
+      if (!options?.kb_type || options.kb_type === 'google-drive') try {
         const folders = await this.getUserGoogleDriveFolders(userId);
         if (folders.length > 0) {
           const drive = await this.getGoogleDriveClient();
+          const driveLimit = options?.limit ?? 100;
+          const driveOffset = options?.offset ?? 0;
           for (const folder of folders) {
             try {
+              // Build Drive query with optional date filter
+              let driveQuery = `'${folder.folderId}' in parents and trashed = false`;
+              if (options?.modified_after) {
+                driveQuery += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+              }
+              if (options?.modified_before) {
+                driveQuery += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+              }
+
+              // Fetch enough to support pagination: offset + limit
               const response = await drive.files.list({
-                q: `'${folder.folderId}' in parents and trashed = false`,
+                q: driveQuery,
                 fields: 'files(id, name, mimeType, size, modifiedTime)',
-                orderBy: 'name',
-                pageSize: 100,
+                orderBy: 'modifiedTime desc',
+                pageSize: Math.min(driveOffset + driveLimit, 1000),
               });
 
-              const driveFiles = (response.data.files || []).map((f) => ({
+              const allFiles = (response.data.files || []).map((f) => ({
                 fileName: f.name || 'unknown',
                 fileSize: f.size ? parseInt(f.size, 10) : 0,
                 mimeType: f.mimeType || 'unknown',
@@ -13030,12 +13051,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 modifiedTime: f.modifiedTime,
               }));
 
+              const totalMatchingFiles = allFiles.length;
+              const driveFiles = allFiles.slice(driveOffset, driveOffset + driveLimit);
+
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
                 name: folder.name,
                 type: 'google-drive',
-                updatedAt: driveFiles.length > 0 ? driveFiles[0].modifiedTime : undefined,
+                updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
                 files: driveFiles,
+                totalFiles: totalMatchingFiles,
+                hasMore: driveOffset + driveLimit < totalMatchingFiles,
+                offset: driveOffset,
+                limit: driveLimit,
               });
             } catch (folderErr) {
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
@@ -13047,7 +13075,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Include ClickUp docs
-      try {
+      if (!options?.kb_type || options.kb_type === 'clickup') try {
         const clickUpToken = await getClickUpAccessToken(userId);
         if (clickUpToken) {
           const workspaces = await getClickUpWorkspaces(clickUpToken);
@@ -13079,7 +13107,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Include ClickUp tasks
-      try {
+      if (!options?.kb_type || options.kb_type === 'clickup-tasks') try {
         const clickUpToken = await getClickUpAccessToken(userId);
         if (clickUpToken) {
           const workspaces = await getClickUpWorkspaces(clickUpToken);
@@ -13116,7 +13144,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Include Foreplay boards and swipefile
-      try {
+      if (!options?.kb_type || options.kb_type === 'foreplay-swipefile' || options.kb_type === 'foreplay-board') try {
         const foreplayToken = await getForeplayAccessToken(userId);
         if (foreplayToken) {
           // Add swipefile
@@ -13186,22 +13214,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         0
       );
 
+      const appliedFiltersEarly = [
+        options?.modified_after ? `modified_after=${options.modified_after}` : null,
+        options?.modified_before ? `modified_before=${options.modified_before}` : null,
+        options?.kb_type ? `kb_type=${options.kb_type}` : null,
+        options?.limit != null ? `limit=${options.limit}` : null,
+        options?.offset != null ? `offset=${options.offset}` : null,
+      ].filter(Boolean) as string[];
+
       if (knowledgeBases.length === 0) {
         return {
           success: true,
           message: 'No knowledge bases found',
           knowledge_bases: [],
           totalKnowledgeBases: 0,
-          totalFiles: 0
+          totalFiles: 0,
+          ...(appliedFiltersEarly.length > 0 && { appliedFilters: appliedFiltersEarly }),
         };
       }
 
+      const hasMorePages = knowledgeBases.some((kb: any) => kb.hasMore);
+      const appliedFilters = appliedFiltersEarly;
+
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
-        totalFiles
+        totalFiles,
+        ...(appliedFilters.length > 0 && { appliedFilters }),
+        ...(hasMorePages && { hasMore: true }),
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
