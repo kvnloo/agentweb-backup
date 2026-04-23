@@ -1461,14 +1461,14 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'install_skills',
-    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
+    description: 'Install skills by their IDs. Pass ALL skill IDs you need in a single call — do not call this tool multiple times. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
     inputSchema: {
       type: 'object',
       properties: {
         skillIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of skill IDs to install.'
+          description: 'Array of ALL skill IDs to install. Include every skill you need in one call.'
         }
       },
       required: ['skillIds']
