@@ -122,7 +122,13 @@ describe('Emma API Routes', () => {
         .get('/api/emma/knowledge-bases');
 
       expect(res.status).toBe(200);
-      expect(mockService.listKnowledgeBaseFiles).toHaveBeenCalledWith('user-123');
+      expect(mockService.listKnowledgeBaseFiles).toHaveBeenCalledWith('user-123', {
+        modified_after: undefined,
+        modified_before: undefined,
+        limit: undefined,
+        offset: undefined,
+        kb_type: undefined,
+      });
     });
   });
 
