@@ -2050,13 +2050,51 @@ async function getExecutionsWithAssets(
     // Load sessions metadata only (no messages) — single DynamoDB query
     const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
 
-    // Phase 1: Load messages in parallel batches (avoid DynamoDB throttling)
+    // Phase 1: Load messages in parallel batches (avoid DynamoDB throttling).
+    // For html-reports: sessions without assetCache are skipped in the main path
+    // (they have no known assets) and warmed in the background so future loads pick
+    // them up. For images/videos we retain the original eager-scan behavior.
     const BATCH_SIZE = 15;
     const activeSessions = agentSessions.filter(s => !s.archived);
+
+    let sessionsToScan: typeof activeSessions;
+
+    if (assetType === 'html-reports') {
+      const cachedSessions = activeSessions.filter(s => s.assetCache !== undefined && s.assetScanIndex !== undefined);
+      const uncachedSessions = activeSessions.filter(s => s.assetCache === undefined || s.assetScanIndex === undefined);
+
+      // Background-warm uncached sessions (fire-and-forget)
+      if (uncachedSessions.length > 0) {
+        (async () => {
+          try {
+            for (let i = 0; i < uncachedSessions.length; i += BATCH_SIZE) {
+              const batch = uncachedSessions.slice(i, i + BATCH_SIZE);
+              await Promise.all(batch.map(async (session) => {
+                try {
+                  const messages = await chatbotDb.getMessagesFromMessagesTable(session.sessionId);
+                  const newAssets = scanMessagesForAssets(messages, session);
+                  const cache = { images: newAssets.images, videos: newAssets.videos, htmlReports: newAssets.htmlReports };
+                  const maxIndex = messages.reduce((max: number, m: any) => {
+                    const idx = m.messageIndex ?? 0;
+                    return idx > max ? idx : max;
+                  }, 0);
+                  chatbotDb.updateAssetCache(session.sessionId, cache, maxIndex + 1);
+                } catch { /* non-fatal */ }
+              }));
+            }
+          } catch { /* non-fatal */ }
+        })();
+      }
+
+      sessionsToScan = cachedSessions;
+    } else {
+      sessionsToScan = activeSessions;
+    }
+
     const sessionResults: Array<{ session: typeof activeSessions[0]; messages: any[]; existingCache: any }> = [];
 
-    for (let i = 0; i < activeSessions.length; i += BATCH_SIZE) {
-      const batch = activeSessions.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < sessionsToScan.length; i += BATCH_SIZE) {
+      const batch = sessionsToScan.slice(i, i + BATCH_SIZE);
       const batchResults = await Promise.all(batch.map(async (session) => {
         const cachedScanIndex = session.assetScanIndex ?? 0;
         const cachedMessageCount = session.messageCount ?? 0;
@@ -2125,9 +2163,11 @@ async function getExecutionsWithAssets(
     console.error(`Error fetching Agent Mode ${assetType}:`, error);
   }
 
-  // Enrich HTML report result files with searchable text content
+  // Enrich HTML report result files with searchable text content (fire-and-forget —
+  // the result object is mutated in-place, but we don't block the response on it;
+  // cached values are already populated so this only runs for brand-new reports).
   if (assetType === 'html-reports') {
-    await enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich);
+    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich).catch(() => {/* non-fatal */});
   }
 
   return result;
