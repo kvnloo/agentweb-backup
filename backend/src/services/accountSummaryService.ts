@@ -1,5 +1,5 @@
 import { chatbotDb, ChatSession } from './chatbotService';
-import { userDb, crmDb } from './db';
+import { userDb, crmDb, scheduleDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { agentModeService } from './agentModeService';
 import { getAccountsByUserId } from './connectedAccountsDb';
@@ -43,6 +43,10 @@ export interface SessionSummaryEntry {
 
 export interface AccountSummary {
   period: string;
+  account: {
+    connected_accounts: number;
+    active_schedules: number;
+  };
   sessions: number;
   session_summaries: SessionSummaryEntry[];
   assets: {
@@ -82,11 +86,12 @@ export async function getAccountSummary(
   const startDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
   // Run all queries in parallel
-  const [allSessions, leadsAdded, emailMetrics, socialMetrics] = await Promise.all([
+  const [allSessions, leadsAdded, emailMetrics, socialMetrics, accountCounts] = await Promise.all([
     chatbotDb.getSessionsWithoutMessages(userId),
     getLeadsAdded(userId, startDate),
     getEmailMetrics(userId, startDate),
     getSocialMediaMetrics(userId, startDate),
+    getAccountCounts(userId),
   ]);
 
   const sessions = allSessions.filter(
@@ -139,6 +144,7 @@ export async function getAccountSummary(
 
   return {
     period: periodLabel,
+    account: accountCounts,
     sessions: sessions.length,
     session_summaries: sessionSummaries,
     assets: {
@@ -158,6 +164,26 @@ export async function getAccountSummary(
       social_media: socialMetrics,
     },
   };
+}
+
+async function getAccountCounts(userId: string): Promise<AccountSummary['account']> {
+  const empty = { connected_accounts: 0, active_schedules: 0 };
+  try {
+    const [connectedAccounts, schedules] = await Promise.all([
+      getAccountsByUserId(userId).catch(() => []),
+      scheduleDb.getSchedulesByUserId(userId).catch(() => []),
+    ]);
+
+    const activeSchedules = (schedules || []).filter((s: any) => s.type === 'scheduled_chat' && s.status === 'active').length;
+
+    return {
+      connected_accounts: connectedAccounts.length,
+      active_schedules: activeSchedules,
+    };
+  } catch (error) {
+    console.error('accountSummary: Error fetching account counts:', error);
+    return empty;
+  }
 }
 
 async function getSessionSummaries(sessions: ChatSession[]): Promise<SessionSummaryEntry[]> {
