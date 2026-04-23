@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-23',
+    changes: [
+      'Fixed: CRM Page No Longer Crashes for Accounts with Large Lead Lists',
+      '- The CRM page was crashing or timing out for accounts with very large lead lists (100,000+ leads)',
+      '- The backend now caps how many leads are loaded into memory at once, preventing out-of-memory crashes',
+      '- Recently-active lists are prioritised so the most relevant contacts always appear in the Inbox',
+      '- The Inbox now shows up to 5,000 unique contacts (up from 2,000) and displays a hint when results are capped',
+    ],
+  },
+  {
     date: '2026-04-22',
     changes: [
       'Fix: Attio CRM Sync No Longer Fails with Field Mapping Errors',
