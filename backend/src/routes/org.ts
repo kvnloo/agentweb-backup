@@ -426,10 +426,11 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
       }
     }
 
-    // Member personal accounts
+    // Member personal accounts — only those the member has explicitly shared with the org
     for (const member of members) {
       if (member.connected_accounts) {
         for (const account of member.connected_accounts) {
+          if (!account.sharedWithOrg) continue;
           allAccounts.push({
             ...account,
             addedBy: member.userId,
@@ -443,6 +444,42 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
     return res.json({ success: true, data: allAccounts });
   } catch (error) {
     console.error("Error getting org connected accounts:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Toggle sharing a personal connected account with the org
+router.patch("/connected-accounts/:platform/:accountId/share", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return res.status(403).json({ error: "You are not a member of any organization" });
+    }
+
+    const { platform, accountId } = req.params;
+    const { sharedWithOrg } = req.body;
+    if (typeof sharedWithOrg !== "boolean") {
+      return res.status(400).json({ error: "sharedWithOrg must be a boolean" });
+    }
+
+    const accounts = user.connected_accounts || [];
+    const idx = accounts.findIndex(
+      (a) => a.platform === platform && a.account_id === accountId
+    );
+    if (idx === -1) {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
+
+    const updated = [...accounts];
+    updated[idx] = { ...updated[idx], sharedWithOrg };
+    await userDb.updateUser(userId, { connected_accounts: updated } as any);
+
+    return res.json({ success: true, sharedWithOrg });
+  } catch (error) {
+    console.error("Error toggling connected account org sharing:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
