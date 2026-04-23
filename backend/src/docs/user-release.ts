@@ -91,6 +91,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-23',
+    changes: [
+      'New: CRM is Shared Across Your Organization',
+      '- Org members can now see all lead lists belonging to anyone in their organization',
+      '- Contacts are deduplicated across the org — the same contact appearing in multiple members\' lists is only counted once',
+      '- All CRM operations (viewing leads, adding leads, filtering) work on org members\' lists, not just your own',
+      '- Tasks and credentials remain private by default and are only visible to their owner',
+    ],
+  },
+  {
     date: '2026-04-21',
     changes: [
       'Improved: Reports Page Search Now Searches Report Content',
