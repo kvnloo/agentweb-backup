@@ -17815,6 +17815,33 @@ Requirements:
 - Format the content draft into well-structured HTML with proper paragraphs, headings, lists, etc. as needed
 ${formatRequirements ? `\nAdditional Format Requirements:\n${formatRequirements}` : ''}
 
+DATA ACCURACY RULES (CRITICAL):
+- NEVER invent, estimate, approximate, or round numeric values for charts or tables
+- Use ONLY the exact numbers provided in the content draft — copy them verbatim
+- NEVER use placeholder labels like "Ad Variant 1", "Campaign A", "Label 1" etc. — use the actual names from the data
+- If a value is not present in the content draft, omit that data point entirely rather than guessing
+- Chart data arrays must contain exactly the values provided, in the correct order
+
+CHART RULES (if the document includes charts):
+Option A — QuickChart (server-side, preferred for simple charts):
+  - Use https://quickchart.io/chart?v=2.9.4&c=<URL-encoded JSON config> as <img> src
+  - The chart config JSON MUST be 100% valid JSON with all strings properly quoted (double or single, but ALWAYS closed)
+  - COMMON BUG TO AVOID: every string value must have BOTH an opening AND closing quote. e.g. "position:'right'" not "position:'right"
+  - Before URL-encoding, mentally verify every string literal in the JSON has matching open/close quotes
+  - QuickChart uses Chart.js v2 syntax: scales use "xAxes"/"yAxes" arrays, legend/title at root level
+  - The "horizontalBar" type is supported by QuickChart
+  - Always URL-encode the full chart config JSON
+Option B — Inline Chart.js (for interactive charts):
+  - ALWAYS load Chart.js v4 from CDN: <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  - Use ONLY Chart.js v4 configuration syntax:
+    - Scales: { x: {...}, y: {...} } NOT xAxes/yAxes arrays
+    - Legend: options.plugins.legend (NOT options.legend)
+    - Title: options.plugins.title (NOT options.title)
+    - Tooltips: options.plugins.tooltip (NOT options.tooltips)
+    - "horizontalBar" does NOT exist in v4 — use type: "bar" with indexAxis: "y" instead
+  - Every canvas must have a unique id; wrap Chart() calls in DOMContentLoaded or place at end of body
+- Do NOT mix Chart.js v2 and v4 syntax — pick one approach and use it consistently throughout the document
+
 The HTML should be production-ready and well-formatted.`;
 
       // Build user prompt
