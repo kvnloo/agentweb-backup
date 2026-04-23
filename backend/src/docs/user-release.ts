@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-23',
     changes: [
+      'Fix: Scheduled Website Scans Now Complete the Full Audit After Navigation',
+      '- Scheduled scans were navigating to the target site but then asking "what should I do next?" instead of running the audit',
+      '- Root cause: after 10+ retry attempts, consecutive retry messages filled the context window and pushed the original task instruction out of the messages sent to the LLM',
+      '- Consecutive user messages are now merged before the context window is applied, so the original task is always visible to the LLM regardless of retry count',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
       'Fixed: CRM Page No Longer Crashes for Accounts with Large Lead Lists',
       '- The CRM page was crashing or timing out for accounts with very large lead lists (100,000+ leads)',
       '- The backend now caps how many leads are loaded into memory at once, preventing out-of-memory crashes',
