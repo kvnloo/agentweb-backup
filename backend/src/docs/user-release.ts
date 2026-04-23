@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Ad Report Charts Now Render Correctly With Accurate Data',
+      '- Charts in HTML ad performance reports were showing "Chart error: Unexpected identifier" due to malformed JSON in chart configurations (missing closing quotes in property values)',
+      '- The HTML report generator now enforces valid JSON syntax rules and explicit Chart.js version pinning, preventing broken chart URLs',
+      '- Reports are also instructed to never invent placeholder data — if a value is not in the source data, it is omitted rather than fabricated',
+    ],
+  },
+  {
     date: '2026-04-22',
     changes: [
       'Fix: Attio CRM Sync No Longer Fails with Field Mapping Errors',
