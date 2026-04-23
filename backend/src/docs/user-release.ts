@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Scheduled scans were navigating to the target site but then asking "what should I do next?" instead of running the audit',
       '- Root cause: after 10+ retry attempts, consecutive retry messages filled the context window and pushed the original task instruction out of the messages sent to the LLM',
       '- Consecutive user messages are now merged before the context window is applied, so the original task is always visible to the LLM regardless of retry count',
+      'Fix: Reports Page Now Loads for Accounts with Large Numbers of Reports',
+      '- The Reports page was timing out for accounts with thousands of HTML reports because report preview text was re-fetched from S3 on every page load',
+      '- Preview text (used for search) is now cached after the first load, so subsequent visits are instant',
+      '- Cache is automatically invalidated when a report is edited in the report editor',
     ],
   },
   {
