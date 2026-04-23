@@ -2393,7 +2393,7 @@ function addCachedHtmlReportsToResult(
   result: Record<string, any>,
   sessionKey: string,
   session: ChatSession,
-  assets: Array<{ url: string; filename: string; generatedAt: string }>,
+  assets: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>,
   messages: any[]
 ): void {
   for (const asset of assets) {
