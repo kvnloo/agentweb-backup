@@ -85,7 +85,21 @@ jest.mock('../services/emailService', () => ({
     sendDailyDigestEmail: jest.fn(),
     sendScheduledChatVariableRequestEmail: jest.fn(),
     sendScheduledChatErrorEmail: jest.fn(),
+    sendScheduledChatTokenLimitEmail: jest.fn(),
   },
+}));
+
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(async () => ({
+    allowed: true,
+    warning: false,
+    used: 100000,
+    allowance: 1000000,
+    bonus: 0,
+    effectiveAllowance: 1000000,
+    percentUsed: 10,
+    month: '2026-04',
+  })),
 }));
 
 jest.mock('../services/skillService', () => ({
@@ -102,11 +116,13 @@ import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getAllowedFunctionCalls, getAllowedSkills } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
+import { checkTokenUsage } from '../services/tokenUsageService';
 import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
 const mockedSkillService = skillService as jest.Mocked<typeof skillService>;
+const mockedCheckTokenUsage = checkTokenUsage as jest.MockedFunction<typeof checkTokenUsage>;
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -2438,6 +2454,106 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       expect(mockEmailService.sendScheduledChatErrorEmail).toHaveBeenCalled();
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should block scheduled chat and send token limit email when user is over token limit', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: true,
+        used: 1050000,
+        allowance: 1000000,
+        percentUsed: 105,
+        effectiveAllowance: 1000000,
+        bonus: 0,
+        month: '2026-04',
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalledWith(
+        ['owner@example.com'],
+        scheduleWithEmails.scheduleName,
+        scheduleWithEmails.scheduleId,
+        expect.objectContaining({ allowed: false, used: 1050000 })
+      );
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', passed: false }));
+    });
+
+    it('should block scheduled chat over token limit and fall back to user email when no emailNotifications set', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: true,
+        used: 1050000,
+        allowance: 1000000,
+        percentUsed: 105,
+        effectiveAllowance: 1000000,
+        bonus: 0,
+        month: '2026-04',
+      });
+
+      const scheduleNoEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: [],
+      };
+
+      await runScheduledChat(scheduleNoEmails, mockUserId, true);
+
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalledWith(
+        ['owner@example.com'], // falls back to user's email from userDb
+        scheduleNoEmails.scheduleName,
+        scheduleNoEmails.scheduleId,
+        expect.objectContaining({ allowed: false })
+      );
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should save failure run result to DB when token limit is exceeded', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: true,
+        used: 1050000,
+        allowance: 1000000,
+        percentUsed: 105,
+        effectiveAllowance: 1000000,
+        bonus: 0,
+        month: '2026-04',
+      });
+
+      const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
+      await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({ status: 'failure', passed: false })
+      );
+    });
+
+    it('should allow scheduled chat when token usage is under the limit', async () => {
+      // Default mock returns allowed: true — just verify normal execution proceeds
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'marketing strategy tips',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).not.toHaveBeenCalled();
+      expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
+      expect(result).toEqual(expect.objectContaining({ status: 'success' }));
     });
   });
 
