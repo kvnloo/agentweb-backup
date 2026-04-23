@@ -35,7 +35,11 @@ export function isContextLimitError(error: unknown): boolean {
 export function isWorkerShutdownError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
-  return message === 'Worker shutdown';
+  // Graceful shutdown (server stopping)
+  if (message === 'Worker shutdown') return true;
+  // Unexpected worker subprocess crash (e.g. OOM kill, EB instance replacement)
+  if (message.startsWith('Worker process exited with code')) return true;
+  return false;
 }
 
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];

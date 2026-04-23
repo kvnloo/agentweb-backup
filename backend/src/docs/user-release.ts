@@ -32,6 +32,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The Reports page was timing out for accounts with thousands of HTML reports because report preview text was re-fetched from S3 on every page load',
       '- Preview text (used for search) is now cached after the first load, so subsequent visits are instant',
       '- Cache is automatically invalidated when a report is edited in the report editor',
+      'Fix: Emma Now Prompts to Resend When a Response Was Lost Due to a Server Restart',
+      '- If Emma was in the middle of responding when the server restarted, your message was saved but the reply never arrived',
+      '- The chat now detects this "orphaned" state on reload and shows a banner: "The previous response wasn\'t received — the server may have restarted."',
+      '- A Resend button lets you re-submit the message with one click instead of having to retype it',
+      '- The server also now gives a clearer "please resend" message (instead of a generic error) when a crash occurs mid-response',
     ],
   },
   {
