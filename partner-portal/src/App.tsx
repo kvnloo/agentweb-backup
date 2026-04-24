@@ -33,7 +33,6 @@ import Skills from './pages/Skills';
 import WorkPlans from './pages/WorkPlans';
 import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
-import DripCampaigns from './pages/DripCampaigns';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
 import { useEffect } from 'react';
@@ -125,14 +124,6 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <ClientHealth />
-                        </AdminRoute>
-                      }
-                    />
-                    <Route
-                      path="drip-campaigns"
-                      element={
-                        <AdminRoute>
-                          <DripCampaigns />
                         </AdminRoute>
                       }
                     />
