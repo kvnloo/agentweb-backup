@@ -450,6 +450,7 @@ describe('Email Campaign Settings API', () => {
 
     it('should update an existing template with new variables', async () => {
       const existingTemplates = [{
+        template_id: 't-123',
         template_name: 'test_template',
         subject: 'Old {{old_var}}',
         html_content: '<p>{{old_content}}</p>',
@@ -459,13 +460,19 @@ describe('Email Campaign Settings API', () => {
         updated_at: '2024-01-01T00:00:00.000Z'
       }];
 
-      mockedSettingsService.getSetting.mockResolvedValue({
-        settingName: 'templates_test-user-123',
-        settingValue: JSON.stringify(existingTemplates),
-        description: 'User templates',
-        updatedBy: 'test@example.com',
-        updatedAt: new Date().toISOString()
+      mockedSettingsService.getSetting.mockImplementation(async (key: string) => {
+        if (key === 'templates_test-user-123') {
+          return {
+            settingName: 'templates_test-user-123',
+            settingValue: JSON.stringify(existingTemplates),
+            description: 'User templates',
+            updatedBy: 'test@example.com',
+            updatedAt: new Date().toISOString()
+          };
+        }
+        return null;
       });
+
       mockedSettingsService.setSetting.mockResolvedValue({
         settingName: 'templates_test-user-123',
         settingValue: expect.any(String),
@@ -475,8 +482,8 @@ describe('Email Campaign Settings API', () => {
       });
 
       const updateData = {
+        template_id: 't-123',
         template_name: 'test_template',
-        original_template_name: 'test_template',
         type: ['email'],
         subject: 'New {{new_var}}',
         html_content: '<h1>{{new_title}}</h1>',
@@ -607,6 +614,7 @@ describe('Email Campaign Settings API', () => {
     it('should return templates with variables', async () => {
       const mockTemplates = [
         {
+          template_id: 't-1',
           template_name: 'template1',
           subject: 'Subject',
           html_content: '<h1>{{title}}</h1>',
@@ -617,12 +625,17 @@ describe('Email Campaign Settings API', () => {
         }
       ];
 
-      mockedSettingsService.getSetting.mockResolvedValue({
-        settingName: 'templates_test-user-123',
-        settingValue: JSON.stringify(mockTemplates),
-        description: 'User templates',
-        updatedBy: 'test@example.com',
-        updatedAt: new Date().toISOString()
+      mockedSettingsService.getSetting.mockImplementation(async (key: string) => {
+        if (key === 'templates_test-user-123') {
+          return {
+            settingName: 'templates_test-user-123',
+            settingValue: JSON.stringify(mockTemplates),
+            description: 'User templates',
+            updatedBy: 'test@example.com',
+            updatedAt: new Date().toISOString()
+          };
+        }
+        return null;
       });
 
       const response = await request(app)
@@ -634,9 +647,10 @@ describe('Email Campaign Settings API', () => {
       expect(response.body.templates[0].arrayVariables).toEqual(['news_n_content']);
     });
 
-    it('should expose legacy templates as email templates when type is missing', async () => {
+    it('should add type=email to templates when type is missing', async () => {
       const mockTemplates = [
         {
+          template_id: 't-old',
           template_name: 'old_template',
           subject: 'Subject with {{old_var}}',
           html_content: '<h1>{{title}}</h1><div>{{item_1}}</div><div>{{item_n}}</div>',
@@ -646,11 +660,11 @@ describe('Email Campaign Settings API', () => {
       ];
 
       mockedSettingsService.getSetting.mockImplementation(async (settingName: string) => {
-        if (settingName === 'email_templates_test-user-123') {
+        if (settingName === 'templates_test-user-123') {
           return {
             settingName,
             settingValue: JSON.stringify(mockTemplates),
-            description: 'User email templates',
+            description: 'User templates',
             updatedBy: 'test@example.com',
             updatedAt: new Date().toISOString()
           };
@@ -668,10 +682,11 @@ describe('Email Campaign Settings API', () => {
     });
   });
 
-  describe('DELETE /api/html-templates/:templateName', () => {
+  describe('DELETE /api/html-templates/:templateId', () => {
     it('should delete an existing template', async () => {
       const mockTemplates = [
         {
+          template_id: 't-1',
           template_name: 'template1',
           subject: 'Subject',
           html_content: '<p>Content</p>',
@@ -681,6 +696,7 @@ describe('Email Campaign Settings API', () => {
           updated_at: '2024-01-01T00:00:00.000Z'
         },
         {
+          template_id: 't-2',
           template_name: 'template2',
           subject: 'Subject 2',
           html_content: '<p>Content 2</p>',
@@ -707,7 +723,7 @@ describe('Email Campaign Settings API', () => {
       });
 
       const response = await request(app)
-        .delete('/api/html-templates/template1')
+        .delete('/api/html-templates/t-1')
         .expect(200);
 
       expect(response.body.success).toBe(true);

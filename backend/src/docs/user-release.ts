@@ -11,12 +11,54 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-24',
     changes: [
+      'Fix: Meta Ads Reports Now Work Even When Meta Connected Account Is Unavailable',
+      '- If your Meta connected account is missing or expired, Emma now automatically falls back to the legacy ad account configuration and continues fetching campaign data without stopping',
+      '- Previously, Emma would stall or spiral into repeated failed attempts when the connected account was unavailable',
+      '- The workflow is unchanged: Emma lists your campaigns first, then fetches 7-day performance metrics — it just works without a connected account',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
+      'Fix: Agent Mode Progress Panel No Longer Shows Duplicate Tool Calls',
+      '- The progress panel was showing each tool call multiple times when the agent ran more than one round of tools in a single response',
+      '- Root cause: the backend was sending the full cumulative list of all tool calls on every progress event; the frontend re-added any tool it could not match to an active card, causing duplicates',
+      '- Fix: each progress event now sends only the tool calls from the current round, so every tool appears exactly once',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
+      'Fixed: Meta Ads Account Now Connects Correctly from Agent Chat',
+      '- Connecting a Meta Ads account via the agent chat (when Emma asks you to reconnect) now properly saves the account to your profile',
+      '- Previously, the ad account selection step was skipped in agent mode, so the token was never stored even though the popup appeared to succeed',
+      '- After completing the OAuth popup, you will now see the ad account picker to select which Meta ad account to connect before returning to the chat',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
       'New: Find Leads from LinkedIn — AI-Powered Lead Discovery in CRM',
       '- A new "Find Leads" button in any CRM list opens a search form where you can find LinkedIn leads by keywords, job title, and company',
       '- Results are imported directly into your list with names, titles, companies, and clean LinkedIn profile URLs',
       '- Duplicate detection is built in — leads already in the list are automatically skipped',
       '- Emma can also find and add leads via natural language: "Find 10 VPs of Engineering and add them to my list"',
       '- Works even if you have not connected a personal LinkedIn account (uses the platform-wide LinkedIn integration)',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
+      'Fix: CRM Lead Enrichment No Longer Overwrites Valid LinkedIn URLs With "Unknown"',
+      '- Running enrichment with "linkedin_url" as an output field was incorrectly overwriting valid LinkedIn URLs already on your leads with the placeholder "Unknown"',
+      '- Root cause: the enrichment code was skipping the existing URL and jumping straight to a name+company search; if nothing was found, the LLM returned "Unknown" which was then saved back',
+      '- Fix: the enricher now always tries the existing URL first (via a quick profile lookup); the people search is now a fallback, not the default',
+      '- Fix: "Unknown", "N/A", and empty values returned by the LLM are now discarded and never written to your leads',
+      'Improvement: CRM Enrichment Now Finds LinkedIn Profiles for Leads With No Company Data',
+      '- Enrichment previously required a company name to run the LinkedIn people search; leads with no company set were silently skipped',
+      '- The enricher now falls back to custom fields (e.g. company_name) and, if still empty, uses the lead\'s business email domain as a search keyword',
+      '- For example, a lead nick@engenerate.ai with no company will now be searched as "Nick Koutsunis engenerate.ai"',
+      '- Personal email domains (Gmail, iCloud, Outlook, etc.) are excluded from this fallback to avoid noisy searches',
     ],
   },
   {
@@ -4987,6 +5029,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-24',
+    changes: [
+      'Fixed: Meta Ads Campaign Metrics Load Reliably When Connected Account Is Removed',
+      '- Scheduled Meta Ads reports (e.g. campaign performance reports) no longer fail with "Meta Ads account is not connected" when the Meta Marketing OAuth connection has been removed',
+      '- The agent now falls back to the configured ad account ID and a centralized access token, matching the approach used by the quick-dashboard metrics tool',
+      '- Affected tools: list Meta ad campaigns, call Meta Ads Insights API, call Meta Marketing API',
+    ],
+  },
+  {
     date: '2026-04-23',
     changes: [
       'Improved: Emma Handles Large Knowledge Bases More Efficiently',
@@ -5002,6 +5053,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: External CRM Sync Settings Now Load Reliably',
       '- Opening the External CRM Sync dialog no longer shows "Failed to load your sync configuration" due to a transient backend error during webhook secret backfill',
       '- The sync configuration is now always returned even if the one-time webhook secret write encounters a temporary issue',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
+      'Improved: CRM Enrichment Cost Is Now Tracked Per User',
+      '- The platform now logs the API cost of each CRM lead enrichment job against the user\'s monthly extra cost usage',
+      '- Admins can see each user\'s extra cost breakdown (enrichment, and future sources) in the Users tab of the Admin Dashboard',
+      '- Cost tracking is non-blocking — enrichment jobs are never delayed or rejected based on cost monitoring',
     ],
   },
   {

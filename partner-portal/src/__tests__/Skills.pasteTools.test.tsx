@@ -39,6 +39,9 @@ jest.mock('../services/skillService', () => ({
     createSkill: jest.fn().mockResolvedValue({}),
     updateSkill: jest.fn().mockResolvedValue({}),
     deleteSkill: jest.fn().mockResolvedValue({}),
+    getSyncStatus: jest.fn().mockResolvedValue({ skills: {}, environment: 'production' }),
+    getSkillAssignments: jest.fn().mockResolvedValue([]),
+    syncSkill: jest.fn().mockResolvedValue({}),
   },
 }));
 
@@ -125,7 +128,6 @@ describe('Skills - Paste Tools Feature', () => {
   });
 
   it('should show recognition feedback as user types tool names', async () => {
-    const user = userEvent.setup();
     renderSkills();
 
     await waitFor(() => {
@@ -144,7 +146,7 @@ describe('Skills - Paste Tools Feature', () => {
 
     // Type comma-separated tool names (2 valid, 1 invalid)
     const textarea = screen.getByPlaceholderText('Paste tool names, one per line or comma-separated...');
-    await user.type(textarea, 'list_gtm_plans, read_gtm_plan, fake_tool');
+    fireEvent.change(textarea, { target: { value: 'list_gtm_plans, read_gtm_plan, fake_tool' } });
 
     // Should show recognition feedback
     await waitFor(() => {
@@ -156,7 +158,6 @@ describe('Skills - Paste Tools Feature', () => {
   });
 
   it('should add recognized tools when confirmed', async () => {
-    const user = userEvent.setup();
     renderSkills();
 
     await waitFor(() => {
@@ -174,7 +175,7 @@ describe('Skills - Paste Tools Feature', () => {
     });
 
     const textarea = screen.getByPlaceholderText('Paste tool names, one per line or comma-separated...');
-    await user.type(textarea, 'list_gtm_plans, create_gtm_plan');
+    fireEvent.change(textarea, { target: { value: 'list_gtm_plans, create_gtm_plan' } });
 
     // Click the Add button
     const addButton = screen.getByText(/Add 2 Tool\(s\)/);
@@ -193,7 +194,6 @@ describe('Skills - Paste Tools Feature', () => {
   });
 
   it('should disable Add button when no tools are recognized', async () => {
-    const user = userEvent.setup();
     renderSkills();
 
     await waitFor(() => {
@@ -211,7 +211,7 @@ describe('Skills - Paste Tools Feature', () => {
     });
 
     const textarea = screen.getByPlaceholderText('Paste tool names, one per line or comma-separated...');
-    await user.type(textarea, 'fake_tool_1, fake_tool_2');
+    fireEvent.change(textarea, { target: { value: 'fake_tool_1, fake_tool_2' } });
 
     const addButton = screen.getByText(/Add 0 Tool\(s\)/);
     expect(addButton).toBeDisabled();
@@ -245,7 +245,6 @@ describe('Skills - Paste Tools Feature', () => {
   });
 
   it('should handle case-insensitive tool name matching', async () => {
-    const user = userEvent.setup();
     renderSkills();
 
     await waitFor(() => {
@@ -263,7 +262,7 @@ describe('Skills - Paste Tools Feature', () => {
     });
 
     const textarea = screen.getByPlaceholderText('Paste tool names, one per line or comma-separated...');
-    await user.type(textarea, 'LIST_GTM_PLANS, SEND_EMAIL');
+    fireEvent.change(textarea, { target: { value: 'LIST_GTM_PLANS, SEND_EMAIL' } });
 
     await waitFor(() => {
       expect(screen.getByText(/2 of 2 tool name\(s\) recognized/)).toBeInTheDocument();
@@ -297,7 +296,6 @@ describe('Skills - Paste Tools Feature', () => {
   });
 
   it('should deduplicate tools when pasting names that are already selected', async () => {
-    const user = userEvent.setup();
     renderSkills();
 
     await waitFor(() => {
@@ -316,7 +314,7 @@ describe('Skills - Paste Tools Feature', () => {
     });
 
     let textarea = screen.getByPlaceholderText('Paste tool names, one per line or comma-separated...');
-    await user.type(textarea, 'list_gtm_plans, create_gtm_plan');
+    fireEvent.change(textarea, { target: { value: 'list_gtm_plans, create_gtm_plan' } });
     fireEvent.click(screen.getByText(/Add 2 Tool\(s\)/));
 
     await waitFor(() => {
@@ -330,7 +328,7 @@ describe('Skills - Paste Tools Feature', () => {
     });
 
     textarea = screen.getByPlaceholderText('Paste tool names, one per line or comma-separated...');
-    await user.type(textarea, 'list_gtm_plans, send_email');
+    fireEvent.change(textarea, { target: { value: 'list_gtm_plans, send_email' } });
 
     // Should show that 2 are recognized but 1 is already selected
     await waitFor(() => {

@@ -29,6 +29,7 @@ import WorkflowRun from './pages/WorkflowRun';
 import WorkflowExecutionDetails from './pages/WorkflowExecutionDetails';
 import Release from './pages/Release';
 import Templates from './pages/Templates';
+import HtmlTemplates from './pages/HtmlTemplates';
 import Skills from './pages/Skills';
 import WorkPlans from './pages/WorkPlans';
 import ScheduleTemplates from './pages/ScheduleTemplates';
@@ -76,6 +77,14 @@ export default function App() {
                       element={
                         <PartnerRoute>
                           <Templates />
+                        </PartnerRoute>
+                      }
+                    />
+                    <Route
+                      path="html-templates"
+                      element={
+                        <PartnerRoute>
+                          <HtmlTemplates />
                         </PartnerRoute>
                       }
                     />

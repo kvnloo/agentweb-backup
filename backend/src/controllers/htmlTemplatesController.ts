@@ -4,11 +4,13 @@ import { extractVariables, parseTemplateArray } from '../utils/templateParser';
 import path from 'path';
 import fs from 'fs';
 import { AuthenticatedRequest } from '../middleware/auth';
+import { randomUUID } from 'node:crypto';
 
 const settingsService = new SettingsService();
 const MAX_HTML_BYTES = 512 * 1024; // 512KB
 
 export interface HtmlTemplate {
+  template_id: string;
   template_name: string;
   type: string[];
   subject?: string;
@@ -26,12 +28,32 @@ export interface HtmlTemplate {
  */
 
 // Helper to determine the target DynamoDB key
-const getSettingKey = (userId: string, isPublic?: boolean) => 
+const getSettingKey = (userId: string, isPublic?: boolean) =>
   isPublic ? 'templates_public' : `templates_${userId}`;
 
-// Helper to check old keys during migration
-const getOldSettingKey = (userId: string, isPublic?: boolean) => 
-  isPublic ? 'email_templates_public' : `email_templates_${userId}`;
+// Keys confirmed to have all template_ids present. Skips the per-request scan
+// once a key is known to be fully migrated (reset on process restart, which is fine).
+const fullyMigratedKeys = new Set<string>();
+
+// Assigns template_id to any template that lacks one and writes back to DynamoDB.
+// After the first passing check the key is recorded and subsequent requests skip
+// entirely, so there is no per-request overhead once migration is complete.
+const backfillTemplateIds = async (
+  templates: HtmlTemplate[],
+  key: string,
+  userEmail: string
+): Promise<HtmlTemplate[]> => {
+  if (fullyMigratedKeys.has(key)) return templates;
+  if (templates.every(t => t.template_id)) {
+    fullyMigratedKeys.add(key);
+    return templates;
+  }
+  const filled = templates.map(t => t.template_id ? t : { ...t, template_id: randomUUID() });
+  await settingsService.setSetting(key, JSON.stringify(filled), key, userEmail);
+  fullyMigratedKeys.add(key);
+  return filled;
+};
+
 
 const getAuthenticatedUser = (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
@@ -53,57 +75,31 @@ export const getTemplates = async (req: Request, res: Response) => {
     const userId = user.userId;
 
     const typeFilter = req.query.type as string;
+    const scopePublicOnly = req.query.scope === 'public';
 
-    const includeLegacyEmail = !typeFilter || typeFilter === 'email';
-    const [newUserSetting, newPublicSetting, oldUserSetting, oldPublicSetting] = await Promise.all([
-      settingsService.getSetting(`templates_${userId}`),
+    const [newUserSetting, newPublicSetting] = await Promise.all([
+      scopePublicOnly ? Promise.resolve(null) : settingsService.getSetting(`templates_${userId}`),
       settingsService.getSetting('templates_public'),
-      includeLegacyEmail ? settingsService.getSetting(`email_templates_${userId}`) : null,
-      includeLegacyEmail ? settingsService.getSetting('email_templates_public') : null,
     ]);
 
-    const newUser = parseTemplateArray(newUserSetting);
-    const newPublic = parseTemplateArray(newPublicSetting);
-    const oldUser: HtmlTemplate[] = parseTemplateArray(oldUserSetting).map((t: HtmlTemplate) =>
+    const rawPublic: HtmlTemplate[] = parseTemplateArray(newPublicSetting).map((t: HtmlTemplate) =>
       t.type ? t : { ...t, type: ['email'] }
     );
-    const oldPublic: HtmlTemplate[] = parseTemplateArray(oldPublicSetting).map((t: HtmlTemplate) =>
-      t.type ? t : { ...t, type: ['email'] }
-    );
+    const newPublic = await backfillTemplateIds(rawPublic, 'templates_public', user.email);
 
-    // Merge logic: new keys win over old keys, user wins over public
-    const seen = new Set<string>();
-    const merged: HtmlTemplate[] = [];
-
-    // Prioritize newest user-specific templates
-    newUser.forEach(t => {
-      seen.add(t.template_name);
-      merged.push(t);
-    });
-
-    // Add new public templates if not overwritten
-    newPublic.forEach(t => {
-      if (!seen.has(t.template_name)) {
-        seen.add(t.template_name);
-        merged.push({ ...t, isPublic: true });
-      }
-    });
-
-    // Fallback to legacy user templates
-    oldUser.forEach(t => {
-      if (!seen.has(t.template_name)) {
-        seen.add(t.template_name);
-        merged.push(t);
-      }
-    });
-
-    // Fallback to legacy public templates
-    oldPublic.forEach(t => {
-      if (!seen.has(t.template_name)) {
-        seen.add(t.template_name);
-        merged.push({ ...t, isPublic: true });
-      }
-    });
+    let merged: HtmlTemplate[];
+    if (scopePublicOnly) {
+      merged = newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true }));
+    } else {
+      const rawUser: HtmlTemplate[] = parseTemplateArray(newUserSetting).map((t: HtmlTemplate) =>
+        t.type ? t : { ...t, type: ['email'] }
+      );
+      const newUser = await backfillTemplateIds(rawUser, `templates_${userId}`, user.email);
+      merged = [
+        ...newUser,
+        ...newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true })),
+      ];
+    }
 
     const result = typeFilter
       ? merged.filter((t: HtmlTemplate) => Array.isArray(t.type) && t.type.includes(typeFilter))
@@ -118,7 +114,7 @@ export const getTemplates = async (req: Request, res: Response) => {
 
 /**
  * SAVE (Create or Update) Template
- * Specifically handles uniqueness checks and renames via original_template_name.
+ * Uses template_id for updates and allows duplicate names.
  */
 export const saveTemplate = async (req: Request, res: Response) => {
   try {
@@ -127,14 +123,14 @@ export const saveTemplate = async (req: Request, res: Response) => {
     const userId = user.userId;
 
     const { 
-      template_name, 
-      type, 
-      html_content, 
-      subject, 
-      variables, 
-      arrayVariables, 
-      isPublic,
-      original_template_name 
+      template_id,
+      template_name,
+      type,
+      html_content,
+      subject,
+      variables,
+      arrayVariables,
+      isPublic
     } = req.body;
 
     // validation
@@ -164,52 +160,68 @@ export const saveTemplate = async (req: Request, res: Response) => {
     const existingSetting = await settingsService.getSetting(targetKey);
     let templates = parseTemplateArray(existingSetting);
 
-    // UNIQNESS & COLLISION CHECK
-    if (original_template_name) {
-      // It's a Rename or existing update. New name must not clash with OTHER templates.
-      if (original_template_name !== template_name) {
-        const conflict = templates.find((t: HtmlTemplate) => t.template_name === template_name);
-        if (conflict) {
-          return res.status(400).json({ error: `A template named "${template_name}" already exists.` });
-        }
-      }
-    } else {
-      // New Create. Must not clash with any existing name.
-      const conflict = templates.find((t: HtmlTemplate) => t.template_name === template_name);
-      if (conflict) {
-        return res.status(400).json({ error: `A template named "${template_name}" already exists.` });
-      }
-    }
-
     const now = new Date().toISOString();
     const isEmail = Array.isArray(type) && type.includes('email');
     let createdAt = now;
     let existingIdx = -1;
 
-    // FIND EXISTING ENTRY FOR UPDATE
-    if (original_template_name) {
-      existingIdx = templates.findIndex((t: any) => t.template_name === original_template_name);
+    if (template_id) {
+      existingIdx = templates.findIndex((t: any) => t.template_id === template_id);
       if (existingIdx >= 0) {
         createdAt = templates[existingIdx].created_at || now;
       } else {
-        // Migration: check legacy keys (email_templates_*)
-        const oldKey = getOldSettingKey(userId, isPublic);
-        const oldSetting = await settingsService.getSetting(oldKey);
-        const oldTemplates = parseTemplateArray(oldSetting);
-        const oldIdx = oldTemplates.findIndex((t: any) => t.template_name === original_template_name);
-        if (oldIdx >= 0) {
-          createdAt = oldTemplates[oldIdx].created_at || now;
+        // Template not found in the target key.
+        // Only admins may move a template between user/public by toggling isPublic.
+        // Non-admins get a plain 404 — they cannot trigger a cross-key move.
+        if (!user.isAdmin) {
+          return res.status(404).json({ error: 'Template not found' });
         }
-      }
-    } else {
-      // Safety check if original_template_name wasn't sent but it exists anyway
-      existingIdx = templates.findIndex((t: any) => t.template_name === template_name);
-      if (existingIdx >= 0) {
-        createdAt = templates[existingIdx].created_at || now;
+        // Admin cross-key move: template lives in the opposite key.
+        // e.g. moving to public → source is templates_{userId}, and vice versa.
+        const sourceKey = getSettingKey(userId, !isPublic);
+        const sourceSetting = await settingsService.getSetting(sourceKey);
+        const sourceTemplates = parseTemplateArray(sourceSetting);
+        const sourceIdx = sourceTemplates.findIndex((t: any) => t.template_id === template_id);
+        if (sourceIdx < 0) {
+          return res.status(404).json({ error: 'Template not found' });
+        }
+        createdAt = sourceTemplates[sourceIdx].created_at || now;
+        // Keep a copy so we can write to target first (avoid data loss on failure).
+        const sourceTemplate = sourceTemplates[sourceIdx];
+
+        // Write sourceTemplate to target first (safety write — ensures the template
+        // exists in the target key even if the process crashes before the final write).
+        // If a stale copy with the same ID already exists in target, overwrite it.
+        const targetIdx = templates.findIndex((t: any) => t.template_id === template_id);
+        if (targetIdx >= 0) {
+          templates[targetIdx] = sourceTemplate;
+          existingIdx = targetIdx;
+        } else {
+          templates.push(sourceTemplate);
+          existingIdx = templates.length - 1;
+        }
+        await settingsService.setSetting(
+          targetKey,
+          JSON.stringify(templates),
+          isPublic ? 'Public templates' : 'User templates',
+          user.email
+        );
+
+        // Now remove from source so the template doesn't exist in both places.
+        sourceTemplates.splice(sourceIdx, 1);
+        await settingsService.setSetting(
+          sourceKey,
+          JSON.stringify(sourceTemplates),
+          isPublic ? 'User templates' : 'Public templates',
+          user.email
+        );
+        // existingIdx is now set — the final write below will correctly overwrite
+        // the sourceTemplate entry with the fully updated newTemplate.
       }
     }
 
     const newTemplate = {
+      template_id: template_id || randomUUID(),
       template_name,
       type,
       ...(isEmail ? { subject: subject || '' } : {}),
@@ -234,26 +246,6 @@ export const saveTemplate = async (req: Request, res: Response) => {
       user.email
     );
 
-    // On any edit, remove the old copy from all other keys (both new and legacy).
-    // This migrates templates out of legacy keys and prevents shadowing when isPublic changes.
-    // Non-admins are scoped to their own keys only — they cannot touch public keys.
-    if (original_template_name) {
-      const nameToRemove = original_template_name;
-      const candidateKeys = user.isAdmin
-        ? [`templates_${userId}`, 'templates_public', `email_templates_${userId}`, 'email_templates_public']
-        : [`templates_${userId}`, `email_templates_${userId}`];
-      const otherKeys = candidateKeys.filter(k => k !== targetKey);
-
-      await Promise.all(otherKeys.map(async (key) => {
-        const setting = await settingsService.getSetting(key);
-        const list = parseTemplateArray(setting);
-        const filtered = list.filter((t: HtmlTemplate) => t.template_name !== nameToRemove);
-        if (filtered.length !== list.length) {
-          await settingsService.setSetting(key, JSON.stringify(filtered), key, user.email || 'system');
-        }
-      }));
-    }
-
     res.json({ success: true, message: 'Template saved successfully', template: newTemplate });
   } catch (error) {
     console.error('[HTML TEMPLATES] Error saving template:', error);
@@ -270,30 +262,20 @@ export const deleteTemplate = async (req: Request, res: Response) => {
     if (!user) return;
     const userId = user.userId;
 
-    const { templateName } = req.params;
+    const { templateId } = req.params;
     const isPublic = req.query.isPublic === 'true';
 
     if (isPublic && !user.isAdmin) {
       return res.status(403).json({ error: 'Only admins can delete public templates' });
     }
 
-    // Admins can delete from all keys; regular users are scoped to their own keys only
-    const allKeys = user.isAdmin
-      ? [`templates_${userId}`, 'templates_public', `email_templates_${userId}`, 'email_templates_public']
-      : [`templates_${userId}`, `email_templates_${userId}`];
+    const key = getSettingKey(userId, isPublic);
+    const setting = await settingsService.getSetting(key);
+    const list = parseTemplateArray(setting);
+    const filtered = list.filter((t: HtmlTemplate) => t.template_id !== templateId);
 
-    const results = await Promise.all(allKeys.map(async (key) => {
-      const setting = await settingsService.getSetting(key);
-      const list = parseTemplateArray(setting);
-      const filtered = list.filter((t: HtmlTemplate) => t.template_name !== templateName);
-      if (filtered.length !== list.length) {
-        await settingsService.setSetting(key, JSON.stringify(filtered), key, user.email || 'system');
-        return true;
-      }
-      return false;
-    }));
-
-    if (results.some(Boolean)) {
+    if (filtered.length !== list.length) {
+      await settingsService.setSetting(key, JSON.stringify(filtered), key, user.email || 'system');
       return res.json({ success: true, message: 'Template deleted' });
     }
 
@@ -310,34 +292,30 @@ export const deleteTemplate = async (req: Request, res: Response) => {
  */
 export const getPreviewTemplate = async (req: Request, res: Response) => {
   try {
-    const { templateName } = req.params;
+    const { templateId } = req.params;
     const user = getAuthenticatedUser(req, res);
     if (!user) return;
     const userId = user.userId;
 
-    // 1. Try DynamoDB (New + Old keys)
-    const [userNew, pubNew, userOld, pubOld] = await Promise.all([
+    // 1. Try DynamoDB (New keys only)
+    const [userNew, pubNew] = await Promise.all([
       settingsService.getSetting(`templates_${userId}`),
       settingsService.getSetting('templates_public'),
-      settingsService.getSetting(`email_templates_${userId}`),
-      settingsService.getSetting('email_templates_public'),
     ]);
 
     const all = [
       ...parseTemplateArray(userNew),
       ...parseTemplateArray(pubNew),
-      ...parseTemplateArray(userOld),
-      ...parseTemplateArray(pubOld),
     ];
 
-    const found = all.find(t => t.template_name === templateName);
+    const found = all.find(t => t.template_id === templateId);
     if (found) {
       res.setHeader('Content-Type', 'text/html');
       return res.send(found.html_content);
     }
 
     // 2. Legacy Filesystem Fallback
-    if (templateName === 'default-v2' || templateName === 'landing-page-v2') {
+    if (templateId === 'default-v2' || templateId === 'landing-page-v2') {
       try {
         const filePath = path.join(__dirname, '..', 'templates', 'landing-page-v2.html');
         if (fs.existsSync(filePath)) {

@@ -241,6 +241,17 @@ export interface User {
     totalCost: number;
   }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
+  extraCostUsage?: {
+    month: string;      // "YYYY-MM" format for current tracking month
+    totalCost: number;  // cumulative extra API cost in USD this month (enrichment, image gen, etc.)
+    breakdown: Record<string, number>; // cost by source key (e.g. { enrichment: 4.5, image_gen: 1.2 })
+    resetDate: string;  // ISO date of next monthly reset
+  };
+  extraCostUsageHistory?: Array<{
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+  }>;                   // Up to 24 past months, oldest first
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end

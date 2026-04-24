@@ -21,10 +21,10 @@ router.get('/', authenticateToken, getTemplates);
 router.post('/', authenticateToken, saveTemplate);
 
 // Delete a template (requires isPublic query param for public ones)
-router.delete('/:templateName', authenticateToken, deleteTemplate);
+router.delete('/:templateId', authenticateToken, deleteTemplate);
 
 // Preview a template (legacy path support included)
-// This is used for real-time visualization of templates by name.
-router.get('/preview/:templateName', authenticateToken, getPreviewTemplate);
+// This is used for real-time visualization of templates by ID (or default-v2/landing-page-v2).
+router.get('/preview/:templateId', authenticateToken, getPreviewTemplate);
 
 export default router;

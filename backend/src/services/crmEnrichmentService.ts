@@ -1,6 +1,10 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
+import { incrementExtraCostUsage } from './tokenUsageService';
 import { v4 as uuidv4 } from 'uuid';
+
+// Estimated cost per enriched lead in USD (Google Custom Search dominates at $0.005/query)
+const ENRICHMENT_COST_PER_LEAD = 0.0052;
 
 // Callback type for emitting Socket.IO events.
 // In the main process this uses the real `io` instance directly;
@@ -327,20 +331,25 @@ export class CrmEnrichmentService {
         const isValidLinkedInUrl = linkedinUrl && /\/in\//.test(linkedinUrl);
         let profileData: any = null;
 
-        // Skip direct URL lookup when enriching linkedin fields — the URL itself may be wrong/outdated
-        if (isValidLinkedInUrl && !isEnrichingLinkedin) {
+        // When enriching the linkedin field itself, still try the existing URL first —
+        // it's almost always correct and avoids a search-people round-trip.
+        if (isValidLinkedInUrl) {
           const result = await agentModeService.linkedinOutreach(spec.userId, {
             action: 'get-profile',
             account_id: linkedInAccountId,
             profile_url: linkedinUrl,
           });
           if (result?.success) profileData = result.data;
-        } else {
         }
 
         if (!profileData) {
-          const name = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
-          const company = String(lead.company || '').trim();
+          const cf = (lead.customFields || {}) as Record<string, string>;
+          const firstName = String(lead.firstName || cf.first_name || '').trim();
+          const lastName = String(lead.lastName || cf.last_name || '').trim();
+          const name = `${firstName} ${lastName}`.trim();
+          const emailDomain = lead.email ? lead.email.split('@')[1] || '' : '';
+          const domainCompany = emailDomain && !CrmEnrichmentService.isPersonalEmailDomain(lead.email || '') ? emailDomain : '';
+          const company = String(lead.company || cf.company_name || domainCompany || '').trim();
           if (name && company) {
             const searchResult = await agentModeService.linkedinOutreach(spec.userId, {
               action: 'search-people',
@@ -375,7 +384,9 @@ export class CrmEnrichmentService {
           if (profileUrl && isEnrichingLinkedin) {
             linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
           }
-        } else {
+        } else if (isEnrichingLinkedin && isValidLinkedInUrl) {
+          // Unipile lookup failed but we already have a valid URL — surface it so the LLM doesn't guess
+          linkedinContext = `\n\nResolved LinkedIn profile URL: ${linkedinUrl}`;
         }
       } catch (err: any) {
         console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);
@@ -386,11 +397,15 @@ export class CrmEnrichmentService {
 
     // 3. Build lead context
     const leadContext: Record<string, string> = {};
-    const name = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+    const cfCtx = (lead.customFields || {}) as Record<string, string>;
+    const ctxFirstName = String(lead.firstName || cfCtx.first_name || '').trim();
+    const ctxLastName = String(lead.lastName || cfCtx.last_name || '').trim();
+    const name = `${ctxFirstName} ${ctxLastName}`.trim();
     if (name) leadContext.name = name;
     if (lead.email) leadContext.email = String(lead.email).trim();
-    if (lead.title) leadContext.title = String(lead.title).trim();
-    if (lead.company) leadContext.company = String(lead.company).trim();
+    if (lead.title) leadContext.title = String(lead.title || cfCtx.title || '').trim();
+    if (leadContext.title === '') delete leadContext.title;
+    if (lead.company) leadContext.company = String(lead.company || cfCtx.company_name || '').trim();
     // Exclude existing linkedin URL when enriching linkedin fields — it may be wrong/outdated
     if (lead.linkedin && !isEnrichingLinkedin) leadContext.linkedin = String(lead.linkedin).trim();
     // Include existing custom fields for context
@@ -536,10 +551,12 @@ Valid example:
 
     for (const [key, value] of Object.entries(fields)) {
       const mapped = CrmEnrichmentService.STANDARD_FIELD_MAP[key.toLowerCase()];
+      // Never write placeholder values back to any field
+      const isPlaceholder = !value || value.toLowerCase() === 'unknown' || value.toLowerCase() === 'n/a';
       if (mapped) {
-        standardUpdates[mapped] = value;
+        if (!isPlaceholder) standardUpdates[mapped] = value;
       } else {
-        customUpdates[key] = value;
+        if (!isPlaceholder) customUpdates[key] = value;
       }
     }
 
@@ -728,6 +745,13 @@ Valid example:
         emit(socketId, completeEvent, completionPayload);
       }
       emit(userRoom, completeEvent, completionPayload);
+    }
+
+    // Record extra cost for this job (fire-and-forget — never block the response)
+    if (totalProcessedCount > 0) {
+      incrementExtraCostUsage(spec.userId, {
+        enrichment: Math.round(totalProcessedCount * ENRICHMENT_COST_PER_LEAD * 10000) / 10000,
+      }).catch((err) => console.error('[CrmEnrichment] Failed to record extra cost:', err));
     }
 
     return {
