@@ -19909,13 +19909,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
     }
 
-    // For get-profile only, fall back to site-wide Unipile enrichment accounts when the
-    // user has no personally-connected account. Restricted to get-profile to prevent
-    // the shared account from being used for search quotas or discoverable via list actions.
-    if (!account_id && action === 'get-profile') {
+    // For read-only actions (get-profile, search-people), fall back to site-wide Unipile
+    // accounts when the user has no personally-connected account.
+    // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
+    // they already block non-owned accounts above.
+    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people'];
+    if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
       account_id = await linkedInOutreachService.resolveAccountId(userId);
       if (account_id) {
-        console.log(`[AgentMode] linkedinOutreach: using site-wide enrichment account for get-profile`);
+        console.log(`[AgentMode] linkedinOutreach: using site-wide account for ${action}`);
       }
     }
 
@@ -20573,6 +20575,108 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async listAllClients(callerUserId: string): Promise<any> {
     const { listAllClients } = await import('./clientHealthService');
     return listAllClients(callerUserId);
+  }
+
+  async importLeadsFromSearch(userId: string, args: {
+    listId: string;
+    keywords?: string;
+    search_url?: string;
+    title?: string;
+    company?: string;
+    limit?: number;
+    auto_enrich?: boolean;
+  }): Promise<any> {
+    const { listId, keywords, search_url, title, company, limit = 20, auto_enrich = false } = args;
+
+    if (!listId) return { success: false, error: 'listId is required' };
+    if (!keywords && !search_url && !title && !company) {
+      return { success: false, error: 'At least one search filter is required: keywords, search_url, title, or company' };
+    }
+
+    // Resolve account: user's own or platform-wide fallback
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return {
+        success: false,
+        error: 'No LinkedIn account is available for lead discovery. Ask your admin to configure platform-wide outreach accounts, or connect your own LinkedIn account in Settings → Connected Accounts.',
+      };
+    }
+
+    // Search for people
+    const searchResult = await linkedInOutreachService.searchPeople(accountId, {
+      keywords,
+      url: search_url,
+      title,
+      company,
+    });
+
+    if (!searchResult?.items?.length) {
+      return { success: true, imported: 0, skipped: 0, message: 'No results found for the given search criteria.' };
+    }
+
+    // Slice to requested limit
+    const itemsToImport = searchResult.items.slice(0, limit);
+
+    // Map Unipile search result fields → CRM lead fields.
+    // Search results use a different shape than full profiles:
+    //   name (full), public_identifier (slug), profile_url (messy with miniProfileUrn),
+    //   headline, location — NO first_name/last_name, NO clean public_profile_url.
+    const leads = itemsToImport.map((item: any) => {
+      const lead: any = {};
+
+      // Split full name into first/last
+      if (item.name) {
+        const parts = (item.name as string).trim().split(/\s+/);
+        lead.firstName = parts[0] || '';
+        lead.lastName = parts.slice(1).join(' ') || '';
+      } else {
+        if (item.first_name) lead.firstName = item.first_name;
+        if (item.last_name) lead.lastName = item.last_name;
+      }
+
+      // Build clean LinkedIn URL from slug — avoids the messy miniProfileUrn query string
+      if (item.public_identifier) {
+        lead.linkedin = `https://www.linkedin.com/in/${item.public_identifier}`;
+      } else if (item.profile_url) {
+        // Strip the miniProfileUrn garbage if present
+        const baseUrl = (item.profile_url as string).split('?')[0];
+        lead.linkedin = baseUrl;
+      }
+
+      // Title from headline or current_role
+      if (item.headline) lead.title = item.headline;
+      if (item.work_experience?.length) {
+        const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+        if (current?.company && !lead.company) lead.company = current.company;
+        if (current?.position && !lead.title) lead.title = current.position;
+      }
+
+      if (item.location) lead.notes = `Location: ${item.location}`;
+
+      return lead;
+    });
+
+    // Bulk-import into CRM list
+    const { crmDb } = await import('./db');
+    const { default: crmRouter } = await import('../routes/crm').catch(() => ({ default: null }));
+
+    // Call batchCreateLeads directly (same path as the bulk-import endpoint)
+    const result = await crmDb.batchCreateLeads(listId, leads);
+
+    const response: any = {
+      success: true,
+      imported: result.newCount,
+      skipped: result.mergedCount,
+      errors: result.errors,
+      total: itemsToImport.length,
+      cursor: searchResult.cursor,
+    };
+
+    if (auto_enrich && result.newCount > 0) {
+      response.enrich_note = 'auto_enrich is not yet supported — run the Enrich with Web action on the list to enrich imported leads.';
+    }
+
+    return response;
   }
 }
 
