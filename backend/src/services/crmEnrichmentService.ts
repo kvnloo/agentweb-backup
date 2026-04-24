@@ -343,7 +343,9 @@ export class CrmEnrichmentService {
           const firstName = String(lead.firstName || cf.first_name || '').trim();
           const lastName = String(lead.lastName || cf.last_name || '').trim();
           const name = `${firstName} ${lastName}`.trim();
-          const company = String(lead.company || cf.company_name || '').trim();
+          const emailDomain = lead.email ? lead.email.split('@')[1] || '' : '';
+          const domainCompany = emailDomain && !CrmEnrichmentService.isPersonalEmailDomain(lead.email || '') ? emailDomain : '';
+          const company = String(lead.company || cf.company_name || domainCompany || '').trim();
           if (name && company) {
             const searchResult = await agentModeService.linkedinOutreach(spec.userId, {
               action: 'search-people',
