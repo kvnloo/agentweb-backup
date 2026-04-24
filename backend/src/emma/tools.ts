@@ -203,7 +203,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         account_id: {
           type: 'string',
-          description: 'The Unipile account ID for the LinkedIn connection. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
+          description: 'The Unipile account ID for the LinkedIn connection. Optional for search-people and get-profile — the system will automatically use a platform-wide account if the user has no personal account connected. For write actions (send-invite, send-message), must be the user\'s own account. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
         },
         profile_url: {
           type: 'string',
@@ -258,7 +258,7 @@ For target person identification (send-invite, send-message, get-profile, update
           description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
         }
       },
-      required: ['action', 'account_id']
+      required: ['action']
     }
   },
   execute: async (args: any, context: any) => {
@@ -6475,5 +6475,63 @@ emmaToolRegistry.register({
     } catch {
       return { error: `Failed to decrypt credentials for "${match.website}". The saved credentials may be corrupted.` };
     }
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'import_leads_from_search',
+  definition: {
+    name: 'import_leads_from_search',
+    description: `Search LinkedIn for people and import the results directly into a CRM lead list.
+Uses the user's connected LinkedIn account if available, otherwise falls back to platform-wide outreach accounts — so this works even without a personal LinkedIn connection.
+
+Use this when the user wants to:
+- Find leads matching a job title, company, or keyword
+- Populate a CRM list with discovered prospects
+- Discover new contacts to reach out to
+
+After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID to import leads into. Required.'
+        },
+        keywords: {
+          type: 'string',
+          description: 'Free-text search keywords (e.g. "software engineer San Francisco").'
+        },
+        title: {
+          type: 'string',
+          description: 'Job title filter (e.g. "CTO", "VP Sales"). Combined with keywords/company for targeted search.'
+        },
+        company: {
+          type: 'string',
+          description: 'Company name filter. Combined with title/keywords for targeted search.'
+        },
+        search_url: {
+          type: 'string',
+          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to import. Defaults to 20, max 100.'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) throw new Error('Authentication required');
+    const limit = Math.min(args.limit ?? 20, 100);
+    return agentModeService.importLeadsFromSearch(context.userId, {
+      listId: args.list_id,
+      keywords: args.keywords,
+      search_url: args.search_url,
+      title: args.title,
+      company: args.company,
+      limit,
+    });
   }
 });

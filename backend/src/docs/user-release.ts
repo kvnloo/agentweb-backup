@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-24',
+    changes: [
+      'New: Find Leads from LinkedIn — AI-Powered Lead Discovery in CRM',
+      '- A new "Find Leads" button in any CRM list opens a search form where you can find LinkedIn leads by keywords, job title, and company',
+      '- Results are imported directly into your list with names, titles, companies, and clean LinkedIn profile URLs',
+      '- Duplicate detection is built in — leads already in the list are automatically skipped',
+      '- Emma can also find and add leads via natural language: "Find 10 VPs of Engineering and add them to my list"',
+      '- Works even if you have not connected a personal LinkedIn account (uses the platform-wide LinkedIn integration)',
+    ],
+  },
+  {
     date: '2026-04-23',
     changes: [
       'Fix: Emma Now Installs All Skills in a Single Call Instead of Multiple Separate Calls',
