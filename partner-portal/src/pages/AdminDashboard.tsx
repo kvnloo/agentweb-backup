@@ -4349,7 +4349,7 @@ export default function AdminDashboard() {
                                         const currentMonth = new Date().toISOString().slice(0, 7);
                                         const extraUsage = user.extraCostUsage?.month === currentMonth ? user.extraCostUsage : null;
                                         const totalCost = extraUsage?.totalCost ?? 0;
-                                        const breakdown = extraUsage?.breakdown ?? {};
+                                        const breakdown = (extraUsage?.breakdown ?? {}) as Record<string, number>;
                                         const breakdownEntries = Object.entries(breakdown).filter(([, v]) => v > 0);
                                         return (
                                           <>
