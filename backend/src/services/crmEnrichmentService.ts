@@ -1,6 +1,10 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
+import { incrementExtraCostUsage } from './tokenUsageService';
 import { v4 as uuidv4 } from 'uuid';
+
+// Estimated cost per enriched lead in USD (Google Custom Search dominates at $0.005/query)
+const ENRICHMENT_COST_PER_LEAD = 0.0052;
 
 // Callback type for emitting Socket.IO events.
 // In the main process this uses the real `io` instance directly;
@@ -741,6 +745,13 @@ Valid example:
         emit(socketId, completeEvent, completionPayload);
       }
       emit(userRoom, completeEvent, completionPayload);
+    }
+
+    // Record extra cost for this job (fire-and-forget — never block the response)
+    if (totalProcessedCount > 0) {
+      incrementExtraCostUsage(spec.userId, {
+        enrichment: Math.round(totalProcessedCount * ENRICHMENT_COST_PER_LEAD * 10000) / 10000,
+      }).catch((err) => console.error('[CrmEnrichment] Failed to record extra cost:', err));
     }
 
     return {
