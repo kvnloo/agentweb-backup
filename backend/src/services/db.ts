@@ -125,6 +125,22 @@ export interface User {
   dripUnsubscribed?: boolean;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
+  /**
+   * Onboarding v2 Phase 1 — brand build async status.
+   * Set to 'building' when the onboarding flow kicks off brand extraction,
+   * flipped to 'ready' when `brandGuidelines` is next written, or 'failed'
+   * on timeout/error. The UI renders a status pill based on this value so
+   * latency-hiding question screens (Phase 2) can proceed in parallel.
+   */
+  brandBuildStatus?: "building" | "ready" | "failed";
+  /** ISO timestamp when the async brand build was kicked off. */
+  brandBuildStartedAt?: string;
+  /** ISO timestamp when the build terminated (ready or failed). */
+  brandBuildCompletedAt?: string;
+  /** Wall-clock duration in ms from start to completion. Used for p50/p99 metrics. */
+  brandBuildDurationMs?: number;
+  /** Error message if `brandBuildStatus === 'failed'`. Surfaced to the graceful-fallback UI. */
+  brandBuildError?: string;
   brandGuidelines?: {
     brandData: {
       brandName: string;

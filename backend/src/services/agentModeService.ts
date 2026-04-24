@@ -10,6 +10,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
+import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
@@ -8464,6 +8465,19 @@ Format the response as JSON with this structure:
         await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedGuidelines });
       } else {
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
+      }
+
+      // Onboarding v2 Phase 1: flip brand-build status to ready if we were
+      // building. Best-effort; wrapped in try/catch so metrics failures don't
+      // break the tool-call response path.
+      try {
+        const readyPatch = buildReadyPatch(user as any);
+        if (readyPatch) {
+          await userDb.updateUser(userId, readyPatch);
+          logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+        }
+      } catch (e) {
+        console.warn("[brandBuild] ready-patch failed (agentMode path)", e);
       }
 
       const updatedFields = [];
