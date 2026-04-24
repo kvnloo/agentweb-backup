@@ -5047,6 +5047,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-24',
+    changes: [
+      'Improved: CRM Enrichment Cost Is Now Tracked Per User',
+      '- The platform now logs the API cost of each CRM lead enrichment job against the user\'s monthly extra cost usage',
+      '- Admins can see each user\'s extra cost breakdown (enrichment, and future sources) in the Users tab of the Admin Dashboard',
+      '- Cost tracking is non-blocking — enrichment jobs are never delayed or rejected based on cost monitoring',
+    ],
+  },
+  {
     date: '2026-04-22',
     changes: [
       'Improved: Chat History Now Shows Session Summaries',
