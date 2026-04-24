@@ -246,12 +246,16 @@ async function deriveStripeState(
   );
   const sub = sorted[0];
 
-  // Derive tier from the price. If canceled, force Free (matches admin logic).
+  // Derive tier from the price. Mirrors reconcileAllStripeUsers at
+  // stripeService.ts:840-868 — only overwrite subscriptionType when the
+  // price maps to a known tier. Do NOT force-Free on canceled/incomplete_expired:
+  // a canceled sub still has a price on it, so the tier reflects the user's
+  // grandfathered access until an explicit webhook downgrades them. The
+  // diffFields() helper below already skips subscriptionType when derivedType
+  // is null (the `!== null` guard), so leaving the logic absent here is
+  // strictly parity with the canonical admin-reconcile behavior.
   const priceId = sub.items?.data?.[0]?.price?.id;
-  let subscriptionType = deriveSubscriptionTypeFromPriceId(priceId);
-  if (sub.status === 'canceled' || sub.status === 'incomplete_expired') {
-    subscriptionType = 'Free';
-  }
+  const subscriptionType = deriveSubscriptionTypeFromPriceId(priceId);
 
   // Payment method: prefer subscription's default; fall back to listing
   // customer's payment methods (covers users who rely on the default on
@@ -343,6 +347,7 @@ async function main() {
   let wouldUpdate = 0;
   let updated = 0;
   let errors = 0;
+  let stripeNotFound = 0;
   let noStripeSub = 0;
 
   for (let i = 0; i < users.length; i++) {
@@ -392,9 +397,18 @@ async function main() {
         `[reconcile] UPDATED email=${user.email} cust=${user.stripe_customer_id} :: ${diffStr}`
       );
     } catch (err: any) {
-      errors++;
+      const msg = err?.message || String(err);
+      // Stripe's "No such customer" is a common, expected condition when user
+      // rows carry prod customer IDs in the Dev table or when a Stripe
+      // customer was deleted. Bucket it separately so the operator can tell
+      // it apart from real errors.
+      if (/no such customer/i.test(msg)) {
+        stripeNotFound++;
+      } else {
+        errors++;
+      }
       console.error(
-        `[reconcile] ERROR email=${user.email} cust=${user.stripe_customer_id} :: ${err.message || err}`
+        `[reconcile] ERROR email=${user.email} cust=${user.stripe_customer_id} :: ${msg}`
       );
     }
   }
@@ -410,7 +424,8 @@ async function main() {
   } else {
     console.log(`  would update (dry-run):           ${wouldUpdate}`);
   }
-  console.log(`  errors:                           ${errors}`);
+  console.log(`  stripe "no such customer":        ${stripeNotFound}`);
+  console.log(`  errors (other):                   ${errors}`);
   console.log('');
   console.log(
     `[reconcile] done. mode=${APPLY ? 'APPLY' : 'DRY-RUN'} env=${ENV_MODE}`
