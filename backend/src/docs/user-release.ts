@@ -5002,6 +5002,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-24',
+    changes: [
+      'Fixed: Meta Ads Campaign Metrics Load Reliably When Connected Account Is Removed',
+      '- Scheduled Meta Ads reports (e.g. campaign performance reports) no longer fail with "Meta Ads account is not connected" when the Meta Marketing OAuth connection has been removed',
+      '- The agent now falls back to the configured ad account ID and a centralized access token, matching the approach used by the quick-dashboard metrics tool',
+      '- Affected tools: list Meta ad campaigns, call Meta Ads Insights API, call Meta Marketing API',
+    ],
+  },
+  {
     date: '2026-04-23',
     changes: [
       'Improved: Emma Handles Large Knowledge Bases More Efficiently',
