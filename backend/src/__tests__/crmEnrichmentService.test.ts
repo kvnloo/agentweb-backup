@@ -346,6 +346,142 @@ describe('CrmEnrichmentService', () => {
       );
     });
 
+    it('should preserve existing linkedin URL when Unipile returns nothing and LLM says Unknown', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({
+        leadId: 'lead1',
+        linkedin: 'https://www.linkedin.com/in/existing-url',
+        firstName: 'Jane',
+        lastName: 'Doe',
+        company: 'Acme',
+      })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
+
+      // Unipile lookup fails — no profile found
+      mockAgentModeService.linkedinOutreach.mockResolvedValue({ success: false, data: null });
+
+      // LLM returns Unknown (no LinkedIn data available)
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'Unknown' }));
+
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find the personal LinkedIn profile URL for {{firstName}} {{lastName}} at {{company}}',
+        outputFields: ['linkedin_url'],
+        sources: ['linkedin'],
+        sourcesPerField: { linkedin_url: ['linkedin'] },
+        linkedinSearchTemplate: '{{firstName}} {{lastName}} {{company}}',
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+
+      // updateLead must NOT have written "Unknown" to the linkedin field
+      const updateCall = mockCrmDb.updateLead.mock.calls[0];
+      const updates = updateCall[2];
+      expect(updates.linkedin).toBeUndefined();
+    });
+
+    it('should use existing valid linkedin URL as primary source when isEnrichingLinkedin', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({
+        leadId: 'lead1',
+        linkedin: 'https://www.linkedin.com/in/existing-url',
+        firstName: 'Jane',
+        lastName: 'Doe',
+        company: 'Acme',
+      })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
+
+      // Unipile returns profile data from the existing URL lookup
+      mockAgentModeService.linkedinOutreach
+        .mockResolvedValue({ success: true, data: { public_identifier: 'existing-url', headline: 'CTO' } });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/existing-url' }));
+
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find the personal LinkedIn profile URL for {{firstName}} {{lastName}} at {{company}}',
+        outputFields: ['linkedin_url'],
+        sources: ['linkedin'],
+        sourcesPerField: { linkedin_url: ['linkedin'] },
+        linkedinSearchTemplate: '{{firstName}} {{lastName}} {{company}}',
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+
+      // First linkedinOutreach call should be get-profile with the existing URL (not search-people)
+      expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+        'user1',
+        expect.objectContaining({ action: 'get-profile', profile_url: 'https://www.linkedin.com/in/existing-url' })
+      );
+
+      // The valid URL should be written back
+      const updateCall = mockCrmDb.updateLead.mock.calls[0];
+      const updates = updateCall[2];
+      expect(updates.linkedin).toBe('https://www.linkedin.com/in/existing-url');
+    });
+
+    it('should use email domain as company fallback for linkedin search when no company set', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({
+        leadId: 'lead1',
+        company: '',
+        firstName: '',
+        lastName: '',
+        email: 'nick@engenerate.ai',
+        customFields: { first_name: 'Nicholas', last_name: 'Koutsunis' },
+      })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+      mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
+
+      // search-people finds a result
+      mockAgentModeService.linkedinOutreach
+        .mockResolvedValueOnce({
+          success: true,
+          data: { items: [{ provider_id: 'p123', public_identifier: 'nicholas-koutsunis' }] },
+        })
+        .mockResolvedValueOnce({
+          success: true,
+          data: { public_identifier: 'nicholas-koutsunis', headline: 'Founder' },
+        });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/nicholas-koutsunis' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find linkedin',
+        outputFields: ['linkedin_url'],
+        sources: ['linkedin'],
+        sourcesPerField: { linkedin_url: ['linkedin'] },
+        linkedinSearchTemplate: '',
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+
+      // search-people should have been called with name + email domain
+      expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+        'user1',
+        expect.objectContaining({ action: 'search-people', keywords: 'Nicholas Koutsunis engenerate.ai' })
+      );
+    });
+
     it('should feed both web_search and linkedin data to Gemini with combined sources', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       const leads = [createLead({ leadId: 'lead1' })];
@@ -591,6 +727,38 @@ describe('CrmEnrichmentService', () => {
       const { standardUpdates, customUpdates } = splitFields({});
       expect(standardUpdates).toEqual({});
       expect(customUpdates).toEqual({});
+    });
+
+    it('should drop "Unknown" values from both standard and custom updates', () => {
+      const { standardUpdates, customUpdates } = splitFields({
+        linkedin_url: 'Unknown',
+        company: 'Unknown',
+        employee_count: 'Unknown',
+        title: 'CEO',
+      });
+      expect(standardUpdates).toEqual({ title: 'CEO' });
+      expect(customUpdates).toEqual({});
+    });
+
+    it('should drop empty and "n/a" values', () => {
+      const { standardUpdates, customUpdates } = splitFields({
+        linkedin_url: '',
+        company: 'n/a',
+        funding_status: 'N/A',
+        title: 'CTO',
+      });
+      expect(standardUpdates).toEqual({ title: 'CTO' });
+      expect(customUpdates).toEqual({});
+    });
+
+    it('should keep real values even when other fields are Unknown', () => {
+      const { standardUpdates, customUpdates } = splitFields({
+        linkedin_url: 'https://linkedin.com/in/jane',
+        company: 'Unknown',
+        employee_count: '11-50',
+      });
+      expect(standardUpdates).toEqual({ linkedin: 'https://linkedin.com/in/jane' });
+      expect(customUpdates).toEqual({ employee_count: '11-50' });
     });
   });
 

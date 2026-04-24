@@ -20,6 +20,21 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-24',
+    changes: [
+      'Fix: CRM Lead Enrichment No Longer Overwrites Valid LinkedIn URLs With "Unknown"',
+      '- Running enrichment with "linkedin_url" as an output field was incorrectly overwriting valid LinkedIn URLs already on your leads with the placeholder "Unknown"',
+      '- Root cause: the enrichment code was skipping the existing URL and jumping straight to a name+company search; if nothing was found, the LLM returned "Unknown" which was then saved back',
+      '- Fix: the enricher now always tries the existing URL first (via a quick profile lookup); the people search is now a fallback, not the default',
+      '- Fix: "Unknown", "N/A", and empty values returned by the LLM are now discarded and never written to your leads',
+      'Improvement: CRM Enrichment Now Finds LinkedIn Profiles for Leads With No Company Data',
+      '- Enrichment previously required a company name to run the LinkedIn people search; leads with no company set were silently skipped',
+      '- The enricher now falls back to custom fields (e.g. company_name) and, if still empty, uses the lead\'s business email domain as a search keyword',
+      '- For example, a lead nick@engenerate.ai with no company will now be searched as "Nick Koutsunis engenerate.ai"',
+      '- Personal email domains (Gmail, iCloud, Outlook, etc.) are excluded from this fallback to avoid noisy searches',
+    ],
+  },
+  {
     date: '2026-04-23',
     changes: [
       'Fix: Emma Now Installs All Skills in a Single Call Instead of Multiple Separate Calls',
