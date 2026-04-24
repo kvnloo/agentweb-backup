@@ -3559,3 +3559,47 @@ The Goaldenhour ad account is now under our (AgentWeb's) control. **We granted k
 ### Long-Term Fix
 
 Pursue **transfer of ownership** of the Goaldenhour ad account to Goaldenhour itself via Facebook Business Manager. Once Goaldenhour owns the account, karthy (as an admin of that business) will be able to grant `ads_management` and `ads_read` access through normal OAuth without needing `business_management`. No code changes required for this path either.
+
+## Google OAuth App Review — Gmail Connected Accounts (2026-04-24)
+
+### Status
+
+**App review submitted / in progress.** Review typically takes 4–6 weeks for restricted scopes.
+
+### Google Cloud Project
+
+- **Project Name:** AgentWeb
+- **Project ID:** `gen-lang-client-0725723168`
+- **Project Number:** `606140610214`
+- **OAuth Client ID:** `606140610214-tqm4fkgp6o7m4e5aq4n13n09ijqfhaij.apps.googleusercontent.com`
+- **Credentials stored in:** AWS Secrets Manager at `prod/AgentWeb/Google/Gmail`
+
+### Scopes Under Review
+
+| Scope | Classification | Purpose |
+|---|---|---|
+| `https://www.googleapis.com/auth/gmail.readonly` | **Restricted** | Read user's Gmail inbox for AI-assisted email management |
+| `https://www.googleapis.com/auth/gmail.send` | **Restricted** | Send emails on the user's behalf in AI outreach workflows |
+| `https://www.googleapis.com/auth/calendar.readonly` | **Sensitive** | Read calendar to avoid scheduling conflicts |
+
+`userinfo.email` and `userinfo.profile` are non-sensitive and do not require review.
+
+### How to Submit / Re-Submit
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com) → project **AgentWeb** (`gen-lang-client-0725723168`)
+2. Navigate to **APIs & Services → OAuth consent screen**
+3. Ensure app name, support email, homepage (`https://app.agentweb.pro`), privacy policy, and ToS URLs are filled in
+4. Click **"Submit for Verification"**
+5. Provide scope justifications:
+   - **`gmail.readonly`**: Read inbox to surface relevant emails in the AgentWeb AI assistant for outreach management
+   - **`gmail.send`**: Send emails on behalf of users as part of AI-assisted outreach workflows (user reviews before sending)
+   - **`calendar.readonly`**: Read calendar to help schedule meetings and avoid conflicts
+6. Record a **demo video** (required for restricted scopes): show the OAuth flow and how each scope is used in the UI
+7. Submit. Review takes **4–6 weeks** for restricted scopes.
+
+### Notes
+
+- While pending review, only users listed under **Test users** on the consent screen can authorize the Gmail connection
+- The privacy policy must explicitly state Gmail data is not shared or sold
+- Redirect URI registered in the OAuth client: `https://api.agentweb.pro/api/oauth/gmail/callback`
+- YouTube connected accounts reuse the same Google Cloud project and OAuth client (`prod/AgentWeb/Google/Gmail`)
