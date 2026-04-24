@@ -141,6 +141,33 @@ export interface User {
   brandBuildDurationMs?: number;
   /** Error message if `brandBuildStatus === 'failed'`. Surfaced to the graceful-fallback UI. */
   brandBuildError?: string;
+  /**
+   * Onboarding v2 Phase 4 — ad creative generation async status.
+   * Separate state machine from brandBuildStatus because the two runs are
+   * concurrent during Phase 3→4 transition and have different timeout
+   * budgets. See `backend/src/services/adGenStatusService.ts`.
+   */
+  adGenStatus?: "generating" | "ready" | "failed";
+  /** ISO timestamp when ad-gen was kicked off. */
+  adGenStartedAt?: string;
+  /** ISO timestamp when ad-gen terminated (ready or failed). */
+  adGenCompletedAt?: string;
+  /** Wall-clock duration in ms. Used for p50/p99 metrics. */
+  adGenDurationMs?: number;
+  /** Error message if `adGenStatus === 'failed'`. */
+  adGenError?: string;
+  /**
+   * Persisted ad variants from the last successful generation. Rendered by
+   * the Phase 4 reveal UI. Array is capped at MAX_AD_VARIANTS (3) and each
+   * field is length-bounded — see `sanitizeAdVariants` for the contract.
+   */
+  adGenVariants?: Array<{
+    id: string;
+    headline: string;
+    primaryText: string;
+    cta: string;
+    imageUrl?: string;
+  }>;
   brandGuidelines?: {
     brandData: {
       brandName: string;
