@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-24',
     changes: [
+      'Fixed: Meta Ads Account Now Connects Correctly from Agent Chat',
+      '- Connecting a Meta Ads account via the agent chat (when Emma asks you to reconnect) now properly saves the account to your profile',
+      '- Previously, the ad account selection step was skipped in agent mode, so the token was never stored even though the popup appeared to succeed',
+      '- After completing the OAuth popup, you will now see the ad account picker to select which Meta ad account to connect before returning to the chat',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
       'New: Find Leads from LinkedIn — AI-Powered Lead Discovery in CRM',
       '- A new "Find Leads" button in any CRM list opens a search form where you can find LinkedIn leads by keywords, job title, and company',
       '- Results are imported directly into your list with names, titles, companies, and clean LinkedIn profile URLs',
