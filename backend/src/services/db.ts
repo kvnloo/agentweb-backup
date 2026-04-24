@@ -5084,6 +5084,45 @@ export const crmDb = {
     }).promise();
   },
 
+  /**
+   * Onboarding v2 dual-write helper — mirror per-User onboarding analytics
+   * onto the matching Lead row. The user-facing route (onboardingEvents.ts)
+   * writes to the User record first, then fire-and-forget calls this to
+   * keep the Lead in sync so Fangfang / Emma can see the full flow on the
+   * Lead detail page.
+   *
+   * Writes three top-level attributes on the Lead:
+   *   - onboardingEvents: OnboardingEvent[] (full log mirror)
+   *   - onboardingStage: OnboardingStage
+   *   - onboardingDeviationCount: int
+   *
+   * Overwrites atomically — this is a pure projection of User state.
+   * Task: https://www.notion.so/34c09247c951812cbc90f09aa68fc5d3
+   */
+  async updateLeadOnboardingAnalytics(
+    listId: string,
+    leadId: string,
+    analytics: {
+      onboardingEvents: unknown[];
+      onboardingStage: string;
+      onboardingDeviationCount: number;
+    },
+  ): Promise<void> {
+    const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET onboardingEvents = :events, onboardingStage = :stage, onboardingDeviationCount = :dc, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':events': analytics.onboardingEvents,
+        ':stage': analytics.onboardingStage,
+        ':dc': analytics.onboardingDeviationCount,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }).promise();
+  },
+
   async addLeadEngagement(listId: string, leadId: string, engagement: {
     eventType: string;
     eventData: any;
