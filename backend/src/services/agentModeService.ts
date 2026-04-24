@@ -2,7 +2,7 @@ import axios from 'axios';
 import { AGENT_MODE_SYSTEM_PROMPT } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
@@ -3284,6 +3284,7 @@ export class AgentModeService {
         message: actualResult.message,
         s3_url: actualResult.s3_url,
         filename: actualResult.filename,
+        template_id: actualResult.template_id,
         template_name: actualResult.template_name,
       };
       console.log('[DEBUG] returning extracted:', JSON.stringify(extracted));
@@ -4113,6 +4114,7 @@ export class AgentModeService {
           success: true,
           email_templates: [
             {
+              template_id: 'tpl_welcome_email',
               template_name: 'welcome_email',
               subject: 'Welcome to {{company_name}}!',
               variables: ['company_name', 'user_name'],
@@ -4121,6 +4123,7 @@ export class AgentModeService {
               updated_at: '2024-01-15T10:00:00Z'
             },
             {
+              template_id: 'tpl_newsletter',
               template_name: 'newsletter',
               subject: 'Weekly Update: {{news_title}}',
               variables: ['news_title', 'company_name'],
@@ -4182,12 +4185,16 @@ export class AgentModeService {
           };
         }
 
+        const rawId = (args.template_id || '') as string;
+        const shortId = rawId ? `_${rawId.slice(0, 8)}` : '';
+        const filename = `html_template${shortId}_${Date.now()}.html`;
         return {
           success: true,
-          s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${args.template_name}_${Date.now()}.html`,
-          subject: `Mock subject with variables substituted for ${args.template_name}`,
-          template_name: args.template_name,
-          filename: `html_${args.template_name}_${Date.now()}.html`,
+          s3_url: `https://mock-s3-bucket.s3.amazonaws.com/${filename}`,
+          subject: `Mock subject with variables substituted for ${rawId || 'template'}`,
+          template_id: rawId || undefined,
+          template_name: 'mock-template',
+          filename,
           message: 'Mock HTML generated using LLM variable substitution'
         };
 
@@ -16842,13 +16849,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
   }
 
-  // Fetch templates from all 4 keys (new + old), deduplicated (new key wins)
+  // Fetch templates from new keys only
   private async getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {
-    const [newUserSetting, newPublicSetting, oldUserSetting, oldPublicSetting] = await Promise.all([
+    const [newUserSetting, newPublicSetting] = await Promise.all([
       settingsService.getSetting(`templates_${userId}`),
       settingsService.getSetting('templates_public'),
-      settingsService.getSetting(`email_templates_${userId}`),
-      settingsService.getSetting('email_templates_public'),
     ]);
 
     const parse = (s: any): any[] => {
@@ -16856,37 +16861,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       try { return JSON.parse(s.settingValue); } catch { return []; }
     };
 
-    const newUser = parse(newUserSetting);
-    const newPublic = parse(newPublicSetting);
-    const oldUser = parse(oldUserSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
-    const oldPublic = parse(oldPublicSetting).map((t: any) => t.type ? t : { ...t, type: ['email'] });
-
-    // Deduplicate: new key wins over old key
-    const userSeen = new Set(newUser.map((t: any) => t.template_name));
-    const userTemplates = [
-      ...newUser,
-      ...oldUser.filter((t: any) => !userSeen.has(t.template_name)),
-    ];
-
-    const publicSeen = new Set(newPublic.map((t: any) => t.template_name));
-    const publicTemplates = [
-      ...newPublic,
-      ...oldPublic.filter((t: any) => !publicSeen.has(t.template_name)),
-    ];
+    const userTemplates = parse(newUserSetting);
+    const publicTemplates = parse(newPublicSetting);
 
     return { userTemplates, publicTemplates };
   }
 
-  // Find a template by name, searching user templates first then public
-  public async findTemplateByName(templateName: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+  // Find a template by id, searching user templates first then public
+  public async findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
     const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
-    const userMatch = userTemplates.find((t: any) => t.template_name === templateName);
+    const userMatch = userTemplates.find((t: any) => t.template_id === templateId);
     if (userMatch) {
       return { template: userMatch, isPublic: false };
     }
 
-    const publicMatch = publicTemplates.find((t: any) => t.template_name === templateName);
+    const publicMatch = publicTemplates.find((t: any) => t.template_id === templateId);
     if (publicMatch) {
       return { template: publicMatch, isPublic: true };
     }
@@ -16894,14 +16884,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return { template: null, isPublic: false };
   }
 
-  // List all HTML templates for the user (merged from all 4 keys)
+  // List all HTML templates for the user (merged from new keys)
   public async listHtmlTemplates(userId: string, type?: string): Promise<any> {
     try {
       const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
-      const userTemplateNames = new Set(userTemplates.map((t: any) => t.template_name));
-
       const mapTemplate = (template: any, isPublic: boolean) => ({
+        template_id: template.template_id,
         template_name: template.template_name,
         type: template.type || ['email'],
         subject: template.subject,
@@ -16914,9 +16903,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       let merged = [
         ...userTemplates.map((t: any) => mapTemplate(t, false)),
-        ...publicTemplates
-          .filter((t: any) => !userTemplateNames.has(t.template_name))
-          .map((t: any) => mapTemplate(t, true))
+        ...publicTemplates.map((t: any) => mapTemplate(t, true))
       ];
 
       if (type) {
@@ -17534,7 +17521,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Create HTML from template with variable substitution
   public async createHtmlFromTemplate(
     llmModel: string,
-    templateName: string,
+    templateId: string,
     variableValues: Record<string, string> | undefined,
     arrayVariableValues: Record<string, string[]> | undefined,
     userId: string,
@@ -17542,12 +17529,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   ): Promise<any> {
     try {
       // Get the template from user or public store
-      const { template, isPublic } = await this.findTemplateByName(templateName, userId);
+      const { template } = await this.findTemplateById(templateId, userId);
 
       if (!template) {
         return {
           success: false,
-          message: `Template '${templateName}' not found`
+          message: `Template '${templateId}' not found`
         };
       }
 
@@ -17750,7 +17737,11 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const filename = `html_${templateName}.html`;
+      const rawName = (template.template_name || 'template').toLowerCase();
+      const slug = rawName.replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'template';
+      const idSuffix = (template.template_id || templateId || '').slice(0, 8);
+      const suffix = idSuffix ? `_${idSuffix}` : '';
+      const filename = `html_${slug}${suffix}.html`;
       const uploadResult = await uploadFileToS3(finalHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
@@ -17763,7 +17754,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         success: true,
         s3_url: s3Url,
         final_subject: finalSubject,
-        template_name: templateName,
+        template_id: template.template_id,
+        template_name: template.template_name,
         filename: filename
       };
     } catch (error) {
@@ -17918,6 +17910,7 @@ Please generate a complete, professional HTML document that properly formats and
   // Create HTML template from existing HTML file (upload to email templates)
   public async createHtmlTemplate(
     htmlSource: string,
+    templateId: string | undefined,
     templateName: string,
     subject: string,
     additionalInstructions: string,
@@ -18037,26 +18030,49 @@ Please:
         }
       }
 
-      // Check if template already exists
-      const existingTemplateIndex = templates.findIndex(
-        (t: any) => t.template_name === templateName
-      );
-
       const templateTypes = types && types.length > 0 ? types : ['email'];
+      const now = new Date().toISOString();
+
+      let targetIndex = -1;
+      let resolvedTemplateId = templateId || randomUUID();
+      let createdAt = now;
+
+      if (templateId) {
+        targetIndex = templates.findIndex((t: any) => t.template_id === templateId);
+        if (targetIndex < 0) {
+          return {
+            success: false,
+            message: 'Template not found',
+            error: `Template with id "${templateId}" not found`
+          };
+        }
+        const existing = templates[targetIndex];
+        resolvedTemplateId = existing.template_id || resolvedTemplateId;
+        createdAt = existing.created_at || createdAt;
+      } else {
+        const matchingTemplates = templates.filter((t: any) => t.template_name === templateName);
+        if (matchingTemplates.length === 1) {
+          targetIndex = templates.findIndex((t: any) => t.template_name === templateName);
+          const existing = templates[targetIndex];
+          resolvedTemplateId = existing.template_id || resolvedTemplateId;
+          createdAt = existing.created_at || createdAt;
+        }
+      }
 
       const newTemplate = {
+        template_id: resolvedTemplateId,
         template_name: templateName,
         type: templateTypes,
         subject: subject,
         html_content: enhancedHtml,
         variables: variables,
         arrayVariables: arrayVariables,
-        created_at: existingTemplateIndex >= 0 ? templates[existingTemplateIndex].created_at : new Date().toISOString(),
-        updated_at: new Date().toISOString()
+        created_at: createdAt,
+        updated_at: now
       };
 
-      if (existingTemplateIndex >= 0) {
-        templates[existingTemplateIndex] = newTemplate;
+      if (targetIndex >= 0) {
+        templates[targetIndex] = newTemplate;
       } else {
         templates.push(newTemplate);
       }
@@ -18068,21 +18084,11 @@ Please:
         userId
       );
 
-      // Migrate: remove old copy from legacy user key to prevent shadowing.
-      // Never touch public keys — createHtmlTemplate is always a user-scoped operation.
-      const { parseTemplateArray } = await import('../utils/templateParser');
-      const legacyKey = `email_templates_${userId}`;
-      const legacySetting = await settingsService.getSetting(legacyKey);
-      const legacyList = parseTemplateArray(legacySetting);
-      const legacyFiltered = legacyList.filter((t: any) => t.template_name !== templateName);
-      if (legacyFiltered.length !== legacyList.length) {
-        await settingsService.setSetting(legacyKey, JSON.stringify(legacyFiltered), legacyKey, userId);
-      }
-
       console.log('AgentMode: HTML template created successfully:', templateName);
 
       return {
         success: true,
+        template_id: resolvedTemplateId,
         template_name: templateName,
         type: templateTypes,
         subject: subject,

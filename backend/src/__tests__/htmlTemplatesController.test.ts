@@ -15,6 +15,11 @@ jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() }
 }));
 
+jest.mock('crypto', () => ({
+  ...jest.requireActual('crypto'),
+  randomUUID: jest.fn(() => 'mock-uuid-1234')
+}));
+
 jest.mock('axios', () => ({ get: jest.fn(), post: jest.fn() }));
 
 // Mock SettingsService used inside the controller module
@@ -27,8 +32,8 @@ jest.mock('../services/settingsService', () => ({
     setSetting: mockSetSetting,
   })),
   settingsService: {
-    getSetting: jest.fn(),
-    setSetting: jest.fn(),
+    getSetting: mockGetSetting,
+    setSetting: mockSetSetting,
   },
 }));
 
@@ -105,15 +110,13 @@ describe('getTemplates', () => {
     expect(status).toHaveBeenCalledWith(401);
   });
 
-  it('returns merged templates from new and legacy keys', async () => {
-    const newUserTpl = { template_name: 'new-user', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
-    const legacyPublicTpl = { template_name: 'legacy-pub', html_content: '<p/>', subject: 'S', variables: [], arrayVariables: [] };
+  it('returns merged templates from new keys only', async () => {
+    const newUserTpl = { template_id: 't1', template_name: 'new-user', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    const publicTpl = { template_id: 'p1', template_name: 'pub', html_content: '<p/>', subject: 'S', variables: [], arrayVariables: [] };
 
     mockGetSetting.mockImplementation((key: string) => {
       if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([newUserTpl]));
-      if (key === 'templates_public') return Promise.resolve(null);
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(null);
-      if (key === 'email_templates_public') return Promise.resolve(settingWith([legacyPublicTpl]));
+      if (key === 'templates_public') return Promise.resolve(settingWith([publicTpl]));
       return Promise.resolve(null);
     });
 
@@ -125,16 +128,16 @@ describe('getTemplates', () => {
     expect(json).toHaveBeenCalledWith(
       expect.objectContaining({
         templates: expect.arrayContaining([
-          expect.objectContaining({ template_name: 'new-user' }),
-          expect.objectContaining({ template_name: 'legacy-pub', isPublic: true }),
+          expect.objectContaining({ template_id: 't1', template_name: 'new-user' }),
+          expect.objectContaining({ template_id: 'p1', template_name: 'pub', isPublic: true }),
         ]),
       })
     );
   });
 
-  it('user-key template shadows public template of the same name', async () => {
-    const userTpl = { template_name: 'shared', type: ['email'], html_content: '<p>user</p>', variables: [], arrayVariables: [] };
-    const pubTpl  = { template_name: 'shared', type: ['email'], html_content: '<p>public</p>', variables: [], arrayVariables: [] };
+  it('multiple templates of same name are returned normally', async () => {
+    const userTpl = { template_id: 'u1', template_name: 'shared', type: ['email'], html_content: '<p>user</p>', variables: [], arrayVariables: [] };
+    const pubTpl  = { template_id: 'p1', template_name: 'shared', type: ['email'], html_content: '<p>public</p>', variables: [], arrayVariables: [] };
 
     mockGetSetting.mockImplementation((key: string) => {
       if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([userTpl]));
@@ -149,13 +152,12 @@ describe('getTemplates', () => {
 
     const { templates } = (json.mock.calls[0][0] as any);
     const shared = templates.filter((t: any) => t.template_name === 'shared');
-    expect(shared).toHaveLength(1);
-    expect(shared[0].html_content).toBe('<p>user</p>');
+    expect(shared).toHaveLength(2);
   });
 
   it('filters result by ?type query param', async () => {
-    const emailTpl   = { template_name: 'e', type: ['email'],        html_content: '<p/>', variables: [], arrayVariables: [] };
-    const lpTpl      = { template_name: 'l', type: ['landing_page'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    const emailTpl   = { template_id: 'e1', template_name: 'e', type: ['email'],        html_content: '<p/>', variables: [], arrayVariables: [] };
+    const lpTpl      = { template_id: 'l1', template_name: 'l', type: ['landing_page'], html_content: '<p/>', variables: [], arrayVariables: [] };
 
     mockGetSetting.mockImplementation((key: string) => {
       if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([emailTpl, lpTpl]));
@@ -169,24 +171,7 @@ describe('getTemplates', () => {
 
     const { templates } = (json.mock.calls[0][0] as any);
     expect(templates).toHaveLength(1);
-    expect(templates[0].template_name).toBe('l');
-  });
-
-  it('adds type=email to legacy templates that lack a type field', async () => {
-    const legacyTpl = { template_name: 'old', html_content: '<p/>', variables: [], arrayVariables: [] };
-
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([legacyTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ query: { type: 'email' } });
-    const { res, json } = makeRes();
-
-    await getTemplates(req, res);
-
-    const { templates } = (json.mock.calls[0][0] as any);
-    expect(templates.some((t: any) => t.template_name === 'old')).toBe(true);
+    expect(templates[0].template_id).toBe('l1');
   });
 
   it('returns 500 when settings lookup fails', async () => {
@@ -265,7 +250,7 @@ describe('saveTemplate', () => {
     expect(status).toHaveBeenCalledWith(403);
   });
 
-  it('saves a new template successfully', async () => {
+  it('saves a new template successfully with generated uuid', async () => {
     const req = reqWithUser({ body: validBody });
     const { res, json } = makeRes();
 
@@ -273,51 +258,21 @@ describe('saveTemplate', () => {
 
     expect(mockSetSetting).toHaveBeenCalled();
     expect(json).toHaveBeenCalledWith(
-      expect.objectContaining({ success: true, template: expect.objectContaining({ template_name: 'my-tpl' }) })
+      expect.objectContaining({ success: true, template: expect.objectContaining({ template_id: expect.any(String), template_name: 'my-tpl' }) })
     );
   });
 
-  it('returns 400 on duplicate template_name during create', async () => {
-    const existing = { ...validBody, created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
-    mockGetSetting.mockResolvedValue(settingWith([existing]));
+  it('updates an existing template by template_id', async () => {
+    const tpl = { template_id: 't-123', template_name: 'old-name', html_content: 'old' };
+    mockGetSetting.mockResolvedValue(settingWith([tpl]));
 
-    const req = reqWithUser({ body: validBody }); // same name, no original_template_name
-    const { res, status } = makeRes();
-
-    await saveTemplate(req, res);
-
-    expect(status).toHaveBeenCalledWith(400);
-  });
-
-  it('allows rename when original_template_name is provided', async () => {
-    const existing = { ...validBody, template_name: 'old-name', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
-    mockGetSetting.mockResolvedValue(settingWith([existing]));
-
-    const req = reqWithUser({
-      body: { ...validBody, template_name: 'new-name', original_template_name: 'old-name' }
-    });
+    const req = reqWithUser({ body: { ...validBody, template_id: 't-123', template_name: 'new-name' } });
     const { res, json } = makeRes();
-
     await saveTemplate(req, res);
 
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-  });
-
-  it('returns 400 when rename target conflicts with another template', async () => {
-    const templates = [
-      { ...validBody, template_name: 'old-name', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' },
-      { ...validBody, template_name: 'taken-name', created_at: '2024-01-02T00:00:00Z', updated_at: '2024-01-02T00:00:00Z' },
-    ];
-    mockGetSetting.mockResolvedValue(settingWith(templates));
-
-    const req = reqWithUser({
-      body: { ...validBody, template_name: 'taken-name', original_template_name: 'old-name' }
-    });
-    const { res, status } = makeRes();
-
-    await saveTemplate(req, res);
-
-    expect(status).toHaveBeenCalledWith(400);
+    const savedArray = JSON.parse(mockSetSetting.mock.calls[0][1]);
+    expect(savedArray[0].template_name).toBe('new-name');
   });
 
   it('extracts variables automatically when not supplied', async () => {
@@ -329,30 +284,6 @@ describe('saveTemplate', () => {
 
     const savedTemplate = (json.mock.calls[0][0] as any).template;
     expect(savedTemplate.variables).toContain('greeting');
-  });
-
-  it('preserves legacy created_at when updating a migrated template', async () => {
-    const oldTemplate = {
-      ...validBody,
-      template_name: 'legacy-name',
-      created_at: '2024-02-03T04:05:06.000Z',
-      updated_at: '2024-02-03T04:05:06.000Z',
-    };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([]));
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([oldTemplate]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({
-      body: { ...validBody, template_name: 'renamed-template', original_template_name: 'legacy-name' }
-    });
-    const { res, json } = makeRes();
-
-    await saveTemplate(req, res);
-
-    const savedTemplate = (json.mock.calls[0][0] as any).template;
-    expect(savedTemplate.created_at).toBe('2024-02-03T04:05:06.000Z');
   });
 
   it('allows admin to save a public template', async () => {
@@ -420,78 +351,34 @@ describe('saveTemplate', () => {
     expect(status).toHaveBeenCalledWith(500);
   });
 
-  it('migrates template from legacy user key to new user key on update', async () => {
-    const legacyTpl = { ...validBody, template_name: 'my-tpl', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
+  it('admin can promote a private template to public', async () => {
+    const tpl = { template_id: 't-123', template_name: 'name', type: ['email'], isPublic: false, created_at: 'old' };
     mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([]));
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([legacyTpl]));
-      return Promise.resolve(null);
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
+      return Promise.resolve(settingWith([]));
     });
 
-    const req = reqWithUser({ body: { ...validBody, original_template_name: 'my-tpl' } });
+    const req = adminReq({ body: { ...validBody, template_id: 't-123', isPublic: true } });
     const { res, json } = makeRes();
-
     await saveTemplate(req, res);
 
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-    // Saved to new user key
-    expect(calledKeys).toContain(`templates_${USER_ID}`);
-    // Removed from legacy user key
-    expect(calledKeys).toContain(`email_templates_${USER_ID}`);
+    const keysSet = mockSetSetting.mock.calls.map(c => c[0]);
+    // It should add to public and remove from private
+    expect(keysSet).toContain('templates_public');
+    expect(keysSet).toContain(`templates_${USER_ID}`);
   });
 
-  it('promotes template to public: saves to templates_public and removes from user key', async () => {
-    const userTpl = { ...validBody, template_name: 'my-tpl', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([userTpl]));
-      return Promise.resolve(null);
-    });
+  it('non-admin gets 404 when trying cross-key move implicitly', async () => {
+    // Non-admins can't do cross-key, so if it's not found in their own key, they should get 404
+    mockGetSetting.mockResolvedValue(settingWith([]));
 
-    const req = adminReq({ body: { ...validBody, isPublic: true, original_template_name: 'my-tpl' } });
-    const { res, json } = makeRes();
-
+    // Notice we pass isPublic: false to try to update a template that doesn't exist
+    const req = reqWithUser({ body: { ...validBody, template_id: 't-ghost', isPublic: false } });
+    const { res, status } = makeRes();
     await saveTemplate(req, res);
 
-    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-    expect(calledKeys).toContain('templates_public');
-    expect(calledKeys).toContain(`templates_${USER_ID}`);
-  });
-
-  it('demotes template to private: saves to user key and removes from public key', async () => {
-    const pubTpl = { ...validBody, template_name: 'my-tpl', isPublic: true, created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === 'templates_public') return Promise.resolve(settingWith([pubTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = adminReq({ body: { ...validBody, isPublic: false, original_template_name: 'my-tpl' } });
-    const { res, json } = makeRes();
-
-    await saveTemplate(req, res);
-
-    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-    expect(calledKeys).toContain(`templates_${USER_ID}`);
-    expect(calledKeys).toContain('templates_public');
-  });
-
-  it('non-admin update cleanup does not touch public keys', async () => {
-    const userTpl = { ...validBody, template_name: 'my-tpl', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([userTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ body: { ...validBody, original_template_name: 'my-tpl' } });
-    const { res } = makeRes();
-
-    await saveTemplate(req, res);
-
-    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-    expect(calledKeys).not.toContain('templates_public');
-    expect(calledKeys).not.toContain('email_templates_public');
+    expect(status).toHaveBeenCalledWith(404);
   });
 });
 
@@ -504,7 +391,7 @@ describe('deleteTemplate', () => {
   });
 
   it('returns 401 when no user is attached', async () => {
-    const req = makeReq({ params: { templateName: 'tpl' } });
+    const req = makeReq({ params: { templateId: 'tpl' } });
     const { res, status } = makeRes();
 
     await deleteTemplate(req, res);
@@ -514,7 +401,7 @@ describe('deleteTemplate', () => {
 
   it('returns 403 when non-admin tries to delete a public template', async () => {
     mockGetSetting.mockResolvedValue(null);
-    const req = reqWithUser({ params: { templateName: 'tpl' }, query: { isPublic: 'true' } });
+    const req = reqWithUser({ params: { templateId: 'tpl' }, query: { isPublic: 'true' } });
     const { res, status } = makeRes();
 
     await deleteTemplate(req, res);
@@ -523,13 +410,13 @@ describe('deleteTemplate', () => {
   });
 
   it('deletes template from new key and returns success', async () => {
-    const tpl = { template_name: 'to-delete', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    const tpl = { template_id: 'to-delete', template_name: 'to-delete', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
     mockGetSetting.mockImplementation((key: string) => {
       if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
       return Promise.resolve(null);
     });
 
-    const req = reqWithUser({ params: { templateName: 'to-delete' }, query: {} });
+    const req = reqWithUser({ params: { templateId: 'to-delete' }, query: {} });
     const { res, json } = makeRes();
 
     await deleteTemplate(req, res);
@@ -538,69 +425,10 @@ describe('deleteTemplate', () => {
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
   });
 
-  it('deletes from legacy user key when template is not in new key', async () => {
-    const legacyTpl = { template_name: 'legacy', html_content: '<p/>', variables: [], arrayVariables: [] };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([]));
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([legacyTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ params: { templateName: 'legacy' }, query: {} });
-    const { res, json } = makeRes();
-
-    await deleteTemplate(req, res);
-
-    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-    expect(mockSetSetting).toHaveBeenCalledWith(
-      `email_templates_${USER_ID}`,
-      JSON.stringify([]),
-      `email_templates_${USER_ID}`,
-      'dev@test.com'
-    );
-  });
-
-  it('deletes from all keys simultaneously when template exists in multiple keys', async () => {
-    const tpl = { template_name: 'multi', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ params: { templateName: 'multi' }, query: {} });
-    const { res, json } = makeRes();
-
-    await deleteTemplate(req, res);
-
-    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-    // Both the new and legacy user keys should be cleaned up
-    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-    expect(calledKeys).toContain(`templates_${USER_ID}`);
-    expect(calledKeys).toContain(`email_templates_${USER_ID}`);
-  });
-
-  it('non-admin delete only touches user keys, not public keys', async () => {
-    const tpl = { template_name: 'mine', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ params: { templateName: 'mine' }, query: {} });
-    const { res } = makeRes();
-
-    await deleteTemplate(req, res);
-
-    const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-    expect(calledKeys).not.toContain('templates_public');
-    expect(calledKeys).not.toContain('email_templates_public');
-  });
-
-  it('returns 404 when template does not exist in any store', async () => {
+  it('returns 404 when template does not exist in store', async () => {
     mockGetSetting.mockResolvedValue(settingWith([]));
 
-    const req = reqWithUser({ params: { templateName: 'ghost' }, query: {} });
+    const req = reqWithUser({ params: { templateId: 'ghost' }, query: {} });
     const { res, status } = makeRes();
 
     await deleteTemplate(req, res);
@@ -609,46 +437,24 @@ describe('deleteTemplate', () => {
   });
 
   it('allows admin to delete a public template', async () => {
-    const pubTpl = { template_name: 'pub-tpl', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    const pubTpl = { template_id: 'pub-tpl', template_name: 'pub-tpl', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
     mockGetSetting.mockImplementation((key: string) => {
       if (key === 'templates_public') return Promise.resolve(settingWith([pubTpl]));
       return Promise.resolve(null);
     });
 
-    const req = adminReq({ params: { templateName: 'pub-tpl' }, query: { isPublic: 'true' } });
+    const req = adminReq({ params: { templateId: 'pub-tpl' }, query: { isPublic: 'true' } });
     const { res, json } = makeRes();
 
     await deleteTemplate(req, res);
 
-    expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
-  });
-
-  it('deletes from legacy public storage when missing from the new public key', async () => {
-    const legacyTpl = { template_name: 'legacy-public', html_content: '<p/>', variables: [], arrayVariables: [] };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === 'templates_public') return Promise.resolve(settingWith([]));
-      if (key === 'email_templates_public') return Promise.resolve(settingWith([legacyTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = adminReq({ params: { templateName: 'legacy-public' }, query: { isPublic: 'true' } });
-    const { res, json } = makeRes();
-
-    await deleteTemplate(req, res);
-
-    expect(mockSetSetting).toHaveBeenCalledWith(
-      'email_templates_public',
-      JSON.stringify([]),
-      'email_templates_public',
-      'admin@test.com'
-    );
     expect(json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
   });
 
   it('returns 500 when delete lookup fails', async () => {
     mockGetSetting.mockRejectedValueOnce(new Error('boom'));
 
-    const req = reqWithUser({ params: { templateName: 'tpl' }, query: {} });
+    const req = reqWithUser({ params: { templateId: 'tpl' }, query: {} });
     const { res, status } = makeRes();
 
     await deleteTemplate(req, res);
@@ -665,13 +471,13 @@ describe('getPreviewTemplate', () => {
   });
 
   it('serves html_content from new user key when found', async () => {
-    const tpl = { template_name: 'preview-me', html_content: '<html>content</html>' };
+    const tpl = { template_id: 'preview-me', template_name: 'preview-me', html_content: '<html>content</html>' };
     mockGetSetting.mockImplementation((key: string) => {
       if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([tpl]));
       return Promise.resolve(null);
     });
 
-    const req = reqWithUser({ params: { templateName: 'preview-me' } });
+    const req = reqWithUser({ params: { templateId: 'preview-me' } });
     const { res, send, setHeader } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -681,13 +487,13 @@ describe('getPreviewTemplate', () => {
   });
 
   it('serves html_content from public key when not in user key', async () => {
-    const pubTpl = { template_name: 'pub-preview', html_content: '<html>public</html>' };
+    const pubTpl = { template_id: 'pub-preview', template_name: 'pub-preview', html_content: '<html>public</html>' };
     mockGetSetting.mockImplementation((key: string) => {
       if (key === 'templates_public') return Promise.resolve(settingWith([pubTpl]));
       return Promise.resolve(null);
     });
 
-    const req = reqWithUser({ params: { templateName: 'pub-preview' } });
+    const req = reqWithUser({ params: { templateId: 'pub-preview' } });
     const { res, send, setHeader } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -696,42 +502,10 @@ describe('getPreviewTemplate', () => {
     expect(send).toHaveBeenCalledWith('<html>public</html>');
   });
 
-  it('serves from legacy user key (email_templates_*) when not in new keys', async () => {
-    const legacyTpl = { template_name: 'old-preview', html_content: '<html>legacy</html>' };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === `email_templates_${USER_ID}`) return Promise.resolve(settingWith([legacyTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ params: { templateName: 'old-preview' } });
-    const { res, send, setHeader } = makeRes();
-
-    await getPreviewTemplate(req, res);
-
-    expect(setHeader).toHaveBeenCalledWith('Content-Type', 'text/html');
-    expect(send).toHaveBeenCalledWith('<html>legacy</html>');
-  });
-
-  it('serves from legacy public key when no user-specific template exists', async () => {
-    const legacyPublicTpl = { template_name: 'legacy-public-preview', html_content: '<html>legacy-public</html>' };
-    mockGetSetting.mockImplementation((key: string) => {
-      if (key === 'email_templates_public') return Promise.resolve(settingWith([legacyPublicTpl]));
-      return Promise.resolve(null);
-    });
-
-    const req = reqWithUser({ params: { templateName: 'legacy-public-preview' } });
-    const { res, send, setHeader } = makeRes();
-
-    await getPreviewTemplate(req, res);
-
-    expect(setHeader).toHaveBeenCalledWith('Content-Type', 'text/html');
-    expect(send).toHaveBeenCalledWith('<html>legacy-public</html>');
-  });
-
   it('returns 500 when preview lookup fails', async () => {
     mockGetSetting.mockRejectedValueOnce(new Error('boom'));
 
-    const req = reqWithUser({ params: { templateName: 'preview-me' } });
+    const req = reqWithUser({ params: { templateId: 'preview-me' } });
     const { res, status } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -742,7 +516,7 @@ describe('getPreviewTemplate', () => {
   it('returns 404 when template is not found in any store and name is not a legacy FS alias', async () => {
     mockGetSetting.mockResolvedValue(null);
 
-    const req = reqWithUser({ params: { templateName: 'nonexistent' } });
+    const req = reqWithUser({ params: { templateId: 'nonexistent' } });
     const { res, status } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -756,7 +530,7 @@ describe('getPreviewTemplate', () => {
     fs.existsSync.mockReturnValue(true);
     fs.promises.readFile.mockResolvedValue('<html>v2-legacy</html>');
 
-    const req = reqWithUser({ params: { templateName: 'default-v2' } });
+    const req = reqWithUser({ params: { templateId: 'default-v2' } });
     const { res, send, setHeader } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -771,7 +545,7 @@ describe('getPreviewTemplate', () => {
     fs.existsSync.mockReturnValue(true);
     fs.promises.readFile.mockResolvedValue('<html>v2-legacy</html>');
 
-    const req = reqWithUser({ params: { templateName: 'landing-page-v2' } });
+    const req = reqWithUser({ params: { templateId: 'landing-page-v2' } });
     const { res, send } = makeRes();
 
     await getPreviewTemplate(req, res);
@@ -784,7 +558,7 @@ describe('getPreviewTemplate', () => {
     const fs = require('fs');
     fs.existsSync.mockReturnValue(false);
 
-    const req = reqWithUser({ params: { templateName: 'default-v2' } });
+    const req = reqWithUser({ params: { templateId: 'default-v2' } });
     const { res, status } = makeRes();
 
     await getPreviewTemplate(req, res);

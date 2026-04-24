@@ -64,6 +64,7 @@ describe('AgentModeService - Public HTML Templates', () => {
   let agentModeService: AgentModeService;
 
   const userTemplate = {
+    template_id: 'user-template-id',
     template_name: 'user-template',
     html_content: '<html><body><h1>{{title}}</h1></body></html>',
     subject: 'User Template: {{title}}',
@@ -74,6 +75,7 @@ describe('AgentModeService - Public HTML Templates', () => {
   };
 
   const publicTemplate = {
+    template_id: 'public-template-id',
     template_name: 'public-template',
     html_content: '<html><body><h1>{{heading}}</h1></body></html>',
     subject: 'Public Template: {{heading}}',
@@ -84,6 +86,7 @@ describe('AgentModeService - Public HTML Templates', () => {
   };
 
   const overlappingTemplate = {
+    template_id: 'shared-id-public',
     template_name: 'shared-name',
     html_content: '<html><body><p>Public version</p></body></html>',
     subject: 'Public Shared',
@@ -94,6 +97,7 @@ describe('AgentModeService - Public HTML Templates', () => {
   };
 
   const userOverlappingTemplate = {
+    template_id: 'shared-id-user',
     template_name: 'shared-name',
     html_content: '<html><body><p>User version</p></body></html>',
     subject: 'User Shared',
@@ -123,12 +127,12 @@ describe('AgentModeService - Public HTML Templates', () => {
       expect(result.email_templates).toEqual([]);
     });
 
-    it('should deduplicate — user template shadows public template with same name', async () => {
+    it('should NOT deduplicate templates with the same name from both stores', async () => {
       (settingsService.getSetting as jest.Mock).mockImplementation((key: string) => {
-        if (key === 'email_templates_user123') {
+        if (key === 'email_templates_user123' || key === 'templates_user123') {
           return { settingValue: JSON.stringify([userOverlappingTemplate]) };
         }
-        if (key === 'email_templates_public') {
+        if (key === 'email_templates_public' || key === 'templates_public') {
           return { settingValue: JSON.stringify([overlappingTemplate]) };
         }
         return null;
@@ -137,21 +141,20 @@ describe('AgentModeService - Public HTML Templates', () => {
       const result = await (agentModeService as any).listHtmlTemplates('user123');
 
       expect(result.success).toBe(true);
-      // Should only have one template with the shared name
       const sharedTemplates = result.email_templates.filter(
         (t: any) => t.template_name === 'shared-name'
       );
-      expect(sharedTemplates).toHaveLength(1);
-      // The user version should win (isPublic should be false/undefined)
-      expect(sharedTemplates[0].isPublic).toBeFalsy();
+      expect(sharedTemplates).toHaveLength(2);
+      expect(sharedTemplates.some((t: any) => t.isPublic)).toBeTruthy();
+      expect(sharedTemplates.some((t: any) => !t.isPublic)).toBeTruthy();
     });
 
     it('should return only public templates with isPublic=true when user has none', async () => {
       (settingsService.getSetting as jest.Mock).mockImplementation((key: string) => {
-        if (key === 'email_templates_user123') {
+        if (key === 'templates_user123') {
           return null;
         }
-        if (key === 'email_templates_public') {
+        if (key === 'templates_public') {
           return { settingValue: JSON.stringify([publicTemplate]) };
         }
         return null;
@@ -167,10 +170,10 @@ describe('AgentModeService - Public HTML Templates', () => {
 
     it('should merge both stores with correct isPublic flags', async () => {
       (settingsService.getSetting as jest.Mock).mockImplementation((key: string) => {
-        if (key === 'email_templates_user123') {
+        if (key === 'templates_user123') {
           return { settingValue: JSON.stringify([userTemplate]) };
         }
-        if (key === 'email_templates_public') {
+        if (key === 'templates_public') {
           return { settingValue: JSON.stringify([publicTemplate]) };
         }
         return null;
@@ -197,7 +200,7 @@ describe('AgentModeService - Public HTML Templates', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'gpt-4',
-        'nonexistent-template',
+        'nonexistent-template-id',
         {},
         {},
         'user123',
@@ -209,10 +212,10 @@ describe('AgentModeService - Public HTML Templates', () => {
 
     it('should find template in public store when not in user store', async () => {
       (settingsService.getSetting as jest.Mock).mockImplementation((key: string) => {
-        if (key === 'email_templates_user123') {
+        if (key === 'templates_user123') {
           return null;
         }
-        if (key === 'email_templates_public') {
+        if (key === 'templates_public') {
           return { settingValue: JSON.stringify([publicTemplate]) };
         }
         return null;
@@ -232,7 +235,7 @@ describe('AgentModeService - Public HTML Templates', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'gpt-4',
-        'public-template',
+        'public-template-id',
         { heading: 'Hello World' },
         {},
         'user123',
