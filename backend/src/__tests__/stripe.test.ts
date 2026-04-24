@@ -155,9 +155,27 @@ describe('Stripe Backend Integration', () => {
             line_items: [{ price: 'price_abc', quantity: 1 }],
             success_url: 'http://localhost:5174/success',
             cancel_url: 'http://localhost:5174/cancel',
+            allow_promotion_codes: true,
             metadata: { userId: 'user-123' },
           })
         );
+      });
+
+      it('should enable promotion codes on the hosted checkout page', async () => {
+        mockCheckoutSessionsCreate.mockResolvedValue({
+          id: 'cs_test_promo',
+          url: 'https://checkout.stripe.com/session/cs_test_promo',
+        });
+
+        await stripeService.createCheckoutSession(
+          'user-456',
+          'price_starter_123',
+          'http://localhost:5174/success',
+          'http://localhost:5174/cancel'
+        );
+
+        const call = mockCheckoutSessionsCreate.mock.calls[0][0];
+        expect(call.allow_promotion_codes).toBe(true);
       });
     });
 

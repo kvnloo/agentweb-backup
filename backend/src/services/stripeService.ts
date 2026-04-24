@@ -52,6 +52,7 @@ export const stripeService = {
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
+      allow_promotion_codes: true,
       metadata: { userId },
     });
   },
