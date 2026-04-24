@@ -9922,6 +9922,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     );
 
     if (fbAccounts.length === 0) {
+      // Fall back to legacy adAccount field + centralized Secrets Manager token.
+      // This covers users who had their Meta Marketing connected account removed but still
+      // have adAccount configured (e.g. Waldium-style agency-managed accounts).
+      const legacyAccountId = (user.adAccount || '').replace('act_', '').trim();
+      if (legacyAccountId) {
+        const { getMetaAccessToken } = await import('../utils/secretsManager');
+        const accessToken = await getMetaAccessToken();
+        console.log(`[AgentMode] No connected Meta account for user ${userId}; falling back to legacy adAccount ${legacyAccountId}`);
+        return { accountId: legacyAccountId, accessToken };
+      }
       console.error(`[AgentMode] No valid Meta connected account found for user ${userId}`);
       throw new Error('Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.');
     }
