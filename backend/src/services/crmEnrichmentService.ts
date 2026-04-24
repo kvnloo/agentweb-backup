@@ -339,8 +339,11 @@ export class CrmEnrichmentService {
         }
 
         if (!profileData) {
-          const name = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
-          const company = String(lead.company || '').trim();
+          const cf = (lead.customFields || {}) as Record<string, string>;
+          const firstName = String(lead.firstName || cf.first_name || '').trim();
+          const lastName = String(lead.lastName || cf.last_name || '').trim();
+          const name = `${firstName} ${lastName}`.trim();
+          const company = String(lead.company || cf.company_name || '').trim();
           if (name && company) {
             const searchResult = await agentModeService.linkedinOutreach(spec.userId, {
               action: 'search-people',
@@ -388,11 +391,15 @@ export class CrmEnrichmentService {
 
     // 3. Build lead context
     const leadContext: Record<string, string> = {};
-    const name = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+    const cfCtx = (lead.customFields || {}) as Record<string, string>;
+    const ctxFirstName = String(lead.firstName || cfCtx.first_name || '').trim();
+    const ctxLastName = String(lead.lastName || cfCtx.last_name || '').trim();
+    const name = `${ctxFirstName} ${ctxLastName}`.trim();
     if (name) leadContext.name = name;
     if (lead.email) leadContext.email = String(lead.email).trim();
-    if (lead.title) leadContext.title = String(lead.title).trim();
-    if (lead.company) leadContext.company = String(lead.company).trim();
+    if (lead.title) leadContext.title = String(lead.title || cfCtx.title || '').trim();
+    if (leadContext.title === '') delete leadContext.title;
+    if (lead.company) leadContext.company = String(lead.company || cfCtx.company_name || '').trim();
     // Exclude existing linkedin URL when enriching linkedin fields — it may be wrong/outdated
     if (lead.linkedin && !isEnrichingLinkedin) leadContext.linkedin = String(lead.linkedin).trim();
     // Include existing custom fields for context
