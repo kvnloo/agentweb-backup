@@ -40,6 +40,13 @@ jest.mock("../../services/contactCaptureHooks", () => ({
   onOnboardingStageChanged: (...args: any[]) => mockOnOnboardingStageChanged(...args),
 }));
 
+// Onboarding v2 dual-write mirror — mocked so existing User-path tests don't
+// reach DynamoDB / the crm layer. Route treats it as fire-and-forget.
+const mockMirrorOnboardingEventToLead = jest.fn();
+jest.mock("../../services/onboardingLeadSync", () => ({
+  mirrorOnboardingEventToLead: (...args: any[]) => mockMirrorOnboardingEventToLead(...args),
+}));
+
 import onboardingEventsRouter from "../onboardingEvents";
 
 function makeApp() {
@@ -65,6 +72,7 @@ beforeEach(() => {
   // Default no-op for the capture hook — the route calls .catch() on the
   // returned promise, so the mock must return a thenable.
   mockOnOnboardingStageChanged.mockResolvedValue(null);
+  mockMirrorOnboardingEventToLead.mockResolvedValue({ mirrored: true, reason: "updated" });
 });
 
 describe("POST /api/onboarding/events", () => {
@@ -226,6 +234,86 @@ describe("POST /api/onboarding/events", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.onboardingStage).toBe("active");
+  });
+
+  // ─── Onboarding v2 analytics: new events + dual-write mirror ─────────────
+
+  it("accepts the Phase 2 event 'channel_selected'", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "channel_selected", data: { channel: "meta" } });
+    expect(res.status).toBe(200);
+    expect(res.body.recorded.event).toBe("channel_selected");
+  });
+
+  it("accepts the Phase 2 event 'deviation' and records the freeform message", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({
+        event: "deviation",
+        data: { message: "what about ecommerce?", step: "goal" },
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.recorded.data).toMatchObject({
+      message: "what about ecommerce?",
+      step: "goal",
+    });
+  });
+
+  it("accepts the Phase 2 event 'icp_selected'", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({
+        event: "icp_selected",
+        data: { id: "icp_1", name: "Growth-stage SaaS PMs" },
+      });
+    expect(res.status).toBe(200);
+  });
+
+  it("dual-writes every onboarding event to the matching Lead (fire-and-forget)", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "goal_selected", data: { goal: "paid_ads" } });
+    expect(res.status).toBe(200);
+    expect(mockMirrorOnboardingEventToLead).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "user-123",
+        email: "user@example.com",
+        onboardingStage: "goal_selected",
+        allEvents: expect.arrayContaining([
+          expect.objectContaining({ event: "goal_selected" }),
+        ]),
+        event: expect.objectContaining({ event: "goal_selected" }),
+      }),
+    );
+  });
+
+  it("does NOT fail the request when the Lead mirror rejects (fire-and-forget)", async () => {
+    mockMirrorOnboardingEventToLead.mockRejectedValueOnce(new Error("boom"));
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "goal_selected" });
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("goal_selected");
+  });
+
+  it("skips the mirror when the user has no email (defensive guard)", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "",
+      onboardingEvents: [],
+    });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "goal_selected" });
+    expect(res.status).toBe(200);
+    expect(mockMirrorOnboardingEventToLead).not.toHaveBeenCalled();
   });
 });
 

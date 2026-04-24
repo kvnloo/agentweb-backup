@@ -141,9 +141,10 @@ describe("isOnboardingStage", () => {
 });
 
 describe("ALLOWED_ONBOARDING_EVENTS", () => {
-  it("includes every event name emitted by OnboardingV2.tsx", () => {
+  it("includes every event name emitted by OnboardingV2.tsx (Phase 1 + Phase 2)", () => {
     // If this list changes, the frontend must change too (see OnboardingV2.tsx).
     const expected = [
+      // Phase 1 — PR #568
       "goal_selected",
       "brand_submitted",
       "brand_skipped",
@@ -152,9 +153,26 @@ describe("ALLOWED_ONBOARDING_EVENTS", () => {
       "channel_connected",
       "onboarding_completed",
       "onboarding_skipped",
+      // Phase 2 — Onboarding v2 analytics
+      "channel_selected",
+      "channels_skipped",
+      "icp_selected",
+      "value_prop_edited",
+      "ads_generated",
+      "ads_regenerated",
+      "welcome_offer_shown",
+      "welcome_offer_outcome",
+      "brand_build_status",
+      "onboarding_abandoned",
+      "deviation",
     ];
     for (const name of expected) {
       expect(ALLOWED_ONBOARDING_EVENTS.has(name)).toBe(true);
     }
+  });
+
+  it("rejects made-up event names — allowlist is strict", () => {
+    expect(ALLOWED_ONBOARDING_EVENTS.has("totally_made_up")).toBe(false);
+    expect(ALLOWED_ONBOARDING_EVENTS.has("")).toBe(false);
   });
 });

@@ -24,6 +24,7 @@ import {
   OnboardingEvent,
 } from "../utils/onboardingStage";
 import { onOnboardingStageChanged } from "../services/contactCaptureHooks";
+import { mirrorOnboardingEventToLead } from "../services/onboardingLeadSync";
 
 const router = express.Router();
 
@@ -123,6 +124,20 @@ router.post("/events", authenticateToken, async (req, res) => {
         toStage: newStage,
         triggeredByEvent: event,
         changedAt: newEvent.ts,
+      }).catch(() => {});
+    }
+
+    // Onboarding v2: dual-write the full event stream to the matched Lead
+    // row so Fangfang / Emma can reason over Lead records without cross-joining
+    // to User. Fire-and-forget — must never break the primary User write.
+    // Task: https://www.notion.so/34c09247c951812cbc90f09aa68fc5d3
+    if (user.email) {
+      mirrorOnboardingEventToLead({
+        userId,
+        email: user.email,
+        event: newEvent,
+        allEvents: appended,
+        onboardingStage: newStage,
       }).catch(() => {});
     }
 
