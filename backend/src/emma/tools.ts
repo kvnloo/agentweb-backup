@@ -282,7 +282,7 @@ emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
-    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Use this to show users available campaigns before fetching metrics with get_meta_ads_metrics.',
+    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -629,7 +629,7 @@ emmaToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           minItems: 1,
-          description: 'Required list of campaign IDs to filter metrics by. Use call_meta_marketing_api to get available campaign IDs.'
+          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
         }
       },
       required: ['campaign_ids']

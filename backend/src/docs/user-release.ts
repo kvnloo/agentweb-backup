@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-24',
     changes: [
+      'Fix: Meta Ads Reports Now Work Even When Meta Connected Account Is Unavailable',
+      '- If your Meta connected account is missing or expired, Emma now automatically falls back to the legacy ad account configuration and continues fetching campaign data without stopping',
+      '- Previously, Emma would stall or spiral into repeated failed attempts when the connected account was unavailable',
+      '- The workflow is unchanged: Emma lists your campaigns first, then fetches 7-day performance metrics — it just works without a connected account',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
       'Fix: Agent Mode Progress Panel No Longer Shows Duplicate Tool Calls',
       '- The progress panel was showing each tool call multiple times when the agent ran more than one round of tools in a single response',
       '- Root cause: the backend was sending the full cumulative list of all tool calls on every progress event; the frontend re-added any tool it could not match to an active card, causing duplicates',
