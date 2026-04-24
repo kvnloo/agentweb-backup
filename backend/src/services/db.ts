@@ -3936,6 +3936,25 @@ export const crmDb = {
     }
   },
 
+  async getLeadByAttioRecordId(listId: string, recordId: string) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        KeyConditionExpression: 'listId = :listId',
+        FilterExpression: 'syncMetadata.attio_record_id = :recordId',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':recordId': recordId,
+        },
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items?.[0] ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByAttioRecordId");
+      throw error;
+    }
+  },
+
   async getLeadByHubSpotContactId(listId: string, contactId: string) {
     try {
       const params: any = {

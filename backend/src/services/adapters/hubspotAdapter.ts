@@ -280,7 +280,19 @@ export class HubspotAdapter implements CrmAdapter {
             propsWithName = { ...propsWithName, pipeline: config.externalPipelineId };
         }
 
-        const existingDealId: string | undefined = lead.syncMetadata?.hubspot_deal_id || lead.customFields?.hubspot_deal_id;
+        // Prefer DB-stored deal ID; fall back to CRM lookup to avoid creating duplicates
+        // if a previous sync created the deal but failed to save the ID to our DB.
+        let existingDealId: string | undefined = lead.syncMetadata?.hubspot_deal_id || lead.customFields?.hubspot_deal_id;
+        if (!existingDealId) {
+            const associated = await svc.getContactDealAssociations(contactId).catch((err: any) => {
+                console.error(`[HubspotAdapter] failed to look up existing deals for contact ${contactId}: ${this.formatError(err)}`);
+                return [] as string[];
+            });
+            existingDealId = associated[0];
+            if (existingDealId) {
+                console.log(`[HubspotAdapter] recovered existing deal ${existingDealId} for contact ${contactId} via CRM lookup`);
+            }
+        }
         let dealId: string;
 
         if (existingDealId) {
@@ -288,6 +300,8 @@ export class HubspotAdapter implements CrmAdapter {
                 await svc.updateDeal(existingDealId, dealProps);
                 dealId = existingDealId;
                 console.log(`[HubspotAdapter] updated HubSpot deal ${existingDealId} for lead=${lead.email || lead.leadId}`);
+                await svc.associateContactToDeal(contactId, dealId);
+                console.log(`[HubspotAdapter] re-associated contact ${contactId} to deal ${dealId}`);
             } catch (err: any) {
                 console.error(
                     `[HubspotAdapter] update failed for HubSpot deal ${existingDealId} lead=${lead.email || lead.leadId}: ${this.formatError(err)}. Falling back to create.`,

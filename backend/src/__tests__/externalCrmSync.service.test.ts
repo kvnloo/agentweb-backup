@@ -265,7 +265,7 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.customFieldMapping).toEqual(customMapping);
     });
 
-    it('merges Attio deal mappings into custom mappings', async () => {
+    it('saves Attio deal mappings separately (not merged into custom mappings)', async () => {
       mockNoConfig();
       mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
@@ -280,10 +280,16 @@ describe('ExternalCrmSyncService', () => {
 
       const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
       const saved = call[2] as Record<string, any>;
-      expect(saved.dealFieldMapping).toEqual([]);
-      expect(saved.customFieldMapping).toEqual(expect.arrayContaining([
+      // Attio now has a proper Deals object — deal mappings stay in dealFieldMapping
+      expect(saved.dealFieldMapping).toEqual(expect.arrayContaining([
         expect.objectContaining({ agentwebField: 'status', crmProperty: 'deal_status' }),
+      ]));
+      // Custom mappings should only contain what was passed, not deal entries
+      expect(saved.customFieldMapping).toEqual(expect.arrayContaining([
         expect.objectContaining({ agentwebField: 'company', crmProperty: 'company_name' }),
+      ]));
+      expect(saved.customFieldMapping).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'status', crmProperty: 'deal_status' }),
       ]));
     });
 

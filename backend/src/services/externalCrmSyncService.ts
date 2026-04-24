@@ -119,7 +119,10 @@ export const DEFAULT_ATTIO_CONTACT_MAPPING: FieldMapping[] = [
   // It is synced as a list-entry attribute via DEFAULT_ATTIO_CUSTOM_MAPPING below.
 ];
 
-export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
+export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [
+  { agentwebField: 'dealValue', crmProperty: 'value', direction: 'both', enabled: true },
+  { agentwebField: 'status', crmProperty: 'stage', direction: 'both', enabled: true },
+];
 
 export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: false },
@@ -200,14 +203,6 @@ export class ExternalCrmSyncService {
     let nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
 
-    // Attio has no separate "deal" object — deal mappings are stored as list-entry (custom) attrs.
-    // When saving for Attio, merge any deal mappings into customFieldMapping and clear dealFieldMapping.
-    if (!isHubspot && nextDealFieldMapping.length > 0) {
-      const existingCustomKeys = new Set(nextCustomFieldMapping.map((m: FieldMapping) => m.agentwebField));
-      const dealEntries = nextDealFieldMapping.filter((m: FieldMapping) => !existingCustomKeys.has(m.agentwebField));
-      nextCustomFieldMapping = [...nextCustomFieldMapping, ...dealEntries];
-      nextDealFieldMapping = [];
-    }
 
     // Pipeline selection is locked once any sync has occurred.
     const alreadySynced = !!(existing?.lastPushSyncAt || existing?.lastPullSyncAt);
@@ -452,26 +447,27 @@ export class ExternalCrmSyncService {
       return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
     }
 
-    // Attio: contacts use People attributes, while deal mappings use Deals attributes.
+    // Attio: contacts use People attributes; deal section uses Deals object attributes.
     const svc = auth.type === 'token'
       ? AttioService.fromToken(auth.apiKey!)
       : await AttioService.create(auth.userId!, auth.accountId!);
 
-
-
-    // Attio: merge People object attributes + list-entry attributes
+    if (options.objectType === 'deal') {
+      const dealAttrs = await svc.getAllDealAttributes();
+      return {
+        properties: dealAttrs
+          .filter(a => a.api_slug !== 'associated_people' && a.api_slug !== 'associated_company')
+          .map(a => ({ name: a.api_slug, label: a.title, type: a.type })),
+      };
+    }
 
     const peopleAttrs = await svc.getAllPeopleAttributes();
     const properties: CrmProperty[] = [];
 
     for (const a of peopleAttrs) {
       if (a.type === 'personal-name') {
-        // Expand the composite name attribute into selectable first_name / last_name sub-fields.
-        // The adapter's buildPersonValues already handles these slugs specially, so they map
-        // correctly to values.name[0].first_name / values.name[0].last_name on write.
         properties.push({ name: 'first_name', label: 'First Name', type: 'text' });
         properties.push({ name: 'last_name', label: 'Last Name', type: 'text' });
-        // Also keep the composite 'name' for full-name string mappings
         properties.push({ name: a.api_slug, label: a.title, type: a.type });
       } else {
         properties.push({ name: a.api_slug, label: a.title, type: a.type });
@@ -514,6 +510,12 @@ export class ExternalCrmSyncService {
       const svc = auth.type === 'token'
         ? AttioService.fromToken(auth.apiKey!)
         : await AttioService.create(auth.userId!, auth.accountId!);
+      const dealId = lead.syncMetadata?.attio_deal_id;
+      if (dealId) {
+        await svc.deleteDeal(dealId).catch(err =>
+          console.error(`[ExternalCrmSync] deleteLeadFromCrm: failed to delete Attio deal ${dealId}:`, err.message)
+        );
+      }
       const recordId = lead.syncMetadata?.attio_record_id ?? lead.customFields?.attio_record_id;
       if (recordId) {
         await svc.deletePerson(recordId);
@@ -535,7 +537,7 @@ export class ExternalCrmSyncService {
   private getStandardFieldKeys(provider?: string): string[] {
     const internalFields = [
       'leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt',
-      'hubspot_contact_id', 'hubspot_deal_id', 'attio_record_id',
+      'hubspot_contact_id', 'hubspot_deal_id', 'attio_record_id', 'attio_deal_id',
       'status', 'dealValue', 'dealCurrency', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin',
       'chatSessionCount'
     ];

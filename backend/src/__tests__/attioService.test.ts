@@ -366,6 +366,52 @@ describe('AttioService', () => {
     });
   });
 
+  describe('resolveObjectSlug', () => {
+    beforeEach(() => {
+      // Clear the module-level cache between tests so they don't bleed
+      (AttioService as any).objectIdSlugCache = new Map();
+    });
+
+    it('fetches objects list and returns slug for a known UUID', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          data: [
+            { id: { object_id: 'uuid-people-123' }, api_slug: 'people' },
+            { id: { object_id: 'uuid-deals-456' }, api_slug: 'deals' },
+          ],
+        },
+      });
+
+      const slug = await service.resolveObjectSlug('uuid-people-123');
+      expect(slug).toBe('people');
+    });
+
+    it('returns slug from cache without re-fetching on second call', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { data: [{ id: { object_id: 'uuid-abc' }, api_slug: 'companies' }] },
+      });
+
+      await service.resolveObjectSlug('uuid-abc');
+      await service.resolveObjectSlug('uuid-abc');
+
+      expect(mockAxiosGet).toHaveBeenCalledTimes(1); // only one fetch, then cached
+    });
+
+    it('returns empty string when UUID not in objects list', async () => {
+      mockAxiosGet.mockResolvedValueOnce({ data: { data: [{ id: { object_id: 'other-uuid' }, api_slug: 'notes' }] } });
+
+      const slug = await service.resolveObjectSlug('uuid-unknown');
+      expect(slug).toBe('');
+    });
+
+    it('returns empty string and does not throw on API error', async () => {
+      mockAxiosGet.mockRejectedValueOnce(new Error('network error'));
+
+      const slug = await service.resolveObjectSlug('uuid-xyz');
+      expect(slug).toBe('');
+    });
+  });
+
   describe('addPersonToList with entry values', () => {
     it('passes entry_values when provided', async () => {
       mockAxiosPost.mockResolvedValue({ data: {} });

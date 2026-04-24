@@ -25,6 +25,16 @@ export interface AttioCompany {
   domainNames?: string[];
 }
 
+export interface AttioDeal {
+  recordId: string;
+  name?: string;
+  stage?: string;
+  value?: number;
+  ownerEmail?: string;
+  associatedPeopleIds?: string[];
+  associatedCompanyId?: string;
+}
+
 // ─── Module-level account resolver ───────────────────────────────────────────
 
 async function resolveAttioAccount(userId: string, accountId?: string) {
@@ -52,6 +62,9 @@ async function resolveAttioAccount(userId: string, accountId?: string) {
 
 export class AttioService {
   private readonly baseUrl = ATTIO_API_BASE;
+
+  // object_id UUID → api_slug cache (e.g. "people", "deals"). Never changes at runtime.
+  private static objectIdSlugCache: Map<string, string> = new Map();
 
   // ─── Instance state ───────────────────────────────────────────────────────
   // _token      — always set (resolved at factory time or passed directly)
@@ -109,6 +122,26 @@ export class AttioService {
       const msg = err.response?.data?.message || err.message || 'Unknown error';
       return { valid: false, error: msg };
     }
+  }
+
+  // Resolves an Attio object_id UUID to its api_slug (e.g. "people", "deals").
+  // Results are cached at the class level since object IDs never change.
+  async resolveObjectSlug(objectId: string): Promise<string> {
+    if (AttioService.objectIdSlugCache.has(objectId)) {
+      return AttioService.objectIdSlugCache.get(objectId)!;
+    }
+    try {
+      const res = await axiosInstance.get(`${this.baseUrl}/objects`, { headers: this.headers() });
+      const objects: any[] = (res.data as any).data ?? [];
+      for (const obj of objects) {
+        const id: string = obj.id?.object_id ?? '';
+        const slug: string = obj.api_slug ?? '';
+        if (id && slug) AttioService.objectIdSlugCache.set(id, slug);
+      }
+    } catch (err: any) {
+      console.error('[AttioService] Failed to fetch object list for slug resolution:', err.message);
+    }
+    return AttioService.objectIdSlugCache.get(objectId) ?? '';
   }
 
   // ─── Mappers ──────────────────────────────────────────────────────────────
@@ -342,6 +375,156 @@ export class AttioService {
 
     return this.mapCompany((res.data as any)?.data);
   }
+
+  // ─── Deals ────────────────────────────────────────────────────────────────
+
+  private mapDeal(record: any): AttioDeal {
+    const v = record?.values ?? {};
+    return {
+      recordId: record?.id?.record_id ?? record?.id,
+      name: v.name?.[0]?.value ?? '',
+      stage: v.stage?.[0]?.status?.title ?? '',
+      value: v.value?.[0]?.currency_value ?? undefined,
+      ownerEmail: v.owner?.[0]?.workspace_member_email_address ?? undefined,
+      associatedPeopleIds: (v.associated_people ?? []).map((r: any) => r.target_record_id).filter(Boolean),
+      associatedCompanyId: v.associated_company?.[0]?.target_record_id ?? undefined,
+    };
+  }
+
+  async getDealById(recordId: string): Promise<AttioDeal | null> {
+    try {
+      const res = await axiosInstance.get(
+        `${this.baseUrl}/objects/deals/records/${recordId}`,
+        { headers: this.headers() }
+      );
+      return this.mapDeal((res.data as any)?.data);
+    } catch {
+      return null;
+    }
+  }
+
+  async createDeal(data: {
+    name: string;
+    stage?: string;
+    value?: number;
+    owner?: string;
+    associatedPersonId?: string;
+    associatedCompanyId?: string;
+  }): Promise<string> {
+    const values: Record<string, any> = {
+      name: [{ value: data.name }],
+    };
+    if (data.stage) values.stage = [{ status: data.stage }];
+    if (data.value != null && !isNaN(data.value)) values.value = [{ currency_value: data.value }];
+    if (data.owner) values.owner = [{ workspace_member_email_address: data.owner }];
+    if (data.associatedPersonId) {
+      values.associated_people = [{ target_object: 'people', target_record_id: data.associatedPersonId }];
+    }
+    if (data.associatedCompanyId) {
+      values.associated_company = [{ target_object: 'companies', target_record_id: data.associatedCompanyId }];
+    }
+
+    const res = await axiosInstance.post(
+      `${this.baseUrl}/objects/deals/records`,
+      { data: { values } },
+      { headers: this.headers() }
+    );
+    const recordId = (res.data as any).data?.id?.record_id;
+    if (!recordId) throw new Error('Attio createDeal returned no record_id');
+    return recordId;
+  }
+
+  async updateDeal(recordId: string, data: {
+    name?: string;
+    stage?: string;
+    value?: number;
+    owner?: string;
+    associatedPersonId?: string;
+    associatedCompanyId?: string;
+  }): Promise<void> {
+    const values: Record<string, any> = {};
+    if (data.name != null) values.name = [{ value: data.name }];
+    if (data.stage != null) values.stage = [{ status: data.stage }];
+    if (data.value != null && !isNaN(data.value)) values.value = [{ currency_value: data.value }];
+    if (data.owner) values.owner = [{ workspace_member_email_address: data.owner }];
+    if (data.associatedPersonId) {
+      values.associated_people = [{ target_object: 'people', target_record_id: data.associatedPersonId }];
+    }
+    if (data.associatedCompanyId) {
+      values.associated_company = [{ target_object: 'companies', target_record_id: data.associatedCompanyId }];
+    }
+    if (Object.keys(values).length === 0) return;
+
+    await axiosInstance.patch(
+      `${this.baseUrl}/objects/deals/records/${recordId}`,
+      { data: { values } },
+      { headers: this.headers() }
+    );
+  }
+
+  async deleteDeal(recordId: string): Promise<void> {
+    await axiosInstance.delete(
+      `${this.baseUrl}/objects/deals/records/${recordId}`,
+      { headers: this.headers() }
+    );
+  }
+
+  async findDealsByPersonId(personId: string): Promise<AttioDeal[]> {
+    try {
+      const res = await axiosInstance.post(
+        `${this.baseUrl}/objects/deals/records/query`,
+        {
+          filter: { associated_people: { target_record_id: { $eq: personId } } },
+          limit: 10,
+        },
+        { headers: this.headers() }
+      );
+      return ((res.data as any)?.data ?? []).map((r: any) => this.mapDeal(r));
+    } catch {
+      return [];
+    }
+  }
+
+  async getAllDealAttributes(): Promise<Array<{ api_slug: string; title: string; type: string; is_system_attribute: boolean }>> {
+    const res = await axiosInstance.get(
+      `${this.baseUrl}/objects/deals/attributes`,
+      { headers: this.headers() }
+    );
+    return ((res.data as any)?.data ?? []).map((a: any) => ({
+      api_slug: a.api_slug as string,
+      title: a.title as string,
+      type: a.type as string,
+      is_system_attribute: !!a.is_system_attribute,
+    }));
+  }
+
+  async getDealStages(): Promise<Array<{ id: string; title: string }>> {
+    return this.listAttributeStatuses('deals', 'stage');
+  }
+
+  async getFirstWorkspaceMemberEmail(): Promise<string | null> {
+    try {
+      const res = await axiosInstance.get(
+        `${this.baseUrl}/workspace_members`,
+        { headers: this.headers() }
+      );
+      const members: any[] = (res.data as any)?.data ?? [];
+      return members[0]?.email_address ?? null;
+    } catch (error) {
+      console.error('[AttioService] getFirstWorkspaceMemberEmail failed:', error);
+      return null;
+    }
+  }
+
+  async getDefaultDealStage(): Promise<string | null> {
+    try {
+      const stages = await this.listAttributeStatuses('deals', 'stage');
+      return stages[0]?.title ?? null;
+    } catch {
+      return null;
+    }
+  }
+
 
   // ─── Lists ────────────────────────────────────────────────────────────────
   // Attio Lists are named collections of People or Company records.

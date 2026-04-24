@@ -92,7 +92,7 @@ async function handleHubSpotEvent(
   const events: any[] = Array.isArray(body) ? body : [body];
 
   // Group all property changes by contact objectId
-  const byObjectId: Record<string, { properties: Record<string, string>; isDeleted: boolean }> = {};
+  const byObjectId: Record<string, { properties: Record<string, string>; isDeleted: boolean; isDeal?: boolean }> = {};
   for (const event of events) {
     const eventType: string = event?.subscriptionType ?? '';
     const objectId: string = String(event?.objectId ?? '');
@@ -100,7 +100,7 @@ async function handleHubSpotEvent(
     const propertyValue: string = event?.propertyValue ?? '';
 
     const changeSource: string = event?.changeSource ?? '';
-    const relevant = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
+    const relevant = ['contact.creation', 'contact.propertyChange', 'contact.deletion', 'deal.propertyChange'].includes(eventType);
     if (!relevant || !objectId) continue;
     if (changeSource === 'API') {
       console.log(`[CrmWebhook/HubSpot] Skipping API-sourced event for objectId=${objectId}`);
@@ -112,6 +112,9 @@ async function handleHubSpotEvent(
     }
     if (eventType === 'contact.deletion') {
       byObjectId[objectId].isDeleted = true;
+    }
+    if (eventType === 'deal.propertyChange') {
+      byObjectId[objectId].isDeal = true;
     }
     if (propertyName && propertyValue !== undefined) {
       byObjectId[objectId].properties[propertyName] = propertyValue;
@@ -147,13 +150,65 @@ async function handleHubSpotEvent(
     let email: string | null = data.properties.email || null;
     if (!email) {
       try {
-        email = await svc.getContactEmailById(objectId);
-      } catch {
-        // Non-fatal — skip this contact if we can't resolve the email
+        if (data.isDeal) {
+          console.log(`[CrmWebhook/HubSpot] Fetching associations for deal ${objectId}`);
+          const contactIds = await svc.getDealContactAssociations(objectId);
+          console.log(`[CrmWebhook/HubSpot] Found ${contactIds.length} associated contacts for deal ${objectId}:`, contactIds);
+          if (contactIds.length > 0) {
+            const fetchedEmail = await svc.getContactEmailById(contactIds[0]);
+            console.log(`[CrmWebhook/HubSpot] Resolved email ${fetchedEmail} for contact ${contactIds[0]}`);
+            if (fetchedEmail) email = fetchedEmail;
+          }
+        } else {
+          const fetchedEmail = await svc.getContactEmailById(objectId);
+          if (fetchedEmail) email = fetchedEmail;
+        }
+      } catch (err: any) {
+        console.error(`[CrmWebhook/HubSpot] Error resolving email for ${data.isDeal ? 'deal' : 'contact'} ${objectId}:`, err.response?.data || err.message);
       }
     }
     if (!email) {
-      console.log(`[CrmWebhook/HubSpot] Could not resolve email for objectId=${objectId}, skipping`);
+      console.log(`[CrmWebhook/HubSpot] Could not resolve email for ${data.isDeal ? 'deal' : 'contact'} ${objectId}, skipping`);
+      continue;
+    }
+
+    if (data.isDeal) {
+      // Apply deal mapping configuration updates
+      if (!config.dealFieldMapping) continue;
+      const dealUpdates: any = {};
+      const dealCustomUpdates: any = {};
+      const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+
+      const reverseStageMapping = (val: string) => {
+        if (!config.hubspotDealStageMap) return val;
+        const reverseEntry = Object.entries(config.hubspotDealStageMap).find(([, stageId]) => stageId === val);
+        return reverseEntry?.[0] || val;
+      };
+
+      const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+      for (const [key, val] of Object.entries(data.properties)) {
+        const mapping = pullDealMappings.find(m => m.crmProperty === key);
+        if (mapping) {
+          // 'dealstage' is HubSpot's fixed system field for pipeline stage — not a custom property
+          const mappedVal = key === 'dealstage' ? reverseStageMapping(val) : val;
+          if (nativeDealFields.includes(mapping.agentwebField)) {
+            dealUpdates[mapping.agentwebField] = mappedVal;
+          } else {
+            dealCustomUpdates[mapping.agentwebField] = mappedVal;
+          }
+        }
+      }
+
+      const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+      if (lead) {
+        if (Object.keys(dealCustomUpdates).length > 0) {
+          dealUpdates.customFields = { ...(lead.customFields || {}), ...dealCustomUpdates };
+        }
+        if (Object.keys(dealUpdates).length > 0) {
+          await crmDb.updateLead(listId, lead.leadId, dealUpdates);
+          console.log(`[CrmWebhook/HubSpot] Updated deal properties for lead ${lead.leadId} in list ${listId}`);
+        }
+      }
       continue;
     }
 
@@ -204,11 +259,29 @@ async function handleHubSpotEvent(
   }
 }
 
+function extractAttioValue(values: any[] | undefined, type: string): any {
+  if (!values || !values.length) return undefined;
+  const entry = values[0];
+  const cleanType = type.replace(/-/g, '_');
+  switch (cleanType) {
+    case 'status': return entry.status?.title ?? entry.status?.target;
+    case 'select': return entry.select?.title ?? entry.select?.target;
+    case 'currency': return entry.currency_value;
+    case 'number': return entry.number_value;
+    case 'email_address': return entry.email_address;
+    case 'phone_number': return entry.original_phone_number;
+    case 'personal_name':
+    case 'name':
+      return `${entry.first_name || ''} ${entry.last_name || ''}`.trim();
+    default: return entry.value ?? entry.target_record_id;
+  }
+}
+
 // ─── Attio event handler ──────────────────────────────────────────────────────
 
 /**
  * Attio sends a single event per request.
- * We only handle 'people' object events — companies are ignored.
+ * We handle 'people' and 'deals' object events.
  */
 async function handleAttioEvent(
   userId: string,
@@ -226,39 +299,86 @@ async function handleAttioEvent(
   for (const event of events) {
     const eventType: string = event?.event_type ?? '';
     const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
+    const objectId: string = event?.id?.object_id ?? event?.data?.record?.id?.object_id ?? '';
     const actorType: string = event?.actor?.type ?? event?.data?.actor?.type ?? '';
-    const objectSlug: string = event?.data?.object?.slug ?? '';
 
     const relevant = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
     if (!relevant || !recordId) continue;
-    // Only process People records — skip Companies and other object types
-    if (objectSlug && objectSlug !== 'people') continue;
+
+    // Resolve object_id UUID → api_slug since Attio's webhook payload does not include slug
+    const objectSlug: string = objectId
+      ? await svc.resolveObjectSlug(objectId)
+      : (event?.data?.object?.slug ?? '');
+    console.log(`[CrmWebhook/Attio] eventType=${eventType} objectSlug=${objectSlug} recordId=${recordId} actorType=${actorType}`);
+
+    // Only process People and Deals — skip companies, notes, and anything unknown
+    if (objectSlug !== 'people' && objectSlug !== 'deals') continue;
     if (actorType === 'api-token') {
       console.log(`[CrmWebhook/Attio] Skipping API-sourced event for recordId=${recordId}`);
       continue;
     }
 
     if (eventType === 'record.deleted') {
+      if (objectSlug === 'deals') continue; // We do not delete leads when a deal is deleted
+
       if (!config.deleteOnPull) {
         console.log(`[CrmWebhook/Attio] deletion event for recordId=${recordId} ignored (deleteOnPull is disabled)`);
         continue;
       }
-      try {
-        const values = await svc.getPersonValues(recordId);
-        const email = values.email_addresses?.[0]?.email_address ?? '';
-        if (!email) continue;
-        const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
-        if (lead) {
-          await crmDb.deleteLead(listId, lead.leadId);
-          console.log(`[CrmWebhook/Attio] Deleted lead ${lead.leadId} from list ${listId}`);
-        }
-      } catch (err: any) {
-        console.error(`[CrmWebhook/Attio] Failed to process deletion for recordId=${recordId}:`, err?.message);
+      const lead = await crmDb.getLeadByAttioRecordId(listId, recordId);
+      if (lead) {
+        await crmDb.deleteLead(listId, lead.leadId);
+        console.log(`[CrmWebhook/Attio] Deleted lead ${lead.leadId} from list ${listId}`);
       }
       continue;
     }
 
-    // Fetch person values from Attio for created/updated
+    if (objectSlug === 'deals') {
+      const deal = await svc.getDealById(recordId);
+      if (!deal) continue;
+
+      const pullDealMappings = (config.dealFieldMapping || []).filter(m => m.enabled && m.direction !== 'push');
+      if (pullDealMappings.length === 0) continue;
+
+      for (const personId of (deal.associatedPeopleIds || [])) {
+        const pValues = await svc.getPersonValues(personId).catch(() => null);
+        if (!pValues) continue;
+        const email = extractAttioValue(pValues.email_addresses, 'email_address');
+        if (!email) continue;
+
+        const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+        if (!lead) continue;
+
+        const dealUpdates: any = {};
+        const dealCustomFields: any = {};
+        const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+
+        for (const m of pullDealMappings) {
+          if (m.crmProperty === 'stage' && deal.stage) {
+            if (nativeDealFields.includes(m.agentwebField)) dealUpdates[m.agentwebField] = deal.stage;
+            else dealCustomFields[m.agentwebField] = deal.stage;
+          } else if (m.crmProperty === 'value' && deal.value != null) {
+            if (nativeDealFields.includes(m.agentwebField)) dealUpdates[m.agentwebField] = deal.value;
+            else dealCustomFields[m.agentwebField] = deal.value;
+          } else if (m.crmProperty === 'name' && deal.name) {
+            if (nativeDealFields.includes(m.agentwebField)) dealUpdates[m.agentwebField] = deal.name;
+            else dealCustomFields[m.agentwebField] = deal.name;
+          }
+        }
+
+        if (Object.keys(dealCustomFields).length > 0) {
+          dealUpdates.customFields = { ...(lead.customFields || {}), ...dealCustomFields };
+        }
+
+        if (Object.keys(dealUpdates).length > 0) {
+          await crmDb.updateLead(listId, lead.leadId, dealUpdates);
+          console.log(`[CrmWebhook/Attio] Updated deal properties for lead ${lead.leadId} in list ${listId}`);
+        }
+      }
+      continue;
+    }
+
+    // Process People updates (including custom fields)
     let values: Record<string, any>;
     try {
       values = await svc.getPersonValues(recordId);
@@ -267,36 +387,56 @@ async function handleAttioEvent(
       continue;
     }
 
-    const email = values.email_addresses?.[0]?.email_address ?? '';
+    const email = extractAttioValue(values.email_addresses, 'email_address');
     if (!email) {
       console.log(`[CrmWebhook/Attio] No email for recordId=${recordId}, skipping`);
       continue;
     }
 
-    const firstName = values.name?.[0]?.first_name ?? '';
-    const lastName = values.name?.[0]?.last_name ?? '';
-    const phone = values.phone_numbers?.[0]?.original_phone_number ?? '';
-    const title = values.job_title?.[0]?.value ?? '';
-    const linkedin = values.linkedin?.[0]?.value ?? '';
+    const attrCache = await svc.loadAttributeTypes('people');
+    const pullContactMappings = config.contactFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+    const pullCustomMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+
+    const leadFields: Record<string, any> = { email: email.toLowerCase(), syncMetadata: { attio_record_id: recordId } };
+    const customFields: Record<string, any> = {};
+
+    for (const m of pullContactMappings) {
+      if (m.crmProperty === 'company') continue; // Handled separately or explicitly pulled otherwise
+      const type = attrCache.get(`object:people:${m.crmProperty}`) || 'text';
+      const val = extractAttioValue(values[m.crmProperty], type);
+      if (val != null && val !== '') {
+        leadFields[m.agentwebField] = val;
+      }
+    }
+
+    for (const m of pullCustomMappings) {
+      const type = attrCache.get(`object:people:${m.crmProperty}`) || 'text';
+      const val = extractAttioValue(values[m.crmProperty], type);
+      if (val != null && val !== '') {
+        customFields[m.agentwebField] = val;
+      }
+    }
+
+    if (Object.keys(customFields).length > 0) {
+      leadFields.customFields = customFields;
+    }
 
     const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
 
     if (!lead) {
-      const newLead: Record<string, any> = { email: email.toLowerCase(), syncMetadata: { attio_record_id: recordId } };
-      if (firstName) newLead.firstName = firstName;
-      if (lastName) newLead.lastName = lastName;
-      if (phone) newLead.phone = phone;
-      if (title) newLead.title = title;
-      if (linkedin) newLead.linkedin = linkedin;
-      await crmDb.createLead(listId, newLead);
+      await crmDb.createLead(listId, leadFields);
       console.log(`[CrmWebhook/Attio] Created lead for ${email} in list ${listId}`);
     } else {
-      const updates: Record<string, any> = {};
-      if (firstName) updates.firstName = firstName;
-      if (lastName) updates.lastName = lastName;
-      if (phone) updates.phone = phone;
-      if (title) updates.title = title;
-      if (linkedin) updates.linkedin = linkedin;
+      const mergedCustomFields = Object.keys(customFields).length > 0
+        ? { ...(lead.customFields || {}), ...customFields }
+        : undefined;
+
+      const updates: Record<string, any> = { ...leadFields };
+      delete updates.email;
+      delete updates.syncMetadata;
+      delete updates.customFields;
+      if (mergedCustomFields) updates.customFields = mergedCustomFields;
+
       if (Object.keys(updates).length > 0) {
         await crmDb.updateLead(listId, lead.leadId, updates);
         console.log(`[CrmWebhook/Attio] Updated lead ${lead.leadId} in list ${listId}`);

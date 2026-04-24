@@ -390,11 +390,11 @@ describe('HubSpotService — associateContactToDeal', () => {
   let svc: HubSpotService;
   beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
 
-  it('calls v4 associations default endpoint', async () => {
+  it('calls v3 associations endpoint with type 4', async () => {
     mockAxiosPut.mockResolvedValue({ data: {} });
     await svc.associateContactToDeal('hs-contact-1', 'hs-deal-1');
     expect(mockAxiosPut).toHaveBeenCalledWith(
-      expect.stringContaining('crm/v4/objects/contacts/hs-contact-1/associations/default/deals/hs-deal-1'),
+      expect.stringContaining('crm/v3/objects/contacts/hs-contact-1/associations/deals/hs-deal-1/4'),
       undefined,
       expect.any(Object)
     );
@@ -567,20 +567,26 @@ describe('HubSpotService — getContactDealAssociations', () => {
   let svc: HubSpotService;
   beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
 
-  it('returns array of deal ids from associations', async () => {
+  it('returns array of deal ids from v3 associations', async () => {
     mockAxiosGet.mockResolvedValue({
-      data: { results: [{ id: 'deal-1' }, { id: 'deal-2' }] },
+      data: { associations: { deals: { results: [{ id: 'deal-1' }, { id: 'deal-2' }] } } },
     });
     const ids = await svc.getContactDealAssociations('hs-contact-1');
     expect(mockAxiosGet).toHaveBeenCalledWith(
-      expect.stringContaining('contacts/hs-contact-1/associations/deals'),
+      expect.stringContaining('crm/v3/objects/contacts/hs-contact-1?associations=deals'),
       expect.any(Object)
     );
     expect(ids).toEqual(['deal-1', 'deal-2']);
   });
 
   it('returns empty array when no deals associated', async () => {
-    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    mockAxiosGet.mockResolvedValue({ data: { associations: { deals: { results: [] } } } });
+    const ids = await svc.getContactDealAssociations('hs-contact-1');
+    expect(ids).toEqual([]);
+  });
+
+  it('returns empty array when associations field is absent', async () => {
+    mockAxiosGet.mockResolvedValue({ data: {} });
     const ids = await svc.getContactDealAssociations('hs-contact-1');
     expect(ids).toEqual([]);
   });

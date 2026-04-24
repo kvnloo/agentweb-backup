@@ -77,7 +77,23 @@ export class AttioAdapter implements CrmAdapter {
                     console.error(`[AttioAdapter] Failed to ensure person attribute "${rawSlug}":`, errDetails);
                 });
         }
-        console.log(`[AttioAdapter] Ensured person-level slugs:`, Array.from(ensuredSlugs));
+        // ── Prefetch deal defaults (once per batch) ───────────────────────────
+        // Fetch first available stage and first workspace member email as fallbacks,
+        // since Attio requires both stage and owner on deal creation.
+        let defaultDealStage: string | null = null;
+        let defaultOwnerEmail: string | null = null;
+        try {
+            const [stages, ownerEmail] = await Promise.all([
+                svc.getDealStages(),
+                svc.getFirstWorkspaceMemberEmail(),
+            ]);
+            defaultDealStage = stages[0]?.title ?? null;
+            defaultOwnerEmail = ownerEmail;
+
+        } catch (err: any) {
+            console.warn('[AttioAdapter] Could not prefetch deal defaults:', err.message);
+        }
+
 
         // ── 4. Sync each lead ───────────────────────────────────────────────────
         for (const lead of leads) {
@@ -120,13 +136,6 @@ export class AttioAdapter implements CrmAdapter {
 
                 let personId: string | undefined;
 
-                // ── DEBUG: log exact payload for name attribute ───────────────
-                console.log(`[AttioAdapter-DEBUG] lead=${lead.email} name payload:`, JSON.stringify(personValues.name));
-                console.log(`[AttioAdapter-DEBUG] lead=${lead.email} full personValues keys:`, Object.keys(personValues));
-                if (personValues.name) {
-                    console.log(`[AttioAdapter-DEBUG] name[0] keys:`, Object.keys(personValues.name[0] || {}));
-                }
-
                 if (lead.email) {
                     const { recordId, isNew } = await svc.upsertPersonByValues(personValues);
                     personId = recordId;
@@ -151,10 +160,72 @@ export class AttioAdapter implements CrmAdapter {
                 if (!lead.syncMetadata?.attio_record_id) {
                     await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
                         syncMetadata: { ...(lead.syncMetadata || {}), attio_record_id: personId },
-                    }).catch((err: any) => { });
+                    }).catch((err: any) => {
+                        console.error(`[AttioAdapter] failed to persist attio_record_id for ${lead.email}:`, err.message);
+                    });
                     lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: personId };
                 }
 
+                // ── Deal sync (always create/update — mappings only enrich) ──
+                const pushDealMappings = (config.dealFieldMapping ?? []).filter(
+                    m => m.enabled && m.direction !== 'pull'
+                );
+                try {
+                    const dealData = this.buildDealData(lead, pushDealMappings, config.listName, defaultDealStage);
+
+                    // Normalize stage slug/ID to title case then ensure it exists in Attio.
+                    // e.g. 'proposal_sent' → 'Proposal Sent', 'appointmentscheduled' → 'Appointment Scheduled'
+                    if (dealData.stage) {
+                        const normalized = this.normalizeStageTitle(dealData.stage);
+                        dealData.stage = await svc.ensureStatusOption('deals', 'stage', normalized)
+                            .catch((err: any) => {
+                                console.error(`[AttioAdapter] failed to ensure deal stage '${normalized}' for ${lead.email}:`, err.message);
+                                return normalized;
+                            });
+                    }
+
+                    // Prefer DB-stored deal ID; fall back to CRM lookup to avoid creating duplicates
+                    // if a previous sync created the deal but failed to save the ID to our DB.
+                    let existingDealId: string | undefined = lead.syncMetadata?.attio_deal_id;
+                    if (!existingDealId) {
+                        const existingDeals = await svc.findDealsByPersonId(personId).catch(() => []);
+                        existingDealId = existingDeals[0]?.recordId;
+                    }
+
+                    if (existingDealId) {
+                        await svc.updateDeal(existingDealId, {
+                            ...dealData,
+                            associatedPersonId: personId,
+                            associatedCompanyId: companyId,
+                        });
+                        // Persist recovered deal ID if it wasn't in our DB
+                        if (!lead.syncMetadata?.attio_deal_id) {
+                            await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                                syncMetadata: { ...(lead.syncMetadata || {}), attio_deal_id: existingDealId },
+                            }).catch((err: any) => {
+                                console.error(`[AttioAdapter] failed to persist recovered attio_deal_id for ${lead.email}:`, err.message);
+                            });
+                            lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_deal_id: existingDealId };
+                        }
+                    } else {
+                        const dealId = await svc.createDeal({
+                            ...dealData,
+                            owner: defaultOwnerEmail ?? undefined,
+                            associatedPersonId: personId,
+                            associatedCompanyId: companyId,
+                        });
+                        await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                            syncMetadata: { ...(lead.syncMetadata || {}), attio_deal_id: dealId },
+                        }).catch((err: any) => {
+                            console.error(`[AttioAdapter] failed to persist attio_deal_id for ${lead.email}:`, err.message);
+                        });
+                        lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_deal_id: dealId };
+                    }
+                } catch (err: any) {
+                    const msg = err.response?.data?.message || err.message || 'Unknown deal error';
+                    console.error(`[AttioAdapter] Deal sync failed for lead ${lead.email}:`, msg);
+                    // Non-fatal — person synced successfully
+                }
 
                 result.successCount++;
             } catch (err: any) {
@@ -242,6 +313,33 @@ export class AttioAdapter implements CrmAdapter {
                 if (!leadData.email) {
                     console.log(`[Attio-Pull] Skipping person ${personId} because no email was found.`);
                     continue;
+                }
+
+                // ── Deal pull ────────────────────────────────────────────────
+                const pullDealMappings = (config.dealFieldMapping ?? []).filter(
+                    m => m.enabled && m.direction !== 'push'
+                );
+                if (pullDealMappings.length > 0) {
+                    try {
+                        const deals = await svc.findDealsByPersonId(personId);
+                        if (deals.length > 0) {
+                            // AgentWeb maintains a 1:1 contact-to-deal mapping — push always creates/updates
+                            // exactly one deal per contact, so deals[0] is always the only relevant deal.
+                            const deal = deals[0];
+                            syncMetadata.attio_deal_id = deal.recordId;
+                            for (const m of pullDealMappings) {
+                                if (m.crmProperty === 'stage' && deal.stage) {
+                                    leadData[m.agentwebField] = deal.stage;
+                                } else if (m.crmProperty === 'value' && deal.value != null) {
+                                    leadData[m.agentwebField] = deal.value;
+                                } else if (m.crmProperty === 'name' && deal.name) {
+                                    customFields[m.agentwebField] = deal.name;
+                                }
+                            }
+                        }
+                    } catch (err: any) {
+                        console.error(`[Attio-Pull] Failed to fetch deals for person ${personId}:`, err.message);
+                    }
                 }
 
                 if (Object.keys(customFields).length > 0) leadData.customFields = customFields;
@@ -337,6 +435,45 @@ export class AttioAdapter implements CrmAdapter {
         }
 
         return values;
+    }
+
+    private normalizeStageTitle(raw: string): string {
+        return raw
+            .replace(/([a-z])([A-Z])/g, '$1 $2')   // camelCase → words
+            .replace(/[_-]+/g, ' ')                  // snake_case / kebab-case → spaces
+            .replace(/\b\w/g, c => c.toUpperCase()) // title case
+            .trim();
+    }
+
+    private buildDealData(
+        lead: any,
+        dealMappings: FieldMapping[],
+        listName?: string,
+        defaultStage?: string | null
+    ): { name: string; stage?: string; value?: number } {
+        const leadName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || lead.email || 'Deal';
+        const data: { name: string; stage?: string; value?: number } = {
+            name: listName ? `${leadName} — ${listName}` : leadName,
+        };
+
+        for (const m of dealMappings) {
+            const val = this.getNestedValue(lead, m.agentwebField) ?? lead.customFields?.[m.agentwebField];
+            if (val == null || String(val).trim() === '') continue;
+
+            if (m.crmProperty === 'stage') {
+                data.stage = String(val);
+            } else if (m.crmProperty === 'value') {
+                const num = parseFloat(String(val).replace(/[^0-9.]/g, ''));
+                if (!isNaN(num)) data.value = num;
+            }
+        }
+
+        // Fall back to first available stage if stage is required but not set from lead data
+        if (!data.stage && defaultStage) {
+            data.stage = defaultStage;
+        }
+
+        return data;
     }
 
     private formatAttioValue(value: any, type: string): any {

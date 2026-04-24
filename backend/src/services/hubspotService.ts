@@ -501,27 +501,33 @@ export class HubSpotService {
     );
   }
 
-  /**
-   * Associate a contact with a deal using the v4 Associations API.
-   * Uses the HUBSPOT_DEFINED default association type (contact_to_deal).
-   */
   async associateContactToDeal(contactId: string, dealId: string): Promise<void> {
     await axiosInstance.put(
-      `${HUBSPOT_API_BASE}/crm/v4/objects/contacts/${contactId}/associations/default/deals/${dealId}`,
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}/associations/deals/${dealId}/4`,
       undefined,
       { headers: await this.authHeaders() }
     );
   }
 
-  /**
-   * Get the IDs of all deals associated with a contact.
-   */
   async getContactDealAssociations(contactId: string): Promise<string[]> {
     const res = await axiosInstance.get(
-      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}/associations/deals`,
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactId}?associations=deals`,
       { headers: await this.authHeaders() }
     );
-    return ((res.data as any)?.results ?? []).map((r: any) => r.id as string);
+    const associations = (res.data as any)?.associations?.deals?.results ?? [];
+    return associations.map((r: any) => String(r.id));
+  }
+
+  /**
+   * Get the IDs of all contacts associated with a deal.
+   */
+  async getDealContactAssociations(dealId: string): Promise<string[]> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}?associations=contacts`,
+      { headers: await this.authHeaders() }
+    );
+    const associations = (res.data as any)?.associations?.contacts?.results ?? [];
+    return associations.map((r: any) => String(r.id));
   }
 
   /**

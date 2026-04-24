@@ -22,6 +22,8 @@ jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     getLeadByEmail: jest.fn(),
+    getLeadByAttioRecordId: jest.fn(),
+    deleteLead: jest.fn(),
     updateLead: jest.fn(),
   },
 }));
@@ -42,10 +44,23 @@ jest.mock('../services/hubspotService', () => ({
 }));
 
 const mockAttioGetPersonValues = jest.fn();
+const mockAttioResolveObjectSlug = jest.fn();
+const mockAttioLoadAttributeTypes = jest.fn().mockResolvedValue(new Map());
+const mockAttioGetDealById = jest.fn().mockResolvedValue(null);
 jest.mock('../services/attioService', () => ({
   AttioService: {
-    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues }),
-    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues }),
+    fromToken: jest.fn().mockReturnValue({
+      getPersonValues: mockAttioGetPersonValues,
+      resolveObjectSlug: mockAttioResolveObjectSlug,
+      loadAttributeTypes: mockAttioLoadAttributeTypes,
+      getDealById: mockAttioGetDealById,
+    }),
+    create: jest.fn().mockResolvedValue({
+      getPersonValues: mockAttioGetPersonValues,
+      resolveObjectSlug: mockAttioResolveObjectSlug,
+      loadAttributeTypes: mockAttioLoadAttributeTypes,
+      getDealById: mockAttioGetDealById,
+    }),
   },
 }));
 
@@ -83,9 +98,14 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('hubspot'));
     (externalCrmSyncService.resolveAuthForList as jest.Mock).mockResolvedValue({ type: 'token', apiKey: 'api-key-123' });
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByAttioRecordId as jest.Mock).mockResolvedValue(null);
+    (crmDb.deleteLead as jest.Mock).mockResolvedValue(undefined);
     (crmDb.updateLead as jest.Mock).mockResolvedValue(undefined);
     mockHubSpotGetContactEmailById.mockResolvedValue(null);
     mockAttioGetPersonValues.mockResolvedValue({});
+    mockAttioResolveObjectSlug.mockResolvedValue('');
+    mockAttioLoadAttributeTypes.mockResolvedValue(new Map());
+    mockAttioGetDealById.mockResolvedValue(null);
   });
 
   // ─── Invalid inputs ───────────────────────────────────────────────────────────
@@ -247,15 +267,18 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
   });
 
   it('calls getPersonValues and updates lead on Attio record.updated', async () => {
-    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('attio'),
+      // job_title is a plain text Attio attribute; extractAttioValue returns entry.value
+      contactFieldMapping: [
+        { crmProperty: 'job_title', agentwebField: 'title', enabled: true, direction: 'both' },
+      ],
+    });
     mockAttioGetPersonValues.mockResolvedValue({
       email_addresses: [{ email_address: 'attio@company.com' }],
-      name:            [{ first_name: 'Alice', last_name: 'Smith' }],
       job_title:       [{ value: 'CTO' }],
-      phone_numbers:   [{ original_phone_number: '+44-20-1234' }],
-      linkedin:        [],
     });
-    const existingLead = { leadId: 'lead-3', email: 'attio@company.com', firstName: 'Alice' };
+    const existingLead = { leadId: 'lead-3', email: 'attio@company.com' };
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
 
     const event = {
@@ -278,7 +301,7 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(crmDb.updateLead).toHaveBeenCalledWith(
       VALID_LIST_ID,
       'lead-3',
-      expect.objectContaining({ firstName: 'Alice', lastName: 'Smith', title: 'CTO' })
+      expect.objectContaining({ title: 'CTO' })
     );
   });
 
@@ -346,6 +369,160 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(res.status).toBe(200);
     await new Promise(r => setTimeout(r, 50));
     expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  // ─── Attio flat payload format (UUID object_id resolution) ──────────────────
+
+  it('processes flat Attio payload: resolves UUID via resolveObjectSlug → people', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('attio'),
+      contactFieldMapping: [
+        { crmProperty: 'job_title', agentwebField: 'title', enabled: true, direction: 'both' },
+      ],
+    });
+    mockAttioResolveObjectSlug.mockResolvedValue('people');
+    mockAttioGetPersonValues.mockResolvedValue({
+      email_addresses: [{ email_address: 'flat@company.com' }],
+      job_title:       [{ value: 'Engineer' }],
+    });
+    const existingLead = { leadId: 'lead-flat', email: 'flat@company.com' };
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+
+    // Flat format: id.object_id is a UUID, no data.object.slug field
+    const event = {
+      event_type: 'record.updated',
+      id: { object_id: 'uuid-people-123', record_id: 'rec-flat-xyz' },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockAttioResolveObjectSlug).toHaveBeenCalledWith('uuid-people-123');
+    expect(mockAttioGetPersonValues).toHaveBeenCalledWith('rec-flat-xyz');
+    expect(crmDb.updateLead).toHaveBeenCalledWith(VALID_LIST_ID, 'lead-flat', expect.objectContaining({ title: 'Engineer' }));
+  });
+
+  it('skips flat Attio payload when UUID resolves to non-people/deals object', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    mockAttioResolveObjectSlug.mockResolvedValue('companies');
+
+    const event = {
+      event_type: 'record.updated',
+      id: { object_id: 'uuid-companies-999', record_id: 'rec-comp-abc' },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockAttioResolveObjectSlug).toHaveBeenCalledWith('uuid-companies-999');
+    expect(mockAttioGetPersonValues).not.toHaveBeenCalled();
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  // ─── Attio record.deleted ────────────────────────────────────────────────────
+
+  it('deletes lead by stored Attio record ID when deleteOnPull is true', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('attio'),
+      deleteOnPull: true,
+    });
+    const existingLead = { leadId: 'lead-del-1', email: 'deleted@company.com' };
+    (crmDb.getLeadByAttioRecordId as jest.Mock).mockResolvedValue(existingLead);
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send({
+        event_type: 'record.deleted',
+        data: {
+          object: { slug: 'people' },
+          record: { id: { record_id: 'rec-deleted-123' } },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.getLeadByAttioRecordId).toHaveBeenCalledWith(VALID_LIST_ID, 'rec-deleted-123');
+    expect(crmDb.deleteLead).toHaveBeenCalledWith(VALID_LIST_ID, 'lead-del-1');
+    expect(mockAttioGetPersonValues).not.toHaveBeenCalled();
+  });
+
+  it('does not delete lead when deleteOnPull is false for Attio record.deleted', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('attio'),
+      deleteOnPull: false,
+    });
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send({
+        event_type: 'record.deleted',
+        data: {
+          object: { slug: 'people' },
+          record: { id: { record_id: 'rec-deleted-456' } },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.getLeadByAttioRecordId).not.toHaveBeenCalled();
+    expect(crmDb.deleteLead).not.toHaveBeenCalled();
+  });
+
+  it('skips deletion silently when no matching lead found for Attio record.deleted', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('attio'),
+      deleteOnPull: true,
+    });
+    (crmDb.getLeadByAttioRecordId as jest.Mock).mockResolvedValue(null);
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send({
+        event_type: 'record.deleted',
+        data: {
+          object: { slug: 'people' },
+          record: { id: { record_id: 'rec-unknown-789' } },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.getLeadByAttioRecordId).toHaveBeenCalledWith(VALID_LIST_ID, 'rec-unknown-789');
+    expect(crmDb.deleteLead).not.toHaveBeenCalled();
+  });
+
+  it('does not delete lead for Attio deals record.deleted', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('attio'),
+      deleteOnPull: true,
+    });
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send({
+        event_type: 'record.deleted',
+        data: {
+          object: { slug: 'deals' },
+          record: { id: { record_id: 'deal-deleted-111' } },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.getLeadByAttioRecordId).not.toHaveBeenCalled();
+    expect(crmDb.deleteLead).not.toHaveBeenCalled();
   });
 
   it('processes events normally when webhookEnabled is true', async () => {

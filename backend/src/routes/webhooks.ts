@@ -629,6 +629,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         properties: Record<string, string>;
         isCreation: boolean;
         isDeleted: boolean;
+        isDeal?: boolean;
       };
       const changesByObjectId: Record<string, ContactChange> = {};
 
@@ -641,7 +642,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
 
         console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
 
-        const isRelevantEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
+        const isRelevantEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion', 'deal.propertyChange'].includes(eventType);
         if (!isRelevantEvent || !objectId) continue;
 
         if (!changesByObjectId[objectId]) {
@@ -649,6 +650,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         }
         if (eventType === 'contact.creation') changesByObjectId[objectId].isCreation = true;
         if (eventType === 'contact.deletion') changesByObjectId[objectId].isDeleted = true;
+        if (eventType === 'deal.propertyChange') changesByObjectId[objectId].isDeal = true;
         if (propertyName && propertyValue !== undefined) {
           changesByObjectId[objectId].properties[propertyName] = propertyValue;
         }
@@ -680,13 +682,21 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         let email = data.properties.email;
         if (!email && svc) {
           try {
-            const fetchedEmail = await svc.getContactEmailById(objectId);
-            if (fetchedEmail) email = fetchedEmail;
+            if (data.isDeal) {
+              const contactIds = await svc.getDealContactAssociations(objectId);
+              if (contactIds.length > 0) {
+                const fetchedEmail = await svc.getContactEmailById(contactIds[0]);
+                if (fetchedEmail) email = fetchedEmail;
+              }
+            } else {
+              const fetchedEmail = await svc.getContactEmailById(objectId);
+              if (fetchedEmail) email = fetchedEmail;
+            }
           } catch { /* non-fatal — skip if token unavailable */ }
         }
 
         if (!email) {
-          console.log(`[HubSpot Webhook] Could not determine email for contact ${objectId}, skipping`);
+          console.log(`[HubSpot Webhook] Could not determine email for ${data.isDeal ? 'deal' : 'contact'} ${objectId}, skipping`);
           continue;
         }
 
@@ -712,12 +722,50 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             continue;
           }
 
+          if (data.isDeal) {
+            // It's a deal update: apply mappings based on syncConfig.dealFieldMapping
+            if (!syncConfig || !syncConfig.dealFieldMapping) continue;
+            const dealUpdates: any = {};
+            const dealCustomUpdates: any = {};
+            const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+
+            // helper for mapping stage IDs back to our status values
+            const reverseStageMapping = (val: string) => {
+              if (!syncConfig.hubspotDealStageMap) return val;
+              const reverseEntry = Object.entries(syncConfig.hubspotDealStageMap).find(([, stageId]) => stageId === val);
+              return reverseEntry?.[0] || val;
+            };
+
+            const pullDealMappings = syncConfig.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+
+            for (const [key, val] of Object.entries(data.properties)) {
+              const mapping = pullDealMappings.find(m => m.crmProperty === key);
+              if (mapping) {
+                // 'dealstage' is HubSpot's fixed system field for pipeline stage — not a custom property
+                const mappedVal = key === 'dealstage' ? reverseStageMapping(val) : val;
+                if (nativeDealFields.includes(mapping.agentwebField)) {
+                  dealUpdates[mapping.agentwebField] = mappedVal;
+                } else {
+                  dealCustomUpdates[mapping.agentwebField] = mappedVal;
+                }
+              }
+            }
+            if (Object.keys(dealCustomUpdates).length > 0) {
+              dealUpdates.customFields = { ...lead.customFields, ...dealCustomUpdates };
+            }
+            if (Object.keys(dealUpdates).length > 0) {
+              await crmDb.updateLead(list.listId, lead.leadId, dealUpdates);
+              console.log(`[HubSpot Webhook] Synced deal updates to lead ${lead.leadId} in list ${list.listId}`);
+            }
+            continue;
+          }
+
           const updates: any = {};
-          if (data.properties.firstname    !== undefined) updates.firstName = data.properties.firstname;
-          if (data.properties.lastname     !== undefined) updates.lastName  = data.properties.lastname;
-          if (data.properties.phone        !== undefined) updates.phone     = data.properties.phone;
-          if (data.properties.jobtitle     !== undefined) updates.title     = data.properties.jobtitle;
-          if (data.properties.company      !== undefined) updates.company   = data.properties.company;
+          if (data.properties.firstname !== undefined) updates.firstName = data.properties.firstname;
+          if (data.properties.lastname !== undefined) updates.lastName = data.properties.lastname;
+          if (data.properties.phone !== undefined) updates.phone = data.properties.phone;
+          if (data.properties.jobtitle !== undefined) updates.title = data.properties.jobtitle;
+          if (data.properties.company !== undefined) updates.company = data.properties.company;
           if (data.properties.hs_linkedin_url !== undefined) updates.linkedin = data.properties.hs_linkedin_url;
 
           const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
