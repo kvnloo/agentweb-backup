@@ -64,6 +64,17 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  extraCostUsage?: {
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+    resetDate: string;
+  };
+  extraCostUsageHistory?: Array<{
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+  }>;
   introductionEmailSent?: string; // ISO date when the team introduction email was last sent
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
