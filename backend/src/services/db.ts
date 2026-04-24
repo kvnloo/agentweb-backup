@@ -125,6 +125,22 @@ export interface User {
   dripUnsubscribed?: boolean;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
+  /**
+   * Onboarding v2 Phase 1 — brand build async status.
+   * Set to 'building' when the onboarding flow kicks off brand extraction,
+   * flipped to 'ready' when `brandGuidelines` is next written, or 'failed'
+   * on timeout/error. The UI renders a status pill based on this value so
+   * latency-hiding question screens (Phase 2) can proceed in parallel.
+   */
+  brandBuildStatus?: "building" | "ready" | "failed";
+  /** ISO timestamp when the async brand build was kicked off. */
+  brandBuildStartedAt?: string;
+  /** ISO timestamp when the build terminated (ready or failed). */
+  brandBuildCompletedAt?: string;
+  /** Wall-clock duration in ms from start to completion. Used for p50/p99 metrics. */
+  brandBuildDurationMs?: number;
+  /** Error message if `brandBuildStatus === 'failed'`. Surfaced to the graceful-fallback UI. */
+  brandBuildError?: string;
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -5079,6 +5095,45 @@ export const crmDb = {
       UpdateExpression: 'SET linkedinMessageSyncAt = :syncAt, updatedAt = :updatedAt',
       ExpressionAttributeValues: {
         ':syncAt': syncAt,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }).promise();
+  },
+
+  /**
+   * Onboarding v2 dual-write helper — mirror per-User onboarding analytics
+   * onto the matching Lead row. The user-facing route (onboardingEvents.ts)
+   * writes to the User record first, then fire-and-forget calls this to
+   * keep the Lead in sync so Fangfang / Emma can see the full flow on the
+   * Lead detail page.
+   *
+   * Writes three top-level attributes on the Lead:
+   *   - onboardingEvents: OnboardingEvent[] (full log mirror)
+   *   - onboardingStage: OnboardingStage
+   *   - onboardingDeviationCount: int
+   *
+   * Overwrites atomically — this is a pure projection of User state.
+   * Task: https://www.notion.so/34c09247c951812cbc90f09aa68fc5d3
+   */
+  async updateLeadOnboardingAnalytics(
+    listId: string,
+    leadId: string,
+    analytics: {
+      onboardingEvents: unknown[];
+      onboardingStage: string;
+      onboardingDeviationCount: number;
+    },
+  ): Promise<void> {
+    const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET onboardingEvents = :events, onboardingStage = :stage, onboardingDeviationCount = :dc, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':events': analytics.onboardingEvents,
+        ':stage': analytics.onboardingStage,
+        ':dc': analytics.onboardingDeviationCount,
         ':updatedAt': new Date().toISOString(),
       },
     }).promise();
