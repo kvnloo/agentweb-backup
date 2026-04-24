@@ -448,7 +448,7 @@ router.post('/create-html-from-template', async (req: Request, res: Response) =>
   try {
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFromTemplate(
-      req.body.llm_model, req.body.template_name,
+      req.body.llm_model, req.body.template_id,
       req.body.variable_values, req.body.array_variable_values,
       userId(req), req.body.session_id || ''
     );
@@ -462,7 +462,8 @@ router.post('/create-html-template', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const result = await svc.createHtmlTemplate(
-      req.body.html_source, req.body.template_name,
+      req.body.html_source, req.body.template_id,
+      req.body.template_name,
       req.body.subject, req.body.additional_instructions || '',
       userId(req), req.body.session_id || ''
     );

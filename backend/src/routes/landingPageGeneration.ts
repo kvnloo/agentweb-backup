@@ -178,16 +178,14 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_name } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id } = req.body;
     let template_html: string | undefined = rawTemplateHtml;
 
-    // If template_name provided (user picked a template), look it up from DynamoDB
-    if (template_name && !template_html) {
+    // If template_id provided (user picked a template), look it up from DynamoDB
+    if (template_id && !template_html) {
       const lookupKeys = [
         `templates_${userId}`,
-        `email_templates_${userId}`,
         'templates_public',
-        'email_templates_public',
       ];
       let found = false;
       for (const key of lookupKeys) {
@@ -195,10 +193,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
           const setting = await settingsService.getSetting(key);
           if (!setting?.settingValue) continue;
           const arr: any[] = JSON.parse(setting.settingValue);
-          const match = arr.find((t: any) => t.template_name === template_name);
+          const match = arr.find((t: any) => t.template_id === template_id);
           if (match?.html_content) {
             template_html = extractTemplateOutline(match.html_content);
-            console.log(`[LP GENERATION] Loaded template "${template_name}" from ${key} (${template_html?.length} chars condensed)`);
+            console.log(`[LP GENERATION] Loaded template "${template_id}" from ${key} (${template_html?.length} chars condensed)`);
             found = true;
             break;
           }
@@ -207,7 +205,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         }
       }
       if (!found) {
-        console.warn(`[LP GENERATION] Template "${template_name}" not found in any DynamoDB key, continuing without template`);
+        console.warn(`[LP GENERATION] Template "${template_id}" not found in any DynamoDB key, continuing without template`);
       }
     }
 

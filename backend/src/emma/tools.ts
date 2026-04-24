@@ -1807,7 +1807,7 @@ emmaToolRegistry.register({
   name: 'list_html_templates',
   definition: {
     name: 'list_html_templates',
-    description: "Get a list of all available HTML templates for the user (email and/or landing page templates). Use the optional 'type' filter to narrow results.",
+    description: "Get a list of all available HTML templates for the user (email and/or landing page templates). Use the optional 'type' filter to narrow results. IMPORTANT: If multiple templates share the same template_name, ask the user to choose which one to use and confirm by template_id (or by created_at/updated_at and isPublic if needed).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -1828,13 +1828,13 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool.',
     inputSchema: {
       type: 'object',
       properties: {
-        template_name: {
+        template_id: {
           type: 'string',
-          description: 'Name of the HTML template to use'
+          description: 'ID of the HTML template to use (from list_html_templates)'
         },
         variable_values_json: {
           type: 'string',
@@ -1845,14 +1845,14 @@ emmaToolRegistry.register({
           description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
         }
       },
-      required: ['template_name', 'variable_values_json', 'array_variable_values_json']
+      required: ['template_id', 'variable_values_json', 'array_variable_values_json']
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.template_name) {
+    if (!args.template_id) {
       return {
         success: false,
-        message: 'template_name is required'
+        message: 'template_id is required'
       };
     }
 
@@ -1884,7 +1884,7 @@ emmaToolRegistry.register({
       };
     }
 
-    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_name, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
+    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_id, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
   }
 });
 
@@ -4519,6 +4519,10 @@ emmaToolRegistry.register({
     inputSchema: {
       type: "object",
       properties: {
+        template_id: {
+          type: "string",
+          description: "Optional ID of an existing template to update. If provided, the template with this ID will be updated."
+        },
         html_source: {
           type: "string",
           description: "Either an S3 URL to an HTML file, or raw HTML content string"
@@ -4547,6 +4551,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await agentModeService.createHtmlTemplate(
       args.html_source,
+      args.template_id,
       args.template_name,
       args.subject,
       args.additional_instructions || '',
