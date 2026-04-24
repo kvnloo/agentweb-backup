@@ -28,8 +28,31 @@ export interface HtmlTemplate {
  */
 
 // Helper to determine the target DynamoDB key
-const getSettingKey = (userId: string, isPublic?: boolean) => 
+const getSettingKey = (userId: string, isPublic?: boolean) =>
   isPublic ? 'templates_public' : `templates_${userId}`;
+
+// Keys confirmed to have all template_ids present. Skips the per-request scan
+// once a key is known to be fully migrated (reset on process restart, which is fine).
+const fullyMigratedKeys = new Set<string>();
+
+// Assigns template_id to any template that lacks one and writes back to DynamoDB.
+// After the first passing check the key is recorded and subsequent requests skip
+// entirely, so there is no per-request overhead once migration is complete.
+const backfillTemplateIds = async (
+  templates: HtmlTemplate[],
+  key: string,
+  userEmail: string
+): Promise<HtmlTemplate[]> => {
+  if (fullyMigratedKeys.has(key)) return templates;
+  if (templates.every(t => t.template_id)) {
+    fullyMigratedKeys.add(key);
+    return templates;
+  }
+  const filled = templates.map(t => t.template_id ? t : { ...t, template_id: randomUUID() });
+  await settingsService.setSetting(key, JSON.stringify(filled), key, userEmail);
+  fullyMigratedKeys.add(key);
+  return filled;
+};
 
 
 const getAuthenticatedUser = (req: Request, res: Response) => {
@@ -59,17 +82,19 @@ export const getTemplates = async (req: Request, res: Response) => {
       settingsService.getSetting('templates_public'),
     ]);
 
-    const newPublic: HtmlTemplate[] = parseTemplateArray(newPublicSetting).map((t: HtmlTemplate) =>
+    const rawPublic: HtmlTemplate[] = parseTemplateArray(newPublicSetting).map((t: HtmlTemplate) =>
       t.type ? t : { ...t, type: ['email'] }
     );
+    const newPublic = await backfillTemplateIds(rawPublic, 'templates_public', user.email);
 
     let merged: HtmlTemplate[];
     if (scopePublicOnly) {
       merged = newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true }));
     } else {
-      const newUser: HtmlTemplate[] = parseTemplateArray(newUserSetting).map((t: HtmlTemplate) =>
+      const rawUser: HtmlTemplate[] = parseTemplateArray(newUserSetting).map((t: HtmlTemplate) =>
         t.type ? t : { ...t, type: ['email'] }
       );
+      const newUser = await backfillTemplateIds(rawUser, `templates_${userId}`, user.email);
       merged = [
         ...newUser,
         ...newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true })),
