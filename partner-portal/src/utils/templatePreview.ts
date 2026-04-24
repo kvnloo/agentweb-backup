@@ -63,10 +63,11 @@ const injectCspMeta = (html: string, baseHref?: string): string => {
 };
 
 const sanitizeHtml = (html: string, wholeDocument: boolean): string => {
-  const scriptHook = (node: Element, data: { tagName?: string }) => {
+  const scriptHook = (node: Node, data: { tagName: string }) => {
     if (data.tagName !== "script") return;
-    const src = node.getAttribute("src")?.trim() ?? "";
-    if (src && /^(javascript:|data:)/i.test(src)) node.remove();
+    const el = node as Element;
+    const src = el.getAttribute?.("src")?.trim() ?? "";
+    if (src && /^(javascript:|data:)/i.test(src)) el.remove?.();
   };
 
   DOMPurify.addHook("uponSanitizeElement", scriptHook);
