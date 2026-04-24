@@ -34,6 +34,7 @@ import {
   logAdGenCompletionMetric,
   sanitizeAdVariants,
 } from "../services/adGenStatusService";
+import { startAdGenerationForUser } from "../services/onboardingAdGenerator";
 
 const router = express.Router();
 
@@ -48,10 +49,13 @@ router.post("/ad-gen/start", authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: "User not authenticated" });
     }
-    const patch = adGenStartPatch();
-    await userDb.updateUser(userId, patch);
+    // Flip status to `generating` + kick off the async LLM call. The
+    // status persist is synchronous so the UI sees `generating` in the
+    // response; the LLM work runs in the background and patches the
+    // record on completion. See `onboardingAdGenerator.ts`.
+    await startAdGenerationForUser(userId);
     const user = await userDb.getUserById(userId);
-    return res.json({ status: adGenSnapshot(user || patch) });
+    return res.json({ status: adGenSnapshot(user || adGenStartPatch()) });
   } catch (err) {
     console.error("[adGen] start failed", err);
     return res.status(500).json({ message: "Failed to start ad generation" });
