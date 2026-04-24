@@ -5264,7 +5264,20 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      if (session.userId !== user.userId) {
+      // Under delegation (`req.delegateInfo.isDelegated`), `req.user.userId` is
+      // the TARGET customer per middleware/auth.ts — so owner-matching against
+      // `user.userId` already covers the "admin viewing target's sessions"
+      // case. But an admin-created session (owned by the admin's own userId)
+      // shown in the admin's UI while they're delegated gets a false-positive
+      // 403 otherwise — which is why the prod UI sat in a 403 polling loop
+      // during impersonation (see nginx log, 2026-04-23 23:52 UTC). Allow
+      // the delegated admin to read their own admin-owned sessions too.
+      const delegateInfo = req.delegateInfo;
+      const isOwner = session.userId === user.userId;
+      const isDelegatedAdminOwnSession =
+        delegateInfo?.isDelegated &&
+        session.userId === delegateInfo.adminUserId;
+      if (!isOwner && !isDelegatedAdminOwnSession) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
