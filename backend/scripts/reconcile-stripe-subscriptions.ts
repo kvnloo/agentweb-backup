@@ -119,8 +119,12 @@ const sleep = (ms: number) =>
 
 function deriveSubscriptionTypeFromPriceId(priceId: string | undefined): string | null {
   if (!priceId) return null;
-  if (priceId === STARTER_PRICE_ID) return 'Basic';
-  if (priceId === COMPLETE_PRICE_ID) return 'Super Premium';
+  // Mirrors canonical deriveSubscriptionTypeFromPriceId in
+  // backend/src/services/stripeService.ts:909-913. Tier names must match
+  // what the live admin-reconcile path writes, otherwise this script
+  // would flip every paid user's tier on a full sweep.
+  if (priceId === STARTER_PRICE_ID) return 'Starter';
+  if (priceId === COMPLETE_PRICE_ID) return 'Pro';
   return null;
 }
 
@@ -225,7 +229,7 @@ async function deriveStripeState(
     }
     return {
       subscription_status: 'canceled',
-      subscriptionType: 'Free',
+      subscriptionType: null,
       current_period_end: null,
       has_payment_method: hasPaymentMethod,
     };
@@ -274,8 +278,19 @@ async function deriveStripeState(
     }
   }
 
+  // Mirror reconcileAllStripeUsers' effectiveStatus derivation
+  // (stripeService.ts:1047-1060): when a sub is active/trialing AND
+  // cancel_at_period_end is set, we write the pseudo-status 'canceling'
+  // so the UI "Canceling" badge survives. Without this, any full sweep
+  // would clobber a canceling user back to 'active'.
+  const effectiveStatus =
+    sub.cancel_at_period_end &&
+    (sub.status === 'active' || sub.status === 'trialing')
+      ? 'canceling'
+      : sub.status;
+
   return {
-    subscription_status: sub.status,
+    subscription_status: effectiveStatus,
     subscriptionType,
     current_period_end: unixSecondsToIso((sub as any).current_period_end),
     has_payment_method: hasPaymentMethod,
