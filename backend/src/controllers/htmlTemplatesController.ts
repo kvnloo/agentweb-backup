@@ -52,22 +52,29 @@ export const getTemplates = async (req: Request, res: Response) => {
     const userId = user.userId;
 
     const typeFilter = req.query.type as string;
+    const scopePublicOnly = req.query.scope === 'public';
 
     const [newUserSetting, newPublicSetting] = await Promise.all([
-      settingsService.getSetting(`templates_${userId}`),
+      scopePublicOnly ? Promise.resolve(null) : settingsService.getSetting(`templates_${userId}`),
       settingsService.getSetting('templates_public'),
     ]);
 
-    const newUser: HtmlTemplate[] = parseTemplateArray(newUserSetting).map((t: HtmlTemplate) =>
-      t.type ? t : { ...t, type: ['email'] }
-    );
     const newPublic: HtmlTemplate[] = parseTemplateArray(newPublicSetting).map((t: HtmlTemplate) =>
       t.type ? t : { ...t, type: ['email'] }
     );
-    const merged: HtmlTemplate[] = [
-      ...newUser,
-      ...newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true })),
-    ];
+
+    let merged: HtmlTemplate[];
+    if (scopePublicOnly) {
+      merged = newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true }));
+    } else {
+      const newUser: HtmlTemplate[] = parseTemplateArray(newUserSetting).map((t: HtmlTemplate) =>
+        t.type ? t : { ...t, type: ['email'] }
+      );
+      merged = [
+        ...newUser,
+        ...newPublic.map((t: HtmlTemplate) => ({ ...t, isPublic: true })),
+      ];
+    }
 
     const result = typeFilter
       ? merged.filter((t: HtmlTemplate) => Array.isArray(t.type) && t.type.includes(typeFilter))

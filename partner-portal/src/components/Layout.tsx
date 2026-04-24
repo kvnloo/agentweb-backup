@@ -153,6 +153,14 @@ export default function Layout() {
                       <Button
                         color="primary"
                         component={RouterLink}
+                        to="/html-templates"
+                        variant={isActivePath('/html-templates') ? 'contained' : 'text'}
+                      >
+                        HTML Templates
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
                         to="/skills"
                         variant={isActivePath('/skills') ? 'contained' : 'text'}
                       >

@@ -174,6 +174,47 @@ describe('getTemplates', () => {
     expect(templates[0].template_id).toBe('l1');
   });
 
+  it('returns only public templates when ?scope=public is passed', async () => {
+    const userTpl = { template_id: 'u1', template_name: 'private', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    const pubTpl = { template_id: 'p1', template_name: 'public', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === `templates_${USER_ID}`) return Promise.resolve(settingWith([userTpl]));
+      if (key === 'templates_public') return Promise.resolve(settingWith([pubTpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = reqWithUser({ query: { scope: 'public' } });
+    const { res, json } = makeRes();
+
+    await getTemplates(req, res);
+
+    expect(mockGetSetting).toHaveBeenCalledTimes(1);
+    expect(mockGetSetting).toHaveBeenCalledWith('templates_public');
+    const { templates } = (json.mock.calls[0][0] as any);
+    expect(templates).toHaveLength(1);
+    expect(templates[0]).toEqual(expect.objectContaining({ template_id: 'p1', isPublic: true }));
+  });
+
+  it('applies type filtering on public-only scope', async () => {
+    const pubEmailTpl = { template_id: 'p1', template_name: 'public-email', type: ['email'], html_content: '<p/>', variables: [], arrayVariables: [] };
+    const pubLandingTpl = { template_id: 'p2', template_name: 'public-lp', type: ['landing_page'], html_content: '<p/>', variables: [], arrayVariables: [] };
+
+    mockGetSetting.mockImplementation((key: string) => {
+      if (key === 'templates_public') return Promise.resolve(settingWith([pubEmailTpl, pubLandingTpl]));
+      return Promise.resolve(null);
+    });
+
+    const req = reqWithUser({ query: { scope: 'public', type: 'landing_page' } });
+    const { res, json } = makeRes();
+
+    await getTemplates(req, res);
+
+    const { templates } = (json.mock.calls[0][0] as any);
+    expect(templates).toHaveLength(1);
+    expect(templates[0]).toEqual(expect.objectContaining({ template_id: 'p2', isPublic: true }));
+  });
+
   it('returns 500 when settings lookup fails', async () => {
     mockGetSetting.mockRejectedValueOnce(new Error('boom'));
 
