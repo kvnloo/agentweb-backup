@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-24',
     changes: [
+      'Fix: Agent Mode Progress Panel No Longer Shows Duplicate Tool Calls',
+      '- The progress panel was showing each tool call multiple times when the agent ran more than one round of tools in a single response',
+      '- Root cause: the backend was sending the full cumulative list of all tool calls on every progress event; the frontend re-added any tool it could not match to an active card, causing duplicates',
+      '- Fix: each progress event now sends only the tool calls from the current round, so every tool appears exactly once',
+    ],
+  },
+  {
+    date: '2026-04-24',
+    changes: [
       'Fixed: Meta Ads Account Now Connects Correctly from Agent Chat',
       '- Connecting a Meta Ads account via the agent chat (when Emma asks you to reconnect) now properly saves the account to your profile',
       '- Previously, the ad account selection step was skipped in agent mode, so the token was never stored even though the popup appeared to succeed',
