@@ -190,14 +190,6 @@ export default function Layout() {
                       >
                         Client Health
                       </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/drip-campaigns"
-                        variant={isActivePath('/drip-campaigns') ? 'contained' : 'text'}
-                      >
-                        Drip Campaigns
-                      </Button>
                     </>
                   )}
                   <Button 
