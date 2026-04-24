@@ -1851,6 +1851,7 @@ const main = async () => {
     await createOAuthSessionsTable();
     await createDripSequencesTable();
     await createSequenceEnrollmentsTable();
+    await createEnrichmentDbTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2189,6 +2190,60 @@ const createSequenceEnrollmentsTable = async () => {
         IndexName: 'leadEmail-index',
         KeySchema: [
           { AttributeName: 'leadEmail', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createEnrichmentDbTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-EnrichmentDB`,
+    AttributeDefinitions: [
+      { AttributeName: 'pk', AttributeType: 'S' },
+      { AttributeName: 'sk', AttributeType: 'S' },
+      { AttributeName: 'linkedinUrl', AttributeType: 'S' },
+      { AttributeName: 'domain', AttributeType: 'S' },
+      { AttributeName: 'normalizedFullName', AttributeType: 'S' },
+      { AttributeName: 'normalizedCompanyName', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'pk', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'linkedinUrl-index',
+        KeySchema: [
+          { AttributeName: 'linkedinUrl', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'domain-normalizedName-index',
+        KeySchema: [
+          { AttributeName: 'domain', KeyType: 'HASH' },
+          { AttributeName: 'normalizedFullName', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'normalizedCompanyName-index',
+        KeySchema: [
+          { AttributeName: 'normalizedCompanyName', KeyType: 'HASH' },
         ],
         Projection: { ProjectionType: 'ALL' },
       },

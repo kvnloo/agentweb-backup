@@ -1,6 +1,18 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  lookupPerson,
+  lookupCompany,
+  getPersonFreshFields,
+  getCompanyFreshFields,
+  getCachedFieldValues,
+  buildCachedEnrichmentContext,
+  mapOutputFieldToPersonField,
+  mapOutputFieldToCompanyField,
+  upsertPerson,
+  upsertCompany,
+} from './enrichmentDbService';
 
 // Callback type for emitting Socket.IO events.
 // In the main process this uses the real `io` instance directly;
@@ -276,16 +288,44 @@ export class CrmEnrichmentService {
     let webContext = '';
     let linkedinContext = '';
 
+    // ── 0. Shared enrichment DB lookup ────────────────────────────────────────
+    const leadEmail = lead.email ? String(lead.email).toLowerCase().trim() : undefined;
+    const emailDomain = leadEmail?.includes('@') ? leadEmail.split('@')[1] : undefined;
+    const leadLinkedinUrl = lead.linkedin ? String(lead.linkedin).trim() : undefined;
+
+    const [cachedPerson, cachedCompany] = await Promise.all([
+      lookupPerson({
+        email: leadEmail,
+        linkedinUrl: leadLinkedinUrl,
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        domain: emailDomain,
+        companyName: lead.company,
+      }).catch(() => null),
+      lookupCompany({
+        domain: emailDomain,
+        companyName: lead.company,
+      }).catch(() => null),
+    ]);
+
+    const freshPersonFields = cachedPerson ? getPersonFreshFields(cachedPerson) : {};
+    const freshCompanyFields = cachedCompany ? getCompanyFreshFields(cachedCompany) : {};
+    const cachedFieldValues = getCachedFieldValues(spec.outputFields, freshPersonFields, freshCompanyFields);
+    const cachedContext = buildCachedEnrichmentContext(freshPersonFields, freshCompanyFields);
+
+    // Fields not covered by fresh cache still need API fetching
+    const fieldsNeedingFetch = spec.outputFields.filter(f => !cachedFieldValues[f]);
+
     // Helper: effective sources for a field — per-field override or job-level fallback
     const effectiveSources = (field: string) =>
       spec.sourcesPerField?.[field] ?? spec.sources;
 
-    // Which fields need LinkedIn?
-    const linkedinFields = spec.outputFields.filter(f => effectiveSources(f).includes('linkedin'));
+    // Which fields need LinkedIn? (only those not in cache)
+    const linkedinFields = fieldsNeedingFetch.filter(f => effectiveSources(f).includes('linkedin'));
     const isEnrichingLinkedin = linkedinFields.some(f => /linkedin/i.test(f));
 
     // 1. Web search source — ONE search per lead covering all web_search fields combined
-    const webSearchFields = spec.outputFields.filter(f => effectiveSources(f).includes('web_search'));
+    const webSearchFields = fieldsNeedingFetch.filter(f => effectiveSources(f).includes('web_search'));
     if (webSearchFields.length > 0) {
       // Build one comprehensive query: use stored template if provided, otherwise auto-build
       const template = spec.webSearchTemplate;
@@ -430,7 +470,7 @@ ${CrmEnrichmentService.buildFieldGuidance(spec.outputFields)}`;
 
     const userPrompt = `Lead context:
 ${JSON.stringify(leadContext, null, 2)}
-${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}
+${cachedContext ? `\n${cachedContext}` : ''}${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}
 
 Extract the requested fields now.`;
 
@@ -495,6 +535,33 @@ Valid example:
     for (const field of spec.outputFields) {
       fields[field] = typeof response?.[field] === 'string' ? response[field].trim() : 'Unknown';
     }
+
+    // Merge: fall back to cached value for any field the LLM returned as Unknown
+    for (const [field, cached] of Object.entries(cachedFieldValues)) {
+      if (fields[field] === 'Unknown' || !fields[field]) {
+        fields[field] = cached;
+      }
+    }
+
+    // ── Write-back to shared enrichment DB (best-effort, non-blocking) ────────
+    const writeBackSource = spec.sources.includes('linkedin') ? 'linkedin' : 'web_search';
+    const personWriteBack: Record<string, string> = {};
+    const companyWriteBack: Record<string, string> = {};
+    for (const [fieldName, value] of Object.entries(fields)) {
+      if (!value || value === 'Unknown') continue;
+      const personField = mapOutputFieldToPersonField(fieldName);
+      if (personField) { personWriteBack[personField] = value; continue; }
+      const companyField = mapOutputFieldToCompanyField(fieldName);
+      if (companyField) companyWriteBack[companyField] = value;
+    }
+    Promise.all([
+      leadEmail && Object.keys(personWriteBack).length > 0
+        ? upsertPerson(leadEmail, personWriteBack as any, writeBackSource).catch(() => {})
+        : Promise.resolve(),
+      emailDomain && Object.keys(companyWriteBack).length > 0
+        ? upsertCompany(emailDomain, companyWriteBack as any, writeBackSource).catch(() => {})
+        : Promise.resolve(),
+    ]).catch(() => {});
 
     return { fields };
   }
