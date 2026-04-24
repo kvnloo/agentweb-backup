@@ -249,6 +249,17 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  extraCostUsage?: {
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+    resetDate: string;
+  };
+  extraCostUsageHistory?: Array<{
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+  }>;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
   introductionEmailSent?: string; // ISO date when team introduction email was sent
   utmSource?: string;
@@ -4329,6 +4340,47 @@ export default function AdminDashboard() {
                                     </Box>
                                   )}
                                 </Grid>
+                                {/* Extra Cost Usage (enrichment, image gen, etc.) */}
+                                {user.roles?.includes("customer") && (
+                                  <Grid item xs={6}>
+                                    <Typography variant="caption" color="text.secondary">Extra Cost Usage</Typography>
+                                    <Box sx={{ mt: 0.5 }}>
+                                      {(() => {
+                                        const currentMonth = new Date().toISOString().slice(0, 7);
+                                        const extraUsage = user.extraCostUsage?.month === currentMonth ? user.extraCostUsage : null;
+                                        const totalCost = extraUsage?.totalCost ?? 0;
+                                        const breakdown = extraUsage?.breakdown ?? {};
+                                        const breakdownEntries = Object.entries(breakdown).filter(([, v]) => v > 0);
+                                        return (
+                                          <>
+                                            <Typography variant="body2">
+                                              ${totalCost.toFixed(4)} this month
+                                            </Typography>
+                                            {breakdownEntries.length > 0 && (
+                                              <Box sx={{ mt: 0.25 }}>
+                                                {breakdownEntries.map(([key, val]) => (
+                                                  <Typography key={key} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
+                                                    {key}: ${(val as number).toFixed(4)}
+                                                  </Typography>
+                                                ))}
+                                              </Box>
+                                            )}
+                                          </>
+                                        );
+                                      })()}
+                                    </Box>
+                                    {user.extraCostUsageHistory && user.extraCostUsageHistory.length > 0 && (
+                                      <Box sx={{ mt: 0.5 }}>
+                                        <Typography variant="caption" color="text.secondary">History: </Typography>
+                                        {[...user.extraCostUsageHistory].reverse().slice(0, 6).map((h) => (
+                                          <Typography key={h.month} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
+                                            {h.month}: ${h.totalCost.toFixed(4)}
+                                          </Typography>
+                                        ))}
+                                      </Box>
+                                    )}
+                                  </Grid>
+                                )}
                                 <Grid item xs={6}>
                                   <Typography variant="caption" color="text.secondary">Actions</Typography>
                                   <Box sx={{ display: "flex", gap: 0.5, mt: 0.5 }}>
