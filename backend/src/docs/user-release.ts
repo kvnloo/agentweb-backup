@@ -49,6 +49,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma was failing silently when asked to log into sites protected by reCAPTCHA v2 (e.g. rankai.ai), calling the solve_captcha tool without the required site key or captcha type',
       '- The tool now detects missing parameters immediately and returns the exact browser_evaluate code needed to extract the site key, so Emma retries with the correct inputs',
       '- The tool description was also updated to explicitly instruct Emma to extract the data-sitekey attribute before calling the tool, preventing the issue from recurring',
+    ],
+  },
   {
     date: '2026-04-23',
     changes: [
