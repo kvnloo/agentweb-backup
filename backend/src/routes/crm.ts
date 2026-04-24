@@ -1436,6 +1436,118 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/bulk-import
+ * @desc Bulk-import leads from an array (e.g. LinkedIn search results via platform-wide outreach accounts).
+ *       Maps linkedin_url → linkedin field. Deduplicates against existing list leads via batchCreateLeads.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const { leads } = req.body;
+
+    if (!Array.isArray(leads) || leads.length === 0) {
+      return res.status(400).json({ message: 'leads must be a non-empty array' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+
+    // Normalize Unipile search result shape → CRM lead shape
+    const normalizedLeads = leads.map((lead: any) => {
+      const { name, linkedin_url, public_profile_url, profile_url, public_identifier, current_role, headline, ...rest } = lead;
+      const normalized: any = { ...rest };
+
+      // Split Unipile full `name` field into firstName/lastName if not already split
+      if (name && !normalized.firstName && !normalized.lastName) {
+        const parts = (name as string).trim().split(/\s+/);
+        normalized.firstName = parts[0] || '';
+        normalized.lastName = parts.slice(1).join(' ') || '';
+      }
+
+      // Build clean LinkedIn URL — prefer slug over messy profile_url with query params
+      if (!normalized.linkedin) {
+        if (public_identifier) {
+          normalized.linkedin = `https://www.linkedin.com/in/${public_identifier}`;
+        } else {
+          const rawUrl = linkedin_url || public_profile_url || profile_url;
+          if (rawUrl) normalized.linkedin = (rawUrl as string).split('?')[0];
+        }
+      }
+
+      // Map headline → title
+      if (headline && !normalized.title) normalized.title = headline;
+      // Flatten current_role
+      if (current_role) {
+        if (current_role.position && !normalized.title) normalized.title = current_role.position;
+        if (current_role.company && !normalized.company) normalized.company = current_role.company;
+      }
+      return normalized;
+    });
+
+    const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+
+    res.status(201).json({
+      imported: result.newCount,
+      skipped: result.mergedCount,
+      errors: result.errors,
+      total: leads.length,
+    });
+  } catch (error: any) {
+    console.error('Error bulk importing leads:', error);
+    res.status(500).json({ message: error.message || 'Failed to bulk import leads' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/find
+ * @desc Search LinkedIn for people using platform-wide outreach accounts and import results into the list.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const { keywords, title, company, search_url, limit } = req.body;
+
+    if (!keywords && !title && !company && !search_url) {
+      return res.status(400).json({ message: 'At least one search filter is required: keywords, title, company, or search_url' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.importLeadsFromSearch(userId, {
+      listId,
+      keywords,
+      title,
+      company,
+      search_url,
+      limit: limit ? Math.min(Number(limit), 100) : 20,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ message: result.error });
+    }
+
+    res.status(201).json(result);
+  } catch (error: any) {
+    console.error('Error finding leads:', error);
+    res.status(500).json({ message: error.message || 'Failed to find leads' });
+  }
+});
+
+/**
  * @route GET /api/crm/lists/:listId/leads/:leadId
  * @desc Get a specific lead
  * @access Private
