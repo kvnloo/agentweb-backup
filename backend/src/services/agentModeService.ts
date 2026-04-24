@@ -1861,6 +1861,9 @@ export class AgentModeService {
         // Send progress update: executing tools
         // Include the names of tools that are about to be executed
         const pendingToolNames = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
+        // Snapshot the toolCalls length before executing this iteration so we can
+        // send only the new calls (not cumulative history) in tool_executed below.
+        const toolCallsLengthBeforeIteration = toolCalls.length;
         if (onProgress) {
           onProgress({
             iteration,
@@ -2118,12 +2121,15 @@ export class AgentModeService {
           }
         }
 
-        // Send progress update after all tools complete
+        // Send progress update after all tools complete.
+        // Only send tool calls added in this iteration — the frontend accumulates
+        // completed cards across iterations, so sending the full history would
+        // cause every prior tool to appear again as a duplicate completed card.
         if (onProgress) {
           onProgress({
             iteration,
             status: 'tool_executed',
-            toolCalls: toolCalls.slice(),
+            toolCalls: toolCalls.slice(toolCallsLengthBeforeIteration),
             pendingTools: []
           });
         }
