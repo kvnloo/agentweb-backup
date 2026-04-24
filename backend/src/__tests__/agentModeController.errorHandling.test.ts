@@ -3,6 +3,7 @@ import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import * as notionService from '../services/notionService';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 
 // Mock dependencies
@@ -12,9 +13,15 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    updateSessionContextLimitReported: jest.fn().mockResolvedValue(undefined),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
+}));
+
+jest.mock('../services/notionService', () => ({
+  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'page-123', notionUrl: 'https://notion.so/page-123' }),
 }));
 
 jest.mock('../services/emailService', () => ({
@@ -62,6 +69,7 @@ jest.mock('../utils/sseProgress', () => ({
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockCreateOncallItem = notionService.createOncallItem as jest.MockedFunction<typeof notionService.createOncallItem>;
 
 describe('AgentModeController - Error Handling', () => {
   const mockUserId = 'test-user-123';
@@ -81,6 +89,7 @@ describe('AgentModeController - Error Handling', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('http://ishare.test/session');
     mockEmailService.sendOncallAlert.mockResolvedValue(undefined);
@@ -510,6 +519,136 @@ describe('AgentModeController - Error Handling', () => {
 
       expect(mockRes.status).toHaveBeenCalledWith(500);
     });
+
+    it('should persist error message for worker-shutdown error in shared response', async () => {
+      const workerShutdownError = new Error('Worker shutdown');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(workerShutdownError);
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: 'test-token' },
+        body: {
+          userMessage: 'Test message',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/ishare/test-session-123/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          expiresAt: '2099-01-01T00:00:00Z',
+        },
+      } as any);
+
+      await agentModeController.generateSharedResponse(mockReq, mockRes);
+
+      // Should persist an error message so the orphaned user message has a response
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![0]).toBe(mockSessionId);
+      expect(errorCall![1].content).toContain('server restarted');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+
+      // Should return 503
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+    });
+
+    it('should persist error message for worker-shutdown error in generateResponse', async () => {
+      const workerShutdownError = new Error('Worker shutdown');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(workerShutdownError);
+
+      // Use a session with existing messages so isFirstMessage=false (no system msg call)
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+      } as any);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      // Should persist an error message so the orphaned user message has a response
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![0]).toBe(mockSessionId);
+      expect(errorCall![1].content).toContain('server restarted');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+
+      // Should return 503
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+    });
+
+    it('should reject concurrent requests to generateSharedResponse with 409', async () => {
+      const { activeSessionGenerations } = require('../controllers/agentModeController');
+      activeSessionGenerations.add(mockSessionId);
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: 'test-token' },
+        body: { userMessage: 'Test message' },
+        method: 'POST',
+        path: '/api/agent-mode/ishare/test-session-123/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          expiresAt: '2099-01-01T00:00:00Z',
+        },
+      } as any);
+
+      await agentModeController.generateSharedResponse(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(409);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'SESSION_BUSY',
+      }));
+
+      // Cleanup
+      activeSessionGenerations.delete(mockSessionId);
+    });
   });
 
   describe('generateResponse - Claude 4.6+ Content Format', () => {
@@ -804,6 +943,76 @@ describe('AgentModeController - Error Handling', () => {
 
       expect(mockAgentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
       expect(mockRes.status).toHaveBeenCalledWith(413);
+    });
+  });
+
+  describe('generateResponse - context limit auto-report to Notion', () => {
+    const contextError = new Error('The request exceeded the maximum context length');
+
+    const makeReq = (sessionId = mockSessionId) => ({
+      user: { userId: mockUserId, email: 'user@example.com' },
+      body: { sessionId, userMessage: 'hi', llmModel: 'gpt-5-chat-2', attachments: [] },
+      method: 'POST',
+      path: '/api/agent-mode/generate',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as Request);
+
+    const makeRes = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+
+    beforeEach(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(contextError);
+    });
+
+    it('should call createOncallItem when session has no contextLimitReported flag', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, contextLimitReported: undefined } as any);
+
+      await agentModeController.generateResponse(makeReq(), makeRes());
+
+      // Allow fire-and-forget to settle
+      await new Promise(r => setImmediate(r));
+
+      expect(mockCreateOncallItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          additionalTags: expect.arrayContaining(['Customer Reported', 'Context Limit']),
+        })
+      );
+      expect(mockChatbotDb.updateSessionContextLimitReported).toHaveBeenCalledWith(mockSessionId);
+    });
+
+    it('should NOT call createOncallItem when session already has contextLimitReported = true', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, contextLimitReported: true } as any);
+
+      await agentModeController.generateResponse(makeReq(), makeRes());
+
+      await new Promise(r => setImmediate(r));
+
+      expect(mockCreateOncallItem).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionContextLimitReported).not.toHaveBeenCalled();
+    });
+
+    it('should NOT call createOncallItem when there is no sessionId', async () => {
+      await agentModeController.generateResponse(
+        { ...makeReq(), body: { userMessage: 'hi', llmModel: 'gpt-5-chat-2', attachments: [] } } as unknown as Request,
+        makeRes()
+      );
+
+      await new Promise(r => setImmediate(r));
+
+      expect(mockCreateOncallItem).not.toHaveBeenCalled();
+    });
+
+    it('should return 413 CONTEXT_LIMIT_EXCEEDED regardless of Notion call success', async () => {
+      mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion unavailable'));
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession } as any);
+
+      const mockRes = makeRes();
+      await agentModeController.generateResponse(makeReq(), mockRes);
+
+      await new Promise(r => setImmediate(r));
+
+      expect(mockRes.status).toHaveBeenCalledWith(413);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'CONTEXT_LIMIT_EXCEEDED' }));
     });
   });
 });

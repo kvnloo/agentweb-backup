@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 

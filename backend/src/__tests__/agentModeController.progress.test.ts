@@ -15,7 +15,8 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     addMessageToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
-    incrementCalledFunctions: jest.fn()
+    incrementCalledFunctions: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn()
   }
 }));
 
@@ -97,6 +98,7 @@ describe('AgentMode Progress SSE Endpoints', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (getLatestProgress as jest.Mock).mockReturnValue(undefined);
   });
 
@@ -157,6 +159,87 @@ describe('AgentMode Progress SSE Endpoints', () => {
 
       expect(res.status).toHaveBeenCalledWith(403);
       expect(res.json).toHaveBeenCalledWith({ error: 'Unauthorized access to session' });
+    });
+
+    // Regression: under admin delegation, the session list shown in the admin UI
+    // can mix the target user's sessions with the admin's own admin-owned
+    // sessions. Before this fix, polling an admin-owned session while delegated
+    // as the target user 403'd (session.userId === admin !== user.userId ===
+    // target), which put the UI in a 403 polling loop. See prod nginx log,
+    // 2026-04-23 23:52-23:55 UTC, 26 consecutive 403s on four session IDs.
+    it('allows a delegated admin to read their own admin-owned session', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...mockSession,
+        userId: 'admin-user-id', // session was created by the admin, not the target
+      });
+
+      const req = mockRequest({
+        params: { sessionId },
+        // Under delegation middleware sets req.user.userId to the TARGET user.
+        user: { userId: 'target-user-id', email: 'target@example.com' } as User,
+      }) as Request;
+      (req as any).delegateInfo = {
+        adminUserId: 'admin-user-id',
+        adminEmail: 'admin@example.com',
+        isDelegated: true,
+      };
+      const res = mockResponse() as Response;
+
+      (registerProgressCallback as jest.Mock).mockReturnValue(jest.fn());
+
+      await agentModeController.getProgress(req as any, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'text/event-stream');
+      expect(registerProgressCallback).toHaveBeenCalledWith(sessionId, expect.any(Function));
+    });
+
+    it('still 403s a delegated admin trying to read a stranger\'s session', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...mockSession,
+        userId: 'stranger-user-id', // neither target nor admin
+      });
+
+      const req = mockRequest({
+        params: { sessionId },
+        user: { userId: 'target-user-id', email: 'target@example.com' } as User,
+      }) as Request;
+      (req as any).delegateInfo = {
+        adminUserId: 'admin-user-id',
+        adminEmail: 'admin@example.com',
+        isDelegated: true,
+      };
+      const res = mockResponse() as Response;
+
+      await agentModeController.getProgress(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Unauthorized access to session' });
+    });
+
+    it('allows a delegated admin to read the target user\'s session (primary path)', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...mockSession,
+        userId: 'target-user-id',
+      });
+
+      const req = mockRequest({
+        params: { sessionId },
+        user: { userId: 'target-user-id', email: 'target@example.com' } as User,
+      }) as Request;
+      (req as any).delegateInfo = {
+        adminUserId: 'admin-user-id',
+        adminEmail: 'admin@example.com',
+        isDelegated: true,
+      };
+      const res = mockResponse() as Response;
+
+      (registerProgressCallback as jest.Mock).mockReturnValue(jest.fn());
+
+      await agentModeController.getProgress(req as any, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(registerProgressCallback).toHaveBeenCalledWith(sessionId, expect.any(Function));
     });
 
     it('should send latest progress if available', async () => {

@@ -173,6 +173,7 @@ export interface ChatSession {
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
+  contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -220,7 +221,7 @@ export interface ChatSession {
   assetCache?: {
     images: Array<{ url: string; filename: string; generatedAt: string }>;
     videos: Array<{ url: string; filename: string; generatedAt: string }>;
-    htmlReports: Array<{ url: string; filename: string; generatedAt: string }>;
+    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>;
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
@@ -803,11 +804,6 @@ export class ChatbotDB {
     const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
     const currentMessageCount = currentMessages.length;
 
-    // Check if adding this message would exceed the limit
-    if (currentMessageCount >= MAX_MESSAGE_SIZE_PER_SESSION) {
-      throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`);
-    }
-
     const messageIndex = currentMessageCount;
 
     // Add message to AW-ChatMessages table
@@ -852,12 +848,6 @@ export class ChatbotDB {
     // Get current message count from AW-ChatMessages
     const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
     const currentMessageCount = currentMessages.length;
-
-    // Check if adding these messages would exceed the limit
-    const totalMessageCount = currentMessageCount + messages.length;
-    if (totalMessageCount > MAX_MESSAGE_SIZE_PER_SESSION) {
-      throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: Adding ${messages.length} message(s) would exceed the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages per session (current: ${currentMessageCount}). Please start a new session to continue the conversation.`);
-    }
 
     const messageIndex = currentMessageCount;
 
@@ -1600,8 +1590,8 @@ export class ChatbotDB {
       params.ExpressionAttributeValues[':pageIdentifier'] = pageIdentifier;
     }
     if (searchTerm) {
-      filterParts.push('contains(#title, :searchTerm)');
-      params.ExpressionAttributeNames = { '#title': 'title' };
+      filterParts.push('(contains(#title, :searchTerm) OR contains(sessionSummary.#summary, :searchTerm))');
+      params.ExpressionAttributeNames = { '#title': 'title', '#summary': 'summary' };
       params.ExpressionAttributeValues[':searchTerm'] = searchTerm;
     }
     if (filterParts.length > 0) {
@@ -1934,6 +1924,81 @@ export class ChatbotDB {
     } catch (error) {
       // Non-critical: log but don't fail the request
       console.error(`Error updating asset cache for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Persist searchableText values for specific htmlReport entries in a session's assetCache.
+   * Uses a list_append / update approach: patches only the matching entries by URL.
+   * Called after enrichHtmlReportsWithSearchableText to avoid repeated S3 fetches.
+   */
+  async persistSearchableTexts(
+    sessionId: string,
+    updates: Array<{ url: string; searchableText: string }>
+  ): Promise<void> {
+    if (updates.length === 0) return;
+
+    try {
+      // Fetch current assetCache, patch the matching entries, write back
+      const result = await dynamodb.get({
+        TableName: this.tableName,
+        Key: { sessionId },
+        ProjectionExpression: 'assetCache, assetScanIndex',
+      }).promise();
+
+      const item = result.Item as any;
+      if (!item || !item.assetCache) return;
+
+      const cache = item.assetCache as ChatSession['assetCache'];
+      if (!cache) return;
+
+      const updateMap = new Map(updates.map(u => [u.url, u.searchableText]));
+      let changed = false;
+
+      for (const report of cache.htmlReports || []) {
+        const text = updateMap.get(report.url);
+        if (text && !report.searchableText) {
+          report.searchableText = text;
+          changed = true;
+        }
+      }
+
+      if (!changed) return;
+
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET assetCache = :cache',
+        ExpressionAttributeValues: { ':cache': cache },
+      }).promise();
+    } catch (error) {
+      console.error(`Error persisting searchableTexts for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Remove cached searchableText for a specific URL across all agent sessions for a user.
+   * Called after saveHtmlContent overwrites an HTML file in-place at the same URL.
+   */
+  async clearSearchableTextByUrl(userId: string, url: string): Promise<void> {
+    try {
+      const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
+      await Promise.all(sessions.map(async (session) => {
+        if (!session.assetCache) return;
+        const reports = session.assetCache.htmlReports || [];
+        const match = reports.find(r => r.url === url);
+        if (!match || !match.searchableText) return;
+
+        delete match.searchableText;
+        await dynamodb.update({
+          TableName: this.tableName,
+          Key: { sessionId: session.sessionId },
+          UpdateExpression: 'SET assetCache = :cache',
+          ExpressionAttributeValues: { ':cache': session.assetCache },
+        }).promise();
+      }));
+    } catch (error) {
+      console.error(`Error clearing searchableText for url ${url}:`, error);
     }
   }
 
@@ -2552,6 +2617,20 @@ export class ChatbotDB {
     } catch (updateError) {
       console.error("Error updating session error:", updateError);
       // Don't throw - we don't want error logging to fail the entire operation
+    }
+  }
+
+  async updateSessionContextLimitReported(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: 'SET contextLimitReported = :val',
+      ExpressionAttributeValues: { ':val': true },
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (updateError) {
+      console.error('Error setting contextLimitReported flag:', updateError);
     }
   }
 

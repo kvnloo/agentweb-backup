@@ -15,17 +15,26 @@ jest.mock('../middleware/auth', () => ({
 // Mock axios
 jest.mock('axios');
 
-// Mock S3 utils for getFileContent which now reads directly via SDK
+// Mock S3 utils
 const mockGetS3ObjectStream = jest.fn();
 const mockGetS3ObjectMetadata = jest.fn();
+const mockUploadFileToS3WithPath = jest.fn();
 jest.mock('../utils/s3Utils', () => {
   const actual = jest.requireActual('../utils/s3Utils');
   return {
     ...actual,
     getS3ObjectStream: (...args: any[]) => mockGetS3ObjectStream(...args),
     getS3ObjectMetadata: (...args: any[]) => mockGetS3ObjectMetadata(...args),
+    uploadFileToS3WithPath: (...args: any[]) => mockUploadFileToS3WithPath(...args),
   };
 });
+
+// Mock ChatbotDB
+jest.mock('../services/chatbotService', () => ({
+  ChatbotDB: jest.fn().mockImplementation(() => ({
+    clearSearchableTextByUrl: jest.fn().mockResolvedValue(undefined),
+  })),
+}));
 
 import request from 'supertest';
 import express from 'express';
@@ -118,6 +127,42 @@ describe('Files routes', () => {
 
       expect(response.status).toBe(400);
       expect(response.body.message).toContain('Must be HTTP or HTTPS');
+    });
+  });
+
+  describe('POST /api/files/html - searchableText invalidation', () => {
+    const S3_URL = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/files/report.html';
+
+    it('should call clearSearchableTextByUrl with the saved URL after successful upload', async () => {
+      mockUploadFileToS3WithPath.mockResolvedValue({ success: true, url: S3_URL, key: 'users/test-user-123/files/report.html' });
+
+      const { ChatbotDB } = require('../services/chatbotService');
+      const mockInstance = { clearSearchableTextByUrl: jest.fn().mockResolvedValue(undefined) };
+      ChatbotDB.mockImplementation(() => mockInstance);
+
+      const response = await request(app)
+        .post('/api/files/html')
+        .set('Authorization', `Bearer ${validToken}`)
+        .send({ url: S3_URL, content: '<html><body>Updated content</body></html>' });
+
+      expect(response.status).toBe(200);
+      expect(mockInstance.clearSearchableTextByUrl).toHaveBeenCalledWith('test-user-123', S3_URL);
+    });
+
+    it('should still return success if clearSearchableTextByUrl fails', async () => {
+      mockUploadFileToS3WithPath.mockResolvedValue({ success: true, url: S3_URL, key: 'users/test-user-123/files/report.html' });
+
+      const { ChatbotDB } = require('../services/chatbotService');
+      const mockInstance = { clearSearchableTextByUrl: jest.fn().mockRejectedValue(new Error('DynamoDB error')) };
+      ChatbotDB.mockImplementation(() => mockInstance);
+
+      const response = await request(app)
+        .post('/api/files/html')
+        .set('Authorization', `Bearer ${validToken}`)
+        .send({ url: S3_URL, content: '<html><body>Updated</body></html>' });
+
+      // Invalidation is non-critical — upload success should still be returned
+      expect(response.status).toBe(200);
     });
   });
 });

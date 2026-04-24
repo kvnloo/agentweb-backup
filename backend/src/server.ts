@@ -449,6 +449,19 @@ createTestAccount().then(async () => {
         console.error('[DripExecutor] Failed to initialize:', error);
       }
 
+      // Drip Sequence Worker — runs every 5 minutes
+      try {
+        const { processDueEnrollments } = await import('./services/dripSequenceWorker');
+        const DRIP_INTERVAL_MS = 5 * 60 * 1000;
+        processDueEnrollments().catch(e => console.error('[dripWorker] Error on first run:', e));
+        setInterval(() => {
+          processDueEnrollments().catch(e => console.error('[dripWorker] Error:', e));
+        }, DRIP_INTERVAL_MS);
+        console.log('[dripWorker] Initialized — running every 5 minutes');
+      } catch (error) {
+        console.error('[dripWorker] Failed to initialize:', error);
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

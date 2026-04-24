@@ -717,6 +717,7 @@ export default function AdminDashboard() {
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
+  const [userFilterHideBotLike, setUserFilterHideBotLike] = useState(true);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
   const [userActivitiesLoading, setUserActivitiesLoading] = useState<Record<string, boolean>>({});
@@ -739,6 +740,7 @@ export default function AdminDashboard() {
   const [chatSessionsCursor, setChatSessionsCursor] = useState<string | null>(null);
   const [chatSessionsHasMore, setChatSessionsHasMore] = useState(true);
   const [chatSessionsInitialized, setChatSessionsInitialized] = useState(false);
+  const [chatSessionIdSearch, setChatSessionIdSearch] = useState("");
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
@@ -912,7 +914,7 @@ export default function AdminDashboard() {
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
     if (tabValue === 2) {
-      loadUsers();
+      loadUsers(userFilterHideBotLike);
       loadSubscriptionTypes();
       // Load admin Slack channel setting
       axios.get(buildApiUrl('/api/settings/slack_admin_channel'), {
@@ -967,7 +969,7 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 3) {
       loadWaitlist();
-      loadUsers(); // Also load users to check if waitlist entries are registered
+      loadUsers(userFilterHideBotLike); // Also load users to check if waitlist entries are registered
     }
   }, [tabValue]);
 
@@ -1045,20 +1047,27 @@ export default function AdminDashboard() {
   }, [tabValue, token]);
 
   const loadChatSessions = React.useCallback(
-    async (options?: { reset?: boolean }) => {
+    async (options?: { reset?: boolean; sessionIdOverride?: string }) => {
       if (!token || chatSessionsLoading) {
         return;
       }
 
       const shouldReset = options?.reset ?? false;
       const cursor = shouldReset ? null : chatSessionsCursor;
+      const searchId = options?.sessionIdOverride !== undefined
+        ? options.sessionIdOverride
+        : chatSessionIdSearch;
 
       try {
         setChatSessionsLoading(true);
         const params = new URLSearchParams();
-        params.set("limit", "30");
-        if (cursor) {
-          params.set("cursor", cursor);
+        if (searchId.trim()) {
+          params.set("sessionId", searchId.trim());
+        } else {
+          params.set("limit", "30");
+          if (cursor) {
+            params.set("cursor", cursor);
+          }
         }
 
         const response = await axios.get(
@@ -1076,7 +1085,7 @@ export default function AdminDashboard() {
         };
 
         setChatSessions((prev) => {
-          if (shouldReset) {
+          if (shouldReset || searchId.trim()) {
             return sessions;
           }
           const seen = new Set(prev.map((session) => session.sessionId));
@@ -1090,7 +1099,7 @@ export default function AdminDashboard() {
           return merged;
         });
         setChatSessionsCursor(nextCursor);
-        setChatSessionsHasMore(Boolean(nextCursor));
+        setChatSessionsHasMore(Boolean(nextCursor) && !searchId.trim());
         setChatSessionsInitialized(true);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
@@ -1098,7 +1107,7 @@ export default function AdminDashboard() {
         setChatSessionsLoading(false);
       }
     },
-    [token, chatSessionsCursor, chatSessionsLoading]
+    [token, chatSessionsCursor, chatSessionsLoading, chatSessionIdSearch]
   );
 
   useEffect(() => {
@@ -1820,7 +1829,7 @@ export default function AdminDashboard() {
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      await loadUsers(); // Reload users list
+      await loadUsers(userFilterHideBotLike); // Reload users list
       setSuccess(`User ${selectedUser.email} has been deactivated`);
     } catch (error: any) {
       setError(error.response?.data?.message || "Failed to deactivate user");
@@ -1847,7 +1856,7 @@ export default function AdminDashboard() {
         setLoading(true);
         await deleteUser(userIdToDelete);
         setSuccess(`User ${userIdToDelete} deleted successfully.`); // Consider showing email or a more user-friendly identifier
-        await loadUsers(); // Ensure user list is refreshed
+        await loadUsers(userFilterHideBotLike); // Ensure user list is refreshed
         handleCloseUserDeleteConfirm();
       } catch (error) {
         let errorMessage = "Failed to delete user";
@@ -3781,8 +3790,22 @@ export default function AdminDashboard() {
               label={<Typography variant="body2">Has usage</Typography>}
               sx={{ ml: 0 }}
             />
-            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage) && (
-              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={userFilterHideBotLike}
+                  onChange={(e) => {
+                    setUserFilterHideBotLike(e.target.checked);
+                    loadUsers(e.target.checked);
+                  }}
+                />
+              }
+              label={<Typography variant="body2">Hide bots</Typography>}
+              sx={{ ml: 0 }}
+            />
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
@@ -3944,7 +3967,7 @@ export default function AdminDashboard() {
                           {paymentStatus === "free" && (
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
-                          {user.subscription_amount != null && user.subscription_amount > 0 && (
+                          {user.subscription_amount != null && (
                             <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
                               ${(user.subscription_amount / 100).toFixed(0)}/mo
                             </Typography>
@@ -5123,6 +5146,40 @@ export default function AdminDashboard() {
               </Button>
             </Box>
           )}
+          <Box sx={{ display: 'flex', gap: 1, mb: 2, alignItems: 'center' }}>
+            <TextField
+              label="Search by Session ID"
+              size="small"
+              value={chatSessionIdSearch}
+              onChange={(e) => setChatSessionIdSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch });
+                }
+              }}
+              sx={{ width: 380 }}
+              placeholder="Paste a session ID and press Enter or Search"
+            />
+            <Button
+              variant="contained"
+              size="small"
+              onClick={() => loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch })}
+            >
+              Search
+            </Button>
+            {chatSessionIdSearch && (
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => {
+                  setChatSessionIdSearch("");
+                  loadChatSessions({ reset: true, sessionIdOverride: "" });
+                }}
+              >
+                Clear
+              </Button>
+            )}
+          </Box>
           <TableContainer component={Paper}>
             <Table>
               <TableHead>

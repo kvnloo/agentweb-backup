@@ -313,4 +313,77 @@ describe("Admin chat sessions endpoint", () => {
       expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(1); // only hydration
     });
   });
+
+  describe("sessionId search", () => {
+    it("returns the specific session when sessionId param is provided and session exists", async () => {
+      const session = {
+        sessionId: "abc-123",
+        userId: "user-1",
+        createdAt: "2024-01-01T00:00:00Z",
+        updatedAt: "2024-01-02T00:00:00Z",
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi" },
+        ],
+      };
+
+      mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sessionId=abc-123")
+        .expect(200);
+
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("abc-123");
+      expect(mockChatbotDb.getRecentSessionsPage).not.toHaveBeenCalled();
+      expect(res.body.sessions).toHaveLength(1);
+      expect(res.body.sessions[0].sessionId).toBe("abc-123");
+      expect(res.body.nextCursor).toBeNull();
+    });
+
+    it("returns empty results when sessionId param is provided but session does not exist", async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(null);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sessionId=nonexistent-id")
+        .expect(200);
+
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("nonexistent-id");
+      expect(mockChatbotDb.getRecentSessionsPage).not.toHaveBeenCalled();
+      expect(res.body.sessions).toHaveLength(0);
+      expect(res.body.nextCursor).toBeNull();
+    });
+
+    it("filters out session found by ID if it has no user messages", async () => {
+      const session = {
+        sessionId: "no-user-msgs",
+        userId: "user-1",
+        createdAt: "2024-01-01T00:00:00Z",
+        updatedAt: "2024-01-01T00:00:00Z",
+        messages: [{ role: "assistant", content: "auto greeting" }],
+      };
+
+      mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sessionId=no-user-msgs")
+        .expect(200);
+
+      expect(res.body.sessions).toHaveLength(0);
+      expect(res.body.nextCursor).toBeNull();
+    });
+
+    it("ignores sessionId param when it is empty string and uses normal pagination", async () => {
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: [],
+        lastEvaluatedKey: undefined,
+      });
+
+      await request(app)
+        .get("/api/admin/chat-sessions?sessionId=")
+        .expect(200);
+
+      expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalled();
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+  });
 });

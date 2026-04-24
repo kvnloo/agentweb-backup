@@ -1,3 +1,32 @@
+# April 21, 2026: Investigation — Agent Mode "Unknown Error" with claude-opus-4-7
+
+## Context
+
+User `ftan@agentweb.pro` hit the generic "I apologize, but I encountered an error processing your request" error in Agent Mode when using model `anthropic.claude-opus-4-7`. This triggered an "Unknown Error in Generate Response" oncall alert.
+
+## Root Cause
+
+`anthropic.claude-opus-4-7` is registered in the model registry but **not provisioned on this AWS Bedrock account**. Bedrock returns:
+
+```
+ValidationException: anthropic.claude-opus-4-7 is not available for this account.
+You can explore other available models on Amazon Bedrock.
+```
+
+This is a 400-class error, but the AWS SDK surfaces the HTTP status on `error.$metadata.httpStatusCode` rather than a top-level `error.status` field. The existing error classifier in `generateMarketingResponse` only checked `error.status === 400`, so the Bedrock ValidationException fell through to the generic catch-all and triggered the oncall alert instead of showing a sensible "issue processing your request" message.
+
+## Fix
+
+- Added `error.$metadata.httpStatusCode` as a fallback when reading the HTTP status in the error classifier (`agentModeService.ts`). Going forward, Bedrock validation errors will map to the correct user-facing message.
+- The model is kept in the registry because: (1) it is admin-only (`getSupportedModels` filters out any model with "opus" for non-admins), so regular users are never exposed to it; (2) it may become available on this account in the future, at which point it will work automatically.
+- If AWS provisions the model on this account, no code changes are needed — the inference profile ARN is already configured.
+
+## Decision
+
+**Do not remove `claude-opus-4-7` from the registry.** It is safely gated behind admin-only access, and the error classification fix means any future Bedrock unavailability errors will show a proper message rather than triggering a generic alert.
+
+---
+
 # April 8, 2026: Investigation — Lead Tech Stack Enrichment Options
 
 ## Context
@@ -3432,3 +3461,101 @@ All 10 LinkedIn outreach actions (`search-people`, `get-profile`, `send-invite`,
 ### Decision
 
 **Finding email from LinkedIn is not supported and will not be added to the LinkedIn outreach feature.** Email discovery is an enrichment concern, not an outreach concern. If email finding from a LinkedIn profile is needed, it should be implemented as part of the CRM enrichment feature (`crmEnrichmentService.ts`) using a third-party enrichment provider (e.g. Apollo.io, which accepts LinkedIn profile URLs and returns verified business emails). This keeps outreach and enrichment concerns cleanly separated.
+
+
+## Goalden Hour Meta Ad Account — Ownership Investigation (2026-04-20)
+
+### Context
+
+Investigated who owns the Goalden Hour ad account in Meta (Facebook) Business Manager, and what steps are needed to transfer or grant access.
+
+### Findings
+
+The Goalden Hour Meta ad account is currently **owned by individual people**, not by a Business Manager. Only the AgentWeb team has full (Admin) control at this time.
+
+### Short-Term Action: Grant Goalden Hour Admin Access
+
+To give the Goalden Hour team full operational control without transferring ownership:
+
+1. Go to [business.facebook.com](https://business.facebook.com) → **Business Settings**
+2. Click **Accounts** → **Ad Accounts** → select the Goalden Hour ad account
+3. Click **Add People** → search for the Goalden Hour contact by name or email
+4. Set their role to **Admin** (full control: manage people, billing, settings, run ads)
+5. Click **Confirm**
+
+This gives them full operational access while ownership stays with the current individual.
+
+### Future Action: Transfer Ownership to Business Manager
+
+When ready to transfer formal ownership to the Goalden Hour Business Manager:
+
+1. The current individual owner must be cooperative
+2. **Option A (preferred):** In Meta Business Manager → Business Settings → Ad Accounts → Add → **Claim an Ad Account** → enter the account ID. The individual owner approves the claim.
+3. **Option B:** The individual goes to their Ad Account Settings → Ad Account Roles → adds the Goalden Hour Business Manager as Admin, then initiates a transfer.
+4. **Option C (last resort):** Contact Meta Support with proof of business ownership if the individual is unreachable.
+
+> **Caveat:** Once an ad account is claimed by a Business Manager, it cannot be moved to another Business. Confirm the correct Business Manager before claiming.
+
+### Decision
+
+**Short term:** Grant the Goalden Hour contact Admin access so they have full operational control immediately. **Long term:** Initiate a formal ownership transfer/claim into their Business Manager when they are ready to do so.
+
+## Security Breach Investigation — Lovable & Vercel (2026-04-21)
+
+### Context
+
+Investigated whether AgentWeb is impacted by two security incidents:
+1. **Lovable security breach** — Lovable (vibe coding platform) disclosed a broken object-level authorization flaw in their API that allowed unauthorized access to user projects, source code, database credentials, and AI chat histories. The vulnerability was unpatched for 48 days after discovery on March 3, 2026.
+2. **Vercel security breach** — Vercel disclosed a security incident. Vercel sent official email communication confirming: *"At this time, we do not have reason to believe that your Vercel credentials or personal data have been compromised."* **Status: Safe, no action required.**
+
+### Lovable Exposure Analysis
+
+The customer-portal repo originated as a Lovable project and remains connected to it. Artifacts found:
+
+**1. External CDN script in `index.html:70`**
+```html
+<script src="https://cdn.gpteng.co/gptengineer.js" type="module"></script>
+```
+Loaded on every page, runs with full browser context. If Lovable's infrastructure is compromised this is a vector for client-side code execution. **Highest priority to remove.**
+
+**2. `lovable-tagger` npm package (`package.json:112`, `vite.config.ts:4,38`)**
+Sends component metadata to Lovable during dev builds. Not evidence of npm compromise, but is telemetry going to a breached vendor. Remove as hygiene.
+
+**3. Fallback URL in `src/config.ts:9`** pointing to `https://preview--agentweb-customer-portal.lovable.app` — cosmetic, but should be cleaned up.
+
+**Key clarification:** The Lovable breach is a **platform data leak** (their API exposed stored project data), not a CDN/supply chain attack. The primary risk to us is: if any real credentials (API keys, env vars, secrets) were ever entered into the Lovable project editor, those may have been exfiltrated.
+
+### Status & Next Steps
+
+- **Vercel:** Confirmed safe per official Vercel email. No action required.
+- **Lovable:** Awaiting Lovable's official email notification to determine whether our specific project was accessed during the breach. Once received, assess whether any credentials need rotation.
+- **Code cleanup (planned):** Remove CDN script, lovable-tagger, and Lovable URL fallback from customer-portal regardless of breach outcome — these are unnecessary Lovable dependencies.
+
+## Meta Account Connection Failure — karthy@goaldenhour.com (2026-04-20)
+
+### Context
+
+karthy@goaldenhour.com (userId: `4027bc5c-0f89-4236-b63e-b0186c634a1c`) reported that connecting their Meta ad account failed.
+
+### Root Cause
+
+Production logs at `Apr 19 00:55:35` showed:
+
+```
+[Meta Finalize] getAdAccounts failed — code=n/a classification=n/a
+message=Meta API Error: (#200) Requires business_management permission to manage the object
+```
+
+The OAuth flow (`flow=marketing`) exchanges the code and gets a valid access token, but the subsequent `/me/adaccounts` API call requires the `business_management` permission. Our current `marketingScopes` in `backend/src/config/integrations.ts` only requests `ads_management`, `ads_read`, and `pages_show_list`. The error is silently caught (`metaAuth.ts:248`) and returns 0 ad accounts, leaving the user unable to connect.
+
+### Why `business_management` Was Not Added
+
+Adding `business_management` to `marketingScopes` would fix the API error, but Meta only allows this permission under **Advanced Access** for customer-facing apps. Standard Access (which we currently have, status Active with 561 users) restricts the permission to users who have a developer/admin/tester role on the Facebook App — it does not work for general customers. Obtaining Advanced Access requires a Meta App Review with a detailed use-case submission and is slow/difficult to get. Decision made after discussion with Harshit@Argusoft.
+
+### Short-Term Fix (Implemented)
+
+The Goaldenhour ad account is now under our (AgentWeb's) control. **We granted karthy@goaldenhour.com full access to the ad account directly through Facebook Business Manager.** This means their user token already has access to the account without needing `business_management` — they can connect successfully today.
+
+### Long-Term Fix
+
+Pursue **transfer of ownership** of the Goaldenhour ad account to Goaldenhour itself via Facebook Business Manager. Once Goaldenhour owns the account, karthy (as an admin of that business) will be able to grant `ads_management` and `ads_read` access through normal OAuth without needing `business_management`. No code changes required for this path either.

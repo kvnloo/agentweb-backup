@@ -22,6 +22,7 @@ jest.mock('../../services/linkedInOutreachService', () => ({
     getClient: jest.fn(),
     getApiUrl: jest.fn(),
     getAccount: jest.fn(),
+    clearStatusCache: jest.fn(),
   },
 }));
 
@@ -111,6 +112,7 @@ describe('LinkedIn Outreach Auth Router', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ success: true, account: mockCreatedAccount });
       expect(linkedInOutreachService.getAccount).toHaveBeenCalledWith('acc-123');
+      expect(linkedInOutreachService.clearStatusCache).toHaveBeenCalledWith('acc-123');
       expect(createAccount).toHaveBeenCalledWith('user-123', 'unipile', {
         account_id: 'acc-123',
         account_name: 'John Doe',

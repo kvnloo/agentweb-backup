@@ -39,7 +39,7 @@ jest.mock('../services/resendService', () => ({
 
 import { getAccountSummary } from '../services/accountSummaryService';
 import { chatbotDb } from '../services/chatbotService';
-import { userDb, crmDb } from '../services/db';
+import { userDb, crmDb, scheduleDb } from '../services/db';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { agentModeService } from '../services/agentModeService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
@@ -65,6 +65,9 @@ jest.mock('../services/db', () => ({
     getLeadListsByUserId: jest.fn().mockResolvedValue([]),
     getLeadsByListId: jest.fn().mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false }),
   },
+  scheduleDb: {
+    getSchedulesByUserId: jest.fn().mockResolvedValue([]),
+  },
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -89,6 +92,7 @@ const mockGetLeads = crmDb.getLeadsByListId as jest.Mock;
 const mockGetEmailEvents = emailEventsDb.getEventsByEmailDomain as jest.Mock;
 const mockLoadPosts = agentModeService.loadConnectedAccountPosts as jest.Mock;
 const mockGetAccounts = getAccountsByUserId as jest.Mock;
+const mockGetSchedulesByUserId = scheduleDb.getSchedulesByUserId as jest.Mock;
 
 function makeSession(overrides: Record<string, any> = {}) {
   return {
@@ -113,6 +117,7 @@ describe('getAccountSummary', () => {
     mockGetEmailEvents.mockResolvedValue([]);
     mockGetAccounts.mockResolvedValue([]);
     mockLoadPosts.mockResolvedValue({ success: true, posts: [] });
+    mockGetSchedulesByUserId.mockResolvedValue([]);
   });
 
   // --- FAIL CASES ---
@@ -690,5 +695,49 @@ describe('getAccountSummary', () => {
     expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-1', { limit: 50, include_metrics: true });
     expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-2', { limit: 50, include_metrics: true });
     expect(result.results.social_media.impressions).toBe(1000); // 500 * 2 accounts
+  });
+
+  // --- Account Counts ---
+
+  test('returns zero account counts when user has no data', async () => {
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.account.connected_accounts).toBe(0);
+    expect(result.account.active_schedules).toBe(0);
+  });
+
+  test('counts connected accounts', async () => {
+    mockGetAccounts.mockResolvedValue([
+      { account_id: 'acc-1', platform: 'linkedin' },
+      { account_id: 'acc-2', platform: 'meta' },
+      { account_id: 'acc-3', platform: 'twitter' },
+    ]);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.account.connected_accounts).toBe(3);
+  });
+
+  test('counts only active scheduled chats', async () => {
+    mockGetSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 's-1', type: 'scheduled_chat', status: 'active' },
+      { scheduleId: 's-2', type: 'scheduled_chat', status: 'active' },
+      { scheduleId: 's-3', type: 'scheduled_chat', status: 'paused' },
+      { scheduleId: 's-4', type: 'task_schedule', status: 'active' }, // different type, excluded
+    ]);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.account.active_schedules).toBe(2);
+  });
+
+test('returns zero account counts gracefully when fetches fail', async () => {
+    mockGetAccounts.mockRejectedValue(new Error('network error'));
+    mockGetSchedulesByUserId.mockRejectedValue(new Error('DynamoDB error'));
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.account.connected_accounts).toBe(0);
+    expect(result.account.active_schedules).toBe(0);
   });
 });

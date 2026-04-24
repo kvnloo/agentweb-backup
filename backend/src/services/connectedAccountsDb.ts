@@ -193,6 +193,8 @@ export interface ConnectedAccountConfig {
   account_name: string;
   config: PlatformConfig;
   engagementMemory?: EngagementMemory;
+  /** When true, org members can see and use this account. Default: false (private). */
+  sharedWithOrg?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -206,6 +208,7 @@ export interface ConnectedAccount {
   account_name: string;
   config: PlatformConfig;
   engagementMemory?: EngagementMemory;
+  sharedWithOrg?: boolean;
   created_at: string;
   updated_at: string;
 }

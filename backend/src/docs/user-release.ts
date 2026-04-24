@@ -9,6 +9,211 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-24',
+    changes: [
+      'New: Find Leads from LinkedIn — AI-Powered Lead Discovery in CRM',
+      '- A new "Find Leads" button in any CRM list opens a search form where you can find LinkedIn leads by keywords, job title, and company',
+      '- Results are imported directly into your list with names, titles, companies, and clean LinkedIn profile URLs',
+      '- Duplicate detection is built in — leads already in the list are automatically skipped',
+      '- Emma can also find and add leads via natural language: "Find 10 VPs of Engineering and add them to my list"',
+      '- Works even if you have not connected a personal LinkedIn account (uses the platform-wide LinkedIn integration)',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Emma Now Installs All Skills in a Single Call Instead of Multiple Separate Calls',
+      '- Emma was calling install_skills once per skill group (e.g. 3 calls when 3 skills were needed), adding unnecessary latency at the start of each session',
+      '- Updated the install_skills tool description and system prompt to explicitly instruct Emma to batch all needed skill IDs into one call',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Emma Now Correctly Solves reCAPTCHA When Logging Into Websites',
+      '- Emma was failing silently when asked to log into sites protected by reCAPTCHA v2 (e.g. rankai.ai), calling the solve_captcha tool without the required site key or captcha type',
+      '- The tool now detects missing parameters immediately and returns the exact browser_evaluate code needed to extract the site key, so Emma retries with the correct inputs',
+      '- The tool description was also updated to explicitly instruct Emma to extract the data-sitekey attribute before calling the tool, preventing the issue from recurring',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Improvement: Account Summary Now Includes Connected Accounts and Active Scheduled Chats',
+      '- The account_summary tool used by Emma now returns an account section with the count of connected accounts and active scheduled chats',
+      '- This gives Emma immediate context about the account setup without requiring separate tool calls',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'New: Email Sequences — Automated Drip Campaigns in CRM',
+      '- A new "Sequences" tab in CRM lets you build multi-step email sequences that send automatically on a delay to convert and nurture leads',
+      '- Supports multiple campaign types: Free → Paid Conversion, Onboarding, Re-engagement, Nurture, Upsell, and Custom',
+      '- Enroll leads individually or in bulk from any lead list; leads can also be enrolled automatically when they reach a specific lifecycle stage',
+      '- Configure exit conditions: stop a sequence when a lead converts, engages with an email (opens, clicks, replies), unsubscribes, or reaches a specific lifecycle stage',
+      '- Each step has a configurable delay (in days) and a full email editor with variable support (e.g. {{firstName}})',
+      '- Per-step utilities: Send Test Email, Verify Variables (checks coverage against enrolled leads), and Load from URL (import email body from a web page)',
+      '- Verification gate before saving: the Save button runs a pre-flight check — hard failures (no sender, missing subject/body) block saving; variable coverage warnings are shown with per-lead counts',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Scheduled Website Scans Now Complete the Full Audit After Navigation',
+      '- Scheduled scans were navigating to the target site but then asking "what should I do next?" instead of running the audit',
+      '- Root cause: after 10+ retry attempts, consecutive retry messages filled the context window and pushed the original task instruction out of the messages sent to the LLM',
+      '- Consecutive user messages are now merged before the context window is applied, so the original task is always visible to the LLM regardless of retry count',
+      'Fix: Reports Page Now Loads for Accounts with Large Numbers of Reports',
+      '- The Reports page was timing out for accounts with thousands of HTML reports because report preview text was re-fetched from S3 on every page load',
+      '- Preview text (used for search) is now cached after the first load, so subsequent visits are instant',
+      '- Cache is automatically invalidated when a report is edited in the report editor',
+      'Fix: Emma Now Prompts to Resend When a Response Was Lost Due to a Server Restart',
+      '- If Emma was in the middle of responding when the server restarted, your message was saved but the reply never arrived',
+      '- The chat now detects this "orphaned" state on reload and shows a banner: "The previous response wasn\'t received — the server may have restarted."',
+      '- A Resend button lets you re-submit the message with one click instead of having to retype it',
+      '- The server also now gives a clearer "please resend" message (instead of a generic error) when a crash occurs mid-response',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fixed: CRM Page No Longer Crashes for Accounts with Large Lead Lists',
+      '- The CRM page was crashing or timing out for accounts with very large lead lists (100,000+ leads)',
+      '- The backend now caps how many leads are loaded into memory at once, preventing out-of-memory crashes',
+      '- Recently-active lists are prioritised so the most relevant contacts always appear in the Inbox',
+      '- The Inbox now shows up to 5,000 unique contacts (up from 2,000) and displays a hint when results are capped',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Emma Chart Generation Now Produces Real Images Instead of Broken Placeholders',
+      '- Charts created by Emma\'s data analysis tool were sometimes saving as unrenderable JSON files (Vega-Lite specs from the altair library) instead of actual PNG images',
+      '- These files appeared as broken image placeholders in reports and chat responses',
+      '- Emma now explicitly uses matplotlib/seaborn for chart rendering, which produces real rasterized PNG images',
+      '- The system also validates that any data returned by the AI is an actual image before uploading it, so non-image responses are discarded rather than saved as broken files',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Ad Report Charts Now Render Correctly With Accurate Data',
+      '- Charts in HTML ad performance reports were showing "Chart error: Unexpected identifier" due to malformed JSON in chart configurations (missing closing quotes in property values)',
+      '- The HTML report generator now enforces valid JSON syntax rules and explicit Chart.js version pinning, preventing broken chart URLs',
+      '- Reports are also instructed to never invent placeholder data — if a value is not in the source data, it is omitted rather than fabricated',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Fix: Scheduled Chats No Longer Run When Monthly Token Limit Is Exceeded',
+      '- Free users who had reached their monthly token limit could still have scheduled chats execute automatically — this has been fixed',
+      '- Scheduled chats now check the token limit before running; if the limit is exceeded, the run is recorded as failed and a notification email is sent',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fix: Attio CRM Sync No Longer Fails with Field Mapping Errors',
+      '- Attio push now succeeds even when stored field mappings use legacy property names (e.g. "email" → "email_addresses", "firstname" → "first_name")',
+      '- Placeholder values like "Unknown" and "n/a" in phone/email fields are now filtered out before sending to Attio, preventing format validation errors',
+      '- If an Attio contact record was previously deleted, the next push now recreates it instead of failing with "record not found"',
+      '- Attio API keys that are not exactly 64 characters are now rejected immediately on save with a clear error message',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fix: Messages Sent via Shared Sessions No Longer Get Stuck Without a Response',
+      '- When a shared session (ishare) request was processed by a server instance that was later terminated by auto-scaling, the user\'s message was saved but Emma\'s response was never written — leaving the message orphaned',
+      '- Emma now always writes an error reply when the server shuts down mid-generation, so users see "The server restarted while processing your request. Please send your message again." instead of silence',
+      '- The shared session endpoint now also rejects concurrent duplicate requests, preventing a second send from interfering with an in-progress generation',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'New: Login Credentials — Save Website Logins for Browser Automation',
+      '- A new "Login Credentials" tab is now available in Settings, letting you securely store login credentials for any website',
+      '- Emma can now retrieve these credentials automatically when she needs to log into a site during browser automation tasks — no more pasting passwords in chat',
+      '- Credentials are stored encrypted and never exposed in the chat history',
+      '- The Browser Automation skill now correctly uses saved credentials instead of refusing login requests',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'New: CRM is Shared Across Your Organization',
+      '- Org members can now see all lead lists belonging to anyone in their organization',
+      '- Contacts are deduplicated across the org — the same contact appearing in multiple members\' lists is only counted once',
+      '- All CRM operations (viewing leads, adding leads, filtering) work on org members\' lists, not just your own',
+      '- Tasks and credentials remain private by default and are only visible to their owner',
+    ],
+  },
+  {
+    date: '2026-04-21',
+    changes: [
+      'Improved: Reports Page Search Now Searches Report Content',
+      '- Search on the Reports page now searches inside the body text of HTML reports, not just task names and filenames',
+      '- You can also search by date (e.g. "April 2026"), approval status ("approved", "pending"), publish status ("published", "draft"), and source ("agent-mode")',
+      '- Reports within a task that don\'t match the search term are now hidden — only matching reports are shown',
+    ],
+  },
+  {
+    date: '2026-04-21',
+    changes: [
+      'Improved: Auto-Engagement Comments Now Sound Like a Real Person, Not a Bot',
+      '- LinkedIn auto-engagement comments and replies are now written to sound natural and specific rather than generic',
+      '- Comments now reference something concrete from the post (a number, an idea, a phrase) instead of commenting in general terms',
+      '- Generic openers like "Great post!", "Absolutely!", and "Thanks for sharing" are now explicitly avoided',
+      '- Personality presets configured in Engagement Settings (e.g. Curious, Expert, Conversational) are now applied when generating comments and replies',
+      '- Fallback comments (used if the AI call fails) are now varied and human-sounding instead of fixed bot phrases',
+      'Fix: Work Plan Sessions with Brave Search No Longer Fail Immediately',
+      '- Work plan sessions using the AI GTM Positioning Audit skill (and any skill with Brave Search) were failing on every attempt with "please try rephrasing your question"',
+      '- Root cause: the Brave Search MCP tool schemas use JSON Schema features (anyOf, $schema) that Amazon Bedrock rejects with a 400 error',
+      '- The agent engine now sanitizes tool schemas before sending them to Bedrock, converting anyOf-with-const patterns to enum arrays and stripping unsupported keywords',
+      'Fix: Video Cost Tracking Now Accounts for Video Duration',
+      '- Videos longer than 8 seconds require multiple AI generation calls (one per 8-second clip), but cost tracking was only charging for a single clip regardless of length',
+      '- Cost tracking now correctly charges per clip: a 16s video costs $5.60 (2 clips), a 24s video costs $8.40 (3 clips), etc.',
+      'Fixed: Social Media Post Creation No Longer Crashes on Missing Post Type',
+      '- Creating social media posts with a missing or undefined post type field no longer throws a TypeError crash',
+      '- Affected scheduled sessions (e.g. LinkedIn Post Factory) that retried and recovered, but the fix eliminates unnecessary errors and wasted retries',
+      'Improved: Connect Account Button Stays in Chat After Closing the Popup',
+      '- When Emma asks you to connect an account (e.g. LinkedIn), a "Connect" card now appears permanently in the chat message',
+      '- Closing the connect popup no longer loses the option — you can scroll back and click "Connect" in the message to re-open it at any time',
+      'Fix: CRM Lead Lists Now Show Associated Landing Page',
+      '- When Emma calls get_lead_lists, each list now includes the name and URL of its linked landing page (if one exists)',
+      '- This prevents Emma from confusing similarly-named lead lists when reporting campaign performance against CRM data',
+      'Fixed: Emma No Longer Retries Image Generation After All Work Plan Steps Complete',
+      '- When a large work plan finishes (e.g. generating many ad images), Emma would sometimes retry completed steps instead of delivering the final summary',
+      '- This happened when some image-generation calls timed out asynchronously — Emma still saw the work plan as "in progress" on the next message',
+      '- Emma now recognises when all steps are done and responds with a plain-text summary instead of re-running tool calls',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Admin Users Tab Now Shows Subscription Amount for $499/mo Plans',
+      '- When a user\'s invoice payment succeeded, the subscription amount was not being saved to the database — so the admin Users tab showed "Paid" but no dollar amount',
+      '- The Stripe webhook handler now correctly updates the subscription amount on each successful payment',
+      '- Users on $0 plans now also show $0/mo in the admin Users tab instead of a blank amount',
+      'New: Create AI Reports from Selected Images',
+      '- On the Images page, select one or more images and click "Create Report" to generate an AI-written HTML report',
+      '- Choose from Ad Copy Analysis (headlines, CTAs, copy variants), Social Media Caption Pack (captions and hashtags per platform), Brand Consistency Review (color audit, consistency scores, recommendations), or Custom (write your own instructions)',
+      '- Generated reports appear automatically on the Reports page',
+      'Fix: Video Generation Error Reason Now Shown to Emma',
+      '- When video generation fails (e.g. network error, content policy filter), the specific error message is now passed through to Emma so she can communicate the exact reason — previously the error field was silently dropped and Emma only received a generic failure indicator',
+      'Fix: Emma Now Knows When GA4 and Google Search Console Are Already Configured',
+      '- When Emma calls get_website_analytics or get_seo_metrics, the tool response now explicitly reports the integration status and lists all configured properties/domains',
+      '- Previously, if audit.agentweb.pro pages showed 0 sessions, Emma would ask the user for a GA4 Measurement ID — not realising GA4 was already connected but the subdomain wasn\'t tracked by that property',
+      '- Emma can now distinguish "not configured" from "configured but missing tracking on this subdomain", and will offer to add tracking rather than asking for credentials',
+      'Fix: Onboarding Checklist Progress Now Persists Across Devices',
+      '- Onboarding checklist state (completed steps and dismissed status) is now saved to your account instead of browser storage only',
+      '- Your progress is restored correctly when you log in on a new device or browser',
+    ],
+  },
+  {
     date: '2026-04-19',
     changes: [
       'Fix: Voice Mode Tool Results Now Show in Chat History',
@@ -4615,6 +4820,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Emma Now Shows the Correct Error When Your Monthly Limit Is Reached',
+      '- Emma will now display "Monthly token limit reached. Please contact support or upgrade your plan." when an account has used up its monthly allowance',
+      '- Previously, Emma showed a generic error message instead of the specific limit notification',
+    ],
+  },
+  {
     date: '2026-04-17',
     changes: [
       'Fixed: Emma No Longer Suggests Replies for AgentWeb Team Messages',
@@ -4637,6 +4850,168 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Connecting a Meta ad account no longer fails with "Invalid or expired token session" when the page load balances across servers',
       '- Previously, the OAuth token was stored in memory on one server instance; if the final connect step hit a different instance it would fail',
       '- Token sessions are now stored in a shared database so all server instances can look them up',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Improved: Admin Chat History Now Supports Search by Session ID',
+      '- Admins can now search for a specific chat session by pasting its session ID into the new search box on the Chat History tab',
+      '- Previously, finding a specific session required scrolling through the entire paginated list',
+      '- The search bypasses pagination entirely and returns the matching session instantly',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Improved: Emma Now Shows Tool Progress and Links When Using the Live Voice Model',
+      '- When Emma calls a tool during a live voice session (e.g. searching the web, writing a blog), spinning progress cards now appear in real time',
+      '- URLs returned by tools (post links, generated images, files) are now reliably surfaced as clickable links after the turn completes',
+      '- Emma\'s in-app chat sidebar now correctly shows the tool name (e.g. "search_web") while a tool is running, instead of always showing "Thinking..."',
+    ],
+  },
+  {
+    date: '2026-04-21',
+    changes: [
+      'Fixed: Work Plan Sessions No Longer Fail With Unexpected Errors on Heavy Research Tasks',
+      '- Work plan sessions that perform many web searches and page reads (e.g. AI GTM Positioning Audit) no longer crash mid-way through',
+      '- Previously, large tool responses were kept fully in memory even after being saved to storage, which could exhaust available memory and cause the session to be killed',
+      '- Large tool responses are now trimmed to a compact in-memory preview once stored, keeping memory usage stable across long multi-step sessions',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Improved: Context Limit Errors Are Now Automatically Reported',
+      '- When a conversation exceeds the model context window, an issue is automatically filed so the team can follow up',
+      '- If the same session hits the limit multiple times, only one report is filed',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Improved: Agent Chats Can Now Run Much Longer Before Needing a New Session',
+      '- The session message limit has been increased from 300 to 500 messages',
+      '- Fixed: Long image-generation sessions no longer lose the final summary response — previously, tool-generated messages (one per image) could push the count over the limit mid-turn, causing the AI\'s closing response to be silently dropped',
+      '- The session limit is now enforced at the start of a new turn instead of during writes, so in-progress work is never interrupted',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Auto Engagement No Longer Posts Multiple Comments on the Same Post',
+      '- LinkedIn auto engagement will no longer comment on the same post more than once per account',
+      '- Previously, LinkedIn could return the same post under two different internal IDs, causing duplicate comment actions to be scheduled and executed',
+      '- The system now deduplicates posts by their numeric ID before scheduling, and skips commenting when the duplicate-check API call fails rather than proceeding',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Email-Change No Longer Causes Webhook Updates to Hit the Wrong Account',
+      '- When an admin changes a user\'s email address, the old record is tombstoned (marked as deleted) in the database',
+      '- Previously, Stripe webhook processing could land on the tombstoned record instead of the live account, causing subscription status updates to be silently lost',
+      '- Tombstoned records are now excluded from all database lookups used by Stripe webhooks, reset-password flows, and domain-based queries',
+      'Fixed: Scheduled Playwright Sessions No Longer Fail After Many Screenshots',
+      '- Scheduled health checks and automation sessions that take 10+ screenshots no longer crash with a request error',
+      '- Previously, base64 screenshot images accumulated in the conversation context during a long session, eventually exceeding the API request size limit',
+      '- Now only the most recent screenshot image is sent to the AI; earlier screenshots are replaced with lightweight text placeholders',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Improved: Admin Users Tab Now Hides Bot-Like Accounts by Default',
+      '- The Users tab in the admin dashboard now filters out bot-like accounts automatically, making it easier to focus on real users',
+      '- Bot detection covers Gmail dot-trick accounts (3+ dots in the local part) and internal test accounts',
+      '- A "Hide bots" checkbox in the filter bar lets admins toggle this filter on or off and re-fetch the list from the API',
+    ],
+  },
+  {
+    date: '2026-04-21',
+    changes: [
+      'New: Emma Can Now Solve CAPTCHAs Automatically',
+      '- When Emma encounters a reCAPTCHA v2, reCAPTCHA v3, hCaptcha, or Cloudflare Turnstile during browser automation, she can now solve it automatically using a CAPTCHA-solving service',
+      '- For simple image or text CAPTCHAs that require human judgement, Emma will take a screenshot and ask the user to type the answer',
+    ],
+  },
+  {
+    date: '2026-04-20',
+    changes: [
+      'Fixed: Agent Mode No Longer Shows "Working In Progress" After Responding',
+      '- The thinking/progress indicator now correctly disappears once Emma finishes responding',
+      '- Previously, if the response involved tool use (e.g. web search, content creation), the indicator would stay visible indefinitely until the page was reloaded',
+      '- Tool execution state is now properly cleared when the agent completes its response',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: LinkedIn Outreach Reconnect Now Works Correctly',
+      '- Reconnecting a LinkedIn Outreach account in Settings > Connected Accounts now immediately shows the account as active',
+      '- Previously, the connection would appear as inactive after reconnecting, requiring users to delete and re-create the connection as a workaround',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'New: Convert HTML Files to PDF with a Single Request',
+      '- Emma can now convert any HTML file to a PDF and share a download link directly in the chat',
+      '- Ask Emma to "convert [file URL] to PDF" or "export this as a PDF" and she will render it server-side and upload the result to your file storage',
+      '- Useful for lead magnets, checklists, reports, and any other HTML documents that need to be shared as PDFs',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: LinkedIn Outreach Connect Button Now Works Correctly on Shared Links',
+      '- On iShare (shared conversation) pages, the "Connect LinkedIn Outreach" button is no longer shown since account connections require being logged in',
+      '- If a visitor on a shared link asks Emma to connect their LinkedIn Outreach account, Emma now explains that account connections are not available in shared sessions and directs them to open Agent Mode in their own account to connect from there',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: Introduction Email Now Sent Automatically to Google Sign-Up Users',
+      '- New users who sign up via Google OAuth now receive the founders\' introduction email automatically, the same way email/password sign-ups do',
+      '- Previously, Google sign-up users were missing this email and admins had to send it manually from the Users tab',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: Shared Session (iShare) Now Shows Error Feedback When a Slack-Triggered Response Fails',
+      '- When Emma responds to a Slack message that is linked to a shared conversation (iShare), a generation error would be reported in Slack but no error message was saved to the session',
+      '- Visitors viewing the shared link would see an unanswered user message with no explanation',
+      '- Emma now saves an error message to the session in all Slack error cases, so iShare viewers see what went wrong instead of a stalled conversation',
+    ],
+  },
+  {
+    date: '2026-04-23',
+    changes: [
+      'Improved: Emma Handles Large Knowledge Bases More Efficiently',
+      '- Emma can now filter Google Drive knowledge base files by date range and type before loading them, avoiding the previous issue where large folders would overflow context and prevent her from finding recent files',
+      '- When asked to find meeting notes or files from a specific period, Emma now calls list_knowledge_base_files with modified_after / modified_before / kb_type parameters instead of loading all 100+ files at once',
+      '- Pagination support (limit / offset) added so Emma can browse large folders page-by-page',
+      '- Results include a hasMore flag and appliedFilters summary so Emma knows when more files are available and what filtering was applied',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Fixed: External CRM Sync Settings Now Load Reliably',
+      '- Opening the External CRM Sync dialog no longer shows "Failed to load your sync configuration" due to a transient backend error during webhook secret backfill',
+      '- The sync configuration is now always returned even if the one-time webhook secret write encounters a temporary issue',
+    ],
+  },
+  {
+    date: '2026-04-22',
+    changes: [
+      'Improved: Chat History Now Shows Session Summaries',
+      '- Each session in the Chat History sidebar now displays a short AI-generated summary of what was accomplished, shown below the session title',
+      '- Summaries are generated automatically in the background and cached — no extra loading time',
+      '- The full summary also appears in the hover tooltip alongside the session title',
+      '- Session search now matches against the summary text, making it easier to find past sessions by what was done rather than just the title',
     ],
   },
 ];

@@ -18,11 +18,13 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { createOncallItem } from '../services/notionService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
+import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
@@ -44,6 +46,40 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
   if (share.expiresAt) return new Date(share.expiresAt);
   if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
   return new Date(0); // No dates at all — treat as expired
+}
+
+/**
+ * Auto-files a Notion "Customer Reported" issue for context-limit errors.
+ * Skips if the session already has contextLimitReported set (dedup).
+ */
+async function autoReportContextLimitToNotion(
+  sessionId: string | undefined,
+  userEmail: string | undefined,
+  userId: string | undefined,
+  llmModel: string | undefined,
+  session: import('../services/chatbotService').ChatSession | null
+): Promise<void> {
+  if (!sessionId || session?.contextLimitReported) return;
+  try {
+    await createOncallItem({
+      title: `Context limit reached - session ${sessionId}`,
+      description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
+      additionalTags: ['Customer Reported', 'Context Limit'],
+      context: {
+        'User ID': userId || 'N/A',
+        'User Email': userEmail || 'N/A',
+        'Session ID': sessionId,
+        'LLM Model': llmModel || 'Not specified',
+        'Session Message Count': session?.messages?.length ?? 'N/A',
+        'Session Title': session?.title || 'N/A',
+      },
+    });
+    chatbotDb.updateSessionContextLimitReported(sessionId).catch(err =>
+      console.error('Failed to set contextLimitReported flag:', err)
+    );
+  } catch (err) {
+    console.error('Failed to create context-limit Notion item:', err);
+  }
 }
 
 /** Classify an error for the diagnosis agent. */
@@ -961,6 +997,53 @@ export async function runScheduledChat(
       }
     }
 
+    // Check token usage limits before creating the session
+    const usageStatus = await checkTokenUsage(userId);
+    if (!usageStatus.allowed) {
+      const emailNotifications = schedule.emailNotifications || [];
+      let notifyEmails: string[] = emailNotifications;
+      if (notifyEmails.length === 0) {
+        const { userDb: tokenUserDb } = await import('../services/db');
+        const tokenUser = await tokenUserDb.getUserById(userId);
+        if (tokenUser?.email) notifyEmails = [tokenUser.email];
+      }
+
+      if (notifyEmails.length > 0) {
+        const { emailService } = await import('../services/emailService');
+        await emailService.sendScheduledChatTokenLimitEmail(
+          notifyEmails,
+          schedule.scheduleName,
+          schedule.scheduleId,
+          usageStatus
+        );
+      }
+
+      const tokenLimitResult = {
+        scheduleId: schedule.scheduleId,
+        runId: require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString()
+      };
+
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, tokenLimitResult);
+      } catch (error) {
+        console.error('Error saving token limit run result:', error);
+      }
+
+      return tokenLimitResult;
+    }
+
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const pageIdentifier = `${sessionTitle}|scheduleId:${schedule.scheduleId}`;
@@ -1341,6 +1424,15 @@ export async function generateSessionResponse(
     throw new Error('Session not found');
   }
 
+  // Check message limit before starting a new turn so in-progress writes (e.g. tool
+  // system messages) that pushed the count over the limit don't silently drop the
+  // final assistant response. The check is intentionally at turn-start so writes during
+  // a turn are never blocked mid-flight.
+  const currentMessageCount = (await chatbotDb.getMessagesFromMessagesTable(sessionId)).length;
+  if (currentMessageCount >= MAX_MESSAGE_SIZE_PER_SESSION) {
+    throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`);
+  }
+
   // Process attachments and include URLs in message content for LLM
   let messageContent = userMessage;
   if (attachments && attachments.length > 0) {
@@ -1707,6 +1799,21 @@ export const agentModeController = {
         lastEvaluatedKey: result.lastEvaluatedKey,
         hasMore: !!result.lastEvaluatedKey
       });
+
+      // Fire-and-forget: update stale/missing session summaries in background
+      // so they're available on the next load (cache-aware — skips up-to-date ones)
+      for (const session of result.sessions) {
+        const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+        const needsSummary = messageCount > 0 && (
+          !session.sessionSummary ||
+          session.sessionSummary.evaluatedMessageIndex < messageCount
+        );
+        if (needsSummary) {
+          summarizeSessionIfNeeded(session).catch((err) => {
+            console.error(`AgentMode: Background summarization failed for ${session.sessionId}:`, err);
+          });
+        }
+      }
     } catch (error) {
       console.error('AgentMode: Get sessions error:', error);
       res.status(500).json({ error: 'Failed to get sessions' });
@@ -1996,10 +2103,15 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
-        // Skip diagnosis for errors that already have specific handling below (context limit, worker shutdown, etc.)
-        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
-          const userMessage = req.body?.userMessage || '';
-          diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+        // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          if (error instanceof Error && isWorkerShutdownError(error)) {
+            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else {
+            const userMessage = req.body?.userMessage || '';
+            diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+          }
         }
 
         const errorAssistantMessage: ChatMessage = {
@@ -2085,6 +2197,9 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
+          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
+
           res.status(413).json({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
@@ -2133,12 +2248,14 @@ export const agentModeController = {
         const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
+        const originalMessageForAlert = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
           subject: 'Agent Mode: Unknown Error in Generate Response',
-          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${originalMessageForAlert || error.message || 'Unknown error'}`,
           sessionId,
           context: {
             'Error Message': error.message || 'Unknown error',
+            'Original Error': originalMessageForAlert || 'Not available',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'User ID': user?.userId || 'Not available',
@@ -2533,6 +2650,18 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
+      // Reject concurrent requests for the same session (synchronous check before any await)
+      if (activeSessionGenerations.has(session.sessionId)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
+      activeSessionGenerations.add(session.sessionId);
+
+      try {
+
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
@@ -2563,6 +2692,9 @@ export const agentModeController = {
         skills: response.skills,
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+      } finally {
+        activeSessionGenerations.delete(session.sessionId);
+      }
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
 
@@ -2578,9 +2710,15 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
-        if (!(error instanceof Error && (isContextLimitError(error) || isWorkerShutdownError(error)))) {
-          const userMessage = req.body?.userMessage || '';
-          diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+        // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          if (error instanceof Error && isWorkerShutdownError(error)) {
+            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else {
+            const userMessage = req.body?.userMessage || '';
+            diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+          }
         }
 
         const errorAssistantMessage: ChatMessage = {
@@ -2657,6 +2795,9 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
+          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
+
           res.status(413).json({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
@@ -2715,12 +2856,14 @@ export const agentModeController = {
         const session = shareId ? await chatbotDb.getChatSession(shareId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
+        const originalMessage = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
           subject: 'Agent Mode: Unknown Error in Generate Shared Response',
-          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${originalMessage || error.message || 'Unknown error'}`,
           sessionId: shareId,
           context: {
             'Error Message': error.message || 'Unknown error',
+            'Original Error': originalMessage || 'Not available',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
             'Session ID (Share ID)': shareId || 'Not provided',
@@ -5168,7 +5311,20 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      if (session.userId !== user.userId) {
+      // Under delegation (`req.delegateInfo.isDelegated`), `req.user.userId` is
+      // the TARGET customer per middleware/auth.ts — so owner-matching against
+      // `user.userId` already covers the "admin viewing target's sessions"
+      // case. But an admin-created session (owned by the admin's own userId)
+      // shown in the admin's UI while they're delegated gets a false-positive
+      // 403 otherwise — which is why the prod UI sat in a 403 polling loop
+      // during impersonation (see nginx log, 2026-04-23 23:52 UTC). Allow
+      // the delegated admin to read their own admin-owned sessions too.
+      const delegateInfo = req.delegateInfo;
+      const isOwner = session.userId === user.userId;
+      const isDelegatedAdminOwnSession =
+        delegateInfo?.isDelegated &&
+        session.userId === delegateInfo.adminUserId;
+      if (!isOwner && !isDelegatedAdminOwnSession) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 

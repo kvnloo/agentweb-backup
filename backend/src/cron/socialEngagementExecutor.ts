@@ -7,15 +7,28 @@ import { v4 as uuidv4 } from 'uuid';
 const INSTANCE_ID = uuidv4();
 const COMMENT_MODEL = 'gemini-3.1-flash-lite-preview';
 
-const POST_COMMENT_SYSTEM_PROMPT = `You are a professional social media engagement assistant.
-Write a thoughtful, genuine 1-2 sentence comment on the following LinkedIn post.
-Avoid generic phrases like "Great post!" or "Totally agree!".
-Return ONLY the comment text, no quotes or explanation.`;
+const POST_COMMENT_SYSTEM_PROMPT = `You are writing a LinkedIn comment on behalf of a real person. Write exactly as a human would — natural, specific, and personal to the post content.
 
-const COMMENT_REPLY_SYSTEM_PROMPT = `You are a professional social media engagement assistant.
-Write a genuine, concise reply to the following comment on a LinkedIn post.
-The reply should add value or acknowledge the comment naturally.
-Return ONLY the reply text, no quotes or explanation.`;
+Rules:
+- Reference something specific from the post (a number, an idea, a phrase) — do not comment on the post in general terms
+- Vary your structure: sometimes ask a question, sometimes share a reaction, sometimes add a brief related thought
+- Keep it 1-3 sentences — shorter is often better
+- Never start with "Great", "Love", "Wow", "Absolutely", "Totally", "Insightful", "Fascinating", or any generic opener
+- No hashtags, no emojis unless the post itself is casual
+- Do not say "Thanks for sharing" or "This is so important" or anything a bot would say
+- Sound like you read the post, not like you scanned it
+Return ONLY the comment text, no quotes, no explanation.`;
+
+const COMMENT_REPLY_SYSTEM_PROMPT = `You are writing a LinkedIn reply on behalf of a real person. Write exactly as a human would — direct, warm, and specific to what was said.
+
+Rules:
+- Respond to something specific in the comment — a word, a claim, a question
+- Keep it 1-2 sentences, conversational in tone
+- Never start with "Absolutely", "Great point", "Totally agree", "So true", or any filler opener
+- No hashtags, no "Thanks for sharing"
+- It's fine to disagree gently, add nuance, or just connect briefly — whatever fits naturally
+- Sound like a colleague continuing a conversation, not an assistant acknowledging a ticket
+Return ONLY the reply text, no quotes, no explanation.`;
 
 const REACTION_SYSTEM_PROMPT = `You are a LinkedIn engagement assistant. Based on the content provided, choose the single most appropriate LinkedIn reaction.
 Reply with EXACTLY one of these values (no other text):
@@ -118,8 +131,9 @@ export class SocialEngagementExecutor {
 
         console.log(`[Executor] Engaging as: "${engagingConnection.account_name}" (${engagingAccountId})`);
 
-        // Load engagement memory for personalized comments
+        // Load engagement memory and personality for personalized comments
         const engagerMemory = engagingConnection.engagementMemory?.content || '';
+        const engagerPersonality = engagingConnection.engagementSettings?.personality;
 
         const adapter = getLinkedInAdapter();
         let success = false;
@@ -130,12 +144,12 @@ export class SocialEngagementExecutor {
         try {
             if (targetType === 'comment') {
                 generated = await this.executeCommentAction(
-                    adapter, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType, engagerMemory
+                    adapter, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType, engagerMemory, engagerPersonality
                 );
             } else {
                 // Default: post engagement
                 generated = await this.executePostAction(
-                    adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType, engagerMemory
+                    adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType, engagerMemory, engagerPersonality
                 );
             }
             success = true;
@@ -192,7 +206,8 @@ export class SocialEngagementExecutor {
         ownerUserId: string,
         postId: string,
         actionType: string,
-        engagerMemory?: string
+        engagerMemory?: string,
+        engagerPersonality?: { presets: string[]; custom?: string }
     ): Promise<{ generatedText?: string; reactionType?: string }> {
         const doLike = actionType === 'like' || actionType === 'comment_and_like';
         const doComment = actionType === 'comment' || actionType === 'comment_and_like';
@@ -209,7 +224,7 @@ export class SocialEngagementExecutor {
             if (alreadyCommented) {
                 console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
             } else {
-                generatedText = await this.generatePostComment(postContent, engagerMemory);
+                generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality);
                 console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
                 await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
                 console.log(`[Executor] Comment posted on post ${postId}`);
@@ -283,16 +298,22 @@ export class SocialEngagementExecutor {
             const comments = await adapter.getComments(engagingConnection, targetUrn, engagingUserId);
             return comments.some((c) => c.actorUrn === engagingConnection.account_id);
         } catch (err) {
-            console.warn(`[Executor] Could not fetch comments for dedup check on ${targetUrn}:`, err);
-            return false; // Fail open — don't block commenting if the check fails
+            console.warn(`[Executor] Could not fetch comments for dedup check on ${targetUrn}, assuming already commented to prevent duplicates:`, err);
+            return true; // Fail closed — skip commenting when check fails to prevent duplicate posts
         }
     }
 
-    private async generatePostComment(postContent: string, engagerMemory?: string): Promise<string> {
+    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }): Promise<string> {
         try {
             let systemPrompt = POST_COMMENT_SYSTEM_PROMPT;
+            if (personality?.presets?.length || personality?.custom) {
+                const parts: string[] = [];
+                if (personality.presets.length) parts.push(`Tone/style: ${personality.presets.join(', ')}`);
+                if (personality.custom) parts.push(`Additional guidance: ${personality.custom}`);
+                systemPrompt += `\n\nPersonality:\n${parts.join('\n')}`;
+            }
             if (engagerMemory) {
-                systemPrompt += `\n\nIMPORTANT: Write the comment from the perspective described in this engagement persona profile. Match the voice, tone, and expertise areas described below:\n\n${engagerMemory}`;
+                systemPrompt += `\n\nPerson profile (write as this person, matching their voice and interests):\n${engagerMemory}`;
             }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
@@ -301,14 +322,21 @@ export class SocialEngagementExecutor {
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: `Post content: ${postContent}` },
                 ],
-                temperature: 0.8,
+                temperature: 0.9,
             });
             const text = completion.choices[0]?.message?.content?.trim();
             if (text) return text;
         } catch (err) {
             console.warn(`[Executor] LLM comment generation failed:`, err);
         }
-        return 'Great insights! Thanks for sharing.';
+        const fallbacks = [
+            'Curious what prompted this — was there a specific moment that shifted your thinking on it?',
+            'This is something I\'ve been thinking about too. The part about [redacted] really stuck with me.',
+            'Hadn\'t considered it from this angle before. Makes sense though.',
+            'Worth bookmarking. A lot of people overlook this.',
+            'This resonates. Have you seen the same pattern in other contexts too?',
+        ];
+        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
 
     private async generateReactionType(content: string): Promise<LinkedInReaction> {
@@ -343,7 +371,8 @@ export class SocialEngagementExecutor {
         commentId: string | undefined,
         commentText: string | undefined,
         actionType: string,
-        engagerMemory?: string
+        engagerMemory?: string,
+        engagerPersonality?: { presets: string[]; custom?: string }
     ): Promise<{ generatedText?: string; reactionType?: string }> {
         if (!commentId) {
             throw new Error('commentId is required for comment engagement actions');
@@ -361,7 +390,7 @@ export class SocialEngagementExecutor {
             if (alreadyReplied) {
                 console.log(`[Executor] Account ${engagingConnection.account_id} already replied to ${commentId}, skipping reply.`);
             } else {
-                generatedText = await this.generateCommentReply(commentText || '', engagerMemory);
+                generatedText = await this.generateCommentReply(commentText || '', engagerMemory, engagerPersonality);
                 console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
                 await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
                 console.log(`[Executor] Reply posted on comment ${commentId}`);
@@ -389,11 +418,17 @@ export class SocialEngagementExecutor {
         return { generatedText, reactionType };
     }
 
-    private async generateCommentReply(commentText: string, engagerMemory?: string): Promise<string> {
+    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }): Promise<string> {
         try {
             let systemPrompt = COMMENT_REPLY_SYSTEM_PROMPT;
+            if (personality?.presets?.length || personality?.custom) {
+                const parts: string[] = [];
+                if (personality.presets.length) parts.push(`Tone/style: ${personality.presets.join(', ')}`);
+                if (personality.custom) parts.push(`Additional guidance: ${personality.custom}`);
+                systemPrompt += `\n\nPersonality:\n${parts.join('\n')}`;
+            }
             if (engagerMemory) {
-                systemPrompt += `\n\nIMPORTANT: Write the reply from the perspective described in this engagement persona profile. Match the voice, tone, and expertise areas described below:\n\n${engagerMemory}`;
+                systemPrompt += `\n\nPerson profile (write as this person, matching their voice and interests):\n${engagerMemory}`;
             }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
@@ -402,14 +437,20 @@ export class SocialEngagementExecutor {
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: `Comment: ${commentText}` },
                 ],
-                temperature: 0.8,
+                temperature: 0.9,
             });
             const text = completion.choices[0]?.message?.content?.trim();
             if (text) return text;
         } catch (err) {
             console.warn(`[Executor] LLM reply generation failed:`, err);
         }
-        return 'Thank you for your perspective!';
+        const fallbacks = [
+            'Interesting point — I hadn\'t thought about it that way.',
+            'Fair. That tracks with what I\'ve seen too.',
+            'Yeah, this keeps coming up. Worth paying attention to.',
+            'Good call. More people should be thinking about this.',
+        ];
+        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
 
     // ────────────────────────────────────────────────────────────────────────────

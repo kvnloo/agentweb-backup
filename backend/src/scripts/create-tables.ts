@@ -1803,6 +1803,7 @@ const createTempEmailsTable = async () => {
   }
 };
 
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1848,6 +1849,8 @@ const main = async () => {
     await createTestAccountsTable();
     await createDealsTable();
     await createOAuthSessionsTable();
+    await createDripSequencesTable();
+    await createSequenceEnrollmentsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2099,6 +2102,96 @@ const createOAuthSessionsTable = async () => {
     ],
     KeySchema: [
       { AttributeName: 'sessionId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createDripSequencesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-DripSequences`,
+    AttributeDefinitions: [
+      { AttributeName: 'sequenceId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'sequenceId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createSequenceEnrollmentsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SequenceEnrollments`,
+    AttributeDefinitions: [
+      { AttributeName: 'enrollmentId', AttributeType: 'S' },
+      { AttributeName: 'sequenceId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'nextSendAt', AttributeType: 'S' },
+      { AttributeName: 'leadEmail', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'enrollmentId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'sequenceId-status-index',
+        KeySchema: [
+          { AttributeName: 'sequenceId', KeyType: 'HASH' },
+          { AttributeName: 'status', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'userId-nextSendAt-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'nextSendAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'leadEmail-index',
+        KeySchema: [
+          { AttributeName: 'leadEmail', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };

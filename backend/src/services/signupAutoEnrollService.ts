@@ -22,7 +22,33 @@
  */
 
 import type { SyncInput, SyncResult } from './contactSyncService';
+import type { AttributionTouch } from '../types/attribution';
 import { crmDb as defaultCrmDb } from './db';
+
+/**
+ * Flatten an AttributionTouch blob into the same customFields shape that
+ * crmAutoSyncService writes on regular auto-sync. Keeps the two auto-enroll
+ * paths producing structurally identical lead rows so the frontend filter +
+ * Source column show the correct bucket regardless of which service created
+ * the lead.
+ */
+function flattenAttributionToCustomFields(touch?: AttributionTouch): Record<string, string> {
+  if (!touch) return {};
+  const cf: Record<string, string> = {};
+  if (touch.utm?.source) cf.utm_source = touch.utm.source;
+  if (touch.utm?.medium) cf.utm_medium = touch.utm.medium;
+  if (touch.utm?.campaign) cf.utm_campaign = touch.utm.campaign;
+  if (touch.utm?.content) cf.utm_content = touch.utm.content;
+  if (touch.utm?.term) cf.utm_term = touch.utm.term;
+  if (touch.clickIds?.gclid) cf.gclid = touch.clickIds.gclid;
+  if (touch.clickIds?.fbclid) cf.fbclid = touch.clickIds.fbclid;
+  if (touch.clickIds?.ttclid) cf.ttclid = touch.clickIds.ttclid;
+  if (touch.clickIds?.liFatId) cf.li_fat_id = touch.clickIds.liFatId;
+  if (touch.referrer) cf.referrer = touch.referrer;
+  if (touch.landingUrl) cf.landing_url = touch.landingUrl;
+  if (touch.ref) cf.ref = touch.ref;
+  return cf;
+}
 
 export const FOUNDERS_USERID = 'be754b6c-767e-44ec-b181-4042cfe45ea9';
 export const FOUNDERS_SIGNUPS_LIST_NAME = 'AgentWeb Signups';
@@ -165,6 +191,14 @@ export async function enrollSignupIntoFoundersList(
       };
     }
 
+    // Attribution was threaded through via SyncInput.payload.attribution by
+    // the crmSignalHooks.onUserSignup path. Flatten into customFields so the
+    // CRM Source column + Attribution filter can bucket the lead by channel.
+    const attribution = (input.payload && typeof input.payload === 'object')
+      ? (input.payload.attribution as AttributionTouch | undefined)
+      : undefined;
+    const attributionFields = flattenAttributionToCustomFields(attribution);
+
     const lead = await crmDb.createLead(listId, {
       email: fields.email,
       firstName: fields.firstName,
@@ -174,6 +208,7 @@ export async function enrollSignupIntoFoundersList(
       lifecycle: 'signed_up',
       tenantId: FOUNDERS_USERID,
       accountOwnerUserId: FOUNDERS_USERID,
+      ...(Object.keys(attributionFields).length > 0 && { customFields: attributionFields }),
     });
 
     return {

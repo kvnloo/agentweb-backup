@@ -186,6 +186,83 @@ describe('Stripe subscription management', () => {
         subscription_status: 'active',
       }));
     });
+
+    it('should fall back to trialing subs when no active sub exists', async () => {
+      // Regression: a user who canceled during a free trial had no
+      // status=active sub and /reactivate-subscription returned 404.
+      // Now it should discover the trialing sub the same way
+      // /cancel-subscription does.
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      // First call (status=active) returns empty, second (status=trialing) returns the sub
+      mockStripe.subscriptions.list
+        .mockResolvedValueOnce({ data: [] })
+        .mockResolvedValueOnce({
+          data: [{
+            id: 'sub_trial',
+            status: 'trialing',
+            cancel_at_period_end: true,
+            items: { data: [{ current_period_end: 1700000000 }] },
+          }],
+        });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_trial',
+        cancel_at_period_end: false,
+        items: { data: [{ current_period_end: 1700000000 }] },
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/reactivate-subscription')
+        .set('Authorization', 'Bearer valid-token');
+
+      expect(res.status).toBe(200);
+      expect(mockStripe.subscriptions.update).toHaveBeenCalledWith('sub_trial', {
+        cancel_at_period_end: false,
+      });
+      expect(mockStripe.subscriptions.list).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not crash when current_period_end is null on reactivated sub', async () => {
+      // Same defensive null-period_end pattern PR #1262 applied to
+      // /cancel-subscription. Before this, `new Date(null * 1000).toISOString()`
+      // threw "Invalid time value" and the whole request 500'd.
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_abc',
+          status: 'active',
+          cancel_at_period_end: true,
+          current_period_end: null,
+        }],
+      });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_abc',
+        cancel_at_period_end: false,
+        current_period_end: null,
+        items: { data: [{}] }, // no current_period_end anywhere
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/reactivate-subscription')
+        .set('Authorization', 'Bearer valid-token');
+
+      expect(res.status).toBe(200);
+      expect(res.body.current_period_end).toBeNull();
+      // updateUser should be called with subscription_status=active but
+      // WITHOUT current_period_end (since it could not be derived).
+      const updateArgs = mockUpdateUser.mock.calls[0][1];
+      expect(updateArgs.subscription_status).toBe('active');
+      expect(updateArgs).not.toHaveProperty('current_period_end');
+    });
   });
 
   // --- WEBHOOK TESTS ---

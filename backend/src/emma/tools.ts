@@ -15,14 +15,14 @@ emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
     name: 'install_skills',
-    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
+    description: 'Install skills by their IDs. Pass ALL skill IDs you need in a single call — do not call this tool multiple times. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
     inputSchema: {
       type: 'object',
       properties: {
         skillIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of skill IDs to install.'
+          description: 'Array of ALL skill IDs to install. Include every skill you need in one call.'
         }
       },
       required: ['skillIds']
@@ -203,7 +203,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         account_id: {
           type: 'string',
-          description: 'The Unipile account ID for the LinkedIn connection. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
+          description: 'The Unipile account ID for the LinkedIn connection. Optional for search-people and get-profile — the system will automatically use a platform-wide account if the user has no personal account connected. For write actions (send-invite, send-message), must be the user\'s own account. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
         },
         profile_url: {
           type: 'string',
@@ -258,7 +258,7 @@ For target person identification (send-invite, send-message, get-profile, update
           description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
         }
       },
-      required: ['action', 'account_id']
+      required: ['action']
     }
   },
   execute: async (args: any, context: any) => {
@@ -4094,15 +4094,43 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List all available knowledge base files for the current user, including private (user-specific), public (shared by all users) knowledge bases, Google Drive shared folders, and ClickUp docs. Google Drive entries have identifiers starting with "gdrive:" followed by the folder ID. ClickUp entries have identifiers starting with "clickup:" followed by the workspace ID. Returns a list of files with their unique identifiers, names, sizes, types (public/private/google-drive/clickup), and last updated timestamps.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp entries start with "clickup:". Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        modified_after: {
+          type: "string",
+          description: 'Only return files modified on or after this date. ISO 8601 date string, e.g. "2026-04-15". Applies to Google Drive files.'
+        },
+        modified_before: {
+          type: "string",
+          description: 'Only return files modified on or before this date. ISO 8601 date string, e.g. "2026-04-22". Applies to Google Drive files.'
+        },
+        limit: {
+          type: "number",
+          description: 'Maximum number of files to return per knowledge base source (default: 100). Use with offset for pagination.'
+        },
+        offset: {
+          type: "number",
+          description: 'Number of files to skip within each knowledge base source (default: 0). Use with limit for pagination.'
+        },
+        kb_type: {
+          type: "string",
+          enum: ["google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"],
+          description: 'Filter to only return a specific type of knowledge base. Omit to return all types.'
+        }
+      },
       required: []
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listKnowledgeBaseFiles(context?.userId);
+    return await agentModeService.listKnowledgeBaseFiles(context?.userId, {
+      modified_after: args?.modified_after,
+      modified_before: args?.modified_before,
+      limit: args?.limit,
+      offset: args?.offset,
+      kb_type: args?.kb_type,
+    });
   }
 });
 
@@ -4563,6 +4591,31 @@ emmaToolRegistry.register({
   }
 });
 
+emmaToolRegistry.register({
+  name: 'convert_to_pdf',
+  definition: {
+    name: 'convert_to_pdf',
+    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_url: {
+          type: 'string',
+          description: 'The URL of the HTML file to convert to PDF (e.g. an S3 URL from a previously saved HTML file)',
+        },
+        output_filename: {
+          type: 'string',
+          description: 'Desired filename for the PDF (without extension, e.g. "sentriq-readiness-checklist-v5")',
+        },
+      },
+      required: ['source_url', 'output_filename'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId);
+  },
+});
+
 // --- Tools from workflowTools.ts ---
 emmaToolRegistry.register({
   name: 'create_work_plan',
@@ -4972,7 +5025,7 @@ emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
     name: 'account_summary',
-    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    description: 'Get a full account overview. Returns: (1) account state — connected account count, knowledge base file count, saved config count, task count, active schedule count; (2) activity over the time period — sessions, assets (images, videos, reports, social posts, blogs), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6348,3 +6401,137 @@ for (const toolName of adminToolNames) {
     console.warn(`[emma/tools] Failed to bridge admin tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }
+
+// Login credentials tool — lets Emma retrieve saved website credentials for browser automation
+emmaToolRegistry.register({
+  name: 'get_login_credentials',
+  definition: {
+    name: 'get_login_credentials',
+    description: 'Retrieve saved login credentials for a website domain. Use this when you need to log into a website during browser automation. Credentials must be pre-saved by the user in Settings > Login Credentials. Never ask the user to paste passwords in chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        domain: {
+          type: 'string',
+          description: 'The domain of the website to get credentials for (e.g. "linkedin.com", "app.hubspot.com")'
+        }
+      },
+      required: ['domain']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const domain = (args.domain || '').toLowerCase().trim();
+    if (!domain) return { error: 'domain is required' };
+
+    const { DynamoDB } = await import('aws-sdk');
+    const { decryptPassword } = await import('../utils/crypto');
+    const dynamodb = new DynamoDB.DocumentClient();
+    const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+    // Extract base domain for fuzzy matching (strip www. and subdomains down to registrable domain)
+    const baseDomain = domain.replace(/^www\./, '');
+
+    const result = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'attribute_not_exists(isApiConfig) OR isApiConfig = :false',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+        ':false': false
+      }
+    }).promise();
+
+    const items = result.Items || [];
+
+    // Match by exact domain or base domain suffix
+    const match = items.find((c: any) => {
+      const w = (c.website || '').toLowerCase();
+      return w === domain || w === baseDomain || domain.endsWith('.' + w) || baseDomain.endsWith('.' + w);
+    });
+
+    if (!match) {
+      const saved = items.filter((c: any) => !c.isApiConfig).map((c: any) => c.website).join(', ');
+      return {
+        error: `No credentials saved for "${domain}". Please go to Settings > Login Credentials to save them first.`,
+        savedDomains: saved || 'none'
+      };
+    }
+
+    const encrypted = match.encryptedPassword || match.password;
+    if (!encrypted) {
+      return { error: `Credentials found for "${match.website}" but no password is stored.` };
+    }
+
+    try {
+      const { password } = decryptPassword(encrypted);
+      return {
+        username: match.username,
+        password,
+        domain: match.website
+      };
+    } catch {
+      return { error: `Failed to decrypt credentials for "${match.website}". The saved credentials may be corrupted.` };
+    }
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'import_leads_from_search',
+  definition: {
+    name: 'import_leads_from_search',
+    description: `Search LinkedIn for people and import the results directly into a CRM lead list.
+Uses the user's connected LinkedIn account if available, otherwise falls back to platform-wide outreach accounts — so this works even without a personal LinkedIn connection.
+
+Use this when the user wants to:
+- Find leads matching a job title, company, or keyword
+- Populate a CRM list with discovered prospects
+- Discover new contacts to reach out to
+
+After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID to import leads into. Required.'
+        },
+        keywords: {
+          type: 'string',
+          description: 'Free-text search keywords (e.g. "software engineer San Francisco").'
+        },
+        title: {
+          type: 'string',
+          description: 'Job title filter (e.g. "CTO", "VP Sales"). Combined with keywords/company for targeted search.'
+        },
+        company: {
+          type: 'string',
+          description: 'Company name filter. Combined with title/keywords for targeted search.'
+        },
+        search_url: {
+          type: 'string',
+          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to import. Defaults to 20, max 100.'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) throw new Error('Authentication required');
+    const limit = Math.min(args.limit ?? 20, 100);
+    return agentModeService.importLeadsFromSearch(context.userId, {
+      listId: args.list_id,
+      keywords: args.keywords,
+      search_url: args.search_url,
+      title: args.title,
+      company: args.company,
+      limit,
+    });
+  }
+});

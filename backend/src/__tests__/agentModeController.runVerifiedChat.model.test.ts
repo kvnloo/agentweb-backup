@@ -10,6 +10,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
@@ -57,6 +58,7 @@ describe('runVerifiedChat model selection', () => {
     jest.clearAllMocks();
 
     mockChatbotDb.getChatSession.mockResolvedValue(baseSession as any);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);

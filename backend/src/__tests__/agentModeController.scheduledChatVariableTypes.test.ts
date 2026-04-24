@@ -14,6 +14,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
@@ -73,7 +74,21 @@ jest.mock('../services/emailService', () => ({
     sendDailyDigestEmail: jest.fn(),
     sendScheduledChatVariableRequestEmail: jest.fn(),
     sendScheduledChatErrorEmail: jest.fn(),
+    sendScheduledChatTokenLimitEmail: jest.fn(),
   },
+}));
+
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(async () => ({
+    allowed: true,
+    warning: false,
+    used: 100000,
+    allowance: 1000000,
+    bonus: 0,
+    effectiveAllowance: 1000000,
+    percentUsed: 10,
+    month: '2026-04',
+  })),
 }));
 
 jest.mock('../services/skillService', () => ({
@@ -419,6 +434,7 @@ describe('Scheduled Chat Variable Types', () => {
     beforeEach(() => {
       mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
       mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
       mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
       mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
       mockAgentModeService.generateSessionTitle.mockResolvedValue('Test Title');

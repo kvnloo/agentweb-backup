@@ -15,6 +15,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   }
 }));
 
@@ -80,6 +81,7 @@ describe('Sharing Integration Tests', () => {
     (chatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.addMessagesToSession as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.updateSessionTitle as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
   });
 
   describe('Complete Sharing Workflow', () => {

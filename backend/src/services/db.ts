@@ -123,6 +123,8 @@ export interface User {
    * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
    */
   dripUnsubscribed?: boolean;
+  onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
+  onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -202,6 +204,20 @@ export interface User {
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   /**
+   * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
+   * from Pro to Starter that takes effect at period_end). Cached here from
+   * subscription_schedules so the UI can surface it without hitting Stripe on
+   * every /auth/me. Cleared when: (a) the schedule fires (webhook → schedule.completed),
+   * (b) the user explicitly cancels it via /api/stripe/cancel-scheduled-downgrade,
+   * or (c) the schedule is released/canceled for any other reason (webhook).
+   */
+  scheduledChange?: {
+    stripeScheduleId: string;
+    toPriceId: string;
+    toTier: string; // e.g., "Starter"
+    effectiveAt: string; // ISO 8601
+  } | null;
+  /**
    * Stripe Connect OAuth — customer-authorized read-only access to their own
    * Stripe account. Used to enrich CRM contacts with the customer's live
    * billing data (not AgentWeb's platform billing).
@@ -268,6 +284,8 @@ export interface User {
         custom?: string;
       };
     };
+    /** When true, org members can see and use this account. Default: false (private). */
+    sharedWithOrg?: boolean;
     created_at: string;
     updated_at: string;
   }>;
@@ -508,7 +526,8 @@ class UserDB {
     googleId?: string,
     stripe_customer_id?: string,
     companyName?: string,
-    useCaseCategories?: string[]
+    useCaseCategories?: string[],
+    attribution?: import("../types/attribution").AttributionTouch
   ): Promise<User | undefined> {
     const itemToCreate: any = {
       userId,
@@ -554,6 +573,7 @@ class UserDB {
         companyName,
         isOAuthUser,
         createdAt: itemToCreate.createdAt,
+        ...(attribution && { attribution }),
       });
       return params.Item as User;
     } catch (error) {
@@ -603,9 +623,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "stripe_customer_id = :scid",
+        FilterExpression: "stripe_customer_id = :scid AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":scid": stripeCustomerId,
+          ":tombstone": "deleted_",
         },
       };
 
@@ -625,9 +646,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "stripeConnectedAccountId = :cid",
+        FilterExpression: "stripeConnectedAccountId = :cid AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":cid": connectedAccountId,
+          ":tombstone": "deleted_",
         },
       };
       // Full table scan — small user base today, add a GSI if this becomes hot.
@@ -653,9 +675,10 @@ class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain',
+          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
+            ':tombstone': 'deleted_',
           },
           ExclusiveStartKey: lastEvaluatedKey,
         };
@@ -672,7 +695,22 @@ class UserDB {
     }
   }
 
-  async getAllUsers(): Promise<UserWithCounts[]> {
+  static isBotLikeEmail(email: string): boolean {
+    if (!email) return false;
+    const [local, domain] = email.split("@");
+    if (!domain) return false;
+    // Gmail dot-trick bots: 3+ dots in the local part
+    if (domain === "gmail.com" && (local.match(/\./g) || []).length >= 3) return true;
+    // Internal test/smoke accounts
+    const testDomains = ["test.com", "onb.com"];
+    if (testDomains.includes(domain)) return true;
+    const ownDomain = "agentweb.pro";
+    if (domain === ownDomain && /^(test|smoketest|attrtest)/.test(local)) return true;
+    if (domain === `updates.${ownDomain}`) return true;
+    return false;
+  }
+
+  async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
     try {
       const params = {
         TableName: this.tableName,
@@ -681,7 +719,9 @@ class UserDB {
 
       const result = await this.docClient.scan(params).promise();
       const users = (result.Items || []).filter(
-        (u) => !u.userId?.startsWith("deleted_")
+        (u) =>
+          !u.userId?.startsWith("deleted_") &&
+          (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
       );
 
       // Get task and workflow counts for each user
@@ -717,12 +757,13 @@ class UserDB {
     filterExpression: string,
     expressionAttributeValues: Record<string, any>,
   ): Promise<any[]> {
-    const hasValues = Object.keys(expressionAttributeValues).length > 0;
+    const combinedFilter = `NOT begins_with(userId, :_tombstone_prefix) AND (${filterExpression})`;
+    const combinedValues = { ...expressionAttributeValues, ':_tombstone_prefix': 'deleted_' };
     const result = await this.docClient
       .scan({
         TableName: this.tableName,
-        FilterExpression: filterExpression,
-        ...(hasValues && { ExpressionAttributeValues: expressionAttributeValues }),
+        FilterExpression: combinedFilter,
+        ExpressionAttributeValues: combinedValues,
       })
       .promise();
     return result.Items || [];
@@ -957,9 +998,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "resetPasswordToken = :token",
+        FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":token": resetToken,
+          ":tombstone": "deleted_",
         },
       };
 
@@ -1437,6 +1479,22 @@ export const taskDb = {
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "updateTaskExecution");
+    }
+  },
+
+  async updateTaskExecutionResultFiles(
+    executionId: string,
+    resultFiles: Array<{ url: string; filename: string; token: string; is_html?: boolean; searchableText?: string; [key: string]: any }>
+  ) {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: { executionId },
+        UpdateExpression: 'SET result_files = :files',
+        ExpressionAttributeValues: { ':files': resultFiles },
+      }).promise();
+    } catch (error) {
+      console.error(`Error updating result_files for execution ${executionId}:`, error);
     }
   },
 
