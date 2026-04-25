@@ -41,6 +41,10 @@ import {
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import type { AdImageVariant } from "./adImageStatusService";
+import {
+  AdVariantRatingFields,
+  recentRejectedRatings,
+} from "./adVariantRatingService";
 
 /** Bedrock model alias. Same family as Steps 2 / 3 / 4. */
 const AD_COPY_MODEL = "anthropic.claude-sonnet-4-6";
@@ -159,12 +163,50 @@ export function pickDistinctVarieties(n: number): string[] {
   return BRICK_10_VARIETIES.slice(0, cap);
 }
 
+/**
+ * Build the "User has rejected these directions" negative-example block
+ * for the per-variant prompt. Reads the latest 5 rejects from the User's
+ * `adVariantsRated` log and looks up the matching headline / primaryText
+ * on the previous `adCopyResult`. Variants that are no longer present
+ * (e.g. because the user re-rolled) are silently dropped.
+ *
+ * Returns an empty string if no negative examples are available; the
+ * caller appends only when this is non-empty so the prompt stays clean
+ * on the first run.
+ *
+ * Exported for unit testing.
+ */
+export function buildNegativeExamplesBlock(
+  ratings: AdVariantRatingFields,
+  previousVariants: Array<{ id: string; headline: string; primaryText: string; variety?: string }>,
+  limit = 5
+): string {
+  const rejects = recentRejectedRatings(ratings, limit);
+  if (rejects.length === 0) return "";
+  const lines: string[] = [];
+  for (const r of rejects) {
+    const prev = previousVariants.find((v) => v.id === r.variantId);
+    if (!prev) continue;
+    const head = (prev.headline || "").slice(0, 100);
+    const body = (prev.primaryText || "").slice(0, 200);
+    const tag = prev.variety ? ` [${prev.variety}]` : "";
+    lines.push(`- "${head}"${tag} — ${body}`);
+  }
+  if (lines.length === 0) return "";
+  return [
+    "User REJECTED these recent ad copy directions — do NOT mimic the angle, hook, or tone:",
+    ...lines,
+    "Steer toward a different angle and a clearly different hook.",
+  ].join("\n");
+}
+
 function buildUserPrompt(
   brand: IcpBrandContext,
   personas: ICPPersona[],
   creativeDir: CreativeDirResult,
   image: AdImageVariant,
-  variety: string
+  variety: string,
+  negativeExamples = ""
 ): string {
   const lines: string[] = [
     `You are writing ONE Meta ad copy variant in the "${variety}" variety.`,
@@ -196,6 +238,11 @@ function buildUserPrompt(
   lines.push(`  Image id: ${image.id}`);
   lines.push(`  Image prompt / description: ${image.prompt}`);
   lines.push("");
+  if (negativeExamples) {
+    lines.push("");
+    lines.push(negativeExamples);
+  }
+  lines.push("");
   lines.push(
     `Write ONE variant in the "${variety}" variety. The first 125 characters of primaryText MUST stand alone as the hook (mobile users see only that before "See More"). Headline ≤ 40 chars. Return JSON matching the schema in the system prompt.`
   );
@@ -211,7 +258,8 @@ export async function generateAdCopyForUser(
   creativeDir: CreativeDirResult,
   personas: ICPPersona[],
   brand: IcpBrandContext,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {}
+  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {},
+  negativeExamples = ""
 ): Promise<AdCopyResult> {
   if (!Array.isArray(images) || images.length === 0) {
     throw new Error("ad copy requires at least one image variant");
@@ -230,7 +278,8 @@ export async function generateAdCopyForUser(
       personas,
       creativeDir,
       image,
-      variety
+      variety,
+      negativeExamples
     );
     const raw = await llm.generateJSONContent<PerVariantLlmResponse>(
       AD_COPY_SYSTEM_PROMPT,
@@ -299,13 +348,31 @@ export async function triggerAdCopyForUser(
       : { concepts: [], copy_angles: [], format_archetypes: [] };
   const brand = extractIcpBrandContext(u);
 
+  // Pull existing copy variants (if any) so we can map rejected variantId
+  // back to the headline / primaryText that the user swiped left on.
+  // First-run users have no previousVariants and no ratings — the negative
+  // block is empty.
+  const previousVariants = Array.isArray(u.adCopyResult?.variants)
+    ? (u.adCopyResult.variants as Array<{
+        id: string;
+        headline: string;
+        primaryText: string;
+        variety?: string;
+      }>)
+    : [];
+  const negativeExamples = buildNegativeExamplesBlock(
+    { adVariantsRated: u.adVariantsRated },
+    previousVariants
+  );
+
   try {
     const result = await generateAdCopyForUser(
       imageVariants,
       creativeDir,
       personas,
       brand,
-      deps
+      deps,
+      negativeExamples
     );
     const current = await userDb.getUserById(userId);
     const patch = adCopyReadyPatch((current as any) || {}, result);
