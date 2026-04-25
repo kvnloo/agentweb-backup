@@ -5067,6 +5067,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-25',
     changes: [
+      'Fixed: Slack Bot No Longer Silently Drops Completed Responses',
+      '- When the Slack bot finishes a task (e.g. Weekly Product Updates), the response is now always delivered even if saving the session history to the database fails',
+      '- If the AI completes a task but produces no text summary, a fallback message is posted so users always get confirmation rather than silence',
+    ],
+  },
+  {
+    date: '2026-04-25',
+    changes: [
       'Improved: Voice Model Is Now Easier to Find',
       '- The Gemini Live Flash model (which supports real-time voice chat) now shows a microphone icon next to its name in the model selector',
       '- The Start/End voice session button now uses a microphone icon instead of a phone icon, making the voice feature more intuitive',
