@@ -65,6 +65,7 @@ import {
   adCopyReadyPatch,
   adCopyFailedPatch,
   adCopySnapshot,
+  adCopyUpdateVariantPatch,
   logAdCopyCompletionMetric,
   sanitizeAdCopyResult,
 } from "../services/adCopyStatusService";
@@ -511,6 +512,75 @@ router.post("/ad-copy/fail", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("[ad-copy] fail failed", err);
     return res.status(500).json({ message: "Failed to mark ad copy failed" });
+  }
+});
+
+/**
+ * POST /api/onboarding/ad-copy/update
+ *
+ * Inline-edit a single variant's headline / primaryText / cta on a
+ * ready ad-copy result. Used by the Phase 4 reveal screen's click-to-edit
+ * UX. Variety is intentionally NOT user-editable — it is the angle tag
+ * the LLM picked from the Brick 10 set and changing it after the fact
+ * would lie about which angle the variant tests.
+ *
+ * Validates that the user has a ready result, that the variant exists,
+ * and that at least one editable field was supplied. Returns the latest
+ * snapshot on success so the client can re-render in one round trip.
+ */
+router.post("/ad-copy/update", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+
+    const variantId = req.body?.variantId;
+    if (typeof variantId !== "string" || variantId.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "variantId must be a non-empty string" });
+    }
+
+    const headline =
+      typeof req.body?.headline === "string" ? req.body.headline : undefined;
+    const primaryText =
+      typeof req.body?.primaryText === "string"
+        ? req.body.primaryText
+        : undefined;
+    const cta = typeof req.body?.cta === "string" ? req.body.cta : undefined;
+
+    if (
+      headline === undefined &&
+      primaryText === undefined &&
+      cta === undefined
+    ) {
+      return res.status(400).json({
+        message:
+          "supply at least one of: headline, primaryText, cta",
+      });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const patch = adCopyUpdateVariantPatch(user, {
+      variantId,
+      headline,
+      primaryText,
+      cta,
+    });
+    if (!patch) {
+      return res.status(404).json({
+        message:
+          "ad-copy variant not found, or ad copy is not ready",
+      });
+    }
+
+    await userDb.updateUser(userId, patch);
+    const updated = await userDb.getUserById(userId);
+    return res.json({ status: adCopySnapshot(updated || { ...user, ...patch }) });
+  } catch (err) {
+    console.error("[ad-copy] update failed", err);
+    return res.status(500).json({ message: "Failed to update ad copy variant" });
   }
 });
 

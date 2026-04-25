@@ -167,3 +167,60 @@ export function logAdCopyCompletionMetric(
     `[metrics] ad_copy_complete status=${status} duration_ms=${durationMs} variants=${variantCount} user=${userPrefix}`
   );
 }
+
+/**
+ * Inline-edit a single variant on a ready ad-copy result.
+ *
+ * Returns a patch with the updated `adCopyResult` when the variant
+ * exists and at least one editable field is provided. Returns `null` when:
+ *   - no current ad-copy result (state isn't ready)
+ *   - variant id isn't found
+ *   - no editable fields supplied
+ *
+ * The route handler maps `null` to a 404/400 — pure logic stays here so
+ * this is unit-testable without Express.
+ */
+export interface AdCopyVariantUpdateInput {
+  variantId: string;
+  headline?: string;
+  primaryText?: string;
+  cta?: string;
+}
+
+export function adCopyUpdateVariantPatch(
+  current: AdCopyStatusFields,
+  update: AdCopyVariantUpdateInput
+): AdCopyStatusFields | null {
+  const result = current.adCopyResult;
+  if (!result || !Array.isArray(result.variants)) return null;
+
+  const idx = result.variants.findIndex((v) => v.id === update.variantId);
+  if (idx === -1) return null;
+
+  const hasHeadline = typeof update.headline === "string";
+  const hasPrimary = typeof update.primaryText === "string";
+  const hasCta = typeof update.cta === "string";
+  if (!hasHeadline && !hasPrimary && !hasCta) return null;
+
+  const existing = result.variants[idx];
+  const next: AdCopyVariant = {
+    id: existing.id,
+    headline: hasHeadline
+      ? (update.headline as string).slice(0, MAX_HEADLINE_LEN)
+      : existing.headline,
+    primaryText: hasPrimary
+      ? (update.primaryText as string).slice(0, MAX_PRIMARY_TEXT_LEN)
+      : existing.primaryText,
+    cta: hasCta
+      ? (update.cta as string).slice(0, MAX_CTA_LEN)
+      : existing.cta,
+    variety: existing.variety,
+  };
+
+  const nextVariants = [...result.variants];
+  nextVariants[idx] = next;
+
+  return {
+    adCopyResult: { variants: nextVariants },
+  };
+}

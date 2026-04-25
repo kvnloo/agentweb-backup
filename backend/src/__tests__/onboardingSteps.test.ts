@@ -546,6 +546,124 @@ describe("ad-copy axis", () => {
     res = await request(app).post("/api/onboarding/ad-copy/fail").send({});
     expect(res.status).toBe(200);
   });
+
+  describe("POST /api/onboarding/ad-copy/update", () => {
+    const goodCopyState = {
+      userId: "user-1",
+      adCopyStatus: "ready",
+      adCopyResult: {
+        variants: [
+          {
+            id: "v1",
+            headline: "Old headline 1",
+            primaryText: "Old body 1",
+            cta: "Learn more",
+            variety: "Problem Agitation",
+          },
+          {
+            id: "v2",
+            headline: "Old headline 2",
+            primaryText: "Old body 2",
+            cta: "Learn more",
+            variety: "Social Proof",
+          },
+        ],
+      },
+    };
+
+    it("400 when variantId is missing", async () => {
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .send({ headline: "x" });
+      expect(res.status).toBe(400);
+    });
+
+    it("400 when no editable field is supplied", async () => {
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .send({ variantId: "v1" });
+      expect(res.status).toBe(400);
+    });
+
+    it("404 when user not found", async () => {
+      userDb.getUserById.mockResolvedValueOnce(undefined);
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .send({ variantId: "v1", headline: "x" });
+      expect(res.status).toBe(404);
+    });
+
+    it("404 when variant id not in result", async () => {
+      userDb.getUserById.mockResolvedValueOnce(goodCopyState);
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .send({ variantId: "missing", headline: "x" });
+      expect(res.status).toBe(404);
+    });
+
+    it("404 when ad copy not yet ready (no result)", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        adCopyStatus: "running",
+      });
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .send({ variantId: "v1", headline: "x" });
+      expect(res.status).toBe(404);
+    });
+
+    it("200 + persists update when variant + field both valid", async () => {
+      userDb.getUserById.mockReset();
+      userDb.getUserById
+        .mockResolvedValueOnce(goodCopyState) // initial getUserById to load current
+        .mockResolvedValueOnce({
+          // after-update getUserById returns the patched state
+          ...goodCopyState,
+          adCopyResult: {
+            variants: [
+              {
+                id: "v1",
+                headline: "New headline",
+                primaryText: "Old body 1",
+                cta: "Learn more",
+                variety: "Problem Agitation",
+              },
+              goodCopyState.adCopyResult.variants[1],
+            ],
+          },
+        });
+      userDb.updateUser.mockResolvedValueOnce({ userId: "user-1" });
+
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .send({ variantId: "v1", headline: "New headline" });
+
+      expect(res.status).toBe(200);
+      // updateUser called with the patched result
+      expect(userDb.updateUser).toHaveBeenCalled();
+      const patchCall = userDb.updateUser.mock.calls[0];
+      expect(patchCall[0]).toBe("user-1");
+      expect(patchCall[1].adCopyResult.variants[0].headline).toBe(
+        "New headline"
+      );
+      // variety preserved (not user-editable)
+      expect(patchCall[1].adCopyResult.variants[0].variety).toBe(
+        "Problem Agitation"
+      );
+      // Other variant untouched
+      expect(patchCall[1].adCopyResult.variants[1]).toEqual(
+        goodCopyState.adCopyResult.variants[1]
+      );
+    });
+
+    it("401 when no auth header", async () => {
+      const res = await request(app)
+        .post("/api/onboarding/ad-copy/update")
+        .set("x-no-auth", "1")
+        .send({ variantId: "v1", headline: "x" });
+      expect(res.status).toBe(401);
+    });
+  });
 });
 
 // ───────── Wiring assertions: /start delegates to background services ─────────
