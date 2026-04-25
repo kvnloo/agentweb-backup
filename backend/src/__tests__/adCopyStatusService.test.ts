@@ -4,6 +4,7 @@ import {
   adCopyReadyPatch,
   adCopySnapshot,
   adCopyStartPatch,
+  adCopyUpdateVariantPatch,
   logAdCopyCompletionMetric,
   sanitizeAdCopyResult,
   MAX_AD_COPY_VARIANTS,
@@ -121,5 +122,101 @@ describe("adCopyStatusService", () => {
       /^\[metrics\] ad_copy_complete status=ready duration_ms=45000 variants=3 user=user-123$/
     );
     spy.mockRestore();
+  });
+
+  describe("adCopyUpdateVariantPatch", () => {
+    const baseFields = {
+      adCopyStatus: "ready" as const,
+      adCopyResult: {
+        variants: [variant(1), variant(2), variant(3)],
+      },
+    };
+
+    it("returns null when no result is present (state not ready)", () => {
+      const patch = adCopyUpdateVariantPatch(
+        {},
+        { variantId: "v1", headline: "x" }
+      );
+      expect(patch).toBeNull();
+    });
+
+    it("returns null when variant id is not found", () => {
+      const patch = adCopyUpdateVariantPatch(baseFields, {
+        variantId: "missing",
+        headline: "x",
+      });
+      expect(patch).toBeNull();
+    });
+
+    it("returns null when no editable fields are supplied", () => {
+      const patch = adCopyUpdateVariantPatch(baseFields, {
+        variantId: "v1",
+      });
+      expect(patch).toBeNull();
+    });
+
+    it("updates only the headline when only headline supplied", () => {
+      const patch = adCopyUpdateVariantPatch(baseFields, {
+        variantId: "v2",
+        headline: "Brand new headline",
+      });
+      expect(patch).not.toBeNull();
+      const variants = patch!.adCopyResult!.variants;
+      expect(variants[0]).toEqual(variant(1));
+      expect(variants[1].headline).toBe("Brand new headline");
+      expect(variants[1].primaryText).toBe("Body text 2");
+      expect(variants[1].cta).toBe("Learn more");
+      expect(variants[1].variety).toBe("variety-2");
+      expect(variants[2]).toEqual(variant(3));
+    });
+
+    it("supports updating headline + primaryText + cta together", () => {
+      const patch = adCopyUpdateVariantPatch(baseFields, {
+        variantId: "v3",
+        headline: "H",
+        primaryText: "P",
+        cta: "Sign up",
+      });
+      expect(patch).not.toBeNull();
+      const v = patch!.adCopyResult!.variants[2];
+      expect(v.id).toBe("v3");
+      expect(v.headline).toBe("H");
+      expect(v.primaryText).toBe("P");
+      expect(v.cta).toBe("Sign up");
+      expect(v.variety).toBe("variety-3");
+    });
+
+    it("clamps oversized fields to the canonical max lengths", () => {
+      const longHeadline = "x".repeat(500);
+      const longPrimary = "y".repeat(2000);
+      const longCta = "z".repeat(100);
+      const patch = adCopyUpdateVariantPatch(baseFields, {
+        variantId: "v1",
+        headline: longHeadline,
+        primaryText: longPrimary,
+        cta: longCta,
+      });
+      const v = patch!.adCopyResult!.variants[0];
+      expect(v.headline.length).toBeLessThanOrEqual(200);
+      expect(v.primaryText.length).toBeLessThanOrEqual(1000);
+      expect(v.cta.length).toBeLessThanOrEqual(40);
+    });
+
+    it("preserves variety on edit (not user-editable)", () => {
+      const patch = adCopyUpdateVariantPatch(baseFields, {
+        variantId: "v1",
+        headline: "edited",
+      });
+      expect(patch!.adCopyResult!.variants[0].variety).toBe("variety-1");
+    });
+
+    it("returns a fresh array — does not mutate input", () => {
+      const before = JSON.parse(JSON.stringify(baseFields));
+      adCopyUpdateVariantPatch(baseFields, {
+        variantId: "v1",
+        headline: "edited",
+      });
+      expect(baseFields).toEqual(before);
+    });
   });
 });
