@@ -3603,3 +3603,34 @@ Pursue **transfer of ownership** of the Goaldenhour ad account to Goaldenhour it
 - The privacy policy must explicitly state Gmail data is not shared or sold
 - Redirect URI registered in the OAuth client: `https://api.agentweb.pro/api/oauth/gmail/callback`
 - YouTube connected accounts reuse the same Google Cloud project and OAuth client (`prod/AgentWeb/Google/Gmail`)
+
+## Emma Self-Improvement — Investigation (2026-04-25)
+
+### Context
+
+Investigated how to get Emma to self-improve over time, inspired by agent self-improvement patterns like Reflexion.
+
+### What Already Exists
+
+The memory system (`AW-AccountMemory`) already covers the core use case:
+
+- Categories: `preference`, `history`, `insight`, `workflow`
+- Emma tools: `save_memory` (save a fact mid-session), `delete_memory` (remove by ID)
+- Full CRUD API at `/api/memory` for user management
+- All active memories are injected into every new session's system prompt (up to 20, most recent)
+
+Emma already self-improves incrementally **within** a session: she can detect corrections or "remember that…" instructions and save them immediately via `save_memory`. Users can manage their memories via the customer portal settings UI.
+
+### Gap Considered: Post-Session Auto-Extraction
+
+The one missing piece is a post-session job that sends the full conversation transcript to an LLM and asks it to extract net-new learnings, then writes them to `AW-AccountMemory` automatically.
+
+### Why We're Not Building It Now
+
+Post-session auto-extraction risks being **overly aggressive**: the LLM may extract low-quality, redundant, or incorrect facts from routine exchanges (e.g., "user asked about SEO" → saves "user is interested in SEO" every session). This would pollute the memory store with noise and degrade Emma's quality over time rather than improving it.
+
+The existing in-session `save_memory` mechanism is more precise because it only fires when there is a clear signal (explicit user instruction or detected correction). Auto-extraction has no such signal — it runs on every session regardless of whether anything new was learned.
+
+### Decision
+
+No action. The current memory system is sufficient. Revisit post-session extraction if we add a quality-scoring or deduplication layer that can filter out noise before writing.
