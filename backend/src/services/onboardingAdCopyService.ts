@@ -258,7 +258,7 @@ export async function generateAdCopyForUser(
   creativeDir: CreativeDirResult,
   personas: ICPPersona[],
   brand: IcpBrandContext,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {},
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
   negativeExamples = ""
 ): Promise<AdCopyResult> {
   if (!Array.isArray(images) || images.length === 0) {
@@ -281,10 +281,11 @@ export async function generateAdCopyForUser(
       variety,
       negativeExamples
     );
-    const raw = await llm.generateJSONContent<PerVariantLlmResponse>(
+    // generateJsonRobust: retry-once on prose preambles. Per-variant loop
+    // means one bad call won't cascade-fail the whole ad-copy step.
+    const raw = await llm.generateJsonRobust<PerVariantLlmResponse>(
       AD_COPY_SYSTEM_PROMPT,
       userPrompt,
-      "json"
     );
     out.push({
       id: image.id,
@@ -308,7 +309,7 @@ export async function generateAdCopyForUser(
  */
 export async function triggerAdCopyForUser(
   userId: string,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {}
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -401,7 +402,7 @@ export async function triggerAdCopyForUser(
  */
 export async function startAdCopyForUser(
   userId: string,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {}
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<void> {
   await userDb.updateUser(userId, adCopyStartPatch() as any);
   void triggerAdCopyForUser(userId, deps);
