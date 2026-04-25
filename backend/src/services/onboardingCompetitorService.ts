@@ -291,7 +291,7 @@ export async function generateCompetitorStrategyForUser(
   brand: IcpBrandContext,
   personas: ICPPersona[],
   deps: {
-    llm?: { generateJSONContent: LLMService["generateJSONContent"] };
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
 ): Promise<CompetitorResult> {
@@ -323,10 +323,11 @@ export async function generateCompetitorStrategyForUser(
     }
 
     const userPrompt = buildPerIcpUserPrompt(brand, persona, searchCtx);
-    const raw = await llm.generateJSONContent<PerIcpLlmResponse>(
+    // generateJsonRobust adds a retry-on-extract-failure layer so a single
+    // prose preamble from the LLM doesn't fail the whole per-ICP loop.
+    const raw = await llm.generateJsonRobust<PerIcpLlmResponse>(
       COMPETITOR_STRATEGY_SYSTEM_PROMPT,
       userPrompt,
-      "json",
     );
     out.push({
       icp_id: persona.name,
@@ -352,7 +353,7 @@ export async function generateCompetitorStrategyForUser(
 export async function triggerCompetitorStrategyForUser(
   userId: string,
   deps: {
-    llm?: { generateJSONContent: LLMService["generateJSONContent"] };
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
 ): Promise<void> {
@@ -392,7 +393,7 @@ export async function triggerCompetitorStrategyForUser(
 export async function startCompetitorStrategyForUser(
   userId: string,
   deps: {
-    llm?: { generateJSONContent: LLMService["generateJSONContent"] };
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
 ): Promise<void> {

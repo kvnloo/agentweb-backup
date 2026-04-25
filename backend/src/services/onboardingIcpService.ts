@@ -140,16 +140,20 @@ function buildUserPrompt(brand: IcpBrandContext): string {
 
 /**
  * Pure LLM call — exported for unit-testing with an injected LLMService.
+ *
+ * Uses `generateJsonRobust` (not `generateJSONContent`) so a stray prose
+ * preamble in the model's response no longer cascade-fails the entire
+ * Phase 4 ad-gen pipeline. See `services/util/extractJson.ts`.
  */
 export async function generateIcpsForUser(
   brand: IcpBrandContext,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {},
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<ICPPersona[]> {
   const llm =
     deps.llm ?? new LLMService(ICP_MODEL, ICP_TEMPERATURE, ICP_MAX_TOKENS);
   const system = ICP_DISCOVERY_SYSTEM_PROMPT;
   const user = buildUserPrompt(brand);
-  const raw = await llm.generateJSONContent<LlmResponse>(system, user, "json");
+  const raw = await llm.generateJsonRobust<LlmResponse>(system, user);
   if (!raw || !Array.isArray((raw as LlmResponse).icps)) {
     throw new Error("LLM returned no icps");
   }
@@ -167,7 +171,7 @@ export async function generateIcpsForUser(
  */
 export async function triggerIcpDiscoveryForUser(
   userId: string,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {},
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -200,7 +204,7 @@ export async function triggerIcpDiscoveryForUser(
  */
 export async function startIcpDiscoveryForUser(
   userId: string,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {},
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<void> {
   await userDb.updateUser(userId, icpStartPatch() as any);
   // Intentionally not awaited — the route returns immediately.

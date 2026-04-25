@@ -39,10 +39,9 @@ class FakeLlm {
     private readonly throwError?: Error
   ) {}
 
-  async generateJSONContent<T = unknown>(
+  async generateJsonRobust<T = unknown>(
     system: string,
-    user: string,
-    _format: "json" | "xml" = "json"
+    user: string
   ): Promise<T> {
     this.callCount += 1;
     this.lastSystemPrompt = system;
@@ -654,7 +653,7 @@ describe("onboardingAdCopyService", () => {
       userDb.updateUser.mockResolvedValue({});
 
       const weirdLlm = {
-        generateJSONContent: async () => {
+        generateJsonRobust: async () => {
           throw "literal-string-thrown";
         },
       };

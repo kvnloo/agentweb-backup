@@ -182,14 +182,15 @@ export async function generateCreativeDirectionForUser(
   brand: IcpBrandContext,
   personas: ICPPersona[],
   competitor: CompetitorResult,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {}
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<CreativeDirResult> {
   const llm =
     deps.llm ??
     new LLMService(CREATIVE_DIR_MODEL, CREATIVE_DIR_TEMPERATURE, CREATIVE_DIR_MAX_TOKENS);
   const system = CREATIVE_DIR_SYSTEM_PROMPT;
   const user = buildUserPrompt(brand, personas, competitor);
-  const raw = await llm.generateJSONContent<LlmResponse>(system, user, "json");
+  // generateJsonRobust: retries once with a strict suffix on parse failure.
+  const raw = await llm.generateJsonRobust<LlmResponse>(system, user);
   const result = sanitizeCreativeDirResult(raw);
   if (
     result.concepts.length === 0 &&
@@ -209,7 +210,7 @@ export async function generateCreativeDirectionForUser(
  */
 export async function triggerCreativeDirForUser(
   userId: string,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {}
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -257,7 +258,7 @@ export async function triggerCreativeDirForUser(
  */
 export async function startCreativeDirForUser(
   userId: string,
-  deps: { llm?: { generateJSONContent: LLMService["generateJSONContent"] } } = {}
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<void> {
   await userDb.updateUser(userId, creativeDirStartPatch() as any);
   void triggerCreativeDirForUser(userId, deps);
