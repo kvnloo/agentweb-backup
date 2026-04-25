@@ -1636,7 +1636,13 @@ export async function generateSessionResponse(
       }
       return msg;
     });
-    await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
+    // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
+    // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
+    try {
+      await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
+    } catch (saveError) {
+      console.error('AgentMode: Failed to persist response messages to session — response will still be returned to caller:', saveError);
+    }
   }
 
   // If this session is linked to a GTM work item, update status to pending_review after AI responds

@@ -318,6 +318,12 @@ async function handleSlackSessionResponse(params: {
     // Post Emma's response to the Slack thread
     if (response.content) {
       await postThreadResponse(channel, ts, response.content);
+    } else {
+      // Generation succeeded but produced no text content — log and post a fallback so the
+      // user gets feedback instead of silence. This can happen when the LLM returns only tool
+      // calls with no final summary text, or when the content variable was never populated.
+      console.error(`❌ Slack session ${session.sessionId}: generateSessionResponse succeeded but response.content is empty`);
+      await postThreadResponse(channel, ts, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
     }
 
     // Post iShare link and GTM Tracker link as a separate follow-up message

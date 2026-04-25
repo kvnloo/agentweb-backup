@@ -9,6 +9,25 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-25',
+    changes: [
+      'Fix: Website Scans No Longer Fail When a Previous Session Left the Browser Locked',
+      '- Scheduled and manual website scans were failing with "Browser is already in use" errors when a prior session crashed without cleanly closing the browser',
+      '- The Chromium process would hold a lock on the browser profile directory, blocking all subsequent scan attempts for the same user',
+      '- Fix: Playwright MCP now runs in --isolated mode, which creates an independent browser context each time and does not require exclusive ownership of the user profile directory',
+      '- Retrying a failed website scan in the same session now works reliably without needing to wait or start a new session',
+    ],
+  },
+  {
+    date: '2026-04-25',
+    changes: [
+      'Fix: Browser Tool Errors During Website Scans Now Automatically Retry',
+      '- If a browser tool call (navigate, screenshot, snapshot, etc.) fails due to a transient error — connection drop, MCP server restart, or browser crash — the system now automatically retries up to 2 additional times before reporting failure',
+      '- Previously, a single transient failure would immediately surface as an error to Emma, causing the scan to stall',
+      '- Non-browser tools are unchanged and still fail fast',
+    ],
+  },
+  {
     date: '2026-04-24',
     changes: [
       'Fix: Meta Ads Reports Now Work Even When Meta Connected Account Is Unavailable',
@@ -5062,6 +5081,31 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The platform now logs the API cost of each CRM lead enrichment job against the user\'s monthly extra cost usage',
       '- Admins can see each user\'s extra cost breakdown (enrichment, and future sources) in the Users tab of the Admin Dashboard',
       '- Cost tracking is non-blocking — enrichment jobs are never delayed or rejected based on cost monitoring',
+    ],
+  },
+  {
+    date: '2026-04-25',
+    changes: [
+      'Fixed: Slack Bot No Longer Silently Drops Completed Responses',
+      '- When the Slack bot finishes a task (e.g. Weekly Product Updates), the response is now always delivered even if saving the session history to the database fails',
+      '- If the AI completes a task but produces no text summary, a fallback message is posted so users always get confirmation rather than silence',
+    ],
+  },
+  {
+    date: '2026-04-25',
+    changes: [
+      'Fixed: Drip Campaign Management Now Works in Chat',
+      '- Creating and listing drip campaigns via the chat interface (manage_drip_campaign) no longer returns a server error',
+      '- Both the list and create actions now complete successfully',
+    ],
+  },
+  {
+    date: '2026-04-25',
+    changes: [
+      'Improved: Voice Model Is Now Easier to Find',
+      '- The Gemini Live Flash model (which supports real-time voice chat) now shows a microphone icon next to its name in the model selector',
+      '- The Start/End voice session button now uses a microphone icon instead of a phone icon, making the voice feature more intuitive',
+      '- The model name in the selector now truncates cleanly instead of overflowing the dropdown trigger',
     ],
   },
   {
