@@ -321,6 +321,13 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   }>;
+  /**
+   * Onboarding v2 — value proposition the user committed to on the
+   * BrandReview gate screen (between dataGathering and adReveal).
+   * Stored separately from `marketStrategy.icp[].valueProposition` because
+   * it represents the brand-level value prop, not a per-ICP one.
+   */
+  valueProp?: string;
   introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;

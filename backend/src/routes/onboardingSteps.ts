@@ -506,4 +506,153 @@ router.post("/ad-copy/fail", authenticateToken, async (req, res) => {
   }
 });
 
+// ─────────────────────── BrandReview-gate per-card actions ───────────────────
+//
+// These three endpoints power the per-ICP-card actions on the BrandReview
+// gate (the screen between dataGathering and adReveal). Personas don't
+// carry an opaque id in storage, so we use index-based identity: the FE
+// backfills `id: 'icp-{idx}'` when rendering, and we parse the index out
+// of that string here. Future schema change (adding a stable persona id)
+// can wrap these without changing the FE contract.
+
+const ICP_ID_RE = /^icp-(\d+)$/;
+const ICP_PERSONA_FIELDS = [
+  "name",
+  "pain",
+  "desire",
+  "objection",
+  "meta_targeting_brief",
+] as const;
+const FIELD_MAX = 2000;
+const VALUE_PROP_MAX = 2000;
+
+function parseIcpIndex(icpId: unknown): number | null {
+  if (typeof icpId !== "string") return null;
+  const m = ICP_ID_RE.exec(icpId);
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
+
+function sanitizePersonaPatch(raw: unknown): Record<string, string> | null {
+  if (!raw || typeof raw !== "object") return null;
+  const out: Record<string, string> = {};
+  const v = raw as Record<string, unknown>;
+  for (const f of ICP_PERSONA_FIELDS) {
+    if (typeof v[f] === "string") {
+      const trimmed = (v[f] as string).slice(0, FIELD_MAX);
+      out[f] = trimmed;
+    }
+  }
+  if (Object.keys(out).length === 0) return null;
+  return out;
+}
+
+router.post("/icp/edit-one", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+    const idx = parseIcpIndex(req.body?.icpId);
+    if (idx === null) {
+      return res.status(400).json({ message: "icpId is required (format: icp-N)" });
+    }
+    const patchFields = sanitizePersonaPatch(req.body?.patch);
+    if (!patchFields) {
+      return res
+        .status(400)
+        .json({ message: "patch must include at least one of " + ICP_PERSONA_FIELDS.join(", ") });
+    }
+    const user = await userDb.getUserById(userId);
+    const list: Array<Record<string, string>> = user?.icpResult ?? [];
+    if (list.length === 0 || idx >= list.length) {
+      return res.status(404).json({ message: "icp not found" });
+    }
+    const nextList = list.map((p, i) =>
+      i === idx ? { ...p, ...patchFields } : p
+    );
+    await userDb.updateUser(userId, {
+      icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],
+    });
+    return res.json({ icpResult: nextList });
+  } catch (err) {
+    console.error("[icp] edit-one failed", err);
+    return res.status(500).json({ message: "Failed to edit icp" });
+  }
+});
+
+router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+    const idx = parseIcpIndex(req.body?.icpId);
+    if (idx === null) {
+      return res
+        .status(400)
+        .json({ message: "icpId is required (format: icp-N)" });
+    }
+    // Re-run the orchestrator. v1 regenerates the whole ICP set rather than
+    // just the indexed persona — the LLM service is set-level. The FE
+    // optimistically renders a per-card stall, then drops it when status
+    // flips back to ready.
+    await startIcpDiscoveryForUser(userId);
+    const user = await userDb.getUserById(userId);
+    const fallback = icpStartPatch();
+    return res.json({ status: icpSnapshot(user || fallback) });
+  } catch (err) {
+    console.error("[icp] regenerate-one failed", err);
+    return res.status(500).json({ message: "Failed to regenerate icp" });
+  }
+});
+
+router.post("/icp/delete-one", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+    const idx = parseIcpIndex(req.body?.icpId);
+    if (idx === null) {
+      return res
+        .status(400)
+        .json({ message: "icpId is required (format: icp-N)" });
+    }
+    const user = await userDb.getUserById(userId);
+    const list: Array<Record<string, string>> = user?.icpResult ?? [];
+    if (list.length === 0 || idx >= list.length) {
+      return res.status(404).json({ message: "icp not found" });
+    }
+    const nextList = list.filter((_, i) => i !== idx);
+    await userDb.updateUser(userId, {
+      icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],
+    });
+    return res.json({ icpResult: nextList });
+  } catch (err) {
+    console.error("[icp] delete-one failed", err);
+    return res.status(500).json({ message: "Failed to delete icp" });
+  }
+});
+
+router.post("/value-prop", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+    const raw = req.body?.valueProp;
+    if (typeof raw !== "string") {
+      return res
+        .status(400)
+        .json({ message: "valueProp must be a non-empty string" });
+    }
+    const trimmed = raw.trim().slice(0, VALUE_PROP_MAX);
+    if (!trimmed) {
+      return res
+        .status(400)
+        .json({ message: "valueProp must be a non-empty string" });
+    }
+    await userDb.updateUser(userId, { valueProp: trimmed });
+    return res.json({ valueProp: trimmed });
+  } catch (err) {
+    console.error("[value-prop] failed", err);
+    return res.status(500).json({ message: "Failed to save value prop" });
+  }
+});
+
 export default router;
