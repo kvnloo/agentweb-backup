@@ -186,6 +186,20 @@ export async function triggerIcpDiscoveryForUser(
       return;
     }
     await userDb.updateUser(userId, patch as any);
+
+    // Cascade kickoff: fire-and-forget the competitor step now that ICPs
+    // are persisted and `icpStatus === 'ready'`. Without this, the user
+    // had to wait for the next FE polling tick (or the next /competitor/start
+    // call) before competitor research started — adding 20s+ of dead time
+    // to onboarding. Combined with the gate inside
+    // `triggerCompetitorStrategyForUser`, this makes the ICP→Competitor
+    // handoff race-free. We intentionally `require` here (not `import`) to
+    // avoid a circular module dep — onboardingCompetitorService imports
+    // `extractIcpBrandContext` from this file. Errors are swallowed by
+    // the competitor service itself (it has its own try/catch).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { triggerCompetitorStrategyForUser } = require("./onboardingCompetitorService");
+    void triggerCompetitorStrategyForUser(userId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
