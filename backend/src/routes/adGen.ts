@@ -34,7 +34,12 @@ import {
   logAdGenCompletionMetric,
   sanitizeAdVariants,
 } from "../services/adGenStatusService";
-import { startAdGenerationForUser } from "../services/onboardingAdGenerator";
+
+// NOTE: The legacy `onboardingAdGenerator` (single-shot 3-angle LLM call) is
+// removed. The `/ad-gen/*` routes still exist for backward compatibility
+// with any clients still polling them, but `/start` is now a pure status
+// flip — the new per-step pipeline (`/creative-dir/start` →
+// `/ad-image/start` → `/ad-copy/start`) drives ad generation.
 
 const router = express.Router();
 
@@ -49,11 +54,12 @@ router.post("/ad-gen/start", authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: "User not authenticated" });
     }
-    // Flip status to `generating` + kick off the async LLM call. The
-    // status persist is synchronous so the UI sees `generating` in the
-    // response; the LLM work runs in the background and patches the
-    // record on completion. See `onboardingAdGenerator.ts`.
-    await startAdGenerationForUser(userId);
+    // Pure status flip — the legacy single-shot LLM generator was removed.
+    // Clients should migrate to the per-step pipeline (creative-dir →
+    // ad-image → ad-copy). UI flows on the new pipeline call those
+    // endpoints directly; this route remains so existing clients still see
+    // a coherent state machine and can complete via `/ad-gen/complete`.
+    await userDb.updateUser(userId, adGenStartPatch());
     const user = await userDb.getUserById(userId);
     return res.json({ status: adGenSnapshot(user || adGenStartPatch()) });
   } catch (err) {
