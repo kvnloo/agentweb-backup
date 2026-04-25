@@ -5,6 +5,9 @@
  * an injected fake LLM. No DynamoDB, no real Bedrock.
  */
 
+// Run cascade trigger synchronously in unit tests (no GSI to wait on).
+process.env.CASCADE_TRIGGER_DELAY_MS = "0";
+
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
@@ -16,6 +19,7 @@ jest.mock("../services/db", () => ({
 // from the ICP service after a successful run, without actually doing any
 // LLM/network work in this test file.
 jest.mock("../services/onboardingCompetitorService", () => ({
+  startCompetitorStrategyForUser: jest.fn(),
   triggerCompetitorStrategyForUser: jest.fn(),
 }));
 
@@ -418,9 +422,9 @@ describe("onboardingIcpService", () => {
       userDb.updateUser.mockResolvedValue({});
 
       const {
-        triggerCompetitorStrategyForUser,
+        startCompetitorStrategyForUser,
       } = require("../services/onboardingCompetitorService");
-      (triggerCompetitorStrategyForUser as jest.Mock).mockClear();
+      (startCompetitorStrategyForUser as jest.Mock).mockClear();
 
       const llm = new FakeLlm({ icps: fivePersonas });
       await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
@@ -429,9 +433,9 @@ describe("onboardingIcpService", () => {
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       expect(userDb.updateUser.mock.calls[0][1].icpStatus).toBe("ready");
 
-      // Cascade kickoff: competitor service trigger called exactly once with userId.
-      expect(triggerCompetitorStrategyForUser).toHaveBeenCalledTimes(1);
-      expect(triggerCompetitorStrategyForUser).toHaveBeenCalledWith("user-1");
+      // Cascade kickoff: competitor service start called exactly once with userId.
+      expect(startCompetitorStrategyForUser).toHaveBeenCalledTimes(1);
+      expect(startCompetitorStrategyForUser).toHaveBeenCalledWith("user-1");
     });
 
     it("does NOT trigger competitor when ICP completion is dropped silently (stale)", async () => {
@@ -440,16 +444,16 @@ describe("onboardingIcpService", () => {
         .mockResolvedValueOnce({ userId: "user-1", icpStatus: "idle" }); // not running
 
       const {
-        triggerCompetitorStrategyForUser,
+        startCompetitorStrategyForUser,
       } = require("../services/onboardingCompetitorService");
-      (triggerCompetitorStrategyForUser as jest.Mock).mockClear();
+      (startCompetitorStrategyForUser as jest.Mock).mockClear();
 
       const llm = new FakeLlm({ icps: fivePersonas });
       await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
 
       expect(userDb.updateUser).not.toHaveBeenCalled();
       // No DB write of `ready` ⇒ no cascade kickoff.
-      expect(triggerCompetitorStrategyForUser).not.toHaveBeenCalled();
+      expect(startCompetitorStrategyForUser).not.toHaveBeenCalled();
     });
 
     it("does NOT trigger competitor when ICP fails (cascade should not fire on failure)", async () => {
@@ -463,9 +467,9 @@ describe("onboardingIcpService", () => {
       userDb.updateUser.mockResolvedValue({});
 
       const {
-        triggerCompetitorStrategyForUser,
+        startCompetitorStrategyForUser,
       } = require("../services/onboardingCompetitorService");
-      (triggerCompetitorStrategyForUser as jest.Mock).mockClear();
+      (startCompetitorStrategyForUser as jest.Mock).mockClear();
 
       const llm = new FakeLlm(null, new Error("bedrock down"));
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
@@ -474,7 +478,7 @@ describe("onboardingIcpService", () => {
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       expect(userDb.updateUser.mock.calls[0][1].icpStatus).toBe("failed");
-      expect(triggerCompetitorStrategyForUser).not.toHaveBeenCalled();
+      expect(startCompetitorStrategyForUser).not.toHaveBeenCalled();
     });
   });
 

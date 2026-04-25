@@ -380,8 +380,8 @@ export async function triggerCompetitorStrategyForUser(
     ? (u.icpResult as ICPPersona[])
     : [];
   if (icpStatus !== "ready" || personas.length === 0) {
-    // Don't mark failed. Don't run. The polling tick and the icp-service
-    // cascade trigger will re-call us once ICP is actually ready.
+    // Don't mark failed. Don't run. The polling tick and the next
+    // cascade kickoff will re-call us once ICP is actually ready.
     // eslint-disable-next-line no-console
     console.log("[onboardingCompetitorService] gated by icp step", {
       userId,

@@ -33,14 +33,57 @@
  * output as the PR description's "real chain works end-to-end" receipt.
  */
 
+// CRITICAL: undo Jest's auto-mock for aws-sdk + bedrock SDKs. The
+// project ships a manual mock at src/__mocks__/aws-sdk.ts so unit tests
+// don't hit real DynamoDB. The live E2E test, by definition, MUST hit
+// real DynamoDB + real Bedrock — so we explicitly unmock both.
+jest.unmock("aws-sdk");
+jest.unmock("@aws-sdk/client-bedrock-runtime");
+
 import { randomUUID } from "crypto";
-import { userDb } from "../services/db";
-import { startIcpDiscoveryForUser } from "../services/onboardingIcpService";
-import { startCreativeDirForUser } from "../services/onboardingCreativeDirService";
-import { startAdImageGenerationForUser } from "../services/onboardingAdImageService";
-import { startAdCopyForUser } from "../services/onboardingAdCopyService";
+import * as path from "path";
 
 const RUN = process.env.RUN_LIVE_TESTS === "true";
+
+// CRITICAL: load real .env BEFORE importing service modules so the
+// DynamoDB client + Bedrock client pick up the real AWS credentials,
+// NOT the dummy `test-access-key` values that `__tests__/setup.ts` set
+// for normal unit-test runs. We force-override the test stubs because
+// setup.ts already ran by the time this module is evaluated.
+if (RUN) {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const dotenv = require("dotenv");
+  dotenv.config({
+    path: path.resolve(__dirname, "../../.env"),
+    override: true,
+  });
+  // Belt-and-braces: setup.ts forced NODE_ENV=test, but db.ts only uses
+  // the `Dev-` table prefix when NODE_ENV === "development". Force it
+  // explicitly so the live test ONLY writes to Dev-* tables. Never prod.
+  process.env.NODE_ENV = "development";
+  // eslint-disable-next-line no-console
+  console.log(
+    `[live-test] AWS creds prefix: ${(
+      process.env.AWS_ACCESS_KEY_ID || ""
+    ).slice(0, 4)}*** region=${process.env.AWS_REGION} node_env=${
+      process.env.NODE_ENV
+    }`,
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { userDb } = require("../services/db");
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { startCreativeDirForUser } = require("../services/onboardingCreativeDirService");
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const {
+  startAdImageGenerationForUser,
+} = require("../services/onboardingAdImageService");
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { startAdCopyForUser } = require("../services/onboardingAdCopyService");
+
 const describeLive = RUN ? describe : describe.skip;
 
 const POLL_INTERVAL_MS = 2_000;
@@ -95,7 +138,17 @@ describeLive("Onboarding pipeline — live E2E (real Bedrock + Gemini + Google S
       // and seed the User row with what brand-build would have written, so
       // this test focuses entirely on the ICP → Competitor → CreativeDir →
       // AdImage → AdCopy cascade.
-      await userDb.createUser(
+      // Sanity check: confirm AWS SDK sees the right account.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const AWS = require("aws-sdk");
+      const sts = new AWS.STS({ region: process.env.AWS_REGION });
+      const ident = await sts.getCallerIdentity().promise();
+      // eslint-disable-next-line no-console
+      console.log(
+        `[live-test] STS identity: account=${ident.Account} arn=${ident.Arn}`,
+      );
+
+      const created = await userDb.createUser(
         testEmail,
         testUserId,
         "live-test-not-used",
@@ -104,6 +157,33 @@ describeLive("Onboarding pipeline — live E2E (real Bedrock + Gemini + Google S
         ["customer"],
         "Live Test Linear",
       );
+      // eslint-disable-next-line no-console
+      console.log(`[live-test] createUser returned:`, created ? "ok" : "FALSY");
+      // Direct check: does it actually exist in DynamoDB?
+      const directDocClient = new AWS.DynamoDB.DocumentClient();
+      const directGet = await directDocClient
+        .get({ TableName: "Dev-AW-Users", Key: { email: testEmail } })
+        .promise();
+      // eslint-disable-next-line no-console
+      console.log(
+        `[live-test] direct get from Dev-AW-Users:`,
+        directGet.Item ? `present userId=${directGet.Item.userId}` : "MISSING",
+      );
+      // GSI eventual consistency — `UserIdIndex` may take a few seconds to
+      // index the new put. Poll up to 30s for it to become visible before
+      // proceeding so the cascade isn't waiting on a missing user.
+      let fetched: any = null;
+      for (let i = 0; i < 30; i++) {
+        fetched = await userDb.getUserById(testUserId);
+        if (fetched && fetched.email) break;
+        await sleep(1_000);
+      }
+      // eslint-disable-next-line no-console
+      console.log(
+        `[live-test] getUserById returned:`,
+        fetched ? `ok email=${fetched.email}` : "MISSING after 30s",
+      );
+      if (!fetched) throw new Error("createUser did not propagate to UserIdIndex within 30s");
       await userDb.updateUser(testUserId, {
         productDomain: "linear.app",
         companyName: "Linear",
