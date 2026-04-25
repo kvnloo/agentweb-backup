@@ -9,6 +9,25 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-25',
+    changes: [
+      'Fix: Website Scans No Longer Fail When a Previous Session Left the Browser Locked',
+      '- Scheduled and manual website scans were failing with "Browser is already in use" errors when a prior session crashed without cleanly closing the browser',
+      '- The Chromium process would hold a lock on the browser profile directory, blocking all subsequent scan attempts for the same user',
+      '- Fix: Playwright MCP now runs in --isolated mode, which creates an independent browser context each time and does not require exclusive ownership of the user profile directory',
+      '- Retrying a failed website scan in the same session now works reliably without needing to wait or start a new session',
+    ],
+  },
+  {
+    date: '2026-04-25',
+    changes: [
+      'Fix: Browser Tool Errors During Website Scans Now Automatically Retry',
+      '- If a browser tool call (navigate, screenshot, snapshot, etc.) fails due to a transient error — connection drop, MCP server restart, or browser crash — the system now automatically retries up to 2 additional times before reporting failure',
+      '- Previously, a single transient failure would immediately surface as an error to Emma, causing the scan to stall',
+      '- Non-browser tools are unchanged and still fail fast',
+    ],
+  },
+  {
     date: '2026-04-24',
     changes: [
       'Fix: Meta Ads Reports Now Work Even When Meta Connected Account Is Unavailable',
