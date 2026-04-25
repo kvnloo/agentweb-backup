@@ -33,6 +33,7 @@ import {
   logICPCompletionMetric,
   sanitizeICPPersonas,
 } from "../services/icpStatusService";
+import { startIcpDiscoveryForUser } from "../services/onboardingIcpService";
 import {
   competitorStartPatch,
   competitorReadyPatch,
@@ -41,6 +42,7 @@ import {
   logCompetitorCompletionMetric,
   sanitizeCompetitorResult,
 } from "../services/competitorStatusService";
+import { startCompetitorStrategyForUser } from "../services/onboardingCompetitorService";
 import {
   creativeDirStartPatch,
   creativeDirReadyPatch,
@@ -85,10 +87,13 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const patch = icpStartPatch();
-    await userDb.updateUser(userId, patch);
+    // startIcpDiscoveryForUser applies icpStartPatch synchronously and
+    // launches the background LLM call (fire-and-forget). The route returns
+    // the running snapshot immediately so the UI can poll /icp/status.
+    await startIcpDiscoveryForUser(userId);
     const user = await userDb.getUserById(userId);
-    return res.json({ status: icpSnapshot(user || patch) });
+    const fallback = icpStartPatch();
+    return res.json({ status: icpSnapshot(user || fallback) });
   } catch (err) {
     console.error("[icp] start failed", err);
     return res.status(500).json({ message: "Failed to start icp" });
@@ -160,10 +165,14 @@ router.post("/competitor/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const patch = competitorStartPatch();
-    await userDb.updateUser(userId, patch);
+    // startCompetitorStrategyForUser applies competitorStartPatch synchronously
+    // and launches the background per-ICP LLM loop (fire-and-forget). The
+    // route returns the running snapshot immediately so the UI can poll
+    // /competitor/status.
+    await startCompetitorStrategyForUser(userId);
     const user = await userDb.getUserById(userId);
-    return res.json({ status: competitorSnapshot(user || patch) });
+    const fallback = competitorStartPatch();
+    return res.json({ status: competitorSnapshot(user || fallback) });
   } catch (err) {
     console.error("[competitor] start failed", err);
     return res.status(500).json({ message: "Failed to start competitor" });
