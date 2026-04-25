@@ -158,6 +158,17 @@ function isConnectionError(error: unknown): boolean {
   );
 }
 
+const BROWSER_TOOL_MAX_RETRIES = 2;
+const BROWSER_TOOL_RETRY_DELAY_MS = 2000;
+
+function isBrowserTool(toolName: string): boolean {
+  return toolName.startsWith('playwright_') || toolName.startsWith('browser_');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export class McpClientService {
   private clients: Map<string, Client> = new Map();
   private mcpTools: AgentTool[] = [];
@@ -512,44 +523,54 @@ export class McpClientService {
               }
             },
             execute: async (args: any, context: ToolContext) => {
-              try {
-                const toolArgs = { ...args };
-                if (isInternal) {
-                  Object.assign(toolArgs, {
-                    userId: context.userId,
-                    sessionId: context.sessionId,
-                    llmModel: context.llmModel
-                  });
-                }
-                const sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
-                const clientTransport = (sessionClient as any)._transport;
-                const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
-                console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${serverName}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}`);
-                const result = await sessionClient.callTool({
-                  name: originalToolName,
-                  arguments: toolArgs
-                }, undefined, { timeout: 3600000 });
-                const contentArray = (result.content as any[]) || [];
-                if (result.isError) {
-                  throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
-                }
-                const content = contentArray
-                  .filter((c: any) => c.type === 'text')
-                  .map((c: any) => c.text)
-                  .join('\n');
-                return { content, raw: result };
-              } catch (error) {
-                // Evict dead client from session pool so the next call reconnects
-                if (isConnectionError(error)) {
-                  const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
-                  if (execPool?.clients.has(serverName)) {
-                    console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
-                    execPool.clients.delete(serverName);
+              const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
+              let lastError: unknown;
+              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                  const toolArgs = { ...args };
+                  if (isInternal) {
+                    Object.assign(toolArgs, {
+                      userId: context.userId,
+                      sessionId: context.sessionId,
+                      llmModel: context.llmModel
+                    });
+                  }
+                  const sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
+                  const clientTransport = (sessionClient as any)._transport;
+                  const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
+                  console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${serverName}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}${attempt > 1 ? ` (retry ${attempt - 1}/${BROWSER_TOOL_MAX_RETRIES})` : ''}`);
+                  const result = await sessionClient.callTool({
+                    name: originalToolName,
+                    arguments: toolArgs
+                  }, undefined, { timeout: 3600000 });
+                  const contentArray = (result.content as any[]) || [];
+                  if (result.isError) {
+                    throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
+                  }
+                  const content = contentArray
+                    .filter((c: any) => c.type === 'text')
+                    .map((c: any) => c.text)
+                    .join('\n');
+                  return { content, raw: result };
+                } catch (error) {
+                  lastError = error;
+                  // Evict dead client from session pool so the next call reconnects
+                  if (isConnectionError(error)) {
+                    const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
+                    if (execPool?.clients.has(serverName)) {
+                      console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
+                      execPool.clients.delete(serverName);
+                    }
+                  }
+                  if (attempt < maxAttempts) {
+                    console.warn(`[MCP-RETRY] Browser tool "${exposedToolName}" failed on attempt ${attempt}/${maxAttempts}, retrying in ${BROWSER_TOOL_RETRY_DELAY_MS}ms:`, error);
+                    await sleep(BROWSER_TOOL_RETRY_DELAY_MS);
+                  } else {
+                    console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
                   }
                 }
-                console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
-                throw error;
               }
+              throw lastError;
             }
           };
           this.mcpTools.push(agentTool);
@@ -737,10 +758,11 @@ export class McpClientService {
       if (!resolvedArgs.includes('--no-sandbox')) {
         resolvedArgs.push('--no-sandbox');
       }
-      // Give each user a separate browser profile to avoid "browser already in use" conflicts
-      if (poolKey && !resolvedArgs.some(arg => arg.startsWith('--user-data-dir'))) {
-        const userDataDir = `/tmp/playwright-users/${poolKey}`;
-        resolvedArgs.push(`--user-data-dir=${userDataDir}`);
+      // --isolated prevents "Browser is already in use" errors when a prior session didn't clean up.
+      // Note: --isolated is mutually exclusive with --user-data-dir (Playwright MCP enforces this),
+      // so we do NOT set --user-data-dir when --isolated is active.
+      if (!resolvedArgs.includes('--isolated')) {
+        resolvedArgs.push('--isolated');
       }
       // Anti-headless detection: pass Chromium args that prevent bot detection via config file.
       // The --launch-options CLI flag was removed in @playwright/mcp@0.0.68+, so we write
@@ -764,7 +786,7 @@ export class McpClientService {
         fs.writeFileSync(configPath, JSON.stringify(config));
         resolvedArgs.push('--config', configPath);
       }
-      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox and --config for ${name}${poolKey ? ` (user data dir: /tmp/playwright-users/${poolKey.substring(0, 8)}...)` : ''}`);
+      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox --isolated and --config for ${name}`);
     }
 
     // Resolve environment variables in the env config
@@ -955,61 +977,71 @@ export class McpClientService {
           }
         },
         execute: async (args: any, context: ToolContext) => {
-          try {
-            // Conditionally inject technical parameters if server is internal
-            const toolArgs = { ...args };
-            if (isInternal) {
-              Object.assign(toolArgs, {
-                userId: context.userId,
-                sessionId: context.sessionId,
-                llmModel: context.llmModel
-              });
-            }
+          const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
+          let lastError: unknown;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              // Conditionally inject technical parameters if server is internal
+              const toolArgs = { ...args };
+              if (isInternal) {
+                Object.assign(toolArgs, {
+                  userId: context.userId,
+                  sessionId: context.sessionId,
+                  llmModel: context.llmModel
+                });
+              }
 
-            // CRITICAL FIX: Get session-specific client instead of using shared client
-            // This ensures each chat session has its own isolated MCP connection
-            const sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
+              // CRITICAL FIX: Get session-specific client instead of using shared client
+              // This ensures each chat session has its own isolated MCP connection
+              const sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
 
-            // Log MCP tool call with session info
-            const clientTransport = (sessionClient as any)._transport;
-            const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
-            console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${name}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}`);
+              // Log MCP tool call with session info
+              const clientTransport = (sessionClient as any)._transport;
+              const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
+              console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${name}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}${attempt > 1 ? ` (retry ${attempt - 1}/${BROWSER_TOOL_MAX_RETRIES})` : ''}`);
 
-            const result = await sessionClient.callTool({
-              name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
-              arguments: toolArgs
-            }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
+              const result = await sessionClient.callTool({
+                name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
+                arguments: toolArgs
+              }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
 
-            // Cast content to any to access properties safely
-            const contentArray = (result.content as any[]) || [];
+              // Cast content to any to access properties safely
+              const contentArray = (result.content as any[]) || [];
 
-            // Check if it's an error
-            if (result.isError) {
-              throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
-            }
+              // Check if it's an error
+              if (result.isError) {
+                throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
+              }
 
-            // Extract text content
-            const content = contentArray
-              .filter((c: any) => c.type === 'text')
-              .map((c: any) => c.text)
-              .join('\n');
+              // Extract text content
+              const content = contentArray
+                .filter((c: any) => c.type === 'text')
+                .map((c: any) => c.text)
+                .join('\n');
 
-            return {
-              content,
-              raw: result
-            };
-          } catch (error) {
-            // Evict dead client from session pool so the next call reconnects
-            if (isConnectionError(error)) {
-              const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
-              if (execPool?.clients.has(name)) {
-                console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
-                execPool.clients.delete(name);
+              return {
+                content,
+                raw: result
+              };
+            } catch (error) {
+              lastError = error;
+              // Evict dead client from session pool so the next call reconnects
+              if (isConnectionError(error)) {
+                const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
+                if (execPool?.clients.has(name)) {
+                  console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
+                  execPool.clients.delete(name);
+                }
+              }
+              if (attempt < maxAttempts) {
+                console.warn(`[MCP-RETRY] Browser tool "${exposedToolName}" failed on attempt ${attempt}/${maxAttempts}, retrying in ${BROWSER_TOOL_RETRY_DELAY_MS}ms:`, error);
+                await sleep(BROWSER_TOOL_RETRY_DELAY_MS);
+              } else {
+                console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
               }
             }
-            console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
-            throw error;
           }
+          throw lastError;
         }
       };
 

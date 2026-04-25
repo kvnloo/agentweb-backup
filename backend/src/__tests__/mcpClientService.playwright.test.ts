@@ -77,7 +77,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     service = new McpClientService();
   });
 
-  it('should inject --headless, --no-sandbox, and --config for Playwright MCP server', async () => {
+  it('should inject --headless, --no-sandbox, --isolated, and --config for Playwright MCP server', async () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
@@ -93,6 +93,10 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     expect(callArgs.args).toContain('@playwright/mcp@latest');
     expect(callArgs.args).toContain('--headless');
     expect(callArgs.args).toContain('--no-sandbox');
+    // --isolated prevents "Browser is already in use" errors when a prior session didn't clean up.
+    // --isolated is mutually exclusive with --user-data-dir, so user-data-dir must NOT be present.
+    expect(callArgs.args).toContain('--isolated');
+    expect(callArgs.args.some((a: string) => a.startsWith('--user-data-dir'))).toBe(false);
     // Anti-headless detection args via config file
     expect(callArgs.args).toContain('--config');
     const configIdx = callArgs.args.indexOf('--config');
@@ -122,7 +126,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--headless', '--no-sandbox'],
+      args: ['@playwright/mcp@latest', '--headless', '--no-sandbox', '--isolated'],
       isInternal: false,
     };
 
@@ -132,8 +136,10 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     const callArgs = mockStdioConstructor.mock.calls[0][0];
     const headlessCount = callArgs.args.filter((a: string) => a === '--headless').length;
     const noSandboxCount = callArgs.args.filter((a: string) => a === '--no-sandbox').length;
+    const isolatedCount = callArgs.args.filter((a: string) => a === '--isolated').length;
     expect(headlessCount).toBe(1);
     expect(noSandboxCount).toBe(1);
+    expect(isolatedCount).toBe(1);
   });
 
   it('should NOT inject --config if already provided', async () => {
