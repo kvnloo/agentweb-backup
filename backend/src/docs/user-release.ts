@@ -28,6 +28,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-25',
+    changes: [
+      'Fix: Emma No Longer Fabricates Meta Ads Data When Account Is Not Connected',
+      '- When a Meta Ads account is not connected, Emma now immediately stops and tells you to connect your account — instead of generating fake campaign names, made-up spend figures, and hallucinated charts',
+      '- Root cause: authentication errors from the Meta API were being silently swallowed and returned as data to the AI, which then had no signal to stop and invented plausible-looking results',
+      '- Fix: authentication errors now properly surface as tool failures, causing Emma to report the real problem and stop',
+    ],
+  },
+  {
     date: '2026-04-24',
     changes: [
       'Fix: Meta Ads Reports Now Work Even When Meta Connected Account Is Unavailable',

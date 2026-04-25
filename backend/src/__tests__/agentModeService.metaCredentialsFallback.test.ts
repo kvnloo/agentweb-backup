@@ -48,25 +48,21 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
 
   // --- FAIL cases ---
 
-  it('should still throw when no connected account AND no adAccount field', async () => {
+  it('should throw when no connected account AND no adAccount field', async () => {
     const userWithNoMeta = { id: 'user1', connected_accounts: [], adAccount: '' };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithNoMeta);
 
-    const result = await agentModeService.listMetaAdsCampaignsNew('user1');
-    expect(result.success).toBe(false);
-    expect(result.message).toMatch(/not connected/i);
+    await expect(agentModeService.listMetaAdsCampaignsNew('user1')).rejects.toThrow(/not connected/i);
   });
 
-  it('should still throw when no connected account AND adAccount is undefined', async () => {
+  it('should throw when no connected account AND adAccount is undefined', async () => {
     const userWithNoMeta = { id: 'user1', connected_accounts: [] };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithNoMeta);
 
-    const result = await agentModeService.listMetaAdsCampaignsNew('user1');
-    expect(result.success).toBe(false);
-    expect(result.message).toMatch(/not connected/i);
+    await expect(agentModeService.listMetaAdsCampaignsNew('user1')).rejects.toThrow(/not connected/i);
   });
 
-  it('should fail gracefully when adAccount exists but Secrets Manager token fetch fails', async () => {
+  it('should return error when adAccount exists but Secrets Manager token fetch fails', async () => {
     const userWithLegacyAccount = { id: 'user1', connected_accounts: [], adAccount: '883347640787043' };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithLegacyAccount);
     (getMetaAccessToken as jest.Mock).mockRejectedValue(new Error('Secret not found'));
@@ -76,7 +72,7 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
     expect(result.message).toBeTruthy();
   });
 
-  it('should fail when connected_accounts has a non-ad_account Meta entry and adAccount is missing', async () => {
+  it('should throw when connected_accounts has a non-ad_account Meta entry and adAccount is missing', async () => {
     const userWithWrongType = {
       id: 'user1',
       connected_accounts: [{
@@ -89,9 +85,7 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
     };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithWrongType);
 
-    const result = await agentModeService.listMetaAdsCampaignsNew('user1');
-    expect(result.success).toBe(false);
-    expect(result.message).toMatch(/not connected/i);
+    await expect(agentModeService.listMetaAdsCampaignsNew('user1')).rejects.toThrow(/not connected/i);
   });
 
   // --- SUCCESS cases ---
