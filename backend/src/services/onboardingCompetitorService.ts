@@ -6,8 +6,7 @@
  * for each ICP runs an optional web search + LLM synthesis to produce
  * a `CompetitorPerICP` entry.
  *
- * Same fire-and-forget orchestration pattern as `onboardingIcpService` and
- * `onboardingAdGenerator`:
+ * Same fire-and-forget orchestration pattern as `onboardingIcpService`:
  *   1. Route flips `competitorStatus → running` via competitorStartPatch.
  *   2. Route calls `startCompetitorStrategyForUser(userId)`.
  *   3. Background: read ICPs from User → per-ICP web search → per-ICP LLM
