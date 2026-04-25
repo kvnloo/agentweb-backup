@@ -264,6 +264,15 @@ export interface User {
       variety: string;
     }>;
   };
+  // ── Ad variant ratings (Phase 4 "Ads Tinder" swipe UI) ──
+  // Append-only log of like/reject decisions per variant. Capped at 50.
+  // Used by the LLM regen prompts to bias future variants away from
+  // rejected directions. See `adVariantRatingService.ts`.
+  adVariantsRated?: Array<{
+    variantId: string;
+    rating: "like" | "reject";
+    ratedAt: string;
+  }>;
   brandGuidelines?: {
     brandData: {
       brandName: string;

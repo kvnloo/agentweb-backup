@@ -71,6 +71,12 @@ import {
 } from "../services/adCopyStatusService";
 import { startAdCopyForUser } from "../services/onboardingAdCopyService";
 import { startAdImageGenerationForUser } from "../services/onboardingAdImageService";
+import {
+  appendRatingPatch,
+  isAdVariantRating,
+  isValidVariantId,
+  ratingSummary,
+} from "../services/adVariantRatingService";
 
 const router = express.Router();
 
@@ -706,6 +712,55 @@ router.post("/icp/delete-one", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("[icp] delete-one failed", err);
     return res.status(500).json({ message: "Failed to delete icp" });
+  }
+});
+
+// ─────────────────────── Ad-variant rating (Ads Tinder) ────────────────────
+//
+// Phase 4 reveal mobile UX is a Tinder-style card stack. Every swipe
+// commits a rating to the User record, which feeds the LLM regen prompts
+// to bias future variants away from rejected directions. See
+// `adVariantRatingService.ts` for the pure-function side.
+//
+// POST /api/onboarding/ad-variant/rate
+// Body: { variantId: string, rating: "like" | "reject" }
+// Response: { summary: { likes, rejects, total } }
+router.post("/ad-variant/rate", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+
+    const variantId = req.body?.variantId;
+    if (!isValidVariantId(variantId)) {
+      return res.status(400).json({
+        message:
+          "variantId must be a non-empty string up to 64 characters",
+      });
+    }
+
+    const rating = req.body?.rating;
+    if (!isAdVariantRating(rating)) {
+      return res.status(400).json({
+        message: 'rating must be "like" or "reject"',
+      });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const patch = appendRatingPatch(user, variantId, rating);
+    // The patch object only has `adVariantsRated`; cast to any so the
+    // partial-User update is accepted by `userDb.updateUser`.
+    await userDb.updateUser(userId, patch as any);
+    const updated = await userDb.getUserById(userId);
+    return res.json({
+      summary: ratingSummary(updated || patch),
+    });
+  } catch (err) {
+    console.error("[ad-variant] rate failed", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to record ad-variant rating" });
   }
 });
 
