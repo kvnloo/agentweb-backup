@@ -69,6 +69,7 @@ import {
   sanitizeAdCopyResult,
 } from "../services/adCopyStatusService";
 import { startAdCopyForUser } from "../services/onboardingAdCopyService";
+import { startAdImageGenerationForUser } from "../services/onboardingAdImageService";
 
 const router = express.Router();
 
@@ -343,10 +344,17 @@ router.post("/ad-image/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const patch = adImageStartPatch();
-    await userDb.updateUser(userId, patch);
+    // startAdImageGenerationForUser applies adImageStartPatch synchronously
+    // and launches the background Brick 8 / Step 5 image-generation loop
+    // (Gemini Pro, 3 variants in parallel, per-variant timeout). The route
+    // returns the running snapshot immediately so the UI can poll
+    // /ad-image/status. The orchestrator gates on creativeDirStatus ===
+    // 'ready' — if creative direction hasn't completed, it patches with
+    // adImageFailedPatch and the UI surfaces the gating reason.
+    await startAdImageGenerationForUser(userId);
     const user = await userDb.getUserById(userId);
-    return res.json({ status: adImageSnapshot(user || patch) });
+    const fallback = adImageStartPatch();
+    return res.json({ status: adImageSnapshot(user || fallback) });
   } catch (err) {
     console.error("[ad-image] start failed", err);
     return res.status(500).json({ message: "Failed to start ad image" });
