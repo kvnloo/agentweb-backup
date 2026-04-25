@@ -51,6 +51,7 @@ import {
   logCreativeDirCompletionMetric,
   sanitizeCreativeDirResult,
 } from "../services/creativeDirStatusService";
+import { startCreativeDirForUser } from "../services/onboardingCreativeDirService";
 import {
   adImageStartPatch,
   adImageReadyPatch,
@@ -67,6 +68,7 @@ import {
   logAdCopyCompletionMetric,
   sanitizeAdCopyResult,
 } from "../services/adCopyStatusService";
+import { startAdCopyForUser } from "../services/onboardingAdCopyService";
 
 const router = express.Router();
 
@@ -249,10 +251,13 @@ router.post("/creative-dir/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const patch = creativeDirStartPatch();
-    await userDb.updateUser(userId, patch);
+    // startCreativeDirForUser applies creativeDirStartPatch synchronously and
+    // launches the background LLM call (fire-and-forget). The route returns
+    // the running snapshot immediately so the UI can poll /creative-dir/status.
+    await startCreativeDirForUser(userId);
     const user = await userDb.getUserById(userId);
-    return res.json({ status: creativeDirSnapshot(user || patch) });
+    const fallback = creativeDirStartPatch();
+    return res.json({ status: creativeDirSnapshot(user || fallback) });
   } catch (err) {
     console.error("[creative-dir] start failed", err);
     return res.status(500).json({ message: "Failed to start creative direction" });
@@ -420,10 +425,15 @@ router.post("/ad-copy/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const patch = adCopyStartPatch();
-    await userDb.updateUser(userId, patch);
+    // startAdCopyForUser applies adCopyStartPatch synchronously and launches
+    // the background per-image LLM loop. The orchestrator gates on
+    // adImageStatus === 'ready' — until the image step ships, it will fail
+    // immediately. The route returns the running snapshot regardless so the
+    // UI can poll /ad-copy/status.
+    await startAdCopyForUser(userId);
     const user = await userDb.getUserById(userId);
-    return res.json({ status: adCopySnapshot(user || patch) });
+    const fallback = adCopyStartPatch();
+    return res.json({ status: adCopySnapshot(user || fallback) });
   } catch (err) {
     console.error("[ad-copy] start failed", err);
     return res.status(500).json({ message: "Failed to start ad copy" });

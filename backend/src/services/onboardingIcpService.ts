@@ -2,7 +2,7 @@
  * Onboarding Epic Phase 2 — ICP discovery service.
  *
  * Step 2 of the B2B lead-gen ads work plan (`plan_1768351741814_jgc2wwlxa`).
- * Mirrors the `onboardingAdGenerator` pattern: pure LLM call exported for
+ * Mirrors the per-axis onboarding service pattern: pure LLM call exported for
  * unit-testing, plus a fire-and-forget orchestrator that patches the User
  * record's per-axis state machine on the way in (`running`) and out
  * (`ready` | `failed`).

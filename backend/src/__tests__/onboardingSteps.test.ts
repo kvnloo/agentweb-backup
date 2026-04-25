@@ -45,6 +45,30 @@ jest.mock("../services/onboardingCompetitorService", () => {
   };
 });
 
+jest.mock("../services/onboardingCreativeDirService", () => {
+  const actual = jest.requireActual("../services/onboardingCreativeDirService");
+  return {
+    ...actual,
+    startCreativeDirForUser: jest.fn(async (userId: string) => {
+      const { userDb } = require("../services/db");
+      const { creativeDirStartPatch } = require("../services/creativeDirStatusService");
+      await userDb.updateUser(userId, creativeDirStartPatch());
+    }),
+  };
+});
+
+jest.mock("../services/onboardingAdCopyService", () => {
+  const actual = jest.requireActual("../services/onboardingAdCopyService");
+  return {
+    ...actual,
+    startAdCopyForUser: jest.fn(async (userId: string) => {
+      const { userDb } = require("../services/db");
+      const { adCopyStartPatch } = require("../services/adCopyStatusService");
+      await userDb.updateUser(userId, adCopyStartPatch());
+    }),
+  };
+});
+
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     if (req.headers["x-no-auth"] === "1") {
