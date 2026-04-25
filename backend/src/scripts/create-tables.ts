@@ -1851,6 +1851,8 @@ const main = async () => {
     await createOAuthSessionsTable();
     await createDripSequencesTable();
     await createSequenceEnrollmentsTable();
+    await createDripCampaignsTable();
+    await createDripSendsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2192,6 +2194,66 @@ const createSequenceEnrollmentsTable = async () => {
         ],
         Projection: { ProjectionType: 'ALL' },
       },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createDripCampaignsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+    AttributeDefinitions: [
+      { AttributeName: 'campaignId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'campaignId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createDripSendsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-DripSends`,
+    AttributeDefinitions: [
+      { AttributeName: 'sendId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'sendId', KeyType: 'HASH' },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };
