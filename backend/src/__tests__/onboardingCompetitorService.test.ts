@@ -29,7 +29,7 @@ class FakeLlm {
     private readonly throwError?: Error,
   ) {}
 
-  async generateJSONContent<T = unknown>(
+  async generateJsonRobust<T = unknown>(
     system: string,
     user: string,
   ): Promise<T> {
@@ -423,7 +423,7 @@ describe("onboardingCompetitorService", () => {
       userDb.updateUser.mockResolvedValue({});
       // Custom LLM that throws a non-Error (string) — exercises String(err) path.
       const weirdLlm = {
-        generateJSONContent: async () => {
+        generateJsonRobust: async () => {
           throw "literal-string-error";
         },
       };

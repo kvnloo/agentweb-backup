@@ -31,10 +31,9 @@ class FakeLlm {
     private readonly throwError?: Error,
   ) {}
 
-  async generateJSONContent<T = unknown>(
+  async generateJsonRobust<T = unknown>(
     system: string,
     user: string,
-    _format: "json" | "xml" = "json",
   ): Promise<T> {
     this.callCount += 1;
     this.lastSystemPrompt = system;
@@ -354,7 +353,7 @@ describe("onboardingIcpService", () => {
 
       // LLM throws a literal string (not an Error instance) — exercises String(err) path.
       const weirdLlm = {
-        generateJSONContent: async () => {
+        generateJsonRobust: async () => {
           throw "literal-string-thrown";
         },
       };
@@ -415,6 +414,84 @@ describe("onboardingIcpService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.icpStatus).toBe("running");
       expect(startPatch.icpStartedAt).toBeTruthy();
+    });
+  });
+
+  /**
+   * Prose-recovery tests — the regression class behind PR #666 / Phase 4 ad-gen.
+   * The real `LLMService.generateJsonRobust` strips fences + balanced-brace
+   * extracts + retries once on failure. Service-level callers should reach
+   * `ready` whenever ANY of those layers recover JSON, and reach `failed`
+   * with a useful breadcrumb when all layers exhaust.
+   *
+   * We exercise this end-to-end by simulating the robust method's contract
+   * directly inside the FakeLlm (so we don't have to spin up the real
+   * Bedrock client).
+   */
+  describe("prose-recovery via generateJsonRobust", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("reaches ready when the robust LLM call recovers from a prose-then-JSON response", async () => {
+      // Simulating: real LLM returned prose-wrapped JSON, generateJsonRobust
+      // recovered it via balanced-brace extraction and returned the parsed
+      // object. The service sees a clean object — that is the contract.
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const patch = userDb.updateUser.mock.calls[0][1];
+      expect(patch.icpStatus).toBe("ready");
+      expect(patch.icpResult).toHaveLength(5);
+    });
+
+    it("reaches failed with a debuggable error when the robust LLM call exhausts retries", async () => {
+      // Simulating: real LLM returned prose twice. generateJsonRobust gave
+      // up and threw JsonExtractError carrying the raw snippet.
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      // Reuse the real JsonExtractError class so the service's String(err.message)
+      // path runs identically to production.
+      const {
+        JsonExtractError,
+      } = require("../services/util/extractJson");
+      const llm = {
+        generateJsonRobust: jest.fn(async () => {
+          throw new JsonExtractError(
+            "could not extract JSON from LLM response",
+            "It looks like I cannot generate that right now.",
+          );
+        }),
+      };
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+      errSpy.mockRestore();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const patch = userDb.updateUser.mock.calls[0][1];
+      expect(patch.icpStatus).toBe("failed");
+      // Error message persisted; capped at 512 chars by icpFailedPatch.
+      expect(typeof patch.icpError).toBe("string");
+      expect(patch.icpError.length).toBeGreaterThan(0);
+      expect(patch.icpError.length).toBeLessThanOrEqual(512);
+      expect(patch.icpError).toContain("could not extract JSON");
     });
   });
 });
