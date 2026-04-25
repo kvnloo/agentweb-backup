@@ -168,6 +168,102 @@ export interface User {
     cta: string;
     imageUrl?: string;
   }>;
+  /**
+   * Onboarding Epic — per-step state machines.
+   *
+   * Five concurrent state machines that each track one async step the
+   * onboarding flow can fire (ICP, competitor, creative direction, ad
+   * image, ad copy). The legacy single-axis `adGenStatus` mixed image +
+   * copy in one machine; this Epic splits each axis so a single failure
+   * doesn't block the others, and each screen can drive the step it hides
+   * without guessing what's already in flight.
+   *
+   * Each axis has the same shape (status / startedAt / completedAt /
+   * durationMs / error / result), tracked in its own pure state-machine
+   * module under `services/{axis}StatusService.ts` and exposed via
+   * `routes/onboardingSteps.ts`. Result types are loose `unknown[]`-ish
+   * structures so the LLM-output boundary can tighten them without
+   * churning persistence types every prompt iteration.
+   *
+   * State values: idle | running | ready | failed.
+   *   idle      — never started OR explicit reset
+   *   running   — async work in flight
+   *   ready     — terminal: result populated
+   *   failed    — terminal: error populated
+   *
+   * See:
+   *   - icpStatusService.ts        (5 personas)
+   *   - competitorStatusService.ts (per-icp targeting briefs)
+   *   - creativeDirStatusService.ts (concepts + copy angles + archetypes)
+   *   - adImageStatusService.ts    (3 image variants)
+   *   - adCopyStatusService.ts     (3 copy variants with variety tags)
+   */
+  // ── ICP axis ──
+  icpStatus?: "idle" | "running" | "ready" | "failed";
+  icpStartedAt?: string;
+  icpCompletedAt?: string;
+  icpDurationMs?: number;
+  icpError?: string;
+  icpResult?: Array<{
+    name: string;
+    pain: string;
+    desire: string;
+    objection: string;
+    meta_targeting_brief: string;
+  }>;
+  // ── Competitor axis ──
+  competitorStatus?: "idle" | "running" | "ready" | "failed";
+  competitorStartedAt?: string;
+  competitorCompletedAt?: string;
+  competitorDurationMs?: number;
+  competitorError?: string;
+  competitorResult?: {
+    per_icp: Array<{
+      icp_id: string;
+      competitor_names: string[];
+      offer_angles: string[];
+      meta_targeting_brief: string;
+    }>;
+  };
+  // ── Creative direction axis ──
+  creativeDirStatus?: "idle" | "running" | "ready" | "failed";
+  creativeDirStartedAt?: string;
+  creativeDirCompletedAt?: string;
+  creativeDirDurationMs?: number;
+  creativeDirError?: string;
+  creativeDirResult?: {
+    concepts: string[];
+    copy_angles: string[];
+    format_archetypes: string[];
+  };
+  // ── Ad image axis ──
+  adImageStatus?: "idle" | "running" | "ready" | "failed";
+  adImageStartedAt?: string;
+  adImageCompletedAt?: string;
+  adImageDurationMs?: number;
+  adImageError?: string;
+  adImageResult?: {
+    variants: Array<{
+      id: string;
+      imageUrl: string;
+      prompt: string;
+    }>;
+  };
+  // ── Ad copy axis ──
+  adCopyStatus?: "idle" | "running" | "ready" | "failed";
+  adCopyStartedAt?: string;
+  adCopyCompletedAt?: string;
+  adCopyDurationMs?: number;
+  adCopyError?: string;
+  adCopyResult?: {
+    variants: Array<{
+      id: string;
+      headline: string;
+      primaryText: string;
+      cta: string;
+      variety: string;
+    }>;
+  };
   brandGuidelines?: {
     brandData: {
       brandName: string;
