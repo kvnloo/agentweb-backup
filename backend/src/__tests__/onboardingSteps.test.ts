@@ -18,6 +18,33 @@ jest.mock("../services/db", () => ({
   },
 }));
 
+// Stub the new fire-and-forget orchestrators so /icp/start and
+// /competitor/start tests don't kick off real Bedrock calls. These services
+// have their own dedicated unit tests; here we only assert the route wiring.
+jest.mock("../services/onboardingIcpService", () => {
+  const actual = jest.requireActual("../services/onboardingIcpService");
+  return {
+    ...actual,
+    startIcpDiscoveryForUser: jest.fn(async (userId: string) => {
+      const { userDb } = require("../services/db");
+      const { icpStartPatch } = require("../services/icpStatusService");
+      await userDb.updateUser(userId, icpStartPatch());
+    }),
+  };
+});
+
+jest.mock("../services/onboardingCompetitorService", () => {
+  const actual = jest.requireActual("../services/onboardingCompetitorService");
+  return {
+    ...actual,
+    startCompetitorStrategyForUser: jest.fn(async (userId: string) => {
+      const { userDb } = require("../services/db");
+      const { competitorStartPatch } = require("../services/competitorStatusService");
+      await userDb.updateUser(userId, competitorStartPatch());
+    }),
+  };
+});
+
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     if (req.headers["x-no-auth"] === "1") {
@@ -494,5 +521,38 @@ describe("ad-copy axis", () => {
 
     res = await request(app).post("/api/onboarding/ad-copy/fail").send({});
     expect(res.status).toBe(200);
+  });
+});
+
+// ───────── Wiring assertions: /start delegates to background services ─────────
+describe("/icp/start and /competitor/start delegate to onboarding services", () => {
+  it("/icp/start invokes startIcpDiscoveryForUser exactly once", async () => {
+    const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+    (startIcpDiscoveryForUser as jest.Mock).mockClear();
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app).post("/api/onboarding/icp/start");
+    expect(res.status).toBe(200);
+    expect(startIcpDiscoveryForUser).toHaveBeenCalledTimes(1);
+    expect(startIcpDiscoveryForUser).toHaveBeenCalledWith("user-1");
+  });
+
+  it("/competitor/start invokes startCompetitorStrategyForUser exactly once", async () => {
+    const { startCompetitorStrategyForUser } = require("../services/onboardingCompetitorService");
+    (startCompetitorStrategyForUser as jest.Mock).mockClear();
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      competitorStatus: "running",
+      competitorStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app).post("/api/onboarding/competitor/start");
+    expect(res.status).toBe(200);
+    expect(startCompetitorStrategyForUser).toHaveBeenCalledTimes(1);
+    expect(startCompetitorStrategyForUser).toHaveBeenCalledWith("user-1");
   });
 });
