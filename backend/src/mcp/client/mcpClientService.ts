@@ -784,6 +784,14 @@ export class McpClientService {
           `if (!window.chrome) { Object.defineProperty(window, 'chrome', { get: () => ({ runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} }) }); }`,
           // Patch permissions.query so notifications return 'prompt' not 'denied'
           `try { const oq = window.navigator.permissions?.query?.bind(window.navigator.permissions); if (oq) { window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: 'prompt', onchange: null }) : oq(p); } } catch(e) {}`,
+          // Spoof navigator.plugins — headless has 0 plugins, real Chrome has several
+          `try { Object.defineProperty(navigator, 'plugins', { get: () => { const p = [{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }, { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' }, { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }]; p.__proto__ = PluginArray.prototype; return p; } }); } catch(e) {}`,
+          // Spoof navigator.mimeTypes
+          `try { Object.defineProperty(navigator, 'mimeTypes', { get: () => { const m = [{ type: 'application/pdf', suffixes: 'pdf', description: '', enabledPlugin: {} }, { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: {} }]; m.__proto__ = MimeTypeArray.prototype; return m; } }); } catch(e) {}`,
+          // Spoof screen properties that headless Chrome reports unusually
+          `try { Object.defineProperty(screen, 'colorDepth', { get: () => 24 }); Object.defineProperty(screen, 'pixelDepth', { get: () => 24 }); } catch(e) {}`,
+          // Mask the HeadlessChrome string in userAgent if it slipped through
+          `try { if (navigator.userAgent.includes('HeadlessChrome')) { Object.defineProperty(navigator, 'userAgent', { get: () => navigator.userAgent.replace('HeadlessChrome', 'Chrome') }); } } catch(e) {}`,
         ].join('\n');
         const stealthScriptPath = path.join(configDir, `${configKey}-stealth.js`);
         fs.writeFileSync(stealthScriptPath, stealthScriptContent);

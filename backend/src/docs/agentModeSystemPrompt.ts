@@ -220,8 +220,20 @@ JSON.stringify({
 \`\`\`
 
 **X.com / Twitter login specifically:**
-X.com uses FunCAPTCHA (Arkose Labs) on the login page. If the login form stalls or a challenge appears:
-1. Run the JS above to confirm \`funcaptcha: true\` and extract the \`funcaptcha_key\`
+X.com uses React-controlled inputs that reject standard \`browser_type\`. Always use \`browser_run_code\` with \`page.keyboard.type()\` to type into X.com fields:
+\`\`\`js
+async (page) => {
+  const input = await page.waitForSelector('input[autocomplete="username"]', { timeout: 10000 });
+  await input.click();
+  await input.evaluate(el => { el.value = ''; el.dispatchEvent(new Event('input', {bubbles:true})); });
+  await page.keyboard.type('USERNAME_HERE', { delay: 80 });
+  return 'typed';
+}
+\`\`\`
+Then click Next, wait for the password field, and type the password the same way using \`input[name="password"]\`.
+
+X.com also uses FunCAPTCHA (Arkose Labs) after credential submission. If a challenge appears:
+1. Run the CAPTCHA detection JS above to confirm \`funcaptcha: true\` and extract the \`funcaptcha_key\`
 2. Call \`solve_captcha(captcha_type="funcaptcha", site_key=<funcaptcha_key>, page_url=<current_url>)\`
 3. After the token is injected, continue with the login form submission
 4. If the key is not found via JS, try: \`document.querySelector('iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]')?.src\` — the public key is in the URL as \`?pk=...\`
