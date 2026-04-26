@@ -9,6 +9,21 @@ process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 
 import * as fs from 'fs';
 
+// Prevent actual playwright browser installs during tests (binary search returns nothing)
+jest.mock('fs', () => {
+  const realFs = jest.requireActual('fs');
+  return {
+    ...realFs,
+    existsSync: jest.fn((p: string) => {
+      // Return false for playwright binary paths to skip real install
+      if (typeof p === 'string' && (p.includes('playwright-mcp') || (p.includes('playwright') && p.includes('node_modules/.bin')))) {
+        return false;
+      }
+      return realFs.existsSync(p);
+    }),
+  };
+});
+
 // Capture StdioClientTransport constructor calls
 const mockStdioConstructor = jest.fn().mockImplementation(() => ({
   onclose: null,
@@ -74,6 +89,8 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     for (const key of Object.keys(internalMcpServers)) {
       delete (internalMcpServers as any)[key];
     }
+    // Reset static playwright install promise so tests don't share install state
+    (McpClientService as any).playwrightBrowsersInstall = null;
     service = new McpClientService();
   });
 
