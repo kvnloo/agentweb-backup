@@ -752,15 +752,72 @@ router.post("/ad-variant/rate", authenticateToken, async (req, res) => {
     // The patch object only has `adVariantsRated`; cast to any so the
     // partial-User update is accepted by `userDb.updateUser`.
     await userDb.updateUser(userId, patch as any);
-    const updated = await userDb.getUserById(userId);
+
+    // Also log the signal to PromptSignals so the partner-portal Prompt
+    // Templates tab can show like-rate per archetype + version. We
+    // resolve the variant's promptVersion + archetype from the User
+    // record's adImageResult so the metric carries the prompt context.
+    const updatedUser = (await userDb.getUserById(userId)) as any;
+    const variants = updatedUser?.adImageResult?.variants ?? [];
+    const variant = variants.find((v: any) => v?.id === variantId);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { logPromptSignal } = require("../services/promptSignalsService");
+    void logPromptSignal({
+      userId,
+      variantId,
+      promptVersion: variant?.promptVersion,
+      archetype: variant?.archetype,
+      signal: rating === "like" ? "like" : "skip",
+    });
+
     return res.json({
-      summary: ratingSummary(updated || patch),
+      summary: ratingSummary(updatedUser || patch),
     });
   } catch (err) {
     console.error("[ad-variant] rate failed", err);
     return res
       .status(500)
       .json({ message: "Failed to record ad-variant rating" });
+  }
+});
+
+// POST /api/onboarding/ad-set/signal
+// Set-level prompt feedback (continue / regenerate). Records a signal
+// row per ad variant so the partner-portal metrics correctly attribute
+// the verdict to each prompt version + archetype that was in the set.
+//
+// Body: { signal: "continue_set" | "regenerate_set" }
+router.post("/ad-set/signal", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+    const signal = req.body?.signal;
+    if (signal !== "continue_set" && signal !== "regenerate_set") {
+      return res
+        .status(400)
+        .json({ message: 'signal must be "continue_set" or "regenerate_set"' });
+    }
+    const user = (await userDb.getUserById(userId)) as any;
+    const variants = user?.adImageResult?.variants ?? [];
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { logPromptSignal } = require("../services/promptSignalsService");
+    if (Array.isArray(variants) && variants.length > 0) {
+      for (const v of variants) {
+        void logPromptSignal({
+          userId,
+          variantId: v?.id,
+          promptVersion: v?.promptVersion,
+          archetype: v?.archetype,
+          signal,
+        });
+      }
+    } else {
+      void logPromptSignal({ userId, signal });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[ad-set] signal failed", err);
+    return res.status(500).json({ message: "Failed to record ad-set signal" });
   }
 });
 

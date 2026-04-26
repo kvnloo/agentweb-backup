@@ -211,4 +211,15 @@ export function logICPCompletionMetric(
   console.log(
     `[metrics] icp_complete status=${status} duration_ms=${durationMs} personas=${personaCount} user=${userPrefix}`
   );
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { logStepMetric } = require("./onboardingMetricsService");
+  const completedAt = new Date();
+  void logStepMetric({
+    userId,
+    step: "icp",
+    startedAt: new Date(completedAt.getTime() - (durationMs || 0)).toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs || 0,
+    status,
+  });
 }

@@ -50,6 +50,14 @@ import {
 } from "./onboardingIcpService";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
+import {
+  ARCHETYPES,
+  AESTHETIC_RULES,
+  DEFAULT_VARIANT_ARCHETYPES,
+  resolveArchetype,
+  type Aesthetic,
+  type Archetype,
+} from "./brick5Archetypes";
 
 /** Number of ad image variants per run. Brick 8 spec is "3 per ICP". */
 const AD_IMAGE_VARIANT_COUNT = 3;
@@ -185,99 +193,172 @@ export interface SixLayerPromptInputs {
 }
 
 /**
+ * Identifier baked into every generated variant so we can tell which
+ * version of the prompt produced which image. Bumped manually when the
+ * brick templates or layer construction changes. Eventually moves to
+ * DynamoDB so the partner portal can edit + version prompts without a
+ * deploy.
+ */
+export const PROMPT_BUILDER_VERSION = "v2-brick5-2026-04-26";
+
+/**
+ * Default aesthetic when none is captured on the brand. We pick
+ * "minimal-typographic" because it's the safest fit for most brands and
+ * Gemini renders bold typography flawlessly. Heuristic upgrade path:
+ * derive aesthetic from brand category in Brick 1.
+ */
+const DEFAULT_AESTHETIC: Aesthetic = "minimal-typographic";
+
+/**
  * Build the Brick 8 6-layer prompt for a single variant. Pure — no I/O.
  *
- * The Gemini API takes a SINGLE STRING prompt, so all 6 layers are emitted
- * inline as one structured spec. The rendering model parses the layer
- * headers and produces a coherent ad creative that matches the spec.
+ * The prompt is the brick's archetype LAYOUT STRUCTURE + TEXT BUDGET
+ * injected verbatim, with brand context (colors, font, company name,
+ * tagline, logo URL) substituted as variables. The TEXT BUDGET is the
+ * primary mechanism that keeps Gemini from rendering full AI-paragraph
+ * subheadlines onto the canvas — it tells the model exactly how many
+ * text elements are allowed and how many words each can contain.
+ *
+ * Why we don't pass the long copy angle as a subheadline anymore: every
+ * archetype's TEXT BUDGET caps subheadlines at 5-10 words. Passing the
+ * full copy angle (often 20-40 words) was the bug that produced the
+ * "Your checkout is leaking revenue right now — every declined card,
+ * every abandoned cart, every manual payout..." rendered onto the image.
  */
 export function buildSixLayerPromptForVariant(
-  inputs: SixLayerPromptInputs
+  inputs: SixLayerPromptInputs,
+  /**
+   * Optional template override loaded from DynamoDB by the orchestrator.
+   * When present, layout + budget come from the row (admin-edited via
+   * the partner portal). When absent, we fall back to the constants —
+   * this keeps unit tests pure (no DB mocking required) and gives us a
+   * safe default when DynamoDB is unreachable. The caller's
+   * responsibility to bump promptVersion when they pass a template.
+   */
+  template?: {
+    feedLayout: string;
+    storyLayout: string;
+    textBudget: string;
+    name: string;
+  },
 ): string {
   const { variantIndex, format, concept, copyAngle, formatArchetype, brand, persona } =
     inputs;
-  const companyName = brand.companyName || "(not provided)";
+  const archetypeId: Archetype = resolveArchetype(formatArchetype, variantIndex);
+  const archetypeConst = ARCHETYPES[archetypeId];
+  const archetype = template ?? archetypeConst;
+  const aestheticRules = AESTHETIC_RULES[DEFAULT_AESTHETIC];
+
+  const companyName = brand.companyName || "Your brand";
   const primaryColor = brand.primaryColor || DEFAULT_PRIMARY_COLOR;
   const secondaryColor = brand.secondaryColor || "#FFFFFF";
   const fontFamily = brand.fontFamily || DEFAULT_FONT_FAMILY;
-  const tagline = brand.tagline || brand.valueProposition || companyName;
-  const personaName = persona?.name || "ICP";
-  const personaPain = persona?.pain || "(no pain captured)";
-  const personaDesire = persona?.desire || "(no desire captured)";
+  const tagline = brand.tagline || brand.valueProposition || "";
+  const personaPain = persona?.pain || "";
+
+  const isFeed = format === "1080x1080";
+  const layoutBlock = isFeed ? archetype.feedLayout : archetype.storyLayout;
 
   const lines: string[] = [];
 
-  // Layer 1 — FORMAT & DIMENSIONS
+  lines.push(`# Brick 8 — Gemini Pro image prompt (variant ${variantIndex + 1})`);
+  lines.push(`# Prompt version: ${PROMPT_BUILDER_VERSION}`);
+  lines.push(`# Archetype: ${archetypeConst.id} — ${archetype.name}`);
+  lines.push(`# Concept: ${concept || "(none)"}`);
+  lines.push(`# Copy angle: ${copyAngle || "(none)"}`);
+  lines.push(``);
+
+  // Layer 1 — FORMAT & DIMENSIONS (verbatim brick template)
   lines.push(`LAYER 1: FORMAT & DIMENSIONS`);
   lines.push(
-    `Create a high-end editorial-style Facebook / Meta ad in ${format}px (variant ${
-      variantIndex + 1
-    }).`
+    isFeed
+      ? `Create a photorealistic square Meta Feed ad — 1080x1080px. Aspect ratio 1:1.`
+      : `Create a photorealistic portrait Story/Reel Meta ad — 1080x1350px. Aspect ratio 4:5.`,
   );
-  if (format === "1080x1080") {
-    lines.push(`Square format for Meta Feed. Aspect ratio 1:1.`);
-  } else {
-    lines.push(`Vertical format for Story / Reel. Aspect ratio 4:5.`);
-  }
   lines.push(``);
 
   // Layer 2 — BACKGROUND / SETTING
+  // Aesthetic rules govern background choices. The archetype's layout
+  // block (Layer 3) constrains composition — Layer 2 just sets the
+  // visual world.
   lines.push(`LAYER 2: BACKGROUND / SETTING`);
+  lines.push(aestheticRules);
+  lines.push(``);
   lines.push(
-    `SETTING: A clean, modern environment that visually expresses the "${concept}" concept. ` +
-      `Use ${primaryColor} as the dominant atmospheric color, with ${secondaryColor} as the secondary. ` +
-      `Soft directional lighting, minimal clutter, premium SaaS aesthetic. ` +
-      `Composition follows format archetype "${formatArchetype}" — see archetype reference.`
+    `Brand color anchors: primary ${primaryColor}, secondary ${secondaryColor}. ` +
+      `Lighting: soft directional, natural color temperature. ` +
+      `No clutter; high signal-to-noise.`,
   );
   lines.push(``);
 
-  // Layer 3 — SUBJECT / FOCAL POINT
-  lines.push(`LAYER 3: SUBJECT / FOCAL POINT`);
-  lines.push(
-    `FOCAL POINT: The viewer's eye hits ${
-      personaName
-    }'s pain — "${personaPain}" — rendered as a recognizable visual ` +
-      `(UI screenshot, dashboard, chart, or relatable workspace). ` +
-      `Use color cues that map to the resolution: green / success accents for the desired state ` +
-      `("${personaDesire}"), red / alert accents for the unresolved pain. ` +
-      `Spatial hierarchy: pain is foregrounded, resolution is implied or partially revealed.`
-  );
+  // Layer 3 — SUBJECT / FOCAL POINT (verbatim archetype LAYOUT STRUCTURE)
+  // This is the layer that previously caused gibberish. By using the
+  // archetype's exact layout instead of "render a UI screenshot or
+  // dashboard or chart or workspace", we constrain the image so Gemini
+  // doesn't have to invent UI text.
+  lines.push(`LAYER 3: SUBJECT / FOCAL POINT — Archetype ${archetypeConst.id} layout (${archetype.name})`);
+  lines.push(layoutBlock);
+  if (personaPain) {
+    lines.push(``);
+    lines.push(
+      `Emotional anchor: this ad targets the pain "${personaPain}". The focal-point composition above should evoke that pain visually within the archetype's structure. Do NOT render the pain text on the canvas — it lives in the Meta primary text shown above the image.`,
+    );
+  }
   lines.push(``);
 
-  // Layer 4 — TEXT OVERLAYS
+  // Layer 4 — TEXT OVERLAYS (governed by the archetype's TEXT BUDGET)
+  // The brand text we pass through is intentionally minimal — only what
+  // the archetype's text budget allows. Long copy belongs to the Meta
+  // primary text rendered ABOVE the image by Meta itself, not on the
+  // canvas. The TEXT BUDGET below is the verbatim brick rule that
+  // Gemini must respect.
   lines.push(`LAYER 4: TEXT OVERLAYS`);
-  lines.push(
-    `TEXT OVERLAY at top-center in ${fontFamily} bold (${primaryColor}, 36pt): ` +
-      `"${tagline}". ` +
-      `SUBHEADLINE at bottom-center in ${fontFamily} regular (${primaryColor}, 22pt): ` +
-      `the copy angle "${copyAngle}" rendered as a one-line hook. ` +
-      `Typography weight and size match Meta Feed legibility standards.`
-  );
+  lines.push(archetype.textBudget);
+  lines.push(``);
+  if (tagline) {
+    lines.push(
+      `Headline source material (use within the budget above; condense if needed): "${tagline}". ` +
+        `Render in ${fontFamily} bold (${primaryColor}). ` +
+        `If the budget says no headline (e.g. archetype A or K), ignore this and follow the budget.`,
+    );
+  }
   lines.push(``);
 
   // Layer 5 — BADGE / CTA + COLOR & BRAND
-  lines.push(`LAYER 5: BADGE / CTA + COLOR & BRAND`);
   const logoLine = brand.logoUrl
-    ? `Logo for ${companyName} (${brand.logoUrl}) placed top-left at 96x96px, light version on dark backgrounds and dark version on light backgrounds. `
-    : `Brand wordmark "${companyName}" placed top-left in ${fontFamily} bold (${primaryColor}, 28pt). `;
+    ? `Logo for ${companyName} from ${brand.logoUrl} — render at the position the archetype specifies (top-left default). Light version on dark backgrounds, dark version on light backgrounds.`
+    : `Brand wordmark "${companyName}" rendered in ${fontFamily} bold (${primaryColor}) at the position the archetype specifies (top-left default).`;
+  lines.push(`LAYER 5: BADGE / CTA + COLOR & BRAND`);
+  lines.push(logoLine);
   lines.push(
-    `${logoLine}` +
-      `CTA button at bottom-right: rounded rectangle, ${primaryColor} background, ${secondaryColor} text, ` +
-      `text "Learn more" in ${fontFamily} bold 18pt. ` +
-      `Brand colors for ${companyName}: primary ${primaryColor}, secondary ${secondaryColor}.`
+    `CTA button (if archetype permits one): rounded rectangle, ${primaryColor} background, ${secondaryColor} text, ` +
+      `text "Learn more" in ${fontFamily} bold. Position per archetype layout.`,
   );
   lines.push(``);
 
   // Layer 6 — STYLE SPECIFICATION
   lines.push(`LAYER 6: STYLE SPECIFICATION`);
   lines.push(
-    `Photography style: clean, editorial, high-end SaaS. ` +
-      `Mood: confident, trustworthy, premium. ` +
-      `Lighting: soft natural light, no harsh shadows. ` +
-      `What this should NOT look like: stock photography, cluttered collages, generic gradient backgrounds. ` +
-      `Format confirmation: ${format} ${
-        format === "1080x1080" ? "square" : "vertical"
-      } format.`
+    `Photorealistic, premium editorial. Mood: confident, trustworthy. ` +
+      `What this should NOT look like: stock photography, cluttered collages, generic gradient backgrounds, AI-paragraph text walls rendered on the canvas. ` +
+      `Format confirmation: ${format} ${isFeed ? "square" : "vertical"} format.`,
+  );
+  lines.push(``);
+
+  // Final reminder — Gemini sometimes ignores text-budget rules without
+  // an explicit re-statement. This catches the common failure mode.
+  lines.push(`HARD CONSTRAINTS:`);
+  lines.push(
+    `- Respect the TEXT BUDGET in Layer 4 EXACTLY. Count text elements before rendering. If the budget caps the headline at N words, the headline MUST be ≤ N words.`,
+  );
+  lines.push(
+    `- Do NOT render any sentence longer than the budget allows. If you need to fit more meaning, cut the sentence — do not over-write.`,
+  );
+  lines.push(
+    `- Every text element MUST be legible at thumbnail size (the ad will appear in a feed). If a text element wouldn't be legible, drop it rather than shrink it.`,
+  );
+  lines.push(
+    `- All UI text inside dashboards/screens must be coherent English. If you can't render coherent text at the chosen size, use abstract bars/lines/numbers without text — never lorem-ipsum or hallucinated placeholder strings.`,
   );
 
   return lines.join("\n");
@@ -393,10 +474,35 @@ export async function generateAdImagesForUser(
   brand: AdImageBrandContext,
   personas: ICPPersona[],
   userId: string,
-  deps: { imageGen?: AdImageGeneratorDep; timeoutMs?: number } = {}
+  deps: {
+    imageGen?: AdImageGeneratorDep;
+    timeoutMs?: number;
+    /**
+     * Inject a template loader for tests so we don't need a real Dynamo
+     * connection. Defaults to `getTemplateForArchetype` from the
+     * promptTemplatesService — which falls back to brick5Archetypes
+     * constants if Dynamo is unreachable, so even prod is degraded-OK.
+     */
+    loadTemplate?: (
+      archetype: Archetype,
+    ) => Promise<{
+      feedLayout: string;
+      storyLayout: string;
+      textBudget: string;
+      name: string;
+      version: string;
+    }>;
+  } = {}
 ): Promise<AdImageResult> {
   const gen = deps.imageGen ?? (defaultImageService as AdImageGeneratorDep);
   const timeoutMs = deps.timeoutMs ?? PER_VARIANT_TIMEOUT_MS;
+  const loadTemplate =
+    deps.loadTemplate ??
+    (async (a: Archetype) => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { getTemplateForArchetype } = require("./promptTemplatesService");
+      return getTemplateForArchetype(a);
+    });
 
   const formats = pickFormatSplit(AD_IMAGE_VARIANT_COUNT);
   const concepts =
@@ -412,23 +518,57 @@ export async function generateAdImagesForUser(
       ? creativeDir.format_archetypes
       : ["A", "B", "C"];
 
-  const tasks = formats.map((format, i) => {
-    const concept = concepts[i % concepts.length];
-    const copyAngle = copyAngles[i % copyAngles.length];
-    const formatArchetype = archetypes[i % archetypes.length];
-    const persona = personas[i % Math.max(personas.length, 1)] || undefined;
-    const prompt = buildSixLayerPromptForVariant({
-      variantIndex: i,
-      format,
-      concept,
-      copyAngle,
-      formatArchetype,
-      brand,
-      persona,
-    });
-    const filename = `ad-image-${userId}-${i + 1}-${Date.now()}.png`;
-    return { prompt, filename, format, index: i };
-  });
+  // Build tasks in parallel — we may need to fetch template rows from
+  // Dynamo, and there's no point doing those serially.
+  const tasks = await Promise.all(
+    formats.map(async (format, i) => {
+      const concept = concepts[i % concepts.length];
+      const copyAngle = copyAngles[i % copyAngles.length];
+      const formatArchetypeRaw = archetypes[i % archetypes.length];
+      const archetype = resolveArchetype(formatArchetypeRaw, i);
+      const persona = personas[i % Math.max(personas.length, 1)] || undefined;
+      // Hydrate the template from Dynamo (or constants fallback). The
+      // version string from the loaded row gets stamped on the variant
+      // for prompt-quality attribution.
+      let template:
+        | {
+            feedLayout: string;
+            storyLayout: string;
+            textBudget: string;
+            name: string;
+            version: string;
+          }
+        | undefined;
+      try {
+        template = await loadTemplate(archetype);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[onboardingAdImageService] template load failed; using constants",
+          {
+            archetype,
+            error: e instanceof Error ? e.message : String(e),
+          },
+        );
+      }
+      const prompt = buildSixLayerPromptForVariant(
+        {
+          variantIndex: i,
+          format,
+          concept,
+          copyAngle,
+          formatArchetype: archetype,
+          brand,
+          persona,
+        },
+        template,
+      );
+      const filename = `ad-image-${userId}-${i + 1}-${Date.now()}.png`;
+      const promptVersion =
+        template?.version ?? PROMPT_BUILDER_VERSION;
+      return { prompt, filename, format, index: i, archetype, promptVersion };
+    }),
+  );
 
   const results = await Promise.all(
     tasks.map(async (t) => {
@@ -445,6 +585,11 @@ export async function generateAdImagesForUser(
         imageUrl:
           r.success && r.imageUrl ? r.imageUrl : `${PLACEHOLDER_URL}#${t.index + 1}`,
         prompt: t.prompt,
+        // Combine the builder version + template version so signals can
+        // distinguish "same template text, new builder logic" from
+        // "same builder, edited template text" when iterating.
+        promptVersion: `${PROMPT_BUILDER_VERSION}/${t.promptVersion}`,
+        archetype: t.archetype,
       };
       if (!r.success) {
         // eslint-disable-next-line no-console

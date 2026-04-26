@@ -21,6 +21,21 @@ export interface AdImageVariant {
   id: string;
   imageUrl: string;
   prompt: string;
+  /**
+   * Identifier for the prompt template + builder version that produced
+   * this variant. Used by the prompt-quality feedback loop — when the
+   * user likes/skips a variant via the swipe deck, the signal is logged
+   * against this version so we can compare like-rates across prompt
+   * iterations. Optional for backward compatibility; absent on rows
+   * generated before the versioning change shipped.
+   */
+  promptVersion?: string;
+  /**
+   * Format archetype (A-L per Brick 5) used for this variant. Same
+   * purpose as promptVersion — lets us see "archetype D's like rate is
+   * 30% higher than archetype A on Stripe-like brands."
+   */
+  archetype?: string;
 }
 
 export interface AdImageResult {
@@ -159,4 +174,15 @@ export function logAdImageCompletionMetric(
   console.log(
     `[metrics] ad_image_complete status=${status} duration_ms=${durationMs} variants=${variantCount} user=${userPrefix}`
   );
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { logStepMetric } = require("./onboardingMetricsService");
+  const completedAt = new Date();
+  void logStepMetric({
+    userId,
+    step: "ad-image",
+    startedAt: new Date(completedAt.getTime() - (durationMs || 0)).toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs || 0,
+    status,
+  });
 }

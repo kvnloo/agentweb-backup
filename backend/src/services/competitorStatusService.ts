@@ -183,4 +183,15 @@ export function logCompetitorCompletionMetric(
   console.log(
     `[metrics] competitor_complete status=${status} duration_ms=${durationMs} icps=${icpCount} user=${userPrefix}`
   );
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { logStepMetric } = require("./onboardingMetricsService");
+  const completedAt = new Date();
+  void logStepMetric({
+    userId,
+    step: "competitor",
+    startedAt: new Date(completedAt.getTime() - (durationMs || 0)).toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs || 0,
+    status,
+  });
 }

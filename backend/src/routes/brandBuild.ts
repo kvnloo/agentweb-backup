@@ -27,13 +27,22 @@ import {
   logCompletionMetric,
   snapshot,
 } from "../services/brandBuildStatusService";
+import { triggerBrandBuildForUser } from "../services/onboardingBrandBuildService";
 
 const router = express.Router();
 
 /**
  * POST /api/onboarding/brand-build/start
- * Marks the caller's brand build as in-flight. Idempotent — repeated calls
- * reset the clock (user retrying from the UI).
+ *
+ * Body (optional): { companyUrl?: string, companyName?: string, goal?: string }
+ *
+ * (1) Persists the supplied companyUrl/companyName/goal onto the User record
+ *     so the orchestrator has them. (2) Flips brandBuildStatus to "building".
+ * (3) Fires the direct scrape-then-LLM brand build in the background. Returns
+ *     the running snapshot immediately so the UI can poll /status.
+ *
+ * No agent-mode work plan, no chat session. The whole pipeline is in
+ * `onboardingBrandBuildService.triggerBrandBuildForUser`.
  */
 router.post("/brand-build/start", authenticateToken, async (req, res) => {
   try {
@@ -42,10 +51,30 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: "User not authenticated" });
     }
-    const patch = buildStartPatch();
-    await userDb.updateUser(userId, patch);
+
+    const body = (req.body ?? {}) as {
+      companyUrl?: string;
+      companyName?: string;
+      goal?: string;
+    };
+    const patch: Record<string, unknown> = { ...buildStartPatch() };
+    if (typeof body.companyUrl === "string" && body.companyUrl.trim()) {
+      patch.productDomain = body.companyUrl.trim();
+    }
+    if (typeof body.companyName === "string" && body.companyName.trim()) {
+      patch.companyName = body.companyName.trim();
+    }
+    if (typeof body.goal === "string" && body.goal.trim()) {
+      patch.goal = body.goal.trim();
+    }
+    await userDb.updateUser(userId, patch as any);
+    // Fire-and-forget background work; route returns immediately so the UI
+    // can poll /status without holding an HTTP connection open for ~30s.
+    void triggerBrandBuildForUser(userId).catch((e) => {
+      console.error("[brandBuild] background trigger crashed", e);
+    });
     const user = await userDb.getUserById(userId);
-    return res.json({ status: snapshot(user || patch) });
+    return res.json({ status: snapshot(user || (patch as any)) });
   } catch (err) {
     console.error("[brandBuild] start failed", err);
     return res.status(500).json({ message: "Failed to start brand build" });
