@@ -459,13 +459,23 @@ export class McpClientService {
       }
     );
 
-    // Add timeout to connection
+    // Add timeout to connection — stdio subprocesses (e.g. Playwright) need more time to start
+    const transportType = getTransportType(serverConfig.config);
+    const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
     const connectPromise = client.connect(transport);
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), 15000)
+      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), connectTimeoutMs)
     );
 
-    transport.onclose = () => console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
+    transport.onclose = () => {
+      console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
+      // Fix 4: Evict the dead client so the next tool call triggers a fresh reconnect
+      const pool = this.sessionClientPools.get(poolKey);
+      if (pool?.clients.has(serverName)) {
+        pool.clients.delete(serverName);
+        console.warn(`[MCP-SESSION] Evicted dead client for "${serverName}" from pool after transport close`);
+      }
+    };
     transport.onerror = (err: any) => {
       const errorMessage = err?.message || '';
       if (
@@ -481,15 +491,19 @@ export class McpClientService {
     try {
       await Promise.race([connectPromise, timeoutPromise]);
     } catch (connectError) {
-      this.recordConnectionFailure(serverName);
+      // Fix 3: Don't trigger circuit breaker for stdio servers — each spawn is independent
+      if (transportType !== 'stdio') {
+        this.recordConnectionFailure(serverName);
+      }
       throw connectError;
     }
 
-    // Successful connection — reset circuit breaker
-    this.resetCircuit(serverName);
+    // Successful connection — reset circuit breaker (only applies to non-stdio servers)
+    if (transportType !== 'stdio') {
+      this.resetCircuit(serverName);
+    }
 
     // Wait for session establishment
-    const transportType = getTransportType(serverConfig.config);
     if (transportType === 'streamable-http') {
       await new Promise(resolve => setTimeout(resolve, 500));
       const sessionId = (transport as any).sessionId;
@@ -619,7 +633,10 @@ export class McpClientService {
     switch (transportType) {
       case "stdio": {
         const stdioConfig = config as StdioTransportConfig;
-        if (stdioConfig.args?.some(arg => arg.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE))) {
+        const isPlaywright =
+          stdioConfig.command?.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE) ||
+          stdioConfig.args?.some(arg => arg.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE));
+        if (isPlaywright) {
           await this.ensurePlaywrightBrowsers();
         }
         return this.createStdioTransport(name, stdioConfig, poolKey);
@@ -638,9 +655,8 @@ export class McpClientService {
 
   /**
    * Ensures Playwright Chromium browsers are installed before the MCP server starts.
-   * @playwright/mcp pins a specific Chromium revision; if the revision isn't cached locally
-   * the browser launch will fail. This runs playwright install once per process startup.
-   * Using a shared Promise so concurrent session creation waits on the same install.
+   * Uses the locally-installed @playwright/mcp binary (preferred) or falls back to
+   * the npx cache. Shared Promise so concurrent sessions wait on the same install.
    */
   private async ensurePlaywrightBrowsers(): Promise<void> {
     if (!McpClientService.playwrightBrowsersInstall) {
@@ -650,9 +666,9 @@ export class McpClientService {
   }
 
   private async runPlaywrightInstall(): Promise<void> {
-    const playwrightBin = this.findPlaywrightBinInNpxCache();
+    const playwrightBin = this.findPlaywrightBin();
     if (!playwrightBin) {
-      console.log('MCP: No playwright binary found in npx cache, skipping browser pre-install');
+      console.log('MCP: No playwright binary found, skipping browser pre-install');
       return;
     }
 
@@ -680,10 +696,18 @@ export class McpClientService {
   }
 
   /**
-   * Finds the playwright CLI binary inside the npx cache for @playwright/mcp.
-   * The npx cache lives at ~/.npm/_npx/<hash>/node_modules/.bin/playwright.
+   * Returns the playwright CLI binary path.
+   * Prefers the locally-installed package (node_modules/.bin/playwright) which is
+   * version-pinned and requires no network lookup. Falls back to the npx cache for
+   * environments where the package isn't installed as a real dependency.
    */
-  private findPlaywrightBinInNpxCache(): string | null {
+  private findPlaywrightBin(): string | null {
+    // Prefer local node_modules (installed as real dependency — no npx overhead)
+    const localBin = path.join(__dirname, '../../../node_modules/.bin/playwright');
+    if (fs.existsSync(localBin)) {
+      return localBin;
+    }
+    // Fallback: npx cache (legacy / environments without local install)
     try {
       const cacheDir = path.join(os.homedir(), '.npm', '_npx');
       for (const hash of fs.readdirSync(cacheDir)) {
@@ -696,6 +720,21 @@ export class McpClientService {
       console.warn('MCP: Error searching for playwright binary:', (e as Error).message);
     }
     return null;
+  }
+
+  /**
+   * Returns the playwright-mcp CLI entry point.
+   * Prefers the locally-installed @playwright/mcp package (node_modules/.bin/playwright-mcp)
+   * to avoid npx registry lookups on every cold start. Falls back to npx for envs
+   * where it isn't a real dependency yet.
+   */
+  private findPlaywrightMcpBin(): { command: string; args: string[] } {
+    const localBin = path.join(__dirname, '../../../node_modules/.bin/playwright-mcp');
+    if (fs.existsSync(localBin)) {
+      return { command: localBin, args: [] };
+    }
+    // Fallback: use npx (will use cached package if available)
+    return { command: 'npx', args: ['@playwright/mcp@0.0.70'] };
   }
 
   /**
@@ -746,11 +785,22 @@ export class McpClientService {
    * Creates Stdio transport (for local subprocess MCP servers)
    */
   private createStdioTransport(name: string, config: StdioTransportConfig, poolKey?: string): Transport {
-    const resolvedCommand = resolveEnvPlaceholders(config.command);
-    const resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
+    let resolvedCommand = resolveEnvPlaceholders(config.command);
+    let resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
 
     // Auto-configure Playwright MCP for headless server environments
-    const isPlaywrightMcp = resolvedArgs.some(arg => arg.includes('@playwright/mcp'));
+    const isPlaywrightMcp =
+      resolvedCommand.includes('@playwright/mcp') ||
+      resolvedArgs.some(arg => arg.includes('@playwright/mcp'));
+
+    // Rewrite npx @playwright/mcp@... to local binary to avoid npm registry lookups on cold start
+    if (isPlaywrightMcp) {
+      const localBin = this.findPlaywrightMcpBin();
+      // Strip any @playwright/mcp@* tokens from args (they were the npx target, not CLI flags)
+      resolvedArgs = resolvedArgs.filter(arg => !arg.startsWith('@playwright/mcp'));
+      resolvedCommand = localBin.command;
+      resolvedArgs = [...localBin.args, ...resolvedArgs];
+    }
     if (isPlaywrightMcp) {
       if (!resolvedArgs.includes('--headless')) {
         resolvedArgs.push('--headless');
@@ -950,11 +1000,12 @@ export class McpClientService {
     );
 
     console.log(`MCP: Connecting to ${transportType} transport for ${name}...`);
-    
-    // Add timeout to connection
+
+    // Stdio subprocesses (e.g. Playwright) need more time to start than HTTP servers
+    const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
     const connectPromise = client.connect(transport);
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error(`Connection timeout for ${name}`)), 15000)
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Connection timeout for ${name}`)), connectTimeoutMs)
     );
 
     transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
@@ -962,7 +1013,7 @@ export class McpClientService {
       // Suppress expected errors during shutdown/reload
       const errorMessage = err?.message || '';
       if (
-        errorMessage.includes('AbortError') || 
+        errorMessage.includes('AbortError') ||
         errorMessage.includes('SSE stream disconnected') ||
         errorMessage.includes('This operation was aborted')
       ) {

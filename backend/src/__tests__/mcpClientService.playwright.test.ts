@@ -9,6 +9,21 @@ process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 
 import * as fs from 'fs';
 
+// Prevent actual playwright browser installs during tests (binary search returns nothing)
+jest.mock('fs', () => {
+  const realFs = jest.requireActual('fs');
+  return {
+    ...realFs,
+    existsSync: jest.fn((p: string) => {
+      // Return false for playwright binary paths to skip real install
+      if (typeof p === 'string' && (p.includes('playwright-mcp') || (p.includes('playwright') && p.includes('node_modules/.bin')))) {
+        return false;
+      }
+      return realFs.existsSync(p);
+    }),
+  };
+});
+
 // Capture StdioClientTransport constructor calls
 const mockStdioConstructor = jest.fn().mockImplementation(() => ({
   onclose: null,
@@ -74,6 +89,8 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     for (const key of Object.keys(internalMcpServers)) {
       delete (internalMcpServers as any)[key];
     }
+    // Reset static playwright install promise so tests don't share install state
+    (McpClientService as any).playwrightBrowsersInstall = null;
     service = new McpClientService();
   });
 
@@ -89,8 +106,10 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
 
     expect(mockStdioConstructor).toHaveBeenCalledTimes(1);
     const callArgs = mockStdioConstructor.mock.calls[0][0];
-    expect(callArgs.command).toBe('npx');
-    expect(callArgs.args).toContain('@playwright/mcp@latest');
+    // Command is rewritten to local binary (node_modules/.bin/playwright-mcp) or npx fallback
+    expect(callArgs.command).toBeTruthy();
+    // @playwright/mcp@* token is stripped from args (it was the npx target, not a CLI flag)
+    expect(callArgs.args).not.toContain('@playwright/mcp@latest');
     expect(callArgs.args).toContain('--headless');
     expect(callArgs.args).toContain('--no-sandbox');
     // --isolated prevents "Browser is already in use" errors when a prior session didn't clean up.
@@ -126,7 +145,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--headless', '--no-sandbox', '--isolated'],
+      args: ['@playwright/mcp@0.0.70', '--headless', '--no-sandbox', '--isolated'],
       isInternal: false,
     };
 
@@ -146,7 +165,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--config', '/custom/config.json'],
+      args: ['@playwright/mcp@0.0.70', '--config', '/custom/config.json'],
       isInternal: false,
     };
 
