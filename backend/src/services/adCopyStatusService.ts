@@ -166,6 +166,17 @@ export function logAdCopyCompletionMetric(
   console.log(
     `[metrics] ad_copy_complete status=${status} duration_ms=${durationMs} variants=${variantCount} user=${userPrefix}`
   );
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { logStepMetric } = require("./onboardingMetricsService");
+  const completedAt = new Date();
+  void logStepMetric({
+    userId,
+    step: "ad-copy",
+    startedAt: new Date(completedAt.getTime() - (durationMs || 0)).toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs || 0,
+    status,
+  });
 }
 
 /**

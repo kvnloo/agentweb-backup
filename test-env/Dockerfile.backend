@@ -13,6 +13,17 @@ WORKDIR /app
 COPY backend/package.json backend/package-lock.json ./
 RUN npm ci
 
+# Install Playwright's bundled Chrome so the Playwright MCP server (npx
+# @playwright/mcp) can run browser_navigate / browser_click etc. The MCP
+# process spawns its own Chrome instance via Playwright's launcher — it
+# does NOT use the apt-installed chromium above (puppeteer-core uses that
+# one; Playwright is a separate library with its own browser cache at
+# ~/.cache/ms-playwright). Without this, every browser_navigate fails
+# with `Run "npx playwright install chrome"` and Emma's onboarding
+# brand-build wastes its budget on retries before falling back to
+# search_web. ~300MB extra image size, acceptable for the test env.
+RUN npx -y playwright install chrome --with-deps && rm -rf /var/lib/apt/lists/*
+
 # Copy source and build
 COPY backend/tsconfig.json ./
 COPY backend/src ./src

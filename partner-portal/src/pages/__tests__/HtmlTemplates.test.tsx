@@ -138,6 +138,12 @@ describe("HtmlTemplates page", () => {
     expect(mockedAxios.get).toHaveBeenCalledTimes(2);
   });
 
+  // 15s timeout: userEvent's realistic-typing simulation of
+  // clear("Welcome Email") + type("Welcome Email Updated") + a button
+  // click consistently takes 5-8s on CI runners — just over the default
+  // 5s budget. Bumping the budget rather than swapping userEvent.type
+  // for fireEvent.change because the realistic-typing path is what
+  // exercises the controlled-input update logic this test cares about.
   it("edits a template and sends template_id in payload", async () => {
     const user = userEvent.setup();
     render(<HtmlTemplates />);
@@ -164,7 +170,7 @@ describe("HtmlTemplates page", () => {
       }),
       { headers: { Authorization: "Bearer mock-token" } }
     );
-  });
+  }, 15000);
 
   it("deletes a template using public delete endpoint and refetches", async () => {
     const user = userEvent.setup();

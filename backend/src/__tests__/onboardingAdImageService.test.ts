@@ -235,7 +235,7 @@ describe("onboardingAdImageService", () => {
       expect(prompt.toLowerCase()).toContain("typography");
     });
 
-    it("emits CompanyName fallback '(not provided)' when missing", () => {
+    it("emits the brand fallback wordmark 'Your brand' when companyName is missing", () => {
       const prompt = buildSixLayerPromptForVariant({
         variantIndex: 0,
         format: "1080x1080",
@@ -245,7 +245,12 @@ describe("onboardingAdImageService", () => {
         brand: {} as any,
         persona: onePersona,
       });
-      expect(prompt).toContain("(not provided)");
+      // The prompt builder swaps any missing companyName for "Your brand"
+      // and emits it inside the Layer 5 wordmark fallback line. Previous
+      // builder used "(not provided)" but that placeholder text could
+      // get rendered onto the canvas by Gemini — "Your brand" is a safer
+      // generic that reads naturally if it leaks through.
+      expect(prompt).toContain("Your brand");
     });
   });
 

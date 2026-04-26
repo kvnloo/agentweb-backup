@@ -162,4 +162,15 @@ export function logCreativeDirCompletionMetric(
   console.log(
     `[metrics] creative_dir_complete status=${status} duration_ms=${durationMs} concepts=${conceptCount} user=${userPrefix}`
   );
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { logStepMetric } = require("./onboardingMetricsService");
+  const completedAt = new Date();
+  void logStepMetric({
+    userId,
+    step: "creative-dir",
+    startedAt: new Date(completedAt.getTime() - (durationMs || 0)).toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs || 0,
+    status,
+  });
 }

@@ -198,6 +198,14 @@ export default function Layout() {
                       >
                         Client Health
                       </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
+                        to="/prompt-templates"
+                        variant={isActivePath('/prompt-templates') ? 'contained' : 'text'}
+                      >
+                        Prompt Templates
+                      </Button>
                     </>
                   )}
                   <Button 

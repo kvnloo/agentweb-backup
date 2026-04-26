@@ -158,4 +158,19 @@ export function logCompletionMetric(
   console.log(
     `[metrics] brand_build_complete status=${status} duration_ms=${durationMs} user=${userPrefix}`
   );
+  // Durable per-step metric. Emitted in addition to the structured log
+  // line so the OnboardingMetrics dashboard has aggregate visibility (logs
+  // rotate; the table doesn't). Lazy-required to avoid pulling AWS SDK at
+  // module-load time in tests that mock this service.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { logStepMetric } = require("./onboardingMetricsService");
+  const completedAt = new Date();
+  void logStepMetric({
+    userId,
+    step: "brand-build",
+    startedAt: new Date(completedAt.getTime() - (durationMs || 0)).toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs || 0,
+    status,
+  });
 }
