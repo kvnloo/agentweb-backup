@@ -349,6 +349,20 @@ export async function generateCompetitorStrategyForUser(
  * Fire-and-forget orchestrator. Reads the User record, pulls the ICPs out
  * of the persisted `icpResult`, runs the per-ICP loop, and patches the
  * User with the result.
+ *
+ * Gates on `icpStatus === 'ready' && icpResult?.length > 0` — when ICP is
+ * still mid-flight (or never started), we bail with a `gated by icp step`
+ * breadcrumb and DO NOT persist `failed`. The polling tick (and the
+ * cascade trigger from `onboardingIcpService` on icp `ready`) re-call us
+ * once ICP is actually ready. This mirrors the gate-on-creative-dir
+ * pattern in `onboardingAdImageService.triggerAdImageGenerationForUser`.
+ *
+ * Without this gate, the original behavior was: fire optimistically right
+ * after `/icp/start`, see `icpResult` is empty, persist
+ * `competitorStatus: failed`. That single race-condition write halted the
+ * entire downstream cascade (creativeDir → adImage → adCopy all stuck
+ * `running`) and produced a 100% onboarding ad-gen failure rate. See
+ * Notion `34d09247-c951-81e4-af97-df1e869bc8aa` for the full diagnosis.
  */
 export async function triggerCompetitorStrategyForUser(
   userId: string,
@@ -359,14 +373,25 @@ export async function triggerCompetitorStrategyForUser(
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
-  const personas: ICPPersona[] = Array.isArray((user as any).icpResult)
-    ? ((user as any).icpResult as ICPPersona[])
+
+  const u = user as any;
+  const icpStatus = typeof u.icpStatus === "string" ? u.icpStatus : "idle";
+  const personas: ICPPersona[] = Array.isArray(u.icpResult)
+    ? (u.icpResult as ICPPersona[])
     : [];
-  const brand = extractIcpBrandContext(user as any);
+  if (icpStatus !== "ready" || personas.length === 0) {
+    // Don't mark failed. Don't run. The polling tick and the next
+    // cascade kickoff will re-call us once ICP is actually ready.
+    // eslint-disable-next-line no-console
+    console.log("[onboardingCompetitorService] gated by icp step", {
+      userId,
+      reason: `icp not ready (status=${icpStatus}, personas=${personas.length})`,
+    });
+    return;
+  }
+
+  const brand = extractIcpBrandContext(u);
   try {
-    if (personas.length === 0) {
-      throw new Error("no ICPs persisted — Step 2 must complete first");
-    }
     const result = await generateCompetitorStrategyForUser(brand, personas, deps);
     const current = await userDb.getUserById(userId);
     const patch = competitorReadyPatch((current as any) || {}, result);

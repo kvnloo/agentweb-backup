@@ -42,6 +42,21 @@ const ICP_TEMPERATURE = 0.7;
 const ICP_MAX_TOKENS = 4000;
 
 /**
+ * Delay before firing the cascade trigger to the competitor step after
+ * persisting `icpStatus: 'ready'`. Lets the UserIdIndex GSI propagate
+ * the just-written row so the competitor service's gate read sees
+ * `icpStatus === 'ready'` instead of stale `running`. 2s is generous —
+ * DynamoDB GSI propagation is typically <1s in us-west-2.
+ *
+ * Override to 0 in tests via `process.env.CASCADE_TRIGGER_DELAY_MS=0`
+ * so unit assertions can fire synchronously.
+ */
+export const CASCADE_TRIGGER_DELAY_MS =
+  process.env.CASCADE_TRIGGER_DELAY_MS !== undefined
+    ? Number(process.env.CASCADE_TRIGGER_DELAY_MS)
+    : 2_000;
+
+/**
  * Step 2 system prompt — VERBATIM from prod work plan
  * `plan_1768351741814_jgc2wwlxa`, steps[1].description. Sourced via
  * `aws dynamodb get-item --table-name AW-WorkPlans --key '{"planId":{"S":"plan_1768351741814_jgc2wwlxa"}}'`.
@@ -186,6 +201,42 @@ export async function triggerIcpDiscoveryForUser(
       return;
     }
     await userDb.updateUser(userId, patch as any);
+
+    // Cascade kickoff: fire-and-forget the competitor step now that ICPs
+    // are persisted and `icpStatus === 'ready'`. Without this, the user
+    // had to wait for the next FE polling tick before competitor research
+    // started — adding 20s+ of dead time to onboarding. Combined with
+    // the gate inside `triggerCompetitorStrategyForUser`, this makes the
+    // ICP→Competitor handoff race-free. We intentionally `require` here
+    // (not `import`) to avoid a circular module dep —
+    // onboardingCompetitorService imports `extractIcpBrandContext` from
+    // this file. Errors are swallowed by the competitor service itself
+    // (it has its own try/catch).
+    //
+    // We use `startCompetitorStrategyForUser` (NOT `trigger`) because
+    // `competitorReadyPatch` is gated on `competitorStatus === 'running'`
+    // — the start variant flips status to `running` before invoking the
+    // background work. Without that prior flip the LLM result is silently
+    // dropped on completion (`competitorReadyPatch` returns null).
+    //
+    // We delay the cascade kickoff by `CASCADE_TRIGGER_DELAY_MS` to let
+    // the UserIdIndex GSI propagate the icpReadyPatch we just wrote —
+    // without this, the immediate read inside the cascade sees the
+    // pre-update row and the gate inside
+    // `triggerCompetitorStrategyForUser` trips with `gated by icp step`
+    // even though icp is genuinely ready. Default is 2s (generous;
+    // DynamoDB GSI propagation is typically <1s in us-west-2). Tests
+    // inject 0 to assert the cascade synchronously.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { startCompetitorStrategyForUser } = require("./onboardingCompetitorService");
+    const delay = CASCADE_TRIGGER_DELAY_MS;
+    if (delay > 0) {
+      setTimeout(() => {
+        void startCompetitorStrategyForUser(userId);
+      }, delay);
+    } else {
+      void startCompetitorStrategyForUser(userId);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);

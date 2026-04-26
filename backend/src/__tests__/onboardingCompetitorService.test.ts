@@ -328,6 +328,7 @@ describe("onboardingCompetitorService", () => {
       userDb.getUserById
         .mockResolvedValueOnce({
           userId: "user-1",
+          icpStatus: "ready",
           icpResult: personas,
           brandGuidelines: { brandData: { brandName: "Acme" } },
         })
@@ -349,27 +350,115 @@ describe("onboardingCompetitorService", () => {
       expect(patch.competitorResult.per_icp).toHaveLength(2);
     });
 
-    it("patches with competitorFailedPatch when icpResult is empty (Step 2 incomplete)", async () => {
-      userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: [] })
-        .mockResolvedValueOnce({
-          userId: "user-1",
-          competitorStatus: "running",
-        });
+    it("no-ops (does NOT mark failed) when icpStatus is 'running' — gated by icp step", async () => {
+      const personas = [samplePersona(1)];
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "running",
+        icpResult: personas, // even if personas leak through, gating must hold
+      });
       userDb.updateUser.mockResolvedValue({});
-      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
       await triggerCompetitorStrategyForUser("user-1");
-      errSpy.mockRestore();
+      logSpy.mockRestore();
 
-      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-      expect(userDb.updateUser.mock.calls[0][1].competitorStatus).toBe("failed");
-      expect(userDb.updateUser.mock.calls[0][1].competitorError).toMatch(/Step 2|no ICPs/i);
+      // Critical: do NOT mark failed — the polling tick will retry once ICP flips to ready.
+      expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
-    it("patches with failed when LLM throws", async () => {
+    it("no-ops when icpStatus is 'building' — gated by icp step (covers brand-build flow)", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "building",
+        icpResult: [],
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1");
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("no-ops when icpStatus is 'failed' — gated by icp step", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "failed",
+        icpResult: [],
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1");
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("no-ops when icpStatus is 'idle' or missing — gated by icp step", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        // no icpStatus, no icpResult
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1");
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("no-ops when icpStatus='ready' but icpResult is empty (defensive)", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "ready",
+        icpResult: [],
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1");
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("no-ops when icpStatus='ready' but icpResult is not an array (defensive)", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "ready",
+        icpResult: "not-an-array",
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1");
+      logSpy.mockRestore();
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("logs a 'gated by icp step' message when bailing", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        icpStatus: "running",
+        icpResult: [],
+      });
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      await triggerCompetitorStrategyForUser("user-1");
+      const messages = logSpy.mock.calls.map((c) => c.join(" "));
+      logSpy.mockRestore();
+
+      expect(
+        messages.some((m) => m.includes("gated by icp step")),
+      ).toBe(true);
+    });
+
+    it("patches with failed when LLM throws (icp ready, real generation error)", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: personas })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
         .mockResolvedValueOnce({
           userId: "user-1",
           competitorStatus: "running",
@@ -389,33 +478,25 @@ describe("onboardingCompetitorService", () => {
     it("drops the ready patch silently when user is no longer running", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: personas })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
         .mockResolvedValueOnce({ userId: "user-1", competitorStatus: "idle" });
       const llm = new FakeLlm([sampleCompetitorResp(1)]);
       await triggerCompetitorStrategyForUser("user-1", { llm: llm as any });
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
-    it("treats non-array icpResult as empty (Step 2 incomplete branch)", async () => {
-      userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: "not-an-array" })
-        .mockResolvedValueOnce({
-          userId: "user-1",
-          competitorStatus: "running",
-        });
-      userDb.updateUser.mockResolvedValue({});
-      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-      await triggerCompetitorStrategyForUser("user-1");
-      errSpy.mockRestore();
-
-      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-      expect(userDb.updateUser.mock.calls[0][1].competitorStatus).toBe("failed");
-    });
-
     it("stringifies non-Error thrown values in the failed patch", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: personas })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
         .mockResolvedValueOnce({
           userId: "user-1",
           competitorStatus: "running",
@@ -440,7 +521,11 @@ describe("onboardingCompetitorService", () => {
     it("uses {} fallback when getUserById returns null on the second read (race)", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: personas })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
         .mockResolvedValueOnce(null); // disappeared between LLM and patch read
       userDb.updateUser.mockResolvedValue({});
       const llm = new FakeLlm([sampleCompetitorResp(1)]);
@@ -452,7 +537,11 @@ describe("onboardingCompetitorService", () => {
     it("uses {} fallback in failure path when current user disappears", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById
-        .mockResolvedValueOnce({ userId: "user-1", icpResult: personas })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
         .mockResolvedValueOnce(null); // user gone before failed-patch write
       userDb.updateUser.mockResolvedValue({});
       const llm = new FakeLlm([], new Error("boom"));
