@@ -18,7 +18,7 @@ export const DISCORD_INVITE_URL = "https://discord.gg/kP2u6Wf9KQ";
 // Get the list of available LLMs from environment variable or use default list
 export const AVAILABLE_LLMS = (
   import.meta.env.VITE_LIST_FULL_LLM_NAMES ||
-  "azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,openai->openai->gpt-4o-mini,azure->openai->o1-mini,pld->deepseek->DeepSeek-R1,deepseek->deepseek->deepseek-reasoner,google->google->gemini-2.0-flash,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,openai->openai->gpt-5,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro"
+  "azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,openai->openai->gpt-4o-mini,azure->openai->o1-mini,pld->deepseek->DeepSeek-R1,deepseek->deepseek->deepseek-reasoner,google->google->gemini-2.0-flash,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,openai->openai->gpt-5,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro,azure->openai->gpt-5.5"
 )
   .split(",")
   .map((llm: string) => llm.trim())
