@@ -242,6 +242,14 @@ export class AgentModeService {
         toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
         category: 'tool_bundle',
       },
+      {
+        name: 'Google Calendar',
+        description:
+          'Read events and meetings from Google Calendar. List upcoming events, view event details, ' +
+          'and browse calendars. Requires Gmail connected with Calendar access (Settings → Connected Accounts).',
+        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars'],
+        category: 'tool_bundle',
+      },
     ];
 
   /**
@@ -420,6 +428,7 @@ export class AgentModeService {
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
+        await import('../emma/calendarTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
