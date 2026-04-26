@@ -648,7 +648,7 @@ export class AgentModeService {
   }
 
   // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts)
-  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image'];
+  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
 
   async getImageApiDefaultModel(): Promise<string | undefined> {
     try {
@@ -1395,6 +1395,7 @@ export class AgentModeService {
   private estimateImageGenerationCost(model: string): number {
     const pricing: Record<string, number> = {
       'gpt-image-1': 0.04,
+      'gpt-image-2': 0.04,
       'gemini-2.5-flash-image': 0.039,
       'gemini-3-pro-image-preview': 0.039,
       'gemini-3.1-flash-image-preview': 0.039,
