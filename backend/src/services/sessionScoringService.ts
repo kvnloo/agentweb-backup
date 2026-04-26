@@ -76,7 +76,13 @@ IMPORTANT: Tool calls and generated content:
 - If the tool returns a file URL, this is standard behavior - the important part is whether the content passed TO the tool meets requirements
 - Example: If create_social_media_posts is called with plain text posts as parameters, then the requirement "create plain text posts" is satisfied, even if the tool returns a file URL
 
-Respond with ONLY valid JSON: {"score": <1-5>, "reason": "<brief explanation>"}`;
+In addition to the overall score, rate three specific dimensions (1-5 each):
+- goalCompletion: Did the assistant fully accomplish what the user asked? Did the user get what they came for?
+- dataAccuracy: Did the output contain plausible, consistent, and factually coherent data? Penalize hallucinated facts, made-up numbers, or self-contradictions.
+- outputQuality: Was the output well-structured, specific, and actionable? Penalize vague, generic, or poorly formatted responses.
+
+Respond with ONLY valid JSON:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}`;
 
 const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
@@ -93,10 +99,29 @@ async function getDefaultScoringPrompt(): Promise<string> {
   return DEFAULT_SCORING_SYSTEM_PROMPT;
 }
 
+type ScoringResult = {
+  score: number;
+  reason: string;
+  evaluatedMessageIndex: number;
+  dimensions?: { goalCompletion: number; dataAccuracy: number; outputQuality: number };
+};
+
+function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
+  const d = raw?.dimensions;
+  if (!d || typeof d !== "object") return undefined;
+  const clamp = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
+  if (!d.goalCompletion || !d.dataAccuracy || !d.outputQuality) return undefined;
+  return {
+    goalCompletion: clamp(d.goalCompletion),
+    dataAccuracy: clamp(d.dataAccuracy),
+    outputQuality: clamp(d.outputQuality),
+  };
+}
+
 export async function scoreSession(
   messages: ChatMessage[],
   currentMessageCount: number
-): Promise<{ score: number; reason: string; evaluatedMessageIndex: number }> {
+): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const conversationText = serializeMessagesForScoring(recentMessages);
 
@@ -112,7 +137,7 @@ export async function scoreSession(
     ],
     {
       temperature: 0,
-      max_completion_tokens: 200,
+      max_completion_tokens: 300,
       response_format: { type: "json_object" },
     }
   );
@@ -131,6 +156,7 @@ export async function scoreSession(
     score,
     reason: parsed.reason || "No reason provided",
     evaluatedMessageIndex: currentMessageCount,
+    dimensions: parseDimensions(parsed),
   };
 }
 
@@ -146,7 +172,7 @@ export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
   judge: ScoringJudge
-): Promise<{ score: number; reason: string; evaluatedMessageIndex: number }> {
+): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const conversationText = serializeMessagesForScoring(recentMessages);
 
@@ -160,7 +186,7 @@ export async function scoreSessionWithJudge(
     ],
     {
       temperature: 0,
-      max_completion_tokens: 200,
+      max_completion_tokens: 300,
       response_format: { type: "json_object" },
     }
   );
@@ -179,6 +205,7 @@ export async function scoreSessionWithJudge(
     score,
     reason: parsed.reason || "No reason provided",
     evaluatedMessageIndex: currentMessageCount,
+    dimensions: parseDimensions(parsed),
   };
 }
 
@@ -207,6 +234,7 @@ export async function scoreSessionWithJudgeIfNeeded(
     evaluatedAt: new Date().toISOString(),
     evaluatedMessageIndex: result.evaluatedMessageIndex,
     judgeName: judge.name,
+    ...(result.dimensions ? { dimensions: result.dimensions } : {}),
   };
 
   await chatbotDb.updateSessionJudgeScore(session.sessionId, judge.id, judgeScore);
@@ -247,6 +275,7 @@ export async function scoreSessionIfNeeded(
     reason: result.reason,
     evaluatedAt: new Date().toISOString(),
     evaluatedMessageIndex: result.evaluatedMessageIndex,
+    ...(result.dimensions ? { dimensions: result.dimensions } : {}),
   };
 
   // Persist to DB

@@ -231,6 +231,11 @@ export interface ChatSession {
     evaluatedAt: string;        // ISO timestamp
     evaluatedMessageIndex: number; // messageIndex up to which we evaluated
     adminOverride?: boolean;    // When true, auto-scoring skips this session
+    dimensions?: {
+      goalCompletion: number;   // 1-5: did the assistant accomplish what was asked?
+      dataAccuracy: number;     // 1-5: plausible/consistent data, no hallucinations?
+      outputQuality: number;    // 1-5: well-structured, specific, actionable output?
+    };
   };
   judgeScores?: Record<string, {  // keyed by judge ID
     score: number;
@@ -238,6 +243,11 @@ export interface ChatSession {
     evaluatedAt: string;
     evaluatedMessageIndex: number;
     judgeName: string;
+    dimensions?: {
+      goalCompletion: number;
+      dataAccuracy: number;
+      outputQuality: number;
+    };
   }>;
   sessionSummary?: {
     summary: string;        // LLM-generated summary of what was achieved
