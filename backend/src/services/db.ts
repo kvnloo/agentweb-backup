@@ -26,7 +26,13 @@ AWS.config.update({
   },
 });
 
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+// Cap retry budget to 3 attempts (SDK default for DynamoDB is 10).
+// A single throttled GSI query was burning ~10s on default exponential
+// backoff (50+100+200+...+25600 = 51s of pure wait time on top of round-trips).
+// Observed during the 2026-04-26 onboarding baseline run as a 9s outlier on
+// /api/onboarding/ad-image/status polls. 3 retries is plenty — sustained
+// throttling won't be helped by more.
+const dynamodb = new AWS.DynamoDB.DocumentClient({ maxRetries: 3 });
 const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 
 // Initialize S3 client
