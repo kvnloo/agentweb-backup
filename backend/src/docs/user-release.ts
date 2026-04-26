@@ -32,6 +32,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma will automatically detect the CAPTCHA type and call solve_captcha instead of giving up when a challenge appears during login or form submission',
       '- Stealth browser fingerprinting improvements: headless Chromium now spoofs navigator.webdriver, userAgentData, window.chrome, navigator.plugins, and mimeTypes to avoid bot detection on sites like X.com',
       '- X.com login form now loads correctly (previously showed "Something went wrong" before any credentials could be entered)',
+      'Fix: Scheduled Chats No Longer Fail with "Too Many Tools" Error on Azure OpenAI',
+      '- Scheduled chats using Azure OpenAI (GPT-4.x) were failing when the total number of available tools exceeded the API limit of 128',
+      '- The system now caps the tool list at 128 for Azure OpenAI models, preventing the 400 error',
     ],
   },
   {

@@ -154,6 +154,8 @@ interface LLMModelConfig {
   supportsTemperature: boolean;
   /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
   isLive?: boolean;
+  /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
+  maxTools?: number;
 }
 
 // Type for LLM call options
@@ -1207,10 +1209,11 @@ export class AgentModeService {
 
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false },
+    // Azure OpenAI enforces a 128-tool limit per request
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128 },
+    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128 },
+    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128 },
+    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128 },
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
@@ -1277,7 +1280,13 @@ export class AgentModeService {
 
     // Only add tools and tool_choice if tools are provided
     if (tools && tools.length > 0) {
-      params.tools = tools;
+      const maxTools = this.llmModels[model].maxTools;
+      if (maxTools && tools.length > maxTools) {
+        console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
+        params.tools = tools.slice(0, maxTools);
+      } else {
+        params.tools = tools;
+      }
       params.tool_choice = tool_choice || 'auto';
     }
 
