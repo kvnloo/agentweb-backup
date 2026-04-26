@@ -11,7 +11,7 @@
  *      d. Otherwise: send the email via Resend, advance to next step (or complete)
  */
 
-import { dripSequenceDb, DripSequence, SequenceEnrollment } from './dripSequenceDb';
+import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition } from './dripSequenceDb';
 import { resendService } from './resendService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
@@ -82,6 +82,17 @@ async function processEnrollment(
 
   // Build email context for variable substitution
   const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+
+  // Check enrollment condition — exit (not just skip) if lead no longer meets it
+  if (sequence.enrollmentCondition) {
+    if (!evaluateCondition(sequence.enrollmentCondition, lead)) {
+      console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: condition not met (${sequence.enrollmentCondition.field} ${sequence.enrollmentCondition.operator} ${sequence.enrollmentCondition.value})`);
+      await dripSequenceDb.exitEnrollment(enrollment.enrollmentId, 'manual');
+      stats.exited++;
+      return;
+    }
+  }
+
   const user = await userDb.getUserById(enrollment.userId).catch(() => null);
 
   const emailVars: Record<string, string> = {
@@ -162,6 +173,22 @@ async function checkExitConditions(
   }
 
   return null;
+}
+
+function getNestedValue(obj: any, path: string): any {
+  return path.split('.').reduce((cur, key) => (cur != null ? cur[key] : undefined), obj);
+}
+
+function evaluateCondition(condition: StepCondition, lead: any): boolean {
+  const actual = getNestedValue(lead, condition.field);
+  switch (condition.operator) {
+    case 'exists':     return actual !== undefined && actual !== null;
+    case 'not_exists': return actual === undefined || actual === null;
+    case 'eq':         return String(actual) === String(condition.value);
+    case 'neq':        return String(actual) !== String(condition.value);
+    case 'contains':   return typeof actual === 'string' && actual.includes(String(condition.value));
+    default:           return false;
+  }
 }
 
 function addDays(date: Date, days: number): Date {
