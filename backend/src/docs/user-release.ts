@@ -22,6 +22,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Comments now make statements or share reactions, which reads more naturally and confidently on LinkedIn',
       '- Auto-engagement now passes the post author\'s profile to the AI, so it understands context (e.g. commenting on your own company\'s post) without making outsider assumptions',
       '- Syncing engagement memory for LinkedIn company pages now correctly fetches recent posts, fixing a bug where the sync would generate a generic profile from the account name alone',
+      'Improvement: Emma Can Now Solve FunCAPTCHA (Arkose Labs) Challenges During Browser Automation',
+      '- Emma can now handle FunCAPTCHA challenges (used by X.com/Twitter and other sites) via the 2captcha service, in addition to reCAPTCHA v2/v3, hCaptcha, and Cloudflare Turnstile',
+      '- Emma will automatically detect the CAPTCHA type and call solve_captcha instead of giving up when a challenge appears during login or form submission',
+      '- Stealth browser fingerprinting improvements: headless Chromium now spoofs navigator.webdriver, userAgentData, window.chrome, navigator.plugins, and mimeTypes to avoid bot detection on sites like X.com',
+      '- X.com login form now loads correctly (previously showed "Something went wrong" before any credentials could be entered)',
     ],
   },
   {
