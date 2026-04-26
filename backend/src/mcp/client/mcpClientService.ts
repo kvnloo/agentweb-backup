@@ -459,13 +459,23 @@ export class McpClientService {
       }
     );
 
-    // Add timeout to connection
+    // Add timeout to connection — stdio subprocesses (e.g. Playwright) need more time to start
+    const transportType = getTransportType(serverConfig.config);
+    const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
     const connectPromise = client.connect(transport);
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), 15000)
+      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), connectTimeoutMs)
     );
 
-    transport.onclose = () => console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
+    transport.onclose = () => {
+      console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
+      // Fix 4: Evict the dead client so the next tool call triggers a fresh reconnect
+      const pool = this.sessionClientPools.get(poolKey);
+      if (pool?.clients.has(serverName)) {
+        pool.clients.delete(serverName);
+        console.warn(`[MCP-SESSION] Evicted dead client for "${serverName}" from pool after transport close`);
+      }
+    };
     transport.onerror = (err: any) => {
       const errorMessage = err?.message || '';
       if (
@@ -481,15 +491,19 @@ export class McpClientService {
     try {
       await Promise.race([connectPromise, timeoutPromise]);
     } catch (connectError) {
-      this.recordConnectionFailure(serverName);
+      // Fix 3: Don't trigger circuit breaker for stdio servers — each spawn is independent
+      if (transportType !== 'stdio') {
+        this.recordConnectionFailure(serverName);
+      }
       throw connectError;
     }
 
-    // Successful connection — reset circuit breaker
-    this.resetCircuit(serverName);
+    // Successful connection — reset circuit breaker (only applies to non-stdio servers)
+    if (transportType !== 'stdio') {
+      this.resetCircuit(serverName);
+    }
 
     // Wait for session establishment
-    const transportType = getTransportType(serverConfig.config);
     if (transportType === 'streamable-http') {
       await new Promise(resolve => setTimeout(resolve, 500));
       const sessionId = (transport as any).sessionId;
@@ -619,7 +633,10 @@ export class McpClientService {
     switch (transportType) {
       case "stdio": {
         const stdioConfig = config as StdioTransportConfig;
-        if (stdioConfig.args?.some(arg => arg.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE))) {
+        const isPlaywright =
+          stdioConfig.command?.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE) ||
+          stdioConfig.args?.some(arg => arg.includes(McpClientService.PLAYWRIGHT_MCP_PACKAGE));
+        if (isPlaywright) {
           await this.ensurePlaywrightBrowsers();
         }
         return this.createStdioTransport(name, stdioConfig, poolKey);
@@ -638,9 +655,8 @@ export class McpClientService {
 
   /**
    * Ensures Playwright Chromium browsers are installed before the MCP server starts.
-   * @playwright/mcp pins a specific Chromium revision; if the revision isn't cached locally
-   * the browser launch will fail. This runs playwright install once per process startup.
-   * Using a shared Promise so concurrent session creation waits on the same install.
+   * Uses the locally-installed @playwright/mcp binary (preferred) or falls back to
+   * the npx cache. Shared Promise so concurrent sessions wait on the same install.
    */
   private async ensurePlaywrightBrowsers(): Promise<void> {
     if (!McpClientService.playwrightBrowsersInstall) {
@@ -650,9 +666,9 @@ export class McpClientService {
   }
 
   private async runPlaywrightInstall(): Promise<void> {
-    const playwrightBin = this.findPlaywrightBinInNpxCache();
+    const playwrightBin = this.findPlaywrightBin();
     if (!playwrightBin) {
-      console.log('MCP: No playwright binary found in npx cache, skipping browser pre-install');
+      console.log('MCP: No playwright binary found, skipping browser pre-install');
       return;
     }
 
@@ -680,10 +696,18 @@ export class McpClientService {
   }
 
   /**
-   * Finds the playwright CLI binary inside the npx cache for @playwright/mcp.
-   * The npx cache lives at ~/.npm/_npx/<hash>/node_modules/.bin/playwright.
+   * Returns the playwright CLI binary path.
+   * Prefers the locally-installed package (node_modules/.bin/playwright) which is
+   * version-pinned and requires no network lookup. Falls back to the npx cache for
+   * environments where the package isn't installed as a real dependency.
    */
-  private findPlaywrightBinInNpxCache(): string | null {
+  private findPlaywrightBin(): string | null {
+    // Prefer local node_modules (installed as real dependency — no npx overhead)
+    const localBin = path.join(__dirname, '../../../node_modules/.bin/playwright');
+    if (fs.existsSync(localBin)) {
+      return localBin;
+    }
+    // Fallback: npx cache (legacy / environments without local install)
     try {
       const cacheDir = path.join(os.homedir(), '.npm', '_npx');
       for (const hash of fs.readdirSync(cacheDir)) {
@@ -696,6 +720,21 @@ export class McpClientService {
       console.warn('MCP: Error searching for playwright binary:', (e as Error).message);
     }
     return null;
+  }
+
+  /**
+   * Returns the playwright-mcp CLI entry point.
+   * Prefers the locally-installed @playwright/mcp package (node_modules/.bin/playwright-mcp)
+   * to avoid npx registry lookups on every cold start. Falls back to npx for envs
+   * where it isn't a real dependency yet.
+   */
+  private findPlaywrightMcpBin(): { command: string; args: string[] } {
+    const localBin = path.join(__dirname, '../../../node_modules/.bin/playwright-mcp');
+    if (fs.existsSync(localBin)) {
+      return { command: localBin, args: [] };
+    }
+    // Fallback: use npx (will use cached package if available)
+    return { command: 'npx', args: ['@playwright/mcp@0.0.70'] };
   }
 
   /**
@@ -746,11 +785,22 @@ export class McpClientService {
    * Creates Stdio transport (for local subprocess MCP servers)
    */
   private createStdioTransport(name: string, config: StdioTransportConfig, poolKey?: string): Transport {
-    const resolvedCommand = resolveEnvPlaceholders(config.command);
-    const resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
+    let resolvedCommand = resolveEnvPlaceholders(config.command);
+    let resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
 
     // Auto-configure Playwright MCP for headless server environments
-    const isPlaywrightMcp = resolvedArgs.some(arg => arg.includes('@playwright/mcp'));
+    const isPlaywrightMcp =
+      resolvedCommand.includes('@playwright/mcp') ||
+      resolvedArgs.some(arg => arg.includes('@playwright/mcp'));
+
+    // Rewrite npx @playwright/mcp@... to local binary to avoid npm registry lookups on cold start
+    if (isPlaywrightMcp) {
+      const localBin = this.findPlaywrightMcpBin();
+      // Strip any @playwright/mcp@* tokens from args (they were the npx target, not CLI flags)
+      resolvedArgs = resolvedArgs.filter(arg => !arg.startsWith('@playwright/mcp'));
+      resolvedCommand = localBin.command;
+      resolvedArgs = [...localBin.args, ...resolvedArgs];
+    }
     if (isPlaywrightMcp) {
       if (!resolvedArgs.includes('--headless')) {
         resolvedArgs.push('--headless');
@@ -774,13 +824,44 @@ export class McpClientService {
         }
         const configKey = poolKey ? poolKey.replace(/[^a-zA-Z0-9-_]/g, '_') : name;
         const configPath = path.join(configDir, `${configKey}.json`);
+        // Write stealth init script to a temp file (Playwright MCP requires a file path, not inline JS)
+        const stealthScriptContent = [
+          // Patch navigator.webdriver (primary headless signal)
+          `Object.defineProperty(navigator, 'webdriver', { get: () => undefined });`,
+          // Patch userAgentData brands to match a real Windows Chrome
+          `try { if (navigator.userAgentData) { Object.defineProperty(navigator, 'userAgentData', { get: () => ({ brands: [{ brand: 'Chromium', version: '124' }, { brand: 'Google Chrome', version: '124' }, { brand: 'Not-A.Brand', version: '99' }], mobile: false, platform: 'Windows', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64', brands: [{ brand: 'Chromium', version: '124' }, { brand: 'Google Chrome', version: '124' }, { brand: 'Not-A.Brand', version: '99' }], mobile: false, model: '', platform: 'Windows', platformVersion: '15.0.0', uaFullVersion: '124.0.6367.60', wow64: false }) }) }); } } catch(e) {}`,
+          // Ensure window.chrome exists (missing in headless)
+          `if (!window.chrome) { Object.defineProperty(window, 'chrome', { get: () => ({ runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} }) }); }`,
+          // Patch permissions.query so notifications return 'prompt' not 'denied'
+          `try { const oq = window.navigator.permissions?.query?.bind(window.navigator.permissions); if (oq) { window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: 'prompt', onchange: null }) : oq(p); } } catch(e) {}`,
+          // Spoof navigator.plugins — headless has 0 plugins, real Chrome has several
+          `try { Object.defineProperty(navigator, 'plugins', { get: () => { const p = [{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }, { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' }, { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }]; p.__proto__ = PluginArray.prototype; return p; } }); } catch(e) {}`,
+          // Spoof navigator.mimeTypes
+          `try { Object.defineProperty(navigator, 'mimeTypes', { get: () => { const m = [{ type: 'application/pdf', suffixes: 'pdf', description: '', enabledPlugin: {} }, { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: {} }]; m.__proto__ = MimeTypeArray.prototype; return m; } }); } catch(e) {}`,
+          // Spoof screen properties that headless Chrome reports unusually
+          `try { Object.defineProperty(screen, 'colorDepth', { get: () => 24 }); Object.defineProperty(screen, 'pixelDepth', { get: () => 24 }); } catch(e) {}`,
+          // Mask the HeadlessChrome string in userAgent if it slipped through
+          `try { if (navigator.userAgent.includes('HeadlessChrome')) { Object.defineProperty(navigator, 'userAgent', { get: () => navigator.userAgent.replace('HeadlessChrome', 'Chrome') }); } } catch(e) {}`,
+        ].join('\n');
+        const stealthScriptPath = path.join(configDir, `${configKey}-stealth.js`);
+        fs.writeFileSync(stealthScriptPath, stealthScriptContent);
+
         const config = {
           browser: {
             launchOptions: {
               args: [
                 '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials',
+                '--no-first-run',
+                '--password-store=basic',
+                '--use-mock-keychain',
               ]
-            }
+            },
+            contextOptions: {
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            },
+            initScript: [stealthScriptPath],
           }
         };
         fs.writeFileSync(configPath, JSON.stringify(config));
@@ -919,11 +1000,12 @@ export class McpClientService {
     );
 
     console.log(`MCP: Connecting to ${transportType} transport for ${name}...`);
-    
-    // Add timeout to connection
+
+    // Stdio subprocesses (e.g. Playwright) need more time to start than HTTP servers
+    const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
     const connectPromise = client.connect(transport);
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error(`Connection timeout for ${name}`)), 15000)
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Connection timeout for ${name}`)), connectTimeoutMs)
     );
 
     transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
@@ -931,7 +1013,7 @@ export class McpClientService {
       // Suppress expected errors during shutdown/reload
       const errorMessage = err?.message || '';
       if (
-        errorMessage.includes('AbortError') || 
+        errorMessage.includes('AbortError') ||
         errorMessage.includes('SSE stream disconnected') ||
         errorMessage.includes('This operation was aborted')
       ) {

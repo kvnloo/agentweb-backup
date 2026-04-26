@@ -3813,8 +3813,8 @@ emmaToolRegistry.register({
         },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
+          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gpt-image-2 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
         }
       },
       required: ['prompt', 'filename']
@@ -4495,7 +4495,7 @@ emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
-    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead.",
+    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead. For a deployable landing page with a public URL hosted on Vercel, use generate_landing_page instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4515,7 +4515,7 @@ emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
-    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content.",
+    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content. NOTE: Do NOT use this to create a new landing page from scratch — use generate_landing_page for deployable landing pages hosted on Vercel.",
     inputSchema: {
       type: "object",
       properties: {

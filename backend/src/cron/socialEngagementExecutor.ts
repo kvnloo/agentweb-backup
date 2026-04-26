@@ -11,7 +11,7 @@ const POST_COMMENT_SYSTEM_PROMPT = `You are writing a LinkedIn comment on behalf
 
 Rules:
 - Reference something specific from the post (a number, an idea, a phrase) — do not comment on the post in general terms
-- Vary your structure: sometimes ask a question, sometimes share a reaction, sometimes add a brief related thought
+- Make a statement, share a reaction, or add a brief related thought — do NOT ask questions
 - Keep it 1-3 sentences — shorter is often better
 - Never start with "Great", "Love", "Wow", "Absolutely", "Totally", "Insightful", "Fascinating", or any generic opener
 - No hashtags, no emojis unless the post itself is casual
@@ -27,6 +27,7 @@ Rules:
 - Never start with "Absolutely", "Great point", "Totally agree", "So true", or any filler opener
 - No hashtags, no "Thanks for sharing"
 - It's fine to disagree gently, add nuance, or just connect briefly — whatever fits naturally
+- Make a statement or add a thought — do NOT ask questions back
 - Sound like a colleague continuing a conversation, not an assistant acknowledging a ticket
 Return ONLY the reply text, no quotes, no explanation.`;
 
@@ -212,8 +213,11 @@ export class SocialEngagementExecutor {
         const doLike = actionType === 'like' || actionType === 'comment_and_like';
         const doComment = actionType === 'comment' || actionType === 'comment_and_like';
 
-        // Fetch post content once — used for both comment generation and reaction selection
-        const postContent = await this.fetchPostContent(adapter, engagingConnection, engagingUserId, ownerAccountId, ownerUserId, postId);
+        // Fetch post content and owner context once — used for both comment generation and reaction selection
+        const { content: postContent, ownerConnection } = await this.fetchPostContext(adapter, engagingConnection, engagingUserId, ownerAccountId, ownerUserId, postId);
+        const ownerContext = ownerConnection
+            ? { name: ownerConnection.account_name, memory: ownerConnection.engagementMemory?.content }
+            : undefined;
 
         let generatedText: string | undefined;
         let reactionType: string | undefined;
@@ -224,7 +228,7 @@ export class SocialEngagementExecutor {
             if (alreadyCommented) {
                 console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
             } else {
-                generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality);
+                generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext);
                 console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
                 await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
                 console.log(`[Executor] Comment posted on post ${postId}`);
@@ -252,14 +256,15 @@ export class SocialEngagementExecutor {
         return { generatedText, reactionType };
     }
 
-    private async fetchPostContent(
+    private async fetchPostContext(
         adapter: LinkedInAdapter,
         engagingConnection: ConnectedAccount,
         engagingUserId: string,
         ownerAccountId: string | undefined,
         ownerUserId: string,
         postId: string
-    ): Promise<string> {
+    ): Promise<{ content: string; ownerConnection?: ConnectedAccount }> {
+        let ownerConnection: ConnectedAccount | undefined;
         try {
             // Prefer fetching via the owner's account (has direct DB/API access to the post)
             let fetchConnection = engagingConnection;
@@ -272,15 +277,16 @@ export class SocialEngagementExecutor {
                 if (ownerConn) {
                     fetchConnection = ownerConn;
                     fetchUserId = ownerUserId;
+                    ownerConnection = ownerConn;
                 }
             }
 
             const content = await adapter.getPost(fetchConnection, postId, fetchUserId);
-            if (content) return content;
+            if (content) return { content, ownerConnection };
         } catch (err) {
             console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
         }
-        return '[Post content unavailable]';
+        return { content: '[Post content unavailable]', ownerConnection };
     }
 
     /**
@@ -303,7 +309,7 @@ export class SocialEngagementExecutor {
         }
     }
 
-    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }): Promise<string> {
+    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }): Promise<string> {
         try {
             let systemPrompt = POST_COMMENT_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -314,6 +320,12 @@ export class SocialEngagementExecutor {
             }
             if (engagerMemory) {
                 systemPrompt += `\n\nPerson profile (write as this person, matching their voice and interests):\n${engagerMemory}`;
+            }
+            if (ownerContext?.name || ownerContext?.memory) {
+                const parts: string[] = [];
+                if (ownerContext.name) parts.push(`Name: ${ownerContext.name}`);
+                if (ownerContext.memory) parts.push(ownerContext.memory);
+                systemPrompt += `\n\nPost author profile (who wrote the post you are commenting on):\n${parts.join('\n')}`;
             }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
@@ -330,11 +342,11 @@ export class SocialEngagementExecutor {
             console.warn(`[Executor] LLM comment generation failed:`, err);
         }
         const fallbacks = [
-            'Curious what prompted this — was there a specific moment that shifted your thinking on it?',
-            'This is something I\'ve been thinking about too. The part about [redacted] really stuck with me.',
             'Hadn\'t considered it from this angle before. Makes sense though.',
             'Worth bookmarking. A lot of people overlook this.',
-            'This resonates. Have you seen the same pattern in other contexts too?',
+            'This resonates — the same pattern keeps showing up in a lot of places.',
+            'The numbers here tell a story that\'s easy to miss at first glance.',
+            'This is something more people should be paying attention to.',
         ];
         return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }

@@ -1,3 +1,56 @@
+# April 26, 2026: Investigation — Design4Space Scheduled Chat 400 Error (Azure OpenAI Tool Limit)
+
+## Context
+
+Scheduled chat "Design4Space Website Scan" failed at `2026-04-26T14:19:08` with:
+
+```
+400 Invalid 'tools': array too long. Expected an array with maximum length 128, but got an array with length 143 instead.
+```
+
+Model: `gpt-5.4` (Azure OpenAI deployment). The earlier run at 04:59 succeeded; the 14:19 run failed.
+
+## Root Cause
+
+Azure OpenAI enforces a hard limit of 128 tools per API request. The session ended up with 143 tools split as:
+
+- **34** foundation tools (always included)
+- **22** Browser automation skill tools
+- **2** SEO & Website Analytics skill tools
+- **~85** from `__other_skills__` — the virtual catch-all skill
+
+`__other_skills__` is auto-installed by `runVerifiedChat()` when a required function call isn't assigned to any named skill. The session needed `navigate_to` (which wasn't in any named skill), so the system installed `__other_skills__`, which at the time held ~85 orphaned tools — every registered tool not assigned to a published skill.
+
+The 04:59 run succeeded because it had a different execution path that happened to stay under 128. The 14:19 manual test run hit the full tool list immediately after skill install.
+
+## Fix 1 — Safety net (PR #1334)
+
+Added `maxTools: 128` to all Azure OpenAI model configs (`gpt-5-chat-2`, `gpt-5.2-chat`, `gpt-5.4`) and truncation logic in `callLLM()` in `agentModeService.ts`. Prevents the hard 400 crash even if tool counts exceed the limit again.
+
+## Fix 2 — Root cause (dev environment only, via partner portal UI)
+
+Audited all registered tools against published skills. Found **65 orphaned tools** in `__other_skills__` that had never been assigned to any named skill. Assigned all of them to their proper skills via the Skills Management UI at `/skills`:
+
+| Skill | Tools added |
+|---|---|
+| Meeting Intelligence | `fathom_route_action_items` |
+| LinkedIn Outreach | `linkedin_outreach` |
+| Meta Ads Management & Publishing | `list_meta_ads_campaigns`, `get_meta_ads_metrics` |
+| CRM & Lead Management | `ask_crm`, `set_lead_contact_status`, `delete_leads_by_filter`, `update_lead_status`, `get_lead_list_statuses`, `configure_lead_statuses`, `analyze_crm_data`, `assign_lead`, `promote_to_deal`, `get_hot_leads`, `log_contact_event`, `import_leads_from_search`, `enrich_leads_preview`, `enrich_leads_execute`, `enrich_lead_custom`, `get_user_profile`, `report_product_issues`, `manage_drip_campaign` |
+| Landing Page Builder | `get_landing_page_preview_url`, `publish_landing_page_changes` |
+| Landing Page Design | `create_html_template` |
+| Knowledge Base | `perform_deep_research`, `search_ads_knowledge_base`, `list_books`, `get_book_details`, `get_book_content`, `update_book_content`, `generate_book_content`, `create_book`, `create_book_outline`, `create_blog_article`, `publish_blog_article`, `list_cms_categories`, `repair_blog_article` |
+| GTM Tracking | `account_summary`, `get_clarity_metrics`, `list_task_templates`, `create_task_from_template`, `create_task_from_prompt`, `create_image_task_from_prompt`, `create_revision`, `get_task_subscriber_metrics`, `remove_c2pa_from_image`, `rotate_primary`, `list_schedule_templates`, `manage_schedule_template`, `create_schedule_from_template`, `slack_list_channels`, `slack_get_recent_messages`, `slack_get_thread_replies`, `slack_send_message`, `send_for_review`, `notify_session`, `wait_seconds`, `search_tool_response`, `email`, `post_on_connected_account`, `perform_data_analysis` |
+| B2B Ad Image Batch Generation | `bravesearch_brave_local_search`, `bravesearch_brave_video_search`, `bravesearch_brave_summarizer` |
+
+After these assignments, `__other_skills__` is empty in dev.
+
+## Decision
+
+**Always assign new tools to a named skill when deploying them.** Do not leave tools unassigned — they silently pile into `__other_skills__` and inflate the tool count for any session that needs the catch-all. The `maxTools` truncation is a safety net, not a substitute for correct skill assignment.
+
+---
+
 # April 21, 2026: Investigation — Agent Mode "Unknown Error" with claude-opus-4-7
 
 ## Context

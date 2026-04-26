@@ -155,6 +155,8 @@ interface LLMModelConfig {
   supportsTemperature: boolean;
   /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
   isLive?: boolean;
+  /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
+  maxTools?: number;
 }
 
 // Type for LLM call options
@@ -239,6 +241,14 @@ export class AgentModeService {
           'Access meeting recordings, transcripts, and action items from Fathom. ' +
           'Requires a connected Fathom account (Settings → Connected Accounts).',
         toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        category: 'tool_bundle',
+      },
+      {
+        name: 'Google Calendar',
+        description:
+          'Read events and meetings from Google Calendar. List upcoming events, view event details, ' +
+          'and browse calendars. Requires Gmail connected with Calendar access (Settings → Connected Accounts).',
+        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars'],
         category: 'tool_bundle',
       },
     ];
@@ -419,6 +429,7 @@ export class AgentModeService {
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
+        await import('../emma/calendarTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -649,7 +660,7 @@ export class AgentModeService {
   }
 
   // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts)
-  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image'];
+  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
 
   async getImageApiDefaultModel(): Promise<string | undefined> {
     try {
@@ -1208,9 +1219,11 @@ export class AgentModeService {
 
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true },
+    // Azure OpenAI enforces a 128-tool limit per request
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128 },
+    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128 },
+    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128 },
+    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128 },
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
@@ -1277,7 +1290,13 @@ export class AgentModeService {
 
     // Only add tools and tool_choice if tools are provided
     if (tools && tools.length > 0) {
-      params.tools = tools;
+      const maxTools = this.llmModels[model].maxTools;
+      if (maxTools && tools.length > maxTools) {
+        console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
+        params.tools = tools.slice(0, maxTools);
+      } else {
+        params.tools = tools;
+      }
       params.tool_choice = tool_choice || 'auto';
     }
 
@@ -1395,6 +1414,7 @@ export class AgentModeService {
   private estimateImageGenerationCost(model: string): number {
     const pricing: Record<string, number> = {
       'gpt-image-1': 0.04,
+      'gpt-image-2': 0.04,
       'gemini-2.5-flash-image': 0.039,
       'gemini-3-pro-image-preview': 0.039,
       'gemini-3.1-flash-image-preview': 0.039,
@@ -9919,14 +9939,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  private makeMetaAuthError(message: string): Error {
+    const err = new Error(message) as any;
+    err.isMetaAuthError = true;
+    return err;
+  }
+
   private async getMetaCredentials(userId: string, accountId?: string) {
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(userId);
-    if (!user) throw new Error('User not found');
+    if (!user) throw this.makeMetaAuthError('User not found');
 
     const connectedAccounts = user.connected_accounts || [];
     if (!Array.isArray(connectedAccounts)) {
-      throw new Error('Invalid user account data');
+      throw this.makeMetaAuthError('Invalid user account data');
     }
 
     // Helper to strip 'act_' prefix
@@ -9953,7 +9979,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { accountId: legacyAccountId, accessToken };
       }
       console.error(`[AgentMode] No valid Meta connected account found for user ${userId}`);
-      throw new Error('Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.');
+      throw this.makeMetaAuthError('Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.');
     }
 
     // 2. Handle specific account selection if accountId is provided
@@ -9962,11 +9988,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const selected = fbAccounts.find(acc => clean(acc.account_id || acc.config?.ad_account_id) === cleanTargetId);
 
       if (!selected) {
-        throw new Error(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
+        throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
       if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
-        throw new Error('Meta access token has expired. Please reconnect your Meta account in settings.');
+        throw this.makeMetaAuthError('Meta access token has expired. Please reconnect your Meta account in settings.');
       }
 
       return {
@@ -9983,14 +10009,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return `${acc.account_name} (ID: act_${id})`;
         })
         .join(', ');
-      throw new Error(`Multiple Meta accounts found: [${accountList}]. Specify which one to use.`);
+      throw this.makeMetaAuthError(`Multiple Meta accounts found: [${accountList}]. Specify which one to use.`);
     }
 
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
     if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
-      throw new Error('Meta access token has expired. Please reconnect your Meta account in settings.');
+      throw this.makeMetaAuthError('Meta access token has expired. Please reconnect your Meta account in settings.');
     }
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
@@ -10220,8 +10246,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return { success: true, s3_url: s3Result.url, totalRows: allData.length };
 
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error("Error in callMetaAdsInsightsApiWrapper:", error);
-
       return {
         success: false,
         error: error.message,
@@ -10458,6 +10484,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad: newAd
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error copying Meta ad:', error);
       return {
         success: false,
@@ -10481,6 +10508,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         totalCount: totalCount
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta pages:', error);
       return {
         success: false,
@@ -10536,6 +10564,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error(`Invalid action "${action}" for DATASET. Supported: LIST, GET_MATCH_QUALITY.`);
       }
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error managing Meta datasets:', error);
       return {
         success: false,
@@ -10558,6 +10587,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         totalCount: totalCount
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad campaigns:', error);
       return {
         success: false,
@@ -10578,6 +10608,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign: campaign
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad campaign:', error);
       return {
         success: false,
@@ -10601,6 +10632,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         totalCount: totalCount
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad sets:', error);
       return {
         success: false,
@@ -10786,6 +10818,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet: adSet
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad set:', error);
       return {
         success: false,
@@ -10809,6 +10842,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         totalCount: totalCount
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad creatives:', error);
       return {
         success: false,
@@ -10829,6 +10863,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         creative: creative
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad creative:', error);
       return {
         success: false,
@@ -10852,6 +10887,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         totalCount: totalCount
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ads:', error);
       return {
         success: false,
@@ -10872,6 +10908,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad: ad
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad:', error);
       return {
         success: false,
@@ -10891,6 +10928,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Campaign updated successfully`
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad campaign:', error);
       return {
         success: false,
@@ -10909,6 +10947,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Campaign deleted successfully`
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error deleting Meta ad campaign:', error);
       return {
         success: false,
@@ -10927,6 +10966,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Ad set updated successfully`
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad set:', error);
       return {
         success: false,
@@ -10945,6 +10985,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Ad set deleted successfully`
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error deleting Meta ad set:', error);
       return {
         success: false,
@@ -10980,6 +11021,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Ad updated successfully`
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad:', error);
       return {
         success: false,
@@ -11138,6 +11180,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Ad deleted successfully`
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error deleting Meta ad:', error);
       return {
         success: false,
@@ -11174,6 +11217,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         image: image
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error uploading Meta ad image:', error);
       return {
         success: false,
@@ -11196,6 +11240,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         video: video
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error uploading Meta ad video:', error);
       return {
         success: false,
@@ -11743,6 +11788,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
       }
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error managing custom audiences:', error);
       return {
         success: false,
@@ -11773,6 +11819,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         data: results
       };
     } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error searching ad targeting:', error);
       return {
         success: false,

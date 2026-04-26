@@ -109,16 +109,13 @@ describe('AgentModeService - Meta Pages', () => {
       expect(result.totalCount).toBe(0);
     });
 
-    it('should return error when user is not found', async () => {
+    it('should throw when user is not found', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(null);
 
-      const result = await agentModeService.listMetaPages('user123');
-
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('User not found');
+      await expect(agentModeService.listMetaPages('user123')).rejects.toThrow('User not found');
     });
 
-    it('should return error when Meta ad account not connected', async () => {
+    it('should throw when Meta ad account not connected', async () => {
       const mockUser = {
         id: 'user123',
         connected_accounts: []
@@ -126,10 +123,7 @@ describe('AgentModeService - Meta Pages', () => {
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
 
-      const result = await agentModeService.listMetaPages('user123');
-
-      expect(result.success).toBe(false);
-      expect(result.message).toContain('Meta Ads account is not connected');
+      await expect(agentModeService.listMetaPages('user123')).rejects.toThrow('Meta Ads account is not connected');
     });
 
     it('should handle metaService errors', async () => {

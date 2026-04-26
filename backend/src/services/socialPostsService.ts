@@ -245,17 +245,14 @@ export async function generateEngagementMemory(
         })
         .join('\n\n');
     } else {
-      // Fallback: try LinkedIn API directly (may fail for personal profiles)
-      const authorUrn = config.account_type === 'company_page' && config.organization_id
-        ? `urn:li:organization:${config.organization_id}`
-        : `urn:li:person:${config.profile_id || account.account_id}`;
-      const postsResponse = await linkedInService.listPosts(accessToken, authorUrn, 0, 15);
-      const posts = postsResponse.elements || [];
+      // Fallback: fetch via adapter (handles auth correctly for both personal and company pages)
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      const posts = await adapter.listPosts(account, { limit: 15 }, userId);
       if (posts.length > 0) {
         recentPostsSummary = posts
           .slice(0, 15)
-          .map((p, i) => {
-            const text = p.commentary || '';
+          .map((p: any, i: number) => {
+            const text = p.content || p.commentary || '';
             const truncated = text.length > 300 ? text.slice(0, 300) + '...' : text;
             return `Post ${i + 1}: ${truncated}`;
           })

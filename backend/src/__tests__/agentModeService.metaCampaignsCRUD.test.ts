@@ -282,13 +282,10 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       expect(result.message).toBe('Permission denied');
     });
 
-    it('should return error when user not found', async () => {
+    it('should throw when user not found', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(null);
 
-      const result = await agentModeService.deleteMetaAdsCampaign('user123', 'camp_123');
-
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('User not found');
+      await expect(agentModeService.deleteMetaAdsCampaign('user123', 'camp_123')).rejects.toThrow('User not found');
     });
   });
 });
