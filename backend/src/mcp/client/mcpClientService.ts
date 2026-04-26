@@ -169,6 +169,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Suffix appended to the pool key when a user has proxy mode enabled.
+// Pool key variants per user:
+//   "{userId}"        — direct connection (no proxy)
+//   "{userId}:proxy"  — BrightData residential proxy + Chrome binary (bypasses IP blocks + bot detection)
+const PROXY_POOL_SUFFIX = ':proxy';
+
 export class McpClientService {
   private clients: Map<string, Client> = new Map();
   private mcpTools: AgentTool[] = [];
@@ -194,6 +200,11 @@ export class McpClientService {
   // Playwright browser pre-install: shared Promise so concurrent sessions wait on the same install
   private static readonly PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp';
   private static playwrightBrowsersInstall: Promise<void> | null = null;
+
+  // Users that have proxy mode enabled for their Playwright sessions.
+  // When enabled, the pool key gets the PROXY_POOL_SUFFIX so a separate subprocess
+  // is created with the BrightData residential proxy and Chrome binary.
+  private proxyModeUsers: Set<string> = new Set();
 
   constructor() {
     // Start periodic cleanup of stale sessions
@@ -364,7 +375,13 @@ export class McpClientService {
     const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
     // Pool by userId so same user shares one browser/MCP process across sessions.
     // Fall back to chatSessionId if userId not available.
-    const poolKey = userId || chatSessionId;
+    // For Playwright, append PROXY_POOL_SUFFIX when proxy mode is active for this user
+    // so the proxy and non-proxy subprocesses are isolated pools.
+    const baseKey = userId || chatSessionId;
+    const isPlaywright = serverName === 'playwright' || serverName.includes('playwright');
+    const poolKey = (isPlaywright && this.proxyModeUsers.has(baseKey))
+      ? `${baseKey}${PROXY_POOL_SUFFIX}`
+      : baseKey;
 
     // Touch session to update last activity
     this.touchSession(poolKey);
@@ -752,6 +769,9 @@ export class McpClientService {
     // Auto-configure Playwright MCP for headless server environments
     const isPlaywrightMcp = resolvedArgs.some(arg => arg.includes('@playwright/mcp'));
     if (isPlaywrightMcp) {
+      // Proxy mode: pool key ends with PROXY_POOL_SUFFIX (e.g. "{userId}:proxy")
+      const useProxy = poolKey ? poolKey.endsWith(PROXY_POOL_SUFFIX) : false;
+
       if (!resolvedArgs.includes('--headless')) {
         resolvedArgs.push('--headless');
       }
@@ -764,10 +784,18 @@ export class McpClientService {
       if (!resolvedArgs.includes('--isolated')) {
         resolvedArgs.push('--isolated');
       }
-      // When a proxy is configured, BrightData uses its own CA for SSL inspection.
-      // Pass --ignore-https-errors so Playwright doesn't reject the certificate.
-      if (process.env.PLAYWRIGHT_PROXY_URL && !resolvedArgs.includes('--ignore-https-errors')) {
-        resolvedArgs.push('--ignore-https-errors');
+      // Proxy mode: use real Chrome binary (better TLS + JS fingerprint than Playwright's Chromium build)
+      // and route traffic through the BrightData residential proxy.
+      // Note: proxy credentials go into the JSON config file (launchOptions.proxy), NOT CLI flags,
+      // because @playwright/mcp CLI only accepts --proxy-server (no credential flags).
+      if (useProxy) {
+        if (!resolvedArgs.includes('--browser')) {
+          resolvedArgs.push('--browser', 'chrome');
+        }
+        // BrightData uses its own CA for SSL inspection; ignore cert errors
+        if (!resolvedArgs.includes('--ignore-https-errors')) {
+          resolvedArgs.push('--ignore-https-errors');
+        }
       }
       // Anti-headless detection: pass Chromium args that prevent bot detection via config file.
       // The --launch-options CLI flag was removed in @playwright/mcp@0.0.68+, so we write
@@ -826,30 +854,52 @@ export class McpClientService {
             '--window-size=1280,800',
           ],
         };
-        if (process.env.PLAYWRIGHT_PROXY_URL) {
-          // Playwright requires credentials as separate fields, not embedded in the URL.
-          // Parse http://user:pass@host:port into { server, username, password }.
+        // Inject proxy config into launchOptions when proxy mode is active.
+        // Credentials must be separate fields (not embedded in URL) per Playwright's proxy API.
+        // Bypass list includes Google domains (for reCAPTCHA/analytics) and tracking subdomains
+        // that don't need residential IPs and cause 402/502 errors through BrightData.
+        if (useProxy && process.env.PLAYWRIGHT_PROXY_URL) {
+          const defaultBypass = [
+            'localhost',
+            '127.0.0.1',
+            '*.google.com',
+            '*.googleapis.com',
+            '*.gstatic.com',                 // reCAPTCHA resources
+            '*.doubleclick.net',
+            '*.googletagmanager.com',
+            'w3-reporting.reddit.com',        // Reddit telemetry (not needed for login)
+            'error-tracking.reddit.com',      // Reddit Sentry (not needed for login)
+          ].join(',');
           try {
             const proxyUrl = new URL(process.env.PLAYWRIGHT_PROXY_URL);
+            // Use sticky session: derive a session ID from the pool key so all requests
+            // from this user's browser session use the same residential IP.
+            // Per-request IP rotation looks like bot traffic; sticky IP looks like a real user.
+            // BrightData session IDs must be alphanumeric only (no hyphens).
+            const baseUserId = poolKey ? poolKey.replace(PROXY_POOL_SUFFIX, '') : '';
+            const stickyId = baseUserId ? baseUserId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 16) : '';
+            let username = decodeURIComponent(proxyUrl.username);
+            if (stickyId && !username.includes('-session-')) {
+              username = `${username}-session-${stickyId}`;
+            }
             const proxyConfig: Record<string, unknown> = {
               server: `${proxyUrl.protocol}//${proxyUrl.host}`,
-              bypass: process.env.PLAYWRIGHT_PROXY_BYPASS || 'localhost,127.0.0.1',
+              bypass: process.env.PLAYWRIGHT_PROXY_BYPASS || defaultBypass,
             };
-            if (proxyUrl.username) proxyConfig.username = decodeURIComponent(proxyUrl.username);
+            if (username) proxyConfig.username = username;
             if (proxyUrl.password) proxyConfig.password = decodeURIComponent(proxyUrl.password);
             launchOptions.proxy = proxyConfig;
           } catch {
             launchOptions.proxy = {
               server: process.env.PLAYWRIGHT_PROXY_URL,
-              bypass: process.env.PLAYWRIGHT_PROXY_BYPASS || 'localhost,127.0.0.1',
+              bypass: process.env.PLAYWRIGHT_PROXY_BYPASS || defaultBypass,
             };
           }
         }
         const contextOptions: Record<string, unknown> = {
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         };
-        // BrightData uses SSL inspection with its own CA — ignore cert errors so HTTPS works via proxy.
-        if (process.env.PLAYWRIGHT_PROXY_URL) {
+        if (useProxy) {
           contextOptions.ignoreHTTPSErrors = true;
         }
         const config = {
@@ -862,7 +912,7 @@ export class McpClientService {
         fs.writeFileSync(configPath, JSON.stringify(config));
         resolvedArgs.push('--config', configPath);
       }
-      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox --isolated and --config for ${name}`);
+      console.log(`MCP: Auto-configured Playwright MCP${useProxy ? ' [PROXY+CHROME]' : ''} with --headless --no-sandbox --isolated and --config for ${name}`);
     }
 
     // Resolve environment variables in the env config
@@ -1123,6 +1173,114 @@ export class McpClientService {
 
       this.mcpTools.push(agentTool);
     }
+  }
+
+  /**
+   * Enable proxy mode for a user's Playwright sessions.
+   * Kills the existing direct-connection subprocess so the next browser tool call
+   * automatically starts a fresh one with proxy + Chrome config.
+   */
+  async enableProxyForUser(userId: string): Promise<void> {
+    this.proxyModeUsers.add(userId);
+    // Kill any existing direct-connection Playwright pool so it doesn't linger
+    const directPool = this.sessionClientPools.get(userId);
+    if (directPool) {
+      console.log(`[PROXY] Releasing direct-connection Playwright pool for user ${userId.substring(0, 8)} to switch to proxy mode`);
+      await this.releaseSessionClients(userId);
+    }
+    // Also kill any existing proxy pool so it gets recreated with the latest config
+    const proxyPoolKey = `${userId}${PROXY_POOL_SUFFIX}`;
+    const existingProxyPool = this.sessionClientPools.get(proxyPoolKey);
+    if (existingProxyPool) {
+      console.log(`[PROXY] Releasing stale proxy Playwright pool for user ${userId.substring(0, 8)} (will recreate with fresh config)`);
+      await this.releaseSessionClients(proxyPoolKey);
+    }
+    // Clean up stale proxy pool config files so a fresh config is written on next call
+    const configDir = '/tmp/playwright-mcp-configs';
+    const proxyConfigKey = proxyPoolKey.replace(/[^a-zA-Z0-9-_]/g, '_');
+    try {
+      const proxyConfigPath = path.join(configDir, `${proxyConfigKey}.json`);
+      if (fs.existsSync(proxyConfigPath)) {
+        fs.unlinkSync(proxyConfigPath);
+      }
+      const proxyStealthPath = path.join(configDir, `${proxyConfigKey}-stealth.js`);
+      if (fs.existsSync(proxyStealthPath)) {
+        fs.unlinkSync(proxyStealthPath);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+    console.log(`[PROXY] Proxy mode ENABLED for user ${userId.substring(0, 8)} — next browser call will use BrightData + Chrome`);
+  }
+
+  /**
+   * Disable proxy mode for a user's Playwright sessions.
+   * Kills the proxy subprocess so the next browser tool call starts a fresh direct one.
+   */
+  async disableProxyForUser(userId: string): Promise<void> {
+    this.proxyModeUsers.delete(userId);
+    const proxyPoolKey = `${userId}${PROXY_POOL_SUFFIX}`;
+    const proxyPool = this.sessionClientPools.get(proxyPoolKey);
+    if (proxyPool) {
+      console.log(`[PROXY] Releasing proxy Playwright pool for user ${userId.substring(0, 8)}`);
+      await this.releaseSessionClients(proxyPoolKey);
+    }
+    console.log(`[PROXY] Proxy mode DISABLED for user ${userId.substring(0, 8)}`);
+  }
+
+  /**
+   * Build the browser_enable_proxy internal tool definition.
+   * This is registered by agentModeService so the LLM can switch proxy mode on/off.
+   */
+  buildBrowserProxyTool(): AgentTool {
+    return {
+      name: 'browser_enable_proxy',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'browser_enable_proxy',
+          description: `Enable or disable the BrightData residential proxy for the browser in the current session.
+
+Use this tool BEFORE navigating to sites that require:
+1. A non-datacenter IP address (Reddit, some social networks block AWS IPs)
+2. Advanced bot-detection bypass (Reddit login form requires real Chrome + residential IP)
+
+When enabled=true, the browser will use:
+- BrightData residential proxy (bypasses IP blocks)
+- Real Chrome binary (bypasses JS bot fingerprinting — Reddit login requires this)
+
+When enabled=false, the browser switches back to direct connection.
+
+IMPORTANT: Call this BEFORE calling browser_navigate for sites that need it. The proxy takes effect on the next browser navigation.`,
+          parameters: {
+            type: 'object',
+            properties: {
+              enabled: {
+                type: 'boolean',
+                description: 'true to enable proxy mode (Reddit and other bot-protected sites), false to disable'
+              }
+            },
+            required: ['enabled']
+          }
+        }
+      },
+      execute: async (args: { enabled: boolean }, context: ToolContext) => {
+        const userId = context.userId;
+        if (!userId) {
+          return { content: 'Error: cannot enable proxy without a user ID in context', success: false };
+        }
+        if (args.enabled) {
+          if (!process.env.PLAYWRIGHT_PROXY_URL) {
+            return { content: 'Error: BrightData proxy is not configured (PLAYWRIGHT_PROXY_URL not set). Contact support to enable the proxy.', success: false };
+          }
+          await this.enableProxyForUser(userId);
+          return { content: 'Proxy mode enabled. The next browser navigation will use BrightData residential proxy + Chrome. You can now navigate to Reddit or other bot-protected sites.', success: true };
+        } else {
+          await this.disableProxyForUser(userId);
+          return { content: 'Proxy mode disabled. Browser will use direct connection for subsequent navigations.', success: true };
+        }
+      }
+    };
   }
 
   /**

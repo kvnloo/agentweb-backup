@@ -356,6 +356,9 @@ export class AgentModeService {
             this.toolRegistry.register(tool);
           }
         }
+        if (!this.toolRegistry.getTool('browser_enable_proxy')) {
+          this.toolRegistry.register((AgentModeService as any).sharedMcpClientService.buildBrowserProxyTool());
+        }
       }
       return;
     }
@@ -369,6 +372,8 @@ export class AgentModeService {
       for (const tool of mcpTools) {
         this.toolRegistry.register(tool);
       }
+      // Register the proxy control tool so the agent can switch proxy mode on/off per session
+      this.toolRegistry.register(this.mcpClientService.buildBrowserProxyTool());
       console.log(`[MCP-DEBUG] Registered ${mcpTools.length} tools from MCP servers`);
     } catch (error) {
       console.error('AgentMode: Error initializing MCP:', error);

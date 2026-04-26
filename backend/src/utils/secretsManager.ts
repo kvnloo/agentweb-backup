@@ -640,12 +640,19 @@ export async function get2CaptchaApiKey(): Promise<string> {
 /**
  * Get BrightData proxy URL from AWS Secrets Manager.
  * Accepts these secret formats:
- *   - Full proxy URL string: "http://user:pass@brd.superproxy.io:33335"
- *   - JSON with standard fields: { "username": "...", "password": "...", "host": "...", "port": 33335 }
- *   - JSON with BrightData curl-style fields: { "proxy-user": "brd-customer-...", "key": "...", "host": "brd.superproxy.io", "port": 33335 }
+ *   - Full proxy URL string: "http://user:pass@brd.superproxy.io:22225"
+ *   - JSON with standard fields: { "username": "...", "password": "...", "host": "...", "port": 22225 }
+ *   - JSON with BrightData curl-style fields: { "proxy-user": "brd-customer-...", "key": "...", "host": "brd.superproxy.io", "port": 22225 }
  * Returns a proxy URL string suitable for Playwright's launchOptions.proxy.server.
+ *
+ * IMPORTANT: Always use port 22225 (HTTP CONNECT tunneling, no SSL inspection).
+ * Port 33335 performs SSL MITM inspection which breaks CORS headers on SPAs like Reddit.
+ *
+ * @param sessionId - Optional session ID for sticky session (same residential IP per session).
+ *   If omitted, a rotating IP is used. For browser automation, pass userId to get consistent
+ *   IP across all requests in a session — avoids bot detection from per-request IP rotation.
  */
-export async function getBrightDataProxyUrl(): Promise<string> {
+export async function getBrightDataProxyUrl(sessionId?: string): Promise<string> {
   const environment = process.env.NODE_ENV || 'development';
   const secretName = environment === 'production'
     ? 'prod/AgentWeb/BrightData'
@@ -659,11 +666,28 @@ export async function getBrightDataProxyUrl(): Promise<string> {
 
   const trimmed = secretString.trim();
 
-  // Plain URL — use directly
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('socks5://')) {
-    return trimmed;
-  }
+  // Sanitize sessionId for use in BrightData username (alphanumeric + hyphens only)
+  const stickySegment = sessionId
+    ? `-session-${sessionId.replace(/[^a-zA-Z0-9-]/g, '').substring(0, 20)}`
+    : '';
 
+  // Plain URL — parse and ensure port 22225 (HTTP CONNECT, no SSL inspection)
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('socks5://')) {
+    try {
+      const u = new URL(trimmed);
+      // Rewrite port 33335 → 22225: 33335 does SSL MITM which breaks SPA sites
+      if (u.port === '33335') {
+        u.port = '22225';
+        u.protocol = 'http:';
+      }
+      if (stickySegment && !u.username.includes('-session-')) {
+        u.username = encodeURIComponent(decodeURIComponent(u.username) + stickySegment);
+      }
+      return u.toString();
+    } catch {
+      return trimmed;
+    }
+  }
 
   let creds: Record<string, unknown>;
   try {
@@ -673,23 +697,41 @@ export async function getBrightDataProxyUrl(): Promise<string> {
   }
 
   // Support both { username, password } and { "proxy-user", key } field names
-  const username = (creds['username'] || creds['proxy-user']) as string | undefined;
+  let username = (creds['username'] || creds['proxy-user']) as string | undefined;
   const password = (creds['password'] || creds['key']) as string | undefined;
   const host = (creds['host'] as string | undefined) || 'brd.superproxy.io';
-  const port = (creds['port'] as number | undefined) || 33335;
+  // Default to port 22225 (HTTP CONNECT, no SSL inspection)
+  const port = (creds['port'] as number | undefined) === 33335 ? 22225 : ((creds['port'] as number | undefined) || 22225);
   const scheme = (creds['scheme'] as string | undefined) || 'http';
 
   if (!username) {
     throw new Error('BrightData JSON secret must have username/password or proxy-user/key fields');
   }
 
-  // If the username field is itself a full proxy URL, use it directly
+  // If the username field is itself a full proxy URL, parse and rewrite port
   if (username.startsWith('http://') || username.startsWith('https://') || username.startsWith('socks5://')) {
-    return username;
+    try {
+      const u = new URL(username);
+      if (u.port === '33335') {
+        u.port = '22225';
+        u.protocol = 'http:';
+      }
+      if (stickySegment && !u.username.includes('-session-')) {
+        u.username = encodeURIComponent(decodeURIComponent(u.username) + stickySegment);
+      }
+      return u.toString();
+    } catch {
+      return username;
+    }
   }
 
   if (!password) {
     throw new Error('BrightData JSON secret must have username/password or proxy-user/key fields');
+  }
+
+  // Append sticky session segment to username if provided
+  if (stickySegment && !username.includes('-session-')) {
+    username = username + stickySegment;
   }
 
   return `${scheme}://${username}:${password}@${host}:${port}`;
