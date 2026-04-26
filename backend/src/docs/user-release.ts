@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-26',
+    changes: [
+      'Fix: Emma No Longer Repeats Her Intro Phrase on Every Message',
+      '- Emma was opening every response with "Emma here — your team\'s new AI marketing partner." regardless of where you were in the conversation',
+      '- The intro phrase is now limited to the very first message only; subsequent replies jump straight to the task',
+      'Fix: Emma Now Calls generate_image When Asked to Make an Image',
+      '- When asked to "make an image" or "create an image", Emma was sometimes substituting an HTML file or providing instructions instead of generating a real image',
+      '- Emma now always calls the generate_image tool for image requests, including when user-provided logos or reference images are available as inputs',
+    ],
+  },
+  {
     date: '2026-04-25',
     changes: [
       'Fix: Website Scans No Longer Fail When a Previous Session Left the Browser Locked',
