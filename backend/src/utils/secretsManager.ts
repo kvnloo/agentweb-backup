@@ -637,6 +637,64 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+/**
+ * Get BrightData proxy URL from AWS Secrets Manager.
+ * Accepts these secret formats:
+ *   - Full proxy URL string: "http://user:pass@brd.superproxy.io:33335"
+ *   - JSON with standard fields: { "username": "...", "password": "...", "host": "...", "port": 33335 }
+ *   - JSON with BrightData curl-style fields: { "proxy-user": "brd-customer-...", "key": "...", "host": "brd.superproxy.io", "port": 33335 }
+ * Returns a proxy URL string suitable for Playwright's launchOptions.proxy.server.
+ */
+export async function getBrightDataProxyUrl(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/BrightData'
+    : 'dev/AgentWeb/BrightData';
+
+  const secretString = await getSecret(secretName);
+
+  if (!secretString || secretString.trim() === '') {
+    throw new Error('BrightData credentials secret is empty');
+  }
+
+  const trimmed = secretString.trim();
+
+  // Plain URL — use directly
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('socks5://')) {
+    return trimmed;
+  }
+
+
+  let creds: Record<string, unknown>;
+  try {
+    creds = JSON.parse(trimmed);
+  } catch {
+    throw new Error('BrightData secret must be a proxy URL or JSON object.');
+  }
+
+  // Support both { username, password } and { "proxy-user", key } field names
+  const username = (creds['username'] || creds['proxy-user']) as string | undefined;
+  const password = (creds['password'] || creds['key']) as string | undefined;
+  const host = (creds['host'] as string | undefined) || 'brd.superproxy.io';
+  const port = (creds['port'] as number | undefined) || 33335;
+  const scheme = (creds['scheme'] as string | undefined) || 'http';
+
+  if (!username) {
+    throw new Error('BrightData JSON secret must have username/password or proxy-user/key fields');
+  }
+
+  // If the username field is itself a full proxy URL, use it directly
+  if (username.startsWith('http://') || username.startsWith('https://') || username.startsWith('socks5://')) {
+    return username;
+  }
+
+  if (!password) {
+    throw new Error('BrightData JSON secret must have username/password or proxy-user/key fields');
+  }
+
+  return `${scheme}://${username}:${password}@${host}:${port}`;
+}
+
 export interface AttioCredentials {
   clientId: string;
   clientSecret: string;

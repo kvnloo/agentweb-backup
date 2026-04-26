@@ -354,6 +354,15 @@ createTestAccount().then(async () => {
     console.warn('Stripe credentials not available — billing features will be disabled:', (error as Error).message);
   }
 
+  // Load BrightData proxy URL and expose as PLAYWRIGHT_PROXY_URL
+  try {
+    const { getBrightDataProxyUrl } = await import('./utils/secretsManager');
+    process.env.PLAYWRIGHT_PROXY_URL = await getBrightDataProxyUrl();
+    console.log('BrightData proxy loaded');
+  } catch (error) {
+    console.warn('BrightData proxy not available — browser will use direct connection:', (error as Error).message);
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);

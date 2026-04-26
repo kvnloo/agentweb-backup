@@ -764,6 +764,11 @@ export class McpClientService {
       if (!resolvedArgs.includes('--isolated')) {
         resolvedArgs.push('--isolated');
       }
+      // When a proxy is configured, BrightData uses its own CA for SSL inspection.
+      // Pass --ignore-https-errors so Playwright doesn't reject the certificate.
+      if (process.env.PLAYWRIGHT_PROXY_URL && !resolvedArgs.includes('--ignore-https-errors')) {
+        resolvedArgs.push('--ignore-https-errors');
+      }
       // Anti-headless detection: pass Chromium args that prevent bot detection via config file.
       // The --launch-options CLI flag was removed in @playwright/mcp@0.0.68+, so we write
       // a config file and pass --config instead.
@@ -792,27 +797,67 @@ export class McpClientService {
           `try { Object.defineProperty(screen, 'colorDepth', { get: () => 24 }); Object.defineProperty(screen, 'pixelDepth', { get: () => 24 }); } catch(e) {}`,
           // Mask the HeadlessChrome string in userAgent if it slipped through
           `try { if (navigator.userAgent.includes('HeadlessChrome')) { Object.defineProperty(navigator, 'userAgent', { get: () => navigator.userAgent.replace('HeadlessChrome', 'Chrome') }); } } catch(e) {}`,
+          // Fix window.outerWidth/outerHeight (0 in headless — a reliable detection signal)
+          `try { if (window.outerWidth === 0) { Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth }); } if (window.outerHeight === 0) { Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 88 }); } } catch(e) {}`,
+          // Fix window.innerWidth/innerHeight fallback when viewport is tiny
+          `try { if (!window.innerWidth) { Object.defineProperty(window, 'innerWidth', { get: () => 1280 }); Object.defineProperty(window, 'innerHeight', { get: () => 720 }); Object.defineProperty(window, 'outerWidth', { get: () => 1280 }); Object.defineProperty(window, 'outerHeight', { get: () => 808 }); } } catch(e) {}`,
+          // Spoof hardware concurrency and device memory to match a typical desktop
+          `try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch(e) {}`,
+          `try { if ('deviceMemory' in navigator) { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } } catch(e) {}`,
+          // Spoof connection type (headless often shows undefined)
+          `try { if (navigator.connection) { Object.defineProperty(navigator.connection, 'rtt', { get: () => 100 }); } } catch(e) {}`,
+          // Ensure Notification permission is not 'denied' (headless default)
+          `try { if (typeof Notification !== 'undefined' && Notification.permission === 'denied') { Object.defineProperty(Notification, 'permission', { get: () => 'default' }); } } catch(e) {}`,
         ].join('\n');
         const stealthScriptPath = path.join(configDir, `${configKey}-stealth.js`);
         fs.writeFileSync(stealthScriptPath, stealthScriptContent);
 
+        const launchOptions: Record<string, unknown> = {
+          args: [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-site-isolation-trials',
+            '--no-first-run',
+            '--password-store=basic',
+            '--use-mock-keychain',
+            // Use new headless mode — far less detectable than legacy --headless
+            '--headless=new',
+            // Realistic window size (headless default 0x0 is a bot signal)
+            '--window-size=1280,800',
+          ],
+        };
+        if (process.env.PLAYWRIGHT_PROXY_URL) {
+          // Playwright requires credentials as separate fields, not embedded in the URL.
+          // Parse http://user:pass@host:port into { server, username, password }.
+          try {
+            const proxyUrl = new URL(process.env.PLAYWRIGHT_PROXY_URL);
+            const proxyConfig: Record<string, unknown> = {
+              server: `${proxyUrl.protocol}//${proxyUrl.host}`,
+              bypass: process.env.PLAYWRIGHT_PROXY_BYPASS || 'localhost,127.0.0.1',
+            };
+            if (proxyUrl.username) proxyConfig.username = decodeURIComponent(proxyUrl.username);
+            if (proxyUrl.password) proxyConfig.password = decodeURIComponent(proxyUrl.password);
+            launchOptions.proxy = proxyConfig;
+          } catch {
+            launchOptions.proxy = {
+              server: process.env.PLAYWRIGHT_PROXY_URL,
+              bypass: process.env.PLAYWRIGHT_PROXY_BYPASS || 'localhost,127.0.0.1',
+            };
+          }
+        }
+        const contextOptions: Record<string, unknown> = {
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        };
+        // BrightData uses SSL inspection with its own CA — ignore cert errors so HTTPS works via proxy.
+        if (process.env.PLAYWRIGHT_PROXY_URL) {
+          contextOptions.ignoreHTTPSErrors = true;
+        }
         const config = {
           browser: {
-            launchOptions: {
-              args: [
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-site-isolation-trials',
-                '--no-first-run',
-                '--password-store=basic',
-                '--use-mock-keychain',
-              ]
-            },
-            contextOptions: {
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            },
+            launchOptions,
+            contextOptions,
             initScript: [stealthScriptPath],
-          }
+          },
         };
         fs.writeFileSync(configPath, JSON.stringify(config));
         resolvedArgs.push('--config', configPath);
