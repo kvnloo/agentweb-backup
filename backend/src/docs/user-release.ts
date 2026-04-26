@@ -5156,6 +5156,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-26',
     changes: [
+      'New: GPT-5.5 Now Available in Agent Mode',
+      '- GPT-5.5 (Azure) is now available as a model option in the Agent Mode chat interface',
+      '- Select it from the model dropdown alongside existing options like GPT-5.4 and Gemini',
+    ],
+  },
+  {
+    date: '2026-04-26',
+    changes: [
       'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
       '- The automated satisfaction score for each chat session now includes three sub-scores alongside the overall rating: Goal Completion, Data Accuracy, and Output Quality',
       '- Goal Completion measures whether the assistant fully accomplished what the user asked',
