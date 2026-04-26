@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-27',
+    changes: [
+      'New: Google Calendar Skill — Emma Can Now Read Your Calendar',
+      '- A new "Google Calendar" skill is available in Skills settings that lets Emma read your Google Calendar events',
+      '- Emma can list upcoming events, look up event details (attendees, location, meeting link), and browse all your calendars',
+      '- Requires Gmail connected with Calendar access (Settings → Connected Accounts)',
+      '- Example: "What meetings do I have this week?" or "Show me all events in April"',
+    ],
+  },
+  {
     date: '2026-04-26',
     changes: [
       'New: Email Sequences Now Support Enrollment Conditions',
