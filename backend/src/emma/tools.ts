@@ -3813,8 +3813,8 @@ emmaToolRegistry.register({
         },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
+          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gpt-image-2 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
         }
       },
       required: ['prompt', 'filename']

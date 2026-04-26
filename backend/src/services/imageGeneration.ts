@@ -13,6 +13,7 @@ interface ImageGenerationResult {
 // Supported image generation models
 const SUPPORTED_MODELS = [
   "gpt-image-1",
+  "gpt-image-2",
   "gemini-2.5-flash-image",
   "gemini-3-pro-image-preview",
   "gemini-3.1-flash-image-preview",
@@ -100,10 +101,10 @@ export class ImageService {
     try {
       let secretName: string;
       
-      if (model === "gpt-image-1") {
+      if (model === "gpt-image-1" || model === "gpt-image-2") {
         // Azure AI Services
-        secretName = process.env.NODE_ENV === "development" 
-          ? "dev/AgentWeb/Azure/Image" 
+        secretName = process.env.NODE_ENV === "development"
+          ? "dev/AgentWeb/Azure/Image"
           : "prod/AgentWeb/Azure/Image";
       } else if (model === "gemini-2.5-flash-image" || model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image-preview") {
         // Google Gemini
@@ -218,7 +219,7 @@ export class ImageService {
       let result: ImageGenerationResult;
       try {
         let generationPromise: Promise<ImageGenerationResult>;
-        if (modelToUse === "gpt-image-1") {
+        if (modelToUse === "gpt-image-1" || modelToUse === "gpt-image-2") {
           generationPromise = this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image") {
           generationPromise = this.generateWithGoogleGemini(params);
@@ -310,7 +311,7 @@ export class ImageService {
     const axios = require('axios');
     
     const azureEndpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com";
-    const deploymentName = "gpt-image-1";
+    const deploymentName = model === "gpt-image-2" ? "gpt-image-2" : "gpt-image-1";
     
     if (hasInputImages) {
       // Image editing mode

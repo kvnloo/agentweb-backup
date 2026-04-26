@@ -5164,6 +5164,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-26',
     changes: [
+      'New: GPT Image 2 Available for Image Generation',
+      '- GPT Image 2 (via Azure) is now available as an image generation model alongside GPT Image 1',
+      '- Select "GPT Image 2" in the Image Model dropdown on the Images page to use it',
+      '- Supports the same sizes (1024x1024, 1536x1024, 1024x1536) and quality settings (Low, Medium, High) as GPT Image 1',
+      '- Also available in the generate_image tool in Agent Mode',
+    ],
+  },
+  {
+    date: '2026-04-26',
+    changes: [
       'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
       '- The automated satisfaction score for each chat session now includes three sub-scores alongside the overall rating: Goal Completion, Data Accuracy, and Output Quality',
       '- Goal Completion measures whether the assistant fully accomplished what the user asked',
