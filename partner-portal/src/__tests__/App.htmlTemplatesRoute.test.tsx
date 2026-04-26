@@ -71,7 +71,7 @@ jest.mock("../pages/Skills", () => () => <div>Skills</div>);
 jest.mock("../pages/WorkPlans", () => () => <div>WorkPlans</div>);
 jest.mock("../pages/ScheduleTemplates", () => () => <div>ScheduleTemplates</div>);
 jest.mock("../pages/ClientHealth", () => () => <div>ClientHealth</div>);
-jest.mock("../pages/DripCampaigns", () => () => <div>DripCampaigns</div>);
+jest.mock("../pages/PromptTemplates", () => () => <div>PromptTemplates</div>);
 jest.mock("../pages/Api", () => () => <div>Api</div>);
 jest.mock("../pages/marketing", () => () => <div>Marketing</div>);
 

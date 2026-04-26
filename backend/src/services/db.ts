@@ -125,6 +125,154 @@ export interface User {
   dripUnsubscribed?: boolean;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
+  /**
+   * Onboarding v2 Phase 1 — brand build async status.
+   * Set to 'building' when the onboarding flow kicks off brand extraction,
+   * flipped to 'ready' when `brandGuidelines` is next written, or 'failed'
+   * on timeout/error. The UI renders a status pill based on this value so
+   * latency-hiding question screens (Phase 2) can proceed in parallel.
+   */
+  brandBuildStatus?: "building" | "ready" | "failed";
+  /** ISO timestamp when the async brand build was kicked off. */
+  brandBuildStartedAt?: string;
+  /** ISO timestamp when the build terminated (ready or failed). */
+  brandBuildCompletedAt?: string;
+  /** Wall-clock duration in ms from start to completion. Used for p50/p99 metrics. */
+  brandBuildDurationMs?: number;
+  /** Error message if `brandBuildStatus === 'failed'`. Surfaced to the graceful-fallback UI. */
+  brandBuildError?: string;
+  /**
+   * Onboarding v2 Phase 4 — ad creative generation async status.
+   * Separate state machine from brandBuildStatus because the two runs are
+   * concurrent during Phase 3→4 transition and have different timeout
+   * budgets. See `backend/src/services/adGenStatusService.ts`.
+   */
+  adGenStatus?: "generating" | "ready" | "failed";
+  /** ISO timestamp when ad-gen was kicked off. */
+  adGenStartedAt?: string;
+  /** ISO timestamp when ad-gen terminated (ready or failed). */
+  adGenCompletedAt?: string;
+  /** Wall-clock duration in ms. Used for p50/p99 metrics. */
+  adGenDurationMs?: number;
+  /** Error message if `adGenStatus === 'failed'`. */
+  adGenError?: string;
+  /**
+   * Persisted ad variants from the last successful generation. Rendered by
+   * the Phase 4 reveal UI. Array is capped at MAX_AD_VARIANTS (3) and each
+   * field is length-bounded — see `sanitizeAdVariants` for the contract.
+   */
+  adGenVariants?: Array<{
+    id: string;
+    headline: string;
+    primaryText: string;
+    cta: string;
+    imageUrl?: string;
+  }>;
+  /**
+   * Onboarding Epic — per-step state machines.
+   *
+   * Five concurrent state machines that each track one async step the
+   * onboarding flow can fire (ICP, competitor, creative direction, ad
+   * image, ad copy). The legacy single-axis `adGenStatus` mixed image +
+   * copy in one machine; this Epic splits each axis so a single failure
+   * doesn't block the others, and each screen can drive the step it hides
+   * without guessing what's already in flight.
+   *
+   * Each axis has the same shape (status / startedAt / completedAt /
+   * durationMs / error / result), tracked in its own pure state-machine
+   * module under `services/{axis}StatusService.ts` and exposed via
+   * `routes/onboardingSteps.ts`. Result types are loose `unknown[]`-ish
+   * structures so the LLM-output boundary can tighten them without
+   * churning persistence types every prompt iteration.
+   *
+   * State values: idle | running | ready | failed.
+   *   idle      — never started OR explicit reset
+   *   running   — async work in flight
+   *   ready     — terminal: result populated
+   *   failed    — terminal: error populated
+   *
+   * See:
+   *   - icpStatusService.ts        (5 personas)
+   *   - competitorStatusService.ts (per-icp targeting briefs)
+   *   - creativeDirStatusService.ts (concepts + copy angles + archetypes)
+   *   - adImageStatusService.ts    (3 image variants)
+   *   - adCopyStatusService.ts     (3 copy variants with variety tags)
+   */
+  // ── ICP axis ──
+  icpStatus?: "idle" | "running" | "ready" | "failed";
+  icpStartedAt?: string;
+  icpCompletedAt?: string;
+  icpDurationMs?: number;
+  icpError?: string;
+  icpResult?: Array<{
+    name: string;
+    pain: string;
+    desire: string;
+    objection: string;
+    meta_targeting_brief: string;
+  }>;
+  // ── Competitor axis ──
+  competitorStatus?: "idle" | "running" | "ready" | "failed";
+  competitorStartedAt?: string;
+  competitorCompletedAt?: string;
+  competitorDurationMs?: number;
+  competitorError?: string;
+  competitorResult?: {
+    per_icp: Array<{
+      icp_id: string;
+      competitor_names: string[];
+      offer_angles: string[];
+      meta_targeting_brief: string;
+    }>;
+  };
+  // ── Creative direction axis ──
+  creativeDirStatus?: "idle" | "running" | "ready" | "failed";
+  creativeDirStartedAt?: string;
+  creativeDirCompletedAt?: string;
+  creativeDirDurationMs?: number;
+  creativeDirError?: string;
+  creativeDirResult?: {
+    concepts: string[];
+    copy_angles: string[];
+    format_archetypes: string[];
+  };
+  // ── Ad image axis ──
+  adImageStatus?: "idle" | "running" | "ready" | "failed";
+  adImageStartedAt?: string;
+  adImageCompletedAt?: string;
+  adImageDurationMs?: number;
+  adImageError?: string;
+  adImageResult?: {
+    variants: Array<{
+      id: string;
+      imageUrl: string;
+      prompt: string;
+    }>;
+  };
+  // ── Ad copy axis ──
+  adCopyStatus?: "idle" | "running" | "ready" | "failed";
+  adCopyStartedAt?: string;
+  adCopyCompletedAt?: string;
+  adCopyDurationMs?: number;
+  adCopyError?: string;
+  adCopyResult?: {
+    variants: Array<{
+      id: string;
+      headline: string;
+      primaryText: string;
+      cta: string;
+      variety: string;
+    }>;
+  };
+  // ── Ad variant ratings (Phase 4 "Ads Tinder" swipe UI) ──
+  // Append-only log of like/reject decisions per variant. Capped at 50.
+  // Used by the LLM regen prompts to bias future variants away from
+  // rejected directions. See `adVariantRatingService.ts`.
+  adVariantsRated?: Array<{
+    variantId: string;
+    rating: "like" | "reject";
+    ratedAt: string;
+  }>;
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -182,6 +330,13 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   }>;
+  /**
+   * Onboarding v2 — value proposition the user committed to on the
+   * BrandReview gate screen (between dataGathering and adReveal).
+   * Stored separately from `marketStrategy.icp[].valueProposition` because
+   * it represents the brand-level value prop, not a per-ICP one.
+   */
+  valueProp?: string;
   introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
@@ -5090,6 +5245,45 @@ export const crmDb = {
       UpdateExpression: 'SET linkedinMessageSyncAt = :syncAt, updatedAt = :updatedAt',
       ExpressionAttributeValues: {
         ':syncAt': syncAt,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }).promise();
+  },
+
+  /**
+   * Onboarding v2 dual-write helper — mirror per-User onboarding analytics
+   * onto the matching Lead row. The user-facing route (onboardingEvents.ts)
+   * writes to the User record first, then fire-and-forget calls this to
+   * keep the Lead in sync so Fangfang / Emma can see the full flow on the
+   * Lead detail page.
+   *
+   * Writes three top-level attributes on the Lead:
+   *   - onboardingEvents: OnboardingEvent[] (full log mirror)
+   *   - onboardingStage: OnboardingStage
+   *   - onboardingDeviationCount: int
+   *
+   * Overwrites atomically — this is a pure projection of User state.
+   * Task: https://www.notion.so/34c09247c951812cbc90f09aa68fc5d3
+   */
+  async updateLeadOnboardingAnalytics(
+    listId: string,
+    leadId: string,
+    analytics: {
+      onboardingEvents: unknown[];
+      onboardingStage: string;
+      onboardingDeviationCount: number;
+    },
+  ): Promise<void> {
+    const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET onboardingEvents = :events, onboardingStage = :stage, onboardingDeviationCount = :dc, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':events': analytics.onboardingEvents,
+        ':stage': analytics.onboardingStage,
+        ':dc': analytics.onboardingDeviationCount,
         ':updatedAt': new Date().toISOString(),
       },
     }).promise();

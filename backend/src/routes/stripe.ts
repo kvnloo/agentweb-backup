@@ -372,7 +372,7 @@ router.post(
       return res.status(401).json({ error: "User not authenticated." });
     }
 
-    const { plan } = req.body;
+    const { plan, source } = req.body as { plan?: string; source?: string };
     if (!plan) {
       return res.status(400).json({ error: "Plan is required." });
     }
@@ -461,6 +461,28 @@ router.post(
         allow_promotion_codes: true,
         return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       };
+
+      // Source-specific auto-applied coupons. The onboarding welcome-offer
+      // flash sale lands a user on the Pro plan with the welcome coupon
+      // already attached (no manual code entry). The coupon must exist in
+      // the Stripe dashboard with the id from STRIPE_WELCOME_OFFER_COUPON_ID
+      // — recommended config: 90% off, duration=repeating,
+      // duration_in_months=3. If the env var is unset we log a warning and
+      // fall back to full price (allow_promotion_codes still lets the user
+      // type a code manually) — better than blocking checkout.
+      if (source === "onboarding_welcome_offer") {
+        const welcomeCoupon = process.env.STRIPE_WELCOME_OFFER_COUPON_ID;
+        if (welcomeCoupon) {
+          sessionParams.discounts = [{ coupon: welcomeCoupon }];
+          // discounts and allow_promotion_codes are mutually exclusive in
+          // Stripe; remove the latter when we're auto-applying.
+          delete sessionParams.allow_promotion_codes;
+        } else {
+          console.warn(
+            "[stripe] welcome-offer source supplied but STRIPE_WELCOME_OFFER_COUPON_ID env var unset — checkout will land at full price"
+          );
+        }
+      }
 
       const session = await stripe.checkout.sessions.create(sessionParams);
 

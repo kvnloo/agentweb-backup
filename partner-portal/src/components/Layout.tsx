@@ -201,10 +201,10 @@ export default function Layout() {
                       <Button
                         color="primary"
                         component={RouterLink}
-                        to="/drip-campaigns"
-                        variant={isActivePath('/drip-campaigns') ? 'contained' : 'text'}
+                        to="/prompt-templates"
+                        variant={isActivePath('/prompt-templates') ? 'contained' : 'text'}
                       >
-                        Drip Campaigns
+                        Prompt Templates
                       </Button>
                     </>
                   )}

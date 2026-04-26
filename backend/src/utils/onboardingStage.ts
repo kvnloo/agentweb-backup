@@ -46,8 +46,16 @@ export const ALL_ONBOARDING_STAGES: readonly OnboardingStage[] = [
 /**
  * Event types the onboarding flow emits. Kept as a wide set — the endpoint
  * accepts any of these; unknown event types are rejected at the HTTP layer.
+ *
+ * Phase 2 (Onboarding v2 analytics task
+ * https://www.notion.so/34c09247c951812cbc90f09aa68fc5d3) extended this set with:
+ *   channel_selected, icp_selected, value_prop_edited, ads_generated,
+ *   ads_regenerated, welcome_offer_shown, welcome_offer_outcome,
+ *   brand_build_status, onboarding_abandoned, deviation, channels_skipped
+ * Backwards compatible — every event name PR #568 used still resolves.
  */
 export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
+  // Phase 1 (PR #568) — do not remove, existing consumers depend on these.
   "goal_selected",
   "brand_submitted",
   "brand_skipped",
@@ -56,6 +64,18 @@ export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
   "channel_connected",
   "onboarding_completed",
   "onboarding_skipped",
+  // Phase 2 — Onboarding v2 analytics extension.
+  "channel_selected",
+  "channels_skipped",
+  "icp_selected",
+  "value_prop_edited",
+  "ads_generated",
+  "ads_regenerated",
+  "welcome_offer_shown",
+  "welcome_offer_outcome",
+  "brand_build_status",
+  "onboarding_abandoned",
+  "deviation",
 ]);
 
 export interface OnboardingEvent {
