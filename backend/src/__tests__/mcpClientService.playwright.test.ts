@@ -89,8 +89,10 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
 
     expect(mockStdioConstructor).toHaveBeenCalledTimes(1);
     const callArgs = mockStdioConstructor.mock.calls[0][0];
-    expect(callArgs.command).toBe('npx');
-    expect(callArgs.args).toContain('@playwright/mcp@latest');
+    // Command is rewritten to local binary (node_modules/.bin/playwright-mcp) or npx fallback
+    expect(callArgs.command).toBeTruthy();
+    // @playwright/mcp@* token is stripped from args (it was the npx target, not a CLI flag)
+    expect(callArgs.args).not.toContain('@playwright/mcp@latest');
     expect(callArgs.args).toContain('--headless');
     expect(callArgs.args).toContain('--no-sandbox');
     // --isolated prevents "Browser is already in use" errors when a prior session didn't clean up.
@@ -126,7 +128,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--headless', '--no-sandbox', '--isolated'],
+      args: ['@playwright/mcp@0.0.70', '--headless', '--no-sandbox', '--isolated'],
       isInternal: false,
     };
 
@@ -146,7 +148,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--config', '/custom/config.json'],
+      args: ['@playwright/mcp@0.0.70', '--config', '/custom/config.json'],
       isInternal: false,
     };
 
