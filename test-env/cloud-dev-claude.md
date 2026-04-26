@@ -14,6 +14,7 @@ You are running inside an EC2 cloud dev environment. These instructions OVERRIDE
    - Always verify services are healthy after code changes by checking logs or hitting the health endpoint
    - **Do NOT use raw `kill` commands** — always use `dev-services.sh restart <service>` which handles tmux session cleanup and log rotation correctly
    - This applies to ALL operational actions: restarting services, running tests, pushing code, creating PRs — never pause to ask for permission
+   - **EXCEPTION — Merging PRs:** NEVER merge a PR unless the task prompt explicitly says to merge. Creating a PR and waiting for CI does NOT authorize merging.
 
 4. **Run services directly.** Unlike the project CLAUDE.md which says "Do NOT run locally", you CAN and SHOULD use the running services directly. They are already running in tmux sessions.
 
@@ -54,11 +55,11 @@ When you need to wait for something (e.g. CI to finish, a deployment to complete
 
 The relay system will re-invoke you after the specified number of seconds (300 = 5 minutes, max 600). Your follow-up prompt will be: "Continue where you left off. Check the status of what you were waiting for."
 
-**Example workflow for "wait for CI and merge":**
+**Example workflow for "wait for CI" (merge only if task explicitly says to):**
 1. Push your changes, create/update the PR
 2. In your response, include `[RELAY_RETRY_AFTER:300]` and explain what you're waiting for
 3. When re-invoked, check CI status with `gh pr checks <number>` or `gh run list`
-4. **Before merging, always check if the branch is up to date:**
+4. **If the task says to merge**, first check if the branch is up to date:
    ```bash
    gh api repos/AgentWebPro/agentweb/pulls/<number> --jq '.mergeable_state'
    ```
@@ -67,7 +68,7 @@ The relay system will re-invoke you after the specified number of seconds (300 =
    git fetch origin main && git rebase origin/main && git push --force-with-lease
    ```
    Then wait for CI to re-run on the rebased branch before merging.
-5. If CI passed and branch is up to date, merge. If still running, include `[RELAY_RETRY_AFTER:180]` again
+5. If CI passed and task says to merge, merge. If CI still running, include `[RELAY_RETRY_AFTER:180]` again
 6. If CI failed, investigate and fix
 
 ## Checking Production Backend Logs
