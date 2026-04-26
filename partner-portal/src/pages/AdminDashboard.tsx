@@ -193,6 +193,11 @@ interface AdminChatSession {
     evaluatedAt: string;
     evaluatedMessageIndex: number;
     adminOverride?: boolean;
+    dimensions?: {
+      goalCompletion: number;
+      dataAccuracy: number;
+      outputQuality: number;
+    };
   };
   judgeScores?: Record<string, {
     score: number;
@@ -200,6 +205,11 @@ interface AdminChatSession {
     evaluatedAt: string;
     evaluatedMessageIndex: number;
     judgeName: string;
+    dimensions?: {
+      goalCompletion: number;
+      dataAccuracy: number;
+      outputQuality: number;
+    };
   }>;
 }
 
