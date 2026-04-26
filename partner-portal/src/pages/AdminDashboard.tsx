@@ -5529,8 +5529,11 @@ export default function AdminDashboard() {
                             const chips: React.ReactNode[] = [];
                             if (sat) {
                               const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
+                              const dimSummary = sat.dimensions
+                                ? ` | Goal:${sat.dimensions.goalCompletion} Accuracy:${sat.dimensions.dataAccuracy} Quality:${sat.dimensions.outputQuality}`
+                                : '';
                               chips.push(
-                                <Tooltip key="default" title={`Default: ${sat.reason}${sat.adminOverride ? ' (admin override)' : ''}`}>
+                                <Tooltip key="default" title={`Default: ${sat.reason}${dimSummary}${sat.adminOverride ? ' (admin override)' : ''}`}>
                                   <Chip
                                     label={`Default: ${sat.score}`}
                                     size="small"
@@ -5547,12 +5550,24 @@ export default function AdminDashboard() {
                                   />
                                 </Tooltip>
                               );
+                              if (sat.dimensions) {
+                                const { goalCompletion, dataAccuracy, outputQuality } = sat.dimensions;
+                                const dimColor = (v: number) => v <= 2 ? 'error' : v === 3 ? 'warning' : 'success';
+                                chips.push(
+                                  <Tooltip key="dim-goal" title="Goal completion"><Chip label={`G:${goalCompletion}`} size="small" color={dimColor(goalCompletion) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
+                                  <Tooltip key="dim-acc" title="Data accuracy"><Chip label={`A:${dataAccuracy}`} size="small" color={dimColor(dataAccuracy) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
+                                  <Tooltip key="dim-qual" title="Output quality"><Chip label={`Q:${outputQuality}`} size="small" color={dimColor(outputQuality) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
+                                );
+                              }
                             }
                             if (session.judgeScores) {
                               Object.entries(session.judgeScores).forEach(([jId, jScore]) => {
                                 const jColor = jScore.score <= 2 ? 'error' : jScore.score === 3 ? 'warning' : 'success';
+                                const jDimSummary = jScore.dimensions
+                                  ? ` | Goal:${jScore.dimensions.goalCompletion} Accuracy:${jScore.dimensions.dataAccuracy} Quality:${jScore.dimensions.outputQuality}`
+                                  : '';
                                 chips.push(
-                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}`}>
+                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}${jDimSummary}`}>
                                     <Chip
                                       label={`${jScore.judgeName}: ${jScore.score}`}
                                       size="small"
