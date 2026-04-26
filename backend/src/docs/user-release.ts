@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-27',
+    changes: [
+      'Improvement: Browser Proxy Is Now On-Demand Instead of Always-On',
+      '- The BrightData residential proxy is no longer active for all browser sessions — it is only enabled when the agent explicitly activates it (e.g. when a site blocks datacenter IPs)',
+      '- This prevents unnecessary proxy traffic and associated costs for sites that work fine with a direct connection',
+      '- The agent can now call browser_enable_proxy(enabled=true/false) mid-session to toggle the proxy without restarting the session',
+      '- When the proxy is active, the browser uses the real Google Chrome binary for better TLS and JavaScript fingerprinting, reducing bot detection signals',
+    ],
+  },
+  {
     date: '2026-04-26',
     changes: [
       'Fix: Emma No Longer Repeats Her Intro Phrase on Every Message',
