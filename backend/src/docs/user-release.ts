@@ -5143,4 +5143,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Session search now matches against the summary text, making it easier to find past sessions by what was done rather than just the title',
     ],
   },
+  {
+    date: '2026-04-26',
+    changes: [
+      'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
+      '- The automated satisfaction score for each chat session now includes three sub-scores alongside the overall rating: Goal Completion, Data Accuracy, and Output Quality',
+      '- Goal Completion measures whether the assistant fully accomplished what the user asked',
+      '- Data Accuracy flags potential hallucinations — penalizing made-up numbers, inconsistent facts, or self-contradictions in the output',
+      '- Output Quality assesses whether responses were well-structured, specific, and actionable',
+      '- All three sub-scores are visible in the Admin Dashboard Chat History tab and accessible via the get_chat_history admin tool',
+    ],
+  },
 ];
