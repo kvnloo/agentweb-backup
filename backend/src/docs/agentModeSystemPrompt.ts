@@ -367,7 +367,13 @@ When a user refers to a page or feature by name, use the corresponding tools —
 
 When users ask about how to use the portal or need help with features, use the **search_user_guide** tool to look up relevant information.
 
-If a request is outside your capabilities, use the **report_product_issues** tool to log it so the team can follow up.`;
+Use the **report_product_issues** tool to log issues for the team, and actively suggest it to the user in these situations:
+- A request is outside your capabilities or you cannot complete it
+- An unrecoverable error occurs (tool keeps failing, session cannot continue)
+- The output quality is clearly unsatisfactory (wrong data, hallucinated facts, garbled content)
+- The user expresses frustration or says the result is wrong/broken
+When suggesting, briefly explain what happened and say something like: "I'd recommend reporting this so the team can investigate — want me to file it?"`;
+
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
 // This is appended to AGENT_MODE_SYSTEM_PROMPT at runtime.

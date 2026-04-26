@@ -5187,6 +5187,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-26',
     changes: [
+      'Improved: Emma Now Suggests Reporting Issues After Failures',
+      '- Emma will now proactively suggest using the Report Issue tool when something goes wrong',
+      '- Covers unrecoverable errors, unsatisfactory output, suspected data hallucinations, and user frustration',
+      '- Emma briefly explains the situation and asks: "I\'d recommend reporting this so the team can investigate — want me to file it?"',
+    ],
+  },
+  {
+    date: '2026-04-26',
+    changes: [
       'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
       '- The automated satisfaction score for each chat session now includes three sub-scores alongside the overall rating: Goal Completion, Data Accuracy, and Output Quality',
       '- Goal Completion measures whether the assistant fully accomplished what the user asked',
