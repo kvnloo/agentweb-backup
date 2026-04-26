@@ -11,6 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-26',
     changes: [
+      'New: Email Sequences Now Support Enrollment Conditions',
+      '- You can now set an optional condition on any email sequence that controls whether a lead should receive emails',
+      '- Condition is checked before every send: if the lead\'s field no longer matches, they exit the sequence automatically',
+      '- Supports standard fields (lifecycle, priority, isICP, role, heatScore) and custom fields (e.g. customFields.interested_in_outreach)',
+      '- Operators: equals, not equals, contains, exists, not exists',
       'Fix: Emma No Longer Repeats Her Intro Phrase on Every Message',
       '- Emma was opening every response with "Emma here — your team\'s new AI marketing partner." regardless of where you were in the conversation',
       '- The intro phrase is now limited to the very first message only; subsequent replies jump straight to the task',

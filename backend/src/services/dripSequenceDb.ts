@@ -81,6 +81,14 @@ export type ExitReason =
   | 'bounced'
   | 'manual';
 
+export type StepConditionOperator = 'eq' | 'neq' | 'exists' | 'not_exists' | 'contains';
+
+export interface StepCondition {
+  field: string;              // dot-notation path on lead record, e.g. "lifecycle" or "customFields.interested_in_outreach"
+  operator: StepConditionOperator;
+  value?: any;                // not required for exists / not_exists
+}
+
 export interface SequenceStep {
   stepId: string;
   stepNumber: number;         // 1-based display order
@@ -110,6 +118,8 @@ export interface DripSequence {
     onUnsubscribe: boolean;                      // always enforced
   };
 
+  enrollmentCondition?: StepCondition;  // if set, checked before every send; exits if not met
+
   steps: SequenceStep[];
   status: SequenceStatus;
   createdAt: string;
@@ -122,6 +132,7 @@ export interface CreateSequenceInput {
   description?: string;
   campaignType?: SequenceCampaignType;
   enrollmentTrigger?: DripSequence['enrollmentTrigger'];
+  enrollmentCondition?: StepCondition;
   exitConditions?: Partial<DripSequence['exitConditions']>;
   steps?: Omit<SequenceStep, 'stepId'>[];
   status?: SequenceStatus;
@@ -132,6 +143,7 @@ export interface UpdateSequenceInput {
   description?: string | null;
   campaignType?: SequenceCampaignType;
   enrollmentTrigger?: DripSequence['enrollmentTrigger'];
+  enrollmentCondition?: StepCondition | null;
   exitConditions?: Partial<DripSequence['exitConditions']>;
   steps?: Omit<SequenceStep, 'stepId'>[];
   status?: SequenceStatus;
@@ -201,6 +213,7 @@ async function createSequence(input: CreateSequenceInput): Promise<DripSequence>
     description: input.description,
     campaignType: input.campaignType ?? 'custom',
     enrollmentTrigger: input.enrollmentTrigger ?? { type: 'manual' },
+    ...(input.enrollmentCondition ? { enrollmentCondition: input.enrollmentCondition } : {}),
     exitConditions: {
       onUnsubscribe: true,
       ...input.exitConditions,
@@ -253,6 +266,10 @@ async function updateSequence(
   if (input.description !== undefined) updates.description = input.description ?? undefined;
   if (input.campaignType !== undefined) updates.campaignType = input.campaignType;
   if (input.enrollmentTrigger !== undefined) updates.enrollmentTrigger = input.enrollmentTrigger;
+  if (input.enrollmentCondition !== undefined) {
+    // null means "remove condition"
+    (updates as any).enrollmentCondition = input.enrollmentCondition ?? undefined;
+  }
   if (input.exitConditions !== undefined) {
     updates.exitConditions = {
       ...existing.exitConditions,
