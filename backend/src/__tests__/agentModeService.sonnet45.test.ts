@@ -160,6 +160,20 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.5'].client).not.toBeNull();
     });
 
+    it('should have maxTools: 128 for all Azure OpenAI gpt-5.x models', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5-chat-2'].maxTools).toBe(128);
+      expect(llmModels['gpt-5.2-chat'].maxTools).toBe(128);
+      expect(llmModels['gpt-5.4'].maxTools).toBe(128);
+      expect(llmModels['gpt-5.5'].maxTools).toBe(128);
+    });
+
+    it('should NOT set maxTools on Gemini or Bedrock models', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBeUndefined();
+      expect(llmModels['anthropic.claude-sonnet-4-6'].maxTools).toBeUndefined();
+    });
+
     it('should include Gemini 3.1 Pro Preview in the supported models', async () => {
       const models = await agentModeService.getSupportedModels();
       expect(models).toContain('gemini-3.1-pro-preview');
@@ -486,6 +500,48 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
           { role: 'user', content: 'Hello' },
         ])
       ).rejects.toThrow();
+    });
+  });
+
+  describe('callLLM maxTools truncation (Azure OpenAI 128-tool limit)', () => {
+    it('should truncate tools to maxTools limit for gpt-5.4', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'response', tool_calls: null } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      const llmModels = (agentModeService as any).llmModels;
+      llmModels['gpt-5.4'].client = { chat: { completions: { create: mockCreate } } };
+
+      const tools = Array.from({ length: 143 }, (_, i) => ({
+        type: 'function',
+        function: { name: `tool_${i}`, description: `Tool ${i}`, parameters: { type: 'object', properties: {} } }
+      }));
+
+      await (agentModeService as any).callLLM('gpt-5.4', [{ role: 'user', content: 'test' }], { tools });
+
+      const calledParams = mockCreate.mock.calls[0][0];
+      expect(calledParams.tools).toHaveLength(128);
+      expect(calledParams.tools[0].function.name).toBe('tool_0');
+      expect(calledParams.tools[127].function.name).toBe('tool_127');
+    });
+
+    it('should NOT truncate tools when count is at or below maxTools', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'response', tool_calls: null } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      const llmModels = (agentModeService as any).llmModels;
+      llmModels['gpt-5.4'].client = { chat: { completions: { create: mockCreate } } };
+
+      const tools = Array.from({ length: 128 }, (_, i) => ({
+        type: 'function',
+        function: { name: `tool_${i}`, description: `Tool ${i}`, parameters: { type: 'object', properties: {} } }
+      }));
+
+      await (agentModeService as any).callLLM('gpt-5.4', [{ role: 'user', content: 'test' }], { tools });
+
+      const calledParams = mockCreate.mock.calls[0][0];
+      expect(calledParams.tools).toHaveLength(128);
     });
   });
 
