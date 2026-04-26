@@ -133,6 +133,25 @@ function buildInjectCode(captchaType: string, token: string): string {
 }`;
   }
 
+  if (captchaType === 'funcaptcha') {
+    return `async (page) => {
+  const t = ${t};
+  await page.evaluate((tok) => {
+    // Set token in standard FunCAPTCHA hidden inputs
+    document.querySelectorAll('input[name="fc-token"], #FunCaptcha-Token').forEach(el => { el.value = tok; });
+    // Fire ArkoseEnforcement callback if available (Arkose Labs standard API)
+    try {
+      if (window.ArkoseEnforcement?.setToken) window.ArkoseEnforcement.setToken(tok);
+    } catch(e) {}
+    // Post message for enforcement iframes listening on the parent
+    try {
+      window.postMessage(JSON.stringify({ eventId: 'challenge-complete', payload: { token: tok } }), '*');
+    } catch(e) {}
+  }, t);
+  return 'injected';
+}`;
+  }
+
   return `async (page) => { return 'no-inject-needed'; }`;
 }
 
@@ -147,12 +166,14 @@ emmaToolRegistry.register({
       'Automatically solve a CAPTCHA challenge using the 2captcha service. ' +
       'IMPORTANT: Before calling this tool, you MUST first extract the site_key and captcha_type from the page using browser_evaluate. ' +
       'Use this JS to find them: document.querySelector(\'[data-sitekey]\')?.getAttribute(\'data-sitekey\') — the site_key is the data-sitekey attribute value. ' +
-      'Determine captcha_type by checking: .g-recaptcha or #recaptcha-anchor → "recaptcha_v2"; .h-captcha → "hcaptcha"; .cf-turnstile → "turnstile". ' +
+      'Determine captcha_type by checking: .g-recaptcha or #recaptcha-anchor → "recaptcha_v2"; .h-captcha → "hcaptcha"; .cf-turnstile → "turnstile"; ' +
+      'div[data-enforcementkey] or iframe[src*="arkoselabs"] or iframe[src*="funcaptcha"] → "funcaptcha" (used on X.com/Twitter login). ' +
+      'For funcaptcha: the site_key is the data-pkey or data-enforcementkey attribute value on the Arkose widget div. ' +
       'Note: reCAPTCHA widgets often render inside an iframe — look for the data-sitekey on the outer div in the main document, not inside the iframe. ' +
-      'Use this for token-based CAPTCHAs: reCAPTCHA v2 (checkbox or invisible), reCAPTCHA v3 (score-based), hCaptcha, Cloudflare Turnstile. ' +
-      'For reCAPTCHA v2 / hCaptcha / Turnstile: the token is automatically injected — just submit the form after. ' +
+      'Use this for token-based CAPTCHAs: reCAPTCHA v2 (checkbox or invisible), reCAPTCHA v3 (score-based), hCaptcha, Cloudflare Turnstile, FunCAPTCHA/Arkose Labs. ' +
+      'For reCAPTCHA v2 / hCaptcha / Turnstile / FunCAPTCHA: the token is automatically injected — just submit the form after. ' +
       'For reCAPTCHA v3: the token is returned and you must inject it manually. ' +
-      'Takes ~15–60 seconds. ' +
+      'Takes ~15–120 seconds (FunCAPTCHA may take longer). ' +
       'NOTE: For simple image/text CAPTCHAs (distorted letters, math puzzles, custom image grids without a standard library), ' +
       'use request_user_captcha_solution instead.',
     inputSchema: {
@@ -160,16 +181,17 @@ emmaToolRegistry.register({
       properties: {
         captcha_type: {
           type: 'string',
-          enum: ['recaptcha_v2', 'recaptcha_v3', 'hcaptcha', 'turnstile'],
+          enum: ['recaptcha_v2', 'recaptcha_v3', 'hcaptcha', 'turnstile', 'funcaptcha'],
           description:
             'Type of CAPTCHA: "recaptcha_v2" = checkbox/invisible reCAPTCHA, ' +
             '"recaptcha_v3" = score-based invisible reCAPTCHA, ' +
             '"hcaptcha" = hCaptcha (look for data-sitekey on div.h-captcha or iframe src containing hcaptcha.com), ' +
-            '"turnstile" = Cloudflare Turnstile (look for div.cf-turnstile or iframe src containing challenges.cloudflare.com)'
+            '"turnstile" = Cloudflare Turnstile (look for div.cf-turnstile or iframe src containing challenges.cloudflare.com), ' +
+            '"funcaptcha" = FunCAPTCHA / Arkose Labs (used on X.com/Twitter — look for div[data-enforcementkey] or div[data-pkey] or iframe src containing arkoselabs.com or funcaptcha.com)'
         },
         site_key: {
           type: 'string',
-          description: 'The CAPTCHA site key — value of the data-sitekey attribute on the CAPTCHA widget element'
+          description: 'The CAPTCHA site key. For reCAPTCHA/hCaptcha/Turnstile: value of the data-sitekey attribute. For FunCAPTCHA/Arkose: value of the data-pkey or data-enforcementkey attribute on the widget div.'
         },
         page_url: {
           type: 'string',
@@ -263,8 +285,16 @@ emmaToolRegistry.register({
         }, 10000);
         break;
 
+      case 'funcaptcha':
+        token = await submit2CaptchaTask(apiKey, {
+          method: 'funcaptcha',
+          publickey: site_key,
+          pageurl: page_url
+        }, 30000);
+        break;
+
       default:
-        throw new Error(`Unknown captcha_type: ${captcha_type}. Supported: recaptcha_v2, recaptcha_v3, hcaptcha, turnstile`);
+        throw new Error(`Unknown captcha_type: ${captcha_type}. Supported: recaptcha_v2, recaptcha_v3, hcaptcha, turnstile, funcaptcha`);
     }
 
     // Inject the token into the page

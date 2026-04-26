@@ -774,13 +774,36 @@ export class McpClientService {
         }
         const configKey = poolKey ? poolKey.replace(/[^a-zA-Z0-9-_]/g, '_') : name;
         const configPath = path.join(configDir, `${configKey}.json`);
+        // Write stealth init script to a temp file (Playwright MCP requires a file path, not inline JS)
+        const stealthScriptContent = [
+          // Patch navigator.webdriver (primary headless signal)
+          `Object.defineProperty(navigator, 'webdriver', { get: () => undefined });`,
+          // Patch userAgentData brands to match a real Windows Chrome
+          `try { if (navigator.userAgentData) { Object.defineProperty(navigator, 'userAgentData', { get: () => ({ brands: [{ brand: 'Chromium', version: '124' }, { brand: 'Google Chrome', version: '124' }, { brand: 'Not-A.Brand', version: '99' }], mobile: false, platform: 'Windows', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64', brands: [{ brand: 'Chromium', version: '124' }, { brand: 'Google Chrome', version: '124' }, { brand: 'Not-A.Brand', version: '99' }], mobile: false, model: '', platform: 'Windows', platformVersion: '15.0.0', uaFullVersion: '124.0.6367.60', wow64: false }) }) }); } } catch(e) {}`,
+          // Ensure window.chrome exists (missing in headless)
+          `if (!window.chrome) { Object.defineProperty(window, 'chrome', { get: () => ({ runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} }) }); }`,
+          // Patch permissions.query so notifications return 'prompt' not 'denied'
+          `try { const oq = window.navigator.permissions?.query?.bind(window.navigator.permissions); if (oq) { window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: 'prompt', onchange: null }) : oq(p); } } catch(e) {}`,
+        ].join('\n');
+        const stealthScriptPath = path.join(configDir, `${configKey}-stealth.js`);
+        fs.writeFileSync(stealthScriptPath, stealthScriptContent);
+
         const config = {
           browser: {
             launchOptions: {
               args: [
                 '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials',
+                '--no-first-run',
+                '--password-store=basic',
+                '--use-mock-keychain',
               ]
-            }
+            },
+            contextOptions: {
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            },
+            initScript: [stealthScriptPath],
           }
         };
         fs.writeFileSync(configPath, JSON.stringify(config));

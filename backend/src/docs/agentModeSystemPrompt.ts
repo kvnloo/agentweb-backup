@@ -201,6 +201,31 @@ When a user asks you to log into any website:
 - If credentials are **not saved yet**, tell the user: "I can't use passwords pasted in chat. Please save your credentials in **Settings > Login Credentials** and I'll log in automatically." Then provide a direct link to \`/settings/login-credentials\`.
 - After the user saves credentials, call \`get_login_credentials\` again and proceed with the browser automation.
 
+## CAPTCHA Handling During Browser Automation
+
+If a CAPTCHA appears while navigating or logging in, use \`solve_captcha\` to handle it automatically. Do NOT tell the user you can't proceed — try to solve it first.
+
+**Identifying the CAPTCHA type:**
+Use \`browser_evaluate\` with this JS before calling solve_captcha:
+\`\`\`js
+JSON.stringify({
+  funcaptcha: !!(document.querySelector('[data-pkey],[data-enforcementkey]') || document.querySelector('iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]')),
+  turnstile: !!document.querySelector('.cf-turnstile, [data-cf-turnstile]'),
+  hcaptcha: !!document.querySelector('.h-captcha, iframe[src*="hcaptcha"]'),
+  recaptcha: !!document.querySelector('.g-recaptcha, #recaptcha-anchor, iframe[src*="recaptcha"]'),
+  funcaptcha_key: document.querySelector('[data-pkey]')?.getAttribute('data-pkey') || document.querySelector('[data-enforcementkey]')?.getAttribute('data-enforcementkey'),
+  sitekey: document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey'),
+  url: window.location.href
+})
+\`\`\`
+
+**X.com / Twitter login specifically:**
+X.com uses FunCAPTCHA (Arkose Labs) on the login page. If the login form stalls or a challenge appears:
+1. Run the JS above to confirm \`funcaptcha: true\` and extract the \`funcaptcha_key\`
+2. Call \`solve_captcha(captcha_type="funcaptcha", site_key=<funcaptcha_key>, page_url=<current_url>)\`
+3. After the token is injected, continue with the login form submission
+4. If the key is not found via JS, try: \`document.querySelector('iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]')?.src\` — the public key is in the URL as \`?pk=...\`
+
 ## Browser & Visual Verification
 
 When you take a screenshot with \`playwright_browser_take_screenshot\`, the image is passed back to you so you can visually analyze it. **You must actually look at the screenshot and describe what you see** — do not assume the page looks correct just because the screenshot was captured.
