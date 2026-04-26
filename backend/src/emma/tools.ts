@@ -4495,7 +4495,7 @@ emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
-    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead.",
+    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead. For a deployable landing page with a public URL hosted on Vercel, use generate_landing_page instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4515,7 +4515,7 @@ emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
-    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content.",
+    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content. NOTE: Do NOT use this to create a new landing page from scratch — use generate_landing_page for deployable landing pages hosted on Vercel.",
     inputSchema: {
       type: "object",
       properties: {
