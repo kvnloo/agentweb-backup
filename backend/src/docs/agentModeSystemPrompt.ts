@@ -354,7 +354,10 @@ When a user refers to a page or feature by name, use the corresponding tools —
 - "knowledge base", "KB", "knowledge files", "knowledge base page" → **list_knowledge_base_files**, **read_knowledge_base_files**
   - Use **list_knowledge_base_files** (not search_knowledge_base) when browsing files by name or date. Pass modified_after/modified_before to filter by date range. Pass kb_type="google-drive" to skip unrelated sources. Use limit/offset to paginate large folders.
   - Use **search_knowledge_base** only to search document *content* by topic or keyword — not to list files.
-- "templates", "email templates", "landing pages", "templates page" → **list_html_templates**
+- "templates", "email templates", "templates page" → **list_html_templates**
+- "landing page", "landing pages", "create a landing page", "build a landing page", "landing pages page" → **list_landing_pages**, **generate_landing_page**
+  - To CREATE a new landing page: call **read_brand_guidelines** first, then **create_lead_list** (name it "LP Leads - {page name}"), then **enable_lead_list_public_access**, then **generate_landing_page** (template_id is optional — only pass it if the user specifically wants to base the design on an existing template)
+  - To EDIT an existing landing page: **coding_agent** (pushes changes to a staging branch + Vercel preview) → **publish_landing_page_changes** (merges to production)
 - "books", "ebook", "book", "books page" → **list_books**, **get_book_content**
 - "research", "reports", "research reports", "deep research" → **perform_deep_research**
 - "tasks", "task list", "automations", "tasks page" → **list_task_templates**, **create_task_from_template**
