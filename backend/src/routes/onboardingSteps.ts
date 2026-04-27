@@ -91,6 +91,22 @@ function requireUserId(req: Request, res: Response): string | null {
   return userId;
 }
 
+/**
+ * Email pulled from the auth middleware. Used by status routes that need
+ * a strong-consistent base-table read (via `userDb.getUserByEmailConsistent`)
+ * to avoid the eventually-consistent UserIdIndex GSI returning stale rows
+ * during the 0-1000ms window after an updateUser write.
+ */
+function requireUserEmail(req: Request, res: Response): string | null {
+  const authReq = req as AuthenticatedRequest;
+  const email = authReq.user?.email;
+  if (!email) {
+    res.status(401).json({ message: "User not authenticated" });
+    return null;
+  }
+  return email;
+}
+
 // ───────────────────────────────────── ICP ─────────────────────────────────────
 
 router.post("/icp/start", authenticateToken, async (req, res) => {
@@ -116,9 +132,14 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
 
 router.get("/icp/status", authenticateToken, async (req, res) => {
   try {
-    const userId = requireUserId(req, res);
-    if (!userId) return;
-    const user = await userDb.getUserById(userId);
+    // Strong-consistent base-table read by email — see requireUserEmail
+    // doc + the 2026-04-27 Maya regen-spinner-stuck investigation. The
+    // GSI-based getUserById can return pre-update rows during the 0-1000ms
+    // window after the regenerate-one POST flips icpStatus to 'running',
+    // which causes the FE polling hook to terminate prematurely.
+    const email = requireUserEmail(req, res);
+    if (!email) return;
+    const user = await userDb.getUserByEmailConsistent(email);
     if (!user) return res.status(404).json({ message: "User not found" });
     return res.json({ status: icpSnapshot(user) });
   } catch (err) {
