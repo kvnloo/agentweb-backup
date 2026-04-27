@@ -5228,4 +5228,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Use "Sync Now" (Force Full Sync) on the Admin → Users tab to backfill all existing CRM leads with current user data',
     ],
   },
+  {
+    date: '2026-04-27',
+    changes: [
+      'New: Emma Suggests Scheduling After Successful Workflows',
+      '- After Emma completes a repeatable task (LinkedIn posts, articles, newsletters, research reports, etc.), she now proactively suggests setting up a scheduled chat so it runs automatically',
+      '- The suggestion appears in Emma\'s "Next Step" closing and offers to configure the schedule immediately if you say "schedule this"',
+      '- Emma skips the suggestion for one-off tasks, onboarding, and when you\'re already in a scheduled run',
+    ],
+  },
 ];

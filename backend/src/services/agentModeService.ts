@@ -1534,8 +1534,9 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
+      const sessionTypeLabel = currentSession?.sessionType === 'scheduled' ? '\nSession type: scheduled (this is an automated run — do NOT suggest creating a schedule)' : '';
       const messages: any[] = [
-        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
+        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
