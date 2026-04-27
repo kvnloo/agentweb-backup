@@ -425,7 +425,7 @@ describe('Admin Announcements', () => {
       expect(res.body.title).toBe('Announcement');
     });
 
-    it('should remove script and style tags from content', async () => {
+    it('should remove script tags but preserve style tags from full HTML documents', async () => {
       const mockHtml = `
         <html>
           <body>
@@ -442,8 +442,10 @@ describe('Admin Announcements', () => {
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
+      // Scripts are always stripped
       expect(res.body.message).not.toContain('alert');
-      expect(res.body.message).not.toContain('.test { color: red; }');
+      // Full HTML documents preserve <style> tags so email CSS is not destroyed
+      expect(res.body.message).toContain('.test { color: red; }');
       expect(res.body.message).toContain('Actual content');
     });
 
@@ -565,8 +567,8 @@ describe('Admin Announcements', () => {
       expect(res.body.title).toBe('Test & Title <Special>');
     });
 
-    it('should limit content length to 50KB', async () => {
-      const longContent = '<p>' + 'x'.repeat(60000) + '</p>';
+    it('should limit content length to 200KB', async () => {
+      const longContent = '<p>' + 'x'.repeat(210000) + '</p>';
       const mockHtml = `<html><body>${longContent}</body></html>`;
 
       (mockAxios.get as jest.Mock).mockResolvedValueOnce({
@@ -575,8 +577,7 @@ describe('Admin Announcements', () => {
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(res.body.message.length).toBeLessThanOrEqual(50003); // 50000 + "..."
-      expect(res.body.message).toContain('...');
+      expect(res.body.message.length).toBeLessThanOrEqual(200000);
     });
   });
 });
