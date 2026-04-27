@@ -3687,3 +3687,34 @@ The existing in-session `save_memory` mechanism is more precise because it only 
 ### Decision
 
 No action. The current memory system is sufficient. Revisit post-session extraction if we add a quality-scoring or deduplication layer that can filter out noise before writing.
+
+## Thunderbird Connected Account — Investigation (2026-04-27)
+
+### Context
+
+Investigated whether Thunderbird.net could be supported as a connected account (similar to Gmail, LinkedIn, etc.).
+
+### What Thunderbird Actually Is
+
+**Thunderbird is a local desktop email client, not a platform.** There is no "Thunderbird account" to OAuth into, no REST API, and no webhooks. It is analogous to Outlook the desktop app, not Outlook.com. The mail data lives on whatever IMAP/SMTP server the user configured (Gmail, Yahoo, a custom domain, etc.) — Thunderbird is just the local interface to it.
+
+Mozilla launched **Thundermail** (tb.pro, 2024) as a paid cloud email hosting service, but it is a standard IMAP/SMTP provider with no published developer API or OAuth flow.
+
+### Why Thunderbird as a Connected Account Is Not Practical
+
+- No OAuth authorization server exists — there is nothing to redirect users to
+- No REST API — no way for our backend to read or send email via Thunderbird
+- No webhooks or event system accessible outside the local process
+- The only programmatic access to Thunderbird is via a WebExtension Add-on running *inside* the local Thunderbird process — a fundamentally different architecture that requires users to install an extension and only works while Thunderbird is open on their machine
+
+### What We Can Support Instead
+
+The email accounts that Thunderbird users configure are standard providers that we can already support or could support through existing mechanisms:
+
+- **Gmail accounts** — already fully supported as a connected account via Gmail OAuth
+- **Outlook / Microsoft 365** — could be added via Microsoft OAuth (same pattern as Gmail)
+- **Thundermail and other IMAP providers** — could be added as a generic IMAP/SMTP connected account using credential-based auth (not OAuth)
+
+### Decision
+
+Do not build a Thunderbird-specific connected account — it is not architecturally feasible without requiring users to install a local extension. Instead, direct Thunderbird users to connect the underlying email account they use in Thunderbird (e.g., Gmail via the existing Gmail connected account flow).
