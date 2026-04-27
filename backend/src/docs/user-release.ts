@@ -5245,4 +5245,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma skips the suggestion for one-off tasks, onboarding, and when you\'re already in a scheduled run',
     ],
   },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Sequences Load-from-URL Now Preserves Email Formatting',
+      '- Loading a URL into a Sequence step email body now preserves the full HTML email document including all CSS styles',
+      '- Previously, the import stripped <style> tags and collapsed whitespace, destroying the layout of purpose-built HTML email templates',
+      '- The fix also applies to the CRM group-email and admin announcement load-from-URL features',
+    ],
+  },
 ];
