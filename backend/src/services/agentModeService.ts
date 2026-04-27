@@ -2074,12 +2074,15 @@ export class AgentModeService {
             // We use a text prefix to discourage embedding the raw URL in markdown responses.
             let toolContent: any;
             // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
+            // For Gemini, pass the S3 URL as text so the model can use describe_image on it if needed.
             const isGeminiModel = llmModel.startsWith('gemini-');
             if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
               toolContent = [
                 { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
                 { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
               ];
+            } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
+              toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${extractToolContent(result)}`;
             } else {
               toolContent = extractToolContent(result);
             }
