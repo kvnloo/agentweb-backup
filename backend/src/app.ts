@@ -79,7 +79,6 @@ import onboardingEventsRoutes from "./routes/onboardingEvents";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
-import dripCampaignsRoutes from "./routes/dripCampaigns";
 import usersRoutes from "./routes/users";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
@@ -290,10 +289,6 @@ app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
 app.use("/api/onboarding", onboardingStepsRoutes);
-// Phase A: drip campaigns are now customer-facing. Each user manages
-// their own campaigns scoped to their CRM leads. No isAdmin gate —
-// authenticateToken is the only middleware. See routes/dripCampaigns.ts.
-app.use("/api/drip-campaigns", authenticateToken, dripCampaignsRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
