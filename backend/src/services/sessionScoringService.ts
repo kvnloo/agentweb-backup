@@ -215,9 +215,9 @@ export async function scoreSessionWithJudgeIfNeeded(
 ): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
-  // Skip if already scored by this judge and up-to-date
+  // Skip if already scored by this judge, up-to-date, and has dimensional scores
   const existingJudgeScore = session.judgeScores?.[judge.id];
-  if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount) {
+  if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
     return null;
   }
 
@@ -252,10 +252,11 @@ export async function scoreSessionIfNeeded(
 
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
-  // Skip if already scored and up-to-date
+  // Skip if already scored, up-to-date, and has dimensional scores
   if (
     session.satisfactionScore &&
-    session.satisfactionScore.evaluatedMessageIndex >= messageCount
+    session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
+    session.satisfactionScore.dimensions
   ) {
     return null;
   }

@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-27',
     changes: [
+      'Fix: Chat History Now Returns Dimensional Scores When Using sync=true',
+      '- The get_chat_history tool now re-scores sessions that have an overall satisfaction score but are missing the dimensional breakdown (goalCompletion, dataAccuracy, outputQuality)',
+      '- Previously, sessions scored before dimensional scoring was introduced would never get backfilled with dimension scores even when sync=true was used',
+      '- Call get_chat_history with sync=true to backfill dimensional scores on existing sessions',
       'New: Google Calendar Skill — Emma Can Now Read Your Calendar',
       '- A new "Google Calendar" skill is available in Skills settings that lets Emma read your Google Calendar events',
       '- Emma can list upcoming events, look up event details (attendees, location, meeting link), and browse all your calendars',
