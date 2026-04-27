@@ -98,12 +98,16 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
     const userId = requireUserId(req, res);
     if (!userId) return;
     // startIcpDiscoveryForUser applies icpStartPatch synchronously and
-    // launches the background LLM call (fire-and-forget). The route returns
-    // the running snapshot immediately so the UI can poll /icp/status.
+    // launches the background LLM call (fire-and-forget). Return the
+    // running snapshot directly from the patch we just persisted — do
+    // NOT read the user back via getUserById here. UserIdIndex is
+    // eventually consistent, and a stale GSI read can return the
+    // pre-update row (icpStatus='ready' + previous icpResult), which
+    // tells the FE to stop polling. Source of truth for the response
+    // is what we just wrote, not what the GSI happens to surface in
+    // the next 100-1000ms.
     await startIcpDiscoveryForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = icpStartPatch();
-    return res.json({ status: icpSnapshot(user || fallback) });
+    return res.json({ status: icpSnapshot(icpStartPatch()) });
   } catch (err) {
     console.error("[icp] start failed", err);
     return res.status(500).json({ message: "Failed to start icp" });
@@ -680,9 +684,14 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // optimistically renders a per-card stall, then drops it when status
     // flips back to ready.
     await startIcpDiscoveryForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = icpStartPatch();
-    return res.json({ status: icpSnapshot(user || fallback) });
+    // Return the running snapshot directly from the patch we just wrote.
+    // Do NOT read back via getUserById — UserIdIndex is eventually
+    // consistent and the stale GSI row (icpStatus='ready' + old
+    // icpResult) was the root cause of the regen-spinner-stuck bug
+    // observed during the 2026-04-27 baseline rerun. With this change,
+    // the FE always sees status='running' immediately after the POST
+    // and keeps polling until the trigger persists fresh ICPs.
+    return res.json({ status: icpSnapshot(icpStartPatch()) });
   } catch (err) {
     console.error("[icp] regenerate-one failed", err);
     return res.status(500).json({ message: "Failed to regenerate icp" });

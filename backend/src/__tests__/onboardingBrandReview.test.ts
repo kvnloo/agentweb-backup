@@ -212,6 +212,38 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
     expect(startIcpDiscoveryForUser).toHaveBeenCalledTimes(1);
     expect(startIcpDiscoveryForUser).toHaveBeenCalledWith("user-1");
   });
+
+  it("returns icpStatus='running' even when getUserById returns stale GSI data", async () => {
+    // Repro of the bug observed during the 2026-04-27 baseline rerun
+    // (Maya persona): `userDb.getUserById` queries `UserIdIndex` (GSI),
+    // which is eventually consistent. Immediately after `updateUser`
+    // sets icpStatus='running', the GSI may still return the pre-update
+    // row showing icpStatus='ready' + the old icpResult. The route MUST
+    // NOT trust that stale read — otherwise the FE sees `ready`, stops
+    // polling, and the regen spinner sticks forever.
+    const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+    (startIcpDiscoveryForUser as jest.Mock).mockClear();
+    // Simulate a stale GSI read: getUserById returns the PRE-update row.
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpResult: [personaA, personaB],
+      icpStatus: "ready",
+      icpStartedAt: "2026-04-26T11:00:00.000Z",
+      icpCompletedAt: "2026-04-26T11:00:20.000Z",
+      icpDurationMs: 20_000,
+    });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app)
+      .post("/api/onboarding/icp/regenerate-one")
+      .send({ icpId: "icp-1" });
+    expect(res.status).toBe(200);
+    expect(res.body.status.icpStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
+    // icpResult should NOT be the stale array — running-state snapshot
+    // should not surface stale ICPs to the FE (avoids the regen spinner
+    // clearing prematurely on content-key match).
+    expect(res.body.status.icpResult).toBeUndefined();
+  });
 });
 
 // ───────────────────── /icp/delete-one ─────────────────────
