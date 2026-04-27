@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-27',
     changes: [
+      'Fix: Org Members Can Now Find and Update Leads Owned by the Org Owner',
+      '- Org members can now see and interact with lead lists that belong to other members of their org in Emma agent mode',
+      '- Previously, asking Emma to "find Alice Smith" or update a lead would return Access Denied if the list was owned by the org owner',
+      '- Fixed a DynamoDB pagination bug where org members with >218 users in the database were silently dropped, causing the org owner to not appear in the Users admin tab',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
       'Fixed: Batch Review Page Now Scrollable',
       '- The batch review page (shared externally for content approval) can now be scrolled when there are many assets to review',
       '- Previously the page was locked in place due to a global CSS setting intended for the main app, making it impossible to see assets below the fold',
