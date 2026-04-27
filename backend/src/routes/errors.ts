@@ -16,6 +16,12 @@ router.post('/report', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'operation and errorMessage are required' });
   }
 
+  // "Failed to fetch" is never actionable — drop it server-side so bots or scanners
+  // POSTing directly to this unauthenticated endpoint don't generate oncall noise.
+  if (String(errorMessage).trim() === 'Failed to fetch') {
+    return res.json({ ok: true });
+  }
+
   const userId = (req as any).user?.userId;
 
   // Fire-and-forget — respond immediately, don't block on Notion/email
