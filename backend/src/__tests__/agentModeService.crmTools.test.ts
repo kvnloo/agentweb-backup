@@ -19,6 +19,7 @@ jest.mock('../services/db', () => ({
     getLeadEngagementCount: jest.fn(),
     getLeadEngagements: jest.fn(),
     addLeadEngagement: jest.fn(),
+    canOrgMemberAccessList: jest.fn(),
   }
 }));
 
@@ -81,6 +82,10 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── getLeads ──────────────────────────────────────────────────────────
 
   describe('getLeads', () => {
+    beforeEach(() => {
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     it('should return leads from a list', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
@@ -142,6 +147,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should return access denied for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.getLeads(listId, userId, {});
 
@@ -203,6 +209,10 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── searchLeads ───────────────────────────────────────────────────────
 
   describe('searchLeads', () => {
+    beforeEach(() => {
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     it('should filter by equals operator (case insensitive)', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
@@ -368,6 +378,10 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── getLeadDetails ────────────────────────────────────────────────────
 
   describe('getLeadDetails', () => {
+    beforeEach(() => {
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     it('should return full lead details with engagements', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
@@ -461,6 +475,11 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── updateLead ────────────────────────────────────────────────────────
 
   describe('updateLead', () => {
+    beforeEach(() => {
+      // Default: grant access (list owned by same user)
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     it('should update standard fields', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
@@ -523,6 +542,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should deny access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.updateLead(listId, leadId, { company: 'X' }, userId);
 
@@ -1044,6 +1064,10 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── Error handling ────────────────────────────────────────────────────
 
   describe('Error handling', () => {
+    beforeEach(() => {
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     it('getLeads handles DB errors gracefully', async () => {
       mockCrmDb.getLeadListById.mockRejectedValue(new Error('DB connection failed'));
       const result = await service.getLeads(listId, userId, {});
