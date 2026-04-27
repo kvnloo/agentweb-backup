@@ -19,7 +19,10 @@ jest.mock('../services/db', () => ({
     getLeadEngagementCount: jest.fn(),
     getLeadEngagements: jest.fn(),
     addLeadEngagement: jest.fn(),
-  }
+  },
+  userDb: {
+    getUserById: jest.fn(),
+  },
 }));
 
 jest.mock('../services/resendService', () => ({
@@ -29,10 +32,11 @@ jest.mock('../services/resendService', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-import { crmDb } from '../services/db';
+import { crmDb, userDb } from '../services/db';
 import { resendService } from '../services/resendService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockResend = resendService as jest.Mocked<typeof resendService>;
 
 describe('AgentModeService - CRM Tools', () => {
@@ -454,6 +458,78 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.recentEngagements).toHaveLength(2);
       expect(result.recentEngagements[0].emailContentPreview).toBe('Welcome to our service!');
       expect(result.recentEngagements[1].emailContentPreview).toBe('Thanks for reaching out');
+    });
+
+    it('should override stale CRM subscriptionType with live value from user record when userId is present', async () => {
+      const leadWithStaleSubscription = {
+        ...mockLead,
+        customFields: {
+          userId: 'real-user-456',
+          subscriptionType: 'Super Premium', // stale value in CRM
+        },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithStaleSubscription as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+      mockUserDb.getUserById.mockResolvedValue({ subscriptionType: 'Partner' } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.customFields.subscriptionType).toBe('Partner');
+      expect(mockUserDb.getUserById).toHaveBeenCalledWith('real-user-456');
+    });
+
+    it('should return stale CRM subscriptionType unchanged when lead has no userId', async () => {
+      const leadWithNoUserId = {
+        ...mockLead,
+        customFields: { subscriptionType: 'Basic' },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithNoUserId as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.customFields.subscriptionType).toBe('Basic');
+      expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+    });
+
+    it('should keep stale subscriptionType when user lookup fails', async () => {
+      const leadWithUserId = {
+        ...mockLead,
+        customFields: { userId: 'user-789', subscriptionType: 'Free' },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithUserId as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+      mockUserDb.getUserById.mockRejectedValue(new Error('DB unavailable'));
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.customFields.subscriptionType).toBe('Free');
+    });
+
+    it('should keep stale subscriptionType when user record has no subscriptionType', async () => {
+      const leadWithUserId = {
+        ...mockLead,
+        customFields: { userId: 'user-789', subscriptionType: 'Free' },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithUserId as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'user-789' } as any); // no subscriptionType
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.customFields.subscriptionType).toBe('Free');
     });
   });
 
