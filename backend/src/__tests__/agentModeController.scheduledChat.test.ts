@@ -380,8 +380,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         if (callCount === 2) {
-          // Second attempt throws an error
-          throw new Error('Network error');
+          // Transient 503 error — should retry
+          const err: any = new Error('503 Service Unavailable');
+          err.status = 503;
+          throw err;
         }
         return Promise.resolve({
           ...mockResponse,
@@ -392,7 +394,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       const result = await runScheduledChat(baseSchedule, mockUserId, true);
 
-      // Should have been called 20 times (error on attempt 2, but continued)
+      // Should have been called 20 times (transient error on attempt 2, retried to exhaustion)
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
 
       expect(result).toEqual(

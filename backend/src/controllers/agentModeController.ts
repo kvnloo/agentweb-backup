@@ -847,6 +847,9 @@ export async function runVerifiedChat(
       if (isSessionLimitError(error)) {
         throw error;
       }
+      if (!isTransientLLMError(error) || isContextLimitError(error)) {
+        throw error;
+      }
       if (attempt === maxAttempts) {
         throw error;
       }
@@ -1166,7 +1169,7 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
-    // Send oncall alert if scheduled chat failed validation (not for test runs)
+    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs)
     if (!finalResult.passed && !isTest) {
       sendAgentModeOncallAlert({
         subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
@@ -1184,6 +1187,17 @@ export async function runScheduledChat(
           'Timestamp': finalResult.createdAt
         }
       }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
+      createOncallItem({
+        title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
+        description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+        additionalTags: ['Scheduled Chat'],
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'User ID': userId,
+          'Session ID': sessionId,
+          'Attempts': finalResult.attempt,
+        }
+      }).catch(err => console.error('Failed to create Notion item for scheduled chat failure:', err));
     }
 
     // Also sync Research Reports execution for email campaigns
@@ -1257,7 +1271,7 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
-    // Send oncall alert for scheduled chat exception (always, including test runs)
+    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
     sendAgentModeOncallAlert({
       subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
       message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
@@ -1273,6 +1287,18 @@ export async function runScheduledChat(
         'Timestamp': errorResult.createdAt
       }
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
+    createOncallItem({
+      title: `Scheduled Chat Error: ${schedule.scheduleName}`,
+      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      additionalTags: ['Scheduled Chat'],
+      context: {
+        'Schedule ID': schedule.scheduleId,
+        'User ID': userId,
+        'Session ID': sessionId || 'N/A',
+        'Is Test Run': isTest ? 'Yes' : 'No',
+        'Error Message': errorMessage,
+      }
+    }).catch(err => console.error('Failed to create Notion item for scheduled chat error:', err));
 
     // Return error result for error reporting
     return errorResult;

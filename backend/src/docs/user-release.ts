@@ -5198,6 +5198,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail When Taking Screenshots with Gemini',
+      '- Scheduled chats using Gemini models no longer crash with a 400 error after the browser takes a screenshot',
+      '- The screenshot S3 URL is now included in the tool result so Gemini can analyze it using the describe_image tool if needed',
+      '- Errors in scheduled chats now automatically file a Notion oncall ticket in addition to the existing email alert',
+      '- Fixed a bug where a single scheduled chat error would save the user message 20 times in the database due to over-aggressive retries',
+    ],
+  },
+  {
     date: '2026-04-26',
     changes: [
       'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
