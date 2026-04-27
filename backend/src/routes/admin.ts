@@ -21,7 +21,7 @@ import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../se
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts } from "../services/stripeService";
-import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
+import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
@@ -484,6 +484,7 @@ router.post("/users/:userId/deactivate", async (req, res) => {
     }
 
     const updatedUser = await userDb.deactivateUser(userId);
+    syncUserUpdateToLeadList(user.email, { isActive: false });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error deactivating user:", error);
@@ -506,6 +507,7 @@ router.post("/users/:userId/reactivate", async (req, res) => {
     }
 
     const updatedUser = await userDb.reactivateUser(userId);
+    syncUserUpdateToLeadList(user.email, { isActive: true });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error reactivating user:", error);
@@ -1493,6 +1495,7 @@ router.put("/waitlist/:email/status", async (req, res) => {
           if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
             const updatedRoles = [...existingUser.roles, 'customer'];
             await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+            syncUserUpdateToLeadList(existingUser.email, { roles: updatedRoles });
           }
           await emailService.sendWelcomeEmail(email); // No password = upgrade email
         } else {
@@ -1740,6 +1743,7 @@ router.post("/waitlist/invite", async (req, res) => {
           if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
             const updatedRoles = [...existingUser.roles, 'customer'];
             await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+            syncUserUpdateToLeadList(existingUser.email, { roles: updatedRoles });
           }
           await emailService.sendWelcomeEmail(email); // No password = upgrade email
         } else {
@@ -4485,6 +4489,7 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
 
     // Update the user's subscription type
     const updatedUser = await userDb.updateUser(userId, { subscriptionType });
+    syncUserUpdateToLeadList(user.email, { subscriptionType });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error updating user subscription type:", error);

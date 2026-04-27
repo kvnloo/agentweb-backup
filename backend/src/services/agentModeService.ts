@@ -6949,6 +6949,7 @@ export class AgentModeService {
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagements = engagementsResult.engagements || [];
+      const customFields = lead.customFields || {};
 
       // Truncate HTML email drafts to text preview
       let emailDraftPreview = null;

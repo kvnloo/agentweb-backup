@@ -455,6 +455,7 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.recentEngagements[0].emailContentPreview).toBe('Welcome to our service!');
       expect(result.recentEngagements[1].emailContentPreview).toBe('Thanks for reaching out');
     });
+
   });
 
   // ─── updateLead ────────────────────────────────────────────────────────
