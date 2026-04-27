@@ -621,6 +621,22 @@ export async function getHubSpotCredentials(): Promise<HubSpotCredentials> {
   }
 }
 
+/**
+ * Get 2captcha API key from AWS Secrets Manager.
+ * Secret format: plain string API key (not JSON).
+ */
+export async function get2CaptchaApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/2Captcha'
+    : 'dev/AgentWeb/2Captcha';
+  const key = await getSecret(secretName);
+  if (!key || key.trim() === '') {
+    throw new Error(`2captcha API key is empty. Store it in Secrets Manager at ${secretName}.`);
+  }
+  return key.trim();
+}
+
 export interface AttioCredentials {
   clientId: string;
   clientSecret: string;

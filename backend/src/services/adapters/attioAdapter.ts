@@ -120,22 +120,33 @@ export class AttioAdapter implements CrmAdapter {
 
                 let personId: string | undefined;
 
-                // ── DEBUG: log exact payload for name attribute ───────────────
-                console.log(`[AttioAdapter-DEBUG] lead=${lead.email} name payload:`, JSON.stringify(personValues.name));
-                console.log(`[AttioAdapter-DEBUG] lead=${lead.email} full personValues keys:`, Object.keys(personValues));
-                if (personValues.name) {
-                    console.log(`[AttioAdapter-DEBUG] name[0] keys:`, Object.keys(personValues.name[0] || {}));
-                }
+                // Only treat as email if it looks like a real address (not a placeholder like "unknown").
+                const hasEmail = lead.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(lead.email);
 
-                if (lead.email) {
+                if (hasEmail) {
                     const { recordId, isNew } = await svc.upsertPersonByValues(personValues);
                     personId = recordId;
                     if (isNew) result.newCount++; else result.updatedCount++;
                 } else if (lead.syncMetadata?.attio_record_id || lead.customFields?.attio_record_id || lead.attioRecordId) {
                     const existingId = lead.syncMetadata?.attio_record_id || lead.customFields?.attio_record_id || lead.attioRecordId;
-                    await svc.updatePersonByValues(existingId, personValues);
-                    personId = existingId;
-                    result.updatedCount++;
+                    try {
+                        if (Object.keys(personValues).length > 0) {
+                            await svc.updatePersonByValues(existingId, personValues);
+                        }
+                        personId = existingId;
+                        result.updatedCount++;
+                    } catch (updateErr: any) {
+                        const status = updateErr.response?.status;
+                        if (status === 404) {
+                            // Record was deleted from Attio — create a new one
+                            personId = await svc.createPersonByValues(personValues);
+                            result.newCount++;
+                            // Clear stale record ID so it gets overwritten below
+                            lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: undefined };
+                        } else {
+                            throw updateErr;
+                        }
+                    }
                 } else {
                     personId = await svc.createPersonByValues(personValues);
                     result.newCount++;
@@ -299,23 +310,37 @@ export class AttioAdapter implements CrmAdapter {
             if (m.crmProperty === 'company') continue;
 
             const value = this.getNestedValue(lead, m.agentwebField);
-            if (value == null || String(value).trim() === '' || typeof value === 'object') continue;
+            if (value == null || typeof value === 'object') continue;
+            const strValue = String(value).trim();
+            // Skip empty or known placeholder values that carry no real data.
+            if (!strValue || /^(unknown|n\/a|none|null|undefined|-)$/i.test(strValue)) continue;
 
-            const slug = m.crmProperty;
+            // Normalize legacy/variant slugs to the canonical Attio API names.
+            const slugAliases: Record<string, string> = {
+                email: 'email_addresses',
+                phone: 'phone_numbers',
+                firstname: 'first_name',
+                lastname: 'last_name',
+                jobtitle: 'job_title',
+                job_title_alias: 'job_title',
+                hs_linkedin_url: 'linkedin',
+            };
+            const slug = slugAliases[m.crmProperty] ?? m.crmProperty;
 
             const nativeFields = ['email_addresses', 'phone_numbers', 'first_name', 'last_name', 'job_title', 'linkedin'];
             if (!nativeFields.includes(slug) && !attrCache.has(`object:people:${slug}`)) continue;
 
             if (slug === 'email_addresses') {
-                values.email_addresses = [{ email_address: String(value) }];
+                if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(strValue)) continue;
+                values.email_addresses = [{ email_address: strValue }];
             } else if (slug === 'phone_numbers') {
-                values.phone_numbers = [{ original_phone_number: String(value) }];
+                values.phone_numbers = [{ original_phone_number: strValue }];
             } else if (slug === 'first_name' || slug === 'last_name') {
                 if (!values.name) values.name = [{}];
-                values.name[0][slug] = String(value);
+                values.name[0][slug] = strValue;
             } else {
                 const type = attrCache.get(`object:people:${slug}`) || 'text';
-                values[slug] = [this.formatAttioValue(value, type)];
+                values[slug] = [this.formatAttioValue(strValue, type)];
             }
         }
 

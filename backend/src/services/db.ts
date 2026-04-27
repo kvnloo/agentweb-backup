@@ -4,7 +4,9 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSchema";
+import type { AttributionTouch } from "../types/attribution";
+import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 
 // Load environment variables from .env file
@@ -96,6 +98,181 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  /**
+   * Onboarding event log — appended to by POST /api/onboarding/events. Used
+   * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each
+   * entry is the event name, server-side timestamp, and optional payload.
+   * Capped to the last 50 events to keep the User record bounded; older
+   * events are dropped FIFO.
+   */
+  onboardingEvents?: Array<{
+    event: string;
+    ts: string;
+    data?: Record<string, unknown>;
+  }>;
+  /**
+   * Derived onboarding stage, recomputed from `onboardingEvents` every time
+   * a new event is recorded. Not stored as source-of-truth — rebuildable
+   * from the event log via `deriveOnboardingStage` (utils/onboardingStage).
+   * Persisted so Dynamo queries can filter by stage without replaying the log.
+   */
+  onboardingStage?: string;
+  /**
+   * Lifecycle Drip — Phase 4. When `true`, the drip executor MUST NOT send
+   * this user any drip campaign email, regardless of segment match. Set by
+   * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
+   */
+  dripUnsubscribed?: boolean;
+  onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
+  onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
+  /**
+   * Onboarding v2 Phase 1 — brand build async status.
+   * Set to 'building' when the onboarding flow kicks off brand extraction,
+   * flipped to 'ready' when `brandGuidelines` is next written, or 'failed'
+   * on timeout/error. The UI renders a status pill based on this value so
+   * latency-hiding question screens (Phase 2) can proceed in parallel.
+   */
+  brandBuildStatus?: "building" | "ready" | "failed";
+  /** ISO timestamp when the async brand build was kicked off. */
+  brandBuildStartedAt?: string;
+  /** ISO timestamp when the build terminated (ready or failed). */
+  brandBuildCompletedAt?: string;
+  /** Wall-clock duration in ms from start to completion. Used for p50/p99 metrics. */
+  brandBuildDurationMs?: number;
+  /** Error message if `brandBuildStatus === 'failed'`. Surfaced to the graceful-fallback UI. */
+  brandBuildError?: string;
+  /**
+   * Onboarding v2 Phase 4 — ad creative generation async status.
+   * Separate state machine from brandBuildStatus because the two runs are
+   * concurrent during Phase 3→4 transition and have different timeout
+   * budgets. See `backend/src/services/adGenStatusService.ts`.
+   */
+  adGenStatus?: "generating" | "ready" | "failed";
+  /** ISO timestamp when ad-gen was kicked off. */
+  adGenStartedAt?: string;
+  /** ISO timestamp when ad-gen terminated (ready or failed). */
+  adGenCompletedAt?: string;
+  /** Wall-clock duration in ms. Used for p50/p99 metrics. */
+  adGenDurationMs?: number;
+  /** Error message if `adGenStatus === 'failed'`. */
+  adGenError?: string;
+  /**
+   * Persisted ad variants from the last successful generation. Rendered by
+   * the Phase 4 reveal UI. Array is capped at MAX_AD_VARIANTS (3) and each
+   * field is length-bounded — see `sanitizeAdVariants` for the contract.
+   */
+  adGenVariants?: Array<{
+    id: string;
+    headline: string;
+    primaryText: string;
+    cta: string;
+    imageUrl?: string;
+  }>;
+  /**
+   * Onboarding Epic — per-step state machines.
+   *
+   * Five concurrent state machines that each track one async step the
+   * onboarding flow can fire (ICP, competitor, creative direction, ad
+   * image, ad copy). The legacy single-axis `adGenStatus` mixed image +
+   * copy in one machine; this Epic splits each axis so a single failure
+   * doesn't block the others, and each screen can drive the step it hides
+   * without guessing what's already in flight.
+   *
+   * Each axis has the same shape (status / startedAt / completedAt /
+   * durationMs / error / result), tracked in its own pure state-machine
+   * module under `services/{axis}StatusService.ts` and exposed via
+   * `routes/onboardingSteps.ts`. Result types are loose `unknown[]`-ish
+   * structures so the LLM-output boundary can tighten them without
+   * churning persistence types every prompt iteration.
+   *
+   * State values: idle | running | ready | failed.
+   *   idle      — never started OR explicit reset
+   *   running   — async work in flight
+   *   ready     — terminal: result populated
+   *   failed    — terminal: error populated
+   *
+   * See:
+   *   - icpStatusService.ts        (5 personas)
+   *   - competitorStatusService.ts (per-icp targeting briefs)
+   *   - creativeDirStatusService.ts (concepts + copy angles + archetypes)
+   *   - adImageStatusService.ts    (3 image variants)
+   *   - adCopyStatusService.ts     (3 copy variants with variety tags)
+   */
+  // ── ICP axis ──
+  icpStatus?: "idle" | "running" | "ready" | "failed";
+  icpStartedAt?: string;
+  icpCompletedAt?: string;
+  icpDurationMs?: number;
+  icpError?: string;
+  icpResult?: Array<{
+    name: string;
+    pain: string;
+    desire: string;
+    objection: string;
+    meta_targeting_brief: string;
+  }>;
+  // ── Competitor axis ──
+  competitorStatus?: "idle" | "running" | "ready" | "failed";
+  competitorStartedAt?: string;
+  competitorCompletedAt?: string;
+  competitorDurationMs?: number;
+  competitorError?: string;
+  competitorResult?: {
+    per_icp: Array<{
+      icp_id: string;
+      competitor_names: string[];
+      offer_angles: string[];
+      meta_targeting_brief: string;
+    }>;
+  };
+  // ── Creative direction axis ──
+  creativeDirStatus?: "idle" | "running" | "ready" | "failed";
+  creativeDirStartedAt?: string;
+  creativeDirCompletedAt?: string;
+  creativeDirDurationMs?: number;
+  creativeDirError?: string;
+  creativeDirResult?: {
+    concepts: string[];
+    copy_angles: string[];
+    format_archetypes: string[];
+  };
+  // ── Ad image axis ──
+  adImageStatus?: "idle" | "running" | "ready" | "failed";
+  adImageStartedAt?: string;
+  adImageCompletedAt?: string;
+  adImageDurationMs?: number;
+  adImageError?: string;
+  adImageResult?: {
+    variants: Array<{
+      id: string;
+      imageUrl: string;
+      prompt: string;
+    }>;
+  };
+  // ── Ad copy axis ──
+  adCopyStatus?: "idle" | "running" | "ready" | "failed";
+  adCopyStartedAt?: string;
+  adCopyCompletedAt?: string;
+  adCopyDurationMs?: number;
+  adCopyError?: string;
+  adCopyResult?: {
+    variants: Array<{
+      id: string;
+      headline: string;
+      primaryText: string;
+      cta: string;
+      variety: string;
+    }>;
+  };
+  // ── Ad variant ratings (Phase 4 "Ads Tinder" swipe UI) ──
+  // Append-only log of like/reject decisions per variant. Capped at 50.
+  // Used by the LLM regen prompts to bias future variants away from
+  // rejected directions. See `adVariantRatingService.ts`.
+  adVariantsRated?: Array<{
+    variantId: string;
+    rating: "like" | "reject";
+    ratedAt: string;
+  }>;
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -153,6 +330,13 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   }>;
+  /**
+   * Onboarding v2 — value proposition the user committed to on the
+   * BrandReview gate screen (between dataGathering and adReveal).
+   * Stored separately from `marketStrategy.icp[].valueProposition` because
+   * it represents the brand-level value prop, not a per-ICP one.
+   */
+  valueProp?: string;
   introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
@@ -169,11 +353,36 @@ export interface User {
     totalCost: number;
   }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
+  extraCostUsage?: {
+    month: string;      // "YYYY-MM" format for current tracking month
+    totalCost: number;  // cumulative extra API cost in USD this month (enrichment, image gen, etc.)
+    breakdown: Record<string, number>; // cost by source key (e.g. { enrichment: 4.5, image_gen: 1.2 })
+    resetDate: string;  // ISO date of next monthly reset
+  };
+  extraCostUsageHistory?: Array<{
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+  }>;                   // Up to 24 past months, oldest first
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
   has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
+  /**
+   * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
+   * from Pro to Starter that takes effect at period_end). Cached here from
+   * subscription_schedules so the UI can surface it without hitting Stripe on
+   * every /auth/me. Cleared when: (a) the schedule fires (webhook → schedule.completed),
+   * (b) the user explicitly cancels it via /api/stripe/cancel-scheduled-downgrade,
+   * or (c) the schedule is released/canceled for any other reason (webhook).
+   */
+  scheduledChange?: {
+    stripeScheduleId: string;
+    toPriceId: string;
+    toTier: string; // e.g., "Starter"
+    effectiveAt: string; // ISO 8601
+  } | null;
   /**
    * Stripe Connect OAuth — customer-authorized read-only access to their own
    * Stripe account. Used to enrich CRM contacts with the customer's live
@@ -241,6 +450,8 @@ export interface User {
         custom?: string;
       };
     };
+    /** When true, org members can see and use this account. Default: false (private). */
+    sharedWithOrg?: boolean;
     created_at: string;
     updated_at: string;
   }>;
@@ -481,7 +692,8 @@ class UserDB {
     googleId?: string,
     stripe_customer_id?: string,
     companyName?: string,
-    useCaseCategories?: string[]
+    useCaseCategories?: string[],
+    attribution?: import("../types/attribution").AttributionTouch
   ): Promise<User | undefined> {
     const itemToCreate: any = {
       userId,
@@ -527,6 +739,7 @@ class UserDB {
         companyName,
         isOAuthUser,
         createdAt: itemToCreate.createdAt,
+        ...(attribution && { attribution }),
       });
       return params.Item as User;
     } catch (error) {
@@ -576,9 +789,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "stripe_customer_id = :scid",
+        FilterExpression: "stripe_customer_id = :scid AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":scid": stripeCustomerId,
+          ":tombstone": "deleted_",
         },
       };
 
@@ -598,9 +812,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "stripeConnectedAccountId = :cid",
+        FilterExpression: "stripeConnectedAccountId = :cid AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":cid": connectedAccountId,
+          ":tombstone": "deleted_",
         },
       };
       // Full table scan — small user base today, add a GSI if this becomes hot.
@@ -626,9 +841,10 @@ class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain',
+          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
+            ':tombstone': 'deleted_',
           },
           ExclusiveStartKey: lastEvaluatedKey,
         };
@@ -645,7 +861,22 @@ class UserDB {
     }
   }
 
-  async getAllUsers(): Promise<UserWithCounts[]> {
+  static isBotLikeEmail(email: string): boolean {
+    if (!email) return false;
+    const [local, domain] = email.split("@");
+    if (!domain) return false;
+    // Gmail dot-trick bots: 3+ dots in the local part
+    if (domain === "gmail.com" && (local.match(/\./g) || []).length >= 3) return true;
+    // Internal test/smoke accounts
+    const testDomains = ["test.com", "onb.com"];
+    if (testDomains.includes(domain)) return true;
+    const ownDomain = "agentweb.pro";
+    if (domain === ownDomain && /^(test|smoketest|attrtest)/.test(local)) return true;
+    if (domain === `updates.${ownDomain}`) return true;
+    return false;
+  }
+
+  async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
     try {
       const params = {
         TableName: this.tableName,
@@ -654,7 +885,9 @@ class UserDB {
 
       const result = await this.docClient.scan(params).promise();
       const users = (result.Items || []).filter(
-        (u) => !u.userId?.startsWith("deleted_")
+        (u) =>
+          !u.userId?.startsWith("deleted_") &&
+          (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
       );
 
       // Get task and workflow counts for each user
@@ -690,12 +923,13 @@ class UserDB {
     filterExpression: string,
     expressionAttributeValues: Record<string, any>,
   ): Promise<any[]> {
-    const hasValues = Object.keys(expressionAttributeValues).length > 0;
+    const combinedFilter = `NOT begins_with(userId, :_tombstone_prefix) AND (${filterExpression})`;
+    const combinedValues = { ...expressionAttributeValues, ':_tombstone_prefix': 'deleted_' };
     const result = await this.docClient
       .scan({
         TableName: this.tableName,
-        FilterExpression: filterExpression,
-        ...(hasValues && { ExpressionAttributeValues: expressionAttributeValues }),
+        FilterExpression: combinedFilter,
+        ExpressionAttributeValues: combinedValues,
       })
       .promise();
     return result.Items || [];
@@ -930,9 +1164,10 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        FilterExpression: "resetPasswordToken = :token",
+        FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: {
           ":token": resetToken,
+          ":tombstone": "deleted_",
         },
       };
 
@@ -1410,6 +1645,22 @@ export const taskDb = {
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "updateTaskExecution");
+    }
+  },
+
+  async updateTaskExecutionResultFiles(
+    executionId: string,
+    resultFiles: Array<{ url: string; filename: string; token: string; is_html?: boolean; searchableText?: string; [key: string]: any }>
+  ) {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: { executionId },
+        UpdateExpression: 'SET result_files = :files',
+        ExpressionAttributeValues: { ':files': resultFiles },
+      }).promise();
+    } catch (error) {
+      console.error(`Error updating result_files for execution ${executionId}:`, error);
     }
   },
 
@@ -3749,6 +4000,11 @@ export const crmDb = {
     dealIds?: string[];
     tenantId?: string;
     syncMetadata?: Record<string, any>;
+    // Attribution fields (mirror User schema — see types/attribution.ts)
+    firstTouch?: AttributionTouch;
+    lastTouch?: AttributionTouch;
+    utmSource?: string;
+    utmMedium?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3830,6 +4086,21 @@ export const crmDb = {
       });
       Object.assign(item, crmFields);
 
+      // Attribution fields (Lead UTM — mirrors User schema). firstTouch is
+      // stamped on creation and never mutated; lastTouch is refreshed on each
+      // touch. utmSource / utmMedium are denormalized from firstTouch for
+      // cheap channel-attribution filter queries.
+      const attributionFields = buildLeadAttributionFields({
+        firstTouch: leadData.firstTouch,
+        // On a brand-new Lead, if only firstTouch is supplied, treat it as
+        // lastTouch too — same contract as the User registration path in
+        // controllers/auth.ts.
+        lastTouch: leadData.lastTouch || leadData.firstTouch,
+        utmSource: leadData.utmSource,
+        utmMedium: leadData.utmMedium,
+      });
+      Object.assign(item, attributionFields);
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Item: item,
@@ -3863,6 +4134,38 @@ export const crmDb = {
 
       // Increment lead count
       await this.incrementLeadCount(listId, 1);
+
+      // Attribution event — fire once per Lead when any attribution signal is
+      // captured. Dedupe via sourceRecordId (`attribution:lead:{leadId}`) so
+      // retries on the same lead create a single row.
+      if (leadData.firstTouch) {
+        const contactId = emailValue || `nocontact:${leadId}`;
+        try {
+          await contactEventsDb.logEvent({
+            contactId: normalizeContactId(contactId),
+            source: 'lead_form',
+            eventType: 'attribution.first_touch',
+            sourceRecordId: `attribution:lead:${leadId}`,
+            payload: {
+              leadId,
+              listId,
+              firstTouch: leadData.firstTouch,
+              // Denormalized for cheap dashboard queries — same shape the
+              // User signup event emits.
+              utmSource: leadData.firstTouch.utm?.source,
+              utmMedium: leadData.firstTouch.utm?.medium,
+              utmCampaign: leadData.firstTouch.utm?.campaign,
+              referrer: leadData.firstTouch.referrer,
+              landingUrl: leadData.firstTouch.landingUrl,
+            },
+            ...(leadData.tenantId ? { tenantId: leadData.tenantId } : {}),
+          });
+        } catch (eventErr) {
+          // Never fail lead creation on an event-log write error — the lead
+          // row has already been persisted above. Log and continue.
+          console.error('[createLead] attribution.first_touch logEvent failed:', eventErr);
+        }
+      }
 
       return params.Item;
     } catch (error) {
@@ -4942,6 +5245,45 @@ export const crmDb = {
       UpdateExpression: 'SET linkedinMessageSyncAt = :syncAt, updatedAt = :updatedAt',
       ExpressionAttributeValues: {
         ':syncAt': syncAt,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }).promise();
+  },
+
+  /**
+   * Onboarding v2 dual-write helper — mirror per-User onboarding analytics
+   * onto the matching Lead row. The user-facing route (onboardingEvents.ts)
+   * writes to the User record first, then fire-and-forget calls this to
+   * keep the Lead in sync so Fangfang / Emma can see the full flow on the
+   * Lead detail page.
+   *
+   * Writes three top-level attributes on the Lead:
+   *   - onboardingEvents: OnboardingEvent[] (full log mirror)
+   *   - onboardingStage: OnboardingStage
+   *   - onboardingDeviationCount: int
+   *
+   * Overwrites atomically — this is a pure projection of User state.
+   * Task: https://www.notion.so/34c09247c951812cbc90f09aa68fc5d3
+   */
+  async updateLeadOnboardingAnalytics(
+    listId: string,
+    leadId: string,
+    analytics: {
+      onboardingEvents: unknown[];
+      onboardingStage: string;
+      onboardingDeviationCount: number;
+    },
+  ): Promise<void> {
+    const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET onboardingEvents = :events, onboardingStage = :stage, onboardingDeviationCount = :dc, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':events': analytics.onboardingEvents,
+        ':stage': analytics.onboardingStage,
+        ':dc': analytics.onboardingDeviationCount,
         ':updatedAt': new Date().toISOString(),
       },
     }).promise();

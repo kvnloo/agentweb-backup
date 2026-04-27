@@ -15,14 +15,14 @@ emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
     name: 'install_skills',
-    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
+    description: 'Install skills by their IDs. Pass ALL skill IDs you need in a single call — do not call this tool multiple times. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
     inputSchema: {
       type: 'object',
       properties: {
         skillIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of skill IDs to install.'
+          description: 'Array of ALL skill IDs to install. Include every skill you need in one call.'
         }
       },
       required: ['skillIds']
@@ -203,7 +203,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         account_id: {
           type: 'string',
-          description: 'The Unipile account ID for the LinkedIn connection. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
+          description: 'The Unipile account ID for the LinkedIn connection. Optional for search-people and get-profile — the system will automatically use a platform-wide account if the user has no personal account connected. For write actions (send-invite, send-message), must be the user\'s own account. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
         },
         profile_url: {
           type: 'string',
@@ -258,7 +258,7 @@ For target person identification (send-invite, send-message, get-profile, update
           description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
         }
       },
-      required: ['action', 'account_id']
+      required: ['action']
     }
   },
   execute: async (args: any, context: any) => {
@@ -282,7 +282,7 @@ emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
-    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Use this to show users available campaigns before fetching metrics with get_meta_ads_metrics.',
+    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -629,7 +629,7 @@ emmaToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           minItems: 1,
-          description: 'Required list of campaign IDs to filter metrics by. Use call_meta_marketing_api to get available campaign IDs.'
+          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
         }
       },
       required: ['campaign_ids']
@@ -1807,7 +1807,7 @@ emmaToolRegistry.register({
   name: 'list_html_templates',
   definition: {
     name: 'list_html_templates',
-    description: "Get a list of all available HTML templates for the user (email and/or landing page templates). Use the optional 'type' filter to narrow results.",
+    description: "Get a list of all available HTML templates for the user (email and/or landing page templates). Use the optional 'type' filter to narrow results. IMPORTANT: If multiple templates share the same template_name, ask the user to choose which one to use and confirm by template_id (or by created_at/updated_at and isPublic if needed).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -1828,13 +1828,13 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool.',
     inputSchema: {
       type: 'object',
       properties: {
-        template_name: {
+        template_id: {
           type: 'string',
-          description: 'Name of the HTML template to use'
+          description: 'ID of the HTML template to use (from list_html_templates)'
         },
         variable_values_json: {
           type: 'string',
@@ -1845,14 +1845,14 @@ emmaToolRegistry.register({
           description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
         }
       },
-      required: ['template_name', 'variable_values_json', 'array_variable_values_json']
+      required: ['template_id', 'variable_values_json', 'array_variable_values_json']
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.template_name) {
+    if (!args.template_id) {
       return {
         success: false,
-        message: 'template_name is required'
+        message: 'template_id is required'
       };
     }
 
@@ -1884,7 +1884,7 @@ emmaToolRegistry.register({
       };
     }
 
-    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_name, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
+    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_id, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
   }
 });
 
@@ -3829,8 +3829,8 @@ emmaToolRegistry.register({
         },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
+          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gpt-image-2 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
         }
       },
       required: ['prompt', 'filename']
@@ -4110,15 +4110,43 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List all available knowledge base files for the current user, including private (user-specific), public (shared by all users) knowledge bases, Google Drive shared folders, and ClickUp docs. Google Drive entries have identifiers starting with "gdrive:" followed by the folder ID. ClickUp entries have identifiers starting with "clickup:" followed by the workspace ID. Returns a list of files with their unique identifiers, names, sizes, types (public/private/google-drive/clickup), and last updated timestamps.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp entries start with "clickup:". Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        modified_after: {
+          type: "string",
+          description: 'Only return files modified on or after this date. ISO 8601 date string, e.g. "2026-04-15". Applies to Google Drive files.'
+        },
+        modified_before: {
+          type: "string",
+          description: 'Only return files modified on or before this date. ISO 8601 date string, e.g. "2026-04-22". Applies to Google Drive files.'
+        },
+        limit: {
+          type: "number",
+          description: 'Maximum number of files to return per knowledge base source (default: 100). Use with offset for pagination.'
+        },
+        offset: {
+          type: "number",
+          description: 'Number of files to skip within each knowledge base source (default: 0). Use with limit for pagination.'
+        },
+        kb_type: {
+          type: "string",
+          enum: ["google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"],
+          description: 'Filter to only return a specific type of knowledge base. Omit to return all types.'
+        }
+      },
       required: []
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listKnowledgeBaseFiles(context?.userId);
+    return await agentModeService.listKnowledgeBaseFiles(context?.userId, {
+      modified_after: args?.modified_after,
+      modified_before: args?.modified_before,
+      limit: args?.limit,
+      offset: args?.offset,
+      kb_type: args?.kb_type,
+    });
   }
 });
 
@@ -4483,7 +4511,7 @@ emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
-    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead.",
+    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead. For a deployable landing page with a public URL hosted on Vercel, use generate_landing_page instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4503,10 +4531,14 @@ emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
-    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content.",
+    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content. NOTE: Do NOT use this to create a new landing page from scratch — use generate_landing_page for deployable landing pages hosted on Vercel.",
     inputSchema: {
       type: "object",
       properties: {
+        template_id: {
+          type: "string",
+          description: "Optional ID of an existing template to update. If provided, the template with this ID will be updated."
+        },
         html_source: {
           type: "string",
           description: "Either an S3 URL to an HTML file, or raw HTML content string"
@@ -4535,6 +4567,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await agentModeService.createHtmlTemplate(
       args.html_source,
+      args.template_id,
       args.template_name,
       args.subject,
       args.additional_instructions || '',
@@ -4577,6 +4610,31 @@ emmaToolRegistry.register({
 
     return await agentModeService.saveFile(args.file_name, args.file_content, context?.userId, context?.sessionId);
   }
+});
+
+emmaToolRegistry.register({
+  name: 'convert_to_pdf',
+  definition: {
+    name: 'convert_to_pdf',
+    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_url: {
+          type: 'string',
+          description: 'The URL of the HTML file to convert to PDF (e.g. an S3 URL from a previously saved HTML file)',
+        },
+        output_filename: {
+          type: 'string',
+          description: 'Desired filename for the PDF (without extension, e.g. "sentriq-readiness-checklist-v5")',
+        },
+      },
+      required: ['source_url', 'output_filename'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId);
+  },
 });
 
 // --- Tools from workflowTools.ts ---
@@ -4988,7 +5046,7 @@ emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
     name: 'account_summary',
-    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    description: 'Get a full account overview. Returns: (1) account state — connected account count, knowledge base file count, saved config count, task count, active schedule count; (2) activity over the time period — sessions, assets (images, videos, reports, social posts, blogs), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5424,6 +5482,10 @@ const adminToolNames = [
   'freeze_user_account',
   'manage_scoring_judges',
   'manage_user_notes',
+  // Lifecycle Drip Phase 2: segment users by onboarding stage for drip campaigns
+  'get_users_by_lifecycle_stage',
+  // Lifecycle Drip Phase 3: CRUD on drip campaign configs (admin-only)
+  'manage_drip_campaign',
 ];
 
 for (const toolName of bridgedToolNames) {
@@ -6259,6 +6321,95 @@ emmaToolRegistry.register({
   }
 });
 
+emmaToolRegistry.register({
+  name: 'log_contact_event',
+  definition: {
+    name: 'log_contact_event',
+    description:
+      "Log a natural-language activity event on a CRM contact's timeline. Use this when the user dictates a note like 'add a note that I called Jane and left a voicemail' or 'log that Acme sent over the signed contract'. The event shows up in the contact's Activity Timeline alongside auto-captured events (form submits, payments, meetings). Input: contactId (normalized email, e.g. 'jane@acme.com'), eventType (pick from known types — use 'manual.note' for freeform notes, 'meeting.attended' for calls, 'support.opened' for issues, etc), summary (1-line human-readable description), details (optional structured data).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contactId: {
+          type: 'string',
+          description:
+            "The contact to log against. Almost always the contact's lowercase email (e.g. 'jane@acme.com'). For leads without an email, use the fallback form 'nocontact:<leadId>'.",
+        },
+        eventType: {
+          type: 'string',
+          description:
+            "Event type. Use 'manual.note' for freeform notes; 'meeting.attended' for call/meeting logs; 'support.opened' / 'support.resolved' for issues; 'engagement.email_clicked' etc for engagement events you know happened but weren't auto-captured. Defaults to 'manual.note' if omitted.",
+        },
+        summary: {
+          type: 'string',
+          description:
+            "Short 1-line human-readable summary of the event. Shown verbatim on the timeline. E.g. 'Left voicemail — asked about enterprise pricing'.",
+        },
+        details: {
+          type: 'object',
+          description:
+            'Optional structured data to attach to the event (duration, source, references, etc). Shown as metadata under the summary on the timeline.',
+        },
+      },
+      required: ['contactId', 'summary'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId: string | undefined = context?.userId || context?.agentUserId;
+    if (!userId) {
+      return { error: 'Authentication required: no user context' };
+    }
+
+    const contactId = typeof args.contactId === 'string' ? args.contactId.trim() : '';
+    const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+    const eventType =
+      typeof args.eventType === 'string' && args.eventType ? args.eventType : 'manual.note';
+
+    if (!contactId) {
+      return { error: 'contactId is required' };
+    }
+    if (!summary) {
+      return { error: 'summary is required' };
+    }
+
+    const { logManualEvent, isKnownContactEventType } = await import(
+      '../services/contactCaptureHooks'
+    );
+
+    // Accept unknown types (forward-compat) but surface a warning so the user
+    // knows the timeline renderer may not have a template for it yet.
+    const warning = isKnownContactEventType(eventType)
+      ? undefined
+      : `Unknown eventType "${eventType}" — logged, but the timeline renderer may show it as a generic row.`;
+
+    const details =
+      args.details && typeof args.details === 'object' && !Array.isArray(args.details)
+        ? (args.details as Record<string, unknown>)
+        : undefined;
+
+    const result = await logManualEvent({
+      contactId,
+      eventType,
+      summary,
+      details,
+      loggedByUserId: userId,
+    });
+
+    if (!result) {
+      return { error: 'Failed to log contact event' };
+    }
+
+    return {
+      success: true,
+      eventId: result.event.eventId,
+      eventType: result.event.eventType,
+      contactId: result.event.contactId,
+      deduplicated: result.deduplicated,
+      ...(warning ? { warning } : {}),
+    };
+  },
+});
+
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
@@ -6271,3 +6422,137 @@ for (const toolName of adminToolNames) {
     console.warn(`[emma/tools] Failed to bridge admin tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }
+
+// Login credentials tool — lets Emma retrieve saved website credentials for browser automation
+emmaToolRegistry.register({
+  name: 'get_login_credentials',
+  definition: {
+    name: 'get_login_credentials',
+    description: 'Retrieve saved login credentials for a website domain. Use this when you need to log into a website during browser automation. Credentials must be pre-saved by the user in Settings > Login Credentials. Never ask the user to paste passwords in chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        domain: {
+          type: 'string',
+          description: 'The domain of the website to get credentials for (e.g. "linkedin.com", "app.hubspot.com")'
+        }
+      },
+      required: ['domain']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const domain = (args.domain || '').toLowerCase().trim();
+    if (!domain) return { error: 'domain is required' };
+
+    const { DynamoDB } = await import('aws-sdk');
+    const { decryptPassword } = await import('../utils/crypto');
+    const dynamodb = new DynamoDB.DocumentClient();
+    const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+    // Extract base domain for fuzzy matching (strip www. and subdomains down to registrable domain)
+    const baseDomain = domain.replace(/^www\./, '');
+
+    const result = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'attribute_not_exists(isApiConfig) OR isApiConfig = :false',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+        ':false': false
+      }
+    }).promise();
+
+    const items = result.Items || [];
+
+    // Match by exact domain or base domain suffix
+    const match = items.find((c: any) => {
+      const w = (c.website || '').toLowerCase();
+      return w === domain || w === baseDomain || domain.endsWith('.' + w) || baseDomain.endsWith('.' + w);
+    });
+
+    if (!match) {
+      const saved = items.filter((c: any) => !c.isApiConfig).map((c: any) => c.website).join(', ');
+      return {
+        error: `No credentials saved for "${domain}". Please go to Settings > Login Credentials to save them first.`,
+        savedDomains: saved || 'none'
+      };
+    }
+
+    const encrypted = match.encryptedPassword || match.password;
+    if (!encrypted) {
+      return { error: `Credentials found for "${match.website}" but no password is stored.` };
+    }
+
+    try {
+      const { password } = decryptPassword(encrypted);
+      return {
+        username: match.username,
+        password,
+        domain: match.website
+      };
+    } catch {
+      return { error: `Failed to decrypt credentials for "${match.website}". The saved credentials may be corrupted.` };
+    }
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'import_leads_from_search',
+  definition: {
+    name: 'import_leads_from_search',
+    description: `Search LinkedIn for people and import the results directly into a CRM lead list.
+Uses the user's connected LinkedIn account if available, otherwise falls back to platform-wide outreach accounts — so this works even without a personal LinkedIn connection.
+
+Use this when the user wants to:
+- Find leads matching a job title, company, or keyword
+- Populate a CRM list with discovered prospects
+- Discover new contacts to reach out to
+
+After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID to import leads into. Required.'
+        },
+        keywords: {
+          type: 'string',
+          description: 'Free-text search keywords (e.g. "software engineer San Francisco").'
+        },
+        title: {
+          type: 'string',
+          description: 'Job title filter (e.g. "CTO", "VP Sales"). Combined with keywords/company for targeted search.'
+        },
+        company: {
+          type: 'string',
+          description: 'Company name filter. Combined with title/keywords for targeted search.'
+        },
+        search_url: {
+          type: 'string',
+          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to import. Defaults to 20, max 100.'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) throw new Error('Authentication required');
+    const limit = Math.min(args.limit ?? 20, 100);
+    return agentModeService.importLeadsFromSearch(context.userId, {
+      listId: args.list_id,
+      keywords: args.keywords,
+      search_url: args.search_url,
+      title: args.title,
+      company: args.company,
+      limit,
+    });
+  }
+});

@@ -168,6 +168,137 @@ export async function incrementUserTokenUsage(
   }
 }
 
+// ─── Extra Cost Usage ─────────────────────────────────────────────────────────
+// Tracks non-token API costs (Google Search, enrichment, image gen, etc.) per
+// user per month. Uses the same lazy-reset + 24-month history pattern as tokens.
+
+export interface ExtraCostUsageStatus {
+  allowed: boolean;
+  warning: boolean;
+  used: number;       // USD spent this month
+  allowance: number | null; // null = unlimited
+  percentUsed: number;
+  month: string;
+}
+
+/**
+ * Get a user's current month extra cost usage, with lazy reset if month changed.
+ */
+export async function getUserExtraCostUsage(
+  userId: string
+): Promise<{ month: string; totalCost: number; breakdown: Record<string, number> }> {
+  const user = await userDb.getUserById(userId);
+  if (!user) throw new Error(`User not found: ${userId}`);
+
+  const currentMonth = getCurrentMonth();
+  const usage = user.extraCostUsage;
+
+  if (!usage || usage.month !== currentMonth) {
+    return { month: currentMonth, totalCost: 0, breakdown: {} };
+  }
+
+  return {
+    month: currentMonth,
+    totalCost: usage.totalCost || 0,
+    breakdown: usage.breakdown || {},
+  };
+}
+
+/**
+ * Check if a user can incur more extra cost this month.
+ */
+export async function checkExtraCostUsage(userId: string): Promise<ExtraCostUsageStatus> {
+  const usage = await getUserExtraCostUsage(userId);
+  const subscriptionTypeName = await getUserSubscriptionType(userId);
+  const config = await getSubscriptionTypeConfig(subscriptionTypeName);
+  const allowance = config?.monthlyExtraCostAllowance ?? null;
+
+  if (allowance === null || allowance === undefined) {
+    return {
+      allowed: true,
+      warning: false,
+      used: usage.totalCost,
+      allowance: null,
+      percentUsed: 0,
+      month: usage.month,
+    };
+  }
+
+  const percentUsed =
+    allowance > 0
+      ? Math.round((usage.totalCost / allowance) * 100)
+      : usage.totalCost > 0
+      ? 100
+      : 0;
+
+  return {
+    allowed: percentUsed < 100,
+    warning: percentUsed >= 80 && percentUsed < 100,
+    used: usage.totalCost,
+    allowance,
+    percentUsed,
+    month: usage.month,
+  };
+}
+
+/**
+ * Atomically increment extra cost usage for the current month.
+ * @param breakdown - keyed costs to add (e.g. { enrichment: 0.52 })
+ */
+export async function incrementExtraCostUsage(
+  userId: string,
+  breakdown: Record<string, number>
+): Promise<void> {
+  const totalNew = Object.values(breakdown).reduce((s, v) => s + v, 0);
+  if (totalNew <= 0) return;
+
+  const currentMonth = getCurrentMonth();
+
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return;
+
+    const existingMonth = user.extraCostUsage?.month;
+
+    if (existingMonth !== currentMonth) {
+      // New month — archive previous, reset
+      const prevUsage = user.extraCostUsage;
+      const existingHistory = user.extraCostUsageHistory || [];
+      let newHistory = existingHistory;
+      if (prevUsage && prevUsage.month) {
+        const entry = { month: prevUsage.month, totalCost: prevUsage.totalCost, breakdown: prevUsage.breakdown };
+        newHistory = [...existingHistory, entry].slice(-24);
+      }
+      await userDb.updateUser(userId, {
+        extraCostUsage: {
+          month: currentMonth,
+          totalCost: totalNew,
+          breakdown: { ...breakdown },
+          resetDate: getNextResetDate(),
+        },
+        extraCostUsageHistory: newHistory,
+      });
+    } else {
+      // Same month — merge breakdown and increment total
+      const prevBreakdown = user.extraCostUsage?.breakdown || {};
+      const mergedBreakdown: Record<string, number> = { ...prevBreakdown };
+      for (const [key, val] of Object.entries(breakdown)) {
+        mergedBreakdown[key] = (mergedBreakdown[key] || 0) + val;
+      }
+      await userDb.updateUser(userId, {
+        extraCostUsage: {
+          month: currentMonth,
+          totalCost: (user.extraCostUsage?.totalCost || 0) + totalNew,
+          breakdown: mergedBreakdown,
+          resetDate: user.extraCostUsage?.resetDate || getNextResetDate(),
+        },
+      });
+    }
+  } catch (error) {
+    console.error(`[tokenUsageService] Failed to increment extra cost for ${userId}:`, error);
+  }
+}
+
 /**
  * Grant bonus tokens to a user (additive to any existing bonus).
  */

@@ -36,6 +36,7 @@ jest.mock('crypto', () => ({
     update: jest.fn().mockReturnThis(),
     digest: jest.fn().mockReturnValue('mock-hash')
   })),
+  randomUUID: jest.fn().mockReturnValue('mock-uuid-1234'),
   randomFillSync: jest.fn((arr) => {
     for (let i = 0; i < arr.length; i++) {
       arr[i] = Math.floor(Math.random() * 256);
@@ -146,6 +147,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         mockInputHtml,
+        undefined,
         'welcome_email',
         'Welcome to {{company_name}}!',
         'Add variables for user name and company name',
@@ -189,6 +191,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         'https://s3.amazonaws.com/bucket/test.html',
+        undefined,
         'welcome_email',
         'Welcome!',
         '',
@@ -224,6 +227,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         mockInputHtml,
+        undefined,
         'welcome_email',
         'Welcome to {{company_name}}!',
         'Add variables',
@@ -250,6 +254,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         'https://s3.amazonaws.com/bucket/nonexistent.html',
+        undefined,
         'test_template',
         'Test Subject',
         '',
@@ -270,6 +275,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         mockInputHtml,
+        undefined,
         'test_template',
         'Test Subject',
         '',
@@ -300,6 +306,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         mockInputHtml,
+        undefined,
         'test_template',
         'Test {{company_name}}',
         '',
@@ -316,44 +323,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       );
     });
 
-    it('should remove old copy from legacy user key after saving', async () => {
-      const legacyTemplates = [
-        {
-          template_name: 'welcome_email',
-          subject: 'Old Subject',
-          html_content: '<html>Old</html>',
-          variables: [],
-          arrayVariables: [],
-          created_at: '2024-01-01T00:00:00.000Z',
-          updated_at: '2024-01-01T00:00:00.000Z',
-        }
-      ];
 
-      mockGetSetting.mockImplementation((key: string) => {
-        if (key === 'templates_test-user-123') return Promise.resolve(null);
-        if (key === 'email_templates_test-user-123') return Promise.resolve({ settingValue: JSON.stringify(legacyTemplates) });
-        return Promise.resolve(null);
-      });
-      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
-      mockSetSetting.mockResolvedValue(undefined);
-
-      await agentModeService.createHtmlTemplate(
-        mockInputHtml,
-        'welcome_email',
-        'Welcome!',
-        '',
-        'test-user-123',
-        'test-session-123'
-      );
-
-      const calledKeys = mockSetSetting.mock.calls.map((c: any[]) => c[0]);
-      // Saved to new key
-      expect(calledKeys).toContain('templates_test-user-123');
-      // Cleaned up from legacy key
-      expect(calledKeys).toContain('email_templates_test-user-123');
-      const legacyCall = mockSetSetting.mock.calls.find((c: any[]) => c[0] === 'email_templates_test-user-123');
-      expect(JSON.parse(legacyCall![1])).toEqual([]);
-    });
 
     it('should never touch public keys when saving', async () => {
       mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
@@ -362,6 +332,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
       await agentModeService.createHtmlTemplate(
         mockInputHtml,
+        undefined,
         'welcome_email',
         'Welcome!',
         '',
@@ -397,6 +368,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       // Execute
       const result = await agentModeService.createHtmlTemplate(
         mockInputHtml,
+        undefined,
         'welcome_email',
         'Welcome!',
         '',

@@ -58,7 +58,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
       it('should have correct tool description', () => {
         const tools = agentModeService.getAvailableTools();
         const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
-        expect(tool?.function?.description).toContain('List all available knowledge base files');
+        expect(tool?.function?.description).toContain('List available knowledge base files');
       });
 
       it('should have no required parameters', () => {
@@ -141,6 +141,62 @@ describe('AgentModeService - Knowledge Base Files', () => {
         expect(result.success).toBe(false);
         expect(result.message).toContain('Failed to list knowledge base files');
         expect(result.error).toBe('Database error');
+      });
+
+      it('should skip platform KBs when kb_type=google-drive is specified', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([
+          { taskId: 'task-1', name: 'Task 1', knowledgeBaseType: 'private', knowledgeBaseSize: 100, knowledgeBaseFiles: [] }
+        ] as any);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123', { kb_type: 'google-drive' });
+
+        expect(result.success).toBe(true);
+        // Platform KBs should be excluded (only gdrive, but none configured here)
+        expect(result.knowledge_bases).toHaveLength(0);
+        expect(result.appliedFilters).toContain('kb_type=google-drive');
+      });
+
+      it('should include appliedFilters in response when options provided', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123', {
+          modified_after: '2026-04-15',
+          modified_before: '2026-04-22',
+          limit: 10,
+          offset: 0,
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.appliedFilters).toContain('modified_after=2026-04-15');
+        expect(result.appliedFilters).toContain('modified_before=2026-04-22');
+        expect(result.appliedFilters).toContain('limit=10');
+        expect(result.appliedFilters).toContain('offset=0');
+      });
+
+      it('should include no appliedFilters in response when no options provided', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+
+        expect(result.success).toBe(true);
+        expect(result.appliedFilters).toBeUndefined();
+      });
+
+      it('tool definition should have date filter and pagination parameters', () => {
+        const tools = agentModeService.getAvailableTools();
+        const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
+        expect(tool).toBeDefined();
+        const props = tool?.function?.parameters?.properties;
+        expect(props?.modified_after).toBeDefined();
+        expect(props?.modified_before).toBeDefined();
+        expect(props?.limit).toBeDefined();
+        expect(props?.offset).toBeDefined();
+        expect(props?.kb_type).toBeDefined();
+        // No required parameters
+        expect(tool?.function?.parameters?.required).toEqual([]);
       });
     });
   });

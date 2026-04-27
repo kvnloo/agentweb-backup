@@ -431,6 +431,37 @@ createTestAccount().then(async () => {
         console.error('[ActivationCron] Failed to initialize:', error);
       }
 
+      // Lifecycle Drip Phase 4 — Execution + Safety.
+      // Runs every 15 minutes. Global kill switch via DRIP_CAMPAIGNS_ENABLED
+      // (default OFF). Dry-run default via DRIP_DRY_RUN (default TRUE).
+      // See backend/src/cron/dripExecutor.ts for the full safety gate list.
+      try {
+        const DRIP_INTERVAL_MS = 15 * 60 * 1000;
+        const { runDripExecutor } = await import('./cron/dripExecutor');
+        console.log('[DripExecutor] Scheduler initialized — first run in 60s, then every 15 min.');
+        setTimeout(() => {
+          runDripExecutor().catch(e => console.error('[DripExecutor] Tick error:', e));
+          setInterval(() => {
+            runDripExecutor().catch(e => console.error('[DripExecutor] Tick error:', e));
+          }, DRIP_INTERVAL_MS);
+        }, 60 * 1000);
+      } catch (error) {
+        console.error('[DripExecutor] Failed to initialize:', error);
+      }
+
+      // Drip Sequence Worker — runs every 5 minutes
+      try {
+        const { processDueEnrollments } = await import('./services/dripSequenceWorker');
+        const DRIP_INTERVAL_MS = 5 * 60 * 1000;
+        processDueEnrollments().catch(e => console.error('[dripWorker] Error on first run:', e));
+        setInterval(() => {
+          processDueEnrollments().catch(e => console.error('[dripWorker] Error:', e));
+        }, DRIP_INTERVAL_MS);
+        console.log('[dripWorker] Initialized — running every 5 minutes');
+      } catch (error) {
+        console.error('[dripWorker] Failed to initialize:', error);
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

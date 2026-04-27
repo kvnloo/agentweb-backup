@@ -194,81 +194,73 @@ describe('contactDedupService', () => {
       expect(result.contacts[0].email).toBe('ok@x.com');
     });
 
-    // ── cursor + rawFetchLimit ────────────────────────────────────────────────
-
-    it('throws when rawFetchLimit is less than 1', async () => {
-      await expect(
-        dedupContactsForUser({ userId: 'u1', rawFetchLimit: 0 }),
-      ).rejects.toThrow(/rawFetchLimit/);
-    });
-
-    it('throws when cursor is not valid base64-encoded JSON', async () => {
-      await expect(
-        dedupContactsForUser({ userId: 'u1', cursor: '!!!not-base64' }),
-      ).rejects.toThrow(/cursor/i);
-    });
-
-    it('throws when cursor decodes to non-object JSON', async () => {
-      const badCursor = Buffer.from('["not","an","object"]').toString('base64');
-      await expect(
-        dedupContactsForUser({ userId: 'u1', cursor: badCursor }),
-      ).rejects.toThrow(/cursor/i);
-    });
-
-    it('returns hasMore: false and no nextCursor when all lists are exhausted', async () => {
+    it('respects maxRawLeads cap and stops fetching pages once the cap is hit', async () => {
+      // Simulate a large list that paginates: each page returns 10 leads with a nextKey
+      // until stopped. With maxRawLeads=15 across 1 list, it should stop after 2 pages (20 raw
+      // leads would exceed the cap, so 15 leads are allowed through).
       asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
-        { listId: 'L1', name: 'Sales', listType: 'sales' },
+        { listId: 'BIG', name: 'Huge List', listType: 'sales' },
       ]);
-      asMock(crmDb.getLeadsByListId).mockResolvedValue({
-        items: [{ leadId: '1', email: 'a@x.com', engagementCount: 1 }],
-        lastEvaluatedKey: null,
-        hasMore: false,
+
+      let callCount = 0;
+      asMock(crmDb.getLeadsByListId).mockImplementation(async (_listId: string, pageSize: number) => {
+        callCount += 1;
+        const items = Array.from({ length: pageSize }, (_, i) => ({
+          leadId: `lead-${callCount}-${i}`,
+          email: `lead-${callCount}-${i}@x.com`,
+          engagementCount: 0,
+        }));
+        return {
+          items,
+          // Always indicate more pages available
+          lastEvaluatedKey: { pk: `page${callCount}` },
+        };
       });
 
+      const result = await dedupContactsForUser({ userId: 'u1', maxRawLeads: 15 });
+      // Should have fetched at most ceil(15/500) pages, so 1 page of 500 leads
+      // but capped at 15 unique contacts
+      expect(result.contacts.length).toBeLessThanOrEqual(15);
+      expect(result.rawCount).toBeLessThanOrEqual(15);
+      // Should NOT have fetched indefinitely
+      expect(callCount).toBeLessThanOrEqual(3);
+    });
+
+    it('distributes maxRawLeads evenly across multiple large lists', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
+        { listId: 'L1', name: 'List1', listType: 'sales' },
+        { listId: 'L2', name: 'List2', listType: 'sales' },
+        { listId: 'L3', name: 'List3', listType: 'sales' },
+        { listId: 'L4', name: 'List4', listType: 'sales' },
+      ]);
+
+      asMock(crmDb.getLeadsByListId).mockImplementation(async (listId: string, pageSize: number) => {
+        const items = Array.from({ length: pageSize }, (_, i) => ({
+          leadId: `${listId}-lead-${i}`,
+          email: `${listId}-lead-${i}@x.com`,
+          engagementCount: 0,
+        }));
+        return { items, lastEvaluatedKey: null };
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1', maxRawLeads: 100 });
+      // With 4 lists and 100 max raw leads, each list gets ~25 leads
+      expect(result.rawCount).toBeLessThanOrEqual(100);
+    });
+
+    it('falls back to default cap when maxRawLeads is not specified', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
+        { listId: 'L1', name: 'List1', listType: 'sales' },
+      ]);
+
+      asMock(crmDb.getLeadsByListId).mockImplementation(async () => ({
+        items: [{ leadId: 'x', email: 'x@x.com', engagementCount: 0 }],
+        lastEvaluatedKey: null,
+      }));
+
+      // Should not throw; should use the built-in default cap
       const result = await dedupContactsForUser({ userId: 'u1' });
-      expect(result.hasMore).toBe(false);
-      expect(result.nextCursor).toBeUndefined();
-    });
-
-    it('returns hasMore: true and a decodable nextCursor when a list has more leads', async () => {
-      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
-        { listId: 'L1', name: 'Sales', listType: 'sales' },
-      ]);
-      const resumeKey = { listId: 'L1', leadId: 'cursor-key' };
-      asMock(crmDb.getLeadsByListId).mockResolvedValue({
-        items: [{ leadId: '1', email: 'a@x.com', engagementCount: 1 }],
-        lastEvaluatedKey: resumeKey,
-        hasMore: true,
-      });
-
-      const result = await dedupContactsForUser({ userId: 'u1', rawFetchLimit: 1 });
-      expect(result.hasMore).toBe(true);
-      expect(result.nextCursor).toBeDefined();
-      const decoded = JSON.parse(
-        Buffer.from(result.nextCursor!, 'base64').toString('utf8'),
-      );
-      expect(decoded['L1']).toEqual(resumeKey);
-    });
-
-    it('passes the decoded per-list key from cursor to getLeadsByListId', async () => {
-      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([
-        { listId: 'L1', name: 'Sales', listType: 'sales' },
-      ]);
-      asMock(crmDb.getLeadsByListId).mockResolvedValue({
-        items: [],
-        lastEvaluatedKey: null,
-        hasMore: false,
-      });
-
-      const startKey = { listId: 'L1', leadId: 'some-lead-id' };
-      const cursor = Buffer.from(JSON.stringify({ L1: startKey })).toString('base64');
-
-      await dedupContactsForUser({ userId: 'u1', cursor });
-      expect(crmDb.getLeadsByListId).toHaveBeenCalledWith(
-        'L1',
-        expect.any(Number),
-        startKey,
-      );
+      expect(result.contacts.length).toBeGreaterThan(0);
     });
   });
 });

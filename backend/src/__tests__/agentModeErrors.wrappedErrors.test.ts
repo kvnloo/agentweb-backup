@@ -87,4 +87,16 @@ describe('isWorkerShutdownError', () => {
   it('should return false for a non-Error string value', () => {
     expect(isWorkerShutdownError('some error string')).toBe(false);
   });
+
+  it('should return true for unexpected worker crash with exit code', () => {
+    expect(isWorkerShutdownError(new Error('Worker process exited with code 1 and signal null'))).toBe(true);
+  });
+
+  it('should return true for unexpected worker crash with signal', () => {
+    expect(isWorkerShutdownError(new Error('Worker process exited with code null and signal SIGKILL'))).toBe(true);
+  });
+
+  it('should return true for worker crash with code 0', () => {
+    expect(isWorkerShutdownError(new Error('Worker process exited with code 0 and signal null'))).toBe(true);
+  });
 });

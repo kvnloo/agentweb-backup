@@ -193,6 +193,11 @@ interface AdminChatSession {
     evaluatedAt: string;
     evaluatedMessageIndex: number;
     adminOverride?: boolean;
+    dimensions?: {
+      goalCompletion: number;
+      dataAccuracy: number;
+      outputQuality: number;
+    };
   };
   judgeScores?: Record<string, {
     score: number;
@@ -200,6 +205,11 @@ interface AdminChatSession {
     evaluatedAt: string;
     evaluatedMessageIndex: number;
     judgeName: string;
+    dimensions?: {
+      goalCompletion: number;
+      dataAccuracy: number;
+      outputQuality: number;
+    };
   }>;
 }
 
@@ -249,6 +259,17 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  extraCostUsage?: {
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+    resetDate: string;
+  };
+  extraCostUsageHistory?: Array<{
+    month: string;
+    totalCost: number;
+    breakdown: Record<string, number>;
+  }>;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
   introductionEmailSent?: string; // ISO date when team introduction email was sent
   utmSource?: string;
@@ -717,6 +738,7 @@ export default function AdminDashboard() {
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
+  const [userFilterHideBotLike, setUserFilterHideBotLike] = useState(true);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
   const [userActivitiesLoading, setUserActivitiesLoading] = useState<Record<string, boolean>>({});
@@ -739,6 +761,7 @@ export default function AdminDashboard() {
   const [chatSessionsCursor, setChatSessionsCursor] = useState<string | null>(null);
   const [chatSessionsHasMore, setChatSessionsHasMore] = useState(true);
   const [chatSessionsInitialized, setChatSessionsInitialized] = useState(false);
+  const [chatSessionIdSearch, setChatSessionIdSearch] = useState("");
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
@@ -912,7 +935,7 @@ export default function AdminDashboard() {
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
     if (tabValue === 2) {
-      loadUsers();
+      loadUsers(userFilterHideBotLike);
       loadSubscriptionTypes();
       // Load admin Slack channel setting
       axios.get(buildApiUrl('/api/settings/slack_admin_channel'), {
@@ -967,7 +990,7 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 3) {
       loadWaitlist();
-      loadUsers(); // Also load users to check if waitlist entries are registered
+      loadUsers(userFilterHideBotLike); // Also load users to check if waitlist entries are registered
     }
   }, [tabValue]);
 
@@ -1045,20 +1068,27 @@ export default function AdminDashboard() {
   }, [tabValue, token]);
 
   const loadChatSessions = React.useCallback(
-    async (options?: { reset?: boolean }) => {
+    async (options?: { reset?: boolean; sessionIdOverride?: string }) => {
       if (!token || chatSessionsLoading) {
         return;
       }
 
       const shouldReset = options?.reset ?? false;
       const cursor = shouldReset ? null : chatSessionsCursor;
+      const searchId = options?.sessionIdOverride !== undefined
+        ? options.sessionIdOverride
+        : chatSessionIdSearch;
 
       try {
         setChatSessionsLoading(true);
         const params = new URLSearchParams();
-        params.set("limit", "30");
-        if (cursor) {
-          params.set("cursor", cursor);
+        if (searchId.trim()) {
+          params.set("sessionId", searchId.trim());
+        } else {
+          params.set("limit", "30");
+          if (cursor) {
+            params.set("cursor", cursor);
+          }
         }
 
         const response = await axios.get(
@@ -1076,7 +1106,7 @@ export default function AdminDashboard() {
         };
 
         setChatSessions((prev) => {
-          if (shouldReset) {
+          if (shouldReset || searchId.trim()) {
             return sessions;
           }
           const seen = new Set(prev.map((session) => session.sessionId));
@@ -1090,7 +1120,7 @@ export default function AdminDashboard() {
           return merged;
         });
         setChatSessionsCursor(nextCursor);
-        setChatSessionsHasMore(Boolean(nextCursor));
+        setChatSessionsHasMore(Boolean(nextCursor) && !searchId.trim());
         setChatSessionsInitialized(true);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
@@ -1098,7 +1128,7 @@ export default function AdminDashboard() {
         setChatSessionsLoading(false);
       }
     },
-    [token, chatSessionsCursor, chatSessionsLoading]
+    [token, chatSessionsCursor, chatSessionsLoading, chatSessionIdSearch]
   );
 
   useEffect(() => {
@@ -1820,7 +1850,7 @@ export default function AdminDashboard() {
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      await loadUsers(); // Reload users list
+      await loadUsers(userFilterHideBotLike); // Reload users list
       setSuccess(`User ${selectedUser.email} has been deactivated`);
     } catch (error: any) {
       setError(error.response?.data?.message || "Failed to deactivate user");
@@ -1847,7 +1877,7 @@ export default function AdminDashboard() {
         setLoading(true);
         await deleteUser(userIdToDelete);
         setSuccess(`User ${userIdToDelete} deleted successfully.`); // Consider showing email or a more user-friendly identifier
-        await loadUsers(); // Ensure user list is refreshed
+        await loadUsers(userFilterHideBotLike); // Ensure user list is refreshed
         handleCloseUserDeleteConfirm();
       } catch (error) {
         let errorMessage = "Failed to delete user";
@@ -3781,8 +3811,22 @@ export default function AdminDashboard() {
               label={<Typography variant="body2">Has usage</Typography>}
               sx={{ ml: 0 }}
             />
-            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage) && (
-              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={userFilterHideBotLike}
+                  onChange={(e) => {
+                    setUserFilterHideBotLike(e.target.checked);
+                    loadUsers(e.target.checked);
+                  }}
+                />
+              }
+              label={<Typography variant="body2">Hide bots</Typography>}
+              sx={{ ml: 0 }}
+            />
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
@@ -3944,7 +3988,7 @@ export default function AdminDashboard() {
                           {paymentStatus === "free" && (
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
-                          {user.subscription_amount != null && user.subscription_amount > 0 && (
+                          {user.subscription_amount != null && (
                             <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
                               ${(user.subscription_amount / 100).toFixed(0)}/mo
                             </Typography>
@@ -4306,6 +4350,47 @@ export default function AdminDashboard() {
                                     </Box>
                                   )}
                                 </Grid>
+                                {/* Extra Cost Usage (enrichment, image gen, etc.) */}
+                                {user.roles?.includes("customer") && (
+                                  <Grid item xs={6}>
+                                    <Typography variant="caption" color="text.secondary">Extra Cost Usage</Typography>
+                                    <Box sx={{ mt: 0.5 }}>
+                                      {(() => {
+                                        const currentMonth = new Date().toISOString().slice(0, 7);
+                                        const extraUsage = user.extraCostUsage?.month === currentMonth ? user.extraCostUsage : null;
+                                        const totalCost = extraUsage?.totalCost ?? 0;
+                                        const breakdown = (extraUsage?.breakdown ?? {}) as Record<string, number>;
+                                        const breakdownEntries = Object.entries(breakdown).filter(([, v]) => v > 0);
+                                        return (
+                                          <>
+                                            <Typography variant="body2">
+                                              ${totalCost.toFixed(4)} this month
+                                            </Typography>
+                                            {breakdownEntries.length > 0 && (
+                                              <Box sx={{ mt: 0.25 }}>
+                                                {breakdownEntries.map(([key, val]) => (
+                                                  <Typography key={key} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
+                                                    {key}: ${(val as number).toFixed(4)}
+                                                  </Typography>
+                                                ))}
+                                              </Box>
+                                            )}
+                                          </>
+                                        );
+                                      })()}
+                                    </Box>
+                                    {user.extraCostUsageHistory && user.extraCostUsageHistory.length > 0 && (
+                                      <Box sx={{ mt: 0.5 }}>
+                                        <Typography variant="caption" color="text.secondary">History: </Typography>
+                                        {[...user.extraCostUsageHistory].reverse().slice(0, 6).map((h) => (
+                                          <Typography key={h.month} component="span" variant="caption" color="text.secondary" sx={{ mr: 1 }}>
+                                            {h.month}: ${h.totalCost.toFixed(4)}
+                                          </Typography>
+                                        ))}
+                                      </Box>
+                                    )}
+                                  </Grid>
+                                )}
                                 <Grid item xs={6}>
                                   <Typography variant="caption" color="text.secondary">Actions</Typography>
                                   <Box sx={{ display: "flex", gap: 0.5, mt: 0.5 }}>
@@ -5123,6 +5208,40 @@ export default function AdminDashboard() {
               </Button>
             </Box>
           )}
+          <Box sx={{ display: 'flex', gap: 1, mb: 2, alignItems: 'center' }}>
+            <TextField
+              label="Search by Session ID"
+              size="small"
+              value={chatSessionIdSearch}
+              onChange={(e) => setChatSessionIdSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch });
+                }
+              }}
+              sx={{ width: 380 }}
+              placeholder="Paste a session ID and press Enter or Search"
+            />
+            <Button
+              variant="contained"
+              size="small"
+              onClick={() => loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch })}
+            >
+              Search
+            </Button>
+            {chatSessionIdSearch && (
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => {
+                  setChatSessionIdSearch("");
+                  loadChatSessions({ reset: true, sessionIdOverride: "" });
+                }}
+              >
+                Clear
+              </Button>
+            )}
+          </Box>
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -5420,8 +5539,11 @@ export default function AdminDashboard() {
                             const chips: React.ReactNode[] = [];
                             if (sat) {
                               const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
+                              const dimSummary = sat.dimensions
+                                ? ` | Goal:${sat.dimensions.goalCompletion} Accuracy:${sat.dimensions.dataAccuracy} Quality:${sat.dimensions.outputQuality}`
+                                : '';
                               chips.push(
-                                <Tooltip key="default" title={`Default: ${sat.reason}${sat.adminOverride ? ' (admin override)' : ''}`}>
+                                <Tooltip key="default" title={`Default: ${sat.reason}${dimSummary}${sat.adminOverride ? ' (admin override)' : ''}`}>
                                   <Chip
                                     label={`Default: ${sat.score}`}
                                     size="small"
@@ -5438,12 +5560,24 @@ export default function AdminDashboard() {
                                   />
                                 </Tooltip>
                               );
+                              if (sat.dimensions) {
+                                const { goalCompletion, dataAccuracy, outputQuality } = sat.dimensions;
+                                const dimColor = (v: number) => v <= 2 ? 'error' : v === 3 ? 'warning' : 'success';
+                                chips.push(
+                                  <Tooltip key="dim-goal" title="Goal completion"><Chip label={`G:${goalCompletion}`} size="small" color={dimColor(goalCompletion) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
+                                  <Tooltip key="dim-acc" title="Data accuracy"><Chip label={`A:${dataAccuracy}`} size="small" color={dimColor(dataAccuracy) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
+                                  <Tooltip key="dim-qual" title="Output quality"><Chip label={`Q:${outputQuality}`} size="small" color={dimColor(outputQuality) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
+                                );
+                              }
                             }
                             if (session.judgeScores) {
                               Object.entries(session.judgeScores).forEach(([jId, jScore]) => {
                                 const jColor = jScore.score <= 2 ? 'error' : jScore.score === 3 ? 'warning' : 'success';
+                                const jDimSummary = jScore.dimensions
+                                  ? ` | Goal:${jScore.dimensions.goalCompletion} Accuracy:${jScore.dimensions.dataAccuracy} Quality:${jScore.dimensions.outputQuality}`
+                                  : '';
                                 chips.push(
-                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}`}>
+                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}${jDimSummary}`}>
                                     <Chip
                                       label={`${jScore.judgeName}: ${jScore.score}`}
                                       size="small"
@@ -7769,7 +7903,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image'];
+  const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
 
   const loadImageApiDefaultModel = async () => {
     try {

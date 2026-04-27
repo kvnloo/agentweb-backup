@@ -88,6 +88,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
   describe('createHtmlFromTemplate', () => {
     const mockTemplate = {
+      template_id: 'test-template-id',
       template_name: 'test-template',
       html_content: '<html><body><h1>{{title}}</h1><p>{{content}}</p></body></html>',
       subject: 'Test Subject: {{title}}',
@@ -123,7 +124,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -162,7 +163,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         { items: [{ item: 'Item 1' }, { item: 'Item 2' }] },
         'user123',
@@ -176,7 +177,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should validate that all required variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title' }, // Missing 'content'
         {},
         'user123',
@@ -191,7 +192,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should validate that no extra variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content', extra: 'Extra' },
         {},
         'user123',
@@ -215,7 +216,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         { items: 'not-an-array' }, // Should be array
         'user123',
@@ -233,7 +234,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'nonexistent-template',
+        'nonexistent-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -241,7 +242,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Template \'nonexistent-template\' not found');
+      expect(result.message).toContain('Template \'nonexistent-template-id\' not found');
     });
 
     it('should handle LLM API errors', async () => {
@@ -249,7 +250,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -274,7 +275,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -301,7 +302,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -329,7 +330,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -351,7 +352,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -376,7 +377,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -396,7 +397,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -412,7 +413,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -421,7 +422,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       expect(uploadFileToS3).toHaveBeenCalledWith(
         expect.any(String), // finalHtml
-        'html_test-template.html', // filename
+        expect.stringMatching(/^html_.*\.html$/), // filename
         'user123', // userId
         'text/html' // contentType
       );
@@ -430,7 +431,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should handle undefined variable_values and array_variable_values', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         undefined,
         undefined,
         'user123',
@@ -443,6 +444,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
     it('should validate template structure', async () => {
       const invalidTemplate = {
+        template_id: 'test-template-id',
         template_name: 'test-template',
         // Missing required fields
       };
@@ -453,7 +455,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {},
         'user123',
@@ -478,7 +480,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {
           items: [{ name: 'Item 1', price: '$10' }, { name: 'Item 2', price: '$20' }],
@@ -518,7 +520,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         { features_n: [] }, // Empty array
         'user123',
@@ -562,7 +564,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {
           features_n: ['Feature 1', 'Feature 2'],
@@ -594,7 +596,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
-        'test-template',
+        'test-template-id',
         { title: 'Test Title', content: 'Test Content' },
         {}, // Missing array variable entirely
         'user123',

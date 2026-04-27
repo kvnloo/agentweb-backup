@@ -12,6 +12,8 @@ const mockBillingPortalSessionsCreate = jest.fn();
 const mockProductsList = jest.fn();
 const mockWebhooksConstructEvent = jest.fn();
 const mockPaymentMethodsList = jest.fn();
+const mockSubscriptionsRetrieve = jest.fn();
+const mockSubscriptionsList = jest.fn();
 
 jest.mock('stripe', () => {
   return jest.fn().mockImplementation(() => ({
@@ -34,6 +36,15 @@ jest.mock('stripe', () => {
     },
     paymentMethods: {
       list: mockPaymentMethodsList,
+    },
+    // PR #1261 reads the priceId off subscription.items to derive the tier,
+    // so handleCheckoutSessionCompleted now fetches the subscription via
+    // subscriptions.retrieve. Tests that want the handler to write a tier
+    // must mock this to return a subscription whose first item's price.id
+    // matches one of the configured STRIPE_*_PRICE_ID env vars below.
+    subscriptions: {
+      retrieve: mockSubscriptionsRetrieve,
+      list: mockSubscriptionsList,
     },
   }));
 });
@@ -58,11 +69,14 @@ jest.mock('../services/waitlistDb', () => ({
   },
 }));
 
-// Mock settingsService so subscriptionService doesn't try to create a real DynamoDB DocumentClient
+// Mock settingsService so subscriptionService doesn't try to create a real DynamoDB DocumentClient.
+// PR #1261 renamed the tier derived from the Stripe price IDs: the pricing
+// page already called the tiers "Starter" and "Pro", so the Stripe webhook
+// now writes those names verbatim (see deriveSubscriptionTypeFromPriceId).
 const mockSubscriptionTypes = [
   { name: 'Free', allowedPages: ['/', '/agent-mode', '/settings', '/guide'], allowedSkills: [] },
-  { name: 'Basic', allowedPages: ['/', '/agent-mode', '/settings', '/guide', '/brand-guidelines', '/market-strategy', '/knowledge-base', '/email-templates', '/tasks', '/research-reports'], allowedSkills: ['*'] },
-  { name: 'Super Premium', allowedPages: ['*'], allowedSkills: ['*'] },
+  { name: 'Starter', allowedPages: ['/', '/agent-mode', '/settings', '/guide', '/brand-guidelines', '/market-strategy', '/knowledge-base', '/email-templates', '/tasks', '/research-reports'], allowedSkills: ['*'] },
+  { name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'] },
 ];
 
 jest.mock('../services/settingsService', () => ({
@@ -88,6 +102,11 @@ import { userDb } from '../services/db';
 process.env.STRIPE_SECRET_KEY = 'sk_test_fake_key';
 process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test_fake_secret';
 process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
+// PR #1261: deriveSubscriptionTypeFromPriceId looks up these env vars to
+// decide whether a Stripe price ID maps to the Starter or Pro tier. Tests
+// below use 'price_complete_456' to drive a Pro-tier upgrade.
+process.env.STRIPE_STARTER_PRICE_ID = 'price_starter_123';
+process.env.STRIPE_COMPLETE_PRICE_ID = 'price_complete_456';
 
 describe('Stripe Backend Integration', () => {
   beforeEach(() => {
@@ -136,9 +155,27 @@ describe('Stripe Backend Integration', () => {
             line_items: [{ price: 'price_abc', quantity: 1 }],
             success_url: 'http://localhost:5174/success',
             cancel_url: 'http://localhost:5174/cancel',
+            allow_promotion_codes: true,
             metadata: { userId: 'user-123' },
           })
         );
+      });
+
+      it('should enable promotion codes on the hosted checkout page', async () => {
+        mockCheckoutSessionsCreate.mockResolvedValue({
+          id: 'cs_test_promo',
+          url: 'https://checkout.stripe.com/session/cs_test_promo',
+        });
+
+        await stripeService.createCheckoutSession(
+          'user-456',
+          'price_starter_123',
+          'http://localhost:5174/success',
+          'http://localhost:5174/cancel'
+        );
+
+        const call = mockCheckoutSessionsCreate.mock.calls[0][0];
+        expect(call.allow_promotion_codes).toBe(true);
       });
     });
 
@@ -221,6 +258,17 @@ describe('Stripe Backend Integration', () => {
 
   // FAIL test 3: webhook checkout.session.completed updates user model
   describe('Webhook Handler - checkout.session.completed', () => {
+    // Shared subscription mock for the happy-path tests below: a subscription
+    // on the Complete/Pro price. The handler retrieves the subscription from
+    // Stripe (line_items aren't expanded on the webhook payload) and derives
+    // the tier from subscription.items[0].price.id.
+    const proSubscription = {
+      id: 'sub_stripe_any',
+      status: 'active',
+      current_period_end: 1700000000,
+      items: { data: [{ price: { id: 'price_complete_456' } }] },
+    };
+
     it('should update user with stripe fields when checkout completes (by metadata userId)', async () => {
       const mockUser = {
         userId: 'user-123',
@@ -233,9 +281,10 @@ describe('Stripe Backend Integration', () => {
         ...mockUser,
         stripe_customer_id: 'cus_stripe_123',
         stripe_subscription_id: 'sub_stripe_456',
-        subscriptionType: 'pro',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
       });
+      mockSubscriptionsRetrieve.mockResolvedValue({ ...proSubscription, id: 'sub_stripe_456' });
 
       // Import the handler
       const { handleCheckoutSessionCompleted } = await import('../services/stripeService');
@@ -247,10 +296,12 @@ describe('Stripe Backend Integration', () => {
         customer_details: { email: 'test@example.com' },
       });
 
+      // PR #1261: Complete/pro Stripe price now derives to "Pro" (matches
+      // the pricing page label the customer saw at checkout).
       expect(userDb.updateUser).toHaveBeenCalledWith('user-123', expect.objectContaining({
         stripe_customer_id: 'cus_stripe_123',
         stripe_subscription_id: 'sub_stripe_456',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         allowedPages: ['*'],
         allowedSkills: ['*'],
@@ -270,9 +321,10 @@ describe('Stripe Backend Integration', () => {
         ...mockUser,
         stripe_customer_id: 'cus_stripe_789',
         stripe_subscription_id: 'sub_stripe_abc',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
       });
+      mockSubscriptionsRetrieve.mockResolvedValue({ ...proSubscription, id: 'sub_stripe_abc' });
 
       const { handleCheckoutSessionCompleted } = await import('../services/stripeService');
 
@@ -287,7 +339,7 @@ describe('Stripe Backend Integration', () => {
       expect(userDb.updateUser).toHaveBeenCalledWith('user-456', expect.objectContaining({
         stripe_customer_id: 'cus_stripe_789',
         stripe_subscription_id: 'sub_stripe_abc',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         allowedPages: ['*'],
         allowedSkills: ['*'],
@@ -357,7 +409,7 @@ describe('Stripe Backend Integration', () => {
         userId: 'user-123',
         email: 'test@example.com',
         stripe_customer_id: 'cus_123',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
       };
 
@@ -411,8 +463,17 @@ describe('Stripe Backend Integration', () => {
         ...mockUser,
         stripe_customer_id: 'cus_lifecycle',
         stripe_subscription_id: 'sub_lifecycle',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
+      });
+      // PR #1261: handler reads the priceId from the retrieved subscription
+      // to derive the tier. Mock it to return a Pro-tier subscription so
+      // the expected write below lines up.
+      mockSubscriptionsRetrieve.mockResolvedValue({
+        id: 'sub_lifecycle',
+        status: 'active',
+        current_period_end: 1700000000,
+        items: { data: [{ price: { id: 'price_complete_456' } }] },
       });
 
       const { handleCheckoutSessionCompleted } = await import('../services/stripeService');
@@ -427,7 +488,7 @@ describe('Stripe Backend Integration', () => {
       expect(userDb.updateUser).toHaveBeenCalledWith('user-lifecycle', expect.objectContaining({
         stripe_customer_id: 'cus_lifecycle',
         stripe_subscription_id: 'sub_lifecycle',
-        subscriptionType: 'Super Premium',
+        subscriptionType: 'Pro',
         subscription_status: 'active',
         allowedPages: ['*'],
         allowedSkills: ['*'],

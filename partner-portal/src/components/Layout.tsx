@@ -153,6 +153,14 @@ export default function Layout() {
                       <Button
                         color="primary"
                         component={RouterLink}
+                        to="/html-templates"
+                        variant={isActivePath('/html-templates') ? 'contained' : 'text'}
+                      >
+                        HTML Templates
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
                         to="/skills"
                         variant={isActivePath('/skills') ? 'contained' : 'text'}
                       >
@@ -189,6 +197,14 @@ export default function Layout() {
                         variant={isActivePath('/client-health') ? 'contained' : 'text'}
                       >
                         Client Health
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
+                        to="/prompt-templates"
+                        variant={isActivePath('/prompt-templates') ? 'contained' : 'text'}
+                      >
+                        Prompt Templates
                       </Button>
                     </>
                   )}

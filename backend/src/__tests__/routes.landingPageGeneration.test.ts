@@ -219,12 +219,12 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(brandCtx.logoUrl).toBe("https://example.com/logo.png");
   });
 
-  it("SUCCESS: template_name provided → loads and extracts template from settings", async () => {
+  it("SUCCESS: template_id provided → loads and extracts template from settings", async () => {
     mockGetSetting.mockImplementation(async (key: string) => {
       if (key === "templates_test-user-id") {
         return {
           settingValue: JSON.stringify([
-            { template_name: "event-marketing", html_content: "<html>Full Template</html>" },
+            { template_id: "event-marketing-id", html_content: "<html>Full Template</html>" },
           ]),
         };
       }
@@ -237,7 +237,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
       .post("/api/landing-pages/v0/generate")
       .send({
         prompt: "Create a B2B page",
-        template_name: "event-marketing"
+        template_id: "event-marketing-id"
       });
 
     expect(res.status).toBe(201);
@@ -249,13 +249,13 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(callArgs[5]).toBe("Condensed Outline");
   });
 
-  it("EDGE: valid template_name but template missing in settings → generation proceeds without template", async () => {
+  it("EDGE: valid template_id but template missing in settings → generation proceeds without template", async () => {
     mockGetSetting.mockResolvedValue(null);
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_name: "event-marketing" });
+      .send({ prompt: "Create a page", template_id: "event-marketing-id" });
 
     expect(res.status).toBe(201);
     expect(mockGetSetting).toHaveBeenCalled();
@@ -263,12 +263,12 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][5]).toBeUndefined();
   });
 
-  it("EDGE: unknown template_name is ignored, generation proceeds without template", async () => {
+  it("EDGE: unknown template_id is ignored, generation proceeds without template", async () => {
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_name: "unknown-xyz" });
+      .send({ prompt: "Create a page", template_id: "unknown-xyz" });
 
     expect(res.status).toBe(201);
     expect(mockGetSetting).toHaveBeenCalled();

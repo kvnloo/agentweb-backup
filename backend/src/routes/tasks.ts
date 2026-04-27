@@ -90,6 +90,7 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  searchableText?: string;
   feedback?: {
     type: 'like' | 'dislike';
     reasons?: string[];
@@ -2043,18 +2044,57 @@ async function getExecutionsWithAssets(
   });
 
   // Search Agent Mode sessions for assets using incremental caching
+  const chatbotDbForEnrich = new ChatbotDB();
   try {
-    const chatbotDb = new ChatbotDB();
+    const chatbotDb = chatbotDbForEnrich;
     // Load sessions metadata only (no messages) — single DynamoDB query
     const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
 
-    // Phase 1: Load messages in parallel batches (avoid DynamoDB throttling)
+    // Phase 1: Load messages in parallel batches (avoid DynamoDB throttling).
+    // For html-reports: sessions without assetCache are skipped in the main path
+    // (they have no known assets) and warmed in the background so future loads pick
+    // them up. For images/videos we retain the original eager-scan behavior.
     const BATCH_SIZE = 15;
     const activeSessions = agentSessions.filter(s => !s.archived);
+
+    let sessionsToScan: typeof activeSessions;
+
+    if (assetType === 'html-reports') {
+      const cachedSessions = activeSessions.filter(s => s.assetCache !== undefined && s.assetScanIndex !== undefined);
+      const uncachedSessions = activeSessions.filter(s => s.assetCache === undefined || s.assetScanIndex === undefined);
+
+      // Background-warm uncached sessions (fire-and-forget)
+      if (uncachedSessions.length > 0) {
+        (async () => {
+          try {
+            for (let i = 0; i < uncachedSessions.length; i += BATCH_SIZE) {
+              const batch = uncachedSessions.slice(i, i + BATCH_SIZE);
+              await Promise.all(batch.map(async (session) => {
+                try {
+                  const messages = await chatbotDb.getMessagesFromMessagesTable(session.sessionId);
+                  const newAssets = scanMessagesForAssets(messages, session);
+                  const cache = { images: newAssets.images, videos: newAssets.videos, htmlReports: newAssets.htmlReports };
+                  const maxIndex = messages.reduce((max: number, m: any) => {
+                    const idx = m.messageIndex ?? 0;
+                    return idx > max ? idx : max;
+                  }, 0);
+                  chatbotDb.updateAssetCache(session.sessionId, cache, maxIndex + 1);
+                } catch { /* non-fatal */ }
+              }));
+            }
+          } catch { /* non-fatal */ }
+        })();
+      }
+
+      sessionsToScan = cachedSessions;
+    } else {
+      sessionsToScan = activeSessions;
+    }
+
     const sessionResults: Array<{ session: typeof activeSessions[0]; messages: any[]; existingCache: any }> = [];
 
-    for (let i = 0; i < activeSessions.length; i += BATCH_SIZE) {
-      const batch = activeSessions.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < sessionsToScan.length; i += BATCH_SIZE) {
+      const batch = sessionsToScan.slice(i, i + BATCH_SIZE);
       const batchResults = await Promise.all(batch.map(async (session) => {
         const cachedScanIndex = session.assetScanIndex ?? 0;
         const cachedMessageCount = session.messageCount ?? 0;
@@ -2123,7 +2163,98 @@ async function getExecutionsWithAssets(
     console.error(`Error fetching Agent Mode ${assetType}:`, error);
   }
 
+  // Enrich HTML report result files with searchable text content (fire-and-forget —
+  // the result object is mutated in-place, but we don't block the response on it;
+  // cached values are already populated so this only runs for brand-new reports).
+  if (assetType === 'html-reports') {
+    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich).catch(() => {/* non-fatal */});
+  }
+
   return result;
+}
+
+/**
+ * Fetch HTML content for report files that lack searchableText and attach extracted plain text.
+ * Persists newly-fetched searchableText back to DynamoDB (session assetCache or task execution
+ * result_files) so subsequent loads skip the S3 fetch entirely.
+ * Runs concurrently (up to 10 at a time) so it doesn't block the response for long.
+ */
+async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
+  const CONCURRENCY = 10;
+  const MAX_TEXT_LENGTH = 3000;
+
+  // Collect all result files that need enrichment, tagging each with its execution context
+  const filesToEnrich: Array<{ file: any; executionId: string; sessionId?: string }> = [];
+  for (const task of Object.values(result) as any[]) {
+    for (const execution of task.executions || []) {
+      for (const file of execution.result_files || []) {
+        if (!file.searchableText && file.url && (file.is_html || (file.filename || '').toLowerCase().endsWith('.html'))) {
+          filesToEnrich.push({ file, executionId: execution.executionId, sessionId: file.sessionId });
+        }
+      }
+    }
+  }
+
+  // Process in batches
+  for (let i = 0; i < filesToEnrich.length; i += CONCURRENCY) {
+    const batch = filesToEnrich.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async ({ file }) => {
+      try {
+        const response = await axios.get(file.url, { timeout: 5000, responseType: 'text' });
+        const html: string = typeof response.data === 'string' ? response.data : '';
+        // Strip tags, collapse whitespace, truncate
+        const text = html
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, MAX_TEXT_LENGTH);
+        file.searchableText = text;
+      } catch {
+        // Non-fatal — leave searchableText absent if fetch fails
+      }
+    }));
+  }
+
+  // Persist newly-fetched searchableTexts back to DynamoDB so future loads skip S3 fetches.
+  // Group successful enrichments by sessionId (agent-mode) or executionId (task).
+  // For agent-mode sessions, cap at MAX_CACHE_PER_SESSION most-recent reports to keep
+  // assetCache item size bounded; older reports are fetched live on demand.
+  const MAX_CACHE_PER_SESSION = 10;
+  const sessionUpdates = new Map<string, Array<{ url: string; searchableText: string; generatedAt?: string }>>();
+  const executionUpdates = new Map<string, any[]>();
+
+  for (const { file, executionId, sessionId } of filesToEnrich) {
+    if (!file.searchableText) continue; // fetch failed, skip
+
+    if (sessionId) {
+      if (!sessionUpdates.has(sessionId)) sessionUpdates.set(sessionId, []);
+      sessionUpdates.get(sessionId)!.push({ url: file.url, searchableText: file.searchableText, generatedAt: file.generatedAt });
+    } else {
+      if (!executionUpdates.has(executionId)) executionUpdates.set(executionId, []);
+      executionUpdates.get(executionId)!.push(file);
+    }
+  }
+
+  // Fire-and-forget persistence (non-critical, don't delay the response)
+  for (const [sessionId, updates] of sessionUpdates) {
+    // Keep only the most recent MAX_CACHE_PER_SESSION entries to bound item size
+    const toCache = updates
+      .sort((a, b) => (b.generatedAt || '').localeCompare(a.generatedAt || ''))
+      .slice(0, MAX_CACHE_PER_SESSION)
+      .map(({ url, searchableText }) => ({ url, searchableText }));
+    chatbotDb.persistSearchableTexts(sessionId, toCache).catch(() => {/* already logged inside */});
+  }
+  for (const [execId, files] of executionUpdates) {
+    for (const task of Object.values(result) as any[]) {
+      const exec = (task.executions || []).find((e: any) => e.executionId === execId);
+      if (exec) {
+        taskDb.updateTaskExecutionResultFiles(execId, exec.result_files).catch(() => {/* non-critical */});
+        break;
+      }
+    }
+  }
 }
 
 /**
@@ -2133,10 +2264,10 @@ async function getExecutionsWithAssets(
 function scanMessagesForAssets(
   messages: any[],
   session: ChatSession
-): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string }> } {
+): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }> } {
   const images: Array<{ url: string; filename: string; generatedAt: string }> = [];
   const videos: Array<{ url: string; filename: string; generatedAt: string }> = [];
-  const htmlReports: Array<{ url: string; filename: string; generatedAt: string }> = [];
+  const htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }> = [];
 
   const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
   const seenUrls = new Set<string>();
@@ -2302,7 +2433,7 @@ function addCachedHtmlReportsToResult(
   result: Record<string, any>,
   sessionKey: string,
   session: ChatSession,
-  assets: Array<{ url: string; filename: string; generatedAt: string }>,
+  assets: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>,
   messages: any[]
 ): void {
   for (const asset of assets) {
@@ -2349,6 +2480,7 @@ function addCachedHtmlReportsToResult(
         is_favorited: isFavorited,
         is_archived: false,
         feedback,
+        ...(asset.searchableText ? { searchableText: asset.searchableText } : {}),
       });
     }
   }

@@ -4,8 +4,13 @@ import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { extractJson, JsonExtractError } from '../services/util/extractJson';
 
 export type OutputFormat = 'json' | 'xml';
+
+/** Suffix appended on retry when the first extraction attempt fails. */
+const STRICT_JSON_SUFFIX =
+  '\n\nCRITICAL: You MUST respond with only valid JSON. No preamble, no markdown fences, no commentary. Output the JSON value and NOTHING else.';
 
 export interface LLMUsageData {
   inputTokens: number;
@@ -195,6 +200,79 @@ export class LLMService {
     } catch (error) {
       console.error('LLMService: Error generating content:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Robust JSON-from-LLM helper with one retry. Use this in pipelines that
+   * must NOT cascade-fail on a stray "It looks like..." preamble from the
+   * model.
+   *
+   * Flow:
+   *   1. Invoke the model. Strip fences + parse via `extractJson` (which
+   *      also tries balanced-brace extraction from prose).
+   *   2. If extraction throws `JsonExtractError`, retry the call ONCE with
+   *      a stricter system prompt suffix demanding pure JSON.
+   *   3. If extraction still fails after retry, throw `JsonExtractError`
+   *      whose `rawSnippet` contains a 500-char window of the second raw
+   *      response — callers can persist this in their failure-state
+   *      breadcrumb so a human can debug what the model said.
+   *
+   * Non-extraction errors (network, auth, model timeouts) bubble up
+   * unchanged on the first call — only `JsonExtractError` triggers retry.
+   */
+  async generateJsonRobust<T = any>(
+    systemPrompt: string,
+    userPrompt: string,
+    onUsage?: OnUsageCallback,
+  ): Promise<T> {
+    const callOnce = async (system: string): Promise<{ raw: string }> => {
+      const messages = [
+        new SystemMessage(system),
+        new HumanMessage(userPrompt),
+      ];
+      const response = await this.chatModel.invoke(messages) as any;
+      const rawResponse = typeof response.content === 'string'
+        ? response.content
+        : String(response.content || '');
+      if (onUsage) {
+        onUsage(this.extractUsage(response));
+      }
+      return { raw: rawResponse };
+    };
+
+    let firstRaw = '';
+    try {
+      const { raw } = await callOnce(systemPrompt);
+      firstRaw = raw;
+      return extractJson<T>(raw);
+    } catch (err) {
+      if (!(err instanceof JsonExtractError)) {
+        // Non-parse failure (network, auth, etc) — bubble up untouched.
+        throw err;
+      }
+      // First attempt produced unparseable output — retry once with strict suffix.
+      console.warn(
+        '[LLMService] generateJsonRobust: first extraction failed, retrying with strict prompt',
+        { firstSnippet: err.rawSnippet.slice(0, 120) },
+      );
+    }
+
+    // Retry path — append the strict suffix and try again.
+    try {
+      const { raw } = await callOnce(systemPrompt + STRICT_JSON_SUFFIX);
+      return extractJson<T>(raw);
+    } catch (err) {
+      if (err instanceof JsonExtractError) {
+        // Surface the retry's raw snippet — that's the more recent / relevant breadcrumb.
+        throw err;
+      }
+      // Non-parse error on retry — wrap with a JsonExtractError carrying the first raw text
+      // so the caller's failure persistence path still has something useful.
+      throw new JsonExtractError(
+        `LLM call failed during strict-retry: ${(err as Error).message}`,
+        firstRaw,
+      );
     }
   }
 

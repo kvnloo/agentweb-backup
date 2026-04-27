@@ -32,6 +32,10 @@ export interface DedupedContact {
   primaryLead: any;
 }
 
+/** Safety cap on raw lead rows fetched across all lists. Prevents OOM on
+ *  large accounts (e.g. 130k-lead lists). Inbox only needs a useful top-N. */
+const DEFAULT_MAX_RAW_LEADS = 50_000;
+
 export interface DedupQuery {
   userId: string;
   /** Optional: restrict to a specific listType (e.g. "sales"). */
@@ -42,31 +46,19 @@ export interface DedupQuery {
   limit?: number;
   /** Optional sort order. Defaults to heatScore desc then lastContactAt desc. */
   sort?: 'heat' | 'recent';
-  /**
-   * Max total raw leads to process across all lists (default: 5000).
-   * Distributed evenly across lists. Prevents loading all 100k+ records.
-   */
-  rawFetchLimit?: number;
-  /**
-   * Opaque pagination cursor: base64-encoded JSON map of
-   * { [listId]: lastEvaluatedKey | null } indicating where to resume per list.
-   * Omit for the first page.
-   */
-  cursor?: string;
+  /** Optional: max raw lead rows to load across all lists before stopping.
+   *  Defaults to DEFAULT_MAX_RAW_LEADS. Prevents OOM on very large accounts. */
+  maxRawLeads?: number;
 }
 
 export interface DedupResult {
   contacts: DedupedContact[];
-  /** Total deduped rows in this window (before limit). */
+  /** Total deduped rows (before limit). */
   total: number;
   /** Total raw lead rows processed (for observability). */
   rawCount: number;
   /** Lists consulted. */
   listsCount: number;
-  /** Cursor to pass for the next window. Undefined when all lists are exhausted. */
-  nextCursor?: string;
-  /** True when at least one list has more leads beyond this window. */
-  hasMore: boolean;
 }
 
 /** Coarse heat score — mirrors the frontend computeHeatScore utility. */
@@ -100,39 +92,17 @@ function pickLastContact(lead: any): string | undefined {
   return latest ?? lead?.updatedAt ?? lead?.createdAt;
 }
 
-const RAW_FETCH_DEFAULT = 5000;
-const BATCH_SIZE = 500;
-
 /**
- * Fetch leads across a user's lists and dedupe by lowercased email.
+ * Fetch all leads across a user's lists and dedupe by lowercased email.
  * Returns deduped contacts sorted by heat score (desc) by default.
  *
- * Supports cursor-based windowed fetching so callers can page through
- * large datasets (100k+ leads) without loading everything at once.
+ * Performance: replaces the client-side per-list fetch the Inbox tab used
+ * to do. Calls run in parallel across lists.
  */
 export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResult> {
   const { userId } = query;
   if (!userId || typeof userId !== 'string') {
     throw new Error('userId is required');
-  }
-
-  const rawFetchLimit = query.rawFetchLimit ?? RAW_FETCH_DEFAULT;
-  if (rawFetchLimit < 1) {
-    throw new Error('rawFetchLimit must be >= 1');
-  }
-
-  // Decode cursor: map of { [listId]: lastEvaluatedKey | null }
-  let startCursors: Record<string, any> = {};
-  if (query.cursor) {
-    try {
-      const parsed = JSON.parse(Buffer.from(query.cursor, 'base64').toString('utf8'));
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        throw new Error('not an object');
-      }
-      startCursors = parsed;
-    } catch {
-      throw new Error('Invalid cursor');
-    }
   }
 
   const allLists = await crmDb.getLeadListsByUserId(userId);
@@ -146,36 +116,42 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
     filteredLists = filteredLists.filter((l: any) => allowed.has(l.listId));
   }
 
-  // Budget: distribute rawFetchLimit evenly across lists.
-  const perListBudget = Math.max(1, Math.ceil(rawFetchLimit / Math.max(1, filteredLists.length)));
+  const maxRawLeads = query.maxRawLeads ?? DEFAULT_MAX_RAW_LEADS;
 
-  // Track ending cursor position per list for the nextCursor response.
-  const endCursors: Record<string, any> = {};
+  // Sort lists by updatedAt desc so recently-active lists get their leads
+  // fetched first when the cap would otherwise leave some lists unread.
+  filteredLists = [...filteredLists].sort((a: any, b: any) => {
+    const at = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const bt = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return bt - at;
+  });
 
+  // Distribute the raw-lead cap evenly across lists so no single huge list
+  // starves out others.
+  const perListCap = filteredLists.length > 0
+    ? Math.ceil(maxRawLeads / filteredLists.length)
+    : maxRawLeads;
+
+  // Fetch leads for each list in parallel. Individual list failures are
+  // swallowed so one bad list doesn't kill the whole call.
   const perListResults = await Promise.all(
     filteredLists.map(async (list: any) => {
       try {
         const leads: any[] = [];
-        let lastKey: any = startCursors[list.listId] ?? undefined;
-        let fetched = 0;
+        let lastKey: any = undefined;
         let safety = 0;
-
-        while (fetched < perListBudget && safety < 20) {
-          safety++;
-          const batchSize = Math.min(BATCH_SIZE, perListBudget - fetched);
-          const page: any = await crmDb.getLeadsByListId(list.listId, batchSize, lastKey);
-          const items = Array.isArray(page?.items) ? page.items : [];
-          leads.push(...items);
-          fetched += items.length;
-          lastKey = page?.lastEvaluatedKey ?? null;
-          if (!lastKey) break;
-        }
-
-        endCursors[list.listId] = lastKey ?? null;
+        do {
+          const pageSize = Math.min(500, perListCap - leads.length);
+          const page: any = await crmDb.getLeadsByListId(list.listId, pageSize, lastKey);
+          if (Array.isArray(page?.items)) leads.push(...page.items);
+          lastKey = page?.lastEvaluatedKey;
+          safety += 1;
+          if (safety > 50) break; // hard safety: 500 * 50 = 25k absolute max per list
+          if (leads.length >= perListCap) break; // per-list cap hit
+        } while (lastKey);
         return { list, leads };
       } catch (err) {
         console.error(`[contactDedupService] list ${list?.listId} fetch failed:`, err);
-        endCursors[list.listId] = null;
         return { list, leads: [] as any[] };
       }
     }),
@@ -249,17 +225,10 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
   const limited =
     query.limit && query.limit > 0 ? contacts.slice(0, query.limit) : contacts;
 
-  const hasMore = Object.values(endCursors).some((k) => k !== null);
-  const nextCursor = hasMore
-    ? Buffer.from(JSON.stringify(endCursors)).toString('base64')
-    : undefined;
-
   return {
     contacts: limited,
     total,
     rawCount,
     listsCount: filteredLists.length,
-    nextCursor,
-    hasMore,
   };
 }

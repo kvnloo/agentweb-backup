@@ -20,6 +20,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
 }));
 
@@ -68,6 +69,29 @@ jest.mock('uuid', () => ({
   v4: jest.fn(() => 'mock-run-id-123'),
 }));
 
+jest.mock('../services/emailService', () => ({
+  emailService: {
+    sendScheduledChatResultEmail: jest.fn(),
+    sendDailyDigestEmail: jest.fn(),
+    sendScheduledChatVariableRequestEmail: jest.fn(),
+    sendScheduledChatErrorEmail: jest.fn(),
+    sendScheduledChatTokenLimitEmail: jest.fn(),
+  },
+}));
+
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(async () => ({
+    allowed: true,
+    warning: false,
+    used: 100000,
+    allowance: 1000000,
+    bonus: 0,
+    effectiveAllowance: 1000000,
+    percentUsed: 10,
+    month: '2026-04',
+  })),
+}));
+
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
@@ -112,6 +136,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     // Setup default mocks
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
     mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);

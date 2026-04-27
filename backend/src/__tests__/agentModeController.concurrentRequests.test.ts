@@ -11,6 +11,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -116,6 +117,7 @@ describe('AgentModeController - Concurrent Request Handling', () => {
     jest.clearAllMocks();
     activeSessionGenerations.clear();
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);

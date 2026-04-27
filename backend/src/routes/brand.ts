@@ -7,6 +7,10 @@ import multer from "multer";
 import { S3 } from "aws-sdk";
 import crypto from "crypto";
 import { MAX_FILE_SIZE } from "../config";
+import {
+  buildReadyPatch,
+  logCompletionMetric,
+} from "../services/brandBuildStatusService";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -360,6 +364,19 @@ router.post(
         }
         await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData });
         console.log(`[BRAND DEBUG] Updated org ${user.orgId} brand guidelines`);
+        // Onboarding v2 Phase 1: flip brand-build status to ready if we were
+        // building. Uses the user record (not the org) because the status
+        // pill is per-user in the onboarding flow. Best-effort; never blocks
+        // the save response on a metrics write.
+        try {
+          const readyPatch = buildReadyPatch(user as any);
+          if (readyPatch) {
+            await userDb.updateUser(user.userId, readyPatch);
+            logCompletionMetric(user.userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+          }
+        } catch (e) {
+          console.warn("[brandBuild] ready-patch failed (org path)", e);
+        }
         return res.status(201).json({
           message: "Brand guidelines saved successfully (org-level)",
           attachments: attachments.length,
@@ -392,6 +409,19 @@ router.post(
           ? "brandGuidelines field exists"
           : "brandGuidelines field missing"
       );
+
+      // Onboarding v2 Phase 1: flip brand-build status to ready if we were
+      // building. Best-effort; metrics log emitted on success so the log
+      // scraper can compute p50/p99.
+      try {
+        const readyPatch = buildReadyPatch(user as any);
+        if (readyPatch) {
+          await userDb.updateUser(user.userId, readyPatch);
+          logCompletionMetric(user.userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+        }
+      } catch (e) {
+        console.warn("[brandBuild] ready-patch failed (user path)", e);
+      }
 
       res.status(201).json({
         message: "Brand guidelines saved successfully",

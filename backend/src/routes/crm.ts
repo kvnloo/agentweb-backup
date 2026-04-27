@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { crmDb, taskDb, subscriberDb, userDb } from '../services/db';
+import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
@@ -35,6 +35,7 @@ import {
   SavedViewScope as SavedViewScopeUtil,
 } from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
+import { normalizeAttribution } from '../types/attribution';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -417,6 +418,18 @@ const fetchAllLeadsByStatusIndex = async (
   }
 };
 
+// ─── Org-aware access control ────────────────────────────────────────────────
+// Returns true if userId owns the list OR is a member of the same org as the owner.
+async function canAccessCrmList(userId: string, list: { userId: string } | Record<string, any>): Promise<boolean> {
+  if (list.userId === userId) return true;
+  const [user, owner] = await Promise.all([
+    userDb.getUserById(userId),
+    userDb.getUserById(list.userId),
+  ]);
+  return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Lead List Routes
 
 /**
@@ -634,8 +647,11 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || list.userId !== userId) {
+    if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
     const lead = await crmDb.getLeadById(listId, leadId);
@@ -725,8 +741,22 @@ router.get('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const lists = await crmDb.getLeadListsByUserId(userId);
-    res.json(lists);
+    const ownLists = await crmDb.getLeadListsByUserId(userId);
+
+    // Also include org members' lists
+    const user = await userDb.getUserById(userId);
+    if (user?.orgId) {
+      const members = await orgDb.getOrgMembers(user.orgId);
+      const memberListArrays = await Promise.all(
+        members
+          .filter((m) => m.userId !== userId)
+          .map((m) => crmDb.getLeadListsByUserId(m.userId))
+      );
+      const memberLists = memberListArrays.flat().filter(Boolean).map((l) => ({ ...l, fromOrgMember: true }));
+      return res.json([...(ownLists || []), ...memberLists]);
+    }
+
+    res.json(ownLists);
   } catch (error: any) {
     console.error('Error fetching lead lists:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead lists' });
@@ -785,16 +815,53 @@ router.get('/contacts', async (req: Request, res: Response) => {
       ? listIds.split(',').map((s) => s.trim()).filter(Boolean)
       : undefined;
 
+    // Collect userIds to dedup across: own + all org members
+    const userIdsToDedup: string[] = [userId];
+    const user = await userDb.getUserById(userId);
+    if (user?.orgId) {
+      const members = await orgDb.getOrgMembers(user.orgId);
+      for (const m of members) {
+        if (m.userId !== userId) userIdsToDedup.push(m.userId);
+      }
+    }
+
     const started = Date.now();
-    const result = await dedupContactsForUser({
-      userId,
-      listType: listType as 'sales' | 'customers' | undefined,
-      listIds: parsedListIds,
-      limit: parsedLimit,
-      sort: sort as 'heat' | 'recent' | undefined,
-      cursor,
-      rawFetchLimit: 5000,
-    });
+    const perUserResults = await Promise.all(
+      userIdsToDedup.map((uid) =>
+        dedupContactsForUser({
+          userId: uid,
+          listType: listType as 'sales' | 'customers' | undefined,
+          listIds: uid === userId ? parsedListIds : undefined,
+          limit: parsedLimit,
+          sort: sort as 'heat' | 'recent' | undefined,
+        })
+      )
+    );
+
+    // Merge deduped contacts across users, re-dedup by email
+    const contactMap = new Map<string, any>();
+    let rawCount = 0;
+    let listsCount = 0;
+    for (const r of perUserResults) {
+      rawCount += r.rawCount;
+      listsCount += r.listsCount;
+      for (const c of r.contacts) {
+        const key = c.email?.toLowerCase() ?? '';
+        if (!contactMap.has(key)) contactMap.set(key, c);
+      }
+    }
+
+    let contacts = Array.from(contactMap.values());
+    // Re-sort
+    if (!sort || sort === 'heat') {
+      contacts.sort((a, b) => (b.heatScore ?? 0) - (a.heatScore ?? 0) || new Date(b.lastContactAt ?? 0).getTime() - new Date(a.lastContactAt ?? 0).getTime());
+    } else {
+      contacts.sort((a, b) => new Date(b.lastContactAt ?? 0).getTime() - new Date(a.lastContactAt ?? 0).getTime());
+    }
+    const total = contacts.length;
+    if (parsedLimit !== undefined) contacts = contacts.slice(0, parsedLimit);
+
+    const result = { contacts, total, rawCount, listsCount };
     const durationMs = Date.now() - started;
 
     return res.json({
@@ -802,8 +869,6 @@ router.get('/contacts', async (req: Request, res: Response) => {
       total: result.total,
       rawCount: result.rawCount,
       listsCount: result.listsCount,
-      nextCursor: result.nextCursor,
-      hasMore: result.hasMore,
       durationMs,
     });
   } catch (error: any) {
@@ -922,7 +987,7 @@ router.get('/lists/:listId', async (req: Request, res: Response) => {
     }
 
     // Verify ownership
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -955,7 +1020,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1129,7 +1194,7 @@ router.delete('/lists/:listId', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1172,7 +1237,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1322,6 +1387,21 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const userId = authReq.user?.userId;
     const { listId } = req.params;
     const leadData = req.body;
+
+    // Attribution — accept the same `attribution` / legacy `utm` shape as the
+    // public forward-lead endpoint so the CRM "quick add" flow preserves source
+    // data when a rep pastes in a lead they got from a tracked link.
+    const attributionTouch =
+      normalizeAttribution(leadData?.attribution) ?? normalizeAttribution(leadData?.utm);
+    if (attributionTouch) {
+      leadData.firstTouch = attributionTouch;
+      leadData.lastTouch = attributionTouch;
+    }
+    // Strip the top-level `attribution` / `utm` envelopes — createLead doesn't
+    // know those keys and DynamoDB rejects extra attributes silently.
+    delete leadData.attribution;
+    delete leadData.utm;
+
     if (leadData?.selectedSenderId !== undefined) {
       const normalizedSenderId = normalizeSenderId(leadData.selectedSenderId);
       if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
@@ -1346,7 +1426,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1361,6 +1441,118 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error creating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to create lead' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/bulk-import
+ * @desc Bulk-import leads from an array (e.g. LinkedIn search results via platform-wide outreach accounts).
+ *       Maps linkedin_url → linkedin field. Deduplicates against existing list leads via batchCreateLeads.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const { leads } = req.body;
+
+    if (!Array.isArray(leads) || leads.length === 0) {
+      return res.status(400).json({ message: 'leads must be a non-empty array' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+
+    // Normalize Unipile search result shape → CRM lead shape
+    const normalizedLeads = leads.map((lead: any) => {
+      const { name, linkedin_url, public_profile_url, profile_url, public_identifier, current_role, headline, ...rest } = lead;
+      const normalized: any = { ...rest };
+
+      // Split Unipile full `name` field into firstName/lastName if not already split
+      if (name && !normalized.firstName && !normalized.lastName) {
+        const parts = (name as string).trim().split(/\s+/);
+        normalized.firstName = parts[0] || '';
+        normalized.lastName = parts.slice(1).join(' ') || '';
+      }
+
+      // Build clean LinkedIn URL — prefer slug over messy profile_url with query params
+      if (!normalized.linkedin) {
+        if (public_identifier) {
+          normalized.linkedin = `https://www.linkedin.com/in/${public_identifier}`;
+        } else {
+          const rawUrl = linkedin_url || public_profile_url || profile_url;
+          if (rawUrl) normalized.linkedin = (rawUrl as string).split('?')[0];
+        }
+      }
+
+      // Map headline → title
+      if (headline && !normalized.title) normalized.title = headline;
+      // Flatten current_role
+      if (current_role) {
+        if (current_role.position && !normalized.title) normalized.title = current_role.position;
+        if (current_role.company && !normalized.company) normalized.company = current_role.company;
+      }
+      return normalized;
+    });
+
+    const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+
+    res.status(201).json({
+      imported: result.newCount,
+      skipped: result.mergedCount,
+      errors: result.errors,
+      total: leads.length,
+    });
+  } catch (error: any) {
+    console.error('Error bulk importing leads:', error);
+    res.status(500).json({ message: error.message || 'Failed to bulk import leads' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/find
+ * @desc Search LinkedIn for people using platform-wide outreach accounts and import results into the list.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const { keywords, title, company, search_url, limit } = req.body;
+
+    if (!keywords && !title && !company && !search_url) {
+      return res.status(400).json({ message: 'At least one search filter is required: keywords, title, company, or search_url' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.importLeadsFromSearch(userId, {
+      listId,
+      keywords,
+      title,
+      company,
+      search_url,
+      limit: limit ? Math.min(Number(limit), 100) : 20,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ message: result.error });
+    }
+
+    res.status(201).json(result);
+  } catch (error: any) {
+    console.error('Error finding leads:', error);
+    res.status(500).json({ message: error.message || 'Failed to find leads' });
   }
 });
 
@@ -1385,7 +1577,7 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1438,7 +1630,7 @@ router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res:
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1512,7 +1704,7 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1558,7 +1750,7 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1630,7 +1822,7 @@ router.delete('/lists/:listId/leads/:leadId', async (req: Request, res: Response
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1663,7 +1855,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1781,7 +1973,7 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1895,7 +2087,7 @@ router.get('/lists/:listId/export-history', async (req: Request, res: Response) 
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1929,7 +2121,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2334,7 +2526,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2595,7 +2787,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2791,7 +2983,7 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2867,7 +3059,7 @@ router.get('/lists/:listId/leads/:leadId/engagements', async (req: Request, res:
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2910,7 +3102,7 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2970,7 +3162,7 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3009,7 +3201,7 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3356,7 +3548,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
 
     // Verify the lead belongs to the user's list
     const list = await crmDb.getLeadListById(listId);
-    if (!list || list.userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3422,7 +3614,7 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
 
     // Verify the lead belongs to the user's list
     const list = await crmDb.getLeadListById(listId);
-    if (!list || list.userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3476,7 +3668,7 @@ router.put('/lists/:listId/public-access', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3537,7 +3729,7 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3704,7 +3896,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3757,7 +3949,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3838,7 +4030,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3958,7 +4150,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4034,7 +4226,7 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4147,7 +4339,7 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (list.userId !== userId) {
+    if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 

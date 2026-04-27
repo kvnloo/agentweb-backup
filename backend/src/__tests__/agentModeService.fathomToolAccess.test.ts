@@ -142,6 +142,15 @@ describe('AgentModeService - Fathom Tool Access', () => {
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },
+        {
+          skillId: 'existing-id-2',
+          name: 'Google Calendar',
+          description: 'Already exists',
+          toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars'],
+          isPublished: true,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
       ]);
 
       await agentModeService.ensureBuiltInSkills();

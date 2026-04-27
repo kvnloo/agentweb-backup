@@ -10,6 +10,7 @@ import crypto from "crypto";
 import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
+import { onUserRegistered } from "../services/contactCaptureHooks";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -68,6 +69,12 @@ export const register = async (req: Request, res: Response) => {
     const finalDisplayName =
       reqDisplayName || displayNameFromWaitlist || email.split("@")[0];
 
+    // Compute attribution up-front so createUser can thread it through the
+    // onUserSignup hook → signupAutoEnrollService → lead.customFields. If we
+    // compute after createUser like before, the signup hook fires BEFORE
+    // attribution is known and the enrolled lead is missing UTM data.
+    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
+
     const newUser = await userDb.createUser(
       email,
       userId,
@@ -79,12 +86,12 @@ export const register = async (req: Request, res: Response) => {
       undefined, // googleId
       stripe_customer_id, // from waitlist
       companyNameFromWaitlist, // from waitlist
-      useCaseCategoriesFromWaitlist // from waitlist
+      useCaseCategoriesFromWaitlist, // from waitlist
+      touch // attribution — passes through onUserSignup hook
     );
 
     // Set Free tier defaults for new registrations (subscription upgrades happen via Stripe checkout)
     const freeTierConfig = await getTierConfig("Free");
-    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
     await userDb.updateUser(userId, {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
@@ -108,6 +115,17 @@ export const register = async (req: Request, res: Response) => {
       stripe_customer_id,
       subscriptionType: "Free",
       attribution: touch,
+    }).catch(() => {});
+
+    // Fire user.registered timeline event (fire-and-forget).
+    // Distinct from crmSignalHooks.onUserSignup (contact.created + scoring)
+    // — this populates the contact activity timeline specifically.
+    onUserRegistered({
+      userId,
+      email,
+      displayName: finalDisplayName,
+      signupSource: "password",
+      createdAt: new Date().toISOString(),
     }).catch(() => {});
 
     if (process.env.NODE_ENV !== "development") {
@@ -287,6 +305,12 @@ export const googleCallback = async (
           isAdmin: false,
           subscriptionType: "Free",
         }).catch(() => {});
+
+        if (process.env.NODE_ENV !== "development") {
+          emailService.sendTeamIntroductionEmail(email, finalDisplayName)
+            .then(() => userDb.updateUser(user!.userId, { introductionEmailSent: new Date().toISOString() }))
+            .catch((err) => console.error("Failed to send team introduction email:", err));
+        }
       } else {
         // For other portals, look up waitlist for bonus data (no gate)
         const waitlistEntry = await waitlistDb.getByEmail(email);
@@ -347,6 +371,12 @@ export const googleCallback = async (
           stripe_customer_id,
           subscriptionType: "Free",
         }).catch(() => {});
+
+        if (process.env.NODE_ENV !== "development") {
+          emailService.sendTeamIntroductionEmail(email, finalDisplayName)
+            .then(() => userDb.updateUser(user!.userId, { introductionEmailSent: new Date().toISOString() }))
+            .catch((err) => console.error("Failed to send team introduction email:", err));
+        }
       }
     }
 

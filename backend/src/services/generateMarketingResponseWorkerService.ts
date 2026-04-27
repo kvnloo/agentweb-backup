@@ -187,6 +187,9 @@ export class GenerateMarketingResponseWorkerService {
         if (message.stack) {
           error.stack = message.stack;
         }
+        if (message.originalMessage) {
+          error.originalMessage = message.originalMessage;
+        }
         if (message.partialUsageMessages?.length) {
           error.partialUsageMessages = message.partialUsageMessages;
         }

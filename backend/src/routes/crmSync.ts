@@ -78,11 +78,17 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     const config = await externalCrmSyncService.getConfig(userId, listId, provider);
     if (!config) return res.json({ configured: false });
 
-    // Lazily backfill webhookSecret for configs created before this feature was added
+    // Lazily backfill webhookSecret for configs created before this feature was added.
+    // Non-fatal: if the write fails the config is still returned without a webhookUrl.
     if (!config.webhookSecret) {
-      await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
+      try {
+        await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
+      } catch (backfillErr: any) {
+        console.warn(`[CrmSync] ensureWebhookSecret failed for list ${listId}/${provider}: ${backfillErr.message}`);
+      }
     }
 
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
     res.json({
       configured: true,
       provider: config.provider,
@@ -105,7 +111,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       updatedAt: config.updatedAt,
       // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
       webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        ? `${backendUrl}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
         : undefined,
     });
   } catch (err: any) {
@@ -133,6 +139,14 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
     } = req.body;
+
+    // Validate Attio API key length before encrypting and storing it.
+    if (apiKey && provider === 'attio' && apiKey.trim().length !== 64) {
+      return res.status(400).json({
+        error: `Invalid Attio API key: keys must be exactly 64 characters (yours is ${apiKey.trim().length}). Copy the full key from Attio Settings → API Keys.`,
+      });
+    }
+
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping,
@@ -158,7 +172,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       updatedAt: config.updatedAt,
       // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
       webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        ? `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
         : undefined,
     });
   } catch (err: any) {

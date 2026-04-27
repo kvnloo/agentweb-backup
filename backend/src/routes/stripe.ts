@@ -10,25 +10,27 @@ dotenv.config();
 
 const router = express.Router();
 
-// Ensure STRIPE_SECRET_KEY is set in your .env file
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const CUSTOMER_FRONTEND_URL =
   process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174"; // For return URL
 
-if (!stripeSecretKey) {
-  console.error(
-    "Stripe secret key (STRIPE_SECRET_KEY) is not set in the environment variables."
-  );
-  // Optionally, you could throw an error here to prevent the app from starting
-  // or handle it in a way that doesn't expose uninitialized Stripe functionality.
+// Lazy Stripe client — must be a getter, NOT a module-level const. The
+// async `getStripeCredentials()` bootstrap in server.ts runs AFTER this
+// module is imported, so `process.env.STRIPE_SECRET_KEY` is still
+// undefined at import time. Reading it here with a function instead of at
+// module load lets each request see the now-populated env var and return
+// a valid Stripe SDK instance. Previously this was a module-level const
+// that captured `null` forever, turning every checkout call into
+// "Stripe integration is not configured correctly" on dev/test envs.
+let stripeClient: Stripe | null = null;
+function getStripe(): Stripe | null {
+  if (stripeClient) return stripeClient;
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) return null;
+  stripeClient = new Stripe(key, {
+    apiVersion: "2025-05-28.basil",
+  });
+  return stripeClient;
 }
-
-// Initialize Stripe with a check for the key
-const stripe = stripeSecretKey
-  ? new Stripe(stripeSecretKey, {
-      apiVersion: "2025-05-28.basil", // Using the version suggested by the linter
-    })
-  : null;
 
 /**
  * @route GET /api/stripe/session/:sessionId
@@ -36,6 +38,7 @@ const stripe = stripeSecretKey
  * @access Public (consider adding authentication if needed)
  */
 router.get("/session/:sessionId", async (req: Request, res: Response) => {
+  const stripe = getStripe();
   if (!stripe) {
     console.error("Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.");
     return res
@@ -354,7 +357,8 @@ router.post(
   "/create-checkout-session",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -368,7 +372,7 @@ router.post(
       return res.status(401).json({ error: "User not authenticated." });
     }
 
-    const { plan } = req.body;
+    const { plan, source } = req.body as { plan?: string; source?: string };
     if (!plan) {
       return res.status(400).json({ error: "Plan is required." });
     }
@@ -387,34 +391,97 @@ router.post(
 
     try {
       // Find or create Stripe customer
+      // Find or reuse Stripe customer — defensive against stale DB IDs
+      // (customer deleted from Stripe dashboard) and duplicate customers
+      // (multiple records for the same email because DB lost track).
       const user = await userDb.getUserById(userId);
-      let customerId = user?.stripe_customer_id;
+      let customerId: string | null = user?.stripe_customer_id || null;
 
+      // Step 1: if DB has a customer ID, verify it still exists in Stripe.
+      // Treat "deleted" or "No such customer" as missing so we don't pass a
+      // dead ID to checkout.sessions.create and 500.
+      if (customerId) {
+        try {
+          const existing = await stripe.customers.retrieve(customerId);
+          if ((existing as any).deleted) {
+            customerId = null;
+          }
+        } catch (err: any) {
+          const code = err?.code || err?.raw?.code;
+          const status = err?.statusCode || err?.raw?.statusCode;
+          if (code === "resource_missing" || status === 404) {
+            customerId = null;
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      // Step 2: no valid customer on file. Search Stripe by email BEFORE
+      // creating a new one — prevents duplicate customer records piling up
+      // (the cus_ABC vs cus_DEF orphan problem).
       if (!customerId) {
-        const customer = await stripe.customers.create({
-          email: userEmail,
-          metadata: { userId },
+        // Escape backslash first, then double-quote, before interpolating into
+        // Stripe's search DSL. Without this, an attacker who registered with a
+        // crafted email (registration allows `"` and `\`) could inject
+        // additional search clauses and link another user's Stripe customer
+        // to their DB row — e.g. `foo" OR metadata["userId"]:"victim"`.
+        const escapedEmail = userEmail
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"');
+        const searchResult = await stripe.customers.search({
+          query: `email:"${escapedEmail}"`,
+          limit: 1,
         });
-        customerId = customer.id;
+        const existingByEmail = searchResult.data.find(
+          (c) => !(c as any).deleted
+        );
+        if (existingByEmail) {
+          customerId = existingByEmail.id;
+        } else {
+          const customer = await stripe.customers.create({
+            email: userEmail,
+            metadata: { userId },
+          });
+          customerId = customer.id;
+        }
         await userDb.updateUser(userId, { stripe_customer_id: customerId });
       }
 
-      // Check if user has already used a trial — don't offer trial again
-      const hasUsedTrial = !!(user as any)?.has_used_trial;
-
+      // Free trials removed (product decision, 2026-04). New users pay on
+      // first checkout. Refunds are handled manually by Harsha for
+      // dissatisfied users. Do NOT reintroduce trial_period_days here.
+      // Any existing `has_used_trial: true` values in DynamoDB are harmless
+      // residue and can be ignored.
       const sessionParams: any = {
         ui_mode: "embedded",
         customer: customerId,
         line_items: [{ price: priceId, quantity: 1 }],
         mode: "subscription",
+        allow_promotion_codes: true,
         return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       };
 
-      // Only offer trial if user hasn't used one before
-      if (!hasUsedTrial) {
-        sessionParams.subscription_data = {
-          trial_period_days: 14,
-        };
+      // Source-specific auto-applied coupons. The onboarding welcome-offer
+      // flash sale lands a user on the Pro plan with the welcome coupon
+      // already attached (no manual code entry). The coupon must exist in
+      // the Stripe dashboard with the id from STRIPE_WELCOME_OFFER_COUPON_ID
+      // — recommended config: 90% off, duration=repeating,
+      // duration_in_months=3. If the env var is unset we log a warning and
+      // fall back to full price (allow_promotion_codes still lets the user
+      // type a code manually) — better than blocking checkout.
+      if (source === "onboarding_welcome_offer") {
+        const welcomeCoupon = process.env.STRIPE_WELCOME_OFFER_COUPON_ID;
+        if (welcomeCoupon) {
+          sessionParams.discounts = [{ coupon: welcomeCoupon }];
+          // discounts and allow_promotion_codes are mutually exclusive in
+          // Stripe; remove the latter when we're auto-applying.
+          delete sessionParams.allow_promotion_codes;
+        } else {
+          console.warn(
+            "[stripe] welcome-offer source supplied but STRIPE_WELCOME_OFFER_COUPON_ID env var unset — checkout will land at full price"
+          );
+        }
       }
 
       const session = await stripe.checkout.sessions.create(sessionParams);
@@ -449,7 +516,8 @@ router.post(
   "/upgrade",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -475,6 +543,20 @@ router.post(
     const resolvedPriceId = newPriceId || (plan ? planPriceMap[plan.toLowerCase()] : null);
     if (!resolvedPriceId) {
       return res.status(400).json({ error: "A valid plan or newPriceId is required." });
+    }
+
+    // Whitelist against known env-configured price IDs. Without this,
+    // an authenticated user could pass an arbitrary newPriceId and
+    // downgrade their billing to any active price in the Stripe account
+    // (legacy $1 dev/test prices in particular are dangerous to expose).
+    // `plan` goes through planPriceMap which is already safe; `newPriceId`
+    // is the unsafe override and must match a known env value.
+    const KNOWN_PRICE_IDS = [
+      process.env.STRIPE_STARTER_PRICE_ID,
+      process.env.STRIPE_COMPLETE_PRICE_ID,
+    ].filter(Boolean);
+    if (!KNOWN_PRICE_IDS.includes(resolvedPriceId)) {
+      return res.status(400).json({ error: "Invalid plan or price ID." });
     }
 
     try {
@@ -504,14 +586,58 @@ router.post(
         });
       }
 
-      // Perform the upgrade via Stripe's subscription update API
-      const updated = await stripeService.upgradeSubscription(currentSub.id, resolvedPriceId);
+      // Route upgrade vs downgrade: upgrades apply immediately with
+      // proration, downgrades are scheduled for period-end to avoid
+      // generating a confusing prorated-credit line on the next invoice.
+      const { changeSubscriptionPrice, deriveSubscriptionTypeFromPriceId } =
+        await import("../services/stripeService");
+      const result = await changeSubscriptionPrice(currentSub.id, resolvedPriceId);
 
-      // Derive the new subscription type from the price
-      const { deriveSubscriptionTypeFromPriceId } = await import("../services/stripeService");
+      if (result.kind === "same_price") {
+        return res.status(400).json({ error: "You are already on this plan." });
+      }
+
+      if (result.kind === "downgrade_scheduled") {
+        // User stays on current tier until period end — we do NOT write the
+        // new tier to DB here. When Stripe's subscription_schedule fires at
+        // period end, it emits customer.subscription.updated which our
+        // webhook handler will sync the new tier.
+        //
+        // BUT we DO cache the scheduled change itself (schedule id, target
+        // price/tier, effectiveAt) so the UI can surface "your plan changes
+        // on X" without re-querying Stripe on every /auth/me. This cached
+        // hint is cleared by subscription_schedule.{completed,released,
+        // canceled} webhooks or an explicit cancel call.
+        const currentTierName = currentPriceId
+          ? deriveSubscriptionTypeFromPriceId(currentPriceId)
+          : null;
+        const toTier = deriveSubscriptionTypeFromPriceId(resolvedPriceId) ?? 'unknown';
+        const scheduleId = (result as any).schedule?.id ?? '';
+        await userDb.updateUser(userId, {
+          scheduledChange: {
+            stripeScheduleId: scheduleId,
+            toPriceId: resolvedPriceId,
+            toTier,
+            effectiveAt: result.effectiveAt!,
+          },
+        });
+        console.log(
+          `[STRIPE DOWNGRADE] User ${userId} scheduled downgrade to ${plan || resolvedPriceId} at ${result.effectiveAt} (schedule=${scheduleId})`
+        );
+        return res.json({
+          message: `Your plan will change to ${plan || "the selected plan"} at the end of the current period.`,
+          kind: "downgrade_scheduled",
+          effectiveAt: result.effectiveAt,
+          // Echo current state for UI — nothing has actually changed yet
+          subscriptionType: currentTierName,
+          subscription_status: currentSub.status,
+        });
+      }
+
+      // kind === 'upgrade_immediate' — mirror existing DB-write logic
+      const updated = result.subscription;
       const newTierName = deriveSubscriptionTypeFromPriceId(resolvedPriceId);
 
-      // Update user record with new subscription details
       const { getTierConfig } = await import("../services/subscriptionService");
       const tierConfig = newTierName ? await getTierConfig(newTierName) : null;
 
@@ -528,21 +654,24 @@ router.post(
         updateData.allowedSkills = tierConfig.allowedSkills;
       }
 
-      const periodEnd = (updated as any).current_period_end;
+      const periodEnd =
+        (updated.items?.data?.[0] as any)?.current_period_end ??
+        (updated as any).current_period_end;
       if (periodEnd) {
         updateData.current_period_end = new Date(
-          typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
+          typeof periodEnd === "number" ? periodEnd * 1000 : periodEnd
         ).toISOString();
       }
 
       await userDb.updateUser(userId, updateData);
 
       console.log(
-        `[STRIPE UPGRADE] User ${userId} upgraded to ${newTierName || 'unknown tier'} (price=${resolvedPriceId})`
+        `[STRIPE UPGRADE] User ${userId} upgraded to ${newTierName || "unknown tier"} (price=${resolvedPriceId})`
       );
 
       res.json({
         message: "Subscription upgraded successfully.",
+        kind: "upgrade_immediate",
         subscriptionType: newTierName,
         subscription_status: updated.status,
         current_period_end: updateData.current_period_end,
@@ -550,6 +679,71 @@ router.post(
     } catch (error: any) {
       console.error("Error upgrading subscription:", error.message);
       res.status(500).json({ error: "Failed to upgrade subscription." });
+    }
+  }
+);
+
+/**
+ * @route POST /api/stripe/cancel-scheduled-downgrade
+ * @desc Release an active subscription_schedule (user changed their mind
+ *       about their queued downgrade). Returns to the plain subscription at
+ *       its current price. No proration because we're not changing prices
+ *       yet — the scheduled change just gets torn down before it fires.
+ *
+ *       Stripe fires subscription_schedule.released in response to this,
+ *       which our webhook handler uses to clear the cached scheduledChange
+ *       on the user record. We also clear it optimistically here so the
+ *       next /auth/me doesn't show a stale pending change if the webhook
+ *       races or drops.
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/cancel-scheduled-downgrade",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const stripe = getStripe();
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    try {
+      const user = await userDb.getUserById(userId);
+      if (!user?.scheduledChange?.stripeScheduleId) {
+        return res
+          .status(404)
+          .json({ error: "No scheduled change to cancel." });
+      }
+
+      await stripe.subscriptionSchedules.release(
+        user.scheduledChange.stripeScheduleId
+      );
+      // Optimistic clear — webhook (subscription_schedule.released) will
+      // also clear this, but clearing here prevents a race where /auth/me
+      // returns the stale scheduledChange before the webhook lands.
+      await userDb.updateUser(userId, { scheduledChange: null });
+
+      console.log(
+        `[STRIPE] User ${userId} canceled scheduled downgrade (schedule=${user.scheduledChange.stripeScheduleId})`
+      );
+      res.json({
+        message: "Scheduled change canceled. You stay on your current plan.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Error canceling scheduled downgrade:",
+        error.message
+      );
+      res
+        .status(500)
+        .json({ error: "Failed to cancel scheduled change." });
     }
   }
 );
@@ -563,7 +757,8 @@ router.post(
   "/create-customer-portal-session",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       console.error("Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.");
       return res
         .status(500)
@@ -614,7 +809,8 @@ router.post(
   "/cancel-subscription",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -666,12 +862,28 @@ router.post(
         cancel_at_period_end: true,
       });
 
-      // Update user record
-      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
-      await userDb.updateUser(userId, {
+      // Read current_period_end defensively. The 2025-05-28.basil API
+      // moved this field from subscription.current_period_end to
+      // subscription.items.data[0].current_period_end. Prior code crashed
+      // with "Invalid time value" when the top-level field was null.
+      // Trialing subs also have null on both fields until trial ends.
+      const periodEndUnix =
+        (updated as any).current_period_end ??
+        (updated as any).items?.data?.[0]?.current_period_end ??
+        null;
+      const periodEnd = periodEndUnix
+        ? new Date(periodEndUnix * 1000).toISOString()
+        : null;
+
+      // Update user record. `subscription_status: "canceling"` is a
+      // pseudo-status for the UI. Stripe keeps the sub active/trialing
+      // until period end; then customer.subscription.deleted fires and
+      // the webhook handler clears the fields.
+      const updateData: Record<string, any> = {
         subscription_status: "canceling",
-        current_period_end: periodEnd,
-      });
+      };
+      if (periodEnd) updateData.current_period_end = periodEnd;
+      await userDb.updateUser(userId, updateData);
 
       res.json({
         message: "Subscription will be canceled at the end of the billing period.",
@@ -694,7 +906,8 @@ router.post(
   "/reactivate-subscription",
   authenticateToken,
   async (req: Request, res: Response) => {
-    if (!stripe) {
+    const stripe = getStripe();
+  if (!stripe) {
       return res
         .status(500)
         .json({ error: "Stripe integration is not configured correctly." });
@@ -715,7 +928,10 @@ router.post(
           .json({ error: "No subscription found for this account." });
       }
 
-      // Find the user's subscription (could be active with cancel_at_period_end=true)
+      // Find the user's subscription (could be active with
+      // cancel_at_period_end=true). Mirror /cancel-subscription's logic and
+      // fall back to status=trialing if no active sub is found — otherwise
+      // a user who hit cancel during a free trial cannot reactivate.
       const subscriptions = await stripe.subscriptions.list({
         customer: user.stripe_customer_id,
         status: "active",
@@ -723,9 +939,19 @@ router.post(
       });
 
       if (subscriptions.data.length === 0) {
-        return res
-          .status(404)
-          .json({ error: "No active subscription found to reactivate." });
+        const trialingSubscriptions = await stripe.subscriptions.list({
+          customer: user.stripe_customer_id,
+          status: "trialing",
+          limit: 1,
+        });
+
+        if (trialingSubscriptions.data.length === 0) {
+          return res
+            .status(404)
+            .json({ error: "No active subscription found to reactivate." });
+        }
+
+        subscriptions.data = trialingSubscriptions.data;
       }
 
       const subscription = subscriptions.data[0];
@@ -741,12 +967,23 @@ router.post(
         cancel_at_period_end: false,
       });
 
-      // Update user record
-      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
-      await userDb.updateUser(userId, {
-        subscription_status: "active",
-        current_period_end: periodEnd,
-      });
+      // Read current_period_end defensively — same pattern as PR #1262
+      // applied to /cancel-subscription. The 2025-05-28.basil API moved
+      // this field from subscription.current_period_end to
+      // subscription.items.data[0].current_period_end, and trialing subs
+      // have null until trial ends. Without this the endpoint crashes with
+      // "Invalid time value" when the top-level field is null.
+      const periodEndUnix =
+        (updated as any).current_period_end ??
+        (updated as any).items?.data?.[0]?.current_period_end ??
+        null;
+      const periodEnd = periodEndUnix
+        ? new Date(periodEndUnix * 1000).toISOString()
+        : null;
+
+      const updateData: Record<string, any> = { subscription_status: "active" };
+      if (periodEnd) updateData.current_period_end = periodEnd;
+      await userDb.updateUser(userId, updateData);
 
       res.json({
         message: "Subscription reactivated successfully.",

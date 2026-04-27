@@ -52,6 +52,7 @@ export const stripeService = {
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
+      allow_promotion_codes: true,
       metadata: { userId },
     });
   },
@@ -180,6 +181,93 @@ export const stripeService = {
     return s.webhooks.constructEvent(body, signature, secret);
   },
 };
+
+/**
+ * Change a subscription's price. Upgrade = immediate with proration,
+ * downgrade = scheduled for period-end (clean accounting, user keeps
+ * paid tier until period closes, then auto-switches).
+ *
+ * Rationale: Stripe's default `subscriptions.update` with a cheaper price
+ * prorates the unused time into an account-balance credit ($299 refund-
+ * looking line on their invoice). Most SaaS (Vercel, Linear, Stripe
+ * Billing's own dashboard) instead defer downgrades to period end —
+ * cleaner ledger, cleaner UX.
+ */
+export async function changeSubscriptionPrice(
+  subscriptionId: string,
+  newPriceId: string
+): Promise<{
+  kind: 'upgrade_immediate' | 'downgrade_scheduled' | 'same_price';
+  effectiveAt?: string; // ISO — only for scheduled downgrades
+  subscription: any;
+  schedule?: any; // Stripe subscription_schedule — only set on downgrade_scheduled
+}> {
+  if (!subscriptionId) throw new Error('subscriptionId is required');
+  if (!newPriceId) throw new Error('newPriceId is required');
+
+  const stripe = getStripeOrThrow();
+  const current = await stripe.subscriptions.retrieve(subscriptionId);
+  const currentItem = current.items.data[0];
+  if (!currentItem) throw new Error(`Subscription ${subscriptionId} has no items`);
+
+  if (newPriceId === currentItem.price.id) {
+    return { kind: 'same_price', subscription: current };
+  }
+
+  const currentAmount = currentItem.price.unit_amount ?? 0;
+  const newPrice = await stripe.prices.retrieve(newPriceId);
+  const newAmount = newPrice.unit_amount ?? 0;
+
+  if (newAmount > currentAmount) {
+    // Upgrade — immediate with proration
+    const updated = await stripe.subscriptions.update(subscriptionId, {
+      items: [{ id: currentItem.id, price: newPriceId }],
+      proration_behavior: 'create_prorations',
+    });
+    return { kind: 'upgrade_immediate', subscription: updated };
+  }
+
+  // Downgrade — schedule for period end using Subscription Schedules.
+  // Read period_end defensively: in newer Stripe API versions, per-period
+  // billing info lives on the item; older responses keep it on the sub root.
+  const periodEnd =
+    (currentItem as any).current_period_end ??
+    (current as any).current_period_end;
+  if (!periodEnd) {
+    throw new Error('Cannot schedule downgrade: no current_period_end on subscription');
+  }
+
+  // Create a schedule from the current subscription. Stripe materializes
+  // the current phase so we can append a second phase for the new price.
+  const schedule = await stripe.subscriptionSchedules.create({
+    from_subscription: subscriptionId,
+  });
+  const currentPhase = schedule.phases[0];
+
+  const updated = await stripe.subscriptionSchedules.update(schedule.id, {
+    phases: [
+      {
+        items: currentPhase.items.map((i: any) => ({
+          price: i.price,
+          quantity: i.quantity ?? 1,
+        })),
+        start_date: currentPhase.start_date,
+        end_date: currentPhase.end_date ?? periodEnd,
+      },
+      {
+        items: [{ price: newPriceId, quantity: 1 }],
+      },
+    ],
+    end_behavior: 'release', // After phase 2, drop back to a plain subscription
+  });
+
+  return {
+    kind: 'downgrade_scheduled',
+    effectiveAt: new Date(periodEnd * 1000).toISOString(),
+    subscription: current, // Return current sub — it stays unchanged until period end
+    schedule: updated, // Updated schedule (with id) so callers can cache scheduledChange
+  };
+}
 
 // ─── On-Demand Sync ───────────────────────────────────────────────────
 
@@ -331,36 +419,51 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     return;
   }
 
-  // Derive subscription tier from the price ID in the checkout session
-  const subscriptionType = deriveSubscriptionType(session);
-  const tierConfig = await getTierConfig(subscriptionType);
-
-  // Fetch the actual subscription to get accurate status and period end
+  // Fetch the subscription FIRST. We need it for status AND for the price
+  // ID that drives tier derivation. Stripe webhook events for
+  // checkout.session.completed do NOT include line_items by default, so
+  // deriving the tier from `session.line_items` would always yield
+  // undefined → silently promote every user to the fallback tier.
   let actualStatus = 'active';
   let currentPeriodEnd: string | undefined;
+  let subscription: any = null;
   if (stripeSubscriptionId) {
     try {
       const s = getStripeOrThrow();
-      const sub = await s.subscriptions.retrieve(stripeSubscriptionId) as any;
-      actualStatus = sub.status; // Could be 'trialing', 'active', etc.
-      if (sub.current_period_end) {
-        currentPeriodEnd = new Date(sub.current_period_end * 1000).toISOString();
+      subscription = await s.subscriptions.retrieve(stripeSubscriptionId);
+      actualStatus = subscription.status; // Could be 'trialing', 'active', etc.
+      if (subscription.current_period_end) {
+        currentPeriodEnd = new Date(subscription.current_period_end * 1000).toISOString();
       }
     } catch (err) {
       console.warn(`Could not fetch subscription ${stripeSubscriptionId} for status:`, err);
     }
   }
 
+  // Derive subscription tier — prefer subscription.items over session.line_items.
+  // Returns null when the price ID is unknown/missing; we refuse to silently
+  // promote the user in that case (see deriveSubscriptionType notes).
+  const subscriptionType = deriveSubscriptionType(session, subscription);
+  const tierConfig = subscriptionType ? await getTierConfig(subscriptionType) : null;
+
   const updateData: Record<string, any> = {
     stripe_customer_id: stripeCustomerId,
     stripe_subscription_id: stripeSubscriptionId,
-    subscriptionType,
     subscription_status: actualStatus,
     has_payment_method: true, // completed checkout = has payment method
-    has_used_trial: true, // Mark trial as used so future upgrades don't offer trial
-    allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
-    allowedSkills: tierConfig?.allowedSkills ?? ['*'],
+    // has_used_trial was used to gate the 14-day trial. Trials were removed
+    // (product decision, 2026-04). Existing `true` values in DynamoDB are
+    // harmless residue; we just stop writing the flag on new checkouts.
   };
+  // Only write tier-related fields when derivation succeeded. Otherwise
+  // leave the user's existing tier alone — much better than overwriting
+  // them with a wrong one (historically we defaulted to 'Super Premium',
+  // silently upgrading every checkout with an unrecognised price).
+  if (subscriptionType) {
+    updateData.subscriptionType = subscriptionType;
+    updateData.allowedPages = tierConfig?.allowedPages ?? [...DEFAULT_PAGES];
+    updateData.allowedSkills = tierConfig?.allowedSkills ?? ['*'];
+  }
   if (currentPeriodEnd) {
     updateData.current_period_end = currentPeriodEnd;
   }
@@ -403,8 +506,17 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
 
 /**
  * Handle customer.subscription.updated — sync subscription status.
+ *
+ * When `options.isNew` is true (called from customer.subscription.created),
+ * the stale-subscription guard is bypassed because the event IS the authoritative
+ * new subscription — the user's DB may still carry a canceled/old stripe_sub_id
+ * and we want to overwrite it. For normal .updated events the guard prevents
+ * stale/duplicate webhooks from clobbering the latest state.
  */
-export async function handleSubscriptionUpdated(subscription: any): Promise<void> {
+export async function handleSubscriptionUpdated(
+  subscription: any,
+  options: { isNew?: boolean } = {}
+): Promise<void> {
   const customerId = typeof subscription.customer === 'string'
     ? subscription.customer
     : subscription.customer?.id;
@@ -415,22 +527,44 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     return;
   }
 
-  // Only process this webhook if it's for the user's current subscription
-  // (prevents stale/duplicate subscription webhooks from overwriting the latest state)
-  if (user.stripe_subscription_id && user.stripe_subscription_id !== subscription.id) {
+  // Stale-webhook guard: for .updated events, only process when the sub id
+  // matches the user's current one. Skip for .created — that event IS the
+  // new authoritative subscription and the DB's stripe_subscription_id may
+  // still point to an old canceled sub.
+  if (
+    !options.isNew &&
+    user.stripe_subscription_id &&
+    user.stripe_subscription_id !== subscription.id
+  ) {
     console.log(
       `[STRIPE] Ignoring subscription update for ${subscription.id} — user ${user.userId} has current subscription ${user.stripe_subscription_id}`
     );
     return;
   }
 
+  // When a user has requested cancel-at-period-end, Stripe keeps the raw
+  // subscription status as "active" (or "trialing") until the period
+  // closes. Expose that intent to the UI as status="canceling" so the
+  // customer sees "Canceling" instead of "Active" right after they hit
+  // cancel. Without this, the subscription.updated webhook that fires
+  // ~2 seconds after /api/stripe/cancel-subscription would overwrite
+  // our "canceling" marker with the raw Stripe status.
+  const effectiveStatus =
+    subscription.cancel_at_period_end &&
+    (subscription.status === "active" || subscription.status === "trialing")
+      ? "canceling"
+      : subscription.status;
+
   const updateData: Record<string, any> = {
-    subscription_status: subscription.status,
+    subscription_status: effectiveStatus,
   };
 
-  // Backfill stripe_subscription_id if it was never written (e.g., missed checkout webhook).
-  // Only write when null to preserve the line 362 guard against stale webhooks.
-  if (!user.stripe_subscription_id) {
+  // Write stripe_subscription_id when:
+  //  - It's a new subscription (created event) — overwrite any stale canceled ID
+  //  - It was never written (null) — backfill for missed checkout webhooks
+  // For .updated events with an existing sub, don't touch it (the guard above
+  // already ensures we only run when subscription.id matches the DB value).
+  if (options.isNew || !user.stripe_subscription_id) {
     updateData.stripe_subscription_id = subscription.id;
   }
 
@@ -721,33 +855,99 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
   );
 }
 
+/**
+ * Handle subscription_schedule lifecycle termination. Clears any cached
+ * scheduledChange on the user record regardless of which terminal state the
+ * schedule hit: `completed` (phase 2 fired), `released` (user canceled the
+ * queued change or the schedule's end_behavior=release executed), or
+ * `canceled` (the whole schedule was torn down).
+ *
+ * Note: `.completed` means phase 2 fired successfully → a parallel
+ * `customer.subscription.updated` webhook will sync the new tier to DB. We
+ * only clear the scheduled-change hint here so the UI stops advertising a
+ * pending change that has already happened.
+ *
+ * Only clears if the schedule ID on the user matches the one in the event —
+ * prevents a stale / out-of-order webhook from clobbering a newer scheduled
+ * change the user queued right after.
+ */
+export async function handleSubscriptionScheduleEnded(schedule: any): Promise<void> {
+  const customerId = typeof schedule.customer === 'string'
+    ? schedule.customer
+    : schedule.customer?.id;
+  if (!customerId) {
+    console.warn('[STRIPE] subscription_schedule event missing customer ID');
+    return;
+  }
+
+  const user = await findUserByStripeCustomerId(customerId);
+  if (!user) {
+    console.warn(`[STRIPE] No user found for subscription_schedule event. customer=${customerId}`);
+    return;
+  }
+
+  if (user.scheduledChange?.stripeScheduleId === schedule.id) {
+    await userDb.updateUser(user.userId, { scheduledChange: null });
+    console.log(
+      `[STRIPE] Cleared scheduledChange for user ${user.userId} — schedule ${schedule.id} ended (${schedule.status})`
+    );
+  } else {
+    console.log(
+      `[STRIPE] Schedule ${schedule.id} ended (${schedule.status}) but user ${user.userId} has ${user.scheduledChange?.stripeScheduleId || 'no'} cached — no-op`
+    );
+  }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
  * Derive the subscription type from the checkout session's line items price ID.
- * Maps: Starter plan → "Basic", Pro/Complete plan → "Super Premium".
- * Falls back to "Super Premium" if the price cannot be determined.
+ * Maps: Starter plan → "Starter" tier, Pro/Complete plan → "Pro" tier.
+ * Super Premium is an internal-only tier and is never assigned via paid
+ * checkout — unknown prices now return null (caller should preserve
+ * existing tier) rather than silently promoting the user.
  */
 export function deriveSubscriptionTypeFromPriceId(priceId: string): string | null {
-  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Basic';
-  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Super Premium';
+  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Starter';
+  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Pro';
   return null;
 }
 
-function deriveSubscriptionType(session: any): string {
-  const priceId = session.line_items?.data?.[0]?.price?.id
+function deriveSubscriptionType(session: any, subscription?: any): string | null {
+  // Stripe webhook events for checkout.session.completed do NOT expand
+  // line_items by default, so session.line_items is typically undefined
+  // inside a webhook handler. Prefer subscription.items (which the caller
+  // fetches explicitly) and fall back to session.line_items only when a
+  // caller happens to have expanded them (e.g. an admin-invoked flow that
+  // retrieves the session with { expand: ['line_items'] }).
+  const priceId = subscription?.items?.data?.[0]?.price?.id
+    || session.line_items?.data?.[0]?.price?.id
     || session.display_items?.[0]?.price?.id;
 
-  if (priceId) {
-    if (priceId === process.env.STRIPE_STARTER_PRICE_ID) {
-      return 'Basic';
-    }
-    if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) {
-      return 'Super Premium';
-    }
+  if (!priceId) {
+    console.error(
+      `[STRIPE] No priceId in checkout session ${session.id} or subscription — cannot derive tier. Skipping tier update.`
+    );
+    return null;
   }
+  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Starter';
+  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Pro';
 
-  return 'Super Premium';
+  // Unknown price: do NOT silently default. Previously this path returned
+  // 'Super Premium', which meant every checkout with a price the backend
+  // didn't recognise (misconfigured env var, new price in Stripe, stale
+  // dev config) got a free upgrade to the top tier. Return null so the
+  // handler keeps the user's existing tier untouched and we get a loud log.
+  const starterHint = process.env.STRIPE_STARTER_PRICE_ID
+    ? `…${process.env.STRIPE_STARTER_PRICE_ID.slice(-10)}`
+    : '(unset)';
+  const completeHint = process.env.STRIPE_COMPLETE_PRICE_ID
+    ? `…${process.env.STRIPE_COMPLETE_PRICE_ID.slice(-10)}`
+    : '(unset)';
+  console.error(
+    `[STRIPE] Unknown priceId '${priceId}' in session ${session.id}. Expected STARTER=${starterHint} or COMPLETE=${completeHint}. Not writing subscriptionType.`
+  );
+  return null;
 }
 
 /**
@@ -845,9 +1045,19 @@ export async function reconcileAllStripeUsers(): Promise<{
       const updates: Record<string, any> = {};
       const changes: string[] = [];
 
-      if (user.subscription_status !== sub.status) {
-        updates.subscription_status = sub.status;
-        changes.push(`status ${user.subscription_status || 'null'} -> ${sub.status}`);
+      // Mirror handleSubscriptionUpdated's effectiveStatus derivation so the
+      // reconcile sweep does not clobber the "canceling" pseudo-status that
+      // /api/stripe/cancel-subscription writes. Without this, any admin
+      // triggered /reconcile run would flip a canceling user back to
+      // "active" and the UI would lose the "Canceling" badge.
+      const effectiveStatus =
+        sub.cancel_at_period_end &&
+        (sub.status === 'active' || sub.status === 'trialing')
+          ? 'canceling'
+          : sub.status;
+      if (user.subscription_status !== effectiveStatus) {
+        updates.subscription_status = effectiveStatus;
+        changes.push(`status ${user.subscription_status || 'null'} -> ${effectiveStatus}`);
       }
       if (user.stripe_subscription_id !== sub.id) {
         updates.stripe_subscription_id = sub.id;

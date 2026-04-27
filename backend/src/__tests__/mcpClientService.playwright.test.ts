@@ -9,6 +9,21 @@ process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 
 import * as fs from 'fs';
 
+// Prevent actual playwright browser installs during tests (binary search returns nothing)
+jest.mock('fs', () => {
+  const realFs = jest.requireActual('fs');
+  return {
+    ...realFs,
+    existsSync: jest.fn((p: string) => {
+      // Return false for playwright binary paths to skip real install
+      if (typeof p === 'string' && (p.includes('playwright-mcp') || (p.includes('playwright') && p.includes('node_modules/.bin')))) {
+        return false;
+      }
+      return realFs.existsSync(p);
+    }),
+  };
+});
+
 // Capture StdioClientTransport constructor calls
 const mockStdioConstructor = jest.fn().mockImplementation(() => ({
   onclose: null,
@@ -74,10 +89,12 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     for (const key of Object.keys(internalMcpServers)) {
       delete (internalMcpServers as any)[key];
     }
+    // Reset static playwright install promise so tests don't share install state
+    (McpClientService as any).playwrightBrowsersInstall = null;
     service = new McpClientService();
   });
 
-  it('should inject --headless, --no-sandbox, and --config for Playwright MCP server', async () => {
+  it('should inject --headless, --no-sandbox, --isolated, and --config for Playwright MCP server', async () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
@@ -89,10 +106,16 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
 
     expect(mockStdioConstructor).toHaveBeenCalledTimes(1);
     const callArgs = mockStdioConstructor.mock.calls[0][0];
-    expect(callArgs.command).toBe('npx');
-    expect(callArgs.args).toContain('@playwright/mcp@latest');
+    // Command is rewritten to local binary (node_modules/.bin/playwright-mcp) or npx fallback
+    expect(callArgs.command).toBeTruthy();
+    // @playwright/mcp@* token is stripped from args (it was the npx target, not a CLI flag)
+    expect(callArgs.args).not.toContain('@playwright/mcp@latest');
     expect(callArgs.args).toContain('--headless');
     expect(callArgs.args).toContain('--no-sandbox');
+    // --isolated prevents "Browser is already in use" errors when a prior session didn't clean up.
+    // --isolated is mutually exclusive with --user-data-dir, so user-data-dir must NOT be present.
+    expect(callArgs.args).toContain('--isolated');
+    expect(callArgs.args.some((a: string) => a.startsWith('--user-data-dir'))).toBe(false);
     // Anti-headless detection args via config file
     expect(callArgs.args).toContain('--config');
     const configIdx = callArgs.args.indexOf('--config');
@@ -122,7 +145,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--headless', '--no-sandbox'],
+      args: ['@playwright/mcp@0.0.70', '--headless', '--no-sandbox', '--isolated'],
       isInternal: false,
     };
 
@@ -132,15 +155,17 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     const callArgs = mockStdioConstructor.mock.calls[0][0];
     const headlessCount = callArgs.args.filter((a: string) => a === '--headless').length;
     const noSandboxCount = callArgs.args.filter((a: string) => a === '--no-sandbox').length;
+    const isolatedCount = callArgs.args.filter((a: string) => a === '--isolated').length;
     expect(headlessCount).toBe(1);
     expect(noSandboxCount).toBe(1);
+    expect(isolatedCount).toBe(1);
   });
 
   it('should NOT inject --config if already provided', async () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
-      args: ['@playwright/mcp@latest', '--config', '/custom/config.json'],
+      args: ['@playwright/mcp@0.0.70', '--config', '/custom/config.json'],
       isInternal: false,
     };
 

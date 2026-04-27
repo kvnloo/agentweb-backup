@@ -1,4 +1,5 @@
 import express from "express";
+import nodePath from "path";
 import cors from "cors";
 import passport from "passport";
 import authRoutes from "./routes/auth";
@@ -30,6 +31,7 @@ import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
+import sequenceRoutes from "./routes/sequences";
 import crmPublicRoutes from "./routes/crmPublic";
 import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
@@ -53,6 +55,7 @@ import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
 import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
+import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
 import supportRoutes from "./routes/support";
 import errorsRoutes from "./routes/errors";
@@ -67,10 +70,17 @@ import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import domainRoutes from "./routes/domains";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
+import imageReportsRoutes from "./routes/imageReports";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import testAccountsRoutes from "./routes/testAccounts";
+import onboardingEventsRoutes from "./routes/onboardingEvents";
+import brandBuildRoutes from "./routes/brandBuild";
+import adGenRoutes from "./routes/adGen";
+import onboardingStepsRoutes from "./routes/onboardingSteps";
+import dripCampaignsRoutes from "./routes/dripCampaigns";
+import usersRoutes from "./routes/users";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -83,6 +93,7 @@ import {
   saveHtmlContent,
   getPresignedFileUrl,
   batchPresignUrls,
+  exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
 
@@ -202,9 +213,11 @@ fileRoutes.get("/content", authenticateToken, getFileContent);
 fileRoutes.post("/html", authenticateToken, saveHtmlContent);
 fileRoutes.get("/presign", authenticateToken, getPresignedFileUrl);
 fileRoutes.post("/presign-batch", authenticateToken, batchPresignUrls);
+fileRoutes.post("/export-pdf", authenticateToken, exportHtmlToPdf);
 
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
@@ -240,6 +253,7 @@ app.use("/api/funnels", funnelRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm/public", crmPublicRoutes);
 app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be after /public, before main crm routes
+app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
@@ -264,6 +278,7 @@ app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
 app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes);
+app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/errors", errorsRoutes);
@@ -271,6 +286,14 @@ app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api/test-accounts", testAccountsRoutes);
+app.use("/api/onboarding", onboardingEventsRoutes);
+app.use("/api/onboarding", brandBuildRoutes);
+app.use("/api/onboarding", adGenRoutes);
+app.use("/api/onboarding", onboardingStepsRoutes);
+// Phase A: drip campaigns are now customer-facing. Each user manages
+// their own campaigns scoped to their CRM leads. No isAdmin gate —
+// authenticateToken is the only middleware. See routes/dripCampaigns.ts.
+app.use("/api/drip-campaigns", authenticateToken, dripCampaignsRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
@@ -278,6 +301,7 @@ app.get("/asset/:assetHash", serveAsset);
 app.use("/review", reviewRouter);
 app.use("/api/batch-review", batchReviewRoutes);
 app.use("/batch-review", batchReviewPublicRouter);
+app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
 
@@ -339,5 +363,12 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Temporary static exports — for one-off file downloads (files in backend/tmp-exports/)
+app.use("/tmp-exports", express.static(nodePath.join(__dirname, "../tmp-exports"), {
+  setHeaders: (res, filePath) => {
+    res.setHeader("Content-Disposition", `attachment; filename="${nodePath.basename(filePath)}"`);
+  },
+}));
 
 export default app;

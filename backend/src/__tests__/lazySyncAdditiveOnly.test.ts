@@ -163,10 +163,12 @@ describe('syncSubscriptionFromStripe — additive-only', () => {
 
     expect(result).not.toBeNull();
     const updateCall = mockUpdateUser.mock.calls[0][1];
-    // All fields should be written when everything is null
+    // All fields should be written when everything is null. PR #1261 renamed
+    // the derived tier for the complete/pro Stripe price from "Super Premium"
+    // to "Pro" — the pricing page name the customer actually sees.
     expect(updateCall).toHaveProperty('subscription_status', 'active');
     expect(updateCall).toHaveProperty('stripe_subscription_id', 'sub_stripe_123');
-    expect(updateCall).toHaveProperty('subscriptionType', 'Super Premium');
+    expect(updateCall).toHaveProperty('subscriptionType', 'Pro');
     expect(updateCall).toHaveProperty('has_payment_method');
     expect(updateCall).toHaveProperty('current_period_end');
   });
@@ -218,8 +220,9 @@ describe('syncSubscriptionFromStripe — additive-only', () => {
 
     expect(result).not.toBeNull();
     const updateCall = mockUpdateUser.mock.calls[0][1];
-    // Should only update null fields
-    expect(updateCall).toHaveProperty('subscriptionType', 'Super Premium');
+    // Should only update null fields. Complete/pro price derives to "Pro"
+    // since PR #1261 — the same name the pricing page surfaces to customers.
+    expect(updateCall).toHaveProperty('subscriptionType', 'Pro');
     expect(updateCall).toHaveProperty('current_period_end');
     // Should NOT update already-set fields
     expect(updateCall).not.toHaveProperty('subscription_status');

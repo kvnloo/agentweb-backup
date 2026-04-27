@@ -41,6 +41,15 @@ jest.mock('../services/resendService', () => ({
   },
 }));
 
+// contactEventsDb is called from createLead when attribution is captured.
+const mockLogEvent = jest.fn().mockResolvedValue({ event: {}, deduplicated: false });
+jest.mock('../services/contactEventsDb', () => ({
+  contactEventsDb: {
+    logEvent: (...args: any[]) => mockLogEvent(...args),
+  },
+  normalizeContactId: (raw: string) => raw.trim().toLowerCase(),
+}));
+
 import { crmDb } from '../services/db';
 import AWS from 'aws-sdk';
 
@@ -175,6 +184,198 @@ describe('CRM Database Service', () => {
       // Email should not be in the item if not provided
       const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
       expect(putCall.Item.email).toBeUndefined();
+    });
+
+    it('stamps firstTouch, lastTouch and denormalized utm fields from attribution', async () => {
+      const listId = 'list_123';
+      const firstTouch = {
+        timestamp: '2026-04-19T10:00:00.000Z',
+        utm: { source: 'linkedin', medium: 'social', campaign: 'launch' },
+        referrer: 'https://linkedin.com/feed',
+      };
+      const leadData = {
+        email: 'attribution@example.com',
+        firstName: 'Jane',
+        firstTouch,
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.firstTouch).toEqual(firstTouch);
+      // lastTouch defaults to firstTouch on a fresh lead when not supplied
+      expect(putCall.Item.lastTouch).toEqual(firstTouch);
+      expect(putCall.Item.utmSource).toBe('linkedin');
+      expect(putCall.Item.utmMedium).toBe('social');
+    });
+
+    it('leaves attribution fields absent when none supplied (CSV import path)', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        email: 'csv-row@example.com',
+        firstName: 'Bob',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.firstTouch).toBeUndefined();
+      expect(putCall.Item.lastTouch).toBeUndefined();
+      expect(putCall.Item.utmSource).toBeUndefined();
+      expect(putCall.Item.utmMedium).toBeUndefined();
+    });
+
+    it('accepts distinct firstTouch and lastTouch (repeat-touch scenarios)', async () => {
+      const listId = 'list_123';
+      const firstTouch = {
+        timestamp: '2026-04-01T10:00:00.000Z',
+        utm: { source: 'google', medium: 'cpc' },
+      };
+      const lastTouch = {
+        timestamp: '2026-04-19T10:00:00.000Z',
+        utm: { source: 'linkedin', medium: 'social' },
+      };
+      const leadData = { email: 'rt@example.com', firstTouch, lastTouch };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.firstTouch).toEqual(firstTouch);
+      expect(putCall.Item.lastTouch).toEqual(lastTouch);
+      // Top-level utm* is denormalized from firstTouch (the origin of the lead)
+      expect(putCall.Item.utmSource).toBe('google');
+      expect(putCall.Item.utmMedium).toBe('cpc');
+    });
+
+    it('fires attribution.first_touch event exactly once per lead with attribution', async () => {
+      const listId = 'list_123';
+      const firstTouch = {
+        timestamp: '2026-04-19T10:00:00.000Z',
+        utm: { source: 'linkedin', medium: 'social', campaign: 'launch' },
+        referrer: 'https://linkedin.com/feed',
+        landingUrl: 'https://agentweb.pro/?utm_source=linkedin',
+      };
+      const leadData = { email: 'event@example.com', firstTouch };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      expect(mockLogEvent).toHaveBeenCalledTimes(1);
+      const payload = mockLogEvent.mock.calls[0][0];
+      expect(payload.eventType).toBe('attribution.first_touch');
+      expect(payload.source).toBe('lead_form');
+      expect(payload.contactId).toBe('event@example.com');
+      expect(payload.sourceRecordId).toMatch(/^attribution:lead:lead_/);
+      expect(payload.payload.utmSource).toBe('linkedin');
+      expect(payload.payload.utmMedium).toBe('social');
+      expect(payload.payload.utmCampaign).toBe('launch');
+      expect(payload.payload.referrer).toBe('https://linkedin.com/feed');
+    });
+
+    it('does NOT fire attribution event when no attribution is provided', async () => {
+      const listId = 'list_123';
+      const leadData = { email: 'noattr@example.com' };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      expect(mockLogEvent).not.toHaveBeenCalled();
+    });
+
+    it('uses `nocontact:<leadId>` as contactId when email is absent but attribution present', async () => {
+      const listId = 'list_123';
+      const firstTouch = {
+        timestamp: '2026-04-19T10:00:00.000Z',
+        utm: { source: 'referral' },
+      };
+      const leadData = { firstName: 'Anon', firstTouch };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      expect(mockLogEvent).toHaveBeenCalledTimes(1);
+      const payload = mockLogEvent.mock.calls[0][0];
+      expect(payload.contactId).toMatch(/^nocontact:lead_/);
+    });
+
+    it('does not fail lead creation when attribution event logging throws', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        email: 'resilient@example.com',
+        firstTouch: { timestamp: '2026-04-19T10:00:00.000Z', utm: { source: 'google' } },
+      };
+
+      mockLogEvent.mockRejectedValueOnce(new Error('ContactEvents table down'));
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      // Must not throw — lead creation succeeds even though event log fails
+      const result = await crmDb.createLead(listId, leadData);
+      expect(result.email).toBe('resilient@example.com');
     });
   });
 

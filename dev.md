@@ -1,3 +1,85 @@
+# April 26, 2026: Investigation — Design4Space Scheduled Chat 400 Error (Azure OpenAI Tool Limit)
+
+## Context
+
+Scheduled chat "Design4Space Website Scan" failed at `2026-04-26T14:19:08` with:
+
+```
+400 Invalid 'tools': array too long. Expected an array with maximum length 128, but got an array with length 143 instead.
+```
+
+Model: `gpt-5.4` (Azure OpenAI deployment). The earlier run at 04:59 succeeded; the 14:19 run failed.
+
+## Root Cause
+
+Azure OpenAI enforces a hard limit of 128 tools per API request. The session ended up with 143 tools split as:
+
+- **34** foundation tools (always included)
+- **22** Browser automation skill tools
+- **2** SEO & Website Analytics skill tools
+- **~85** from `__other_skills__` — the virtual catch-all skill
+
+`__other_skills__` is auto-installed by `runVerifiedChat()` when a required function call isn't assigned to any named skill. The session needed `navigate_to` (which wasn't in any named skill), so the system installed `__other_skills__`, which at the time held ~85 orphaned tools — every registered tool not assigned to a published skill.
+
+The 04:59 run succeeded because it had a different execution path that happened to stay under 128. The 14:19 manual test run hit the full tool list immediately after skill install.
+
+## Fix 1 — Safety net (PR #1334)
+
+Added `maxTools: 128` to all Azure OpenAI model configs (`gpt-5-chat-2`, `gpt-5.2-chat`, `gpt-5.4`) and truncation logic in `callLLM()` in `agentModeService.ts`. Prevents the hard 400 crash even if tool counts exceed the limit again.
+
+## Fix 2 — Root cause (dev environment only, via partner portal UI)
+
+Audited all registered tools against published skills. Found **65 orphaned tools** in `__other_skills__` that had never been assigned to any named skill. Assigned all of them to their proper skills via the Skills Management UI at `/skills`:
+
+| Skill | Tools added |
+|---|---|
+| Meeting Intelligence | `fathom_route_action_items` |
+| LinkedIn Outreach | `linkedin_outreach` |
+| Meta Ads Management & Publishing | `list_meta_ads_campaigns`, `get_meta_ads_metrics` |
+| CRM & Lead Management | `ask_crm`, `set_lead_contact_status`, `delete_leads_by_filter`, `update_lead_status`, `get_lead_list_statuses`, `configure_lead_statuses`, `analyze_crm_data`, `assign_lead`, `promote_to_deal`, `get_hot_leads`, `log_contact_event`, `import_leads_from_search`, `enrich_leads_preview`, `enrich_leads_execute`, `enrich_lead_custom`, `get_user_profile`, `report_product_issues`, `manage_drip_campaign` |
+| Landing Page Builder | `get_landing_page_preview_url`, `publish_landing_page_changes` |
+| Landing Page Design | `create_html_template` |
+| Knowledge Base | `perform_deep_research`, `search_ads_knowledge_base`, `list_books`, `get_book_details`, `get_book_content`, `update_book_content`, `generate_book_content`, `create_book`, `create_book_outline`, `create_blog_article`, `publish_blog_article`, `list_cms_categories`, `repair_blog_article` |
+| GTM Tracking | `account_summary`, `get_clarity_metrics`, `list_task_templates`, `create_task_from_template`, `create_task_from_prompt`, `create_image_task_from_prompt`, `create_revision`, `get_task_subscriber_metrics`, `remove_c2pa_from_image`, `rotate_primary`, `list_schedule_templates`, `manage_schedule_template`, `create_schedule_from_template`, `slack_list_channels`, `slack_get_recent_messages`, `slack_get_thread_replies`, `slack_send_message`, `send_for_review`, `notify_session`, `wait_seconds`, `search_tool_response`, `email`, `post_on_connected_account`, `perform_data_analysis` |
+| B2B Ad Image Batch Generation | `bravesearch_brave_local_search`, `bravesearch_brave_video_search`, `bravesearch_brave_summarizer` |
+
+After these assignments, `__other_skills__` is empty in dev.
+
+## Decision
+
+**Always assign new tools to a named skill when deploying them.** Do not leave tools unassigned — they silently pile into `__other_skills__` and inflate the tool count for any session that needs the catch-all. The `maxTools` truncation is a safety net, not a substitute for correct skill assignment.
+
+---
+
+# April 21, 2026: Investigation — Agent Mode "Unknown Error" with claude-opus-4-7
+
+## Context
+
+User `ftan@agentweb.pro` hit the generic "I apologize, but I encountered an error processing your request" error in Agent Mode when using model `anthropic.claude-opus-4-7`. This triggered an "Unknown Error in Generate Response" oncall alert.
+
+## Root Cause
+
+`anthropic.claude-opus-4-7` is registered in the model registry but **not provisioned on this AWS Bedrock account**. Bedrock returns:
+
+```
+ValidationException: anthropic.claude-opus-4-7 is not available for this account.
+You can explore other available models on Amazon Bedrock.
+```
+
+This is a 400-class error, but the AWS SDK surfaces the HTTP status on `error.$metadata.httpStatusCode` rather than a top-level `error.status` field. The existing error classifier in `generateMarketingResponse` only checked `error.status === 400`, so the Bedrock ValidationException fell through to the generic catch-all and triggered the oncall alert instead of showing a sensible "issue processing your request" message.
+
+## Fix
+
+- Added `error.$metadata.httpStatusCode` as a fallback when reading the HTTP status in the error classifier (`agentModeService.ts`). Going forward, Bedrock validation errors will map to the correct user-facing message.
+- The model is kept in the registry because: (1) it is admin-only (`getSupportedModels` filters out any model with "opus" for non-admins), so regular users are never exposed to it; (2) it may become available on this account in the future, at which point it will work automatically.
+- If AWS provisions the model on this account, no code changes are needed — the inference profile ARN is already configured.
+
+## Decision
+
+**Do not remove `claude-opus-4-7` from the registry.** It is safely gated behind admin-only access, and the error classification fix means any future Bedrock unavailability errors will show a proper message rather than triggering a generic alert.
+
+---
+
 # April 8, 2026: Investigation — Lead Tech Stack Enrichment Options
 
 ## Context
@@ -3432,3 +3514,176 @@ All 10 LinkedIn outreach actions (`search-people`, `get-profile`, `send-invite`,
 ### Decision
 
 **Finding email from LinkedIn is not supported and will not be added to the LinkedIn outreach feature.** Email discovery is an enrichment concern, not an outreach concern. If email finding from a LinkedIn profile is needed, it should be implemented as part of the CRM enrichment feature (`crmEnrichmentService.ts`) using a third-party enrichment provider (e.g. Apollo.io, which accepts LinkedIn profile URLs and returns verified business emails). This keeps outreach and enrichment concerns cleanly separated.
+
+
+## Goalden Hour Meta Ad Account — Ownership Investigation (2026-04-20)
+
+### Context
+
+Investigated who owns the Goalden Hour ad account in Meta (Facebook) Business Manager, and what steps are needed to transfer or grant access.
+
+### Findings
+
+The Goalden Hour Meta ad account is currently **owned by individual people**, not by a Business Manager. Only the AgentWeb team has full (Admin) control at this time.
+
+### Short-Term Action: Grant Goalden Hour Admin Access
+
+To give the Goalden Hour team full operational control without transferring ownership:
+
+1. Go to [business.facebook.com](https://business.facebook.com) → **Business Settings**
+2. Click **Accounts** → **Ad Accounts** → select the Goalden Hour ad account
+3. Click **Add People** → search for the Goalden Hour contact by name or email
+4. Set their role to **Admin** (full control: manage people, billing, settings, run ads)
+5. Click **Confirm**
+
+This gives them full operational access while ownership stays with the current individual.
+
+### Future Action: Transfer Ownership to Business Manager
+
+When ready to transfer formal ownership to the Goalden Hour Business Manager:
+
+1. The current individual owner must be cooperative
+2. **Option A (preferred):** In Meta Business Manager → Business Settings → Ad Accounts → Add → **Claim an Ad Account** → enter the account ID. The individual owner approves the claim.
+3. **Option B:** The individual goes to their Ad Account Settings → Ad Account Roles → adds the Goalden Hour Business Manager as Admin, then initiates a transfer.
+4. **Option C (last resort):** Contact Meta Support with proof of business ownership if the individual is unreachable.
+
+> **Caveat:** Once an ad account is claimed by a Business Manager, it cannot be moved to another Business. Confirm the correct Business Manager before claiming.
+
+### Decision
+
+**Short term:** Grant the Goalden Hour contact Admin access so they have full operational control immediately. **Long term:** Initiate a formal ownership transfer/claim into their Business Manager when they are ready to do so.
+
+## Security Breach Investigation — Lovable & Vercel (2026-04-21)
+
+### Context
+
+Investigated whether AgentWeb is impacted by two security incidents:
+1. **Lovable security breach** — Lovable (vibe coding platform) disclosed a broken object-level authorization flaw in their API that allowed unauthorized access to user projects, source code, database credentials, and AI chat histories. The vulnerability was unpatched for 48 days after discovery on March 3, 2026.
+2. **Vercel security breach** — Vercel disclosed a security incident. Vercel sent official email communication confirming: *"At this time, we do not have reason to believe that your Vercel credentials or personal data have been compromised."* **Status: Safe, no action required.**
+
+### Lovable Exposure Analysis
+
+The customer-portal repo originated as a Lovable project and remains connected to it. Artifacts found:
+
+**1. External CDN script in `index.html:70`**
+```html
+<script src="https://cdn.gpteng.co/gptengineer.js" type="module"></script>
+```
+Loaded on every page, runs with full browser context. If Lovable's infrastructure is compromised this is a vector for client-side code execution. **Highest priority to remove.**
+
+**2. `lovable-tagger` npm package (`package.json:112`, `vite.config.ts:4,38`)**
+Sends component metadata to Lovable during dev builds. Not evidence of npm compromise, but is telemetry going to a breached vendor. Remove as hygiene.
+
+**3. Fallback URL in `src/config.ts:9`** pointing to `https://preview--agentweb-customer-portal.lovable.app` — cosmetic, but should be cleaned up.
+
+**Key clarification:** The Lovable breach is a **platform data leak** (their API exposed stored project data), not a CDN/supply chain attack. The primary risk to us is: if any real credentials (API keys, env vars, secrets) were ever entered into the Lovable project editor, those may have been exfiltrated.
+
+### Status & Next Steps
+
+- **Vercel:** Confirmed safe per official Vercel email. No action required.
+- **Lovable:** Awaiting Lovable's official email notification to determine whether our specific project was accessed during the breach. Once received, assess whether any credentials need rotation.
+- **Code cleanup (planned):** Remove CDN script, lovable-tagger, and Lovable URL fallback from customer-portal regardless of breach outcome — these are unnecessary Lovable dependencies.
+
+## Meta Account Connection Failure — karthy@goaldenhour.com (2026-04-20)
+
+### Context
+
+karthy@goaldenhour.com (userId: `4027bc5c-0f89-4236-b63e-b0186c634a1c`) reported that connecting their Meta ad account failed.
+
+### Root Cause
+
+Production logs at `Apr 19 00:55:35` showed:
+
+```
+[Meta Finalize] getAdAccounts failed — code=n/a classification=n/a
+message=Meta API Error: (#200) Requires business_management permission to manage the object
+```
+
+The OAuth flow (`flow=marketing`) exchanges the code and gets a valid access token, but the subsequent `/me/adaccounts` API call requires the `business_management` permission. Our current `marketingScopes` in `backend/src/config/integrations.ts` only requests `ads_management`, `ads_read`, and `pages_show_list`. The error is silently caught (`metaAuth.ts:248`) and returns 0 ad accounts, leaving the user unable to connect.
+
+### Why `business_management` Was Not Added
+
+Adding `business_management` to `marketingScopes` would fix the API error, but Meta only allows this permission under **Advanced Access** for customer-facing apps. Standard Access (which we currently have, status Active with 561 users) restricts the permission to users who have a developer/admin/tester role on the Facebook App — it does not work for general customers. Obtaining Advanced Access requires a Meta App Review with a detailed use-case submission and is slow/difficult to get. Decision made after discussion with Harshit@Argusoft.
+
+### Short-Term Fix (Implemented)
+
+The Goaldenhour ad account is now under our (AgentWeb's) control. **We granted karthy@goaldenhour.com full access to the ad account directly through Facebook Business Manager.** This means their user token already has access to the account without needing `business_management` — they can connect successfully today.
+
+### Long-Term Fix
+
+Pursue **transfer of ownership** of the Goaldenhour ad account to Goaldenhour itself via Facebook Business Manager. Once Goaldenhour owns the account, karthy (as an admin of that business) will be able to grant `ads_management` and `ads_read` access through normal OAuth without needing `business_management`. No code changes required for this path either.
+
+## Google OAuth App Review — Gmail Connected Accounts (2026-04-24)
+
+### Status
+
+**App review submitted / in progress.** Review typically takes 4–6 weeks for restricted scopes.
+
+### Google Cloud Project
+
+- **Project Name:** AgentWeb
+- **Project ID:** `gen-lang-client-0725723168`
+- **Project Number:** `606140610214`
+- **OAuth Client ID:** `606140610214-tqm4fkgp6o7m4e5aq4n13n09ijqfhaij.apps.googleusercontent.com`
+- **Credentials stored in:** AWS Secrets Manager at `prod/AgentWeb/Google/Gmail`
+
+### Scopes Under Review
+
+| Scope | Classification | Purpose |
+|---|---|---|
+| `https://www.googleapis.com/auth/gmail.readonly` | **Restricted** | Read user's Gmail inbox for AI-assisted email management |
+| `https://www.googleapis.com/auth/gmail.send` | **Restricted** | Send emails on the user's behalf in AI outreach workflows |
+| `https://www.googleapis.com/auth/calendar.readonly` | **Sensitive** | Read calendar to avoid scheduling conflicts |
+
+`userinfo.email` and `userinfo.profile` are non-sensitive and do not require review.
+
+### How to Submit / Re-Submit
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com) → project **AgentWeb** (`gen-lang-client-0725723168`)
+2. Navigate to **APIs & Services → OAuth consent screen**
+3. Ensure app name, support email, homepage (`https://app.agentweb.pro`), privacy policy, and ToS URLs are filled in
+4. Click **"Submit for Verification"**
+5. Provide scope justifications:
+   - **`gmail.readonly`**: Read inbox to surface relevant emails in the AgentWeb AI assistant for outreach management
+   - **`gmail.send`**: Send emails on behalf of users as part of AI-assisted outreach workflows (user reviews before sending)
+   - **`calendar.readonly`**: Read calendar to help schedule meetings and avoid conflicts
+6. Record a **demo video** (required for restricted scopes): show the OAuth flow and how each scope is used in the UI
+7. Submit. Review takes **4–6 weeks** for restricted scopes.
+
+### Notes
+
+- While pending review, only users listed under **Test users** on the consent screen can authorize the Gmail connection
+- The privacy policy must explicitly state Gmail data is not shared or sold
+- Redirect URI registered in the OAuth client: `https://api.agentweb.pro/api/oauth/gmail/callback`
+- YouTube connected accounts reuse the same Google Cloud project and OAuth client (`prod/AgentWeb/Google/Gmail`)
+
+## Emma Self-Improvement — Investigation (2026-04-25)
+
+### Context
+
+Investigated how to get Emma to self-improve over time, inspired by agent self-improvement patterns like Reflexion.
+
+### What Already Exists
+
+The memory system (`AW-AccountMemory`) already covers the core use case:
+
+- Categories: `preference`, `history`, `insight`, `workflow`
+- Emma tools: `save_memory` (save a fact mid-session), `delete_memory` (remove by ID)
+- Full CRUD API at `/api/memory` for user management
+- All active memories are injected into every new session's system prompt (up to 20, most recent)
+
+Emma already self-improves incrementally **within** a session: she can detect corrections or "remember that…" instructions and save them immediately via `save_memory`. Users can manage their memories via the customer portal settings UI.
+
+### Gap Considered: Post-Session Auto-Extraction
+
+The one missing piece is a post-session job that sends the full conversation transcript to an LLM and asks it to extract net-new learnings, then writes them to `AW-AccountMemory` automatically.
+
+### Why We're Not Building It Now
+
+Post-session auto-extraction risks being **overly aggressive**: the LLM may extract low-quality, redundant, or incorrect facts from routine exchanges (e.g., "user asked about SEO" → saves "user is interested in SEO" every session). This would pollute the memory store with noise and degrade Emma's quality over time rather than improving it.
+
+The existing in-session `save_memory` mechanism is more precise because it only fires when there is a clear signal (explicit user instruction or detected correction). Auto-extraction has no such signal — it runs on every session regardless of whether anything new was learned.
+
+### Decision
+
+No action. The current memory system is sufficient. Revisit post-session extraction if we add a quality-scoring or deduplication layer that can filter out noise before writing.
