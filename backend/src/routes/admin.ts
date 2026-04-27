@@ -2552,65 +2552,48 @@ router.post("/announcements/load-from-url", async (req, res) => {
       .replace(/&#39;/g, "'")
       .replace(/&apos;/g, "'");
 
-    // Extract body content
     let bodyContent = "";
 
-    // Try to extract from <body> tag first
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-    if (bodyMatch) {
-      bodyContent = bodyMatch[1];
+    // If this is a complete HTML email document, preserve it as-is (only strip scripts).
+    // Stripping <style> or collapsing whitespace destroys email formatting.
+    const isFullHtmlDocument = /<html[\s>]/i.test(html);
+    if (isFullHtmlDocument) {
+      bodyContent = html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
     } else {
-      // If no body tag, use the entire HTML
-      bodyContent = html;
-    }
-
-    // Remove script and style tags
-    bodyContent = bodyContent
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-      .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
-
-    // Try to extract main content from common semantic tags
-    const mainContentSelectors = [
-      /<main[^>]*>([\s\S]*?)<\/main>/i,
-      /<article[^>]*>([\s\S]*?)<\/article>/i,
-      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-      /<div[^>]*id="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-    ];
-
-    for (const selector of mainContentSelectors) {
-      const match = bodyContent.match(selector);
-      if (match && match[1].trim().length > 50) {
-        bodyContent = match[1];
-        break;
-      }
-    }
-
-    // Clean up the HTML content
-    // Remove comments
-    bodyContent = bodyContent.replace(/<!--[\s\S]*?-->/g, "");
-
-    // Remove excessive whitespace but preserve structure
-    bodyContent = bodyContent
-      .replace(/\s+/g, " ")
-      .replace(/>\s+</g, "><")
-      .trim();
-
-    // If content is too short, use the original body content
-    if (bodyContent.length < 50) {
+      // For plain HTML fragments, extract body content and clean up
       const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-      if (bodyMatch) {
-        bodyContent = bodyMatch[1]
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-          .replace(/<!--[\s\S]*?-->/g, "")
-          .trim();
+      bodyContent = bodyMatch ? bodyMatch[1] : html;
+
+      bodyContent = bodyContent
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
+
+      const mainContentSelectors = [
+        /<main[^>]*>([\s\S]*?)<\/main>/i,
+        /<article[^>]*>([\s\S]*?)<\/article>/i,
+        /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+        /<div[^>]*id="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+      ];
+      for (const selector of mainContentSelectors) {
+        const match = bodyContent.match(selector);
+        if (match && match[1].trim().length > 50) {
+          bodyContent = match[1];
+          break;
+        }
       }
+
+      bodyContent = bodyContent
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/\s+/g, " ")
+        .replace(/>\s+</g, "><")
+        .trim();
     }
 
-    // Limit content length to prevent issues
-    if (bodyContent.length > 50000) {
-      bodyContent = bodyContent.substring(0, 50000) + "...";
+    if (bodyContent.length > 200000) {
+      bodyContent = bodyContent.substring(0, 200000);
     }
 
     return res.json({

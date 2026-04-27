@@ -4252,45 +4252,47 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       .replace(/&#39;/g, "'")
       .replace(/&apos;/g, "'");
 
-    // Extract body content
     let bodyContent = '';
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-    if (bodyMatch) {
-      bodyContent = bodyMatch[1];
+
+    // If this is a complete HTML email document, preserve it as-is (only strip scripts).
+    // Stripping <style> or collapsing whitespace destroys email formatting.
+    const isFullHtmlDocument = /<html[\s>]/i.test(html);
+    if (isFullHtmlDocument) {
+      bodyContent = html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
     } else {
-      bodyContent = html;
-    }
+      // For plain HTML fragments, extract body content and clean up
+      const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      bodyContent = bodyMatch ? bodyMatch[1] : html;
 
-    // Remove script and style tags
-    bodyContent = bodyContent
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-      .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
+      bodyContent = bodyContent
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
 
-    // Try to extract main content from semantic tags
-    const mainContentSelectors = [
-      /<main[^>]*>([\s\S]*?)<\/main>/i,
-      /<article[^>]*>([\s\S]*?)<\/article>/i,
-      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-    ];
-
-    for (const selector of mainContentSelectors) {
-      const match = bodyContent.match(selector);
-      if (match && match[1].trim().length > 50) {
-        bodyContent = match[1];
-        break;
+      const mainContentSelectors = [
+        /<main[^>]*>([\s\S]*?)<\/main>/i,
+        /<article[^>]*>([\s\S]*?)<\/article>/i,
+        /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+      ];
+      for (const selector of mainContentSelectors) {
+        const match = bodyContent.match(selector);
+        if (match && match[1].trim().length > 50) {
+          bodyContent = match[1];
+          break;
+        }
       }
+
+      bodyContent = bodyContent
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/>\s+</g, '><')
+        .trim();
     }
 
-    // Clean up
-    bodyContent = bodyContent
-      .replace(/<!--[\s\S]*?-->/g, '')
-      .replace(/\s+/g, ' ')
-      .replace(/>\s+</g, '><')
-      .trim();
-
-    if (bodyContent.length > 50000) {
-      bodyContent = bodyContent.substring(0, 50000);
+    if (bodyContent.length > 200000) {
+      bodyContent = bodyContent.substring(0, 200000);
     }
 
     return res.json({
