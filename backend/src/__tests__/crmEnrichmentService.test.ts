@@ -1304,6 +1304,7 @@ describe('CrmEnrichmentService', () => {
 
 describe('CrmEnrichmentService.applySearchTemplate', () => {
   const lead = {
+    leadId: 'test',
     firstName: 'John',
     lastName: 'Doe',
     company: 'Acme Corp',
@@ -1330,13 +1331,13 @@ describe('CrmEnrichmentService.applySearchTemplate', () => {
   });
 
   it('collapses multiple spaces when a field is empty', () => {
-    const emptyLead = { company: 'Beta Inc', email: 'test@beta.com' };
+    const emptyLead = { leadId: 'test', company: 'Beta Inc', email: 'test@beta.com' };
     const template = '{{firstName}} {{lastName}} {{company}}';
     expect(CrmEnrichmentService.applySearchTemplate(template, emptyLead)).toBe('Beta Inc');
   });
 
   it('handles lead with no email gracefully for emailDomain', () => {
-    const noEmailLead = { company: 'Gamma' };
+    const noEmailLead = { leadId: 'test', company: 'Gamma' };
     const template = '{{company}} {{emailDomain}}';
     expect(CrmEnrichmentService.applySearchTemplate(template, noEmailLead)).toBe('Gamma');
   });
@@ -1644,7 +1645,7 @@ describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
     (CrmEnrichmentService as any).buildSearchQuery(lead, outputFields);
 
   it('includes "linkedin" in query for company_linkedin_url field', () => {
-    const lead = { company: 'Acme Corp', email: 'john@acme.com' };
+    const lead = { leadId: 'test', company: 'Acme Corp', email: 'john@acme.com' };
     const query = buildSearchQuery(lead, ['company_linkedin_url']);
     expect(query).toContain('Acme Corp');
     expect(query.toLowerCase()).toContain('linkedin');
@@ -1652,7 +1653,7 @@ describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
 
   it('does NOT treat company_linkedin_url as a person-level field', () => {
     // Should NOT prefix with firstName/lastName for company LinkedIn
-    const lead = { firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
+    const lead = { leadId: 'test', firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
     const query = buildSearchQuery(lead, ['company_linkedin_url']);
     // Person-name prefix should not appear for a company-level query
     expect(query).not.toMatch(/^John Doe/);
@@ -1660,7 +1661,7 @@ describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
   });
 
   it('generates person-based query for personal_linkedin_url field', () => {
-    const lead = { firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
+    const lead = { leadId: 'test', firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
     const query = buildSearchQuery(lead, ['personal_linkedin_url']);
     expect(query).toContain('John Doe');
     expect(query.toLowerCase()).toContain('linkedin');

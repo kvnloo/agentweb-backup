@@ -802,6 +802,16 @@ export class AgentModeService {
     return this.gemini_client_promise;
   }
 
+  public async getClientForModel(model: string): Promise<any> {
+    if (model.startsWith('anthropic.')) {
+      return this.getBedrockClient(model);
+    }
+    if (model.startsWith('gpt-')) {
+      return this.getAzureOpenAIClient(model);
+    }
+    return this.getGeminiClient();
+  }
+
   public async getBedrockClient(modelId: string): Promise<any> {
     // Use the Bedrock Converse API directly (instead of LangChain) to support
     // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
