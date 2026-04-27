@@ -6943,12 +6943,29 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
-      // Get engagement count and recent engagements
-      const [engagementCount, engagementsResult] = await Promise.all([
+      // Get engagement count, recent engagements, and live subscription (in parallel)
+      const linkedUserId = lead.customFields?.userId as string | undefined;
+      const [engagementCount, engagementsResult, liveUser] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        crmDb.getLeadEngagements(listId, leadId, userId),
+        linkedUserId
+          ? (async () => {
+              try {
+                const { userDb } = await import('./db');
+                return await userDb.getUserById(linkedUserId);
+              } catch {
+                return null;
+              }
+            })()
+          : Promise.resolve(null),
       ]);
       const engagements = engagementsResult.engagements || [];
+
+      // Overlay live subscriptionType from AW-Users to avoid stale CRM cache
+      const customFields = lead.customFields ? { ...lead.customFields } : {};
+      if (liveUser?.subscriptionType) {
+        customFields.subscriptionType = liveUser.subscriptionType;
+      }
 
       // Truncate HTML email drafts to text preview
       let emailDraftPreview = null;
@@ -6977,7 +6994,7 @@ export class AgentModeService {
           phone: lead.phone || '',
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
-          customFields: lead.customFields || {},
+          customFields,
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
