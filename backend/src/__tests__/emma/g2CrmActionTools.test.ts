@@ -48,6 +48,7 @@ jest.mock('../../services/db', () => ({
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
     updateLead: (...args: any[]) => mockUpdateLead(...args),
     getLeadListsByUserId: (...args: any[]) => mockGetLeadListsByUserId(...args),
+    getLeadListsForUser: (...args: any[]) => mockGetLeadListsByUserId(...args),
     getLeadsByListId: (...args: any[]) => mockGetLeadsByListId(...args),
   },
 }));
