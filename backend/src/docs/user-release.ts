@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-27',
     changes: [
+      'Fixed: Batch Review Page Now Scrollable',
+      '- The batch review page (shared externally for content approval) can now be scrolled when there are many assets to review',
+      '- Previously the page was locked in place due to a global CSS setting intended for the main app, making it impossible to see assets below the fold',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
       'Fix: Chat History Now Returns Dimensional Scores When Using sync=true',
       '- The get_chat_history tool now re-scores sessions that have an overall satisfaction score but are missing the dimensional breakdown (goalCompletion, dataAccuracy, outputQuality)',
       '- Previously, sessions scored before dimensional scoring was introduced would never get backfilled with dimension scores even when sync=true was used',
