@@ -847,6 +847,9 @@ export async function runVerifiedChat(
       if (isSessionLimitError(error)) {
         throw error;
       }
+      if (!isTransientLLMError(error) || isContextLimitError(error)) {
+        throw error;
+      }
       if (attempt === maxAttempts) {
         throw error;
       }

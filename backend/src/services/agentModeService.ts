@@ -2073,7 +2073,9 @@ export class AgentModeService {
             // The screenshot is also displayed to the user via the tool call card in the frontend.
             // We use a text prefix to discourage embedding the raw URL in markdown responses.
             let toolContent: any;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl) {
+            // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
+            const isGeminiModel = llmModel.startsWith('gemini-');
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
               toolContent = [
                 { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
                 { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
