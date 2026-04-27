@@ -5208,4 +5208,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- All three sub-scores are visible in the Admin Dashboard Chat History tab and accessible via the get_chat_history admin tool',
     ],
   },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Lead List Now Stays in Sync with User Records',
+      '- When a user\'s subscription type, subscription status, roles, or active status changes in the admin panel, the matching CRM lead record is automatically updated',
+      '- Covers admin actions: changing subscription type, deactivating/reactivating users, and promoting waitlist users',
+      '- Also covers Stripe webhook events: subscription upgrades/downgrades, cancellations, payment failures, and payment recovery',
+      '- Use "Sync Now" (Force Full Sync) on the Admin → Users tab to backfill all existing CRM leads with current user data',
+    ],
+  },
 ];
