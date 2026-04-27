@@ -2771,7 +2771,7 @@ emmaToolRegistry.register({
     // AskCrmLead shape so askCrm doesn't have to know about the underlying
     // storage layout.
     const loadLeadsForUser = async (uid: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
-      const lists = (await crmDb.getLeadListsByUserId(uid)) || [];
+      const lists = (await crmDb.getLeadListsForUser(uid)) || [];
       const out: AskCrmLead[] = [];
       for (const list of lists as any[]) {
         if (out.length >= opts.limit) break;
@@ -6217,7 +6217,7 @@ emmaToolRegistry.register({
     // Scan caller's lists and collect candidates. Ranking by heatScore desc.
     let lists: any[] = [];
     try {
-      lists = (await crmDb.getLeadListsByUserId(userId)) || [];
+      lists = (await crmDb.getLeadListsForUser(userId)) || [];
     } catch (err: any) {
       return { error: err?.message || 'Failed to load lead lists' };
     }

@@ -6522,7 +6522,7 @@ export class AgentModeService {
       const { listLandingPages } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
-        crmDb.getLeadListsByUserId(userId),
+        crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
@@ -6685,12 +6685,13 @@ export class AgentModeService {
       const { crmDb } = await import('./db');
       const limit = Math.min(Math.max(options.limit || 20, 1), 50);
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessGetLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessGetLeads) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -6784,12 +6785,13 @@ export class AgentModeService {
       const { crmDb } = await import('./db');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 50);
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessSearchLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessSearchLeads) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -6935,12 +6937,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessGetLeadDetails = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessGetLeadDetails) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -7017,12 +7020,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list access (org-aware: org members can update leads in their org's lists)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -7465,12 +7469,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessUpdateStatus) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
