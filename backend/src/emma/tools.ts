@@ -4094,7 +4094,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp entries start with "clickup:". Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
     inputSchema: {
       type: "object",
       properties: {
@@ -4303,7 +4303,7 @@ emmaToolRegistry.register({
   name: 'write_clickup_doc',
   definition: {
     name: 'write_clickup_doc',
-    description: 'Create a new document in the user\'s ClickUp workspace. Use this when the user wants to save content (research, reports, documentation) directly to ClickUp. The workspace_id can be obtained from list_knowledge_base_files (ClickUp entries have identifiers like "clickup:WORKSPACE_ID").',
+    description: 'Create a new document in the user\'s ClickUp workspace. Use this when the user wants to save content (research, reports, documentation) directly to ClickUp. The workspace_id can be obtained from list_knowledge_base_files (ClickUp entries have identifiers like "clickup:WORKSPACE_ID"). To place content inside an existing ClickUp doc (e.g. a doc that acts as a folder/container), pass parent_doc_id using the docId from list_knowledge_base_files. NOTE: ClickUp task-hierarchy folders (clickup-folder: entries) cannot be used as doc parents — only existing doc IDs work.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4313,11 +4313,15 @@ emmaToolRegistry.register({
         },
         name: {
           type: 'string',
-          description: 'Document title'
+          description: 'Document or page title'
         },
         content: {
           type: 'string',
           description: 'Document content (markdown)'
+        },
+        parent_doc_id: {
+          type: 'string',
+          description: 'Optional: ID of an existing ClickUp doc to create this content inside as a page. Get the docId from list_knowledge_base_files (each file entry under a "clickup:" knowledge base has a docId). If omitted, the document is created at the workspace root.'
         }
       },
       required: ['workspace_id', 'name', 'content']
@@ -4331,7 +4335,8 @@ emmaToolRegistry.register({
       args.workspace_id,
       args.name,
       args.content,
-      context.userId
+      context.userId,
+      args.parent_doc_id
     );
   }
 });

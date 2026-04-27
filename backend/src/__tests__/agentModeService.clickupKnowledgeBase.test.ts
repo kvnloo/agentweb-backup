@@ -19,6 +19,9 @@ const mockReadDocContent = jest.fn();
 const mockListTasks = jest.fn();
 const mockReadTaskContent = jest.fn();
 const mockCreateDoc = jest.fn();
+const mockCreatePageInDoc = jest.fn();
+const mockListSpaces = jest.fn();
+const mockListFolders = jest.fn();
 jest.mock('../services/clickupService', () => ({
   getAccessToken: (...args: any[]) => mockGetAccessToken(...args),
   getWorkspaces: (...args: any[]) => mockGetWorkspaces(...args),
@@ -27,6 +30,9 @@ jest.mock('../services/clickupService', () => ({
   listTasks: (...args: any[]) => mockListTasks(...args),
   readTaskContent: (...args: any[]) => mockReadTaskContent(...args),
   createDoc: (...args: any[]) => mockCreateDoc(...args),
+  createPageInDoc: (...args: any[]) => mockCreatePageInDoc(...args),
+  listSpaces: (...args: any[]) => mockListSpaces(...args),
+  listFolders: (...args: any[]) => mockListFolders(...args),
 }));
 
 // Mock userDb (needed by getUserGoogleDriveFolders in listKnowledgeBaseFiles)
@@ -479,7 +485,7 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toBe('Not authorized to access this ClickUp workspace');
     });
 
-    it('should successfully create a ClickUp doc', async () => {
+    it('should successfully create a ClickUp doc at workspace root', async () => {
       mockGetAccessToken.mockResolvedValue('ck_token');
       mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
       mockCreateDoc.mockResolvedValue({ id: 'doc-new-1', name: 'New Doc' });
@@ -499,5 +505,77 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toContain('Failed to create ClickUp document');
     });
 
+    it('should create a page inside a parent doc when parent_doc_id is provided', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockCreatePageInDoc.mockResolvedValue({ id: 'page-1', name: 'Page Doc' });
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'Page Doc', 'content', 'user-123', 'parent-doc-99');
+      expect(result.success).toBe(true);
+      expect(mockCreatePageInDoc).toHaveBeenCalledWith('ck_token', 'ws-1', 'parent-doc-99', 'Page Doc', 'content');
+      expect(mockCreateDoc).not.toHaveBeenCalled();
+      expect(result.message).toContain('parent-doc-99');
+    });
+
+  });
+
+  // ============================================
+  // listKnowledgeBaseFiles - folder listing tests
+  // ============================================
+
+  describe('listKnowledgeBaseFiles - ClickUp folder listing', () => {
+    beforeEach(() => {
+      // No private KB tasks
+      const { taskDb } = require('../services/db');
+      taskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+      taskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+    });
+
+    it('should include clickup-folder entries when folders exist', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'My Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockResolvedValue([]);
+      mockListSpaces.mockResolvedValue([{ id: 'sp-1', name: 'Engineering' }]);
+      mockListFolders.mockResolvedValue([{ id: 'folder-42', name: 'AgentWeb' }]);
+
+      const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+      expect(result.success).toBe(true);
+      const folderEntries = result.knowledge_bases.filter((kb: any) => kb.type === 'clickup-folder');
+      expect(folderEntries).toHaveLength(1);
+      expect(folderEntries[0].identifier).toBe('clickup-folder:folder-42');
+      expect(folderEntries[0].name).toContain('AgentWeb');
+      expect(folderEntries[0].name).toContain('Engineering');
+      expect(folderEntries[0].name).toContain('My Workspace');
+    });
+
+    it('should not add folder entries when no folders exist', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'My Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockResolvedValue([]);
+      mockListSpaces.mockResolvedValue([{ id: 'sp-1', name: 'Engineering' }]);
+      mockListFolders.mockResolvedValue([]);
+
+      const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+      expect(result.success).toBe(true);
+      const folderEntries = result.knowledge_bases.filter((kb: any) => kb.type === 'clickup-folder');
+      expect(folderEntries).toHaveLength(0);
+    });
+
+    it('should continue gracefully when folder listing fails for a space', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'My Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockResolvedValue([]);
+      mockListSpaces.mockResolvedValue([{ id: 'sp-1', name: 'Engineering' }]);
+      mockListFolders.mockRejectedValue(new Error('Permission denied'));
+
+      const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+      // Should not throw — folder errors are caught per-space
+      expect(result.success).toBe(true);
+      const folderEntries = result.knowledge_bases.filter((kb: any) => kb.type === 'clickup-folder');
+      expect(folderEntries).toHaveLength(0);
+    });
   });
 });
