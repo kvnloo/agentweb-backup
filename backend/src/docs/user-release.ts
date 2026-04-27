@@ -5254,4 +5254,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The fix also applies to the CRM group-email and admin announcement load-from-URL features',
     ],
   },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Lead Engagements Now Load Correctly',
+      '- Clicking on a lead in the CRM page no longer shows "Failed to load engagements" every time',
+      '- The error was caused by a missing AWS region configuration in the email events service',
+    ],
+  },
 ];
