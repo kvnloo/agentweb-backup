@@ -22,6 +22,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   creativeDirFailedPatch,
@@ -247,6 +248,16 @@ export async function triggerCreativeDirForUser(
     console.error("[onboardingCreativeDirService] generation failed", {
       userId,
       err: msg,
+    });
+    void reportUIError({
+      operation: "onboarding:creative-dir:llm-generation",
+      errorMessage: msg,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "creativeDir",
+        Stack: err instanceof Error ? (err.stack ?? "").slice(0, 1000) : "",
+      },
     });
   }
 }

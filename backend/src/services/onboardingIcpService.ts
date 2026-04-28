@@ -22,6 +22,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   icpFailedPatch,
@@ -245,6 +246,16 @@ export async function triggerIcpDiscoveryForUser(
       icpFailedPatch((current as any) || {}, msg) as any,
     );
     console.error("[onboardingIcpService] generation failed", { userId, err: msg });
+    void reportUIError({
+      operation: "onboarding:icp:llm-generation",
+      errorMessage: msg,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "icp",
+        Stack: err instanceof Error ? (err.stack ?? "").slice(0, 1000) : "",
+      },
+    });
   }
 }
 
