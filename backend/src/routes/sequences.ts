@@ -283,11 +283,12 @@ router.post(
     }
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email</div>`;
-    // Inject banner inside <body>, then wire up unsubscribe URL
-    const testHtml = injectUnsubscribeUrl(
-      htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`),
-      '#unsubscribe-test'
-    );
+    // Inject banner: inside <body> for full HTML documents, or prepend for fragments
+    const withBanner = /<body\b/i.test(htmlContent)
+      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + htmlContent;
+    // Wire up unsubscribe URL
+    const testHtml = injectUnsubscribeUrl(withBanner, '#unsubscribe-test');
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
