@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl } from '../utils/emailVariables';
 import axios from 'axios';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
@@ -4079,13 +4079,9 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         let personalizedHtml = substituteVariables(htmlContent, lead);
         const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
 
-        // Append unsubscribe footer
+        // Inject unsubscribe URL — updates existing link or appends footer if none found
         const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=${encodeURIComponent(lead.leadId)}&email=${encodeURIComponent(lead.email)}`;
-        const defaultFooter = `<div style="text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid #eee;font-size:12px;color:#999;"><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a> from future emails</div>`;
-        const unsubscribeFooter = unsubscribeFooterHtml
-          ? unsubscribeFooterHtml.replace(/\{\{unsubscribeUrl\}\}/g, unsubscribeUrl)
-          : defaultFooter;
-        personalizedHtml += unsubscribeFooter;
+        personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
 
         const result = await resendService.sendEmail({
           from,
@@ -4167,10 +4163,12 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     }
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
-    const testFooter = unsubscribeFooterHtml
-      ? unsubscribeFooterHtml.replace(/\{\{unsubscribeUrl\}\}/g, '#unsubscribe-test')
-      : `<div style="text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid #eee;font-size:12px;color:#999;"><a href="#unsubscribe-test" style="color:#999;">Unsubscribe</a> from future emails</div>`;
-    const testHtml = testBanner + htmlContent + testFooter;
+    // Inject banner inside <body>, then wire up unsubscribe URL
+    const testHtml = injectUnsubscribeUrl(
+      htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`),
+      '#unsubscribe-test',
+      unsubscribeFooterHtml
+    );
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;

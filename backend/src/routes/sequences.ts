@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl } from '../utils/emailVariables';
 
 const router = express.Router();
 
@@ -283,7 +283,11 @@ router.post(
     }
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email</div>`;
-    const testHtml = testBanner + htmlContent;
+    // Inject banner inside <body>, then wire up unsubscribe URL
+    const testHtml = injectUnsubscribeUrl(
+      htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`),
+      '#unsubscribe-test'
+    );
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
