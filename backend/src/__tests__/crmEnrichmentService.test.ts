@@ -652,8 +652,8 @@ describe('CrmEnrichmentService', () => {
       const guidance = buildFieldGuidance(['employee_count']);
       expect(guidance).toContain('employee_count');
       expect(guidance).toContain('range');
-      // Unknown is a last resort, not the default
-      expect(guidance).toContain('Only return "Unknown" if');
+      // LLM is told to return null (not "Unknown") when value is absent
+      expect(guidance).toContain('Return null if');
     });
 
     it('should default to Bootstrapped for funding fields when not found', () => {
@@ -667,15 +667,15 @@ describe('CrmEnrichmentService', () => {
       expect(guidance).toContain('Not publicly disclosed');
     });
 
-    it('should never say Unknown for industry field', () => {
+    it('should use null for missing industry values', () => {
       const guidance = buildFieldGuidance(['industry']);
       expect(guidance).toContain('industry');
-      expect(guidance).toContain('never return');
+      expect(guidance).toContain('Return null');
     });
 
-    it('should handle empty fields list with fallback string', () => {
+    it('should handle empty fields list with null fallback string', () => {
       const guidance = buildFieldGuidance([]);
-      expect(guidance).toContain('Unknown');
+      expect(guidance).toContain('null');
     });
 
     it('should include guidance for all fields in a mixed list', () => {
@@ -689,7 +689,7 @@ describe('CrmEnrichmentService', () => {
   // ─── splitFields ─────────────────────────────────────────────────────────
 
   describe('splitFields', () => {
-    const splitFields = (fields: Record<string, string>) =>
+    const splitFields = (fields: Record<string, string | null>) =>
       (CrmEnrichmentService as any).splitFields(fields);
 
     it('should map known field names to standard lead fields', () => {
@@ -736,32 +736,31 @@ describe('CrmEnrichmentService', () => {
       expect(customUpdates).toEqual({});
     });
 
-    it('should drop "Unknown" values from both standard and custom updates', () => {
+    it('should exclude null values from standard updates and preserve them in custom updates', () => {
       const { standardUpdates, customUpdates } = splitFields({
-        linkedin_url: 'Unknown',
-        company: 'Unknown',
-        employee_count: 'Unknown',
+        linkedin_url: null,
+        company: null,
+        employee_count: null,
         title: 'CEO',
       });
       expect(standardUpdates).toEqual({ title: 'CEO' });
-      expect(customUpdates).toEqual({});
+      expect(customUpdates).toEqual({ employee_count: null });
     });
 
-    it('should drop empty and "n/a" values', () => {
+    it('should drop empty string values from standard updates', () => {
       const { standardUpdates, customUpdates } = splitFields({
         linkedin_url: '',
-        company: 'n/a',
-        funding_status: 'N/A',
         title: 'CTO',
+        funding_status: null,
       });
       expect(standardUpdates).toEqual({ title: 'CTO' });
-      expect(customUpdates).toEqual({});
+      expect(customUpdates).toEqual({ funding_status: null });
     });
 
-    it('should keep real values even when other fields are Unknown', () => {
+    it('should keep real values even when other fields are null', () => {
       const { standardUpdates, customUpdates } = splitFields({
         linkedin_url: 'https://linkedin.com/in/jane',
-        company: 'Unknown',
+        company: null,
         employee_count: '11-50',
       });
       expect(standardUpdates).toEqual({ linkedin: 'https://linkedin.com/in/jane' });
