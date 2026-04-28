@@ -1866,6 +1866,7 @@ mcpToolRegistry.register({
         longestWaitMs: longestWaitMs > 0 ? longestWaitMs : null,
         maxHeapMB: maxHeapMB > 0 ? Math.round(maxHeapMB) : null,
         workPlan: workPlanSummary,
+        delegateInfo: session.delegateInfo || null,
       };
     });
 

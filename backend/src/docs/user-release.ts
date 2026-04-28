@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-28',
+    changes: [
+      'Improvement: Chat History Now Shows Admin Delegation Info',
+      '- The get_chat_history admin tool now includes delegateInfo on each session, showing whether the session was started by an admin acting on behalf of a user',
+      '- delegateInfo contains adminUserId, adminEmail, and isDelegated — null for sessions started directly by the user',
+    ],
+  },
+  {
     date: '2026-04-27',
     changes: [
       'Fix: Org Members Can Now Find and Update Leads Owned by the Org Owner',
