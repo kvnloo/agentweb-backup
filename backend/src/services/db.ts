@@ -5539,6 +5539,109 @@ export const crmDb = {
       throw error;
     }
   },
+
+  // ─── Enrichment History ───────────────────────────────────────────
+
+  async createEnrichmentSnapshotItem(item: {
+    jobId: string;
+    leadId: string;
+    previousStandardFields: Record<string, string | null>;
+    previousCustomFields: Record<string, string | null>;
+    expiresAt: number;
+  }): Promise<void> {
+    try {
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Item: {
+          jobId: item.jobId,
+          leadId: item.leadId,
+          previousStandardFields: item.previousStandardFields,
+          previousCustomFields: item.previousCustomFields,
+          expiresAt: item.expiresAt,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'createEnrichmentSnapshotItem');
+      throw error;
+    }
+  },
+
+  async createEnrichmentJobMeta(meta: {
+    jobId: string;
+    listId: string;
+    userId: string;
+    outputFields: string[];
+    createdAt: string;
+    status: 'completed' | 'undone';
+    expiresAt: number;
+    processedCount: number;
+  }): Promise<void> {
+    try {
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Item: {
+          jobId: meta.jobId,
+          leadId: '_meta',
+          listId: meta.listId,
+          userId: meta.userId,
+          outputFields: meta.outputFields,
+          createdAt: meta.createdAt,
+          status: meta.status,
+          expiresAt: meta.expiresAt,
+          processedCount: meta.processedCount,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'createEnrichmentJobMeta');
+      throw error;
+    }
+  },
+
+  async updateEnrichmentJobStatus(jobId: string, status: 'completed' | 'undone'): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Key: { jobId, leadId: '_meta' },
+        UpdateExpression: 'SET #status = :status',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': status },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'updateEnrichmentJobStatus');
+      throw error;
+    }
+  },
+
+  async getEnrichmentJobsByListId(listId: string, limit = 10): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        IndexName: 'listId-createdAt-index',
+        KeyConditionExpression: 'listId = :listId',
+        ExpressionAttributeValues: { ':listId': listId },
+        ScanIndexForward: false,
+        Limit: limit,
+      }).promise();
+      return (result.Items || []).filter((item: any) => item.leadId === '_meta');
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentJobsByListId');
+      throw error;
+    }
+  },
+
+  async getEnrichmentSnapshotsByJobId(jobId: string): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        KeyConditionExpression: 'jobId = :jobId',
+        ExpressionAttributeValues: { ':jobId': jobId },
+      }).promise();
+      return (result.Items || []).filter((item: any) => item.leadId !== '_meta');
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentSnapshotsByJobId');
+      throw error;
+    }
+  },
 };
 
 // ─── Account Memory ───────────────────────────────────────────────

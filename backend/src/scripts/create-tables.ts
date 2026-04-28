@@ -1804,6 +1804,44 @@ const createTempEmailsTable = async () => {
 };
 
 
+const createEnrichmentHistoryTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+    AttributeDefinitions: [
+      { AttributeName: 'jobId', AttributeType: 'S' },
+      { AttributeName: 'leadId', AttributeType: 'S' },
+      { AttributeName: 'listId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'jobId', KeyType: 'HASH' },
+      { AttributeName: 'leadId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'listId-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1853,6 +1891,7 @@ const main = async () => {
     await createSequenceEnrollmentsTable();
     await createDripCampaignsTable();
     await createDripSendsTable();
+    await createEnrichmentHistoryTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

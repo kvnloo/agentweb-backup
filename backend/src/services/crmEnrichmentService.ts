@@ -718,10 +718,27 @@ export class CrmEnrichmentService {
     };
   }
 
+  private static pickMappedStandardFields(lead: LeadRecord, standardUpdates: Record<string, string>): Record<string, string | null> {
+    const result: Record<string, string | null> = {};
+    for (const key of Object.keys(standardUpdates)) {
+      result[key] = (lead as any)[key] ?? null;
+    }
+    return result;
+  }
+
+  private static pickCustomFieldValues(customFields: Record<string, any> | undefined, customUpdates: Record<string, string | null>): Record<string, string | null> {
+    const result: Record<string, string | null> = {};
+    for (const key of Object.keys(customUpdates)) {
+      result[key] = customFields?.[key] ?? null;
+    }
+    return result;
+  }
+
   async execute(spec: EnrichmentJobSpec, socketId?: string, options?: { progressEvent?: string; completeEvent?: string; socketEmit?: SocketEmitFn }): Promise<EnrichmentExecuteResult> {
     const progressEvent = options?.progressEvent || 'crm-enrichment-progress';
     const completeEvent = options?.completeEvent || 'crm-enrichment-complete';
     const jobId = uuidv4();
+    const jobExpiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
     const warnings: string[] = [];
 
     const { leadsToProcess, storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate } = await this.loadAndFilterLeads(spec);
@@ -797,6 +814,19 @@ export class CrmEnrichmentService {
           const { fields } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
           const { standardUpdates, customUpdates } = CrmEnrichmentService.splitFields(fields);
 
+          // Snapshot previous values before overwriting
+          const previousStandardFields = CrmEnrichmentService.pickMappedStandardFields(lead, standardUpdates);
+          const previousCustomFields = CrmEnrichmentService.pickCustomFieldValues(lead.customFields, customUpdates);
+          try {
+            await crmDb.createEnrichmentSnapshotItem({
+              jobId, leadId: lead.leadId,
+              previousStandardFields, previousCustomFields,
+              expiresAt: jobExpiresAt,
+            });
+          } catch (err: any) {
+            console.error('[CrmEnrichment] Failed to write snapshot:', err);
+          }
+
           await crmDb.updateLead(spec.listId, lead.leadId, {
             ...standardUpdates,
             customFields: {
@@ -838,6 +868,20 @@ export class CrmEnrichmentService {
     });
 
     await Promise.all(chunkProcessors);
+
+    // Persist enrichment job metadata for history/revert
+    if (counters.processed > 0 || counters.failed > 0) {
+      Promise.resolve(crmDb.createEnrichmentJobMeta({
+        jobId,
+        listId: spec.listId,
+        userId: spec.userId,
+        outputFields: spec.outputFields,
+        createdAt: new Date().toISOString(),
+        status: 'completed',
+        expiresAt: jobExpiresAt,
+        processedCount: counters.processed,
+      })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
+    }
 
     // Register new field names on the list
     try {
@@ -1059,6 +1103,60 @@ export class CrmEnrichmentService {
     }
 
     return result;
+  }
+
+  async revertJob(jobId: string, listId: string): Promise<{ revertedCount: number; failedCount: number }> {
+    const snapshots = await crmDb.getEnrichmentSnapshotsByJobId(jobId);
+
+    if (snapshots.length === 0) {
+      throw new Error(`No snapshot data found for job ${jobId}. It may have already been reverted or expired.`);
+    }
+
+    const parallelism = 20;
+    const chunkSize = Math.max(1, Math.ceil(snapshots.length / parallelism));
+    const chunks: any[][] = [];
+    for (let i = 0; i < snapshots.length; i += chunkSize) {
+      chunks.push(snapshots.slice(i, i + chunkSize));
+    }
+
+    let revertedCount = 0;
+    let failedCount = 0;
+
+    await Promise.all(chunks.map(async (chunk) => {
+      for (const snapshot of chunk) {
+        try {
+          const currentLead = await crmDb.getLeadById(listId, snapshot.leadId);
+          if (!currentLead) {
+            failedCount++;
+            continue;
+          }
+
+          // Merge: start from current state, overwrite only snapshotted fields
+          const restoredCustomFields: Record<string, any> = { ...(currentLead.customFields || {}) };
+          for (const [key, prevValue] of Object.entries(snapshot.previousCustomFields || {})) {
+            if (prevValue === null || prevValue === undefined) {
+              delete restoredCustomFields[key];
+            } else {
+              restoredCustomFields[key] = prevValue;
+            }
+          }
+
+          await crmDb.updateLead(listId, snapshot.leadId, {
+            ...(snapshot.previousStandardFields || {}),
+            customFields: restoredCustomFields,
+          });
+
+          revertedCount++;
+        } catch (err: any) {
+          failedCount++;
+          console.error(`[CrmEnrichment] Revert failed for lead ${snapshot.leadId}:`, err);
+        }
+      }
+    }));
+
+    await crmDb.updateEnrichmentJobStatus(jobId, 'undone');
+
+    return { revertedCount, failedCount };
   }
 
   static async enrichWebCompat(listId: string, userId: string, socketId?: string, forceEnrich = false): Promise<EnrichmentExecuteResult> {
