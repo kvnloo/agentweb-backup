@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Improvement: Admin Chat History Filter by User',
+      '- Admins can now filter the Chat History tab by user email or user ID to see all recent sessions for a specific user',
+      '- Enter an email address or user ID in the new "Filter by User Email or ID" field and click Filter',
+      '- Results load with infinite scroll — scrolling to the bottom automatically loads more sessions for the filtered user',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Improvement: Chat History Now Shows Admin Delegation Info',
       '- The get_chat_history admin tool now includes delegateInfo on each session, showing whether the session was started by an admin acting on behalf of a user',
       '- delegateInfo contains adminUserId, adminEmail, and isDelegated — null for sessions started directly by the user',
