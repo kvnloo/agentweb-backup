@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fixed: Resend Banner No Longer Appears While Emma Is Processing',
+      '- The "previous response wasn\'t received" Resend banner no longer appears while Emma is actively working on a request',
+      '- Previously, the banner would flash during the SSE streaming phase (tool calls, thinking) because the HTTP phase had already completed',
+      '- The banner now correctly only appears when Emma has genuinely stopped responding with no active processing',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Improvement: Admin Chat History Filter by User',
       '- Admins can now filter the Chat History tab by user email or user ID to see all recent sessions for a specific user',
       '- Enter an email address or user ID in the new "Filter by User Email or ID" field and click Filter',
