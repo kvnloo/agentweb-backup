@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fix: Org Member Token Usage Now Counts Against Org Owner\'s Quota',
+      '- Previously, each org member\'s token usage was tracked independently against their own (Free-tier) quota, so members could consume tokens without affecting the org owner\'s limit',
+      '- Token usage for org members now counts against the org owner\'s subscription quota — checks, increments, and the subscription usage dashboard all reflect the owner\'s pool',
+      '- Org owners will now see their full team\'s consumption in the Monthly Token Usage bar on the Subscription settings page',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fix: Admin Delegate Access No Longer Blocked by Onboarding Banner',
       '- When an admin used delegate access to view a customer account that had not yet completed onboarding, a banner prompting them to complete brand setup was incorrectly shown',
       '- Admins using delegate access are now fully exempt from the onboarding banner',
