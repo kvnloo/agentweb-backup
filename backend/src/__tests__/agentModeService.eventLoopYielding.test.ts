@@ -83,8 +83,13 @@ describe('AgentModeService - generateMarketingResponse', () => {
         .mockReturnValue('2026-01-03T12:34:56.000Z');
 
       let systemMessageContent = '';
+      let firstCallCaptured = false;
       llmCallSpy.mockImplementation(async (_model: string, messages: any[]) => {
-        systemMessageContent = messages[0]?.content || '';
+        // Only capture the first call (the main marketing response call, not generateSuggestedReplies)
+        if (!firstCallCaptured) {
+          systemMessageContent = messages[0]?.content || '';
+          firstCallCaptured = true;
+        }
         return {
           choices: [{
             message: {
@@ -504,7 +509,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
             }]
           };
         } else {
-          // 5th call: LLM should respond to the anti-loop warning with a final message
+          // 5th call: LLM responds to anti-loop warning; 6th call is generateSuggestedReplies
           return {
             choices: [{
               message: {
@@ -535,8 +540,8 @@ describe('AgentModeService - generateMarketingResponse', () => {
       // but responseMessages filters out user messages. Verify via console.warn instead.
       const warnSpy = jest.spyOn(console, 'warn');
       // The warning was already logged during execution; check that callCount confirms
-      // the LLM was called 5 times (3 repeated + 1 more repeated after warning + final response)
-      expect(callCount).toBe(5);
+      // the LLM was called 6 times (3 repeated + 1 more repeated after warning + final response + generateSuggestedReplies)
+      expect(callCount).toBe(6);
     });
 
     it('should not trigger anti-loop when tool calls have different arguments', async () => {
