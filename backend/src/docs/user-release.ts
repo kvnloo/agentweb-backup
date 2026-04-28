@@ -11,6 +11,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Improvement: Test Emails Now Auto-Fix CSS for Gmail and Outlook Compatibility',
+      '- When sending a test email for a sequence step, the system now automatically detects class-based CSS that Gmail and Outlook would strip',
+      '- If detected, Claude Sonnet 4.6 converts all CSS classes to inline styles while preserving every color, font, size, and layout exactly',
+      '- Buttons and CTAs now include a solid background-color fallback so they render correctly even when Gmail strips gradient backgrounds',
+      '- Circular number badges and icon circles are converted from flexbox to line-height centering so numbers stay centered in all email clients',
+      '- The orange test banner shows "✅ Styles auto-fixed" when conversion was applied so senders know what changed',
+      '- The unsubscribe link in test emails now points to the real portal unsubscribe page with the correct list and lead parameters',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fixed: Fathom Now Visible in Connected Accounts for All Users',
       '- Fathom was previously hidden for non-admin users due to an incorrect admin-only guard in the Connected Accounts settings page',
       '- All users can now see and connect their Fathom account from Settings → Connected Accounts',
