@@ -1,4 +1,4 @@
-import { userDb, User } from "./db";
+import { userDb, orgDb, User } from "./db";
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
 
 export interface TokenUsageStatus {
@@ -10,6 +10,21 @@ export interface TokenUsageStatus {
   effectiveAllowance: number | null; // allowance + bonus, null = unlimited
   percentUsed: number; // 0-100+, 0 if unlimited
   month: string; // "YYYY-MM"
+}
+
+/**
+ * For org members, returns the org owner's userId so that all quota checks
+ * and usage increments are applied to the owner (the subscription holder).
+ * Returns the original userId for solo users and org owners.
+ */
+export async function resolveBillingUserId(userId: string): Promise<string> {
+  const user = await userDb.getUserById(userId);
+  if (!user || !user.orgId || user.orgRole !== "member") return userId;
+
+  const org = await orgDb.getOrgById(user.orgId);
+  if (!org) return userId;
+
+  return org.ownerUserId;
 }
 
 function getCurrentMonth(): string {
@@ -74,10 +89,12 @@ export async function getUserTokenAllowance(
 
 /**
  * Check if a user can send messages. Returns usage status with warning/blocked flags.
+ * For org members, quota is checked against the org owner's subscription and usage.
  */
 export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
-  const usage = await getUserTokenUsage(userId);
-  const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
+  const billingUserId = await resolveBillingUserId(userId);
+  const usage = await getUserTokenUsage(billingUserId);
+  const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(billingUserId);
 
   // Unlimited
   if (effectiveAllowance === null) {
@@ -114,6 +131,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
 
 /**
  * Atomically increment a user's token usage for the current month.
+ * For org members, usage is recorded on the org owner's account.
  * Performs lazy monthly reset if the stored month differs from current.
  */
 export async function incrementUserTokenUsage(
@@ -126,8 +144,9 @@ export async function incrementUserTokenUsage(
   const currentMonth = getCurrentMonth();
 
   try {
+    const billingUserId = await resolveBillingUserId(userId);
     // Try to read current user to check if we need a month reset
-    const user = await userDb.getUserById(userId);
+    const user = await userDb.getUserById(billingUserId);
     if (!user) return;
 
     const existingMonth = user.tokenUsage?.month;
@@ -141,7 +160,7 @@ export async function incrementUserTokenUsage(
         const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
         newHistory = [...existingHistory, entry].slice(-24);
       }
-      await userDb.updateUser(userId, {
+      await userDb.updateUser(billingUserId, {
         tokenUsage: {
           month: currentMonth,
           totalTokens: tokens,
@@ -153,7 +172,7 @@ export async function incrementUserTokenUsage(
       });
     } else {
       // Same month — increment atomically
-      await userDb.updateUser(userId, {
+      await userDb.updateUser(billingUserId, {
         tokenUsage: {
           month: currentMonth,
           totalTokens: (user.tokenUsage?.totalTokens || 0) + tokens,
@@ -206,10 +225,12 @@ export async function getUserExtraCostUsage(
 
 /**
  * Check if a user can incur more extra cost this month.
+ * For org members, quota is checked against the org owner's subscription and usage.
  */
 export async function checkExtraCostUsage(userId: string): Promise<ExtraCostUsageStatus> {
-  const usage = await getUserExtraCostUsage(userId);
-  const subscriptionTypeName = await getUserSubscriptionType(userId);
+  const billingUserId = await resolveBillingUserId(userId);
+  const usage = await getUserExtraCostUsage(billingUserId);
+  const subscriptionTypeName = await getUserSubscriptionType(billingUserId);
   const config = await getSubscriptionTypeConfig(subscriptionTypeName);
   const allowance = config?.monthlyExtraCostAllowance ?? null;
 
@@ -243,6 +264,7 @@ export async function checkExtraCostUsage(userId: string): Promise<ExtraCostUsag
 
 /**
  * Atomically increment extra cost usage for the current month.
+ * For org members, usage is recorded on the org owner's account.
  * @param breakdown - keyed costs to add (e.g. { enrichment: 0.52 })
  */
 export async function incrementExtraCostUsage(
@@ -255,7 +277,8 @@ export async function incrementExtraCostUsage(
   const currentMonth = getCurrentMonth();
 
   try {
-    const user = await userDb.getUserById(userId);
+    const billingUserId = await resolveBillingUserId(userId);
+    const user = await userDb.getUserById(billingUserId);
     if (!user) return;
 
     const existingMonth = user.extraCostUsage?.month;
@@ -269,7 +292,7 @@ export async function incrementExtraCostUsage(
         const entry = { month: prevUsage.month, totalCost: prevUsage.totalCost, breakdown: prevUsage.breakdown };
         newHistory = [...existingHistory, entry].slice(-24);
       }
-      await userDb.updateUser(userId, {
+      await userDb.updateUser(billingUserId, {
         extraCostUsage: {
           month: currentMonth,
           totalCost: totalNew,
@@ -285,7 +308,7 @@ export async function incrementExtraCostUsage(
       for (const [key, val] of Object.entries(breakdown)) {
         mergedBreakdown[key] = (mergedBreakdown[key] || 0) + val;
       }
-      await userDb.updateUser(userId, {
+      await userDb.updateUser(billingUserId, {
         extraCostUsage: {
           month: currentMonth,
           totalCost: (user.extraCostUsage?.totalCost || 0) + totalNew,

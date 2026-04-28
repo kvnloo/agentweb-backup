@@ -4,6 +4,7 @@ import {
   checkTokenUsage,
   incrementUserTokenUsage,
   grantTokenBonus,
+  resolveBillingUserId,
 } from "../services/tokenUsageService";
 
 // Mock dependencies
@@ -12,6 +13,9 @@ jest.mock("../services/db", () => ({
     getUserById: jest.fn(),
     updateUser: jest.fn(),
   },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 jest.mock("../services/subscriptionService", () => ({
@@ -19,7 +23,7 @@ jest.mock("../services/subscriptionService", () => ({
   getSubscriptionTypeConfig: jest.fn(),
 }));
 
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
 import {
   getUserSubscriptionType,
   getSubscriptionTypeConfig,
@@ -27,6 +31,7 @@ import {
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
+const mockGetOrgById = orgDb.getOrgById as jest.Mock;
 const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
 const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
 
@@ -399,5 +404,116 @@ describe("grantTokenBonus", () => {
     expect(mockUpdateUser).toHaveBeenCalledWith("u1", {
       tokenAllowanceBonus: 10000,
     });
+  });
+});
+
+// ─── ORG BILLING USER RESOLUTION ─────────────────────────────────────────────
+
+describe("resolveBillingUserId - failure cases", () => {
+  it("returns the same userId when user not found (graceful fallback)", async () => {
+    mockGetUserById.mockResolvedValue(null);
+    const result = await resolveBillingUserId("u-missing");
+    expect(result).toBe("u-missing");
+  });
+
+  it("returns the same userId when user has no orgId", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "u1", email: "solo@example.com" });
+    const result = await resolveBillingUserId("u1");
+    expect(result).toBe("u1");
+  });
+
+  it("returns the same userId when user is org owner", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "owner1", email: "owner@example.com", orgId: "org1", orgRole: "owner" });
+    const result = await resolveBillingUserId("owner1");
+    expect(result).toBe("owner1");
+  });
+
+  it("returns member's own userId when org is not found", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(null);
+    const result = await resolveBillingUserId("member1");
+    expect(result).toBe("member1");
+  });
+});
+
+describe("resolveBillingUserId - success cases", () => {
+  it("returns org owner userId for an org member", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
+    const result = await resolveBillingUserId("member1");
+    expect(result).toBe("owner1");
+  });
+});
+
+describe("checkTokenUsage - org member uses owner quota", () => {
+  it("checks against org owner allowance when called for org member", async () => {
+    // member1 belongs to org1, owner is owner1
+    mockGetUserById
+      .mockResolvedValueOnce({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" }) // resolveBillingUserId
+      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", orgId: "org1", orgRole: "owner",
+        tokenUsage: { month: currentMonth(), totalTokens: 90000, totalCost: 9.0, resetDate: "2026-05-01T00:00:00.000Z" },
+        tokenAllowanceBonus: 0,
+      }) // getUserTokenUsage
+      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", tokenAllowanceBonus: 0 }); // getUserTokenAllowance
+    mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
+    mockGetUserSubscriptionType.mockResolvedValue("Pro");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Pro",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 500000,
+    });
+
+    const result = await checkTokenUsage("member1");
+    expect(result.used).toBe(90000);
+    expect(result.allowance).toBe(500000);
+    expect(result.allowed).toBe(true);
+    // Subscription type should have been resolved for owner, not member
+    expect(mockGetUserSubscriptionType).toHaveBeenCalledWith("owner1");
+  });
+
+  it("blocks org member when org owner is at 100% usage", async () => {
+    mockGetUserById
+      .mockResolvedValueOnce({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" })
+      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com",
+        tokenUsage: { month: currentMonth(), totalTokens: 100000, totalCost: 10.0, resetDate: "2026-05-01T00:00:00.000Z" },
+        tokenAllowanceBonus: 0,
+      })
+      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", tokenAllowanceBonus: 0 });
+    mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+    });
+
+    const result = await checkTokenUsage("member1");
+    expect(result.allowed).toBe(false);
+    expect(result.percentUsed).toBe(100);
+  });
+});
+
+describe("incrementUserTokenUsage - org member increments owner counter", () => {
+  it("increments org owner's usage when called for org member", async () => {
+    mockGetUserById
+      .mockResolvedValueOnce({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" }) // resolveBillingUserId
+      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com",
+        tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
+      }); // incrementUserTokenUsage reads owner
+    mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
+    mockUpdateUser.mockResolvedValue(undefined);
+
+    await incrementUserTokenUsage("member1", 2000, 0.2);
+
+    // updateUser should be called with owner1, not member1
+    expect(mockUpdateUser).toHaveBeenCalledWith("owner1", expect.objectContaining({
+      tokenUsage: expect.objectContaining({
+        totalTokens: 7000,
+        totalCost: 0.7,
+      }),
+    }));
+    expect(mockUpdateUser).not.toHaveBeenCalledWith("member1", expect.anything());
   });
 });
