@@ -262,7 +262,6 @@ const CRM_ENRICHMENT_CONFIG_KEY = 'crm-enrichment-config';
 const CRM_ENRICHMENT_DEFAULTS = {
   enrichmentModel: 'gemini-3-flash-preview',
   dataExtractionModel: 'gemini-3-flash-preview',
-  context: '',
 };
 
 router.get('/crm-enrichment-config', authenticateToken, requireAdmin, async (req, res) => {
@@ -287,14 +286,13 @@ router.get('/crm-enrichment-config', authenticateToken, requireAdmin, async (req
 
 router.put('/crm-enrichment-config', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { enrichmentModel, dataExtractionModel, context } = req.body;
+    const { enrichmentModel, dataExtractionModel } = req.body;
     if (!enrichmentModel || !dataExtractionModel) {
       return res.status(400).json({ error: 'enrichmentModel and dataExtractionModel are required' });
     }
     const config = {
       enrichmentModel: String(enrichmentModel),
       dataExtractionModel: String(dataExtractionModel),
-      context: typeof context === 'string' ? context : '',
     };
     await settingsService.setSetting(
       CRM_ENRICHMENT_CONFIG_KEY,

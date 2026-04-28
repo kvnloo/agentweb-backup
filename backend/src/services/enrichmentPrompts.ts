@@ -1,11 +1,10 @@
 export function buildDataExtractionSystemPrompt(options: {
-  globalContext: string;
   resolvedInstruction: string;
   outputFieldsJson: string;
   fieldGuidance: string;
 }): string {
   return `You are a data extraction assistant. Your job is to extract factual information from the provided sources — not to infer, guess, or fabricate.
-${options.globalContext ? `\nBusiness context:\n${options.globalContext}\n` : ''}
+
 CRITICAL RULE: Only return values that are explicitly stated in the provided Lead context, Web search results, or LinkedIn data. If a value is not present in the provided data, return "Unknown". Do NOT construct, guess, or invent any value — especially URLs.
 
 Your task: ${options.resolvedInstruction}
@@ -32,9 +31,8 @@ Valid example:
 {${outputFieldsMap}}`;
 }
 
-export function buildSuggestEnrichmentSystemPrompt(globalContext: string): string {
+export function buildSuggestEnrichmentSystemPrompt(): string {
   return `You are a data enrichment specialist for a B2B CRM system.
-${globalContext ? `\nBusiness context:\n${globalContext}\n` : ''}
 
 Given a user's enrichment goal or instruction, produce:
 

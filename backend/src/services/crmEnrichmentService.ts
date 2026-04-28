@@ -180,7 +180,7 @@ export class CrmEnrichmentService {
   private static readonly DEFAULT_ENRICH_MODEL = 'gemini-3-flash-preview';
   private static readonly DEFAULT_SUGGEST_MODEL = 'gemini-3-flash-preview';
 
-  static async getEnrichmentConfig(): Promise<{ enrichmentModel: string; dataExtractionModel: string; context: string }> {
+  static async getEnrichmentConfig(): Promise<{ enrichmentModel: string; dataExtractionModel: string }> {
     try {
       const setting = await settingsService.getSetting('crm-enrichment-config');
       if (setting?.settingValue) {
@@ -188,7 +188,6 @@ export class CrmEnrichmentService {
         return {
           enrichmentModel: parsed.enrichmentModel || CrmEnrichmentService.DEFAULT_SUGGEST_MODEL,
           dataExtractionModel: parsed.dataExtractionModel || CrmEnrichmentService.DEFAULT_ENRICH_MODEL,
-          context: typeof parsed.context === 'string' ? parsed.context : '',
         };
       }
     } catch {
@@ -197,7 +196,6 @@ export class CrmEnrichmentService {
     return {
       enrichmentModel: CrmEnrichmentService.DEFAULT_SUGGEST_MODEL,
       dataExtractionModel: CrmEnrichmentService.DEFAULT_ENRICH_MODEL,
-      context: '',
     };
   }
 
@@ -351,7 +349,9 @@ export class CrmEnrichmentService {
       : CrmEnrichmentService.buildSearchQuery(lead, webSearchFields);
 
     if (query) {
+      console.log(`[CrmEnrichment][gatherWebContext] searchWeb query="${query}"`);
       let result = await agentModeService.searchWeb(query, 5);
+      console.log(`[CrmEnrichment][gatherWebContext] searchWeb done success=${result?.success} resultCount=${Array.isArray(result?.results) ? result.results.length : 0}`);
       const primarySucceededEmpty = result?.success && (!Array.isArray(result.results) || result.results.length === 0);
       if (primarySucceededEmpty) {
         const personName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
@@ -490,13 +490,12 @@ export class CrmEnrichmentService {
     linkedinContext: string,
     spec: EnrichmentJobSpec,
     lead: LeadRecord,
-    enrichConfig: { enrichmentModel: string; dataExtractionModel: string; context: string }
+    enrichConfig: { enrichmentModel: string; dataExtractionModel: string }
   ): Promise<Record<string, string | null>> {
     const resolvedInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
-    const { dataExtractionModel, context: globalContext } = enrichConfig;
+    const { dataExtractionModel } = enrichConfig;
 
     const systemPrompt = buildDataExtractionSystemPrompt({
-      globalContext,
       resolvedInstruction,
       outputFieldsJson: JSON.stringify(spec.outputFields),
       fieldGuidance: CrmEnrichmentService.buildFieldGuidance(spec.outputFields)
@@ -505,8 +504,10 @@ export class CrmEnrichmentService {
     const userPrompt = `Lead context:\n${JSON.stringify(leadContext, null, 2)}\n${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}\n\nExtract only what is explicitly present in the sources above. Do not infer or fabricate any value. Return null for any field not found in the data.`;
 
     const llmClient = await agentModeService.getClientForModel(dataExtractionModel);
+    console.log(`[CrmEnrichment][extractFieldsViaLLM] calling LLM model=${dataExtractionModel} outputFields=${JSON.stringify(spec.outputFields)}`);
+    const tLlm = Date.now();
     let response: Record<string, string> | null = null;
-    
+
     try {
       const completion = await llmClient.chat.completions.create({
         model: dataExtractionModel,
@@ -518,6 +519,7 @@ export class CrmEnrichmentService {
         response_format: { type: 'json_object' },
       });
       const raw = completion.choices?.[0]?.message?.content || '';
+      console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
     } catch {
       const strictRetryPrompt = buildDataExtractionRetryPrompt(userPrompt, spec.outputFields.map(f => `"${f}":"value"`).join(','));
@@ -588,8 +590,9 @@ export class CrmEnrichmentService {
     lead: LeadRecord,
     spec: EnrichmentJobSpec,
     linkedInAccountId?: string | null,
-    enrichConfig?: { enrichmentModel: string; dataExtractionModel: string; context: string }
+    enrichConfig?: { enrichmentModel: string; dataExtractionModel: string }
   ): Promise<{ fields: Record<string, string | null> }> {
+    const t0 = Date.now();
     if (!enrichConfig) {
       enrichConfig = await CrmEnrichmentService.getEnrichmentConfig();
     }
@@ -599,15 +602,20 @@ export class CrmEnrichmentService {
     const linkedinFields = spec.outputFields.filter(f => effectiveSources(f).includes('linkedin'));
     const isEnrichingLinkedin = linkedinFields.some(f => /linkedin/i.test(f));
     const webSearchFields = spec.outputFields.filter(f => effectiveSources(f).includes('web_search'));
+    console.log(`[CrmEnrichment][enrichLead] lead=${lead.leadId} webSearchFields=${webSearchFields.length} linkedinFields=${linkedinFields.length} isEnrichingLinkedin=${isEnrichingLinkedin}`);
 
     let webContext = '';
     if (webSearchFields.length > 0) {
+      console.log(`[CrmEnrichment][enrichLead] gatherWebContext START lead=${lead.leadId}`);
       webContext = await this.gatherWebContext(lead, spec, webSearchFields);
+      console.log(`[CrmEnrichment][enrichLead] gatherWebContext DONE lead=${lead.leadId} contextLen=${webContext.length} elapsed=${Date.now()-t0}ms`);
     }
 
     let linkedinContext = '';
     if (linkedinFields.length > 0 && linkedInAccountId) {
+      console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext START lead=${lead.leadId}`);
       linkedinContext = await this.gatherLinkedInContext(lead, spec, linkedInAccountId, isEnrichingLinkedin);
+      console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinContext.length} elapsed=${Date.now()-t0}ms`);
     }
 
     const leadContext = this.buildLeadContext(lead, isEnrichingLinkedin);
@@ -620,7 +628,9 @@ export class CrmEnrichmentService {
       }
     }
 
+    console.log(`[CrmEnrichment][enrichLead] extractFieldsViaLLM START lead=${lead.leadId} model=${enrichConfig!.dataExtractionModel}`);
     let fields = await this.extractFieldsViaLLM(leadContext, webContext, linkedinContext, spec, lead, enrichConfig!);
+    console.log(`[CrmEnrichment][enrichLead] extractFieldsViaLLM DONE lead=${lead.leadId} elapsed=${Date.now()-t0}ms fields=${JSON.stringify(fields)}`);
     fields = this.validateLinkedInUrls(fields, webContext, linkedinContext, spec.outputFields);
 
     return { fields };
@@ -683,32 +693,44 @@ export class CrmEnrichmentService {
   }
 
   async preview(spec: EnrichmentJobSpec): Promise<EnrichmentPreviewResult> {
+    console.log(`[CrmEnrichment][preview] START listId=${spec.listId} userId=${spec.userId} sources=${JSON.stringify(spec.sources)} outputFields=${JSON.stringify(spec.outputFields)}`);
+    const t0 = Date.now();
     const { allLeads, leadsToProcess, alreadyEnriched, filteredTotal, storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate } = await this.loadAndFilterLeads(spec);
+    console.log(`[CrmEnrichment][preview] loadAndFilterLeads done: allLeads=${allLeads.length} leadsToProcess=${leadsToProcess.length} alreadyEnriched=${alreadyEnriched} elapsed=${Date.now()-t0}ms`);
 
     spec = this.mergeStoredConfig(spec, { storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate });
 
     // Process up to 2 samples
     const samples: EnrichmentPreviewResult['samples'] = [];
     const sampleLeads = leadsToProcess.slice(0, 2);
+    console.log(`[CrmEnrichment][preview] sampleLeads count=${sampleLeads.length}`);
 
     if (sampleLeads.length > 0) {
       // Resolve LinkedIn account if needed
       let linkedInAccountId: string | null = null;
       if (spec.sources.includes('linkedin')) {
+        console.log(`[CrmEnrichment][preview] resolving LinkedIn account for userId=${spec.userId}`);
         linkedInAccountId = await this.resolveLinkedInAccountId(spec.userId);
+        console.log(`[CrmEnrichment][preview] linkedInAccountId=${linkedInAccountId}`);
       }
 
+      console.log(`[CrmEnrichment][preview] loading enrichment config`);
       const enrichConfig = await CrmEnrichmentService.getEnrichmentConfig();
+      console.log(`[CrmEnrichment][preview] enrichConfig model=${enrichConfig.dataExtractionModel}`);
 
       for (const lead of sampleLeads) {
+        console.log(`[CrmEnrichment][preview] enriching sample lead ${lead.leadId} (${lead.email || lead.company || ''})`);
         try {
           const { fields } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
+          console.log(`[CrmEnrichment][preview] lead ${lead.leadId} enriched OK fields=${JSON.stringify(Object.keys(fields))}`);
           samples.push({ leadId: lead.leadId, lead, enrichedFields: fields });
         } catch (err) {
+          console.error(`[CrmEnrichment][preview] lead ${lead.leadId} enrichment failed:`, err);
           samples.push({ leadId: lead.leadId, lead, enrichedFields: { _error: String(err) } });
         }
       }
     }
+    console.log(`[CrmEnrichment][preview] DONE totalElapsed=${Date.now()-t0}ms samples=${samples.length}`);
 
     return {
       totalLeads: spec.leadIds ? filteredTotal : allLeads.length,
@@ -946,7 +968,7 @@ export class CrmEnrichmentService {
     sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>;
     sources: ('web_search' | 'linkedin' | 'existing_data')[];
   }> {
-    const { enrichmentModel, context: globalContext } = await CrmEnrichmentService.getEnrichmentConfig();
+    const { enrichmentModel } = await CrmEnrichmentService.getEnrichmentConfig();
 
     const existingFieldsSection = (() => {
       const parts: string[] = [];
@@ -962,7 +984,7 @@ export class CrmEnrichmentService {
       return parts.length > 0 ? `\n${parts.join('\n')}\n` : '';
     })();
 
-    const systemPrompt = buildSuggestEnrichmentSystemPrompt(globalContext);
+    const systemPrompt = buildSuggestEnrichmentSystemPrompt();
 
     const userPrompt = `${existingFieldsSection}Enrichment goal or instruction:\n${goal}`;
 
