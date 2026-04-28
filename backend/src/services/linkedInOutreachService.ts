@@ -660,6 +660,38 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * Send a LinkedIn InMail to a profile (works for 2nd/3rd-degree connections).
+   * Requires a LinkedIn Premium account with InMail credits.
+   * @param accountId      - The Unipile account ID to send from.
+   * @param profileUrlOrId - A LinkedIn profile URL OR a raw provider_id.
+   * @param isUrl          - true if profileUrlOrId is a profile URL, false if it is already a provider_id.
+   * @param subject        - Subject line for the InMail (required by LinkedIn).
+   * @param messageText    - The InMail body.
+   */
+  async sendInMail(accountId: string, profileUrlOrId: string, isUrl: boolean, subject: string, messageText: string): Promise<any> {
+    try {
+      const providerId = await this.resolveProviderId(profileUrlOrId, isUrl, accountId);
+      this.log(`Sending InMail`, { accountId, providerId, subject, messageLength: messageText.length });
+      const client = await this.getClient();
+      const res = await client.messaging.startNewChat({
+        account_id: accountId,
+        attendees_ids: [providerId],
+        text: messageText,
+        subject,
+        options: {
+          linkedin: {
+            inmail: true,
+          },
+        },
+      });
+      this.log(`InMail sent successfully`, { accountId, providerId });
+      return res;
+    } catch (error: any) {
+      return this.handleError(error, 'sendInMail');
+    }
+  }
+
+  /**
    * Send a message to a LinkedIn profile.
    * Uses startNewChat to handle both new and existing conversations.
    * @param accountId      - The Unipile account ID to send from.

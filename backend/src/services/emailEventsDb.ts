@@ -336,7 +336,7 @@ class EmailEventsDb {
     eventId: string;
     emailDomain: string;
     leadEmail: string;
-    eventType: 'linkedin.message.sent' | 'linkedin.message.received';
+    eventType: 'linkedin.message.sent' | 'linkedin.message.received' | 'linkedin.inmail.sent';
     text: string | null;
     timestamp: string;
     senderId: string;

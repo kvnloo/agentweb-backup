@@ -184,7 +184,8 @@ Actions:
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
-- send-message: Send a direct message. Requires profile_url or provider_id. message required. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
+- send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
+- send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
@@ -198,7 +199,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -215,7 +216,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message; recommended for send-invite.'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite.'
+        },
+        subject: {
+          type: 'string',
+          description: 'Subject line for send-inmail. Required for InMail messages.'
         },
         list_id: {
           type: 'string',
@@ -265,7 +270,7 @@ For target person identification (send-invite, send-message, get-profile, update
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    const targetActions = ['send-invite', 'send-message', 'get-profile', 'update-conversation-history'];
+    const targetActions = ['send-invite', 'send-message', 'send-inmail', 'get-profile', 'update-conversation-history'];
     if (targetActions.includes(args.action)) {
       if (!args.profile_url && !args.provider_id) {
         return { success: false, message: 'Either profile_url or provider_id is required.' };
