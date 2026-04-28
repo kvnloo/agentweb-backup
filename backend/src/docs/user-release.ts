@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fixed: Emma No Longer Suggests Creating a Schedule Inside Scheduled Sessions',
+      '- When a scheduled chat runs automatically, Emma was incorrectly ending her response with "Want this to run automatically every day?" — even though the user already set up the schedule',
+      '- Emma now detects when she is running inside an automated scheduled session and delivers results directly, without any scheduling suggestions',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Improvement: Admin Chat History Filter by User',
       '- Admins can now filter the Chat History tab by user email or user ID to see all recent sessions for a specific user',
       '- Enter an email address or user ID in the new "Filter by User Email or ID" field and click Filter',
