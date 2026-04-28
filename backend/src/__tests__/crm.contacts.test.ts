@@ -152,6 +152,8 @@ describe('GET /api/crm/contacts', () => {
       listIds: undefined,
       limit: 500,
       sort: 'heat',
+      cursor: undefined,
+      rawFetchLimit: 5000,
     });
     expect(mockRes.json).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -174,7 +176,7 @@ describe('GET /api/crm/contacts', () => {
     mockReq.query = { listIds: 'L1, L2 , L3' };
     await handler!(mockReq, mockRes);
     expect(dedupContactsForUser).toHaveBeenCalledWith(
-      expect.objectContaining({ listIds: ['L1', 'L2', 'L3'] }),
+      expect.objectContaining({ listIds: ['L1', 'L2', 'L3'], rawFetchLimit: 5000 }),
     );
   });
 
@@ -182,5 +184,34 @@ describe('GET /api/crm/contacts', () => {
     asMock(dedupContactsForUser).mockRejectedValue(new Error('nope'));
     await handler!(mockReq, mockRes);
     expect(mockRes.status).toHaveBeenCalledWith(500);
+  });
+
+  it('returns 400 when cursor is malformed', async () => {
+    mockReq.query = { cursor: '!!!not-valid-base64' };
+    await handler!(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(400);
+  });
+
+  it('passes cursor to service and returns nextCursor + hasMore in response', async () => {
+    const validCursor = Buffer.from(
+      JSON.stringify({ L1: { listId: 'L1', leadId: 'x' } }),
+    ).toString('base64');
+    asMock(dedupContactsForUser).mockResolvedValue({
+      contacts: [],
+      total: 0,
+      rawCount: 0,
+      listsCount: 1,
+      nextCursor: 'next-cursor-value',
+      hasMore: true,
+    });
+    mockReq.query = { cursor: validCursor };
+    await handler!(mockReq, mockRes);
+
+    expect(dedupContactsForUser).toHaveBeenCalledWith(
+      expect.objectContaining({ cursor: validCursor }),
+    );
+    expect(mockRes.json).toHaveBeenCalledWith(
+      expect.objectContaining({ nextCursor: 'next-cursor-value', hasMore: true }),
+    );
   });
 });

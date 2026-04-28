@@ -2,13 +2,19 @@ import { useState, useEffect } from 'react';
 import {
   Box,
   Button,
+  Divider,
+  FormControl,
+  InputLabel,
+  MenuItem,
   Paper,
+  Select,
   Table,
   TableBody,
   TableCell,
   TableContainer,
   TableHead,
   TableRow,
+  TextField,
   Typography,
   Alert,
   CircularProgress,
@@ -48,6 +54,11 @@ interface SiteWideAccount {
   connected?: boolean;
 }
 
+interface EnrichmentConfig {
+  enrichmentModel: string;
+  dataExtractionModel: string;
+}
+
 export default function CrmTab() {
   const { token } = useAuth();
   const [siteWideAccounts, setSiteWideAccounts] = useState<SiteWideAccount[]>([]);
@@ -58,17 +69,30 @@ export default function CrmTab() {
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [addingAccountId, setAddingAccountId] = useState<string | null>(null);
 
+  // Enrichment config state
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [enrichmentConfig, setEnrichmentConfig] = useState<EnrichmentConfig>({
+    enrichmentModel: 'gemini-3-flash-preview',
+    dataExtractionModel: 'gemini-3-flash-preview',
+  });
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [configError, setConfigError] = useState('');
+  const [configSuccess, setConfigSuccess] = useState('');
+
   const headers = { Authorization: `Bearer ${token}` };
 
   const fetchData = async () => {
     try {
       setLoading(true);
-      const [siteWideRes, allAccountsRes] = await Promise.all([
+      const [siteWideRes, allAccountsRes, enrichmentConfigRes] = await Promise.all([
         axios.get(buildApiUrl('/api/settings/site-wide-unipile-accounts'), { headers }),
         axios.get(buildApiUrl('/api/admin/unipile-accounts'), { headers }),
+        axios.get(buildApiUrl('/api/settings/crm-enrichment-config'), { headers }),
       ]);
       setSiteWideAccounts(siteWideRes.data.accounts || []);
       setAllUnipileAccounts(allAccountsRes.data.accounts || []);
+      setEnrichmentConfig(enrichmentConfigRes.data.config);
+      setAvailableModels(enrichmentConfigRes.data.availableModels || []);
     } catch (err) {
       console.error('Error fetching data:', err);
       setError('Failed to load data');
@@ -80,6 +104,25 @@ export default function CrmTab() {
   useEffect(() => {
     if (token) fetchData();
   }, [token]);
+
+  const handleSaveEnrichmentConfig = async () => {
+    setSavingConfig(true);
+    setConfigError('');
+    setConfigSuccess('');
+    try {
+      await axios.put(
+        buildApiUrl('/api/settings/crm-enrichment-config'),
+        enrichmentConfig,
+        { headers },
+      );
+      setConfigSuccess('Enrichment configuration saved.');
+    } catch (err) {
+      console.error('Error saving enrichment config:', err);
+      setConfigError('Failed to save enrichment configuration.');
+    } finally {
+      setSavingConfig(false);
+    }
+  };
 
   const handleAddAccount = async (account: UnipileAccount) => {
     setAddingAccountId(account.account_id);
@@ -147,6 +190,73 @@ export default function CrmTab() {
 
   return (
     <Box>
+      {/* ---- Enrichment AI Configuration ---- */}
+      <Typography variant="h6" sx={{ mb: 1 }}>
+        Enrichment AI Configuration
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+        Configure the AI models used for CRM lead enrichment across all clients.
+      </Typography>
+
+      {configError && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setConfigError('')}>
+          {configError}
+        </Alert>
+      )}
+      {configSuccess && (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setConfigSuccess('')}>
+          {configSuccess}
+        </Alert>
+      )}
+
+      <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+        <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', mb: 2 }}>
+          <FormControl size="small" sx={{ minWidth: 260 }}>
+            <InputLabel>Enrichment Model</InputLabel>
+            <Select
+              value={enrichmentConfig.enrichmentModel}
+              label="Enrichment Model"
+              onChange={(e) =>
+                setEnrichmentConfig((prev) => ({ ...prev, enrichmentModel: e.target.value }))
+              }
+            >
+              {availableModels.map((m) => (
+                <MenuItem key={m} value={m}>{m}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <FormControl size="small" sx={{ minWidth: 260 }}>
+            <InputLabel>Data Extraction Model</InputLabel>
+            <Select
+              value={enrichmentConfig.dataExtractionModel}
+              label="Data Extraction Model"
+              onChange={(e) =>
+                setEnrichmentConfig((prev) => ({ ...prev, dataExtractionModel: e.target.value }))
+              }
+            >
+              {availableModels.map((m) => (
+                <MenuItem key={m} value={m}>{m}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        </Box>
+
+        <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <Button
+            variant="contained"
+            onClick={handleSaveEnrichmentConfig}
+            disabled={savingConfig}
+            startIcon={savingConfig ? <CircularProgress size={16} /> : undefined}
+          >
+            Save Configuration
+          </Button>
+        </Box>
+      </Paper>
+
+      <Divider sx={{ mb: 3 }} />
+
+      {/* ---- Site-Wide LinkedIn Enrichment Accounts ---- */}
       <Typography variant="h6" sx={{ mb: 1 }}>
         Site-Wide LinkedIn Enrichment Accounts
       </Typography>

@@ -802,6 +802,16 @@ export class AgentModeService {
     return this.gemini_client_promise;
   }
 
+  public async getClientForModel(model: string): Promise<any> {
+    if (model.startsWith('anthropic.')) {
+      return this.getBedrockClient(model);
+    }
+    if (model.startsWith('gpt-')) {
+      return this.getAzureOpenAIClient(model);
+    }
+    return this.getGeminiClient();
+  }
+
   public async getBedrockClient(modelId: string): Promise<any> {
     // Use the Bedrock Converse API directly (instead of LangChain) to support
     // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
@@ -6680,10 +6690,11 @@ export class AgentModeService {
     engagedOnly?: boolean;
     status?: string;
     limit?: number;
+    cursor?: string;
   } = {}): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const limit = Math.min(Math.max(options.limit || 20, 1), 50);
+      const limit = Math.min(Math.max(options.limit || 20, 1), 100);
 
       // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
@@ -6695,16 +6706,29 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
+      // Decode cursor from base64 JSON
+      let decodedCursor: any = undefined;
+      if (options.cursor) {
+        try {
+          decodedCursor = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf8'));
+        } catch {
+          // Invalid cursor — start from beginning
+        }
+      }
+
       const searchQuery = (options.search || '').trim().toLowerCase();
       const matchingLeads: any[] = [];
-      let cursor: any = undefined;
+      let cursor: any = decodedCursor;
 
       // Use flag indexes for efficiency when filtering by ICP or engaged
       const useIcpIndex = options.icpOnly && !options.engagedOnly;
       const useEngagedIndex = options.engagedOnly && !options.icpOnly;
 
+      // For unfiltered queries, fetch exactly `limit` items so cursor is exact
+      const isFiltered = !!(searchQuery || options.status || options.icpOnly || options.engagedOnly);
+      const pageSize = isFiltered ? 200 : limit;
+
       while (matchingLeads.length < limit) {
-        const pageSize = 200;
         let pageResult: any;
 
         if (useIcpIndex) {
@@ -6751,7 +6775,10 @@ export class AgentModeService {
 
         cursor = pageResult.lastEvaluatedKey;
         if (!cursor) break;
+        if (!isFiltered) break; // exact fetch: one page is enough
       }
+
+      const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
 
       return {
         success: true,
@@ -6772,7 +6799,9 @@ export class AgentModeService {
           isEngaged: lead.isEngaged || false
         })),
         matchCount: matchingLeads.length,
-        listName: list.name
+        listName: list.name,
+        has_more: !!cursor,
+        ...(nextCursor && { next_cursor: nextCursor }),
       };
     } catch (error) {
       console.error('AgentMode: Error getting leads:', error);
@@ -6780,10 +6809,10 @@ export class AgentModeService {
     }
   }
 
-  public async searchLeads(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, limit?: number): Promise<any> {
+  public async searchLeads(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, limit?: number, options?: { search?: string; cursor?: string }): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const effectiveLimit = Math.min(Math.max(limit || 20, 1), 50);
+      const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
@@ -6799,9 +6828,20 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
+      // Decode cursor from base64 JSON
+      let decodedCursor: any = undefined;
+      if (options?.cursor) {
+        try {
+          decodedCursor = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf8'));
+        } catch {
+          // Invalid cursor — start from beginning
+        }
+      }
+
+      const searchQuery = (options?.search || '').trim().toLowerCase();
       const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
       const matchingLeads: any[] = [];
-      let cursor: any = undefined;
+      let cursor: any = decodedCursor;
 
       while (matchingLeads.length < effectiveLimit) {
         const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
@@ -6809,6 +6849,22 @@ export class AgentModeService {
 
         for (const lead of leads) {
           if (matchingLeads.length >= effectiveLimit) break;
+
+          // Apply cross-field keyword search
+          if (searchQuery) {
+            const fields = [
+              lead.email, lead.firstName, lead.lastName,
+              `${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+              lead.company, lead.phone, lead.title, lead.notes, lead.linkedin
+            ];
+            const standardMatch = fields.some((v: any) => String(v || '').toLowerCase().includes(searchQuery));
+            if (!standardMatch) {
+              const customFields = lead.customFields && typeof lead.customFields === 'object' ? lead.customFields : {};
+              const customMatch = Object.values(customFields).some((v: any) => String(v || '').toLowerCase().includes(searchQuery))
+                || Object.keys(customFields).some((k: string) => k.toLowerCase().includes(searchQuery));
+              if (!customMatch) continue;
+            }
+          }
 
           const allMatch = filters.every((filter: any) => {
             const { field, operator, value } = filter;
@@ -6847,6 +6903,16 @@ export class AgentModeService {
                 return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
               case 'starts_with':
                 return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
+              case 'ilike': {
+                // SQL LIKE pattern: % = any sequence, _ = any single char (case-insensitive)
+                const pattern = String(value ?? '');
+                const regexStr = pattern.split('').map((c: string) => {
+                  if (c === '%') return '.*';
+                  if (c === '_') return '.';
+                  return c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                }).join('');
+                return new RegExp(`^${regexStr}$`, 'i').test(String(fieldValue ?? ''));
+              }
               case 'greater_than': {
                 const numFv = Number(fieldValue);
                 const numV = Number(value);
@@ -6873,6 +6939,8 @@ export class AgentModeService {
         if (!cursor) break;
       }
 
+      const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
+
       return {
         success: true,
         message: `Found ${matchingLeads.length} matching lead(s)`,
@@ -6890,7 +6958,9 @@ export class AgentModeService {
           customFields: lead.customFields || {}
         })),
         matchCount: matchingLeads.length,
-        listName: list.name
+        listName: list.name,
+        has_more: !!cursor,
+        ...(nextCursor && { next_cursor: nextCursor }),
       };
     } catch (error) {
       console.error('AgentMode: Error searching leads:', error);

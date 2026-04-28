@@ -783,7 +783,7 @@ router.get('/contacts', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { listType, listIds, limit, sort } = req.query as Record<string, string | undefined>;
+    const { listType, listIds, limit, sort, cursor } = req.query as Record<string, string | undefined>;
 
     if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
       return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
@@ -800,6 +800,15 @@ router.get('/contacts', async (req: Request, res: Response) => {
         return res.status(400).json({ message: 'limit must be a number between 1 and 10000' });
       }
       parsedLimit = Math.floor(n);
+    }
+
+    if (cursor !== undefined) {
+      try {
+        const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error();
+      } catch {
+        return res.status(400).json({ message: 'Invalid cursor' });
+      }
     }
 
     const parsedListIds = listIds
@@ -825,6 +834,8 @@ router.get('/contacts', async (req: Request, res: Response) => {
           listIds: uid === userId ? parsedListIds : undefined,
           limit: parsedLimit,
           sort: sort as 'heat' | 'recent' | undefined,
+          cursor: uid === userId ? cursor : undefined,
+          rawFetchLimit: 5000,
         })
       )
     );
@@ -854,6 +865,7 @@ router.get('/contacts', async (req: Request, res: Response) => {
 
     const result = { contacts, total, rawCount, listsCount };
     const durationMs = Date.now() - started;
+    const primaryResult = perUserResults[0];
 
     return res.json({
       contacts: result.contacts,
@@ -861,6 +873,8 @@ router.get('/contacts', async (req: Request, res: Response) => {
       rawCount: result.rawCount,
       listsCount: result.listsCount,
       durationMs,
+      ...(primaryResult?.nextCursor !== undefined && { nextCursor: primaryResult.nextCursor }),
+      ...(primaryResult?.hasMore !== undefined && { hasMore: primaryResult.hasMore }),
     });
   } catch (error: any) {
     console.error('Error in /api/crm/contacts:', error?.message || error);
@@ -2905,6 +2919,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
             : `Successfully enriched ${result.processedCount} leads`,
         processedCount: result.processedCount,
         failedCount: result.failedCount,
+        skippedCount: result.skippedCount,
         totalLeadsProcessed: result.totalToProcess,
         failureBreakdown: result.failureBreakdown,
       };
@@ -4614,6 +4629,58 @@ router.post('/deals/:dealId/rotate-primary', async (req: Request, res: Response)
     return res.json({ deal });
   } catch (err) {
     return handleDealError(res, err);
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/enrichment-history
+ * @desc List enrichment jobs for a list (newest first, up to 10)
+ */
+router.get('/lists/:listId/enrichment-history', async (req: Request, res: Response) => {
+  const { listId } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const jobs = await crmDb.getEnrichmentJobsByListId(listId, 10);
+    return res.json({ jobs });
+  } catch (error: any) {
+    console.error('[CRM] enrichment-history error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to fetch enrichment history' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/enrichment-jobs/:jobId/revert
+ * @desc Revert an enrichment job, restoring pre-enrichment field values while preserving newer columns
+ */
+router.post('/lists/:listId/enrichment-jobs/:jobId/revert', async (req: Request, res: Response) => {
+  const { listId, jobId } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    const result = await service.revertJob(jobId, listId);
+
+    return res.json({ success: true, ...result });
+  } catch (error: any) {
+    console.error('[CRM] enrichment revert error:', error);
+    const status = error.message?.includes('No snapshot data') ? 400 : 500;
+    return res.status(status).json({ message: error.message || 'Failed to revert enrichment job' });
   }
 });
 

@@ -49,6 +49,10 @@ export interface DedupQuery {
   /** Optional: max raw lead rows to load across all lists before stopping.
    *  Defaults to DEFAULT_MAX_RAW_LEADS. Prevents OOM on very large accounts. */
   maxRawLeads?: number;
+  /** Alias for maxRawLeads — used by the /contacts route. */
+  rawFetchLimit?: number;
+  /** Opaque base64 pagination cursor returned by a previous call. */
+  cursor?: string;
 }
 
 export interface DedupResult {
@@ -59,6 +63,10 @@ export interface DedupResult {
   rawCount: number;
   /** Lists consulted. */
   listsCount: number;
+  /** Opaque cursor for fetching the next page (if pagination is active). */
+  nextCursor?: string;
+  /** Whether more pages are available. */
+  hasMore?: boolean;
 }
 
 /** Coarse heat score — mirrors the frontend computeHeatScore utility. */
@@ -116,7 +124,7 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
     filteredLists = filteredLists.filter((l: any) => allowed.has(l.listId));
   }
 
-  const maxRawLeads = query.maxRawLeads ?? DEFAULT_MAX_RAW_LEADS;
+  const maxRawLeads = query.rawFetchLimit ?? query.maxRawLeads ?? DEFAULT_MAX_RAW_LEADS;
 
   // Sort lists by updatedAt desc so recently-active lists get their leads
   // fetched first when the cap would otherwise leave some lists unread.

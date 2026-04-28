@@ -437,7 +437,7 @@ export class LinkedInOutreachService {
         headers: { 'Content-Type': 'application/json' },
         body
       });
-      this.log(`Search returned results`);
+      this.log(`Search returned results`, { result });
       return result;
     } catch (error: any) {
       return this.handleError(error, 'searchPeople');

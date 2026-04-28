@@ -2670,7 +2670,11 @@ emmaToolRegistry.register({
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of leads to return (default 20, max 50)'
+          description: 'Maximum number of leads to return (default 20, max 100)'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
         }
       },
       required: ['list_id']
@@ -2682,7 +2686,8 @@ emmaToolRegistry.register({
       status: args.status,
       icpOnly: args.icp_only,
       engagedOnly: args.engaged_only,
-      limit: args.limit
+      limit: args.limit,
+      cursor: args.cursor
     });
   }
 });
@@ -2691,7 +2696,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic.',
+    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2710,8 +2715,8 @@ emmaToolRegistry.register({
               },
               operator: {
                 type: 'string',
-                enum: ['equals', 'contains', 'starts_with', 'greater_than', 'less_than', 'not_equals', 'is_empty', 'is_not_empty'],
-                description: 'Comparison operator'
+                enum: ['equals', 'contains', 'starts_with', 'greater_than', 'less_than', 'not_equals', 'is_empty', 'is_not_empty', 'ilike'],
+                description: 'Comparison operator. ilike supports SQL-style wildcards: % matches any sequence of characters, _ matches any single character (case-insensitive). Example: "%@gmail.com" matches any Gmail address.'
               },
               value: {
                 description: 'The value to compare against (not required for is_empty/is_not_empty)'
@@ -2721,16 +2726,27 @@ emmaToolRegistry.register({
           },
           description: 'Array of filter criteria (AND logic — all must match)'
         },
+        search: {
+          type: 'string',
+          description: 'Optional keyword search across all fields (name, email, company, title, notes, custom fields, etc.). Applied in addition to filters (AND logic).'
+        },
         limit: {
           type: 'number',
-          description: 'Maximum number of matching leads to return (default 20, max 50)'
+          description: 'Maximum number of matching leads to return (default 20, max 100)'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
         }
       },
       required: ['list_id', 'filters']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit);
+    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
+      search: args.search,
+      cursor: args.cursor
+    });
   }
 });
 
@@ -5151,7 +5167,7 @@ emmaToolRegistry.register({
     name: 'enrich_leads_preview',
     description: `Preview a CRM lead enrichment job. Processes 2 sample leads to show what the enrichment will produce before committing to the full batch.
 
-Returns total lead count, how many would be processed, how many are already enriched, and 2 sample enrichment results so the user can verify quality before proceeding.
+Returns: totalLeads (total in list), leadsToProcess (would be enriched), alreadyEnriched (already have all fields), and samples (up to 2 leads with their enrichedFields). In enrichedFields, a null value means nothing was found for that field — tell the user "not found" rather than showing null. Show the sample results to the user and ask them to confirm quality before proceeding.
 
 After showing the preview, ask the user to confirm before calling enrich_leads_execute.
 
@@ -5245,7 +5261,7 @@ emmaToolRegistry.register({
     name: 'enrich_leads_execute',
     description: `Execute a CRM lead enrichment job. Processes all matching leads in parallel, enriching custom fields using AI and the specified data sources.
 
-Progress updates are sent via Socket.IO in real-time. Returns immediately with a job ID and the count of leads to be processed.
+Progress updates are sent via Socket.IO in real-time. This call blocks until the full job completes, then returns final counts: processedCount, failedCount, skippedCount, and failureBreakdown. A lead is skipped when it has only a personal email (gmail, etc.) and no company name — check warnings for details.
 
 Call enrich_leads_preview first to show the user what will happen before executing.
 
@@ -5337,7 +5353,7 @@ emmaToolRegistry.register({
 
 Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
 
-Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The tool returns the enriched values directly and also persists them to the lead's customFields in DynamoDB.`,
+Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The response includes enrichedValues — a map of field name to the found value (or null if nothing was found). Values are also persisted to the lead's customFields in DynamoDB. Always show enrichedValues to the user; if a value is null, tell them nothing was found for that field. Check warnings for skip reasons (e.g. personal email with no company).`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5397,6 +5413,7 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
       : ['web_search', 'linkedin'];
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const { crmDb } = await import('../services/db');
     const service = new CrmEnrichmentService();
     const result = await service.execute({
       listId: args.list_id,
@@ -5408,12 +5425,29 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
       forceOverwrite: args.force_overwrite !== false,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
 
+    // Fetch the lead after enrichment so we can return the actual enriched values
+    let enrichedValues: Record<string, string | null> = {};
+    if (result.processedCount > 0) {
+      try {
+        const lead = await crmDb.getLeadById(args.list_id, args.lead_id);
+        if (lead?.customFields) {
+          for (const field of outputFields) {
+            enrichedValues[field] = lead.customFields[field] ?? null;
+          }
+        }
+      } catch {
+        // Non-fatal — enrichment succeeded, values are in DB
+      }
+    }
+
     return {
       leadId: args.lead_id,
       listId: args.list_id,
       outputFields,
+      enrichedValues,
       processedCount: result.processedCount,
       failedCount: result.failedCount,
+      skippedCount: result.skippedCount,
       failureBreakdown: result.failureBreakdown,
       warnings: result.warnings,
       jobId: result.jobId,
