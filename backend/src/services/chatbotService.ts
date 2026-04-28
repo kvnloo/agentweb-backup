@@ -3312,7 +3312,7 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
 // To update: edit that file and open a PR.
 export function getEmmaSystemContext(sessionType?: string): string {
   const scheduledAddendum = sessionType === "scheduled"
-    ? "\nSession type: scheduled (this is an automated run — do NOT suggest creating a schedule, the user has already set one up)."
+    ? "\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying \"want this to run automatically\" — doing so would be incorrect and confusing. Just deliver the results."
     : "";
   return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${scheduledAddendum}`;
 }

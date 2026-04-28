@@ -1534,7 +1534,9 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
-      const sessionTypeLabel = currentSession?.sessionType === 'scheduled' ? '\nSession type: scheduled (this is an automated run — do NOT suggest creating a schedule)' : '';
+      const sessionTypeLabel = currentSession?.sessionType === 'scheduled'
+        ? '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.'
+        : '';
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];

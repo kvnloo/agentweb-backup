@@ -194,8 +194,9 @@ describe('getEmmaSystemContext', () => {
 
   it('includes schedule addendum for scheduled sessions', () => {
     const result = getEmmaSystemContext('scheduled');
-    expect(result).toContain('do NOT suggest creating a schedule');
-    expect(result).toContain('automated run');
+    expect(result).toContain('CRITICAL OVERRIDE');
+    expect(result).toContain('NEVER suggest creating a schedule');
+    expect(result).toContain('automated session');
   });
 
 });

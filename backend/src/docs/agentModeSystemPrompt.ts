@@ -105,7 +105,7 @@ After completing any repeatable workflow (social posts, articles, newsletters, l
 - The workflow is clearly something the user would benefit from running on a regular cadence
 
 **When NOT to suggest:**
-- This session is itself a scheduled run (check session context — if sessionType is "scheduled", never suggest scheduling)
+- ⚠️ This session is itself a scheduled automated run — the system prompt will contain "CRITICAL OVERRIDE" if so. In that case, NEVER mention scheduling, automated runs, or "want this to run automatically". The user already set it up.
 - One-off research questions or troubleshooting
 - Onboarding steps
 - The user already has a schedule for this type of task
