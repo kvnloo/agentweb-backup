@@ -9,8 +9,37 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-28',
+    changes: [
+      'Improvement: Chat History Now Shows Admin Delegation Info',
+      '- The get_chat_history admin tool now includes delegateInfo on each session, showing whether the session was started by an admin acting on behalf of a user',
+      '- delegateInfo contains adminUserId, adminEmail, and isDelegated — null for sessions started directly by the user',
+    ],
+  },
+  {
     date: '2026-04-27',
     changes: [
+      'Fix: Org Members Can Now Find and Update Leads Owned by the Org Owner',
+      '- Org members can now see and interact with lead lists that belong to other members of their org in Emma agent mode',
+      '- Previously, asking Emma to "find Alice Smith" or update a lead would return Access Denied if the list was owned by the org owner',
+      '- Fixed a DynamoDB pagination bug where org members with >218 users in the database were silently dropped, causing the org owner to not appear in the Users admin tab',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: Batch Review Page Now Scrollable',
+      '- The batch review page (shared externally for content approval) can now be scrolled when there are many assets to review',
+      '- Previously the page was locked in place due to a global CSS setting intended for the main app, making it impossible to see assets below the fold',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fix: Chat History Now Returns Dimensional Scores When Using sync=true',
+      '- The get_chat_history tool now re-scores sessions that have an overall satisfaction score but are missing the dimensional breakdown (goalCompletion, dataAccuracy, outputQuality)',
+      '- Previously, sessions scored before dimensional scoring was introduced would never get backfilled with dimension scores even when sync=true was used',
+      '- Call get_chat_history with sync=true to backfill dimensional scores on existing sessions',
       'New: Google Calendar Skill — Emma Can Now Read Your Calendar',
       '- A new "Google Calendar" skill is available in Skills settings that lets Emma read your Google Calendar events',
       '- Emma can list upcoming events, look up event details (attendees, location, meeting link), and browse all your calendars',
@@ -5194,6 +5223,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail When Taking Screenshots with Gemini',
+      '- Scheduled chats using Gemini models no longer crash with a 400 error after the browser takes a screenshot',
+      '- The screenshot S3 URL is now included in the tool result so Gemini can analyze it using the describe_image tool if needed',
+      '- Errors in scheduled chats now automatically file a Notion oncall ticket in addition to the existing email alert',
+      '- Fixed a bug where a single scheduled chat error would save the user message 20 times in the database due to over-aggressive retries',
+    ],
+  },
+  {
     date: '2026-04-26',
     changes: [
       'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
@@ -5202,6 +5241,42 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Data Accuracy flags potential hallucinations — penalizing made-up numbers, inconsistent facts, or self-contradictions in the output',
       '- Output Quality assesses whether responses were well-structured, specific, and actionable',
       '- All three sub-scores are visible in the Admin Dashboard Chat History tab and accessible via the get_chat_history admin tool',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Lead List Now Stays in Sync with User Records',
+      '- When a user\'s subscription type, subscription status, roles, or active status changes in the admin panel, the matching CRM lead record is automatically updated',
+      '- Covers admin actions: changing subscription type, deactivating/reactivating users, and promoting waitlist users',
+      '- Also covers Stripe webhook events: subscription upgrades/downgrades, cancellations, payment failures, and payment recovery',
+      '- Use "Sync Now" (Force Full Sync) on the Admin → Users tab to backfill all existing CRM leads with current user data',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'New: Emma Suggests Scheduling After Successful Workflows',
+      '- After Emma completes a repeatable task (LinkedIn posts, articles, newsletters, research reports, etc.), she now proactively suggests setting up a scheduled chat so it runs automatically',
+      '- The suggestion appears in Emma\'s "Next Step" closing and offers to configure the schedule immediately if you say "schedule this"',
+      '- Emma skips the suggestion for one-off tasks, onboarding, and when you\'re already in a scheduled run',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Sequences Load-from-URL Now Preserves Email Formatting',
+      '- Loading a URL into a Sequence step email body now preserves the full HTML email document including all CSS styles',
+      '- Previously, the import stripped <style> tags and collapsed whitespace, destroying the layout of purpose-built HTML email templates',
+      '- The fix also applies to the CRM group-email and admin announcement load-from-URL features',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Lead Engagements Now Load Correctly',
+      '- Clicking on a lead in the CRM page no longer shows "Failed to load engagements" every time',
+      '- The error was caused by a missing AWS region configuration in the email events service',
     ],
   },
 ];

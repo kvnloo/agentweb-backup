@@ -101,6 +101,15 @@ describe('POST /api/errors/report', () => {
     expect(res.status).toBe(200);
   });
 
+  it('silently drops "Failed to fetch" without calling reportUIError', async () => {
+    const res = await request(app)
+      .post('/api/errors/report')
+      .send({ operation: 'unhandled-rejection', errorMessage: 'Failed to fetch' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(mockReportUIError).not.toHaveBeenCalled();
+  });
+
   it('ignores non-object context values', async () => {
     const res = await request(app)
       .post('/api/errors/report')

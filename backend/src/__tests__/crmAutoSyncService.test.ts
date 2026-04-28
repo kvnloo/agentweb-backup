@@ -1,4 +1,4 @@
-import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
+import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
 import { settingsService } from "../services/settingsService";
 import { crmDb } from "../services/db";
 
@@ -13,6 +13,8 @@ jest.mock("../services/db", () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     batchCreateLeads: jest.fn(),
+    getLeadByEmail: jest.fn(),
+    updateLead: jest.fn(),
   },
 }));
 
@@ -143,5 +145,122 @@ describe("crmAutoSyncService", () => {
 
     // Should not throw
     await expect(syncNewUserToLeadList(testUser)).resolves.toBeUndefined();
+  });
+});
+
+describe("syncUserUpdateToLeadList", () => {
+  const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
+  const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+
+  const enabledSetting = {
+    settingName: "admin_crm_sync_users",
+    settingValue: JSON.stringify({ listId: "list-99", autoSync: true }),
+  };
+  const enabledList = { listId: "list-99", publicAccessEnabled: true };
+  const existingLead = {
+    leadId: "lead-abc",
+    email: "user@example.com",
+    customFields: { subscriptionType: "Free", source: "admin_users" },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("updates subscriptionType in the CRM lead when it changes", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(existingLead as any);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+    await syncUserUpdateToLeadList("user@example.com", { subscriptionType: "Super Premium" });
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledWith("list-99", "lead-abc", {
+      customFields: expect.objectContaining({
+        subscriptionType: "Super Premium",
+        source: "admin_users",
+      }),
+    });
+  });
+
+  it("updates subscription_status in the CRM lead", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(existingLead as any);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+    await syncUserUpdateToLeadList("user@example.com", { subscription_status: "canceled" });
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledWith("list-99", "lead-abc", {
+      customFields: expect.objectContaining({ subscription_status: "canceled" }),
+    });
+  });
+
+  it("converts isActive=false to 'no' in customFields", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(existingLead as any);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+    await syncUserUpdateToLeadList("user@example.com", { isActive: false });
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledWith("list-99", "lead-abc", {
+      customFields: expect.objectContaining({ isActive: "no" }),
+    });
+  });
+
+  it("converts roles array to comma-separated string", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(existingLead as any);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+    await syncUserUpdateToLeadList("user@example.com", { roles: ["free", "customer"] });
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledWith("list-99", "lead-abc", {
+      customFields: expect.objectContaining({ roles: "free,customer" }),
+    });
+  });
+
+  it("does nothing when autoSync is disabled", async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: "admin_crm_sync_users",
+      settingValue: JSON.stringify({ listId: "list-99", autoSync: false }),
+    } as any);
+
+    await syncUserUpdateToLeadList("user@example.com", { subscriptionType: "Pro" });
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when lead does not exist in the list", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(null as any);
+
+    await syncUserUpdateToLeadList("unknown@example.com", { subscriptionType: "Pro" });
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when no fields are supplied", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(existingLead as any);
+
+    await syncUserUpdateToLeadList("user@example.com", {});
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it("does not throw when updateLead fails", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(enabledSetting as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(enabledList as any);
+    mockCrmDb.getLeadByEmail.mockResolvedValue(existingLead as any);
+    mockCrmDb.updateLead.mockRejectedValue(new Error("DynamoDB error"));
+
+    await expect(
+      syncUserUpdateToLeadList("user@example.com", { subscriptionType: "Pro" })
+    ).resolves.toBeUndefined();
   });
 });

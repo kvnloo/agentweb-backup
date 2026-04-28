@@ -21,7 +21,7 @@ import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../se
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts } from "../services/stripeService";
-import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
+import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
@@ -484,6 +484,7 @@ router.post("/users/:userId/deactivate", async (req, res) => {
     }
 
     const updatedUser = await userDb.deactivateUser(userId);
+    syncUserUpdateToLeadList(user.email, { isActive: false });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error deactivating user:", error);
@@ -506,6 +507,7 @@ router.post("/users/:userId/reactivate", async (req, res) => {
     }
 
     const updatedUser = await userDb.reactivateUser(userId);
+    syncUserUpdateToLeadList(user.email, { isActive: true });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error reactivating user:", error);
@@ -1493,6 +1495,7 @@ router.put("/waitlist/:email/status", async (req, res) => {
           if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
             const updatedRoles = [...existingUser.roles, 'customer'];
             await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+            syncUserUpdateToLeadList(existingUser.email, { roles: updatedRoles });
           }
           await emailService.sendWelcomeEmail(email); // No password = upgrade email
         } else {
@@ -1740,6 +1743,7 @@ router.post("/waitlist/invite", async (req, res) => {
           if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
             const updatedRoles = [...existingUser.roles, 'customer'];
             await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+            syncUserUpdateToLeadList(existingUser.email, { roles: updatedRoles });
           }
           await emailService.sendWelcomeEmail(email); // No password = upgrade email
         } else {
@@ -2548,65 +2552,48 @@ router.post("/announcements/load-from-url", async (req, res) => {
       .replace(/&#39;/g, "'")
       .replace(/&apos;/g, "'");
 
-    // Extract body content
     let bodyContent = "";
 
-    // Try to extract from <body> tag first
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-    if (bodyMatch) {
-      bodyContent = bodyMatch[1];
+    // If this is a complete HTML email document, preserve it as-is (only strip scripts).
+    // Stripping <style> or collapsing whitespace destroys email formatting.
+    const isFullHtmlDocument = /<html[\s>]/i.test(html);
+    if (isFullHtmlDocument) {
+      bodyContent = html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
     } else {
-      // If no body tag, use the entire HTML
-      bodyContent = html;
-    }
-
-    // Remove script and style tags
-    bodyContent = bodyContent
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-      .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
-
-    // Try to extract main content from common semantic tags
-    const mainContentSelectors = [
-      /<main[^>]*>([\s\S]*?)<\/main>/i,
-      /<article[^>]*>([\s\S]*?)<\/article>/i,
-      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-      /<div[^>]*id="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-    ];
-
-    for (const selector of mainContentSelectors) {
-      const match = bodyContent.match(selector);
-      if (match && match[1].trim().length > 50) {
-        bodyContent = match[1];
-        break;
-      }
-    }
-
-    // Clean up the HTML content
-    // Remove comments
-    bodyContent = bodyContent.replace(/<!--[\s\S]*?-->/g, "");
-
-    // Remove excessive whitespace but preserve structure
-    bodyContent = bodyContent
-      .replace(/\s+/g, " ")
-      .replace(/>\s+</g, "><")
-      .trim();
-
-    // If content is too short, use the original body content
-    if (bodyContent.length < 50) {
+      // For plain HTML fragments, extract body content and clean up
       const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-      if (bodyMatch) {
-        bodyContent = bodyMatch[1]
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-          .replace(/<!--[\s\S]*?-->/g, "")
-          .trim();
+      bodyContent = bodyMatch ? bodyMatch[1] : html;
+
+      bodyContent = bodyContent
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
+
+      const mainContentSelectors = [
+        /<main[^>]*>([\s\S]*?)<\/main>/i,
+        /<article[^>]*>([\s\S]*?)<\/article>/i,
+        /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+        /<div[^>]*id="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+      ];
+      for (const selector of mainContentSelectors) {
+        const match = bodyContent.match(selector);
+        if (match && match[1].trim().length > 50) {
+          bodyContent = match[1];
+          break;
+        }
       }
+
+      bodyContent = bodyContent
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/\s+/g, " ")
+        .replace(/>\s+</g, "><")
+        .trim();
     }
 
-    // Limit content length to prevent issues
-    if (bodyContent.length > 50000) {
-      bodyContent = bodyContent.substring(0, 50000) + "...";
+    if (bodyContent.length > 200000) {
+      bodyContent = bodyContent.substring(0, 200000);
     }
 
     return res.json({
@@ -4485,6 +4472,7 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
 
     // Update the user's subscription type
     const updatedUser = await userDb.updateUser(userId, { subscriptionType });
+    syncUserUpdateToLeadList(user.email, { subscriptionType });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error updating user subscription type:", error);

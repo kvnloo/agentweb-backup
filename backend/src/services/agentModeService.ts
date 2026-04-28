@@ -7,7 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
@@ -1544,8 +1544,9 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
+      const sessionTypeLabel = currentSession?.sessionType === 'scheduled' ? '\nSession type: scheduled (this is an automated run — do NOT suggest creating a schedule)' : '';
       const messages: any[] = [
-        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
+        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
@@ -2083,11 +2084,16 @@ export class AgentModeService {
             // The screenshot is also displayed to the user via the tool call card in the frontend.
             // We use a text prefix to discourage embedding the raw URL in markdown responses.
             let toolContent: any;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl) {
+            // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
+            // For Gemini, pass the S3 URL as text so the model can use describe_image on it if needed.
+            const isGeminiModel = llmModel.startsWith('gemini-');
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
               toolContent = [
                 { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
                 { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
               ];
+            } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
+              toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${extractToolContent(result)}`;
             } else {
               toolContent = extractToolContent(result);
             }
@@ -6526,7 +6532,7 @@ export class AgentModeService {
       const { listLandingPages } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
-        crmDb.getLeadListsByUserId(userId),
+        crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
@@ -6690,12 +6696,13 @@ export class AgentModeService {
       const { crmDb } = await import('./db');
       const limit = Math.min(Math.max(options.limit || 20, 1), 100);
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessGetLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessGetLeads) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -6807,12 +6814,13 @@ export class AgentModeService {
       const { crmDb } = await import('./db');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessSearchLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessSearchLeads) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -6999,12 +7007,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessGetLeadDetails = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessGetLeadDetails) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -7019,6 +7028,7 @@ export class AgentModeService {
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagements = engagementsResult.engagements || [];
+      const customFields = lead.customFields || {};
 
       // Truncate HTML email drafts to text preview
       let emailDraftPreview = null;
@@ -7080,12 +7090,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list access (org-aware: org members can update leads in their org's lists)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -7528,12 +7539,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessUpdateStatus) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -13282,6 +13294,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing ClickUp docs:', clickUpError);
       }
 
+      // Include ClickUp folders (spaces → folders hierarchy, for use as doc write targets)
+      try {
+        const clickUpToken = await getClickUpAccessToken(userId);
+        if (clickUpToken) {
+          const workspaces = await getClickUpWorkspaces(clickUpToken);
+          for (const workspace of workspaces) {
+            try {
+              const spaces = await listClickUpSpaces(clickUpToken, workspace.id);
+              for (const space of spaces) {
+                try {
+                  const folders = await listClickUpFolders(clickUpToken, space.id);
+                  for (const folder of folders) {
+                    knowledgeBases.push({
+                      identifier: `clickup-folder:${folder.id}`,
+                      name: `ClickUp Folder - ${workspace.name} / ${space.name} / ${folder.name}`,
+                      type: 'clickup-folder',
+                      updatedAt: undefined,
+                      files: [],
+                    });
+                  }
+                } catch (spaceErr) {
+                  console.log(`AgentMode: Error listing ClickUp folders in space ${space.name}:`, spaceErr);
+                }
+              }
+            } catch (wsErr) {
+              console.log(`AgentMode: Error listing ClickUp spaces in workspace ${workspace.name}:`, wsErr);
+            }
+          }
+        }
+      } catch (clickUpError) {
+        console.error('AgentMode: Error listing ClickUp folders:', clickUpError);
+      }
+
       // Include ClickUp tasks
       if (!options?.kb_type || options.kb_type === 'clickup-tasks') try {
         const clickUpToken = await getClickUpAccessToken(userId);
@@ -13414,7 +13459,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
@@ -13823,7 +13868,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     workspaceId: string,
     name: string,
     content: string,
-    userId: string
+    userId: string,
+    parentDocId?: string
   ): Promise<{ success: boolean; message: string; docId?: string }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
@@ -13838,8 +13884,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { success: false, message: 'Not authorized to access this ClickUp workspace' };
       }
 
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      if (parentDocId) {
+        // Create as a page inside the specified parent doc
+        const page = await createClickUpPageInDoc(clickUpToken, workspaceId, parentDocId, name, content);
+        return {
+          success: true,
+          message: `Successfully created page "${name}" inside ClickUp doc (id: ${parentDocId}) in workspace "${workspace.name}"`,
+          docId: page.id,
+        };
+      }
 
+      // Create as a standalone doc at workspace root
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
       return {
         success: true,
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
