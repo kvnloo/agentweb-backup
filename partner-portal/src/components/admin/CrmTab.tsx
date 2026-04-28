@@ -57,7 +57,6 @@ interface SiteWideAccount {
 interface EnrichmentConfig {
   enrichmentModel: string;
   dataExtractionModel: string;
-  context: string;
 }
 
 export default function CrmTab() {
@@ -75,7 +74,6 @@ export default function CrmTab() {
   const [enrichmentConfig, setEnrichmentConfig] = useState<EnrichmentConfig>({
     enrichmentModel: 'gemini-3-flash-preview',
     dataExtractionModel: 'gemini-3-flash-preview',
-    context: '',
   });
   const [savingConfig, setSavingConfig] = useState(false);
   const [configError, setConfigError] = useState('');
@@ -197,7 +195,7 @@ export default function CrmTab() {
         Enrichment AI Configuration
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        Configure the AI models and global context used for CRM lead enrichment across all clients.
+        Configure the AI models used for CRM lead enrichment across all clients.
       </Typography>
 
       {configError && (
@@ -243,20 +241,6 @@ export default function CrmTab() {
             </Select>
           </FormControl>
         </Box>
-
-        <TextField
-          label="Global Context"
-          multiline
-          minRows={3}
-          fullWidth
-          size="small"
-          placeholder="Describe your business, target market, or any context that helps the AI make better enrichment decisions (e.g. 'We are a B2B SaaS company targeting mid-market US businesses in the logistics sector.')."
-          value={enrichmentConfig.context}
-          onChange={(e) =>
-            setEnrichmentConfig((prev) => ({ ...prev, context: e.target.value }))
-          }
-          sx={{ mb: 2 }}
-        />
 
         <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
           <Button
