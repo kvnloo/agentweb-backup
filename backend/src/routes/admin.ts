@@ -2647,6 +2647,73 @@ router.get("/chat-sessions", async (req, res) => {
       return res.json({ sessions: results, nextCursor: null });
     }
 
+    // Filter by user (userId or userEmail)
+    const userIdParam = typeof req.query.userId === "string" && req.query.userId.trim()
+      ? req.query.userId.trim()
+      : undefined;
+    const userEmailParam = typeof req.query.userEmail === "string" && req.query.userEmail.trim()
+      ? req.query.userEmail.trim().toLowerCase()
+      : undefined;
+
+    let filterUserId: string | undefined;
+    if (userIdParam) {
+      filterUserId = userIdParam;
+    } else if (userEmailParam) {
+      const user = await userDb.getUserByEmail(userEmailParam);
+      if (!user) {
+        return res.json({ sessions: [], nextCursor: null });
+      }
+      filterUserId = user.userId;
+    }
+
+    if (filterUserId) {
+      const rawLimit = Number(req.query.limit);
+      const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 30;
+
+      // Decode offset from cursor (offset-based pagination since results are sorted in memory)
+      let offset = 0;
+      const cursorParam = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+      if (cursorParam) {
+        try {
+          const decoded = JSON.parse(Buffer.from(cursorParam, "base64").toString("utf8"));
+          if (typeof decoded.offset === "number") offset = decoded.offset;
+        } catch {
+          return res.status(400).json({ message: "Invalid cursor" });
+        }
+      }
+
+      // Fetch all sessions for user (metadata only), sort by updatedAt desc
+      const allSessions = await chatbotDb.getSessionsWithoutMessages(filterUserId);
+      allSessions.sort((a, b) =>
+        new Date((b as any).updatedAt).getTime() - new Date((a as any).updatedAt).getTime()
+      );
+
+      const page = allSessions.slice(offset, offset + limit);
+
+      // Hydrate messages for this page only
+      const sessionsWithMessages = await Promise.all(
+        page.map(async (session) => {
+          try {
+            return (await chatbotDb.getChatSession(session.sessionId)) ?? session;
+          } catch {
+            return session;
+          }
+        })
+      );
+
+      const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
+        Array.isArray(session.messages) &&
+        session.messages.some((msg: any) => msg.role === "user")
+      );
+
+      const nextOffset = offset + limit;
+      const nextCursor = nextOffset < allSessions.length
+        ? Buffer.from(JSON.stringify({ offset: nextOffset })).toString("base64")
+        : null;
+
+      return res.json({ sessions: nonEmptySessions, nextCursor });
+    }
+
     const startTime = typeof req.query.startTime === "string" ? req.query.startTime : undefined;
     const endTime = typeof req.query.endTime === "string" ? req.query.endTime : undefined;
     const timeRange = startTime && endTime ? { startTime, endTime } : undefined;

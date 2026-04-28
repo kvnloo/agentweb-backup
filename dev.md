@@ -1,3 +1,49 @@
+## Emma 3-Dimension Scores Missing — Investigation (2026-04-28)
+
+### Context
+
+Emma was asked to pull chat history with `sync=true` and report per-session dimensional scores (`goalCompletion`, `dataAccuracy`, `outputQuality`). The scores were consistently absent from all sessions — Emma could only see the top-level integer score.
+
+### Root Cause
+
+The production `AW-Settings` table has a custom `default-scoring-prompt` that was saved on **2026-04-15**, before the dimensional scoring feature was introduced on **2026-04-26**. The old prompt ends with:
+
+```
+Respond with ONLY valid JSON: {"score": <1-5>, "reason": "<brief explanation>"}
+```
+
+`getDefaultScoringPrompt()` in `sessionScoringService.ts` checks the DB first and uses whatever is stored there. Since the DB prompt predates dimensions, the LLM never returns a `dimensions` field, and `parseDimensions()` always returns `undefined`. All 57 production sessions in the queried window had `dims=None`.
+
+### Why PR #1347 Didn't Fully Fix It
+
+PR #1347 (`fix(scoring): re-score sessions missing dimensional scores on sync`, 2026-04-27) fixed the **re-scoring guard** — sessions with a score but no dimensions were previously being skipped as "already scored." That guard was updated to re-score when `dimensions` is absent. However, re-scoring still used the old DB prompt, so the LLM still returned no dimensions. The guard fix was correct but incomplete.
+
+### Fix
+
+Update the `default-scoring-prompt` in `AW-Settings` (via Admin → Scoring Judges → Default edit icon) to append the dimensions instruction before the JSON format line:
+
+```
+In addition to the overall score, rate three specific dimensions (1-5 each):
+- goalCompletion: Did the assistant fully accomplish what the user asked?
+- dataAccuracy: Did the output contain plausible, consistent, and factually coherent data?
+- outputQuality: Was the output well-structured, specific, and actionable?
+
+Respond with ONLY valid JSON:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}
+```
+
+The two custom `IMPORTANT` sections in the existing DB prompt ("Expected outcomes" and "Tool Execution after Nudges") should be preserved — they are prod-only additions not in the hardcoded fallback.
+
+### Verification
+
+Tested on dev by stripping dimensions from a live session, then calling `GET /api/admin/chat-sessions?sync=true`. Confirmed dimensions were backfilled correctly after the prompt update.
+
+### Lesson
+
+When adding new required fields to the scoring LLM output format, also update `AW-Settings` `default-scoring-prompt` if a custom version is stored. The hardcoded `DEFAULT_SCORING_SYSTEM_PROMPT` constant in `sessionScoringService.ts` is only a fallback — any stored DB override takes precedence.
+
+---
+
 # April 27, 2026: Investigation — Drip Campaigns vs. Sequences Overlap
 
 ## Context
