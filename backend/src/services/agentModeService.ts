@@ -20108,7 +20108,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account owned by the calling user.
     // This prevents an LLM from reusing a shared/enrichment account_id it may have
     // seen in a prior get-profile tool call to send invitations or messages.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation', 'accept-invitation'];
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserId(userId);
@@ -20298,6 +20298,46 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: messageResponse };
         }
 
+        case 'send-inmail': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for send-inmail');
+          if (!message) throw new Error('message is required for send-inmail action');
+          const { subject } = args;
+          if (!subject) throw new Error('subject is required for send-inmail action');
+
+          const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
+
+          // Persist the sent InMail to the CRM so it shows up in engagement history.
+          const { list_id: inmailListId, lead_id: inmailLeadId } = args;
+          if (inmailListId && inmailLeadId) {
+            const { crmDb } = await import('./db');
+            const inmailLead = await crmDb.getLeadById(inmailListId, inmailLeadId);
+            if (inmailLead) {
+              const leadLinkedIn = ((inmailLead as any).linkedin as string | undefined)?.toLowerCase();
+              if (leadLinkedIn) {
+                const { emailEventsDb } = await import('./emailEventsDb');
+                const msgId = inmailResponse?.id ?? inmailResponse?.message_id ?? `sent_${Date.now()}`;
+                const sentAt = new Date().toISOString();
+                await Promise.all([
+                  emailEventsDb.addLinkedInMessageEvent({
+                    eventId: `linkedin_inmail_${msgId}`,
+                    emailDomain: `linkedin-${inmailListId}`,
+                    leadEmail: leadLinkedIn,
+                    eventType: 'linkedin.inmail.sent',
+                    text: message,
+                    timestamp: sentAt,
+                    senderId: account_id,
+                    messageProviderId: msgId,
+                  }),
+                  crmDb.updateLeadLinkedInSyncAt(inmailListId, inmailLeadId, sentAt),
+                ]);
+                console.log(`[AgentMode] send-inmail: persisted sent InMail for lead ${inmailLeadId} in list ${inmailListId}`);
+              }
+            }
+          }
+
+          return { success: true, data: inmailResponse };
+        }
+
         case 'update-conversation-history': {
           if (!target) throw new Error('Either profile_url or provider_id is required for update-conversation-history');
           const { list_id, lead_id } = args;
@@ -20364,7 +20404,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }

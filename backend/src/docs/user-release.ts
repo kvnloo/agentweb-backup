@@ -19,6 +19,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'New: LinkedIn InMail Support in Outreach Tool',
+      '- Emma can now send LinkedIn InMail messages to 2nd and 3rd-degree connections (profiles you are not yet connected with)',
+      '- Use the send-inmail action when a direct message is not possible due to connection degree restrictions',
+      '- Requires a LinkedIn Premium, Sales Navigator, or Recruiter subscription with available InMail credits on the connected account',
+      '- Sent InMails are tracked in the CRM engagement history alongside regular messages',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fix: Org Member Token Usage Now Counts Against Org Owner\'s Quota',
       '- Previously, each org member\'s token usage was tracked independently against their own (Free-tier) quota, so members could consume tokens without affecting the org owner\'s limit',
       '- Token usage for org members now counts against the org owner\'s subscription quota — checks, increments, and the subscription usage dashboard all reflect the owner\'s pool',
@@ -5340,3 +5350,4 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
 ];
+
