@@ -20,6 +20,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fixed: Email Sequence Enrollment Condition Now Saves Correctly',
+      '- Setting an Enrollment Condition on a sequence (e.g. customFields.subscriptionType equals Free) now persists correctly after saving',
+      '- Previously, the condition was silently discarded due to a missing field in the API route — the sequence appeared to save but the condition was lost on reload',
+      '- Also fixed: sequences in Draft status no longer send emails — they are now treated the same as Paused sequences and will not advance any active enrollments until the sequence is set to Active',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fix: Admin Delegate Access No Longer Blocked by Onboarding Banner',
       '- When an admin used delegate access to view a customer account that had not yet completed onboarding, a banner prompting them to complete brand setup was incorrectly shown',
       '- Admins using delegate access are now fully exempt from the onboarding banner',
