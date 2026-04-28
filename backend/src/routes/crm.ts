@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, hasUnsafeEmailStyles } from '../utils/emailVariables';
 import axios from 'axios';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
@@ -4164,11 +4164,19 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
-    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
+
+    // Detect and fix class-based CSS that most email clients strip
+    const { html: processedHtml, wasFixed } = await inlineEmailStyles(htmlContent);
+
+    const stylesNote = wasFixed
+      ? ' | ✅ Styles auto-fixed: CSS classes converted to inline styles'
+      : '';
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email${stylesNote}</div>`;
+
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(htmlContent)
-      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + htmlContent;
+    const withBanner = /<body\b/i.test(processedHtml)
+      ? processedHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + processedHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
     const from = `${senderName} <${senderEmail}>`;

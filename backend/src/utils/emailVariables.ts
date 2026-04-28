@@ -1,4 +1,56 @@
+import { LLMService } from './llmService';
+
 const STANDARD_FIELDS = ['firstName', 'lastName', 'email', 'company', 'title'] as const;
+
+/**
+ * Returns true if the HTML contains a <style> block with class-based CSS rules that
+ * are likely to be stripped by email clients (Gmail, Outlook, etc.).
+ */
+export function hasUnsafeEmailStyles(html: string): boolean {
+  if (!html) return false;
+  const styleBlocks = html.match(/<style[^>]*>([\s\S]*?)<\/style>/gi);
+  if (!styleBlocks) return false;
+  return styleBlocks.some(block => /\.[a-zA-Z][\w-]*\s*\{/.test(block));
+}
+
+/**
+ * Uses Claude Sonnet 4.6 to convert a class-based CSS email template to a fully
+ * inline-styled version that renders correctly in all email clients.
+ *
+ * Returns the inlined HTML, or the original HTML if the LLM call fails.
+ */
+export async function inlineEmailStyles(html: string): Promise<{ html: string; wasFixed: boolean }> {
+  if (!hasUnsafeEmailStyles(html)) {
+    return { html, wasFixed: false };
+  }
+
+  try {
+    const llm = new LLMService('anthropic.claude-sonnet-4-6', 0, 16000);
+    const systemPrompt = `You are an expert HTML email developer. Your job is to convert HTML emails that use <style> blocks and CSS classes into email-client-compatible HTML that works in Gmail, Outlook, and Apple Mail.
+
+Rules:
+1. Move ALL CSS from <style> blocks into inline style="" attributes on every element that uses those classes
+2. Do NOT change any colors, fonts, sizes, spacing, layout, or visual design — preserve them exactly
+3. Remove the <style> blocks from <head> after inlining (they are no longer needed)
+4. Keep @media queries in a single <style> block if present (they cannot be inlined)
+5. Keep any Google Fonts <link> tags
+6. Do NOT change any text content, links, images, or HTML structure
+7. Preserve all existing inline style="" attributes — merge class styles into them
+
+Return ONLY the complete fixed HTML wrapped in <actual_html_content>...</actual_html_content> tags. No explanation.`;
+
+    const userPrompt = `Convert this email HTML to use inline styles instead of CSS classes:\n\n${html}`;
+
+    const inlined = await llm.generateHTML(systemPrompt, userPrompt);
+    if (inlined && inlined.length > html.length * 0.5) {
+      return { html: inlined, wasFixed: true };
+    }
+    return { html, wasFixed: false };
+  } catch (err) {
+    console.error('[inlineEmailStyles] LLM call failed, using original HTML:', err);
+    return { html, wasFixed: false };
+  }
+}
 
 /**
  * Extract all variable names used in a template string.

@@ -1,4 +1,8 @@
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles } from '../utils/emailVariables';
+import { LLMService } from '../utils/llmService';
+
+jest.mock('../utils/llmService');
+const MockLLMService = LLMService as jest.MockedClass<typeof LLMService>;
 
 describe('substituteVariables', () => {
   // FAIL cases
@@ -190,5 +194,69 @@ describe('injectUnsubscribeUrl', () => {
     const result = injectUnsubscribeUrl(html, url, footer);
     expect(result).toContain(`href="${url}"`);
     expect(result).toContain('Click to unsubscribe');
+  });
+});
+
+describe('hasUnsafeEmailStyles', () => {
+  it('should return false for empty string', () => {
+    expect(hasUnsafeEmailStyles('')).toBe(false);
+  });
+
+  it('should return false for HTML with no <style> block', () => {
+    expect(hasUnsafeEmailStyles('<p style="color:red">Hello</p>')).toBe(false);
+  });
+
+  it('should return false for <style> block with only element selectors', () => {
+    const html = '<html><head><style>body { color: red; } p { margin: 0; }</style></head></html>';
+    expect(hasUnsafeEmailStyles(html)).toBe(false);
+  });
+
+  it('should return true for <style> block with class-based rules', () => {
+    const html = '<html><head><style>.header { background: purple; }</style></head></html>';
+    expect(hasUnsafeEmailStyles(html)).toBe(true);
+  });
+
+  it('should return true for HTML with multiple <style> blocks where one has classes', () => {
+    const html = '<head><style>body{}</style><style>.btn { color: white; }</style></head>';
+    expect(hasUnsafeEmailStyles(html)).toBe(true);
+  });
+});
+
+describe('inlineEmailStyles', () => {
+  const htmlWithClasses = '<html><head><style>.btn { color: white; background: purple; }</style></head><body><a class="btn" href="#">Click</a></body></html>';
+  const inlinedHtml = '<html><head></head><body><a href="#" style="color: white; background: purple;">Click</a></body></html>';
+
+  beforeEach(() => {
+    MockLLMService.mockClear();
+  });
+
+  it('should return original html unchanged when no unsafe styles detected', async () => {
+    const html = '<html><body><p style="color:red">Hello</p></body></html>';
+    const result = await inlineEmailStyles(html);
+    expect(result.html).toBe(html);
+    expect(result.wasFixed).toBe(false);
+    expect(MockLLMService).not.toHaveBeenCalled();
+  });
+
+  it('should call LLM and return inlined html when class-based styles detected', async () => {
+    MockLLMService.prototype.generateHTML = jest.fn().mockResolvedValue(inlinedHtml);
+    const result = await inlineEmailStyles(htmlWithClasses);
+    expect(result.wasFixed).toBe(true);
+    expect(result.html).toBe(inlinedHtml);
+    expect(MockLLMService.prototype.generateHTML).toHaveBeenCalledTimes(1);
+  });
+
+  it('should return original html if LLM returns suspiciously short output', async () => {
+    MockLLMService.prototype.generateHTML = jest.fn().mockResolvedValue('<p>x</p>');
+    const result = await inlineEmailStyles(htmlWithClasses);
+    expect(result.wasFixed).toBe(false);
+    expect(result.html).toBe(htmlWithClasses);
+  });
+
+  it('should return original html if LLM call throws', async () => {
+    MockLLMService.prototype.generateHTML = jest.fn().mockRejectedValue(new Error('LLM timeout'));
+    const result = await inlineEmailStyles(htmlWithClasses);
+    expect(result.wasFixed).toBe(false);
+    expect(result.html).toBe(htmlWithClasses);
   });
 });

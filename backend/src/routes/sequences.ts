@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, hasUnsafeEmailStyles } from '../utils/emailVariables';
 
 const router = express.Router();
 
@@ -284,11 +284,20 @@ router.post(
 
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=TEST&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
-    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email</div>`;
+
+    // Detect and fix class-based CSS that most email clients strip
+    const needsInlining = hasUnsafeEmailStyles(htmlContent);
+    const { html: processedHtml, wasFixed } = await inlineEmailStyles(htmlContent);
+
+    const stylesNote = wasFixed
+      ? ' | ✅ Styles auto-fixed: CSS classes converted to inline styles'
+      : '';
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email${stylesNote}</div>`;
+
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(htmlContent)
-      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + htmlContent;
+    const withBanner = /<body\b/i.test(processedHtml)
+      ? processedHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + processedHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
