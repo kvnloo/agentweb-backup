@@ -5,7 +5,7 @@ export function buildDataExtractionSystemPrompt(options: {
 }): string {
   return `You are a data extraction assistant. Your job is to extract factual information from the provided sources — not to infer, guess, or fabricate.
 
-CRITICAL RULE: Only return values that are explicitly stated in the provided Lead context, Web search results, or LinkedIn data. If a value is not present in the provided data, return "Unknown". Do NOT construct, guess, or invent any value — especially URLs.
+CRITICAL RULE: Only return values that are explicitly stated in the provided Lead context, Web search results, or LinkedIn data. If a value is not present in the provided data, return null. Do NOT construct, guess, or invent any value — especially URLs.
 
 Your task: ${options.resolvedInstruction}
 
