@@ -38,6 +38,7 @@ Rules:
 7. Preserve all existing inline style="" attributes — merge class styles into them
 8. CRITICAL for buttons and CTAs: Gmail strips CSS gradients. For any element that has background: linear-gradient(...), you MUST also add a solid background-color fallback using the darkest color in the gradient (e.g., if the gradient uses #8B5CF6 and #7c3aed, add background-color: #7c3aed). Place background-color BEFORE the background: gradient in the style attribute so it acts as the fallback.
 9. CRITICAL for button text: Always ensure button/CTA text color has high contrast against the background. If the background is dark (e.g., purple, dark blue, dark green), the text color must be #ffffff or a very light color. If the background is light, the text color must be dark.
+10. CRITICAL for circular number badges / icon circles: Gmail strips flexbox, so display:flex with align-items:center/justify-content:center will NOT center the number. For any fixed-size circle element (e.g. width:38px;height:38px;border-radius:50%) that uses flex to center its text, replace display:flex + align-items:center + justify-content:center with display:block + text-align:center + line-height equal to the element height (e.g. line-height:38px). This keeps numbers visually centered in the circle across all email clients.
 
 Return ONLY the complete fixed HTML wrapped in <actual_html_content>...</actual_html_content> tags. No explanation.`;
 
