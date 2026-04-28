@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fix: Admin Delegate Access No Longer Blocked by Onboarding Banner',
+      '- When an admin used delegate access to view a customer account that had not yet completed onboarding, a banner prompting them to complete brand setup was incorrectly shown',
+      '- Admins using delegate access are now fully exempt from the onboarding banner',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fixed: Emma No Longer Suggests Creating a Schedule Inside Scheduled Sessions',
       '- When a scheduled chat runs automatically, Emma was incorrectly ending her response with "Want this to run automatically every day?" — even though the user already set up the schedule',
       '- Emma now detects when she is running inside an automated scheduled session and delivers results directly, without any scheduling suggestions',
