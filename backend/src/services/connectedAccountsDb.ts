@@ -525,12 +525,13 @@ export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> 
 
   // First check: is the token expired based on timestamp?
   if (account.config.token_expires_at <= now) {
-    // LinkedIn with refresh token can attempt refresh via API verification
-    const canAttemptRefresh = account.platform === 'linkedin' && account.config.refresh_token;
+    // Platforms with a refresh token (e.g. Gmail, LinkedIn) auto-renew — consider them valid.
+    // LinkedIn also gets API verification below; others are trusted based on refresh_token presence.
+    const canAttemptRefresh = !!account.config.refresh_token;
     if (!canAttemptRefresh) {
       return false;
     }
-    // For LinkedIn with refresh token, fall through to API verification which handles refresh
+    // Fall through: token is expired but refresh_token exists, so it can be renewed
   }
 
   // Second check: verify via API (only for LinkedIn for now)
