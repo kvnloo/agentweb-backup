@@ -413,6 +413,7 @@ export class AgentModeService {
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
+        await import('../emma/smsTools');
         await import('../emma/tempEmailTools');
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');

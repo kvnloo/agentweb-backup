@@ -3313,6 +3313,111 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
 });
 
 /**
+ * @route GET /api/crm/sender-phones
+ * @desc Get CRM SMS sender phone configuration for the authenticated user
+ * @access Private
+ */
+router.get('/sender-phones', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const settingName = `crm_sender_phones_${userId}`;
+    const setting = await settingsService.getSetting(settingName);
+
+    if (!setting) {
+      return res.json({ senders: [], defaultSenderId: null });
+    }
+
+    try {
+      const config = JSON.parse(setting.settingValue);
+      res.json({
+        senders: config.senders || [],
+        defaultSenderId: config.defaultSenderId || null,
+      });
+    } catch (parseError) {
+      console.error('Error parsing CRM sender phones:', parseError);
+      res.json({ senders: [], defaultSenderId: null });
+    }
+  } catch (error: any) {
+    console.error('Error fetching CRM sender phones:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch CRM sender phones' });
+  }
+});
+
+/**
+ * @route POST /api/crm/sender-phones
+ * @desc Save CRM SMS sender phone configuration for the authenticated user
+ * @access Private
+ */
+router.post('/sender-phones', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { senders, defaultSenderId } = req.body;
+
+    if (!Array.isArray(senders)) {
+      return res.status(400).json({ message: 'Senders must be an array' });
+    }
+
+    const E164_REGEX = /^\+[1-9]\d{6,14}$/;
+
+    for (const sender of senders) {
+      if (!sender.phoneNumber || !sender.displayName) {
+        return res.status(400).json({ message: 'Each sender must have phoneNumber and displayName' });
+      }
+      if (!E164_REGEX.test(sender.phoneNumber)) {
+        return res.status(400).json({ message: `Invalid phone number format (must be E.164): ${sender.phoneNumber}` });
+      }
+      if (sender.notes !== undefined && typeof sender.notes !== 'string') {
+        return res.status(400).json({ message: 'Notes must be a string if provided' });
+      }
+    }
+
+    if (defaultSenderId !== null && defaultSenderId !== undefined) {
+      const defaultExists = senders.some((s: any, index: number) =>
+        s.id === defaultSenderId || index.toString() === defaultSenderId
+      );
+      if (!defaultExists && senders.length > 0) {
+        return res.status(400).json({ message: 'defaultSenderId must reference an existing sender' });
+      }
+    }
+
+    const settingName = `crm_sender_phones_${userId}`;
+    const config = {
+      senders: senders.map((s: any, index: number) => ({
+        id: s.id || index.toString(),
+        phoneNumber: s.phoneNumber.trim(),
+        displayName: s.displayName.trim(),
+        notes: s.notes ? s.notes.trim() : undefined,
+      })),
+      defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
+    };
+
+    await settingsService.setSetting(
+      settingName,
+      JSON.stringify(config),
+      'CRM SMS sender phones configuration',
+      authReq.user?.email || 'system'
+    );
+
+    res.json({ message: 'CRM sender phones saved successfully', ...config });
+  } catch (error: any) {
+    console.error('Error saving CRM sender phones:', error);
+    res.status(500).json({ message: error.message || 'Failed to save CRM sender phones' });
+  }
+});
+
+/**
  * @route POST /api/crm/email-domain
  * @desc Create (register) an email domain in Resend for the authenticated user
  * @access Private

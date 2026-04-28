@@ -637,6 +637,37 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+export interface TwilioCredentials {
+  accountSid: string;
+  authToken: string;
+}
+
+export async function getTwilioCredentials(): Promise<TwilioCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Twilio'
+      : 'dev/AgentWeb/Twilio';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Twilio credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as TwilioCredentials;
+
+    if (!credentials.accountSid || !credentials.authToken) {
+      throw new Error('Twilio credentials missing accountSid or authToken');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Twilio credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Twilio credentials from Secrets Manager');
+  }
+}
+
 export interface AttioCredentials {
   clientId: string;
   clientSecret: string;
