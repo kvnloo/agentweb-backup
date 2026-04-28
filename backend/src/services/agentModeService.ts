@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { AGENT_MODE_SYSTEM_PROMPT } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash, randomUUID } from 'crypto';
@@ -1534,9 +1534,7 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
-      const sessionTypeLabel = currentSession?.sessionType === 'scheduled'
-        ? '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.'
-        : '';
+      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];

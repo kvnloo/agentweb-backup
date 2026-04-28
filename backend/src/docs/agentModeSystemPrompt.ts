@@ -396,6 +396,13 @@ Use the **report_product_issues** tool to log issues for the team, and actively 
 When suggesting, briefly explain what happened and say something like: "I'd recommend reporting this so the team can investigate — want me to file it?"`;
 
 
+// Injected at the end of the system prompt when the session is a scheduled automated run.
+// Returns an empty string for non-scheduled sessions.
+export function getScheduledSessionOverride(sessionType?: string): string {
+  if (sessionType !== 'scheduled') return '';
+  return '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.';
+}
+
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
 // This is appended to AGENT_MODE_SYSTEM_PROMPT at runtime.
 // Keep this strictly sidebar-specific — anything that applies to all Emma interactions belongs in AGENT_MODE_SYSTEM_PROMPT above.

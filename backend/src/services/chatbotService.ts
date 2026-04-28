@@ -15,7 +15,7 @@ import { taskDb, userDb } from '../services/db';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
-import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
@@ -3311,10 +3311,7 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
 export function getEmmaSystemContext(sessionType?: string): string {
-  const scheduledAddendum = sessionType === "scheduled"
-    ? "\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying \"want this to run automatically\" — doing so would be incorrect and confusing. Just deliver the results."
-    : "";
-  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${scheduledAddendum}`;
+  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}`;
 }
 
 // Exported for backwards-compatibility with existing tests — no-op since there is no longer a cache.
