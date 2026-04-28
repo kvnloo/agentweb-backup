@@ -473,6 +473,57 @@ describe('apiTools', () => {
       expect(session.longestWaitMs).toBeNull();
       expect(session.maxHeapMB).toBeNull();
     });
+
+    it('should include delegateInfo when session was started by admin delegation', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-delegate',
+          userId: 'user-customer',
+          title: 'Delegated Session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          sessionType: 'regular',
+          delegateInfo: { adminUserId: 'admin-1', adminEmail: 'admin@example.com', isDelegated: true },
+          messages: [{ role: 'user', content: 'Hello' }],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      const session = parsed.sessions[0];
+
+      expect(session.delegateInfo).toEqual({ adminUserId: 'admin-1', adminEmail: 'admin@example.com', isDelegated: true });
+    });
+
+    it('should return null delegateInfo for non-delegated sessions', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-normal',
+          userId: 'user-1',
+          title: 'Normal Session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          sessionType: 'regular',
+          messages: [],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      const session = parsed.sessions[0];
+
+      expect(session.delegateInfo).toBeNull();
+    });
   });
 
 });
