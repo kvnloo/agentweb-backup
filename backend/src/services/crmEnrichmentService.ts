@@ -7,7 +7,7 @@ import {
   buildDataExtractionSystemPrompt,
   buildDataExtractionRetryPrompt,
   buildSuggestEnrichmentSystemPrompt
-} from './prompts/enrichmentPrompts';
+} from './enrichmentPrompts';
 
 /** LinkedIn API has stricter rate limits */
 const PARALLELISM_WITH_LINKEDIN = 5;
