@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fixed: Fathom Now Visible in Connected Accounts for All Users',
+      '- Fathom was previously hidden for non-admin users due to an incorrect admin-only guard in the Connected Accounts settings page',
+      '- All users can now see and connect their Fathom account from Settings → Connected Accounts',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fix: Gmail Email Subject Lines Now Display Correctly With Special Characters',
       '- Email subjects containing special characters such as em-dashes (—), smart quotes, and other non-ASCII unicode were previously showing as garbled or unreadable text in some email clients',
       '- Subject lines are now properly encoded using the RFC 2047 standard, so characters like em-dashes render as plain, readable text for recipients',
