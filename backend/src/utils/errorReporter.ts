@@ -7,6 +7,69 @@ export interface UIErrorReport {
   context?: Record<string, any>;
 }
 
+/**
+ * Enrich the oncall context for onboarding-tagged errors. The Notion task IS
+ * the investigation surface (no separate admin portal page) — so we pack
+ * everything Rui needs to investigate directly into the task body:
+ *   - User identity
+ *   - Current onboardingStage
+ *   - Per-step status table (icp / competitor / creativeDir / adImage / adCopy)
+ *   - Last 20 onboarding events
+ *   - A delegate-as-user URL for one-click manual UI inspection
+ *
+ * Best-effort and silent on failure — the base reportUIError flow must never
+ * be blocked by an enrichment-fetch hiccup. If userDb is unreachable the
+ * Notion task still fires with the original context.
+ */
+async function enrichOnboardingContext(
+  userId: string,
+  baseContext: Record<string, any>,
+): Promise<Record<string, any>> {
+  try {
+    const { userDb } = await import('../services/db');
+    const user: any = await userDb.getUserById(userId);
+    if (!user) return baseContext;
+    const enriched: Record<string, any> = { ...baseContext };
+    if (user.email) enriched['User Email'] = user.email;
+    if (user.onboardingStage) enriched['Onboarding Stage'] = user.onboardingStage;
+    if (user.createdAt) enriched['Signup'] = user.createdAt;
+    enriched['Investigate as User'] = `${process.env.PARTNER_PORTAL_URL || 'https://agentweb.pro'}/admin/delegate?targetUserId=${userId}`;
+
+    // Per-step status table — collapse the 5 per-axis states into one
+    // human-scannable string so the Notion bullet renders cleanly.
+    const stepLines: string[] = [];
+    for (const axis of ['brandBuild', 'icp', 'competitor', 'creativeDir', 'adImage', 'adCopy']) {
+      const status = user[`${axis}Status`];
+      if (!status) continue;
+      const startedAt = user[`${axis}StartedAt`];
+      const completedAt = user[`${axis}CompletedAt`];
+      const error = user[`${axis}Error`];
+      const parts = [`${axis}=${status}`];
+      if (startedAt) parts.push(`startedAt=${startedAt}`);
+      if (completedAt) parts.push(`completedAt=${completedAt}`);
+      if (error) parts.push(`error=${String(error).slice(0, 200)}`);
+      stepLines.push(parts.join(' '));
+    }
+    if (stepLines.length > 0) enriched['Step Status'] = stepLines.join('\n');
+
+    // Last 20 onboarding events (oldest → newest) so Rui can see the
+    // user's path through the funnel without leaving the Notion task.
+    const events = Array.isArray(user.onboardingEvents) ? user.onboardingEvents : [];
+    if (events.length > 0) {
+      const lastN = events.slice(-20).map((e: any) => {
+        const ts = e?.ts ? new Date(e.ts).toISOString() : '?';
+        const dataStr = e?.data ? ` ${JSON.stringify(e.data).slice(0, 120)}` : '';
+        return `${ts} ${e?.event ?? '<unknown>'}${dataStr}`;
+      });
+      enriched['Recent Events (last 20)'] = lastN.join('\n');
+    }
+    return enriched;
+  } catch {
+    // Enrichment is purely additive — never block the original report.
+    return baseContext;
+  }
+}
+
 // In-memory dedup cache: fingerprint -> timestamp of last reported occurrence
 const dedupCache = new Map<string, number>();
 const DEDUP_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
@@ -47,12 +110,19 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
   dedupCache.set(fingerprint, now);
 
   const subject = `UI Error: ${operation}`;
-  const fullContext: Record<string, any> = {
+  let fullContext: Record<string, any> = {
     Operation: operation,
     ...(userId ? { 'User ID': userId } : {}),
     Error: errorMessage,
     ...context,
   };
+
+  // Enrich onboarding-tagged errors with full investigation context — see
+  // enrichOnboardingContext doc above. The Notion task becomes the
+  // investigation surface; the responder rarely needs to leave it.
+  if (userId && operation.startsWith('onboarding:')) {
+    fullContext = await enrichOnboardingContext(userId, fullContext);
+  }
 
   try {
     const { createOncallItem } = await import('../services/notionService');
