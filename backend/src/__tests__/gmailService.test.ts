@@ -585,6 +585,38 @@ describe('GmailService', () => {
       expect(decoded).toContain('In-Reply-To: <original-msg-id@mail.gmail.com>');
     });
 
+    it('encodes non-ASCII characters in subject using RFC 2047 encoded-word format', async () => {
+      mockGetAccountById.mockResolvedValue(VALID_ACCOUNT_WITH_SEND);
+      mockMessagesSend.mockResolvedValueOnce({ data: { id: 'sent-uni', threadId: 'thread-uni' } });
+
+      await service.sendEmail('user-123', ACCOUNT_ID, {
+        to: 'alice@example.com',
+        subject: 'CMO Dinner — The New CMO Mandate: Marketing in the Agentic Era',
+        body: 'Details inside.',
+      });
+
+      const sentArg = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(sentArg.requestBody.raw, 'base64').toString('utf-8');
+      // Subject must use RFC 2047 encoded-word, not raw unicode escape sequences
+      expect(decoded).toMatch(/Subject: =\?UTF-8\?B\?[A-Za-z0-9+/]+=*\?=/);
+      expect(decoded).not.toContain('Subject: CMO Dinner —');
+    });
+
+    it('leaves ASCII-only subjects unencoded', async () => {
+      mockGetAccountById.mockResolvedValue(VALID_ACCOUNT_WITH_SEND);
+      mockMessagesSend.mockResolvedValueOnce({ data: { id: 'sent-ascii', threadId: 'thread-ascii' } });
+
+      await service.sendEmail('user-123', ACCOUNT_ID, {
+        to: 'alice@example.com',
+        subject: 'Hello World',
+        body: 'Plain ASCII subject.',
+      });
+
+      const sentArg = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(sentArg.requestBody.raw, 'base64').toString('utf-8');
+      expect(decoded).toContain('Subject: Hello World');
+    });
+
     it('throws GmailQuotaError on 429 from messages.send (after retry)', async () => {
       mockGetAccountById.mockResolvedValue(VALID_ACCOUNT_WITH_SEND);
       const quotaErr = Object.assign(new Error('Quota exceeded'), { response: { status: 429 } });

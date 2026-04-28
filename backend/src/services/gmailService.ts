@@ -180,6 +180,13 @@ export class GmailService implements IEmailService {
 
   // ── Message parsing helpers ───────────────────────────────────────────────
 
+  // Encode a header value per RFC 2047 so non-ASCII characters survive transit.
+  // Uses UTF-8 base64 encoded-word format: =?UTF-8?B?...?=
+  private encodeMimeHeader(value: string): string {
+    if (/^[\x00-\x7F]*$/.test(value)) return value; // pure ASCII — no encoding needed
+    return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+  }
+
   private getHeader(headers: Array<{ name?: string | null; value?: string | null }>, name: string): string {
     return headers.find(h => (h.name || '').toLowerCase() === name.toLowerCase())?.value || '';
   }
@@ -531,7 +538,7 @@ export class GmailService implements IEmailService {
     const contentType = params.isHtml ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
     const headerLines: string[] = [
       `To: ${toStr}`,
-      `Subject: ${params.subject}`,
+      `Subject: ${this.encodeMimeHeader(params.subject)}`,
       'MIME-Version: 1.0',
       `Content-Type: ${contentType}`,
     ];
