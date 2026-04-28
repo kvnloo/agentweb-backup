@@ -35,6 +35,7 @@
  */
 
 import { imageService as defaultImageService } from "./imageGeneration";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   adImageFailedPatch,
@@ -633,6 +634,16 @@ export async function triggerAdImageGenerationForUser(
     console.error("[onboardingAdImageService] gated by creative-dir step", {
       userId,
       reason,
+    });
+    void reportUIError({
+      operation: "onboarding:ad-image:gated-creative-dir",
+      errorMessage: reason,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adImage",
+        creativeDirStatus,
+      },
     });
     return;
   }

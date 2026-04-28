@@ -21,6 +21,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   competitorFailedPatch,
@@ -407,6 +408,16 @@ export async function triggerCompetitorStrategyForUser(
     console.error("[onboardingCompetitorService] generation failed", {
       userId,
       err: msg,
+    });
+    void reportUIError({
+      operation: "onboarding:competitor:llm-generation",
+      errorMessage: msg,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "competitor",
+        Stack: err instanceof Error ? (err.stack ?? "").slice(0, 1000) : "",
+      },
     });
   }
 }

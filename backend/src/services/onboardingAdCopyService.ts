@@ -26,6 +26,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   adCopyFailedPatch,
@@ -337,6 +338,17 @@ export async function triggerAdCopyForUser(
       userId,
       reason,
     });
+    void reportUIError({
+      operation: "onboarding:ad-copy:gated-ad-image",
+      errorMessage: reason,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adCopy",
+        adImageStatus,
+        variantCount: String(imageVariants.length),
+      },
+    });
     return;
   }
 
@@ -392,6 +404,16 @@ export async function triggerAdCopyForUser(
     console.error("[onboardingAdCopyService] generation failed", {
       userId,
       err: msg,
+    });
+    void reportUIError({
+      operation: "onboarding:ad-copy:llm-generation",
+      errorMessage: msg,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adCopy",
+        Stack: err instanceof Error ? (err.stack ?? "").slice(0, 1000) : "",
+      },
     });
   }
 }
