@@ -32,6 +32,13 @@ jest.mock('../services/agentModeService', () => ({
         },
       },
     }),
+    getClientForModel: jest.fn().mockResolvedValue({
+      chat: {
+        completions: {
+          create: mockGeminiCreate,
+        },
+      },
+    }),
   },
 }));
 

@@ -5167,7 +5167,7 @@ emmaToolRegistry.register({
     name: 'enrich_leads_preview',
     description: `Preview a CRM lead enrichment job. Processes 2 sample leads to show what the enrichment will produce before committing to the full batch.
 
-Returns total lead count, how many would be processed, how many are already enriched, and 2 sample enrichment results so the user can verify quality before proceeding.
+Returns: totalLeads (total in list), leadsToProcess (would be enriched), alreadyEnriched (already have all fields), and samples (up to 2 leads with their enrichedFields). In enrichedFields, a null value means nothing was found for that field — tell the user "not found" rather than showing null. Show the sample results to the user and ask them to confirm quality before proceeding.
 
 After showing the preview, ask the user to confirm before calling enrich_leads_execute.
 
@@ -5261,7 +5261,7 @@ emmaToolRegistry.register({
     name: 'enrich_leads_execute',
     description: `Execute a CRM lead enrichment job. Processes all matching leads in parallel, enriching custom fields using AI and the specified data sources.
 
-Progress updates are sent via Socket.IO in real-time. Returns immediately with a job ID and the count of leads to be processed.
+Progress updates are sent via Socket.IO in real-time. This call blocks until the full job completes, then returns final counts: processedCount, failedCount, skippedCount, and failureBreakdown. A lead is skipped when it has only a personal email (gmail, etc.) and no company name — check warnings for details.
 
 Call enrich_leads_preview first to show the user what will happen before executing.
 
@@ -5353,7 +5353,7 @@ emmaToolRegistry.register({
 
 Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
 
-Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The tool returns the enriched values directly and also persists them to the lead's customFields in DynamoDB.`,
+Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The response includes enrichedValues — a map of field name to the found value (or null if nothing was found). Values are also persisted to the lead's customFields in DynamoDB. Always show enrichedValues to the user; if a value is null, tell them nothing was found for that field. Check warnings for skip reasons (e.g. personal email with no company).`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5413,6 +5413,7 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
       : ['web_search', 'linkedin'];
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const { crmDb } = await import('../services/db');
     const service = new CrmEnrichmentService();
     const result = await service.execute({
       listId: args.list_id,
@@ -5424,12 +5425,29 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
       forceOverwrite: args.force_overwrite !== false,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
 
+    // Fetch the lead after enrichment so we can return the actual enriched values
+    let enrichedValues: Record<string, string | null> = {};
+    if (result.processedCount > 0) {
+      try {
+        const lead = await crmDb.getLeadById(args.list_id, args.lead_id);
+        if (lead?.customFields) {
+          for (const field of outputFields) {
+            enrichedValues[field] = lead.customFields[field] ?? null;
+          }
+        }
+      } catch {
+        // Non-fatal — enrichment succeeded, values are in DB
+      }
+    }
+
     return {
       leadId: args.lead_id,
       listId: args.list_id,
       outputFields,
+      enrichedValues,
       processedCount: result.processedCount,
       failedCount: result.failedCount,
+      skippedCount: result.skippedCount,
       failureBreakdown: result.failureBreakdown,
       warnings: result.warnings,
       jobId: result.jobId,

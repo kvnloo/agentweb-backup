@@ -150,7 +150,7 @@ export class CrmEnrichmentService {
             case 'contains': return typeof value === 'string' && value.includes(filter.value);
             case 'is_empty': return !value || (typeof value === 'string' && value.trim() === '');
             case 'is_not_empty': return value && (typeof value !== 'string' || value.trim() !== '');
-            default: return true;
+            default: return false;
           }
         });
       });
@@ -489,10 +489,11 @@ export class CrmEnrichmentService {
     webContext: string,
     linkedinContext: string,
     spec: EnrichmentJobSpec,
-    lead: LeadRecord
+    lead: LeadRecord,
+    enrichConfig: { enrichmentModel: string; dataExtractionModel: string; context: string }
   ): Promise<Record<string, string | null>> {
     const resolvedInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
-    const { dataExtractionModel, context: globalContext } = await CrmEnrichmentService.getEnrichmentConfig();
+    const { dataExtractionModel, context: globalContext } = enrichConfig;
 
     const systemPrompt = buildDataExtractionSystemPrompt({
       globalContext,
@@ -587,7 +588,11 @@ export class CrmEnrichmentService {
     lead: LeadRecord,
     spec: EnrichmentJobSpec,
     linkedInAccountId?: string | null,
+    enrichConfig?: { enrichmentModel: string; dataExtractionModel: string; context: string }
   ): Promise<{ fields: Record<string, string | null> }> {
+    if (!enrichConfig) {
+      enrichConfig = await CrmEnrichmentService.getEnrichmentConfig();
+    }
     this.validateLeadForEnrichment(lead);
 
     const effectiveSources = (field: string) => spec.sourcesPerField?.[field] ?? spec.sources;
@@ -615,7 +620,7 @@ export class CrmEnrichmentService {
       }
     }
 
-    let fields = await this.extractFieldsViaLLM(leadContext, webContext, linkedinContext, spec, lead);
+    let fields = await this.extractFieldsViaLLM(leadContext, webContext, linkedinContext, spec, lead, enrichConfig!);
     fields = this.validateLinkedInUrls(fields, webContext, linkedinContext, spec.outputFields);
 
     return { fields };
@@ -693,9 +698,11 @@ export class CrmEnrichmentService {
         linkedInAccountId = await this.resolveLinkedInAccountId(spec.userId);
       }
 
+      const enrichConfig = await CrmEnrichmentService.getEnrichmentConfig();
+
       for (const lead of sampleLeads) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
+          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
           samples.push({ leadId: lead.leadId, lead, enrichedFields: fields });
         } catch (err) {
           samples.push({ leadId: lead.leadId, lead, enrichedFields: { _error: String(err) } });
@@ -765,6 +772,8 @@ export class CrmEnrichmentService {
       emit(userRoom, progressEvent, payload);
     };
 
+    const enrichConfig = await CrmEnrichmentService.getEnrichmentConfig();
+
     const parallelism = hasLinkedin && linkedInAccountId ? 5 : 20;
     const chunkSize = Math.max(1, Math.ceil(leadsToProcess.length / parallelism));
     const chunks: any[][] = [];
@@ -785,7 +794,7 @@ export class CrmEnrichmentService {
     const chunkProcessors = chunks.map(async (chunk) => {
       for (const lead of chunk) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
+          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
           const { standardUpdates, customUpdates } = CrmEnrichmentService.splitFields(fields);
 
           await crmDb.updateLead(spec.listId, lead.leadId, {
