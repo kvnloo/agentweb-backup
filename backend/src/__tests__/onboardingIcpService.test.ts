@@ -27,6 +27,7 @@ import {
   extractIcpBrandContext,
   generateIcpsForUser,
   ICP_DISCOVERY_SYSTEM_PROMPT,
+  mapIcpResultToMarketStrategy,
   startIcpDiscoveryForUser,
   triggerIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
@@ -576,6 +577,139 @@ describe("onboardingIcpService", () => {
       expect(patch.icpError.length).toBeGreaterThan(0);
       expect(patch.icpError.length).toBeLessThanOrEqual(512);
       expect(patch.icpError).toContain("could not extract JSON");
+    });
+  });
+
+  // Mirror v2 onboarding ICPs to User.marketStrategy.icp[] so the rest of
+  // the product (Agent Mode, chatbot) sees them. Bug from 2026-04-29:
+  // onboarding finishes with icpResult populated but marketStrategy.icp
+  // empty, so the main account looks blank.
+  describe("mapIcpResultToMarketStrategy", () => {
+    it("maps ICPPersona[] into the marketStrategy.icp shape", () => {
+      const out = mapIcpResultToMarketStrategy([
+        {
+          name: "Series A SaaS founder",
+          pain: "Pipeline dries up after launch",
+          desire: "Predictable demand-gen",
+          objection: "Tools are noisy",
+          meta_targeting_brief: "founders, US, 20-100 employees",
+        } as any,
+      ]);
+      expect(out).toEqual([
+        {
+          title: "Series A SaaS founder",
+          description: "Pipeline dries up after launch",
+          valueProposition: "Predictable demand-gen",
+          buyerPersonas: ["founders, US, 20-100 employees"],
+        },
+      ]);
+    });
+
+    it("returns an empty array for empty / non-array input", () => {
+      expect(mapIcpResultToMarketStrategy([])).toEqual([]);
+      expect(mapIcpResultToMarketStrategy(null as any)).toEqual([]);
+      expect(mapIcpResultToMarketStrategy(undefined as any)).toEqual([]);
+    });
+
+    it("tolerates missing meta_targeting_brief (returns empty buyerPersonas)", () => {
+      const out = mapIcpResultToMarketStrategy([
+        { name: "A", pain: "B", desire: "C", objection: "D", meta_targeting_brief: "" } as any,
+      ]);
+      expect(out[0].buyerPersonas).toEqual([]);
+    });
+  });
+
+  describe("triggerIcpDiscoveryForUser — marketStrategy mirror", () => {
+    it("writes marketStrategy.icp[] alongside the icpReadyPatch when a fresh user record is available", async () => {
+      userDb.getUserById
+        // 1: initial brand context read
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          brandGuidelines: { brandData: { brandName: "Linear" } },
+        })
+        // 2: post-LLM read for icpReadyPatch
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        })
+        // 3: mirror read (NEW) — needs to find the user so the mirror writes
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          marketStrategy: {
+            businessOverview: "existing overview",
+            competitors: [{ name: "Existing Co", description: "preserved" }],
+            icp: [],
+            createdAt: "2026-04-01T00:00:00.000Z",
+            updatedAt: "2026-04-01T00:00:00.000Z",
+          },
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      // Two updates: icpReadyPatch + marketStrategy mirror.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(2);
+
+      const firstWrite = userDb.updateUser.mock.calls[0][1];
+      expect(firstWrite.icpStatus).toBe("ready");
+      expect(firstWrite.icpResult).toHaveLength(5);
+
+      const secondWrite = userDb.updateUser.mock.calls[1][1];
+      expect(secondWrite.marketStrategy).toBeDefined();
+      expect(secondWrite.marketStrategy.icp).toHaveLength(5);
+      // Existing fields preserved.
+      expect(secondWrite.marketStrategy.businessOverview).toBe("existing overview");
+      expect(secondWrite.marketStrategy.competitors).toEqual([
+        { name: "Existing Co", description: "preserved" },
+      ]);
+      // createdAt preserved, updatedAt bumped.
+      expect(secondWrite.marketStrategy.createdAt).toBe("2026-04-01T00:00:00.000Z");
+      expect(secondWrite.marketStrategy.updatedAt).not.toBe("2026-04-01T00:00:00.000Z");
+    });
+
+    it("seeds marketStrategy when User has no prior marketStrategy", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" })
+        .mockResolvedValueOnce({ userId: "user-1" }); // no marketStrategy yet
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      const secondWrite = userDb.updateUser.mock.calls[1][1];
+      expect(secondWrite.marketStrategy.icp).toHaveLength(5);
+      expect(secondWrite.marketStrategy.businessOverview).toBe("");
+      expect(secondWrite.marketStrategy.competitors).toEqual([]);
+      expect(secondWrite.marketStrategy.createdAt).toBeDefined();
+    });
+
+    it("exits silently when the mirror read returns null (user disappeared)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "running" })
+        .mockResolvedValueOnce(null); // user deleted between ready-patch and mirror
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      // Only the icpReadyPatch update fired; mirror exited silently.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT mirror when icpReadyPatch is dropped (stale completion)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "idle" }); // not running
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      // Stale completion path returns before reaching mirror.
+      expect(userDb.updateUser).not.toHaveBeenCalled();
     });
   });
 });
