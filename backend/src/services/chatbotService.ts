@@ -3310,8 +3310,11 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
 // Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
-export function getEmmaSystemContext(): string {
-  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}`;
+export function getEmmaSystemContext(sessionType?: string): string {
+  const scheduledAddendum = sessionType === "scheduled"
+    ? "\nSession type: scheduled (this is an automated run — do NOT suggest creating a schedule, the user has already set one up)."
+    : "";
+  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${scheduledAddendum}`;
 }
 
 // Exported for backwards-compatibility with existing tests — no-op since there is no longer a cache.
@@ -3672,7 +3675,7 @@ export async function generateChatResponse(
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
-    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext() : null;
+    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType) : null;
     const messages = [...session.messages];
     if (freshSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
