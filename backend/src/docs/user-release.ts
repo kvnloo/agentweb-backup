@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fix: Gmail Email Subject Lines Now Display Correctly With Special Characters',
+      '- Email subjects containing special characters such as em-dashes (—), smart quotes, and other non-ASCII unicode were previously showing as garbled or unreadable text in some email clients',
+      '- Subject lines are now properly encoded using the RFC 2047 standard, so characters like em-dashes render as plain, readable text for recipients',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fix: Org Member Token Usage Now Counts Against Org Owner\'s Quota',
       '- Previously, each org member\'s token usage was tracked independently against their own (Free-tier) quota, so members could consume tokens without affecting the org owner\'s limit',
       '- Token usage for org members now counts against the org owner\'s subscription quota — checks, increments, and the subscription usage dashboard all reflect the owner\'s pool',
