@@ -1,4 +1,8 @@
-import { substituteVariables, extractVariables, leadHasVariable } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles } from '../utils/emailVariables';
+import { LLMService } from '../utils/llmService';
+
+jest.mock('../utils/llmService');
+const MockLLMService = LLMService as jest.MockedClass<typeof LLMService>;
 
 describe('substituteVariables', () => {
   // FAIL cases
@@ -114,5 +118,145 @@ describe('leadHasVariable', () => {
 
   it('should return false when customFields object is missing', () => {
     expect(leadHasVariable({}, 'customFields.plan')).toBe(false);
+  });
+});
+
+describe('injectUnsubscribeUrl', () => {
+  const url = 'https://example.com/unsubscribe?id=123';
+
+  // FAIL cases (edge inputs)
+  it('should return empty string unchanged', () => {
+    expect(injectUnsubscribeUrl('', url)).toBe('');
+  });
+
+  it('should handle html with no body tag and no unsubscribe anchor by appending footer at end', () => {
+    const html = '<p>Hello</p>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toContain(url);
+    expect(result).toContain('Unsubscribe');
+  });
+
+  // Step 1: {{unsubscribeUrl}} replacement
+  it('should replace {{unsubscribeUrl}} variable in place', () => {
+    const html = '<a href="{{unsubscribeUrl}}">Unsubscribe</a>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toBe(`<a href="${url}">Unsubscribe</a>`);
+  });
+
+  it('should replace multiple {{unsubscribeUrl}} occurrences', () => {
+    const html = '{{unsubscribeUrl}} and again {{unsubscribeUrl}}';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toBe(`${url} and again ${url}`);
+  });
+
+  // Step 2: update existing unsubscribe anchor href
+  it('should update existing unsubscribe anchor href="#" to real URL', () => {
+    const html = '<body><a href="#">Unsubscribe</a></body>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toContain(`href="${url}"`);
+    expect(result).not.toContain('href="#"');
+  });
+
+  it('should update unsubscribe anchor in full HTML document preserving structure', () => {
+    const html = '<!DOCTYPE html><html><head><style>body{color:red}</style></head><body><a href="#">Unsubscribe</a></body></html>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toContain(`href="${url}"`);
+    expect(result).toContain('<!DOCTYPE html>');
+    expect(result).toContain('body{color:red}');
+  });
+
+  it('should not cross tag boundaries when matching unsubscribe anchor', () => {
+    // Two separate anchors: first one has no "unsubscribe" text, second does
+    const html = '<body><a href="https://other.com">Visit us</a><a href="#">Unsubscribe</a></body>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toContain('href="https://other.com"'); // other link unchanged
+    expect(result).toContain(`href="${url}"`);
+  });
+
+  it('should add href if unsubscribe anchor has none', () => {
+    const html = '<body><a>Unsubscribe</a></body>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toContain(`href="${url}"`);
+  });
+
+  // Step 3: no unsubscribe found — append default footer
+  it('should append default footer before </body> when no unsubscribe exists', () => {
+    const html = '<html><body><p>Content</p></body></html>';
+    const result = injectUnsubscribeUrl(html, url);
+    expect(result).toContain(url);
+    expect(result).toContain('Unsubscribe');
+    expect(result.indexOf(url)).toBeLessThan(result.indexOf('</body>'));
+  });
+
+  it('should use fallbackFooterHtml when provided and no unsubscribe exists', () => {
+    const html = '<html><body><p>Content</p></body></html>';
+    const footer = `<div><a href="{{unsubscribeUrl}}">Click to unsubscribe</a></div>`;
+    const result = injectUnsubscribeUrl(html, url, footer);
+    expect(result).toContain(`href="${url}"`);
+    expect(result).toContain('Click to unsubscribe');
+  });
+});
+
+describe('hasUnsafeEmailStyles', () => {
+  it('should return false for empty string', () => {
+    expect(hasUnsafeEmailStyles('')).toBe(false);
+  });
+
+  it('should return false for HTML with no <style> block', () => {
+    expect(hasUnsafeEmailStyles('<p style="color:red">Hello</p>')).toBe(false);
+  });
+
+  it('should return false for <style> block with only element selectors', () => {
+    const html = '<html><head><style>body { color: red; } p { margin: 0; }</style></head></html>';
+    expect(hasUnsafeEmailStyles(html)).toBe(false);
+  });
+
+  it('should return true for <style> block with class-based rules', () => {
+    const html = '<html><head><style>.header { background: purple; }</style></head></html>';
+    expect(hasUnsafeEmailStyles(html)).toBe(true);
+  });
+
+  it('should return true for HTML with multiple <style> blocks where one has classes', () => {
+    const html = '<head><style>body{}</style><style>.btn { color: white; }</style></head>';
+    expect(hasUnsafeEmailStyles(html)).toBe(true);
+  });
+});
+
+describe('inlineEmailStyles', () => {
+  const htmlWithClasses = '<html><head><style>.btn { color: white; background: purple; }</style></head><body><a class="btn" href="#">Click</a></body></html>';
+  const inlinedHtml = '<html><head></head><body><a href="#" style="color: white; background: purple;">Click</a></body></html>';
+
+  beforeEach(() => {
+    MockLLMService.mockClear();
+  });
+
+  it('should return original html unchanged when no unsafe styles detected', async () => {
+    const html = '<html><body><p style="color:red">Hello</p></body></html>';
+    const result = await inlineEmailStyles(html);
+    expect(result.html).toBe(html);
+    expect(result.wasFixed).toBe(false);
+    expect(MockLLMService).not.toHaveBeenCalled();
+  });
+
+  it('should call LLM and return inlined html when class-based styles detected', async () => {
+    MockLLMService.prototype.generateHTML = jest.fn().mockResolvedValue(inlinedHtml);
+    const result = await inlineEmailStyles(htmlWithClasses);
+    expect(result.wasFixed).toBe(true);
+    expect(result.html).toBe(inlinedHtml);
+    expect(MockLLMService.prototype.generateHTML).toHaveBeenCalledTimes(1);
+  });
+
+  it('should return original html if LLM returns suspiciously short output', async () => {
+    MockLLMService.prototype.generateHTML = jest.fn().mockResolvedValue('<p>x</p>');
+    const result = await inlineEmailStyles(htmlWithClasses);
+    expect(result.wasFixed).toBe(false);
+    expect(result.html).toBe(htmlWithClasses);
+  });
+
+  it('should return original html if LLM call throws', async () => {
+    MockLLMService.prototype.generateHTML = jest.fn().mockRejectedValue(new Error('LLM timeout'));
+    const result = await inlineEmailStyles(htmlWithClasses);
+    expect(result.wasFixed).toBe(false);
+    expect(result.html).toBe(htmlWithClasses);
   });
 });
