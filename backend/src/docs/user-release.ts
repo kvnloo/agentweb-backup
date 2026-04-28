@@ -29,6 +29,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Fixed: Gmail Connected Account No Longer Shows as Inactive After Reconnect',
+      '- Gmail accounts were incorrectly showing as inactive in the connected accounts status even though emails were sending successfully',
+      '- The issue occurred because the activity check did not account for Gmail\'s automatic token renewal via refresh token',
+      '- Gmail (and other OAuth platforms with a refresh token) now correctly report as active, matching the status shown in Settings → Connected Accounts',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Fix: Org Member Token Usage Now Counts Against Org Owner\'s Quota',
       '- Previously, each org member\'s token usage was tracked independently against their own (Free-tier) quota, so members could consume tokens without affecting the org owner\'s limit',
       '- Token usage for org members now counts against the org owner\'s subscription quota — checks, increments, and the subscription usage dashboard all reflect the owner\'s pool',
