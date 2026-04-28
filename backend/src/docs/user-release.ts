@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-28',
     changes: [
+      'Improvement: Smarter Quick-Reply Suggestions in Emma Chat',
+      '- Emma now generates contextual quick-reply chips tailored to each specific response, replacing the previous fixed set of generic options',
+      '- Suggestions are powered by a fast AI model and reflect the actual content of the conversation — e.g. after drafting subject lines, chips might say "Write the email body for #2" or "Generate 3 more options"',
+      '- Suggestions now persist when you reload or return to a chat session',
+      '- The previous regex-based chips (Yes / No / Tell me more) remain as an instant fallback while the AI-generated ones load',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
       'Improvement: Test Emails Now Auto-Fix CSS for Gmail and Outlook Compatibility',
       '- When sending a test email for a sequence step, the system now automatically detects class-based CSS that Gmail and Outlook would strip',
       '- If detected, Claude Sonnet 4.6 converts all CSS classes to inline styles while preserving every color, font, size, and layout exactly',
