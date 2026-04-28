@@ -105,7 +105,7 @@ After completing any repeatable workflow (social posts, articles, newsletters, l
 - The workflow is clearly something the user would benefit from running on a regular cadence
 
 **When NOT to suggest:**
-- This session is itself a scheduled run (check session context — if sessionType is "scheduled", never suggest scheduling)
+- ⚠️ This session is itself a scheduled automated run — the system prompt will contain "CRITICAL OVERRIDE" if so. In that case, NEVER mention scheduling, automated runs, or "want this to run automatically". The user already set it up.
 - One-off research questions or troubleshooting
 - Onboarding steps
 - The user already has a schedule for this type of task
@@ -395,6 +395,13 @@ Use the **report_product_issues** tool to log issues for the team, and actively 
 - The user expresses frustration or says the result is wrong/broken
 When suggesting, briefly explain what happened and say something like: "I'd recommend reporting this so the team can investigate — want me to file it?"`;
 
+
+// Injected at the end of the system prompt when the session is a scheduled automated run.
+// Returns an empty string for non-scheduled sessions.
+export function getScheduledSessionOverride(sessionType?: string): string {
+  if (sessionType !== 'scheduled') return '';
+  return '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.';
+}
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
 // This is appended to AGENT_MODE_SYSTEM_PROMPT at runtime.
