@@ -182,6 +182,22 @@ describe('getEmmaSystemContext', () => {
     expect(() => __resetEmmaSystemContextCache()).not.toThrow();
   });
 
+  it('does not include schedule addendum for regular sessions', () => {
+    const result = getEmmaSystemContext('regular');
+    expect(result).not.toContain('do NOT suggest creating a schedule');
+  });
+
+  it('does not include schedule addendum when sessionType is undefined', () => {
+    const result = getEmmaSystemContext();
+    expect(result).not.toContain('do NOT suggest creating a schedule');
+  });
+
+  it('includes schedule addendum for scheduled sessions', () => {
+    const result = getEmmaSystemContext('scheduled');
+    expect(result).toContain('do NOT suggest creating a schedule');
+    expect(result).toContain('automated run');
+  });
+
 });
 
 describe('buildUserAnalyticsContext', () => {
