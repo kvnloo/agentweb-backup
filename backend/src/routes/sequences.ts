@@ -37,7 +37,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 // POST /api/crm/sequences
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
   if (!name || typeof name !== 'string' || !name.trim()) {
     return res.status(400).json({ error: 'name is required' });
   }
@@ -49,6 +49,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       description,
       campaignType,
       enrollmentTrigger,
+      enrollmentCondition,
       exitConditions,
       steps,
       status,
@@ -78,13 +79,14 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
   try {
     const input: UpdateSequenceInput = {
       name,
       description,
       campaignType,
       enrollmentTrigger,
+      enrollmentCondition,
       exitConditions,
       steps,
       status,
