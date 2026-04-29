@@ -1077,6 +1077,8 @@ emmaToolRegistry.register({
             toneOfVoice: { type: 'string', description: 'Brand tone of voice' },
             brandPersonality: { type: 'string', description: 'Brand personality description' },
             targetAudience: { type: 'string', description: 'Target audience description' },
+            valueProposition: { type: 'string', description: 'Brand-level value proposition — single most compelling promise the company makes to its customers, in one sentence. Used as the seed for the onboarding value-prop review screen.' },
+            logoUrl: { type: 'string', description: 'Direct URL to the brand logo as discovered on the company website (e.g. https://example.com/logo.svg). Used by the onboarding review screens and downstream creative/ad surfaces.' },
             keyMessages: {
               type: 'array',
               items: { type: 'string' },
