@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, hasUnsafeEmailStyles } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
 import axios from 'axios';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
@@ -36,6 +36,7 @@ import {
 } from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { normalizeAttribution } from '../types/attribution';
+import { dripSequenceDb } from '../services/dripSequenceDb';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -43,6 +44,67 @@ const d1StripeClient = d1StripeSecretKey
   : null;
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+/**
+ * Fire-and-forget: enroll a single newly created lead into any sequences that
+ * have autoEnrollListIds containing this list. Errors are logged but never surfaced.
+ */
+async function autoEnrollLeadInSequences(
+  userId: string,
+  listId: string,
+  leadId: string,
+  leadEmail: string,
+): Promise<void> {
+  if (!leadEmail) return;
+  try {
+    const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
+    for (const seq of sequences) {
+      await dripSequenceDb.bulkEnroll([{
+        sequenceId: seq.sequenceId,
+        userId,
+        listId,
+        leadId,
+        leadEmail,
+      }]);
+    }
+  } catch (err) {
+    console.error('[crm] autoEnrollLeadInSequences error:', err);
+  }
+}
+
+/**
+ * Fire-and-forget: after a bulk import, re-run bulkEnroll for all current leads
+ * in the list against any sequences watching it. The bulkEnroll dedup ensures
+ * already-enrolled leads are skipped; only genuinely new leads get added.
+ */
+async function autoEnrollListIntoSequences(userId: string, listId: string): Promise<void> {
+  try {
+    const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
+    if (sequences.length === 0) return;
+
+    const leadsResult = await crmDb.getLeadsByListId(listId);
+    const leads = Array.isArray(leadsResult)
+      ? leadsResult
+      : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
+
+    for (const seq of sequences) {
+      const inputs = leads
+        .filter((l: any) => l.email)
+        .map((l: any) => ({
+          sequenceId: seq.sequenceId,
+          userId,
+          listId,
+          leadId: l.leadId,
+          leadEmail: l.email,
+        }));
+      if (inputs.length > 0) {
+        await dripSequenceDb.bulkEnroll(inputs);
+      }
+    }
+  } catch (err) {
+    console.error('[crm] autoEnrollListIntoSequences error:', err);
+  }
+}
 
 // In-memory cache for CRM data files uploaded to S3
 // Key: `${userId}:${listId}`, Value: { leadsUrl, eventsUrl, expiresAt }
@@ -1440,6 +1502,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
+      autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, leadData.email ?? ''),
     ]);
 
     res.status(201).json(lead);
@@ -1505,6 +1568,11 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
     });
 
     const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+
+    // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
+    if (result.newCount > 0) {
+      void autoEnrollListIntoSequences(userId, listId);
+    }
 
     res.status(201).json({
       imported: result.newCount,
@@ -1942,6 +2010,10 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
 
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads);
+
+    if (results.newCount > 0) {
+      void autoEnrollListIntoSequences(userId, listId);
+    }
 
     res.json({
       success: true,
@@ -2487,6 +2559,10 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       // Emit final progress
       emitProgress('Import complete!', 100);
+
+      if (connectionsSuccessCount > 0) {
+        void autoEnrollListIntoSequences(userId, listId);
+      }
 
       res.json({
         success: true,
@@ -4165,18 +4241,12 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
 
-    // Detect and fix class-based CSS that most email clients strip
-    const { html: processedHtml, wasFixed } = await inlineEmailStyles(htmlContent);
-
-    const stylesNote = wasFixed
-      ? ' | ✅ Styles auto-fixed: CSS classes converted to inline styles'
-      : '';
-    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email${stylesNote}</div>`;
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
 
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(processedHtml)
-      ? processedHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + processedHtml;
+    const withBanner = /<body\b/i.test(htmlContent)
+      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + htmlContent;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
     const from = `${senderName} <${senderEmail}>`;
@@ -4318,10 +4388,14 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       bodyContent = bodyContent.substring(0, 200000);
     }
 
+    // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
+    // Doing this at import time avoids the LLM call at every test-send or real send.
+    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
+
     return res.json({
       success: true,
       title: extractedTitle,
-      message: bodyContent,
+      message: inlinedContent,
     });
   } catch (error: any) {
     console.error('Error loading HTML from URL:', error.message || error);

@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, hasUnsafeEmailStyles } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
 
 const router = express.Router();
 
@@ -79,7 +79,7 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
   try {
     const input: UpdateSequenceInput = {
       name,
@@ -88,6 +88,7 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
       enrollmentTrigger,
       enrollmentCondition,
       exitConditions,
+      autoEnrollListIds,
       steps,
       status,
     };
@@ -219,6 +220,17 @@ router.post(
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
+
+      // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
+      // unless it's already there. This means new leads added to this list later
+      // will be automatically enrolled.
+      const existing = sequence.autoEnrollListIds ?? [];
+      if (!existing.includes(listId)) {
+        void dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, {
+          autoEnrollListIds: [...existing, listId],
+        }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));
+      }
+
       res.json(result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
@@ -285,19 +297,12 @@ router.post(
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=TEST&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
 
-    // Detect and fix class-based CSS that most email clients strip
-    const needsInlining = hasUnsafeEmailStyles(htmlContent);
-    const { html: processedHtml, wasFixed } = await inlineEmailStyles(htmlContent);
-
-    const stylesNote = wasFixed
-      ? ' | ✅ Styles auto-fixed: CSS classes converted to inline styles'
-      : '';
-    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email${stylesNote}</div>`;
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email</div>`;
 
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(processedHtml)
-      ? processedHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + processedHtml;
+    const withBanner = /<body\b/i.test(htmlContent)
+      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + htmlContent;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
@@ -489,10 +494,14 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
       bodyContent = bodyContent.substring(0, 200000);
     }
 
+    // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
+    // Doing this at import time avoids the LLM call at every test-send or real send.
+    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
+
     return res.json({
       success: true,
       title: extractedTitle,
-      message: bodyContent,
+      message: inlinedContent,
     });
   } catch (error: any) {
     console.error('[sequences] load-from-url error:', error.message || error);

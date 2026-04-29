@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Fixed: Sequence Email CSS Styles Now Converted at Import Time',
+      '- When loading an email template from a URL into a Sequence step (or CRM group email), CSS class-based styles are now converted to inline styles immediately on import',
+      '- Previously, this conversion happened at send time (including test sends), causing delays and inconsistency — the stored email body could look different than what was sent',
+      '- The stored bodyHtml is now already email-client-safe after loading from URL, so test sends and real sends are fast and consistent',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Fix: PR Digest Now Returns All PRs for Large Date Ranges',
       '- The get_pr_digest admin tool previously capped results at ~200 PRs total (100 per repo) due to missing pagination',
       '- Requesting a 30-day range now correctly returns all merged PRs across the full window instead of only the most recent ~3 days',
@@ -5404,6 +5413,24 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Lead Engagements Now Load Correctly',
       '- Clicking on a lead in the CRM page no longer shows "Failed to load engagements" every time',
       '- The error was caused by a missing AWS region configuration in the email events service',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: CRM Sequences Now Auto-Enroll New Leads',
+      '- When you enroll a lead list into a sequence, new leads added to that list are automatically enrolled in the sequence going forward',
+      '- Auto-enrollment is on by default and can be toggled off per-list from the sequence enrollment detail view',
+      '- Re-enrolling a list no longer re-enrolls leads who already completed or converted — they are correctly skipped',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: Evaluation Scoring No Longer Penalizes Slack Suggest Sessions for Unresolvable User Input',
+      '- When Emma drafts a suggested response to an inbound Slack message, the session scorer now understands her role is response drafting — not directly fulfilling the Slack contact\'s request',
+      '- Previously, if a Slack contact sent garbled or misdirected messages, the scorer penalized goalCompletion even when Emma responded perfectly',
+      '- The fix injects session context into the conversation transcript so the scorer evaluates draft quality, not end-user goal fulfillment',
     ],
   },
 ];
