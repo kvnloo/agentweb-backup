@@ -814,67 +814,58 @@ function mergeWallaceWithRegex(
 ): DesignTokens {
   const result = { ...regexTokens };
 
+  // Helper: wallace .unique fields are frequency maps ({ value: count }), not arrays
+  const wallaceKeys = (unique: unknown): string[] =>
+    unique && typeof unique === 'object' && !Array.isArray(unique)
+      ? Object.keys(unique as Record<string, unknown>)
+      : Array.isArray(unique) ? (unique as string[]) : [];
+
   // Enhance colors with wallace unique values
-  if (wallace.values?.colors?.unique) {
-    const wallaceColors = wallace.values.colors.unique as string[];
-    for (const colorStr of wallaceColors) {
-      const normalized = normalizeColor(colorStr);
-      if (normalized && !result.colors.all.some(c => c.value === normalized)) {
-        result.colors.all.push({ value: normalized, count: 1, contexts: [] });
-      }
+  for (const colorStr of wallaceKeys(wallace.values?.colors?.unique)) {
+    const normalized = normalizeColor(colorStr);
+    if (normalized && !result.colors.all.some(c => c.value === normalized)) {
+      result.colors.all.push({ value: normalized, count: 1, contexts: [] });
     }
   }
 
   // Enhance font families
-  if (wallace.values?.fontFamilies?.unique) {
-    for (const family of wallace.values.fontFamilies.unique as string[]) {
-      const cleaned = family.replace(/['"]/g, '').split(',')[0].trim();
-      if (cleaned && !result.typography.fontFamilies.some(f => f.family === cleaned)) {
-        result.typography.fontFamilies.push({ family: cleaned, count: 1 });
-      }
+  for (const family of wallaceKeys(wallace.values?.fontFamilies?.unique)) {
+    const cleaned = family.replace(/['"]/g, '').split(',')[0].trim();
+    if (cleaned && !result.typography.fontFamilies.some(f => f.family === cleaned)) {
+      result.typography.fontFamilies.push({ family: cleaned, count: 1 });
     }
   }
 
   // Enhance font sizes
-  if (wallace.values?.fontSizes?.unique) {
-    for (const size of wallace.values.fontSizes.unique as string[]) {
-      if (!result.typography.fontSizes.some(f => f.size === size)) {
-        result.typography.fontSizes.push({ size, count: 1 });
-      }
+  for (const size of wallaceKeys(wallace.values?.fontSizes?.unique)) {
+    if (!result.typography.fontSizes.some(f => f.size === size)) {
+      result.typography.fontSizes.push({ size, count: 1 });
     }
   }
 
   // Enhance line heights
-  if (wallace.values?.lineHeights?.unique) {
-    for (const height of wallace.values.lineHeights.unique as string[]) {
-      if (!result.typography.lineHeights.some(l => l.height === height)) {
-        result.typography.lineHeights.push({ height, count: 1 });
-      }
+  for (const height of wallaceKeys(wallace.values?.lineHeights?.unique)) {
+    if (!result.typography.lineHeights.some(l => l.height === height)) {
+      result.typography.lineHeights.push({ height, count: 1 });
     }
   }
 
   // Enhance box shadows
-  if (wallace.values?.boxShadows?.unique) {
-    for (const shadow of wallace.values.boxShadows.unique as string[]) {
-      if (!result.visualEffects.boxShadows.some(s => s.value === shadow)) {
-        result.visualEffects.boxShadows.push({ value: shadow, count: 1 });
-      }
+  for (const shadow of wallaceKeys(wallace.values?.boxShadows?.unique)) {
+    if (!result.visualEffects.boxShadows.some(s => s.value === shadow)) {
+      result.visualEffects.boxShadows.push({ value: shadow, count: 1 });
     }
   }
 
   // Enhance text shadows
-  if (wallace.values?.textShadows?.unique) {
-    for (const shadow of wallace.values.textShadows.unique as string[]) {
-      result.visualEffects.textShadows.push({ value: shadow, count: 1 });
-    }
+  for (const shadow of wallaceKeys(wallace.values?.textShadows?.unique)) {
+    result.visualEffects.textShadows.push({ value: shadow, count: 1 });
   }
 
   // Enhance border radius
-  if (wallace.values?.borderRadiuses?.unique) {
-    for (const radius of wallace.values.borderRadiuses.unique as string[]) {
-      if (!result.visualEffects.borderRadius.some(r => r.value === radius)) {
-        result.visualEffects.borderRadius.push({ value: radius, count: 1 });
-      }
+  for (const radius of wallaceKeys(wallace.values?.borderRadiuses?.unique)) {
+    if (!result.visualEffects.borderRadius.some(r => r.value === radius)) {
+      result.visualEffects.borderRadius.push({ value: radius, count: 1 });
     }
   }
 

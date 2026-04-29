@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Fix: Brand Token Extraction No Longer Fails on CSS Analysis',
+      '- read_page_source with extractDesignTokens=true previously threw "wallaceColors is not iterable" for some websites',
+      '- The CSS analyzer returns color/font/shadow data as frequency-map objects, not arrays — the iteration logic now handles both formats',
+      '- Design tokens (colors, fonts, border radius, shadows) are now correctly extracted from CSS during landing page onboarding',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Fixed: Sequence Email CSS Styles Now Converted at Import Time',
       '- When loading an email template from a URL into a Sequence step (or CRM group email), CSS class-based styles are now converted to inline styles immediately on import',
       '- Previously, this conversion happened at send time (including test sends), causing delays and inconsistency — the stored email body could look different than what was sent',
