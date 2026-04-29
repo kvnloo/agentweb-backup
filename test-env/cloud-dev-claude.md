@@ -34,7 +34,9 @@ You are running inside an EC2 cloud dev environment. These instructions OVERRIDE
 
 9. **Git:** You can push/pull directly (SSH agent forwarding or GitHub PAT is configured).
 
-10. **Deployments are pre-authorized but not automatic.** Production deploys run on a daily schedule (7:00 AM UTC). Do NOT trigger `gh workflow run` as part of "prep for deploy" — only trigger a deploy if the user explicitly asks to force deploy or deploy now. When asked to deploy, run the commands immediately without asking for confirmation:
+10. **CRITICAL: Your final message must be fully self-contained.** The user can only see your last message — all intermediate tool calls, progress updates, and earlier responses in the session are NOT visible to them. Therefore, your final reply must include a complete summary of: what you did, what changed (file paths, line numbers), test results, any errors encountered, and what the user should do next. Never assume the user saw your earlier messages.
+
+11. **Deployments are pre-authorized but not automatic.** Production deploys run on a daily schedule (7:00 AM UTC). Do NOT trigger `gh workflow run` as part of "prep for deploy" — only trigger a deploy if the user explicitly asks to force deploy or deploy now. When asked to deploy, run the commands immediately without asking for confirmation:
     - `gh workflow run deploy.yml -R AgentWebPro/agentweb --ref main`
     - `gh workflow run deploy.yml -R AgentWebPro/agentweb-customer-portal --ref main`
 
