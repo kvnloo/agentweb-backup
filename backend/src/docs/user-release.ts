@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-29',
+    changes: [
+      'Improvement: Invited Org Members Skip Onboarding',
+      '- Users invited to join an organization are no longer forced through the onboarding flow after signing up or logging in',
+      '- After logging in, invited users are redirected directly to the Accept Invitation page',
+      '- Once the invitation is accepted, the user is immediately active as an org member with access to shared brand guidelines, market strategy, and connected accounts',
+      '- Onboarding is designed to convert free users to paid — org members are covered by the org owner\'s subscription and do not need it',
+    ],
+  },
+  {
     date: '2026-04-28',
     changes: [
       'Improvement: Smarter Quick-Reply Suggestions in Emma Chat',
