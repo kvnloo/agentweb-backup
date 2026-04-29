@@ -1,3 +1,35 @@
+## coding_agent "No GitHub / No Vercel" — Investigation (2026-04-29)
+
+### Context
+
+John (`founders@agentweb.pro`) reported that the `coding_agent` tool failed on the "Free AI Eval" landing page (`ai-eval-85a928ad`, `https://audit.agentweb.pro/ai-eval`) after 8 iterations with "No GitHub repository / No Vercel project" errors on all file-editing and deployment tools.
+
+### Root Cause 1: Missing `githubRepoUrl` / `vercelProjectId` on DynamoDB record
+
+The page record existed with `status: deployed` and a live `deployedUrl`, but `githubRepoUrl` and `vercelProjectId` were completely absent. Every coding agent tool — `list_files`, `read_file`, `edit_file`, `check_deployment` — calls `getLandingPage()` and checks these fields before doing anything.
+
+**Why it happened:** `addPageToExistingRepo()` copies these fields from a sibling page at record creation, but the final deployed-status `UPDATE` only wrote `status` and `updatedAt`. If the initial PUT was incomplete for any reason, the record was permanently broken.
+
+**Fix:** The `UPDATE` in `addPageToExistingRepo()` now also re-writes `githubRepoUrl` and `vercelProjectId` (`v0Service.ts`). Backfilled the specific record in production using `repair-landing-page-repo-fields.ts`.
+
+### Root Cause 2: Stale `vercelProjectId` across all pages
+
+After fixing root cause 1, `get_landing_page_preview_url` and `get_deployment_status` failed with 500. The stored Vercel project ID `prj_8MJIkLDVNod9XRj5Kbl0FIk7EhJ3` was stale — the Vercel project had been recreated. All 5 of john's pages had the old ID.
+
+**Fix:** Checked the Vercel dashboard (`vercel.com/agentweb/agentweb-landing-page`), found the new project ID `prj_lH8z68FO47QtpLrLa45FnFRc2xwV`, and ran `repair-vercel-project-id.ts` to update all 5 pages in production.
+
+### How to diagnose this in future
+
+1. Check the DynamoDB record directly: `aws dynamodb get-item --table-name AW-LandingPages --key '{"id":{"S":"<page-id>"}}'` — look for `githubRepoUrl` and `vercelProjectId`.
+2. If `vercelProjectId` is present but deployment APIs return 500, test it: `curl -H "Authorization: Bearer <VERCEL_TOKEN>" "https://api.vercel.com/v9/projects/<vercelProjectId>"`. A 404 means the project was recreated — check the Vercel dashboard for the new project ID.
+3. When a Vercel project is recreated, update all pages sharing the old ID using `repair-vercel-project-id.ts` (update `OLD_ID`/`NEW_ID` constants first).
+
+### Lesson
+
+When the Vercel project is recreated or migrated, all `AW-LandingPages` records pointing to the old project ID become silently broken. There is no automatic sync. Any time Vercel project management happens (delete, transfer, recreate), run the repair script immediately.
+
+---
+
 ## Emma 3-Dimension Scores Missing — Investigation (2026-04-28)
 
 ### Context
