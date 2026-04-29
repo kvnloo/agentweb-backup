@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
 import { Profile } from "passport-google-oauth20";
 import { waitlistDb } from "../services/waitlistDb";
 import { v4 as uuidv4 } from "uuid";
@@ -103,6 +103,21 @@ export const register = async (req: Request, res: Response) => {
         ...(touch.utm?.medium && { utmMedium: touch.utm.medium }),
       }),
     });
+
+    // If a pending org invite exists for this email, stamp it on the new user so
+    // ProtectedRoute redirects them to accept-invite instead of onboarding.
+    try {
+      const pendingOrg = await orgDb.getOrgWithPendingInviteForEmail(email);
+      if (pendingOrg) {
+        const invite = pendingOrg.pendingInvites!.find((inv) => inv.email === email.toLowerCase())!;
+        await userDb.updateUser(userId, {
+          pendingOrgInvite: { orgId: pendingOrg.orgId, inviteToken: invite.inviteToken },
+        });
+      }
+    } catch (err) {
+      console.error("Failed to check pending org invite for new user:", err);
+      // Non-fatal — user can still accept invite via the link in the email
+    }
 
     // Auto-sync new user to CRM lead list (fire-and-forget)
     syncNewUserToLeadList({
@@ -377,6 +392,23 @@ export const googleCallback = async (
             .then(() => userDb.updateUser(user!.userId, { introductionEmailSent: new Date().toISOString() }))
             .catch((err) => console.error("Failed to send team introduction email:", err));
         }
+      }
+    }
+
+    // For newly created users: check if a pending org invite exists for this email
+    // and stamp it so ProtectedRoute redirects them to accept-invite instead of onboarding.
+    if (user && !user.orgId && !user.pendingOrgInvite) {
+      try {
+        const pendingOrg = await orgDb.getOrgWithPendingInviteForEmail(email);
+        if (pendingOrg) {
+          const invite = pendingOrg.pendingInvites!.find((inv) => inv.email === email.toLowerCase())!;
+          await userDb.updateUser(user.userId, {
+            pendingOrgInvite: { orgId: pendingOrg.orgId, inviteToken: invite.inviteToken },
+          });
+          user.pendingOrgInvite = { orgId: pendingOrg.orgId, inviteToken: invite.inviteToken };
+        }
+      } catch (err) {
+        console.error("Failed to check pending org invite for new OAuth user:", err);
       }
     }
 
