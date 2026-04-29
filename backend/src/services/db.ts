@@ -459,6 +459,10 @@ export interface User {
   allowedSkills?: string[];
   orgId?: string;
   orgRole?: "owner" | "member";
+  // Set when an org owner invites this email; cleared when invite is accepted or cancelled.
+  // Used to redirect users straight to accept-invite instead of onboarding.
+  // null is used by updateUser to explicitly remove the field from DynamoDB.
+  pendingOrgInvite?: { orgId: string; inviteToken: string } | null;
   /**
    * Attribution — forward-compatible with a future UserTouches timeline table.
    * firstTouch is set once at signup and never mutated; lastTouch refreshes on
@@ -6206,6 +6210,25 @@ export const orgDb = {
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
     return total;
+  },
+
+  // Find the first org that has a pending invite for the given email.
+  // Used at registration time to stamp pendingOrgInvite on a brand-new account.
+  async getOrgWithPendingInviteForEmail(email: string): Promise<Organization | null> {
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    const normalizedEmail = email.toLowerCase();
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      const match = (result.Items as Organization[] || []).find(
+        (org) => (org.pendingInvites || []).some((inv) => inv.email === normalizedEmail)
+      );
+      if (match) return match;
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return null;
   },
 
   ORG_MAX_MEMBERS,
