@@ -91,6 +91,22 @@ function requireUserId(req: Request, res: Response): string | null {
   return userId;
 }
 
+/**
+ * Email pulled from the auth middleware. Used by status routes that need
+ * a strong-consistent base-table read (via `userDb.getUserByEmailConsistent`)
+ * to avoid the eventually-consistent UserIdIndex GSI returning stale rows
+ * during the 0-1000ms window after an updateUser write.
+ */
+function requireUserEmail(req: Request, res: Response): string | null {
+  const authReq = req as AuthenticatedRequest;
+  const email = authReq.user?.email;
+  if (!email) {
+    res.status(401).json({ message: "User not authenticated" });
+    return null;
+  }
+  return email;
+}
+
 // ───────────────────────────────────── ICP ─────────────────────────────────────
 
 router.post("/icp/start", authenticateToken, async (req, res) => {
@@ -98,12 +114,16 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
     const userId = requireUserId(req, res);
     if (!userId) return;
     // startIcpDiscoveryForUser applies icpStartPatch synchronously and
-    // launches the background LLM call (fire-and-forget). The route returns
-    // the running snapshot immediately so the UI can poll /icp/status.
+    // launches the background LLM call (fire-and-forget). Return the
+    // running snapshot directly from the patch we just persisted — do
+    // NOT read the user back via getUserById here. UserIdIndex is
+    // eventually consistent, and a stale GSI read can return the
+    // pre-update row (icpStatus='ready' + previous icpResult), which
+    // tells the FE to stop polling. Source of truth for the response
+    // is what we just wrote, not what the GSI happens to surface in
+    // the next 100-1000ms.
     await startIcpDiscoveryForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = icpStartPatch();
-    return res.json({ status: icpSnapshot(user || fallback) });
+    return res.json({ status: icpSnapshot(icpStartPatch()) });
   } catch (err) {
     console.error("[icp] start failed", err);
     return res.status(500).json({ message: "Failed to start icp" });
@@ -112,9 +132,14 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
 
 router.get("/icp/status", authenticateToken, async (req, res) => {
   try {
-    const userId = requireUserId(req, res);
-    if (!userId) return;
-    const user = await userDb.getUserById(userId);
+    // Strong-consistent base-table read by email — see requireUserEmail
+    // doc + the 2026-04-27 Maya regen-spinner-stuck investigation. The
+    // GSI-based getUserById can return pre-update rows during the 0-1000ms
+    // window after the regenerate-one POST flips icpStatus to 'running',
+    // which causes the FE polling hook to terminate prematurely.
+    const email = requireUserEmail(req, res);
+    if (!email) return;
+    const user = await userDb.getUserByEmailConsistent(email);
     if (!user) return res.status(404).json({ message: "User not found" });
     return res.json({ status: icpSnapshot(user) });
   } catch (err) {
@@ -680,9 +705,14 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // optimistically renders a per-card stall, then drops it when status
     // flips back to ready.
     await startIcpDiscoveryForUser(userId);
-    const user = await userDb.getUserById(userId);
-    const fallback = icpStartPatch();
-    return res.json({ status: icpSnapshot(user || fallback) });
+    // Return the running snapshot directly from the patch we just wrote.
+    // Do NOT read back via getUserById — UserIdIndex is eventually
+    // consistent and the stale GSI row (icpStatus='ready' + old
+    // icpResult) was the root cause of the regen-spinner-stuck bug
+    // observed during the 2026-04-27 baseline rerun. With this change,
+    // the FE always sees status='running' immediately after the POST
+    // and keeps polling until the trigger persists fresh ICPs.
+    return res.json({ status: icpSnapshot(icpStartPatch()) });
   } catch (err) {
     console.error("[icp] regenerate-one failed", err);
     return res.status(500).json({ message: "Failed to regenerate icp" });

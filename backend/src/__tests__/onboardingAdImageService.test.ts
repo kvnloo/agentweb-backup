@@ -19,6 +19,20 @@ jest.mock("../services/db", () => ({
   },
 }));
 
+// Mock the chat-session mirror so the success path stays testable as
+// "exactly one userDb.updateUser call". The mirror is exercised by its
+// own dedicated test file (onboardingAdImageChatSessionMirror.test.ts).
+// Without this mock, ChatbotDB.createChatSession fires a real
+// userDb.updateUser({ lastActiveAt }) which inflates the call count
+// here and makes the existing assertions on updateUser.mock.calls[0]
+// pick up the wrong write. The mock returns a stable sessionId so the
+// caller can still fold `adImageChatSessionId` into the ready patch.
+jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
+  mirrorOnboardingAdImagesToChatSession: jest
+    .fn()
+    .mockResolvedValue("mocked-onboarding-session-id"),
+}));
+
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,

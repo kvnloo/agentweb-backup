@@ -15,6 +15,7 @@ jest.mock("../services/db", () => ({
 import {
   generateCompetitorStrategyForUser,
   COMPETITOR_STRATEGY_SYSTEM_PROMPT,
+  mapCompetitorResultToMarketStrategy,
   startCompetitorStrategyForUser,
   triggerCompetitorStrategyForUser,
 } from "../services/onboardingCompetitorService";
@@ -569,6 +570,145 @@ describe("onboardingCompetitorService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.competitorStatus).toBe("running");
       expect(startPatch.competitorStartedAt).toBeTruthy();
+    });
+  });
+
+  // Mirror v2 onboarding competitors → marketStrategy.competitors[].
+  // Same backfill as the icp service. See onboardingIcpService.test.ts for
+  // the matching ICP-side coverage.
+  describe("mapCompetitorResultToMarketStrategy", () => {
+    it("flattens per_icp competitors into deduped {name, description}[]", () => {
+      const out = mapCompetitorResultToMarketStrategy({
+        per_icp: [
+          {
+            icp_id: "icp-1",
+            competitor_names: ["Apollo", "Clay"],
+            offer_angles: ["AI prospecting", "Data enrichment"],
+            meta_targeting_brief: "founders, SaaS",
+          },
+          {
+            icp_id: "icp-2",
+            competitor_names: ["Apollo", "Outreach"],
+            offer_angles: ["Sequencing"],
+            meta_targeting_brief: "agencies",
+          },
+        ],
+      });
+      // Apollo deduped (appears in both ICPs); descriptions collected
+      // across both.
+      expect(out).toHaveLength(3);
+      const apollo = out.find((c) => c.name === "Apollo");
+      expect(apollo).toBeDefined();
+      expect(apollo!.description).toContain("AI prospecting");
+      // Other competitors get their own descriptions from their own ICP.
+      const clay = out.find((c) => c.name === "Clay");
+      expect(clay!.description).toBe("AI prospecting; Data enrichment");
+      const outreach = out.find((c) => c.name === "Outreach");
+      expect(outreach!.description).toBe("Sequencing");
+    });
+
+    it("returns an empty array for empty / malformed input", () => {
+      expect(mapCompetitorResultToMarketStrategy({ per_icp: [] })).toEqual([]);
+      expect(
+        mapCompetitorResultToMarketStrategy(null as any),
+      ).toEqual([]);
+      expect(
+        mapCompetitorResultToMarketStrategy({ per_icp: null as any }),
+      ).toEqual([]);
+    });
+
+    it("falls back to a generic description when no offer angles are present", () => {
+      const out = mapCompetitorResultToMarketStrategy({
+        per_icp: [
+          {
+            icp_id: "icp-1",
+            competitor_names: ["Acme"],
+            offer_angles: [],
+            meta_targeting_brief: "",
+          },
+        ],
+      });
+      expect(out).toEqual([
+        { name: "Acme", description: "Identified during onboarding" },
+      ]);
+    });
+
+    it("caps at 10 competitors", () => {
+      const names = Array.from({ length: 15 }, (_, i) => `Competitor ${i}`);
+      const out = mapCompetitorResultToMarketStrategy({
+        per_icp: [
+          {
+            icp_id: "icp-1",
+            competitor_names: names,
+            offer_angles: ["angle"],
+            meta_targeting_brief: "",
+          },
+        ],
+      });
+      expect(out).toHaveLength(10);
+    });
+  });
+
+  describe("triggerCompetitorStrategyForUser — marketStrategy mirror", () => {
+    it("writes marketStrategy.competitors[] alongside the competitorReadyPatch", async () => {
+      // The competitor service reads the user record before the LLM call
+      // (gate check on icpStatus=ready) and then again before the
+      // readyPatch + once more for the mirror. So we need 3 mocks for the
+      // happy path.
+      const personas = [samplePersona(1), samplePersona(2)];
+      userDb.getUserById
+        // 1: gate read — needs icpStatus ready and personas
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+          icps: personas,
+          competitorStatus: "running",
+        })
+        // 2: post-LLM read for competitorReadyPatch
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-25T11:59:00.000Z",
+        })
+        // 3: mirror read — preserves existing icp[] + businessOverview
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          marketStrategy: {
+            businessOverview: "existing overview",
+            competitors: [],
+            icp: [{ title: "preserved", description: "icp", valueProposition: "vp", buyerPersonas: [] }],
+            createdAt: "2026-04-01T00:00:00.000Z",
+            updatedAt: "2026-04-01T00:00:00.000Z",
+          },
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm([
+        sampleCompetitorResp(1),
+        sampleCompetitorResp(2),
+      ]);
+      await triggerCompetitorStrategyForUser("user-1", { llm: llm as any });
+
+      // First update = readyPatch, second update = mirror.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(2);
+
+      const mirrorWrite = userDb.updateUser.mock.calls[1][1];
+      expect(mirrorWrite.marketStrategy).toBeDefined();
+      // Existing icp[] preserved.
+      expect(mirrorWrite.marketStrategy.icp).toEqual([
+        { title: "preserved", description: "icp", valueProposition: "vp", buyerPersonas: [] },
+      ]);
+      // Competitors populated from the freshly generated result.
+      expect(Array.isArray(mirrorWrite.marketStrategy.competitors)).toBe(true);
+      expect(mirrorWrite.marketStrategy.competitors.length).toBeGreaterThan(0);
+      // createdAt preserved, updatedAt bumped.
+      expect(mirrorWrite.marketStrategy.createdAt).toBe(
+        "2026-04-01T00:00:00.000Z",
+      );
+      expect(mirrorWrite.marketStrategy.updatedAt).not.toBe(
+        "2026-04-01T00:00:00.000Z",
+      );
     });
   });
 });

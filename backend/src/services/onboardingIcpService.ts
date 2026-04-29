@@ -22,6 +22,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   icpFailedPatch,
@@ -154,6 +155,90 @@ function buildUserPrompt(brand: IcpBrandContext): string {
 }
 
 /**
+ * Inverse of `mapMarketIcpToResult` in `onboardingBrandBuildService.ts`.
+ * Mirrors the v2 onboarding ICP result back to `User.marketStrategy.icp[]`
+ * shape so the rest of the product (Agent Mode, chatbot, etc.) sees the
+ * ICPs the onboarding flow generated.
+ *
+ * Without this mirror, v2 onboarding writes to `User.icpResult` only and
+ * `marketStrategy.icp[]` stays empty — the user finishes onboarding with
+ * an apparently-blank market strategy. See agentweb-customer-portal#687
+ * companion fix for value-prop hydration; this fixes the ICP half.
+ *
+ * Exported for unit testing.
+ */
+export function mapIcpResultToMarketStrategy(
+  personas: ICPPersona[],
+): Array<{
+  title: string;
+  description: string;
+  valueProposition: string;
+  buyerPersonas: string[];
+}> {
+  if (!Array.isArray(personas)) return [];
+  return personas.map((p) => ({
+    title: typeof p.name === "string" ? p.name : "",
+    description: typeof p.pain === "string" ? p.pain : "",
+    valueProposition: typeof p.desire === "string" ? p.desire : "",
+    buyerPersonas: typeof p.meta_targeting_brief === "string" && p.meta_targeting_brief
+      ? [p.meta_targeting_brief]
+      : [],
+  }));
+}
+
+/**
+ * Merge the freshly-generated ICPs into `User.marketStrategy.icp[]`,
+ * preserving whatever else (competitors, businessOverview, etc.) is
+ * already on the record. Best-effort: errors are logged but do NOT roll
+ * back the icpResult write — the user still gets ICPs in the onboarding
+ * review flow, the rest of the product just won't see them until the
+ * next time something touches marketStrategy.
+ *
+ * Read-merge-write done in this single function to keep the call-site
+ * tidy. The eventual-consistency window we already navigated for the
+ * cascade trigger doesn't apply here — we're writing to the base table
+ * by email via updateUser, which is strongly consistent.
+ */
+async function mirrorIcpsToMarketStrategy(
+  userId: string,
+  personas: ICPPersona[],
+): Promise<void> {
+  try {
+    const fresh: any = await userDb.getUserById(userId);
+    if (!fresh) return;
+    const now = new Date().toISOString();
+    const existing = (fresh.marketStrategy ?? {}) as {
+      businessOverview?: string;
+      competitors?: Array<{ name: string; description: string }>;
+      icp?: Array<{
+        title: string;
+        description: string;
+        valueProposition: string;
+        buyerPersonas: string[];
+      }>;
+      createdAt?: string;
+      updatedAt?: string;
+    };
+    const merged = {
+      businessOverview: existing.businessOverview ?? "",
+      competitors: existing.competitors ?? [],
+      icp: mapIcpResultToMarketStrategy(personas),
+      createdAt: existing.createdAt ?? now,
+      updatedAt: now,
+    };
+    await userDb.updateUser(userId, { marketStrategy: merged } as any);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      "[onboardingIcpService] mirror to marketStrategy failed",
+      { userId, err: msg },
+    );
+    // Non-fatal: don't fire reportUIError here either, this is best-effort
+    // backfill — the primary icpResult write already succeeded.
+  }
+}
+
+/**
  * Pure LLM call — exported for unit-testing with an injected LLMService.
  *
  * Uses `generateJsonRobust` (not `generateJSONContent`) so a stray prose
@@ -202,6 +287,13 @@ export async function triggerIcpDiscoveryForUser(
     }
     await userDb.updateUser(userId, patch as any);
 
+    // Mirror to marketStrategy.icp[] so the main account (Agent Mode,
+    // chatbot, etc.) sees the ICPs the onboarding flow generated. Without
+    // this, v2 onboarding writes to User.icpResult only and the user
+    // finishes onboarding with an apparently-blank market strategy.
+    // Best-effort — errors logged but do NOT block the cascade.
+    await mirrorIcpsToMarketStrategy(userId, personas);
+
     // Cascade kickoff: fire-and-forget the competitor step now that ICPs
     // are persisted and `icpStatus === 'ready'`. Without this, the user
     // had to wait for the next FE polling tick before competitor research
@@ -245,6 +337,16 @@ export async function triggerIcpDiscoveryForUser(
       icpFailedPatch((current as any) || {}, msg) as any,
     );
     console.error("[onboardingIcpService] generation failed", { userId, err: msg });
+    void reportUIError({
+      operation: "onboarding:icp:llm-generation",
+      errorMessage: msg,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "icp",
+        Stack: err instanceof Error ? (err.stack ?? "").slice(0, 1000) : "",
+      },
+    });
   }
 }
 

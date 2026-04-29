@@ -768,6 +768,32 @@ class UserDB {
     return item;
   }
 
+  /**
+   * Strong-consistent read of the User record by email. Email is the base
+   * table's primary key, so a GetItem with ConsistentRead bypasses GSI
+   * propagation lag entirely.
+   *
+   * Use this on the hot path of any route that reads user state IMMEDIATELY
+   * after an updateUser elsewhere in the same request flow (or the
+   * fire-and-forget background trigger that follows it). The legacy
+   * `getUserById` reads via UserIdIndex GSI, which is eventually consistent
+   * and can return pre-update rows for ~100-1000ms after a write — long
+   * enough to break onboarding status polling (see the 2026-04-27 Maya
+   * regen-spinner-stuck investigation).
+   */
+  async getUserByEmailConsistent(email: string) {
+    const result = await this.docClient
+      .get({
+        TableName: this.tableName,
+        Key: { email: email.toLowerCase() },
+        ConsistentRead: true,
+      })
+      .promise();
+    const item = result.Item;
+    if (item?.userId?.startsWith("deleted_")) return undefined;
+    return item;
+  }
+
   async getUserById(userId: string) {
     try {
       const params = {

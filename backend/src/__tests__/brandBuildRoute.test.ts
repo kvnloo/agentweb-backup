@@ -44,11 +44,18 @@ describe("POST /api/onboarding/brand-build/start", () => {
 
   it("writes a building patch and returns the new snapshot", async () => {
     userDb.updateUser.mockResolvedValue({ userId: "user-1" });
-    userDb.getUserById.mockResolvedValue({
-      userId: "user-1",
-      brandBuildStatus: "building",
-      brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
-    });
+    // First call (idempotency check): user has no brandBuildStatus yet (fresh).
+    // All subsequent calls (post-write snapshot read AND any reads inside the
+    // fire-and-forget triggerBrandBuildForUser microtask): return the
+    // post-buildStartPatch state. Use mockResolvedValueOnce for the first
+    // value, mockResolvedValue as the fallback for everything after.
+    userDb.getUserById
+      .mockResolvedValueOnce({ userId: "user-1" })
+      .mockResolvedValue({
+        userId: "user-1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
+      });
     const res = await request(app).post("/api/onboarding/brand-build/start");
     expect(res.status).toBe(200);
     expect(userDb.updateUser).toHaveBeenCalledWith(
@@ -59,7 +66,58 @@ describe("POST /api/onboarding/brand-build/start", () => {
     expect(res.body.status.inFlight).toBe(true);
   });
 
+  it("is idempotent: skips re-trigger when status is already building", async () => {
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    const res = await request(app).post("/api/onboarding/brand-build/start");
+    expect(res.status).toBe(200);
+    // No buildStartPatch write — only the empty-inputPatch check, which
+    // skips updateUser entirely when no body fields are supplied.
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("building");
+  });
+
+  it("is idempotent: skips re-trigger when status is already ready", async () => {
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "ready",
+      brandBuildCompletedAt: "2026-04-24T12:00:30.000Z",
+    });
+    const res = await request(app).post("/api/onboarding/brand-build/start");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("ready");
+  });
+
+  it("idempotent path still persists supplied URL/name updates without re-firing", async () => {
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+    });
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com", companyName: "Example Inc." });
+    expect(res.status).toBe(200);
+    // updateUser called WITHOUT brandBuildStatus — only the input fields.
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({
+        productDomain: "https://example.com",
+        companyName: "Example Inc.",
+      })
+    );
+    const writeArg = userDb.updateUser.mock.calls[0][1];
+    expect(writeArg).not.toHaveProperty("brandBuildStatus");
+  });
+
   it("500s when the DB write throws", async () => {
+    userDb.getUserById.mockResolvedValueOnce({ userId: "user-1" });
     userDb.updateUser.mockRejectedValue(new Error("dynamo down"));
     const spy = jest.spyOn(console, "error").mockImplementation(() => {});
     const res = await request(app).post("/api/onboarding/brand-build/start");

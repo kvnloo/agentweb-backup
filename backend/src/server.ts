@@ -445,6 +445,27 @@ createTestAccount().then(async () => {
         console.error('[dripWorker] Failed to initialize:', error);
       }
 
+      // Onboarding stuck/abandoned user detector — runs hourly. Scans users
+      // with onboardingStage that's not yet terminal and fires reportUIError
+      // (→ Notion oncall task + Rui email) for users who haven't progressed.
+      // 30-min dedup in errorReporter prevents alert flooding for the same
+      // stuck user. See backend/src/cron/onboardingStuckDetector.ts.
+      try {
+        const STUCK_INTERVAL_MS = 60 * 60 * 1000; // 1h
+        const { runOnboardingStuckDetector } = await import('./cron/onboardingStuckDetector');
+        const tick = () => runOnboardingStuckDetector()
+          .then((r) => console.log('[onboardingStuckDetector]', r))
+          .catch((e) => console.error('[onboardingStuckDetector] Error:', e));
+        // First run after 5min to let the server settle and other crons land.
+        setTimeout(() => {
+          tick();
+          setInterval(tick, STUCK_INTERVAL_MS);
+        }, 5 * 60 * 1000);
+        console.log('[onboardingStuckDetector] Initialized — first run in 5 min, then every 1 h');
+      } catch (error) {
+        console.error('[onboardingStuckDetector] Failed to initialize:', error);
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

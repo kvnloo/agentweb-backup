@@ -49,6 +49,15 @@ export interface AdImageStatusFields {
   adImageDurationMs?: number;
   adImageError?: string;
   adImageResult?: AdImageResult;
+  /**
+   * Sessionid of the hidden agent ChatSession into which onboarding
+   * ad-image variants are mirrored. The FE composes
+   * `${adImageChatSessionId}-images` to call the favorite-image /
+   * archive-image endpoints (heart/X). Populated by
+   * `mirrorOnboardingAdImagesToChatSession`. Undefined if the mirror
+   * step never ran (e.g. legacy users).
+   */
+  adImageChatSessionId?: string;
 }
 
 export interface AdImageSnapshot extends AdImageStatusFields {
@@ -133,6 +142,7 @@ export function adImageSnapshot(
     adImageDurationMs: current.adImageDurationMs,
     adImageError: current.adImageError,
     adImageResult: current.adImageResult,
+    adImageChatSessionId: (current as any).adImageChatSessionId,
     inFlight: status === "running",
     timedOut: status === "running" && age >= AD_IMAGE_TIMEOUT_MS,
   };

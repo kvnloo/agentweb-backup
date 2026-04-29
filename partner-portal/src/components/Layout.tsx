@@ -225,9 +225,9 @@ export default function Layout() {
                     Config
                   </Button>
                   {user.isAdmin && (
-                    <Button 
-                      color="primary" 
-                      component={RouterLink} 
+                    <Button
+                      color="primary"
+                      component={RouterLink}
                       to="/admin"
                       variant={isActivePath('/admin') ? 'contained' : 'text'}
                     >

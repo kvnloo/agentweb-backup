@@ -426,6 +426,104 @@ router.get("/users", async (req, res) => {
   }
 });
 
+/**
+ * GET /admin/onboarding/users
+ *
+ * Admin onboarding inspector — surfaces per-user onboarding state in a
+ * compact list. Filters to users who actually started onboarding (have
+ * a `goal` field set) and projects only the onboarding-relevant fields
+ * so the payload stays small even with hundreds of users.
+ *
+ * For each user we return identity, per-step status + timing,
+ * artifact counts, the unified-gallery sessionId, and the last 10
+ * onboarding events. The FE renders a table; click a row to expand
+ * the events log + delegate-as-user link.
+ */
+router.get("/onboarding/users", async (_req, res) => {
+  try {
+    const users = await userDb.getAllUsers(true);
+
+    const onboardingUsers = users
+      .filter((u: any) => typeof u.goal === "string" && u.goal.trim().length > 0)
+      .map((u: any) => {
+        const stages: Record<string, any> = {};
+        for (const step of [
+          "brandBuild",
+          "icp",
+          "competitor",
+          "creativeDir",
+          "adImage",
+          "adCopy",
+        ]) {
+          stages[step] = {
+            status: u[`${step}Status`] ?? null,
+            startedAt: u[`${step}StartedAt`] ?? null,
+            completedAt: u[`${step}CompletedAt`] ?? null,
+            durationMs: u[`${step}DurationMs`] ?? null,
+            error: u[`${step}Error`] ?? null,
+          };
+        }
+
+        const counts = {
+          icps: Array.isArray(u.icpResult) ? u.icpResult.length : 0,
+          competitors: Array.isArray(u.competitorResult?.competitors)
+            ? u.competitorResult.competitors.length
+            : 0,
+          adImages: Array.isArray(u.adImageResult?.variants)
+            ? u.adImageResult.variants.length
+            : 0,
+          adCopies: Array.isArray(u.adCopyResult?.variants)
+            ? u.adCopyResult.variants.length
+            : 0,
+        };
+
+        const events = Array.isArray(u.onboardingEvents)
+          ? u.onboardingEvents.slice(-10).map((e: any) => ({
+              ts: e?.ts ?? null,
+              event: e?.event ?? "(unknown)",
+              data: e?.data ?? null,
+            }))
+          : [];
+
+        const firstTouch = u.firstTouch || {};
+        const utm = firstTouch.utm || {};
+
+        return {
+          userId: u.userId,
+          email: u.email,
+          createdAt: u.createdAt,
+          companyName: u.companyName ?? null,
+          companyUrl: u.productDomain ?? null,
+          goal: u.goal,
+          onboardingStage: u.onboardingStage ?? null,
+          stages,
+          counts,
+          adImageChatSessionId: u.adImageChatSessionId ?? null,
+          attribution: {
+            utmSource: utm.source ?? null,
+            utmMedium: utm.medium ?? null,
+            utmCampaign: utm.campaign ?? null,
+            referrer: firstTouch.referrer ?? null,
+            landingUrl: firstTouch.landingUrl ?? null,
+          },
+          events,
+          lastEventAt:
+            events.length > 0 ? events[events.length - 1].ts : u.createdAt,
+        };
+      })
+      .sort((a: any, b: any) => {
+        const ta = a.lastEventAt ? new Date(a.lastEventAt).getTime() : 0;
+        const tb = b.lastEventAt ? new Date(b.lastEventAt).getTime() : 0;
+        return tb - ta;
+      });
+
+    res.json({ users: onboardingUsers });
+  } catch (error) {
+    console.error("Error fetching onboarding users:", error);
+    res.status(500).json({ message: "Error fetching onboarding users" });
+  }
+});
+
 // Lookup user ID by email (used by Emma tools) — must be before /:userId to avoid param collision
 router.get("/users/lookup", async (req, res) => {
   try {

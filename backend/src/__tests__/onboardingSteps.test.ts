@@ -14,6 +14,7 @@ import express from "express";
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByEmailConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
@@ -195,7 +196,7 @@ describe("POST /api/onboarding/icp/start", () => {
 
 describe("GET /api/onboarding/icp/status", () => {
   it("returns persisted snapshot", async () => {
-    userDb.getUserById.mockResolvedValue({
+    userDb.getUserByEmailConsistent.mockResolvedValue({
       userId: "user-1",
       icpStatus: "ready",
       icpStartedAt: "2026-04-24T11:59:00.000Z",
@@ -211,17 +212,45 @@ describe("GET /api/onboarding/icp/status", () => {
   });
 
   it("404s when user is missing", async () => {
-    userDb.getUserById.mockResolvedValue(null);
+    userDb.getUserByEmailConsistent.mockResolvedValue(null);
     const res = await request(app).get("/api/onboarding/icp/status");
     expect(res.status).toBe(404);
   });
 
   it("returns empty snapshot when user has no icp fields", async () => {
-    userDb.getUserById.mockResolvedValue({ userId: "user-1", email: "x@y.z" });
+    userDb.getUserByEmailConsistent.mockResolvedValue({ userId: "user-1", email: "x@y.z" });
     const res = await request(app).get("/api/onboarding/icp/status");
     expect(res.status).toBe(200);
     expect(res.body.status.icpStatus).toBeUndefined();
     expect(res.body.status.inFlight).toBe(false);
+  });
+
+  it("uses strong-consistent base-table read, NOT the eventually-consistent GSI", async () => {
+    // Repro of the polling-stops-prematurely bug observed during the
+    // 2026-04-27 Maya verification: after a regen POST flips icpStatus to
+    // 'running', the next GET /icp/status hit the GSI and got back the
+    // pre-update row (icpStatus='ready' + old icpResult). The polling
+    // hook stops on 'ready', so the spinner sticks forever even though
+    // the backend is still working. The status route MUST read with
+    // strong consistency — by primary key (email) on the base table.
+    userDb.getUserByEmailConsistent.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: "2026-04-27T10:00:00.000Z",
+    });
+    // Stale GSI mock: the legacy getUserById path would return the old row.
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "ready",
+      icpResult: goodPersonas,
+    });
+    const res = await request(app).get("/api/onboarding/icp/status");
+    expect(res.status).toBe(200);
+    expect(res.body.status.icpStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
+    expect(userDb.getUserByEmailConsistent).toHaveBeenCalled();
+    // Strict: route MUST NOT touch the GSI for this read.
+    expect(userDb.getUserById).not.toHaveBeenCalled();
   });
 });
 

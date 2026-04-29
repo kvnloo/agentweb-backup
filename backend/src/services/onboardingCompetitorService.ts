@@ -21,6 +21,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
   competitorFailedPatch,
@@ -283,6 +284,97 @@ function buildPerIcpUserPrompt(
 }
 
 /**
+ * Mirror v2 onboarding competitor result → `User.marketStrategy.competitors[]`
+ * shape so the rest of the product (Agent Mode, chatbot) sees the
+ * competitors the onboarding flow generated.
+ *
+ * Source shape (per-ICP) → target shape (flat, deduped by name):
+ *   - Walk per_icp entries, collect every competitor_name across them
+ *   - Group offer_angles by competitor name (some competitors appear under
+ *     multiple ICPs)
+ *   - description = first 2 distinct offer_angles joined; falls back to
+ *     "Identified during onboarding" if none
+ *   - cap at 10 (matches the rough ceiling agentMode's MAX_COMPETITORS uses)
+ *
+ * Exported for unit testing.
+ */
+export function mapCompetitorResultToMarketStrategy(
+  result: CompetitorResult,
+): Array<{ name: string; description: string }> {
+  const grouped = new Map<string, string[]>();
+  if (!result || !Array.isArray(result.per_icp)) return [];
+  for (const entry of result.per_icp) {
+    const names = Array.isArray(entry?.competitor_names)
+      ? entry.competitor_names
+      : [];
+    const angles = Array.isArray(entry?.offer_angles)
+      ? entry.offer_angles
+      : [];
+    for (const raw of names) {
+      const name = typeof raw === "string" ? raw.trim() : "";
+      if (!name) continue;
+      if (!grouped.has(name)) grouped.set(name, []);
+      const bucket = grouped.get(name)!;
+      for (const angle of angles) {
+        if (typeof angle !== "string") continue;
+        const t = angle.trim();
+        if (t && !bucket.includes(t)) bucket.push(t);
+      }
+    }
+  }
+  return Array.from(grouped.entries())
+    .slice(0, 10)
+    .map(([name, angles]) => ({
+      name,
+      description:
+        angles.slice(0, 2).join("; ") || "Identified during onboarding",
+    }));
+}
+
+/**
+ * Read-merge-write the freshly-generated competitor result into
+ * `User.marketStrategy.competitors[]`, preserving existing icp /
+ * businessOverview / etc. Best-effort; errors logged but never roll back
+ * the competitorResult write that already succeeded.
+ */
+async function mirrorCompetitorsToMarketStrategy(
+  userId: string,
+  result: CompetitorResult,
+): Promise<void> {
+  try {
+    const fresh: any = await userDb.getUserById(userId);
+    if (!fresh) return;
+    const now = new Date().toISOString();
+    const existing = (fresh.marketStrategy ?? {}) as {
+      businessOverview?: string;
+      competitors?: Array<{ name: string; description: string }>;
+      icp?: Array<{
+        title: string;
+        description: string;
+        valueProposition: string;
+        buyerPersonas: string[];
+      }>;
+      createdAt?: string;
+      updatedAt?: string;
+    };
+    const merged = {
+      businessOverview: existing.businessOverview ?? "",
+      competitors: mapCompetitorResultToMarketStrategy(result),
+      icp: existing.icp ?? [],
+      createdAt: existing.createdAt ?? now,
+      updatedAt: now,
+    };
+    await userDb.updateUser(userId, { marketStrategy: merged } as any);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      "[onboardingCompetitorService] mirror to marketStrategy failed",
+      { userId, err: msg },
+    );
+  }
+}
+
+/**
  * Pure per-ICP loop. Exported for unit-testing with injected fakes. Calls
  * the LLM (and optionally the search fn) once per ICP, capped at
  * MAX_COMPETITOR_ICPS.
@@ -397,6 +489,11 @@ export async function triggerCompetitorStrategyForUser(
     const patch = competitorReadyPatch((current as any) || {}, result);
     if (!patch) return;
     await userDb.updateUser(userId, patch as any);
+
+    // Mirror to marketStrategy.competitors[] so the main account sees the
+    // competitors onboarding generated. See companion mirror in
+    // onboardingIcpService for the same pattern. Best-effort.
+    await mirrorCompetitorsToMarketStrategy(userId, result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
@@ -407,6 +504,16 @@ export async function triggerCompetitorStrategyForUser(
     console.error("[onboardingCompetitorService] generation failed", {
       userId,
       err: msg,
+    });
+    void reportUIError({
+      operation: "onboarding:competitor:llm-generation",
+      errorMessage: msg,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "competitor",
+        Stack: err instanceof Error ? (err.stack ?? "").slice(0, 1000) : "",
+      },
     });
   }
 }

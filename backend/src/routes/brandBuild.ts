@@ -57,16 +57,50 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       companyName?: string;
       goal?: string;
     };
-    const patch: Record<string, unknown> = { ...buildStartPatch() };
+
+    // Idempotency. The FE now calls /start TWICE per onboarding run by
+    // design: once optimistically when the user submits the brand screen
+    // (so the LLM churns while they answer the next 1-2 screens of
+    // questions — latency hiding), and again when they actually land on
+    // the buildingBrand screen. The second call must NOT re-trigger the
+    // LLM if the first already kicked it off. Persist any updated
+    // companyUrl/companyName/goal regardless so an in-flight URL edit
+    // still lands, but skip both buildStartPatch and the trigger when
+    // status is already running/ready.
+    const existing = await userDb.getUserById(userId);
+    const existingStatus = (existing as any)?.brandBuildStatus;
+    // Brand-build uses 'building' as its in-flight state (NOT 'running' —
+    // that's the per-step convention ad-image/icp/competitor use). If we
+    // checked for 'running' here, the buildingBrand-screen `/start` call
+    // would never be recognized as idempotent and would re-fire the LLM,
+    // undoing the prefetch latency savings.
+    const alreadyInFlight =
+      existingStatus === "building" || existingStatus === "ready";
+
+    const inputPatch: Record<string, unknown> = {};
     if (typeof body.companyUrl === "string" && body.companyUrl.trim()) {
-      patch.productDomain = body.companyUrl.trim();
+      inputPatch.productDomain = body.companyUrl.trim();
     }
     if (typeof body.companyName === "string" && body.companyName.trim()) {
-      patch.companyName = body.companyName.trim();
+      inputPatch.companyName = body.companyName.trim();
     }
     if (typeof body.goal === "string" && body.goal.trim()) {
-      patch.goal = body.goal.trim();
+      inputPatch.goal = body.goal.trim();
     }
+
+    if (alreadyInFlight) {
+      // Persist any URL/name/goal updates but DO NOT re-fire the LLM.
+      if (Object.keys(inputPatch).length > 0) {
+        await userDb.updateUser(userId, inputPatch as any);
+      }
+      const refreshed = await userDb.getUserById(userId);
+      return res.json({ status: snapshot(refreshed || existing || {}) });
+    }
+
+    const patch: Record<string, unknown> = {
+      ...buildStartPatch(),
+      ...inputPatch,
+    };
     await userDb.updateUser(userId, patch as any);
     // Fire-and-forget background work; route returns immediately so the UI
     // can poll /status without holding an HTTP connection open for ~30s.
