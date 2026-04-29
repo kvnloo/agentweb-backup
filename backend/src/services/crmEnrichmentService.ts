@@ -4,6 +4,16 @@ import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
 import { v4 as uuidv4 } from 'uuid';
 import {
+  getRawDataFromCache,
+  writeRawDataToCache,
+  buildWebContextFromCache,
+  buildLinkedInContextFromCache,
+  isLinkedInCacheEligible,
+  splitFieldsByGroup,
+} from './enrichmentCacheService';
+import { FIELD_GROUPS } from './enrichmentGroups';
+import type { RawWebResult, RawCacheData } from './enrichmentGroups';
+import {
   buildDataExtractionSystemPrompt,
   buildDataExtractionRetryPrompt,
   buildSuggestEnrichmentSystemPrompt
@@ -71,6 +81,9 @@ export interface EnrichmentJobSpec {
   linkedinSearchTemplate?: string;
   /** Per-field source overrides. Falls back to job-level `sources` when absent for a field. */
   sourcesPerField?: Record<string, EnrichmentSource[]>;
+  /** Bypass AW-EnrichmentRawCache and re-fetch from APIs. Distinct from forceOverwrite
+   *  (which re-enriches leads that already have all output fields populated). */
+  forceRefreshCache?: boolean;
 }
 
 interface EnrichmentPreviewResult {
@@ -341,8 +354,15 @@ export class CrmEnrichmentService {
     }
   }
 
-  private async gatherWebContext(lead: LeadRecord, spec: EnrichmentJobSpec, webSearchFields: string[]): Promise<string> {
+  private async gatherWebContext(
+    lead: LeadRecord,
+    spec: EnrichmentJobSpec,
+    webSearchFields: string[]
+  ): Promise<{ webContext: string; rawResults: RawWebResult[]; linkedinCompanyResults: RawWebResult[] | null; queryUsed: string }> {
     let webContext = '';
+    let rawResults: RawWebResult[] = [];
+    let linkedinCompanyResults: RawWebResult[] | null = null;
+
     const template = spec.webSearchTemplate;
     const query = template
       ? CrmEnrichmentService.applySearchTemplate(template, lead)
@@ -364,7 +384,8 @@ export class CrmEnrichmentService {
       }
 
       if (result?.success && Array.isArray(result.results) && result.results.length > 0) {
-        webContext = JSON.stringify(result.results, null, 2);
+        rawResults = result.results as RawWebResult[];
+        webContext = JSON.stringify(rawResults, null, 2);
       } else if (!result?.success) {
         const msg = result?.error || result?.message || '';
         if (!msg.toLowerCase().includes('no search results found')) {
@@ -387,10 +408,11 @@ export class CrmEnrichmentService {
           const linkedinCompanyQuery = `${companyTerm} site:linkedin.com/company`;
           const linkedinCompanyResult = await agentModeService.searchWeb(linkedinCompanyQuery, 5);
           if (linkedinCompanyResult?.success && Array.isArray(linkedinCompanyResult.results) && linkedinCompanyResult.results.length > 0) {
-            const companyUrls = linkedinCompanyResult.results
-              .map((r: any) => r.url || '')
+            linkedinCompanyResults = linkedinCompanyResult.results as RawWebResult[];
+            const companyUrls = linkedinCompanyResults
+              .map((r: RawWebResult) => r.url || '')
               .filter((url: string) => /linkedin\.com\/company\//i.test(url));
-            webContext += `\n\nDedicated LinkedIn company page search results:\n${JSON.stringify(linkedinCompanyResult.results, null, 2)}`;
+            webContext += `\n\nDedicated LinkedIn company page search results:\n${JSON.stringify(linkedinCompanyResults, null, 2)}`;
             if (companyUrls.length > 0) {
               webContext += `\n\nLinkedIn company page URLs found in dedicated search (use these first):\n${companyUrls.join('\n')}`;
             }
@@ -401,11 +423,35 @@ export class CrmEnrichmentService {
       }
     }
 
-    return webContext;
+    return { webContext, rawResults, linkedinCompanyResults, queryUsed: query };
   }
 
-  private async gatherLinkedInContext(lead: LeadRecord, spec: EnrichmentJobSpec, linkedInAccountId: string, isEnrichingLinkedin: boolean): Promise<string> {
+  // Calls gatherWebContext always using the group's canonical searchTemplate.
+  // The job-level webSearchTemplate is intentionally ignored for grouped fields
+  // so the cache key (groupName#v{version}) always maps to the same query across jobs.
+  // (Job-level template only applies to ungrouped fields via the legacy gatherWebContext path.)
+  private async gatherWebContextForGroup(
+    lead: LeadRecord,
+    spec: EnrichmentJobSpec,
+    groupName: string,
+    groupFields: string[]
+  ): Promise<{ webContext: string; rawResults: RawWebResult[]; linkedinCompanyResults: RawWebResult[] | null; queryUsed: string }> {
+    const groupTemplate = FIELD_GROUPS[groupName]?.searchTemplate;
+    const groupSpec = groupTemplate ? { ...spec, webSearchTemplate: groupTemplate } : spec;
+    return this.gatherWebContext(lead, groupSpec, groupFields);
+  }
+
+  private async gatherLinkedInContext(
+    lead: LeadRecord,
+    spec: EnrichmentJobSpec,
+    linkedInAccountId: string,
+    isEnrichingLinkedin: boolean
+  ): Promise<{ linkedinContext: string; rawProfile: Record<string, unknown> | null; publicIdentifier: string | null; profileId: string | null }> {
     let linkedinContext = '';
+    let rawProfile: Record<string, unknown> | null = null;
+    let publicIdentifier: string | null = null;
+    let profileId: string | null = null;
+
     try {
       const linkedinUrl = lead.linkedin ? String(lead.linkedin).trim() : '';
       const isValidLinkedInUrl = linkedinUrl && /\/in\//.test(linkedinUrl);
@@ -426,7 +472,7 @@ export class CrmEnrichmentService {
         const emailDomain = lead.email ? lead.email.split('@')[1] || '' : '';
         const domainCompany = emailDomain && !CrmEnrichmentService.isPersonalEmailDomain(lead.email || '') ? emailDomain : '';
         const company = existingCompany || domainCompany;
-        
+
         if (name && company) {
           const searchResult = await agentModeService.linkedinOutreach(spec.userId, {
             action: 'search-people',
@@ -449,10 +495,14 @@ export class CrmEnrichmentService {
       }
 
       if (profileData) {
+        rawProfile = profileData as Record<string, unknown>;
+        publicIdentifier = profileData?.public_identifier ?? null;
+        profileId = profileData?.provider_id ?? null;
+
         const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
         const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
-        const profileUrl = profileData?.public_identifier
-          ? `https://www.linkedin.com/in/${profileData.public_identifier}`
+        const profileUrl = publicIdentifier
+          ? `https://www.linkedin.com/in/${publicIdentifier}`
           : cleanUrl;
         linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
         if (profileUrl && isEnrichingLinkedin) {
@@ -464,7 +514,7 @@ export class CrmEnrichmentService {
     } catch (err: any) {
       console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);
     }
-    return linkedinContext;
+    return { linkedinContext, rawProfile, publicIdentifier, profileId };
   }
 
   private buildLeadContext(lead: LeadRecord, isEnrichingLinkedin: boolean): Record<string, string> {
@@ -604,18 +654,89 @@ export class CrmEnrichmentService {
     const webSearchFields = spec.outputFields.filter(f => effectiveSources(f).includes('web_search'));
     console.log(`[CrmEnrichment][enrichLead] lead=${lead.leadId} webSearchFields=${webSearchFields.length} linkedinFields=${linkedinFields.length} isEnrichingLinkedin=${isEnrichingLinkedin}`);
 
+    const forceRefreshCache = spec.forceRefreshCache ?? false;
+
+    // ── Web context (per-group cache-aware) ───────────────────────────────
+    // Each field is mapped to its FIELD_GROUP. Groups are checked independently
+    // so a 2-group job (e.g. firmographic + financial) still benefits from
+    // cache hits on individual groups. Ungrouped fields use the legacy single-
+    // query path. Results from all groups are concatenated into one webContext.
     let webContext = '';
     if (webSearchFields.length > 0) {
-      console.log(`[CrmEnrichment][enrichLead] gatherWebContext START lead=${lead.leadId}`);
-      webContext = await this.gatherWebContext(lead, spec, webSearchFields);
-      console.log(`[CrmEnrichment][enrichLead] gatherWebContext DONE lead=${lead.leadId} contextLen=${webContext.length} elapsed=${Date.now()-t0}ms`);
+      const { byGroup, ungrouped } = splitFieldsByGroup(webSearchFields);
+      const webContextParts: string[] = [];
+
+      for (const [groupName, groupFields] of byGroup) {
+        const hasCompanyLinkedinField = groupFields.some(f =>
+          /company_linkedin|company.*linkedin|linkedin.*company/.test(f.toLowerCase())
+        );
+        const cachedData = await getRawDataFromCache(lead, groupName, forceRefreshCache);
+
+        if (cachedData) {
+          console.log(`[CrmEnrichment][enrichLead] web cache HIT group=${groupName} lead=${lead.leadId}`);
+          const ctx = buildWebContextFromCache(cachedData, hasCompanyLinkedinField);
+          if (ctx) webContextParts.push(ctx);
+        } else {
+          console.log(`[CrmEnrichment][enrichLead] web cache MISS group=${groupName} lead=${lead.leadId}, fetching`);
+          const { webContext: ctx, rawResults, linkedinCompanyResults, queryUsed } =
+            await this.gatherWebContextForGroup(lead, spec, groupName, groupFields);
+          if (ctx) webContextParts.push(ctx);
+          console.log(`[CrmEnrichment][enrichLead] gatherWebContextForGroup DONE group=${groupName} lead=${lead.leadId} results=${rawResults.length} elapsed=${Date.now()-t0}ms`);
+
+          if (rawResults.length > 0) {
+            const rawCacheData: RawCacheData = { webResults: rawResults, linkedinCompanyResults, linkedinData: null };
+            writeRawDataToCache(lead, groupName, rawCacheData, queryUsed, ['web_search']).catch(err =>
+              console.warn(`[CrmEnrichment] web cache write failed group=${groupName} lead=${lead.leadId}: ${err.message}`)
+            );
+          }
+        }
+      }
+
+      if (ungrouped.length > 0) {
+        console.log(`[CrmEnrichment][enrichLead] ungrouped fields=${ungrouped} lead=${lead.leadId}, using legacy gatherWebContext`);
+        const { webContext: ctx } = await this.gatherWebContext(lead, spec, ungrouped);
+        if (ctx) webContextParts.push(ctx);
+      }
+
+      webContext = webContextParts.join('\n\n');
     }
 
+    // ── LinkedIn context (cache-aware) ────────────────────────────────────
+    // Cache is keyed per person email. Only eligible when all linkedin fields
+    // belong to person_identity group.
     let linkedinContext = '';
     if (linkedinFields.length > 0 && linkedInAccountId) {
-      console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext START lead=${lead.leadId}`);
-      linkedinContext = await this.gatherLinkedInContext(lead, spec, linkedInAccountId, isEnrichingLinkedin);
-      console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinContext.length} elapsed=${Date.now()-t0}ms`);
+      const linkedinCacheEligible = isLinkedInCacheEligible(linkedinFields);
+      const cachedLinkedinData = linkedinCacheEligible
+        ? await getRawDataFromCache(lead, 'person_identity', forceRefreshCache)
+        : null;
+
+      if (cachedLinkedinData?.linkedinData) {
+        console.log(`[CrmEnrichment][enrichLead] linkedin cache HIT lead=${lead.leadId}`);
+        linkedinContext = buildLinkedInContextFromCache(cachedLinkedinData, isEnrichingLinkedin);
+      } else {
+        console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext START lead=${lead.leadId}`);
+        const { linkedinContext: ctx, rawProfile, publicIdentifier, profileId } =
+          await this.gatherLinkedInContext(lead, spec, linkedInAccountId, isEnrichingLinkedin);
+        linkedinContext = ctx;
+        console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinContext.length} elapsed=${Date.now()-t0}ms`);
+
+        if (linkedinCacheEligible && rawProfile) {
+          const rawCacheData: RawCacheData = {
+            webResults: [],
+            linkedinCompanyResults: null,
+            linkedinData: {
+              profileId: profileId ?? '',
+              publicIdentifier: publicIdentifier ?? '',
+              rawProfile,
+              fetchedAt: new Date().toISOString(),
+            },
+          };
+          writeRawDataToCache(lead, 'person_identity', rawCacheData, '', ['linkedin']).catch(err =>
+            console.warn(`[CrmEnrichment] linkedin cache write failed lead=${lead.leadId}: ${err.message}`)
+          );
+        }
+      }
     }
 
     const leadContext = this.buildLeadContext(lead, isEnrichingLinkedin);

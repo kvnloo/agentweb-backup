@@ -4692,4 +4692,72 @@ router.post('/lists/:listId/enrichment-jobs/:jobId/revert', async (req: Request,
   }
 });
 
+// ── TEMPORARY DEBUG: EnrichmentRawCache table inspection ─────────────────────
+// Remove this endpoint once cache behaviour is confirmed working in the test env.
+router.get('/debug/enrichment-raw-cache', async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  const AWS = require('aws-sdk');
+  const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  const tableName = `${TABLE_PREFIX}AW-EnrichmentRawCache`;
+  const region = process.env.AWS_REGION || 'us-west-2';
+  const dynamo = new AWS.DynamoDB.DocumentClient({ region });
+  const ddl = new AWS.DynamoDB({ region });
+
+  // Try scanning first
+  try {
+    const result = await dynamo.scan({
+      TableName: tableName,
+      Limit: 10,
+      ProjectionExpression: 'canonicalId, fieldGroup, canonicalKey, entityKey, entityType, queryUsed, resultCount, schemaVersion, fetchedAt, expiresAt',
+    }).promise();
+    return res.json({
+      tableName, region,
+      count: result.Count,
+      scannedCount: result.ScannedCount,
+      hasMore: !!result.LastEvaluatedKey,
+      items: result.Items,
+    });
+  } catch (scanErr: any) {
+    if (scanErr.code !== 'ResourceNotFoundException') {
+      return res.status(500).json({ error: scanErr.code, message: scanErr.message });
+    }
+  }
+
+  // Table missing — attempt to create it
+  try {
+    await ddl.createTable({
+      TableName: tableName,
+      AttributeDefinitions: [
+        { AttributeName: 'canonicalId', AttributeType: 'S' },
+        { AttributeName: 'fieldGroup',  AttributeType: 'S' },
+        { AttributeName: 'entityKey',   AttributeType: 'S' },
+      ],
+      KeySchema: [
+        { AttributeName: 'canonicalId', KeyType: 'HASH' },
+        { AttributeName: 'fieldGroup',  KeyType: 'RANGE' },
+      ],
+      GlobalSecondaryIndexes: [{
+        IndexName: 'entityKey-fieldGroup-index',
+        KeySchema: [
+          { AttributeName: 'entityKey',  KeyType: 'HASH' },
+          { AttributeName: 'fieldGroup', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      }],
+      BillingMode: 'PAY_PER_REQUEST',
+    }).promise();
+
+    // Wait for table to become ACTIVE
+    await ddl.waitFor('tableExists', { TableName: tableName }).promise();
+    return res.json({ tableName, region, created: true, message: 'Table created successfully' });
+  } catch (createErr: any) {
+    if (createErr.code === 'ResourceInUseException') {
+      return res.json({ tableName, region, created: false, message: 'Table already exists (race condition)' });
+    }
+    return res.status(500).json({ createError: createErr.code, message: createErr.message });
+  }
+});
+
 export default router;

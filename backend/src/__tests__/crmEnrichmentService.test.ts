@@ -52,6 +52,15 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
 }));
 
+jest.mock('../services/enrichmentCacheService', () => ({
+  getRawDataFromCache: jest.fn().mockResolvedValue(null),
+  writeRawDataToCache: jest.fn().mockResolvedValue(undefined),
+  buildWebContextFromCache: jest.fn().mockReturnValue(''),
+  buildLinkedInContextFromCache: jest.fn().mockReturnValue(''),
+  isLinkedInCacheEligible: jest.fn().mockReturnValue(false),
+  splitFieldsByGroup: jest.fn().mockImplementation((fields: string[]) => ({ byGroup: new Map(), ungrouped: fields })),
+}));
+
 jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),

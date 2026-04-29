@@ -1842,6 +1842,43 @@ const createEnrichmentHistoryTable = async () => {
   }
 };
 
+const createEnrichmentRawCacheTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+    AttributeDefinitions: [
+      { AttributeName: 'canonicalId', AttributeType: 'S' },
+      { AttributeName: 'fieldGroup',  AttributeType: 'S' },
+      { AttributeName: 'entityKey',   AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'canonicalId', KeyType: 'HASH' },
+      { AttributeName: 'fieldGroup',  KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'entityKey-fieldGroup-index',
+        KeySchema: [
+          { AttributeName: 'entityKey',  KeyType: 'HASH' },
+          { AttributeName: 'fieldGroup', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1892,6 +1929,7 @@ const main = async () => {
     await createDripCampaignsTable();
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
+    await createEnrichmentRawCacheTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

@@ -5672,6 +5672,72 @@ export const crmDb = {
       throw error;
     }
   },
+
+  // ─── Enrichment Raw Cache ─────────────────────────────────────────────
+
+  async getEnrichmentCacheItem(canonicalId: string, fieldGroup: string): Promise<any | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+        Key: { canonicalId, fieldGroup },
+      }).promise();
+      return result.Item ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentCacheItem');
+      throw error;
+    }
+  },
+
+  async putEnrichmentCacheItem(item: {
+    canonicalId: string;
+    fieldGroup: string;
+    canonicalKey: string;
+    entityKey: string;
+    entityType: string;
+    rawData: any;
+    queryUsed: string;
+    sourcesUsed: string[];
+    resultCount: number;
+    schemaVersion: number;
+    fetchedAt: string;
+    expiresAt: number;
+  }): Promise<void> {
+    try {
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+        Item: item,
+        // Only insert if item doesn't exist OR is already expired.
+        // Prevents race when multiple clients simultaneously miss the same cache entry.
+        ConditionExpression: 'attribute_not_exists(canonicalId) OR expiresAt < :now',
+        ExpressionAttributeValues: { ':now': Math.floor(Date.now() / 1000) },
+      }).promise();
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return;  // another worker won the race
+      handleDynamoDbError(error, 'putEnrichmentCacheItem');
+      throw error;
+    }
+  },
+
+  async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+        IndexName: 'entityKey-fieldGroup-index',
+        KeyConditionExpression: 'entityKey = :ek',
+        ExpressionAttributeValues: { ':ek': entityKey },
+      }).promise();
+
+      for (const item of result.Items ?? []) {
+        await dynamodb.delete({
+          TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+          Key: { canonicalId: item.canonicalId, fieldGroup: item.fieldGroup },
+        }).promise();
+      }
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteEnrichmentCacheByEntityKey');
+      throw error;
+    }
+  },
 };
 
 // ─── Account Memory ───────────────────────────────────────────────

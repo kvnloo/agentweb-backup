@@ -5236,6 +5236,10 @@ Field and source guidance:
         force_overwrite: {
           type: 'boolean',
           description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        },
+        force_refresh_cache: {
+          type: 'boolean',
+          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
         }
       },
       required: ['list_id', 'instruction', 'output_fields', 'sources']
@@ -5258,6 +5262,7 @@ Field and source guidance:
       linkedinSearchTemplate: args.linkedin_search_template,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
+      forceRefreshCache: args.force_refresh_cache,
     });
   }
 });
@@ -5326,6 +5331,10 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
         force_overwrite: {
           type: 'boolean',
           description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        },
+        force_refresh_cache: {
+          type: 'boolean',
+          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
         }
       },
       required: ['list_id', 'instruction', 'output_fields', 'sources']
@@ -5348,6 +5357,7 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
       linkedinSearchTemplate: args.linkedin_search_template,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
+      forceRefreshCache: args.force_refresh_cache,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
   }
 });
