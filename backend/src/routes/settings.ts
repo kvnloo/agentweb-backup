@@ -3,6 +3,7 @@ import { settingsService } from '../services/settingsService';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { agentModeService } from '../services/agentModeService';
 
 const router = express.Router();
 
@@ -251,6 +252,58 @@ router.delete('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async
   } catch (error) {
     console.error('Error deleting scoring judge:', error);
     res.status(500).json({ error: 'Failed to delete scoring judge' });
+  }
+});
+
+// ---- CRM Enrichment Config (admin-only) ----
+
+const CRM_ENRICHMENT_CONFIG_KEY = 'crm-enrichment-config';
+
+const CRM_ENRICHMENT_DEFAULTS = {
+  enrichmentModel: 'gemini-3-flash-preview',
+  dataExtractionModel: 'gemini-3-flash-preview',
+};
+
+router.get('/crm-enrichment-config', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting(CRM_ENRICHMENT_CONFIG_KEY);
+    let config = { ...CRM_ENRICHMENT_DEFAULTS };
+    if (setting?.settingValue) {
+      try {
+        config = { ...CRM_ENRICHMENT_DEFAULTS, ...JSON.parse(setting.settingValue) };
+      } catch {
+        // malformed stored value — fall back to defaults
+      }
+    }
+    const allModels = await agentModeService.getSupportedModels(true);
+    const availableModels = allModels.filter((m) => !m.includes('live'));
+    res.json({ config, availableModels });
+  } catch (error) {
+    console.error('Error getting CRM enrichment config:', error);
+    res.status(500).json({ error: 'Failed to get CRM enrichment config' });
+  }
+});
+
+router.put('/crm-enrichment-config', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { enrichmentModel, dataExtractionModel } = req.body;
+    if (!enrichmentModel || !dataExtractionModel) {
+      return res.status(400).json({ error: 'enrichmentModel and dataExtractionModel are required' });
+    }
+    const config = {
+      enrichmentModel: String(enrichmentModel),
+      dataExtractionModel: String(dataExtractionModel),
+    };
+    await settingsService.setSetting(
+      CRM_ENRICHMENT_CONFIG_KEY,
+      JSON.stringify(config),
+      'CRM enrichment model configuration',
+      req.user?.email || 'admin',
+    );
+    res.json({ config });
+  } catch (error) {
+    console.error('Error saving CRM enrichment config:', error);
+    res.status(500).json({ error: 'Failed to save CRM enrichment config' });
   }
 });
 

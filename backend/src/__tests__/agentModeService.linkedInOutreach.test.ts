@@ -22,11 +22,13 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 // Mock linkedInOutreachService
 const mockSendMessage = jest.fn();
+const mockSendInMail = jest.fn();
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
+    sendInMail: (...args: any[]) => mockSendInMail(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
   },
@@ -292,6 +294,122 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('LinkedIn URL');
+    });
+  });
+
+  describe('send-inmail', () => {
+    const validArgs = {
+      action: 'send-inmail',
+      account_id: 'test-account-id',
+      provider_id: 'li-provider-123',
+      subject: 'Quick intro',
+      message: 'Hi, I wanted to reach out about an opportunity.',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    };
+
+    const lead = {
+      leadId: 'lead_test456',
+      listId: 'list_test123',
+      linkedin: 'https://www.linkedin.com/in/johndoe/',
+    };
+
+    it('returns error when account is not owned by user', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account' },
+      ]);
+
+      const result = await service.linkedinOutreach('user-1', validArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not connected to your profile');
+      expect(mockSendInMail).not.toHaveBeenCalled();
+    });
+
+    it('returns error when subject is missing', async () => {
+      const argsNoSubject = { ...validArgs, subject: undefined };
+
+      const result = await service.linkedinOutreach('user-1', argsNoSubject);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('subject is required');
+      expect(mockSendInMail).not.toHaveBeenCalled();
+    });
+
+    it('returns error when message is missing', async () => {
+      const argsNoMessage = { ...validArgs, message: undefined };
+
+      const result = await service.linkedinOutreach('user-1', argsNoMessage);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('message is required');
+      expect(mockSendInMail).not.toHaveBeenCalled();
+    });
+
+    it('calls sendInMail with correct arguments', async () => {
+      mockSendInMail.mockResolvedValue({ id: 'inmail-id-123' });
+      mockGetLeadById.mockResolvedValue(lead);
+
+      const result = await service.linkedinOutreach('user-1', validArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInMail).toHaveBeenCalledWith(
+        'test-account-id',
+        'li-provider-123',
+        false, // isUrl=false because provider_id was passed
+        'Quick intro',
+        'Hi, I wanted to reach out about an opportunity.'
+      );
+    });
+
+    it('persists sent InMail to AW-EmailEvents when list_id and lead_id are provided', async () => {
+      mockSendInMail.mockResolvedValue({ id: 'inmail-id-123' });
+      mockGetLeadById.mockResolvedValue(lead);
+
+      await service.linkedinOutreach('user-1', validArgs);
+
+      expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(1);
+      expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventId: 'linkedin_inmail_inmail-id-123',
+          emailDomain: 'linkedin-list_test123',
+          leadEmail: 'https://www.linkedin.com/in/johndoe/',
+          eventType: 'linkedin.inmail.sent',
+          text: 'Hi, I wanted to reach out about an opportunity.',
+          senderId: 'test-account-id',
+          messageProviderId: 'inmail-id-123',
+        })
+      );
+    });
+
+    it('does NOT persist InMail when list_id/lead_id are absent', async () => {
+      const argsWithoutCrm = {
+        action: 'send-inmail',
+        account_id: 'test-account-id',
+        provider_id: 'li-provider-123',
+        subject: 'Quick intro',
+        message: 'Hi there!',
+      };
+      mockSendInMail.mockResolvedValue({ id: 'inmail-id' });
+
+      await service.linkedinOutreach('user-1', argsWithoutCrm);
+
+      expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+      expect(mockUpdateLeadLinkedInSyncAt).not.toHaveBeenCalled();
+    });
+
+    it('falls back to timestamp-based ID when Unipile response has no id', async () => {
+      mockSendInMail.mockResolvedValue({});
+      mockGetLeadById.mockResolvedValue(lead);
+
+      await service.linkedinOutreach('user-1', validArgs);
+
+      expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventId: expect.stringMatching(/^linkedin_inmail_sent_\d+$/),
+          eventType: 'linkedin.inmail.sent',
+        })
+      );
     });
   });
 });

@@ -4,7 +4,7 @@
  */
 
 // Progress type definition
-type ProgressUpdate = { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] };
+type ProgressUpdate = { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] };
 type ProgressCallback = (progress: ProgressUpdate) => void;
 
 // Store progress updates by sessionId

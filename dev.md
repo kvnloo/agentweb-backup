@@ -1,3 +1,102 @@
+## Emma 3-Dimension Scores Missing — Investigation (2026-04-28)
+
+### Context
+
+Emma was asked to pull chat history with `sync=true` and report per-session dimensional scores (`goalCompletion`, `dataAccuracy`, `outputQuality`). The scores were consistently absent from all sessions — Emma could only see the top-level integer score.
+
+### Root Cause
+
+The production `AW-Settings` table has a custom `default-scoring-prompt` that was saved on **2026-04-15**, before the dimensional scoring feature was introduced on **2026-04-26**. The old prompt ends with:
+
+```
+Respond with ONLY valid JSON: {"score": <1-5>, "reason": "<brief explanation>"}
+```
+
+`getDefaultScoringPrompt()` in `sessionScoringService.ts` checks the DB first and uses whatever is stored there. Since the DB prompt predates dimensions, the LLM never returns a `dimensions` field, and `parseDimensions()` always returns `undefined`. All 57 production sessions in the queried window had `dims=None`.
+
+### Why PR #1347 Didn't Fully Fix It
+
+PR #1347 (`fix(scoring): re-score sessions missing dimensional scores on sync`, 2026-04-27) fixed the **re-scoring guard** — sessions with a score but no dimensions were previously being skipped as "already scored." That guard was updated to re-score when `dimensions` is absent. However, re-scoring still used the old DB prompt, so the LLM still returned no dimensions. The guard fix was correct but incomplete.
+
+### Fix
+
+Update the `default-scoring-prompt` in `AW-Settings` (via Admin → Scoring Judges → Default edit icon) to append the dimensions instruction before the JSON format line:
+
+```
+In addition to the overall score, rate three specific dimensions (1-5 each):
+- goalCompletion: Did the assistant fully accomplish what the user asked?
+- dataAccuracy: Did the output contain plausible, consistent, and factually coherent data?
+- outputQuality: Was the output well-structured, specific, and actionable?
+
+Respond with ONLY valid JSON:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}
+```
+
+The two custom `IMPORTANT` sections in the existing DB prompt ("Expected outcomes" and "Tool Execution after Nudges") should be preserved — they are prod-only additions not in the hardcoded fallback.
+
+### Verification
+
+Tested on dev by stripping dimensions from a live session, then calling `GET /api/admin/chat-sessions?sync=true`. Confirmed dimensions were backfilled correctly after the prompt update.
+
+### Lesson
+
+When adding new required fields to the scoring LLM output format, also update `AW-Settings` `default-scoring-prompt` if a custom version is stored. The hardcoded `DEFAULT_SCORING_SYSTEM_PROMPT` constant in `sessionScoringService.ts` is only a fallback — any stored DB override takes precedence.
+
+---
+
+# April 27, 2026: Investigation — Drip Campaigns vs. Sequences Overlap
+
+## Context
+
+Audit of the Drip Campaigns feature (customer-portal `/crm/drips`) added in PRs agentweb #1218, #1220, #1301 and agentweb-customer-portal #673 (all by Harsha Vankayalapati). The feature was originally built in partner-portal then migrated to customer-portal. Concern: it may duplicate or conflict with the Sequences feature already in the CRM.
+
+## What Drip Campaigns Does
+
+A drip campaign is a single-email broadcast that repeats on a cadence (every N hours/days/weeks) to all leads currently matching a segment filter. Key attributes:
+
+- **Fields:** `name`, `subjectLine`, `templateHtml`, `segmentQuery` (lifecycle, minHeatScore, utmSource, leadListId), `cadenceUnit`, `cadenceValue`, `maxSends`, `isActive`, `killSwitch`
+- **Execution:** `dripExecutor.ts` cron runs every 15 min; for each active campaign, queries matching leads and sends if cadence + safety gates pass
+- **Emma tool:** `manage_drip_campaign` (list/get/create/update/pause/resume/delete)
+- **Tables:** `AW-DripCampaigns`, `AW-DripSends`
+- **Routes:** `backend/src/routes/dripCampaigns.ts`
+- **UI:** `customer-portal/src/pages/Drips.tsx`
+
+## What Sequences Does
+
+A sequence is a multi-step email journey where leads enroll explicitly and advance through steps on configurable delays. Key attributes:
+
+- **Fields:** `name`, `description`, `campaignType`, `status`, steps (each with `delayDays`, `subject`, `bodyHtml`), `enrollmentTrigger`, `enrollmentCondition`, `exitConditions`
+- **Execution:** `dripSequenceWorker.ts` processes due enrollments; advances per-lead state, evaluates exit conditions
+- **Emma tool:** None — UI only
+- **Tables:** `AW-DripSequences`, `AW-SequenceEnrollments`
+- **Routes:** `backend/src/routes/sequences.ts`
+- **UI:** `customer-portal/src/components/crm/SequencesTab.tsx`, `SequenceBuilder.tsx`
+
+## Comparison
+
+| | Drip Campaigns | Sequences |
+|---|---|---|
+| Steps | Single email, repeating | Multi-step series |
+| Trigger | Implicit cadence (cron matches leads) | Explicit enrollment (manual, lifecycle, list) |
+| Per-lead state | `AW-DripSends` send history only | Full enrollment record with currentStep, nextSendAt |
+| Exit conditions | Kill switch / isActive only | Lifecycle change, email engagement, unsubscribe |
+| Emma tool | Yes | No |
+| Use case | Broadcast to dynamic segment | Personalized nurture journey |
+
+## Decision
+
+**Drip Campaigns to be removed.** Sequences is the more capable and correctly designed feature — multi-step, per-lead state, enrollment conditions, exit conditions. Drip Campaigns was accidentally added by Harsha's Claude Code session and was not intentionally designed as a separate product feature. Harsha confirmed this and agreed to remove it.
+
+Work required (tracked separately):
+- Delete `customer-portal/src/pages/Drips.tsx` + route + nav entry
+- Delete `backend/src/routes/dripCampaigns.ts`
+- Delete `backend/src/services/dripCampaignDb.ts`, `dripSendsDb.ts`, `dripExecutor.ts`
+- Remove `manage_drip_campaign` Emma tool from `backend/src/mcp/server/apiTools.ts`
+- Re-assign `manage_drip_campaign` skill assignment (currently in CRM & Lead Management skill) to Sequences or remove
+- Drop `AW-DripCampaigns` and `AW-DripSends` DynamoDB tables in prod (after confirming no active campaigns)
+
+---
+
 # April 26, 2026: Investigation — Design4Space Scheduled Chat 400 Error (Azure OpenAI Tool Limit)
 
 ## Context
@@ -3687,3 +3786,34 @@ The existing in-session `save_memory` mechanism is more precise because it only 
 ### Decision
 
 No action. The current memory system is sufficient. Revisit post-session extraction if we add a quality-scoring or deduplication layer that can filter out noise before writing.
+
+## Thunderbird Connected Account — Investigation (2026-04-27)
+
+### Context
+
+Investigated whether Thunderbird.net could be supported as a connected account (similar to Gmail, LinkedIn, etc.).
+
+### What Thunderbird Actually Is
+
+**Thunderbird is a local desktop email client, not a platform.** There is no "Thunderbird account" to OAuth into, no REST API, and no webhooks. It is analogous to Outlook the desktop app, not Outlook.com. The mail data lives on whatever IMAP/SMTP server the user configured (Gmail, Yahoo, a custom domain, etc.) — Thunderbird is just the local interface to it.
+
+Mozilla launched **Thundermail** (tb.pro, 2024) as a paid cloud email hosting service, but it is a standard IMAP/SMTP provider with no published developer API or OAuth flow.
+
+### Why Thunderbird as a Connected Account Is Not Practical
+
+- No OAuth authorization server exists — there is nothing to redirect users to
+- No REST API — no way for our backend to read or send email via Thunderbird
+- No webhooks or event system accessible outside the local process
+- The only programmatic access to Thunderbird is via a WebExtension Add-on running *inside* the local Thunderbird process — a fundamentally different architecture that requires users to install an extension and only works while Thunderbird is open on their machine
+
+### What We Can Support Instead
+
+The email accounts that Thunderbird users configure are standard providers that we can already support or could support through existing mechanisms:
+
+- **Gmail accounts** — already fully supported as a connected account via Gmail OAuth
+- **Outlook / Microsoft 365** — could be added via Microsoft OAuth (same pattern as Gmail)
+- **Thundermail and other IMAP providers** — could be added as a generic IMAP/SMTP connected account using credential-based auth (not OAuth)
+
+### Decision
+
+Do not build a Thunderbird-specific connected account — it is not architecturally feasible without requiring users to install a local extension. Instead, direct Thunderbird users to connect the underlying email account they use in Thunderbird (e.g., Gmail via the existing Gmail connected account flow).

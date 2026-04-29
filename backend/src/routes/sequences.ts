@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, hasUnsafeEmailStyles } from '../utils/emailVariables';
 
 const router = express.Router();
 
@@ -37,7 +37,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 // POST /api/crm/sequences
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
   if (!name || typeof name !== 'string' || !name.trim()) {
     return res.status(400).json({ error: 'name is required' });
   }
@@ -49,6 +49,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       description,
       campaignType,
       enrollmentTrigger,
+      enrollmentCondition,
       exitConditions,
       steps,
       status,
@@ -78,13 +79,14 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
   try {
     const input: UpdateSequenceInput = {
       name,
       description,
       campaignType,
       enrollmentTrigger,
+      enrollmentCondition,
       exitConditions,
       steps,
       status,
@@ -280,8 +282,24 @@ router.post(
       return res.status(400).json({ message: 'No valid email addresses provided' });
     }
 
-    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email</div>`;
-    const testHtml = testBanner + htmlContent;
+    const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+    const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=TEST&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
+
+    // Detect and fix class-based CSS that most email clients strip
+    const needsInlining = hasUnsafeEmailStyles(htmlContent);
+    const { html: processedHtml, wasFixed } = await inlineEmailStyles(htmlContent);
+
+    const stylesNote = wasFixed
+      ? ' | ✅ Styles auto-fixed: CSS classes converted to inline styles'
+      : '';
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email${stylesNote}</div>`;
+
+    // Inject banner: inside <body> for full HTML documents, or prepend for fragments
+    const withBanner = /<body\b/i.test(processedHtml)
+      ? processedHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + processedHtml;
+    // Wire up unsubscribe URL with the real portal domain
+    const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
@@ -427,45 +445,48 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
       .replace(/&#39;/g, "'")
       .replace(/&apos;/g, "'");
 
-    // Extract body content
     let bodyContent = '';
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-    if (bodyMatch) {
-      bodyContent = bodyMatch[1];
+
+    // If this is a complete HTML email document, preserve it as-is (only strip scripts).
+    // Stripping <style> or collapsing whitespace destroys email formatting.
+    const isFullHtmlDocument = /<html[\s>]/i.test(html);
+    if (isFullHtmlDocument) {
+      bodyContent = html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
     } else {
-      bodyContent = html;
-    }
+      // For plain HTML fragments, extract body content and clean up
+      const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      bodyContent = bodyMatch ? bodyMatch[1] : html;
 
-    // Remove script and style tags
-    bodyContent = bodyContent
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-      .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
+      bodyContent = bodyContent
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
 
-    // Try to extract main content from semantic tags
-    const mainContentSelectors = [
-      /<main[^>]*>([\s\S]*?)<\/main>/i,
-      /<article[^>]*>([\s\S]*?)<\/article>/i,
-      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-    ];
-
-    for (const selector of mainContentSelectors) {
-      const match = bodyContent.match(selector);
-      if (match && match[1].trim().length > 50) {
-        bodyContent = match[1];
-        break;
+      // Try to extract main content from semantic tags
+      const mainContentSelectors = [
+        /<main[^>]*>([\s\S]*?)<\/main>/i,
+        /<article[^>]*>([\s\S]*?)<\/article>/i,
+        /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+      ];
+      for (const selector of mainContentSelectors) {
+        const match = bodyContent.match(selector);
+        if (match && match[1].trim().length > 50) {
+          bodyContent = match[1];
+          break;
+        }
       }
+
+      bodyContent = bodyContent
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/>\s+</g, '><')
+        .trim();
     }
 
-    // Clean up
-    bodyContent = bodyContent
-      .replace(/<!--[\s\S]*?-->/g, '')
-      .replace(/\s+/g, ' ')
-      .replace(/>\s+</g, '><')
-      .trim();
-
-    if (bodyContent.length > 50000) {
-      bodyContent = bodyContent.substring(0, 50000);
+    if (bodyContent.length > 200000) {
+      bodyContent = bodyContent.substring(0, 200000);
     }
 
     return res.json({

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { AGENT_MODE_SYSTEM_PROMPT } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash, randomUUID } from 'crypto';
@@ -7,7 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
@@ -802,6 +802,16 @@ export class AgentModeService {
     return this.gemini_client_promise;
   }
 
+  public async getClientForModel(model: string): Promise<any> {
+    if (model.startsWith('anthropic.')) {
+      return this.getBedrockClient(model);
+    }
+    if (model.startsWith('gpt-')) {
+      return this.getAzureOpenAIClient(model);
+    }
+    return this.getGeminiClient();
+  }
+
   public async getBedrockClient(modelId: string): Promise<any> {
     // Use the Bedrock Converse API directly (instead of LangChain) to support
     // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
@@ -1461,7 +1471,7 @@ export class AgentModeService {
     llmModel: string,
     sessionId: string,
     mockMode: boolean = false,
-    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => void,
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
@@ -1534,8 +1544,9 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
+      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
       const messages: any[] = [
-        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
+        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
@@ -1876,6 +1887,35 @@ export class AgentModeService {
               toolCalls: toolCalls.slice()
             });
           }
+
+          // Generate contextual suggestion chips after the main response.
+          // Awaited so the result is delivered before the worker sends 'success' back
+          // to the parent process (fire-and-forget would race with IPC teardown).
+          // generateSuggestedReplies has its own 5s timeout so this never hangs.
+          if (content) {
+            const recentMsgs = (messages as any[])
+              .filter((m: any) => m.role === 'user' || m.role === 'assistant')
+              .filter((m: any) => typeof m.content === 'string')
+              .slice(-6);
+            try {
+              const suggestions = await this.generateSuggestedReplies(content, recentMsgs);
+              if (suggestions && suggestions.length > 0) {
+                // Stamp into the last assistant responseMessage's metadata so it persists
+                // in DynamoDB and survives page refresh. The message index in the persisted
+                // session acts as the staleness marker — chips only show for the last message.
+                responseMessage.metadata = {
+                  ...responseMessage.metadata,
+                  suggestedReplies: suggestions,
+                };
+                if (onProgress) {
+                  onProgress({ iteration, status: 'suggestions', suggestions });
+                }
+              }
+            } catch {
+              // Silent — client uses regex fallback
+            }
+          }
+
           break;
         }
 
@@ -2073,11 +2113,16 @@ export class AgentModeService {
             // The screenshot is also displayed to the user via the tool call card in the frontend.
             // We use a text prefix to discourage embedding the raw URL in markdown responses.
             let toolContent: any;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl) {
+            // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
+            // For Gemini, pass the S3 URL as text so the model can use describe_image on it if needed.
+            const isGeminiModel = llmModel.startsWith('gemini-');
+            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
               toolContent = [
                 { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
                 { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
               ];
+            } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
+              toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${extractToolContent(result)}`;
             } else {
               toolContent = extractToolContent(result);
             }
@@ -6516,7 +6561,7 @@ export class AgentModeService {
       const { listLandingPages } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
-        crmDb.getLeadListsByUserId(userId),
+        crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
@@ -6674,30 +6719,45 @@ export class AgentModeService {
     engagedOnly?: boolean;
     status?: string;
     limit?: number;
+    cursor?: string;
   } = {}): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const limit = Math.min(Math.max(options.limit || 20, 1), 50);
+      const limit = Math.min(Math.max(options.limit || 20, 1), 100);
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessGetLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessGetLeads) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      // Decode cursor from base64 JSON
+      let decodedCursor: any = undefined;
+      if (options.cursor) {
+        try {
+          decodedCursor = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf8'));
+        } catch {
+          // Invalid cursor — start from beginning
+        }
       }
 
       const searchQuery = (options.search || '').trim().toLowerCase();
       const matchingLeads: any[] = [];
-      let cursor: any = undefined;
+      let cursor: any = decodedCursor;
 
       // Use flag indexes for efficiency when filtering by ICP or engaged
       const useIcpIndex = options.icpOnly && !options.engagedOnly;
       const useEngagedIndex = options.engagedOnly && !options.icpOnly;
 
+      // For unfiltered queries, fetch exactly `limit` items so cursor is exact
+      const isFiltered = !!(searchQuery || options.status || options.icpOnly || options.engagedOnly);
+      const pageSize = isFiltered ? 200 : limit;
+
       while (matchingLeads.length < limit) {
-        const pageSize = 200;
         let pageResult: any;
 
         if (useIcpIndex) {
@@ -6744,7 +6804,10 @@ export class AgentModeService {
 
         cursor = pageResult.lastEvaluatedKey;
         if (!cursor) break;
+        if (!isFiltered) break; // exact fetch: one page is enough
       }
+
+      const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
 
       return {
         success: true,
@@ -6765,7 +6828,9 @@ export class AgentModeService {
           isEngaged: lead.isEngaged || false
         })),
         matchCount: matchingLeads.length,
-        listName: list.name
+        listName: list.name,
+        has_more: !!cursor,
+        ...(nextCursor && { next_cursor: nextCursor }),
       };
     } catch (error) {
       console.error('AgentMode: Error getting leads:', error);
@@ -6773,17 +6838,18 @@ export class AgentModeService {
     }
   }
 
-  public async searchLeads(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, limit?: number): Promise<any> {
+  public async searchLeads(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, limit?: number, options?: { search?: string; cursor?: string }): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const effectiveLimit = Math.min(Math.max(limit || 20, 1), 50);
+      const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessSearchLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessSearchLeads) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -6791,9 +6857,20 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
+      // Decode cursor from base64 JSON
+      let decodedCursor: any = undefined;
+      if (options?.cursor) {
+        try {
+          decodedCursor = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf8'));
+        } catch {
+          // Invalid cursor — start from beginning
+        }
+      }
+
+      const searchQuery = (options?.search || '').trim().toLowerCase();
       const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
       const matchingLeads: any[] = [];
-      let cursor: any = undefined;
+      let cursor: any = decodedCursor;
 
       while (matchingLeads.length < effectiveLimit) {
         const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
@@ -6801,6 +6878,22 @@ export class AgentModeService {
 
         for (const lead of leads) {
           if (matchingLeads.length >= effectiveLimit) break;
+
+          // Apply cross-field keyword search
+          if (searchQuery) {
+            const fields = [
+              lead.email, lead.firstName, lead.lastName,
+              `${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+              lead.company, lead.phone, lead.title, lead.notes, lead.linkedin
+            ];
+            const standardMatch = fields.some((v: any) => String(v || '').toLowerCase().includes(searchQuery));
+            if (!standardMatch) {
+              const customFields = lead.customFields && typeof lead.customFields === 'object' ? lead.customFields : {};
+              const customMatch = Object.values(customFields).some((v: any) => String(v || '').toLowerCase().includes(searchQuery))
+                || Object.keys(customFields).some((k: string) => k.toLowerCase().includes(searchQuery));
+              if (!customMatch) continue;
+            }
+          }
 
           const allMatch = filters.every((filter: any) => {
             const { field, operator, value } = filter;
@@ -6839,6 +6932,16 @@ export class AgentModeService {
                 return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
               case 'starts_with':
                 return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
+              case 'ilike': {
+                // SQL LIKE pattern: % = any sequence, _ = any single char (case-insensitive)
+                const pattern = String(value ?? '');
+                const regexStr = pattern.split('').map((c: string) => {
+                  if (c === '%') return '.*';
+                  if (c === '_') return '.';
+                  return c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                }).join('');
+                return new RegExp(`^${regexStr}$`, 'i').test(String(fieldValue ?? ''));
+              }
               case 'greater_than': {
                 const numFv = Number(fieldValue);
                 const numV = Number(value);
@@ -6865,6 +6968,8 @@ export class AgentModeService {
         if (!cursor) break;
       }
 
+      const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
+
       return {
         success: true,
         message: `Found ${matchingLeads.length} matching lead(s)`,
@@ -6882,7 +6987,9 @@ export class AgentModeService {
           customFields: lead.customFields || {}
         })),
         matchCount: matchingLeads.length,
-        listName: list.name
+        listName: list.name,
+        has_more: !!cursor,
+        ...(nextCursor && { next_cursor: nextCursor }),
       };
     } catch (error) {
       console.error('AgentMode: Error searching leads:', error);
@@ -6929,12 +7036,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessGetLeadDetails = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessGetLeadDetails) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -6949,6 +7057,7 @@ export class AgentModeService {
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagements = engagementsResult.engagements || [];
+      const customFields = lead.customFields || {};
 
       // Truncate HTML email drafts to text preview
       let emailDraftPreview = null;
@@ -7010,12 +7119,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list access (org-aware: org members can update leads in their org's lists)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -7458,12 +7568,13 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessUpdateStatus) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -9825,6 +9936,60 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       return summary || null;
     } catch (error) {
       console.error('AgentMode: Failed to generate scheduled chat summary:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Generate 2-3 contextual follow-up suggestion chips for the user after each agent turn.
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost generation.
+   * Returns null on failure so the caller can fall back to client-side regex heuristics.
+   */
+  async generateSuggestedReplies(
+    lastAssistantMessage: string,
+    recentMessages: Array<{ role: string; content: string }>
+  ): Promise<string[] | null> {
+    const SUGGESTION_TIMEOUT_MS = 5_000;
+    try {
+      const context = recentMessages
+        .slice(-4)
+        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 300)}`)
+        .join('\n');
+
+      const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
+        {
+          role: 'system',
+          content: `You are a helpful assistant generating quick-reply suggestions for a marketing AI chat interface. Based on the conversation context, generate exactly 2-3 short, natural follow-up replies the user might send next. These should be genuinely useful continuations — questions, approvals, redirections, or clarifications. Return ONLY a JSON array of strings, e.g. ["Yes, looks good", "Change the tone to be more formal", "Show me another option"]. Each suggestion must be under 10 words. Do not include explanations or any text outside the JSON array.`,
+        },
+        {
+          role: 'user',
+          content: `Recent conversation:\n${context}\n\nLatest assistant message: ${lastAssistantMessage.slice(0, 600)}`,
+        },
+      ], {
+        max_completion_tokens: 120,
+        temperature: 0.7,
+        response_format: { type: 'text' },
+      });
+
+      const timeoutPromise = new Promise<null>(resolve =>
+        setTimeout(() => resolve(null), SUGGESTION_TIMEOUT_MS)
+      );
+
+      const response = await Promise.race([llmPromise, timeoutPromise]);
+      if (!response) {
+        console.warn('AgentMode: generateSuggestedReplies timed out');
+        return null;
+      }
+
+      const text = (response as any).choices?.[0]?.message?.content?.trim() || '';
+      // Extract JSON array from the response (model may wrap it in markdown)
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) return null;
+      const parsed = JSON.parse(match[0]);
+      if (!Array.isArray(parsed) || parsed.length === 0) return null;
+      return (parsed as any[]).filter(s => typeof s === 'string').slice(0, 3);
+    } catch (error) {
+      console.error('AgentMode: generateSuggestedReplies failed:', error);
       return null;
     }
   }
@@ -13212,6 +13377,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing ClickUp docs:', clickUpError);
       }
 
+      // Include ClickUp folders (spaces → folders hierarchy, for use as doc write targets)
+      try {
+        const clickUpToken = await getClickUpAccessToken(userId);
+        if (clickUpToken) {
+          const workspaces = await getClickUpWorkspaces(clickUpToken);
+          for (const workspace of workspaces) {
+            try {
+              const spaces = await listClickUpSpaces(clickUpToken, workspace.id);
+              for (const space of spaces) {
+                try {
+                  const folders = await listClickUpFolders(clickUpToken, space.id);
+                  for (const folder of folders) {
+                    knowledgeBases.push({
+                      identifier: `clickup-folder:${folder.id}`,
+                      name: `ClickUp Folder - ${workspace.name} / ${space.name} / ${folder.name}`,
+                      type: 'clickup-folder',
+                      updatedAt: undefined,
+                      files: [],
+                    });
+                  }
+                } catch (spaceErr) {
+                  console.log(`AgentMode: Error listing ClickUp folders in space ${space.name}:`, spaceErr);
+                }
+              }
+            } catch (wsErr) {
+              console.log(`AgentMode: Error listing ClickUp spaces in workspace ${workspace.name}:`, wsErr);
+            }
+          }
+        }
+      } catch (clickUpError) {
+        console.error('AgentMode: Error listing ClickUp folders:', clickUpError);
+      }
+
       // Include ClickUp tasks
       if (!options?.kb_type || options.kb_type === 'clickup-tasks') try {
         const clickUpToken = await getClickUpAccessToken(userId);
@@ -13344,7 +13542,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
@@ -13753,7 +13951,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     workspaceId: string,
     name: string,
     content: string,
-    userId: string
+    userId: string,
+    parentDocId?: string
   ): Promise<{ success: boolean; message: string; docId?: string }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
@@ -13768,8 +13967,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { success: false, message: 'Not authorized to access this ClickUp workspace' };
       }
 
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      if (parentDocId) {
+        // Create as a page inside the specified parent doc
+        const page = await createClickUpPageInDoc(clickUpToken, workspaceId, parentDocId, name, content);
+        return {
+          success: true,
+          message: `Successfully created page "${name}" inside ClickUp doc (id: ${parentDocId}) in workspace "${workspace.name}"`,
+          docId: page.id,
+        };
+      }
 
+      // Create as a standalone doc at workspace root
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
       return {
         success: true,
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
@@ -19982,7 +20191,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account owned by the calling user.
     // This prevents an LLM from reusing a shared/enrichment account_id it may have
     // seen in a prior get-profile tool call to send invitations or messages.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'cancel-invitation', 'accept-invitation'];
+    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserId(userId);
@@ -20172,6 +20381,46 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: messageResponse };
         }
 
+        case 'send-inmail': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for send-inmail');
+          if (!message) throw new Error('message is required for send-inmail action');
+          const { subject } = args;
+          if (!subject) throw new Error('subject is required for send-inmail action');
+
+          const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
+
+          // Persist the sent InMail to the CRM so it shows up in engagement history.
+          const { list_id: inmailListId, lead_id: inmailLeadId } = args;
+          if (inmailListId && inmailLeadId) {
+            const { crmDb } = await import('./db');
+            const inmailLead = await crmDb.getLeadById(inmailListId, inmailLeadId);
+            if (inmailLead) {
+              const leadLinkedIn = ((inmailLead as any).linkedin as string | undefined)?.toLowerCase();
+              if (leadLinkedIn) {
+                const { emailEventsDb } = await import('./emailEventsDb');
+                const msgId = inmailResponse?.id ?? inmailResponse?.message_id ?? `sent_${Date.now()}`;
+                const sentAt = new Date().toISOString();
+                await Promise.all([
+                  emailEventsDb.addLinkedInMessageEvent({
+                    eventId: `linkedin_inmail_${msgId}`,
+                    emailDomain: `linkedin-${inmailListId}`,
+                    leadEmail: leadLinkedIn,
+                    eventType: 'linkedin.inmail.sent',
+                    text: message,
+                    timestamp: sentAt,
+                    senderId: account_id,
+                    messageProviderId: msgId,
+                  }),
+                  crmDb.updateLeadLinkedInSyncAt(inmailListId, inmailLeadId, sentAt),
+                ]);
+                console.log(`[AgentMode] send-inmail: persisted sent InMail for lead ${inmailLeadId} in list ${inmailListId}`);
+              }
+            }
+          }
+
+          return { success: true, data: inmailResponse };
+        }
+
         case 'update-conversation-history': {
           if (!target) throw new Error('Either profile_url or provider_id is required for update-conversation-history');
           const { list_id, lead_id } = args;
@@ -20238,7 +20487,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }

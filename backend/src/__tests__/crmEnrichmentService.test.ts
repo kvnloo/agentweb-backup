@@ -14,9 +14,15 @@ jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     getLeadsByListId: jest.fn(),
+    getLeadById: jest.fn(),
     updateLead: jest.fn(),
     updateFieldNames: jest.fn(),
     updateSearchQueryTemplates: jest.fn(),
+    createEnrichmentSnapshotItem: jest.fn(),
+    createEnrichmentJobMeta: jest.fn(),
+    updateEnrichmentJobStatus: jest.fn(),
+    getEnrichmentJobsByListId: jest.fn(),
+    getEnrichmentSnapshotsByJobId: jest.fn(),
   },
 }));
 
@@ -26,6 +32,13 @@ jest.mock('../services/agentModeService', () => ({
     searchWeb: jest.fn(),
     linkedinOutreach: jest.fn(),
     getGeminiClient: jest.fn().mockResolvedValue({
+      chat: {
+        completions: {
+          create: mockGeminiCreate,
+        },
+      },
+    }),
+    getClientForModel: jest.fn().mockResolvedValue({
       chat: {
         completions: {
           create: mockGeminiCreate,
@@ -92,6 +105,9 @@ describe('CrmEnrichmentService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new CrmEnrichmentService();
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
   });
 
   // ─── FAIL CASES ───────────────────────────────────────────────────────────
@@ -645,8 +661,8 @@ describe('CrmEnrichmentService', () => {
       const guidance = buildFieldGuidance(['employee_count']);
       expect(guidance).toContain('employee_count');
       expect(guidance).toContain('range');
-      // Unknown is a last resort, not the default
-      expect(guidance).toContain('Only return "Unknown" if');
+      // LLM is told to return null (not "Unknown") when value is absent
+      expect(guidance).toContain('Return null if');
     });
 
     it('should default to Bootstrapped for funding fields when not found', () => {
@@ -660,15 +676,15 @@ describe('CrmEnrichmentService', () => {
       expect(guidance).toContain('Not publicly disclosed');
     });
 
-    it('should never say Unknown for industry field', () => {
+    it('should use null for missing industry values', () => {
       const guidance = buildFieldGuidance(['industry']);
       expect(guidance).toContain('industry');
-      expect(guidance).toContain('never return');
+      expect(guidance).toContain('Return null');
     });
 
-    it('should handle empty fields list with fallback string', () => {
+    it('should handle empty fields list with null fallback string', () => {
       const guidance = buildFieldGuidance([]);
-      expect(guidance).toContain('Unknown');
+      expect(guidance).toContain('null');
     });
 
     it('should include guidance for all fields in a mixed list', () => {
@@ -682,7 +698,7 @@ describe('CrmEnrichmentService', () => {
   // ─── splitFields ─────────────────────────────────────────────────────────
 
   describe('splitFields', () => {
-    const splitFields = (fields: Record<string, string>) =>
+    const splitFields = (fields: Record<string, string | null>) =>
       (CrmEnrichmentService as any).splitFields(fields);
 
     it('should map known field names to standard lead fields', () => {
@@ -729,32 +745,31 @@ describe('CrmEnrichmentService', () => {
       expect(customUpdates).toEqual({});
     });
 
-    it('should drop "Unknown" values from both standard and custom updates', () => {
+    it('should exclude null values from standard updates and preserve them in custom updates', () => {
       const { standardUpdates, customUpdates } = splitFields({
-        linkedin_url: 'Unknown',
-        company: 'Unknown',
-        employee_count: 'Unknown',
+        linkedin_url: null,
+        company: null,
+        employee_count: null,
         title: 'CEO',
       });
       expect(standardUpdates).toEqual({ title: 'CEO' });
-      expect(customUpdates).toEqual({});
+      expect(customUpdates).toEqual({ employee_count: null });
     });
 
-    it('should drop empty and "n/a" values', () => {
+    it('should drop empty string values from standard updates', () => {
       const { standardUpdates, customUpdates } = splitFields({
         linkedin_url: '',
-        company: 'n/a',
-        funding_status: 'N/A',
         title: 'CTO',
+        funding_status: null,
       });
       expect(standardUpdates).toEqual({ title: 'CTO' });
-      expect(customUpdates).toEqual({});
+      expect(customUpdates).toEqual({ funding_status: null });
     });
 
-    it('should keep real values even when other fields are Unknown', () => {
+    it('should keep real values even when other fields are null', () => {
       const { standardUpdates, customUpdates } = splitFields({
         linkedin_url: 'https://linkedin.com/in/jane',
-        company: 'Unknown',
+        company: null,
         employee_count: '11-50',
       });
       expect(standardUpdates).toEqual({ linkedin: 'https://linkedin.com/in/jane' });
@@ -1304,6 +1319,7 @@ describe('CrmEnrichmentService', () => {
 
 describe('CrmEnrichmentService.applySearchTemplate', () => {
   const lead = {
+    leadId: 'test',
     firstName: 'John',
     lastName: 'Doe',
     company: 'Acme Corp',
@@ -1330,13 +1346,13 @@ describe('CrmEnrichmentService.applySearchTemplate', () => {
   });
 
   it('collapses multiple spaces when a field is empty', () => {
-    const emptyLead = { company: 'Beta Inc', email: 'test@beta.com' };
+    const emptyLead = { leadId: 'test', company: 'Beta Inc', email: 'test@beta.com' };
     const template = '{{firstName}} {{lastName}} {{company}}';
     expect(CrmEnrichmentService.applySearchTemplate(template, emptyLead)).toBe('Beta Inc');
   });
 
   it('handles lead with no email gracefully for emailDomain', () => {
-    const noEmailLead = { company: 'Gamma' };
+    const noEmailLead = { leadId: 'test', company: 'Gamma' };
     const template = '{{company}} {{emailDomain}}';
     expect(CrmEnrichmentService.applySearchTemplate(template, noEmailLead)).toBe('Gamma');
   });
@@ -1644,7 +1660,7 @@ describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
     (CrmEnrichmentService as any).buildSearchQuery(lead, outputFields);
 
   it('includes "linkedin" in query for company_linkedin_url field', () => {
-    const lead = { company: 'Acme Corp', email: 'john@acme.com' };
+    const lead = { leadId: 'test', company: 'Acme Corp', email: 'john@acme.com' };
     const query = buildSearchQuery(lead, ['company_linkedin_url']);
     expect(query).toContain('Acme Corp');
     expect(query.toLowerCase()).toContain('linkedin');
@@ -1652,7 +1668,7 @@ describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
 
   it('does NOT treat company_linkedin_url as a person-level field', () => {
     // Should NOT prefix with firstName/lastName for company LinkedIn
-    const lead = { firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
+    const lead = { leadId: 'test', firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
     const query = buildSearchQuery(lead, ['company_linkedin_url']);
     // Person-name prefix should not appear for a company-level query
     expect(query).not.toMatch(/^John Doe/);
@@ -1660,9 +1676,260 @@ describe('CrmEnrichmentService.buildSearchQuery (private static)', () => {
   });
 
   it('generates person-based query for personal_linkedin_url field', () => {
-    const lead = { firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
+    const lead = { leadId: 'test', firstName: 'John', lastName: 'Doe', company: 'Acme Corp', email: 'john@acme.com' };
     const query = buildSearchQuery(lead, ['personal_linkedin_url']);
     expect(query).toContain('John Doe');
     expect(query.toLowerCase()).toContain('linkedin');
+  });
+});
+
+// ─── Enrichment History Snapshot Tests ───────────────────────────────────────
+
+describe('CrmEnrichmentService - enrichment history snapshot', () => {
+  let service: CrmEnrichmentService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+    mockSettingsService.getSetting.mockResolvedValue(null);
+  });
+
+  // FAIL test 1: snapshot is NOT written when lead enrichment fails
+  it('should NOT call createEnrichmentSnapshotItem for failed leads', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-fail' })],
+      lastEvaluatedKey: null, hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({ success: false, error: 'Network error' });
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Find company size',
+      outputFields: ['company_size'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.failedCount).toBe(1);
+    expect(mockCrmDb.createEnrichmentSnapshotItem).not.toHaveBeenCalled();
+  });
+
+  // FAIL test 2: snapshot previousCustomFields contains ONLY outputFields, not unrelated fields
+  it('should snapshot only outputFields values, not unrelated customFields', async () => {
+    const lead = createLead({
+      leadId: 'lead-1',
+      customFields: { industry: 'SaaS', unrelated_field: 'should-not-be-snapshotted' },
+    });
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [lead], lastEvaluatedKey: null, hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true, results: [{ title: 'Acme', snippet: 'SaaS company' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'FinTech' }));
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Find industry',
+      outputFields: ['industry'],
+      sources: ['web_search'],
+      forceOverwrite: true,
+    };
+
+    await service.execute(spec);
+
+    expect(mockCrmDb.createEnrichmentSnapshotItem).toHaveBeenCalledTimes(1);
+    const snapshotCall = mockCrmDb.createEnrichmentSnapshotItem.mock.calls[0][0];
+    expect(snapshotCall.previousCustomFields).toHaveProperty('industry', 'SaaS');
+    expect(snapshotCall.previousCustomFields).not.toHaveProperty('unrelated_field');
+  });
+
+  // FAIL test 3: job meta NOT written when leadsToProcess is empty
+  it('should NOT call createEnrichmentJobMeta when there are no leads to process', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [], lastEvaluatedKey: null, hasMore: false,
+    });
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Find industry',
+      outputFields: ['industry'],
+      sources: ['web_search'],
+    };
+
+    await service.execute(spec);
+    expect(mockCrmDb.createEnrichmentJobMeta).not.toHaveBeenCalled();
+  });
+
+  // SUCCESS test: snapshot captures correct previous value before updateLead overwrites it
+  it('should snapshot the existing field value before it is overwritten by enrichment', async () => {
+    const lead = createLead({
+      leadId: 'lead-1',
+      customFields: { industry: 'SaaS' },
+    });
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [lead], lastEvaluatedKey: null, hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true, results: [{ title: 'Acme', snippet: 'FinTech company' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'FinTech' }));
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Update industry',
+      outputFields: ['industry'],
+      sources: ['web_search'],
+      forceOverwrite: true,
+    };
+
+    await service.execute(spec);
+
+    expect(mockCrmDb.createEnrichmentSnapshotItem).toHaveBeenCalledTimes(1);
+    const snapshotCall = mockCrmDb.createEnrichmentSnapshotItem.mock.calls[0][0];
+    // Previous value should be captured BEFORE updateLead is called
+    expect(snapshotCall.previousCustomFields).toEqual({ industry: 'SaaS' });
+    expect(snapshotCall.leadId).toBe('lead-1');
+    expect(snapshotCall.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  // FAIL test 4: snapshot stores null for a field not yet on the lead
+  it('should store null in snapshot for outputFields not present on lead', async () => {
+    const lead = createLead({ leadId: 'lead-1', customFields: {} });
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [lead], lastEvaluatedKey: null, hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true, results: [{ title: 'Acme', snippet: 'Tech company' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack: 'React, Node.js' }));
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Find tech stack',
+      outputFields: ['tech_stack'],
+      sources: ['web_search'],
+    };
+
+    await service.execute(spec);
+
+    expect(mockCrmDb.createEnrichmentSnapshotItem).toHaveBeenCalledTimes(1);
+    const snapshotCall = mockCrmDb.createEnrichmentSnapshotItem.mock.calls[0][0];
+    expect(snapshotCall.previousCustomFields).toEqual({ tech_stack: null });
+  });
+
+  // FAIL test 5: createEnrichmentJobMeta called with correct outputFields
+  it('should call createEnrichmentJobMeta with correct listId, userId, and outputFields', async () => {
+    const lead = createLead({ leadId: 'lead-1', customFields: {} });
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [lead], lastEvaluatedKey: null, hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true, results: [{ title: 'Acme', snippet: 'Tech company' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack: 'React' }));
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user42',
+      instruction: 'Find tech stack',
+      outputFields: ['tech_stack'],
+      sources: ['web_search'],
+    };
+
+    await service.execute(spec);
+
+    expect(mockCrmDb.createEnrichmentJobMeta).toHaveBeenCalledTimes(1);
+    const metaCall = mockCrmDb.createEnrichmentJobMeta.mock.calls[0][0];
+    expect(metaCall.listId).toBe('list1');
+    expect(metaCall.userId).toBe('user42');
+    expect(metaCall.outputFields).toEqual(['tech_stack']);
+    expect(metaCall.status).toBe('completed');
+    expect(metaCall.processedCount).toBe(1);
+  });
+});
+
+// ─── Enrichment Revert Tests ──────────────────────────────────────────────────
+
+describe('CrmEnrichmentService - revertJob', () => {
+  let service: CrmEnrichmentService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockSettingsService.getSetting.mockResolvedValue(null);
+  });
+
+  // FAIL test 6: revert on already-undone job returns error
+  it('should throw when reverting an already-undone job', async () => {
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([]);
+    // Simulate job meta being returned with status 'undone' — no snapshots remain
+    // The service should detect there is nothing to revert (0 snapshots) and throw
+    await expect(service.revertJob('job-xyz', 'list1')).rejects.toThrow();
+  });
+
+  // FAIL test 7: getLeadById returning null counts as failed, not thrown
+  it('should count lead as failed (not throw) when getLeadById returns null', async () => {
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([
+      {
+        jobId: 'job-1', leadId: 'lead-missing',
+        previousCustomFields: { industry: 'SaaS' },
+        previousStandardFields: {},
+      },
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue(null);
+
+    const result = await service.revertJob('job-1', 'list1');
+    expect(result.failedCount).toBe(1);
+    expect(result.revertedCount).toBe(0);
+  });
+
+  // FAIL test 8: mismatched listId — verifying snapshots belong to correct list
+  it('should return zero revertedCount when no snapshots exist for jobId', async () => {
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([]);
+
+    await expect(service.revertJob('job-unknown', 'list1')).rejects.toThrow();
+  });
+
+  // SUCCESS test: revert merges snapshot into current lead, preserving new columns
+  it('should restore enriched fields while preserving columns added after enrichment', async () => {
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([
+      {
+        jobId: 'job-1', leadId: 'lead-1',
+        previousCustomFields: { industry: 'SaaS', tech_stack: null },
+        previousStandardFields: {},
+      },
+    ]);
+    // Current lead has a new column 'phone' added after enrichment
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', listId: 'list1',
+      customFields: { industry: 'FinTech', tech_stack: 'React', phone: '123-456' },
+    });
+
+    const result = await service.revertJob('job-1', 'list1');
+
+    expect(result.revertedCount).toBe(1);
+    expect(result.failedCount).toBe(0);
+
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const updatedCustomFields = updateCall[2].customFields as Record<string, any>;
+    // Enriched fields restored to pre-enrichment values
+    expect(updatedCustomFields['industry']).toBe('SaaS');
+    // tech_stack was null before enrichment → should be removed (not present)
+    expect(updatedCustomFields).not.toHaveProperty('tech_stack');
+    // New column added after enrichment must be preserved
+    expect(updatedCustomFields['phone']).toBe('123-456');
   });
 });

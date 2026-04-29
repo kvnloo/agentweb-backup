@@ -43,8 +43,8 @@ jest.spyOn(CrmEnrichmentService.prototype, 'preview').mockResolvedValue({
   leadsToProcess: 80,
   alreadyEnriched: 20,
   samples: [
-    { leadId: 'lead1', lead: { company: 'Acme' }, enrichedFields: { industry: 'Tech' } },
-    { leadId: 'lead2', lead: { company: 'Beta' }, enrichedFields: { industry: 'Finance' } },
+    { leadId: 'lead1', lead: { leadId: 'lead1', company: 'Acme' }, enrichedFields: { industry: 'Tech' } },
+    { leadId: 'lead2', lead: { leadId: 'lead2', company: 'Beta' }, enrichedFields: { industry: 'Finance' } },
   ],
 });
 
@@ -52,6 +52,7 @@ jest.spyOn(CrmEnrichmentService.prototype, 'execute').mockResolvedValue({
   jobId: 'job-123',
   processedCount: 80,
   failedCount: 0,
+  skippedCount: 0,
   totalToProcess: 80,
   outputFields: ['industry'],
   failureBreakdown: { searchWebFailed: 0, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },

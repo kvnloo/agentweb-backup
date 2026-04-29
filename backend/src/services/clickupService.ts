@@ -11,6 +11,16 @@ export interface ClickUpWorkspace {
   avatar?: string | null;
 }
 
+export interface ClickUpSpace {
+  id: string;
+  name: string;
+}
+
+export interface ClickUpFolder {
+  id: string;
+  name: string;
+}
+
 export interface ClickUpDoc {
   id: string;
   name: string;
@@ -231,7 +241,35 @@ export async function listTasks(accessToken: string, teamId: string): Promise<Cl
 }
 
 /**
- * Create a new doc in a workspace (at the workspace root).
+ * List all spaces in a workspace.
+ */
+export async function listSpaces(accessToken: string, workspaceId: string): Promise<ClickUpSpace[]> {
+  const response = await axios.get<{ spaces: any[] }>(
+    `${CLICKUP_API_V2}/team/${workspaceId}/space?archived=false`,
+    { headers: { Authorization: accessToken } }
+  );
+  return (response.data.spaces || []).map((space: any) => ({
+    id: space.id,
+    name: space.name,
+  }));
+}
+
+/**
+ * List all non-archived folders in a space.
+ */
+export async function listFolders(accessToken: string, spaceId: string): Promise<ClickUpFolder[]> {
+  const response = await axios.get<{ folders: any[] }>(
+    `${CLICKUP_API_V2}/space/${spaceId}/folder?archived=false`,
+    { headers: { Authorization: accessToken } }
+  );
+  return (response.data.folders || []).map((folder: any) => ({
+    id: folder.id,
+    name: folder.name,
+  }));
+}
+
+/**
+ * Create a new doc in a workspace at the workspace root.
  */
 export async function createDoc(
   accessToken: string,
@@ -245,6 +283,30 @@ export async function createDoc(
     { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
   );
   return { id: response.data.id, name: response.data.name };
+}
+
+/**
+ * Create a new page inside an existing doc.
+ * This is the correct way to place content inside a specific ClickUp doc/folder.
+ * ClickUp Docs and task-hierarchy folders are separate systems; docs can only
+ * contain pages via the pages API.
+ */
+export async function createPageInDoc(
+  accessToken: string,
+  workspaceId: string,
+  docId: string,
+  name: string,
+  content: string
+): Promise<{ id: string; name: string }> {
+  const response = await axios.post<any>(
+    `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs/${docId}/pages`,
+    { name, content },
+    { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
+  );
+  return {
+    id: response.data.id || response.data.doc_id || docId,
+    name: response.data.name || name,
+  };
 }
 
 /**

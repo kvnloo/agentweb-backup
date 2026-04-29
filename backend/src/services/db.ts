@@ -459,6 +459,10 @@ export interface User {
   allowedSkills?: string[];
   orgId?: string;
   orgRole?: "owner" | "member";
+  // Set when an org owner invites this email; cleared when invite is accepted or cancelled.
+  // Used to redirect users straight to accept-invite instead of onboarding.
+  // null is used by updateUser to explicitly remove the field from DynamoDB.
+  pendingOrgInvite?: { orgId: string; inviteToken: string } | null;
   /**
    * Attribution — forward-compatible with a future UserTouches timeline table.
    * firstTouch is set once at signup and never mutated; lastTouch refreshes on
@@ -904,13 +908,19 @@ class UserDB {
 
   async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
     try {
-      const params = {
-        TableName: this.tableName,
-        Limit: 5000,
-      };
+      const allItems: any[] = [];
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      do {
+        const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+          TableName: this.tableName,
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        };
+        const result = await this.docClient.scan(params).promise();
+        allItems.push(...(result.Items || []));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
 
-      const result = await this.docClient.scan(params).promise();
-      const users = (result.Items || []).filter(
+      const users = allItems.filter(
         (u) =>
           !u.userId?.startsWith("deleted_") &&
           (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
@@ -3578,6 +3588,30 @@ export const crmDb = {
     }
   },
 
+  // Returns true if userId owns the list OR is an org member of the same org as the list owner.
+  async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
+    if (list.userId === userId) return true;
+    const [user, owner] = await Promise.all([
+      userDb.getUserById(userId),
+      userDb.getUserById(list.userId),
+    ]);
+    return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+  },
+
+  // Org-aware version: returns the user's own lists plus all org members' lists.
+  async getLeadListsForUser(userId: string) {
+    const ownLists = await this.getLeadListsByUserId(userId);
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) return ownLists;
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const memberListArrays = await Promise.all(
+      members
+        .filter((m) => m.userId !== userId)
+        .map((m) => this.getLeadListsByUserId(m.userId))
+    );
+    return [...(ownLists || []), ...memberListArrays.flat().filter(Boolean)];
+  },
+
   async getLeadListById(listId: string) {
     try {
       const params = {
@@ -5535,6 +5569,109 @@ export const crmDb = {
       throw error;
     }
   },
+
+  // ─── Enrichment History ───────────────────────────────────────────
+
+  async createEnrichmentSnapshotItem(item: {
+    jobId: string;
+    leadId: string;
+    previousStandardFields: Record<string, string | null>;
+    previousCustomFields: Record<string, string | null>;
+    expiresAt: number;
+  }): Promise<void> {
+    try {
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Item: {
+          jobId: item.jobId,
+          leadId: item.leadId,
+          previousStandardFields: item.previousStandardFields,
+          previousCustomFields: item.previousCustomFields,
+          expiresAt: item.expiresAt,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'createEnrichmentSnapshotItem');
+      throw error;
+    }
+  },
+
+  async createEnrichmentJobMeta(meta: {
+    jobId: string;
+    listId: string;
+    userId: string;
+    outputFields: string[];
+    createdAt: string;
+    status: 'completed' | 'undone';
+    expiresAt: number;
+    processedCount: number;
+  }): Promise<void> {
+    try {
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Item: {
+          jobId: meta.jobId,
+          leadId: '_meta',
+          listId: meta.listId,
+          userId: meta.userId,
+          outputFields: meta.outputFields,
+          createdAt: meta.createdAt,
+          status: meta.status,
+          expiresAt: meta.expiresAt,
+          processedCount: meta.processedCount,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'createEnrichmentJobMeta');
+      throw error;
+    }
+  },
+
+  async updateEnrichmentJobStatus(jobId: string, status: 'completed' | 'undone'): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Key: { jobId, leadId: '_meta' },
+        UpdateExpression: 'SET #status = :status',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': status },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'updateEnrichmentJobStatus');
+      throw error;
+    }
+  },
+
+  async getEnrichmentJobsByListId(listId: string, limit = 10): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        IndexName: 'listId-createdAt-index',
+        KeyConditionExpression: 'listId = :listId',
+        ExpressionAttributeValues: { ':listId': listId },
+        ScanIndexForward: false,
+        Limit: limit,
+      }).promise();
+      return (result.Items || []).filter((item: any) => item.leadId === '_meta');
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentJobsByListId');
+      throw error;
+    }
+  },
+
+  async getEnrichmentSnapshotsByJobId(jobId: string): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        KeyConditionExpression: 'jobId = :jobId',
+        ExpressionAttributeValues: { ':jobId': jobId },
+      }).promise();
+      return (result.Items || []).filter((item: any) => item.leadId !== '_meta');
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentSnapshotsByJobId');
+      throw error;
+    }
+  },
 };
 
 // ─── Account Memory ───────────────────────────────────────────────
@@ -6069,23 +6206,55 @@ export const orgDb = {
   },
 
   async getOrgMembers(orgId: string): Promise<User[]> {
-    // Scan users with this orgId - fine for small orgs (max 5 members)
-    const result = await dynamodb.scan({
-      TableName: `${TABLE_PREFIX}AW-Users`,
-      FilterExpression: "orgId = :orgId",
-      ExpressionAttributeValues: { ":orgId": orgId },
-    }).promise();
-    return (result.Items || []) as User[];
+    const allItems: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        FilterExpression: "orgId = :orgId",
+        ExpressionAttributeValues: { ":orgId": orgId },
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      allItems.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return allItems as User[];
   },
 
   async getOrgMemberCount(orgId: string): Promise<number> {
-    const result = await dynamodb.scan({
-      TableName: `${TABLE_PREFIX}AW-Users`,
-      FilterExpression: "orgId = :orgId",
-      ExpressionAttributeValues: { ":orgId": orgId },
-      Select: "COUNT",
-    }).promise();
-    return result.Count || 0;
+    let total = 0;
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        FilterExpression: "orgId = :orgId",
+        ExpressionAttributeValues: { ":orgId": orgId },
+        Select: "COUNT",
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      total += result.Count || 0;
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return total;
+  },
+
+  // Find the first org that has a pending invite for the given email.
+  // Used at registration time to stamp pendingOrgInvite on a brand-new account.
+  async getOrgWithPendingInviteForEmail(email: string): Promise<Organization | null> {
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    const normalizedEmail = email.toLowerCase();
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      const match = (result.Items as Organization[] || []).find(
+        (org) => (org.pendingInvites || []).some((inv) => inv.email === normalizedEmail)
+      );
+      if (match) return match;
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return null;
   },
 
   ORG_MAX_MEMBERS,

@@ -764,6 +764,7 @@ export default function AdminDashboard() {
   const [chatSessionsHasMore, setChatSessionsHasMore] = useState(true);
   const [chatSessionsInitialized, setChatSessionsInitialized] = useState(false);
   const [chatSessionIdSearch, setChatSessionIdSearch] = useState("");
+  const [chatUserFilter, setChatUserFilter] = useState("");
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
@@ -1070,7 +1071,7 @@ export default function AdminDashboard() {
   }, [tabValue, token]);
 
   const loadChatSessions = React.useCallback(
-    async (options?: { reset?: boolean; sessionIdOverride?: string }) => {
+    async (options?: { reset?: boolean; sessionIdOverride?: string; userFilterOverride?: string }) => {
       if (!token || chatSessionsLoading) {
         return;
       }
@@ -1080,12 +1081,27 @@ export default function AdminDashboard() {
       const searchId = options?.sessionIdOverride !== undefined
         ? options.sessionIdOverride
         : chatSessionIdSearch;
+      const userFilter = options?.userFilterOverride !== undefined
+        ? options.userFilterOverride
+        : chatUserFilter;
 
       try {
         setChatSessionsLoading(true);
         const params = new URLSearchParams();
         if (searchId.trim()) {
           params.set("sessionId", searchId.trim());
+        } else if (userFilter.trim()) {
+          // Determine if input looks like a userId (UUID) or email
+          const trimmed = userFilter.trim();
+          if (trimmed.includes("@")) {
+            params.set("userEmail", trimmed);
+          } else {
+            params.set("userId", trimmed);
+          }
+          params.set("limit", "30");
+          if (cursor) {
+            params.set("cursor", cursor);
+          }
         } else {
           params.set("limit", "30");
           if (cursor) {
@@ -1107,8 +1123,9 @@ export default function AdminDashboard() {
           nextCursor: string | null;
         };
 
+        const isSessionIdSearch = Boolean(searchId.trim());
         setChatSessions((prev) => {
-          if (shouldReset || searchId.trim()) {
+          if (shouldReset || isSessionIdSearch) {
             return sessions;
           }
           const seen = new Set(prev.map((session) => session.sessionId));
@@ -1122,7 +1139,7 @@ export default function AdminDashboard() {
           return merged;
         });
         setChatSessionsCursor(nextCursor);
-        setChatSessionsHasMore(Boolean(nextCursor) && !searchId.trim());
+        setChatSessionsHasMore(Boolean(nextCursor));
         setChatSessionsInitialized(true);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
@@ -1130,7 +1147,7 @@ export default function AdminDashboard() {
         setChatSessionsLoading(false);
       }
     },
-    [token, chatSessionsCursor, chatSessionsLoading, chatSessionIdSearch]
+    [token, chatSessionsCursor, chatSessionsLoading, chatSessionIdSearch, chatUserFilter]
   );
 
   useEffect(() => {
@@ -5211,7 +5228,44 @@ export default function AdminDashboard() {
               </Button>
             </Box>
           )}
-          <Box sx={{ display: 'flex', gap: 1, mb: 2, alignItems: 'center' }}>
+          <Box sx={{ display: 'flex', gap: 1, mb: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+            <TextField
+              label="Filter by User Email or ID"
+              size="small"
+              value={chatUserFilter}
+              onChange={(e) => setChatUserFilter(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  setChatSessionIdSearch("");
+                  loadChatSessions({ reset: true, sessionIdOverride: "", userFilterOverride: chatUserFilter });
+                }
+              }}
+              sx={{ width: 300 }}
+              placeholder="Email or user ID"
+            />
+            <Button
+              variant="contained"
+              size="small"
+              onClick={() => {
+                setChatSessionIdSearch("");
+                loadChatSessions({ reset: true, sessionIdOverride: "", userFilterOverride: chatUserFilter });
+              }}
+            >
+              Filter
+            </Button>
+            {chatUserFilter && (
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => {
+                  setChatUserFilter("");
+                  loadChatSessions({ reset: true, sessionIdOverride: "", userFilterOverride: "" });
+                }}
+              >
+                Clear
+              </Button>
+            )}
+            <Box sx={{ width: 16 }} />
             <TextField
               label="Search by Session ID"
               size="small"
@@ -5219,16 +5273,20 @@ export default function AdminDashboard() {
               onChange={(e) => setChatSessionIdSearch(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
-                  loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch });
+                  setChatUserFilter("");
+                  loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch, userFilterOverride: "" });
                 }
               }}
-              sx={{ width: 380 }}
+              sx={{ width: 340 }}
               placeholder="Paste a session ID and press Enter or Search"
             />
             <Button
               variant="contained"
               size="small"
-              onClick={() => loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch })}
+              onClick={() => {
+                setChatUserFilter("");
+                loadChatSessions({ reset: true, sessionIdOverride: chatSessionIdSearch, userFilterOverride: "" });
+              }}
             >
               Search
             </Button>
@@ -5238,7 +5296,7 @@ export default function AdminDashboard() {
                 size="small"
                 onClick={() => {
                   setChatSessionIdSearch("");
-                  loadChatSessions({ reset: true, sessionIdOverride: "" });
+                  loadChatSessions({ reset: true, sessionIdOverride: "", userFilterOverride: "" });
                 }}
               >
                 Clear

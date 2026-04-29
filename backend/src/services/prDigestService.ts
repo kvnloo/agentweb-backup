@@ -54,45 +54,51 @@ async function fetchRepoPRs(
   const sinceDate = new Date(sinceISO);
   const untilDate = new Date(untilISO);
 
-  // Fetch recently closed PRs (merged PRs have state=closed)
-  // GitHub search API: merged within the date range
   const query = `repo:${org}/${repo} is:pr is:merged base:main merged:${sinceISO}..${untilISO}`;
-  const url = `${GITHUB_API}/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=100`;
-
-  const searchRes = await fetch(url, { headers });
-  if (!searchRes.ok) {
-    const errorText = await searchRes.text();
-    console.error(`GitHub search API error for ${repo}:`, searchRes.status, errorText);
-    return [];
-  }
-
-  const searchData = await searchRes.json();
-  const items = searchData.items || [];
-
-  // Fetch full PR details (additions, deletions, changed_files)
   const prs: PullRequest[] = [];
-  for (const item of items) {
-    const prUrl = `${GITHUB_API}/repos/${org}/${repo}/pulls/${item.number}`;
-    const prRes = await fetch(prUrl, { headers });
-    if (!prRes.ok) continue;
+  const perPage = 100;
 
-    const prData = await prRes.json();
-    if (!prData.merged_at) continue;
+  // Paginate through all search result pages until a partial page signals the end.
+  for (let page = 1; ; page++) {
+    const url = `${GITHUB_API}/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=${perPage}&page=${page}`;
 
-    const mergedAt = new Date(prData.merged_at);
-    if (mergedAt >= sinceDate && mergedAt <= untilDate) {
-      prs.push({
-        number: prData.number,
-        title: prData.title,
-        html_url: prData.html_url,
-        user: { login: prData.user?.login || "unknown" },
-        merged_at: prData.merged_at,
-        body: prData.body,
-        additions: prData.additions || 0,
-        deletions: prData.deletions || 0,
-        changed_files: prData.changed_files || 0,
-      });
+    const searchRes = await fetch(url, { headers });
+    if (!searchRes.ok) {
+      const errorText = await searchRes.text();
+      console.error(`GitHub search API error for ${repo} (page ${page}):`, searchRes.status, errorText);
+      break;
     }
+
+    const searchData = await searchRes.json();
+    const items: any[] = searchData.items || [];
+
+    // Fetch full PR details (additions, deletions, changed_files)
+    for (const item of items) {
+      const prUrl = `${GITHUB_API}/repos/${org}/${repo}/pulls/${item.number}`;
+      const prRes = await fetch(prUrl, { headers });
+      if (!prRes.ok) continue;
+
+      const prData = await prRes.json();
+      if (!prData.merged_at) continue;
+
+      const mergedAt = new Date(prData.merged_at);
+      if (mergedAt >= sinceDate && mergedAt <= untilDate) {
+        prs.push({
+          number: prData.number,
+          title: prData.title,
+          html_url: prData.html_url,
+          user: { login: prData.user?.login || "unknown" },
+          merged_at: prData.merged_at,
+          body: prData.body,
+          additions: prData.additions || 0,
+          deletions: prData.deletions || 0,
+          changed_files: prData.changed_files || 0,
+        });
+      }
+    }
+
+    // A page with fewer than perPage items means we've reached the last page.
+    if (items.length < perPage) break;
   }
 
   return prs;

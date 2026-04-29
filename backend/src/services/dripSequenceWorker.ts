@@ -61,8 +61,8 @@ async function processEnrollment(
     return;
   }
 
-  // Paused sequences: skip silently (don't exit, just don't advance)
-  if (sequence.status === 'paused') return;
+  // Draft/paused sequences: skip silently (don't exit, just don't advance)
+  if (sequence.status === 'draft' || sequence.status === 'paused') return;
 
   // Check exit conditions before sending
   const shouldExit = await checkExitConditions(enrollment, sequence);

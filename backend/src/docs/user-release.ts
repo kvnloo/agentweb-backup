@@ -9,8 +9,164 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-29',
+    changes: [
+      'Fix: PR Digest Now Returns All PRs for Large Date Ranges',
+      '- The get_pr_digest admin tool previously capped results at ~200 PRs total (100 per repo) due to missing pagination',
+      '- Requesting a 30-day range now correctly returns all merged PRs across the full window instead of only the most recent ~3 days',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improvement: Invited Org Members Skip Onboarding',
+      '- Users invited to join an organization are no longer forced through the onboarding flow after signing up or logging in',
+      '- After logging in, invited users are redirected directly to the Accept Invitation page',
+      '- Once the invitation is accepted, the user is immediately active as an org member with access to shared brand guidelines, market strategy, and connected accounts',
+      '- Onboarding is designed to convert free users to paid — org members are covered by the org owner\'s subscription and do not need it',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Improvement: Smarter Quick-Reply Suggestions in Emma Chat',
+      '- Emma now generates contextual quick-reply chips tailored to each specific response, replacing the previous fixed set of generic options',
+      '- Suggestions are powered by a fast AI model and reflect the actual content of the conversation — e.g. after drafting subject lines, chips might say "Write the email body for #2" or "Generate 3 more options"',
+      '- Suggestions now persist when you reload or return to a chat session',
+      '- The previous regex-based chips (Yes / No / Tell me more) remain as an instant fallback while the AI-generated ones load',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Improvement: Test Emails Now Auto-Fix CSS for Gmail and Outlook Compatibility',
+      '- When sending a test email for a sequence step, the system now automatically detects class-based CSS that Gmail and Outlook would strip',
+      '- If detected, Claude Sonnet 4.6 converts all CSS classes to inline styles while preserving every color, font, size, and layout exactly',
+      '- Buttons and CTAs now include a solid background-color fallback so they render correctly even when Gmail strips gradient backgrounds',
+      '- Circular number badges and icon circles are converted from flexbox to line-height centering so numbers stay centered in all email clients',
+      '- The orange test banner shows "✅ Styles auto-fixed" when conversion was applied so senders know what changed',
+      '- The unsubscribe link in test emails now points to the real portal unsubscribe page with the correct list and lead parameters',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fixed: Fathom Now Visible in Connected Accounts for All Users',
+      '- Fathom was previously hidden for non-admin users due to an incorrect admin-only guard in the Connected Accounts settings page',
+      '- All users can now see and connect their Fathom account from Settings → Connected Accounts',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fix: Gmail Email Subject Lines Now Display Correctly With Special Characters',
+      '- Email subjects containing special characters such as em-dashes (—), smart quotes, and other non-ASCII unicode were previously showing as garbled or unreadable text in some email clients',
+      '- Subject lines are now properly encoded using the RFC 2047 standard, so characters like em-dashes render as plain, readable text for recipients',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'New: LinkedIn InMail Support in Outreach Tool',
+      '- Emma can now send LinkedIn InMail messages to 2nd and 3rd-degree connections (profiles you are not yet connected with)',
+      '- Use the send-inmail action when a direct message is not possible due to connection degree restrictions',
+      '- Requires a LinkedIn Premium, Sales Navigator, or Recruiter subscription with available InMail credits on the connected account',
+      '- Sent InMails are tracked in the CRM engagement history alongside regular messages',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fixed: Gmail Connected Account No Longer Shows as Inactive After Reconnect',
+      '- Gmail accounts were incorrectly showing as inactive in the connected accounts status even though emails were sending successfully',
+      '- The issue occurred because the activity check did not account for Gmail\'s automatic token renewal via refresh token',
+      '- Gmail (and other OAuth platforms with a refresh token) now correctly report as active, matching the status shown in Settings → Connected Accounts',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fix: Org Member Token Usage Now Counts Against Org Owner\'s Quota',
+      '- Previously, each org member\'s token usage was tracked independently against their own (Free-tier) quota, so members could consume tokens without affecting the org owner\'s limit',
+      '- Token usage for org members now counts against the org owner\'s subscription quota — checks, increments, and the subscription usage dashboard all reflect the owner\'s pool',
+      '- Org owners will now see their full team\'s consumption in the Monthly Token Usage bar on the Subscription settings page',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fixed: Email Sequence Enrollment Condition Now Saves Correctly',
+      '- Setting an Enrollment Condition on a sequence (e.g. customFields.subscriptionType equals Free) now persists correctly after saving',
+      '- Previously, the condition was silently discarded due to a missing field in the API route — the sequence appeared to save but the condition was lost on reload',
+      '- Also fixed: sequences in Draft status no longer send emails — they are now treated the same as Paused sequences and will not advance any active enrollments until the sequence is set to Active',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fix: Admin Delegate Access No Longer Blocked by Onboarding Banner',
+      '- When an admin used delegate access to view a customer account that had not yet completed onboarding, a banner prompting them to complete brand setup was incorrectly shown',
+      '- Admins using delegate access are now fully exempt from the onboarding banner',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fixed: Emma No Longer Suggests Creating a Schedule Inside Scheduled Sessions',
+      '- When a scheduled chat runs automatically, Emma was incorrectly ending her response with "Want this to run automatically every day?" — even though the user already set up the schedule',
+      '- Emma now detects when she is running inside an automated scheduled session and delivers results directly, without any scheduling suggestions',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Fixed: Resend Banner No Longer Appears While Emma Is Processing',
+      '- The "previous response wasn\'t received" Resend banner no longer appears while Emma is actively working on a request',
+      '- Previously, the banner would flash during the SSE streaming phase (tool calls, thinking) because the HTTP phase had already completed',
+      '- The banner now correctly only appears when Emma has genuinely stopped responding with no active processing',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Improvement: Admin Chat History Filter by User',
+      '- Admins can now filter the Chat History tab by user email or user ID to see all recent sessions for a specific user',
+      '- Enter an email address or user ID in the new "Filter by User Email or ID" field and click Filter',
+      '- Results load with infinite scroll — scrolling to the bottom automatically loads more sessions for the filtered user',
+    ],
+  },
+  {
+    date: '2026-04-28',
+    changes: [
+      'Improvement: Chat History Now Shows Admin Delegation Info',
+      '- The get_chat_history admin tool now includes delegateInfo on each session, showing whether the session was started by an admin acting on behalf of a user',
+      '- delegateInfo contains adminUserId, adminEmail, and isDelegated — null for sessions started directly by the user',
+    ],
+  },
+  {
     date: '2026-04-27',
     changes: [
+      'Fix: Org Members Can Now Find and Update Leads Owned by the Org Owner',
+      '- Org members can now see and interact with lead lists that belong to other members of their org in Emma agent mode',
+      '- Previously, asking Emma to "find Alice Smith" or update a lead would return Access Denied if the list was owned by the org owner',
+      '- Fixed a DynamoDB pagination bug where org members with >218 users in the database were silently dropped, causing the org owner to not appear in the Users admin tab',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: Batch Review Page Now Scrollable',
+      '- The batch review page (shared externally for content approval) can now be scrolled when there are many assets to review',
+      '- Previously the page was locked in place due to a global CSS setting intended for the main app, making it impossible to see assets below the fold',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fix: Chat History Now Returns Dimensional Scores When Using sync=true',
+      '- The get_chat_history tool now re-scores sessions that have an overall satisfaction score but are missing the dimensional breakdown (goalCompletion, dataAccuracy, outputQuality)',
+      '- Previously, sessions scored before dimensional scoring was introduced would never get backfilled with dimension scores even when sync=true was used',
+      '- Call get_chat_history with sync=true to backfill dimensional scores on existing sessions',
       'New: Google Calendar Skill — Emma Can Now Read Your Calendar',
       '- A new "Google Calendar" skill is available in Skills settings that lets Emma read your Google Calendar events',
       '- Emma can list upcoming events, look up event details (attendees, location, meeting link), and browse all your calendars',
@@ -5187,6 +5343,25 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-26',
     changes: [
+      'Improved: Emma Now Suggests Reporting Issues After Failures',
+      '- Emma will now proactively suggest using the Report Issue tool when something goes wrong',
+      '- Covers unrecoverable errors, unsatisfactory output, suspected data hallucinations, and user frustration',
+      '- Emma briefly explains the situation and asks: "I\'d recommend reporting this so the team can investigate — want me to file it?"',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail When Taking Screenshots with Gemini',
+      '- Scheduled chats using Gemini models no longer crash with a 400 error after the browser takes a screenshot',
+      '- The screenshot S3 URL is now included in the tool result so Gemini can analyze it using the describe_image tool if needed',
+      '- Errors in scheduled chats now automatically file a Notion oncall ticket in addition to the existing email alert',
+      '- Fixed a bug where a single scheduled chat error would save the user message 20 times in the database due to over-aggressive retries',
+    ],
+  },
+  {
+    date: '2026-04-26',
+    changes: [
       'Improved: Session Quality Scoring Now Breaks Down Into Three Dimensions',
       '- The automated satisfaction score for each chat session now includes three sub-scores alongside the overall rating: Goal Completion, Data Accuracy, and Output Quality',
       '- Goal Completion measures whether the assistant fully accomplished what the user asked',
@@ -5195,4 +5370,41 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- All three sub-scores are visible in the Admin Dashboard Chat History tab and accessible via the get_chat_history admin tool',
     ],
   },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Lead List Now Stays in Sync with User Records',
+      '- When a user\'s subscription type, subscription status, roles, or active status changes in the admin panel, the matching CRM lead record is automatically updated',
+      '- Covers admin actions: changing subscription type, deactivating/reactivating users, and promoting waitlist users',
+      '- Also covers Stripe webhook events: subscription upgrades/downgrades, cancellations, payment failures, and payment recovery',
+      '- Use "Sync Now" (Force Full Sync) on the Admin → Users tab to backfill all existing CRM leads with current user data',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'New: Emma Suggests Scheduling After Successful Workflows',
+      '- After Emma completes a repeatable task (LinkedIn posts, articles, newsletters, research reports, etc.), she now proactively suggests setting up a scheduled chat so it runs automatically',
+      '- The suggestion appears in Emma\'s "Next Step" closing and offers to configure the schedule immediately if you say "schedule this"',
+      '- Emma skips the suggestion for one-off tasks, onboarding, and when you\'re already in a scheduled run',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Sequences Load-from-URL Now Preserves Email Formatting',
+      '- Loading a URL into a Sequence step email body now preserves the full HTML email document including all CSS styles',
+      '- Previously, the import stripped <style> tags and collapsed whitespace, destroying the layout of purpose-built HTML email templates',
+      '- The fix also applies to the CRM group-email and admin announcement load-from-URL features',
+    ],
+  },
+  {
+    date: '2026-04-27',
+    changes: [
+      'Fixed: CRM Lead Engagements Now Load Correctly',
+      '- Clicking on a lead in the CRM page no longer shows "Failed to load engagements" every time',
+      '- The error was caused by a missing AWS region configuration in the email events service',
+    ],
+  },
 ];
+

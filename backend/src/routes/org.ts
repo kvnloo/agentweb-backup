@@ -182,6 +182,14 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
       pendingInvites: [...pendingInvites, newInvite],
     });
 
+    // If the invitee already has an account, stamp pendingOrgInvite so they're
+    // redirected straight to accept-invite on next login instead of onboarding.
+    if (targetUser) {
+      await userDb.updateUser(targetUser.userId, {
+        pendingOrgInvite: { orgId, inviteToken },
+      });
+    }
+
     // Send invite email
     try {
       const { emailService } = await import("../services/emailService");
@@ -263,8 +271,8 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
     updatedInvites.splice(inviteIndex, 1);
     await orgDb.updateOrg(orgId, { pendingInvites: updatedInvites });
 
-    // Add user to org
-    await userDb.updateUser(userId, { orgId, orgRole: "member" });
+    // Add user to org and clear the pending invite stamp
+    await userDb.updateUser(userId, { orgId, orgRole: "member", pendingOrgInvite: null });
 
     return res.json({ success: true, message: "Successfully joined the organization" });
   } catch (error) {
@@ -296,6 +304,14 @@ router.delete("/:orgId/invite/:email", async (req: Request, res: Response) => {
     }
 
     await orgDb.updateOrg(orgId, { pendingInvites: filtered });
+
+    // Clear the pendingOrgInvite stamp on the user account if they have one
+    const targetEmail = decodeURIComponent(email).toLowerCase();
+    const targetUser = await userDb.getUserByEmail(targetEmail);
+    if (targetUser?.pendingOrgInvite?.orgId === orgId) {
+      await userDb.updateUser(targetUser.userId, { pendingOrgInvite: null });
+    }
+
     return res.json({ success: true, message: "Invite cancelled" });
   } catch (error) {
     console.error("Error cancelling invite:", error);

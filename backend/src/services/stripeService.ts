@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import { userDb } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 import { paymentHistoryDb } from './paymentHistoryDb';
+import { syncUserUpdateToLeadList } from './crmAutoSyncService';
 
 dotenv.config();
 
@@ -469,6 +470,11 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   }
 
   await userDb.updateUser(user.userId, updateData);
+  syncUserUpdateToLeadList(user.email, {
+    subscriptionType: updateData.subscriptionType,
+    subscription_status: updateData.subscription_status,
+    stripe_customer_id: updateData.stripe_customer_id,
+  });
 
   // Cancel any duplicate subscriptions for this customer (keep only the latest)
   if (stripeCustomerId && stripeSubscriptionId) {
@@ -604,6 +610,10 @@ export async function handleSubscriptionUpdated(
   }
 
   await userDb.updateUser(user.userId, updateData);
+  syncUserUpdateToLeadList(user.email, {
+    subscriptionType: updateData.subscriptionType,
+    subscription_status: updateData.subscription_status,
+  });
 
   console.log(
     `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}`
@@ -649,6 +659,7 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
   }
 
   await userDb.updateUser(user.userId, updateData);
+  syncUserUpdateToLeadList(user.email, { subscription_status: 'active' });
 
   console.log(
     `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}`
@@ -721,6 +732,10 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
           }
 
           await userDb.updateUser(user.userId, updateData);
+          syncUserUpdateToLeadList(user.email, {
+            subscriptionType: updateData.subscriptionType,
+            subscription_status: updateData.subscription_status,
+          });
           console.log(
             `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
           );
@@ -742,6 +757,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
     allowedSkills: freeTierConfig?.allowedSkills ?? [],
   });
+  syncUserUpdateToLeadList(user.email, { subscription_status: 'canceled', subscriptionType: 'Free' });
 
   // Record in payment history
   await paymentHistoryDb.record({
@@ -794,6 +810,7 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
   await userDb.updateUser(user.userId, {
     subscription_status: 'past_due',
   });
+  syncUserUpdateToLeadList(user.email, { subscription_status: 'past_due' });
 
   // Record in payment history
   await paymentHistoryDb.record({
@@ -1088,6 +1105,10 @@ export async function reconcileAllStripeUsers(): Promise<{
 
       if (Object.keys(updates).length > 0) {
         await userDb.updateUser(user.userId, updates);
+        syncUserUpdateToLeadList(user.email, {
+          subscriptionType: updates.subscriptionType,
+          subscription_status: updates.subscription_status,
+        });
         summary.fixed++;
         summary.details.push({ email: user.email, action: changes.join(', ') });
         console.log(`[STRIPE RECONCILE] Fixed ${user.email}: ${changes.join(', ')}`);
