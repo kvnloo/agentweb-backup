@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Fixed: Sequence Email CSS Styles Now Converted at Import Time',
+      '- When loading an email template from a URL into a Sequence step (or CRM group email), CSS class-based styles are now converted to inline styles immediately on import',
+      '- Previously, this conversion happened at send time (including test sends), causing delays and inconsistency — the stored email body could look different than what was sent',
+      '- The stored bodyHtml is now already email-client-safe after loading from URL, so test sends and real sends are fast and consistent',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Fix: PR Digest Now Returns All PRs for Large Date Ranges',
       '- The get_pr_digest admin tool previously capped results at ~200 PRs total (100 per repo) due to missing pagination',
       '- Requesting a 30-day range now correctly returns all merged PRs across the full window instead of only the most recent ~3 days',
