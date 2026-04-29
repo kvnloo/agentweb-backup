@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Fix: PR Digest Now Returns All PRs for Large Date Ranges',
+      '- The get_pr_digest admin tool previously capped results at ~200 PRs total (100 per repo) due to missing pagination',
+      '- Requesting a 30-day range now correctly returns all merged PRs across the full window instead of only the most recent ~3 days',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Improvement: Invited Org Members Skip Onboarding',
       '- Users invited to join an organization are no longer forced through the onboarding flow after signing up or logging in',
       '- After logging in, invited users are redirected directly to the Accept Invitation page',
