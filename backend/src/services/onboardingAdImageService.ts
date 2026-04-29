@@ -326,8 +326,14 @@ export function buildSixLayerPromptForVariant(
   lines.push(``);
 
   // Layer 5 — BADGE / CTA + COLOR & BRAND
+  // When `brand.logoUrl` is set we pass the actual logo as an image input
+  // alongside this prompt (see generateWithTimeout → logoImage). The
+  // imageGeneration service auto-injects a strict "reproduce with
+  // absolute precision, do not restyle" instruction. We only need to
+  // tell the model WHERE to place it; the WHAT comes from the image.
+  // Fallback path (no logoUrl) renders a typographic wordmark instead.
   const logoLine = brand.logoUrl
-    ? `Logo for ${companyName} from ${brand.logoUrl} — render at the position the archetype specifies (top-left default). Light version on dark backgrounds, dark version on light backgrounds.`
+    ? `Place the provided logo image (the official mark for ${companyName}, passed as an image input alongside this prompt) at the position the archetype specifies (top-left default). Use a light variant on dark backgrounds and a dark variant on light backgrounds. Reproduce the logo exactly as provided — do NOT redraw, restyle, recolor, or reinterpret it.`
     : `Brand wordmark "${companyName}" rendered in ${fontFamily} bold (${primaryColor}) at the position the archetype specifies (top-left default).`;
   lines.push(`LAYER 5: BADGE / CTA + COLOR & BRAND`);
   lines.push(logoLine);
@@ -411,6 +417,16 @@ export interface AdImageGeneratorDep {
     userId: string;
     size?: string;
     imageModel?: string;
+    /**
+     * URL of the brand logo to condition the generation on. When provided,
+     * `imageService.generateImage` adds the logo as a real image input
+     * (alongside the text prompt) and injects a strict "reproduce with
+     * absolute precision, do NOT restyle" instruction. Fixes the previous
+     * pattern where the URL was passed as a string in the text prompt and
+     * the diffusion model just hallucinated a logo because it can't fetch
+     * URLs from text.
+     */
+    logoImage?: string;
   }) => Promise<{
     success: boolean;
     imageUrl?: string;
@@ -430,7 +446,8 @@ async function generateWithTimeout(
   filename: string,
   userId: string,
   format: AdImageFormat,
-  timeoutMs: number
+  timeoutMs: number,
+  logoUrl?: string
 ): Promise<{ success: boolean; imageUrl?: string; error?: string }> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -441,6 +458,7 @@ async function generateWithTimeout(
         userId,
         size: format,
         imageModel: DEFAULT_IMAGE_MODEL,
+        ...(logoUrl ? { logoImage: logoUrl } : {}),
       }),
       new Promise<{ success: boolean; error: string }>((resolve) => {
         timer = setTimeout(
@@ -579,7 +597,8 @@ export async function generateAdImagesForUser(
         t.filename,
         userId,
         t.format,
-        timeoutMs
+        timeoutMs,
+        brand.logoUrl
       );
       const variant: AdImageVariant = {
         id: `variant-${t.index + 1}`,
