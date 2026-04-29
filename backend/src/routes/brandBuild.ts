@@ -69,8 +69,13 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
     // status is already running/ready.
     const existing = await userDb.getUserById(userId);
     const existingStatus = (existing as any)?.brandBuildStatus;
+    // Brand-build uses 'building' as its in-flight state (NOT 'running' —
+    // that's the per-step convention ad-image/icp/competitor use). If we
+    // checked for 'running' here, the buildingBrand-screen `/start` call
+    // would never be recognized as idempotent and would re-fire the LLM,
+    // undoing the prefetch latency savings.
     const alreadyInFlight =
-      existingStatus === "running" || existingStatus === "ready";
+      existingStatus === "building" || existingStatus === "ready";
 
     const inputPatch: Record<string, unknown> = {};
     if (typeof body.companyUrl === "string" && body.companyUrl.trim()) {

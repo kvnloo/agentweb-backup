@@ -66,11 +66,11 @@ describe("POST /api/onboarding/brand-build/start", () => {
     expect(res.body.status.inFlight).toBe(true);
   });
 
-  it("is idempotent: skips re-trigger when status is already running", async () => {
+  it("is idempotent: skips re-trigger when status is already building", async () => {
     userDb.updateUser.mockResolvedValue({ userId: "user-1" });
     userDb.getUserById.mockResolvedValue({
       userId: "user-1",
-      brandBuildStatus: "running",
+      brandBuildStatus: "building",
       brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
     });
     const res = await request(app).post("/api/onboarding/brand-build/start");
@@ -78,7 +78,7 @@ describe("POST /api/onboarding/brand-build/start", () => {
     // No buildStartPatch write — only the empty-inputPatch check, which
     // skips updateUser entirely when no body fields are supplied.
     expect(userDb.updateUser).not.toHaveBeenCalled();
-    expect(res.body.status.brandBuildStatus).toBe("running");
+    expect(res.body.status.brandBuildStatus).toBe("building");
   });
 
   it("is idempotent: skips re-trigger when status is already ready", async () => {
@@ -98,7 +98,7 @@ describe("POST /api/onboarding/brand-build/start", () => {
     userDb.updateUser.mockResolvedValue({ userId: "user-1" });
     userDb.getUserById.mockResolvedValue({
       userId: "user-1",
-      brandBuildStatus: "running",
+      brandBuildStatus: "building",
     });
     const res = await request(app)
       .post("/api/onboarding/brand-build/start")
