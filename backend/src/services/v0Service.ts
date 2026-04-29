@@ -1720,10 +1720,20 @@ export async function getDeploymentStatus(
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}` };
 
-  const deploymentsRes = await axios.get<any>(
-    `https://api.vercel.com/v6/deployments?projectId=${record.vercelProjectId}&limit=1`,
-    { headers }
-  );
+  let deploymentsRes: any;
+  try {
+    deploymentsRes = await axios.get<any>(
+      `https://api.vercel.com/v6/deployments?projectId=${record.vercelProjectId}&limit=1`,
+      { headers }
+    );
+  } catch (deployErr: any) {
+    const status = deployErr.response?.status;
+    console.warn(`[V0 SERVICE] Failed to get deployment status for project ${record.vercelProjectId}: ${status} ${deployErr.message}`);
+    if (status === 404 || status === 403) {
+      return { status: record.status, buildStatus: "not_found" };
+    }
+    throw deployErr;
+  }
 
   const deployment = deploymentsRes.data?.deployments?.[0];
   if (!deployment) return { status: record.status, buildStatus: "no_deployment" };
@@ -1779,10 +1789,20 @@ export async function getPreviewDeploymentUrl(
   }
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)
-  const deploymentsRes = await axios.get<any>(
-    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=20`,
-    { headers }
-  );
+  let deploymentsRes: any;
+  try {
+    deploymentsRes = await axios.get<any>(
+      `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=20`,
+      { headers }
+    );
+  } catch (deployErr: any) {
+    const status = deployErr.response?.status;
+    console.warn(`[V0 SERVICE] Failed to list deployments for project ${vercelProjectId}: ${status} ${deployErr.message}`);
+    if (status === 404 || status === 403) {
+      return { buildStatus: "not_found" };
+    }
+    throw deployErr;
+  }
 
   const deployments = deploymentsRes.data?.deployments || [];
   console.log(`[V0 SERVICE] Found ${deployments.length} deployments for project ${vercelProjectId}, looking for branch "${branch}". Branches in deployments: [${deployments.map((d: any) => d.meta?.githubCommitRef || 'none').join(', ')}]`);
