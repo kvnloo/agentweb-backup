@@ -219,4 +219,104 @@ describe('reportUIError', () => {
       expect(call.context).not.toHaveProperty('Onboarding Stage');
     });
   });
+
+  describe('attribution enrichment', () => {
+    it('surfaces full firstTouch UTM (source/medium/campaign/content/term) as a pipe-delimited line', async () => {
+      userDb.getUserById.mockResolvedValue({
+        userId: 'user-1',
+        firstTouch: {
+          utm: {
+            source: 'linkedin',
+            medium: 'cpc',
+            campaign: 'b2b-demo',
+            content: 'creative-A',
+            term: 'agentic-marketing',
+          },
+        },
+      });
+
+      await reportUIError({
+        operation: 'onboarding:icp:llm-generation',
+        errorMessage: 'LLM error',
+        userId: 'user-1',
+      });
+
+      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      expect(ctx['Attribution (first touch UTM)']).toBe(
+        'source=linkedin | medium=cpc | campaign=b2b-demo | content=creative-A | term=agentic-marketing',
+      );
+    });
+
+    it('surfaces firstTouch referrer and landingUrl, truncating to 300 chars', async () => {
+      const longUrl = 'https://example.com/' + 'x'.repeat(400);
+      userDb.getUserById.mockResolvedValue({
+        userId: 'user-1',
+        firstTouch: {
+          referrer: 'https://t.co/abc',
+          landingUrl: longUrl,
+        },
+      });
+
+      await reportUIError({
+        operation: 'onboarding:competitor:llm-generation',
+        errorMessage: 'fail',
+        userId: 'user-1',
+      });
+
+      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      expect(ctx['Attribution (first touch referrer)']).toBe('https://t.co/abc');
+      expect(ctx['Attribution (first touch landing URL)']).toHaveLength(300);
+      expect(ctx).not.toHaveProperty('Attribution (first touch UTM)');
+    });
+
+    it('shows lastTouch source only when it differs from firstTouch source', async () => {
+      userDb.getUserById.mockResolvedValue({
+        userId: 'user-1',
+        firstTouch: { utm: { source: 'linkedin' } },
+        lastTouch: { utm: { source: 'direct' } },
+      });
+
+      await reportUIError({
+        operation: 'onboarding:adImage:llm-generation',
+        errorMessage: 'fail',
+        userId: 'user-1',
+      });
+
+      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      expect(ctx['Attribution (last touch source)']).toBe('direct');
+    });
+
+    it('omits lastTouch source when it equals firstTouch source (avoid noise)', async () => {
+      userDb.getUserById.mockResolvedValue({
+        userId: 'user-1',
+        firstTouch: { utm: { source: 'linkedin' } },
+        lastTouch: { utm: { source: 'linkedin' } },
+      });
+
+      await reportUIError({
+        operation: 'onboarding:adCopy:llm-generation',
+        errorMessage: 'fail',
+        userId: 'user-1',
+      });
+
+      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      expect(ctx).not.toHaveProperty('Attribution (last touch source)');
+    });
+
+    it('omits attribution fields entirely when user has no firstTouch / lastTouch', async () => {
+      userDb.getUserById.mockResolvedValue({ userId: 'user-1' });
+
+      await reportUIError({
+        operation: 'onboarding:creativeDir:llm-generation',
+        errorMessage: 'fail',
+        userId: 'user-1',
+      });
+
+      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      expect(ctx).not.toHaveProperty('Attribution (first touch UTM)');
+      expect(ctx).not.toHaveProperty('Attribution (first touch referrer)');
+      expect(ctx).not.toHaveProperty('Attribution (first touch landing URL)');
+      expect(ctx).not.toHaveProperty('Attribution (last touch source)');
+    });
+  });
 });

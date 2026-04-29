@@ -63,6 +63,31 @@ async function enrichOnboardingContext(
       });
       enriched['Recent Events (last 20)'] = lastN.join('\n');
     }
+
+    // Attribution from User.firstTouch (signup-time touch) and lastTouch
+    // (most-recent return). Captured upstream by the auth/signup endpoints
+    // via `normalizeAttribution`. Surfacing here means the responder can
+    // see "user from utm_source=linkedin abandoned at brandReview" without
+    // needing to cross-join the Lead row by email.
+    const firstTouch: any = user.firstTouch;
+    const lastTouch: any = user.lastTouch;
+    if (firstTouch?.utm) {
+      const u = firstTouch.utm;
+      const parts = [
+        u.source && `source=${u.source}`,
+        u.medium && `medium=${u.medium}`,
+        u.campaign && `campaign=${u.campaign}`,
+        u.content && `content=${u.content}`,
+        u.term && `term=${u.term}`,
+      ].filter(Boolean);
+      if (parts.length > 0) enriched['Attribution (first touch UTM)'] = parts.join(' | ');
+    }
+    if (firstTouch?.referrer) enriched['Attribution (first touch referrer)'] = String(firstTouch.referrer).slice(0, 300);
+    if (firstTouch?.landingUrl) enriched['Attribution (first touch landing URL)'] = String(firstTouch.landingUrl).slice(0, 300);
+    if (lastTouch?.utm?.source && lastTouch.utm.source !== firstTouch?.utm?.source) {
+      // Only show last-touch source if it differs — otherwise it's noise.
+      enriched['Attribution (last touch source)'] = String(lastTouch.utm.source);
+    }
     return enriched;
   } catch {
     // Enrichment is purely additive — never block the original report.
