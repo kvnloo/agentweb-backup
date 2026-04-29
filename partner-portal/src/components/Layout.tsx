@@ -229,19 +229,9 @@ export default function Layout() {
                       color="primary"
                       component={RouterLink}
                       to="/admin"
-                      variant={isActivePath('/admin') && !isActivePath('/admin/onboarding') ? 'contained' : 'text'}
+                      variant={isActivePath('/admin') ? 'contained' : 'text'}
                     >
                       Admin
-                    </Button>
-                  )}
-                  {user.isAdmin && (
-                    <Button
-                      color="primary"
-                      component={RouterLink}
-                      to="/admin/onboarding"
-                      variant={isActivePath('/admin/onboarding') ? 'contained' : 'text'}
-                    >
-                      Onboarding
                     </Button>
                   )}
                 </>

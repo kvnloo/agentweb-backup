@@ -5,7 +5,9 @@
  * the events log + grab the delegate-as-user URL for deeper poking.
  *
  * Pairs with backend `GET /api/admin/onboarding/users` (added in
- * routes/admin.ts). Read-only — destructive operations live elsewhere.
+ * routes/admin.ts). Read-only — destructive operations live
+ * elsewhere. Mounted as a tab inside AdminDashboard so it sits
+ * alongside Users / CRM / Funnel etc.
  */
 import React, { useEffect, useMemo, useState } from "react";
 import {
@@ -14,7 +16,6 @@ import {
   Chip,
   CircularProgress,
   Collapse,
-  Container,
   IconButton,
   Link as MuiLink,
   Paper,
@@ -34,8 +35,8 @@ import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import LaunchIcon from "@mui/icons-material/Launch";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import axios from "axios";
-import { useAuth } from "../contexts/AuthContext";
-import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
+import { useAuth } from "../../contexts/AuthContext";
+import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../../config";
 
 type StepStatus =
   | "idle"
@@ -132,7 +133,7 @@ function fmtCompactJson(v: any): string {
   }
 }
 
-const AdminOnboarding: React.FC = () => {
+const OnboardingTab: React.FC = () => {
   const { token } = useAuth();
   const [users, setUsers] = useState<OnboardingUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -183,7 +184,7 @@ const AdminOnboarding: React.FC = () => {
   };
 
   return (
-    <Container maxWidth={false} sx={{ py: 3 }}>
+    <Box sx={{ py: 1 }}>
       <Stack direction="row" alignItems="center" spacing={2} sx={{ mb: 2 }}>
         <Typography variant="h5" sx={{ fontWeight: 600 }}>
           Onboarding Inspector
@@ -472,8 +473,8 @@ const AdminOnboarding: React.FC = () => {
           </TableContainer>
         </>
       )}
-    </Container>
+    </Box>
   );
 };
 
-export default AdminOnboarding;
+export default OnboardingTab;
