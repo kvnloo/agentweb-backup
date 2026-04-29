@@ -5415,5 +5415,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The error was caused by a missing AWS region configuration in the email events service',
     ],
   },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: Evaluation Scoring No Longer Penalizes Slack Suggest Sessions for Unresolvable User Input',
+      '- When Emma drafts a suggested response to an inbound Slack message, the session scorer now understands her role is response drafting — not directly fulfilling the Slack contact\'s request',
+      '- Previously, if a Slack contact sent garbled or misdirected messages, the scorer penalized goalCompletion even when Emma responded perfectly',
+      '- The fix injects session context into the conversation transcript so the scorer evaluates draft quality, not end-user goal fulfillment',
+    ],
+  },
 ];
 
