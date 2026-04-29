@@ -36,6 +36,7 @@ import {
 } from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { normalizeAttribution } from '../types/attribution';
+import { dripSequenceDb } from '../services/dripSequenceDb';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -43,6 +44,67 @@ const d1StripeClient = d1StripeSecretKey
   : null;
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+/**
+ * Fire-and-forget: enroll a single newly created lead into any sequences that
+ * have autoEnrollListIds containing this list. Errors are logged but never surfaced.
+ */
+async function autoEnrollLeadInSequences(
+  userId: string,
+  listId: string,
+  leadId: string,
+  leadEmail: string,
+): Promise<void> {
+  if (!leadEmail) return;
+  try {
+    const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
+    for (const seq of sequences) {
+      await dripSequenceDb.bulkEnroll([{
+        sequenceId: seq.sequenceId,
+        userId,
+        listId,
+        leadId,
+        leadEmail,
+      }]);
+    }
+  } catch (err) {
+    console.error('[crm] autoEnrollLeadInSequences error:', err);
+  }
+}
+
+/**
+ * Fire-and-forget: after a bulk import, re-run bulkEnroll for all current leads
+ * in the list against any sequences watching it. The bulkEnroll dedup ensures
+ * already-enrolled leads are skipped; only genuinely new leads get added.
+ */
+async function autoEnrollListIntoSequences(userId: string, listId: string): Promise<void> {
+  try {
+    const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
+    if (sequences.length === 0) return;
+
+    const leadsResult = await crmDb.getLeadsByListId(listId);
+    const leads = Array.isArray(leadsResult)
+      ? leadsResult
+      : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
+
+    for (const seq of sequences) {
+      const inputs = leads
+        .filter((l: any) => l.email)
+        .map((l: any) => ({
+          sequenceId: seq.sequenceId,
+          userId,
+          listId,
+          leadId: l.leadId,
+          leadEmail: l.email,
+        }));
+      if (inputs.length > 0) {
+        await dripSequenceDb.bulkEnroll(inputs);
+      }
+    }
+  } catch (err) {
+    console.error('[crm] autoEnrollListIntoSequences error:', err);
+  }
+}
 
 // In-memory cache for CRM data files uploaded to S3
 // Key: `${userId}:${listId}`, Value: { leadsUrl, eventsUrl, expiresAt }
@@ -1440,6 +1502,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
+      autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, leadData.email ?? ''),
     ]);
 
     res.status(201).json(lead);
@@ -1505,6 +1568,11 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
     });
 
     const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+
+    // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
+    if (result.newCount > 0) {
+      void autoEnrollListIntoSequences(userId, listId);
+    }
 
     res.status(201).json({
       imported: result.newCount,
@@ -1942,6 +2010,10 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
 
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads);
+
+    if (results.newCount > 0) {
+      void autoEnrollListIntoSequences(userId, listId);
+    }
 
     res.json({
       success: true,
@@ -2487,6 +2559,10 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       // Emit final progress
       emitProgress('Import complete!', 100);
+
+      if (connectionsSuccessCount > 0) {
+        void autoEnrollListIntoSequences(userId, listId);
+      }
 
       res.json({
         success: true,

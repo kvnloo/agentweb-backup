@@ -79,7 +79,7 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
   try {
     const input: UpdateSequenceInput = {
       name,
@@ -88,6 +88,7 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
       enrollmentTrigger,
       enrollmentCondition,
       exitConditions,
+      autoEnrollListIds,
       steps,
       status,
     };
@@ -219,6 +220,17 @@ router.post(
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
+
+      // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
+      // unless it's already there. This means new leads added to this list later
+      // will be automatically enrolled.
+      const existing = sequence.autoEnrollListIds ?? [];
+      if (!existing.includes(listId)) {
+        void dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, {
+          autoEnrollListIds: [...existing, listId],
+        }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));
+      }
+
       res.json(result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
