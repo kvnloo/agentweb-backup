@@ -690,7 +690,44 @@ export async function triggerAdImageGenerationForUser(
     // — drop silently. Same convention as ad-copy / creative-dir services.
     return;
   }
-  await userDb.updateUser(userId, patch as any);
+
+  // Mirror successfully-generated variants into the user's hidden
+  // chat-session so /images, the heart/X favorite-image / archive-image
+  // endpoints, and any future Emma deploy tools see them through the
+  // same code paths Emma's own generated images flow through. Best-
+  // effort — failure must NOT block the cascade. We fold the resolved
+  // sessionId into the same `adImageReadyPatch` write below, keeping
+  // the success path a single userDb.updateUser call.
+  let chatSessionId: string | undefined;
+  try {
+    const liveVariants = result.variants.filter(
+      (v) => typeof v.imageUrl === "string" && !v.imageUrl.includes("placeholder")
+    );
+    if (liveVariants.length > 0) {
+      const { mirrorOnboardingAdImagesToChatSession } = await import(
+        "./onboardingAdImageChatSessionMirror"
+      );
+      chatSessionId = await mirrorOnboardingAdImagesToChatSession(
+        userId,
+        liveVariants.map((v) => ({
+          id: v.id,
+          imageUrl: v.imageUrl,
+          prompt: v.prompt,
+        })),
+        { existingSessionId: (current as any)?.adImageChatSessionId }
+      );
+    }
+  } catch (mirrorErr) {
+    console.warn(
+      "[onboardingAdImageService] chat-session mirror failed (non-fatal):",
+      mirrorErr instanceof Error ? mirrorErr.message : String(mirrorErr)
+    );
+  }
+
+  const finalPatch: any = chatSessionId
+    ? { ...patch, adImageChatSessionId: chatSessionId }
+    : patch;
+  await userDb.updateUser(userId, finalPatch);
 }
 
 /**
