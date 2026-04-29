@@ -5418,6 +5418,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Improved: CRM Sequences Now Auto-Enroll New Leads',
+      '- When you enroll a lead list into a sequence, new leads added to that list are automatically enrolled in the sequence going forward',
+      '- Auto-enrollment is on by default and can be toggled off per-list from the sequence enrollment detail view',
+      '- Re-enrolling a list no longer re-enrolls leads who already completed or converted — they are correctly skipped',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Improved: Evaluation Scoring No Longer Penalizes Slack Suggest Sessions for Unresolvable User Input',
       '- When Emma drafts a suggested response to an inbound Slack message, the session scorer now understands her role is response drafting — not directly fulfilling the Slack contact\'s request',
       '- Previously, if a Slack contact sent garbled or misdirected messages, the scorer penalized goalCompletion even when Emma responded perfectly',
