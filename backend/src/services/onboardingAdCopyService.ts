@@ -427,5 +427,19 @@ export async function startAdCopyForUser(
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<void> {
   await userDb.updateUser(userId, adCopyStartPatch() as any);
+  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
+  // users; cheap no-op gated inside the orchestrator for everyone else.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    isEagerPipelineActiveFor,
+    reconcileForUser,
+  } = require("./onboardingOrchestratorWiring");
+  const current = (await userDb.getUserById(userId)) as
+    | { useEagerPipeline?: boolean }
+    | null;
+  if (isEagerPipelineActiveFor(current)) {
+    void reconcileForUser(userId);
+    return;
+  }
   void triggerAdCopyForUser(userId, deps);
 }
