@@ -319,7 +319,7 @@ export class GenerateMarketingResponseWorkerService {
    */
   async runInWorker(
     params: GenerateMarketingResponseParams,
-    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => void
   ): Promise<GenerateMarketingResponseResult> {
     // Ensure worker is running
     await this.ensureWorker();

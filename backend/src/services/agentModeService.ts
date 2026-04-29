@@ -1471,7 +1471,7 @@ export class AgentModeService {
     llmModel: string,
     sessionId: string,
     mockMode: boolean = false,
-    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => void,
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean,
@@ -1887,6 +1887,35 @@ export class AgentModeService {
               toolCalls: toolCalls.slice()
             });
           }
+
+          // Generate contextual suggestion chips after the main response.
+          // Awaited so the result is delivered before the worker sends 'success' back
+          // to the parent process (fire-and-forget would race with IPC teardown).
+          // generateSuggestedReplies has its own 5s timeout so this never hangs.
+          if (content) {
+            const recentMsgs = (messages as any[])
+              .filter((m: any) => m.role === 'user' || m.role === 'assistant')
+              .filter((m: any) => typeof m.content === 'string')
+              .slice(-6);
+            try {
+              const suggestions = await this.generateSuggestedReplies(content, recentMsgs);
+              if (suggestions && suggestions.length > 0) {
+                // Stamp into the last assistant responseMessage's metadata so it persists
+                // in DynamoDB and survives page refresh. The message index in the persisted
+                // session acts as the staleness marker — chips only show for the last message.
+                responseMessage.metadata = {
+                  ...responseMessage.metadata,
+                  suggestedReplies: suggestions,
+                };
+                if (onProgress) {
+                  onProgress({ iteration, status: 'suggestions', suggestions });
+                }
+              }
+            } catch {
+              // Silent — client uses regex fallback
+            }
+          }
+
           break;
         }
 
@@ -9907,6 +9936,60 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       return summary || null;
     } catch (error) {
       console.error('AgentMode: Failed to generate scheduled chat summary:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Generate 2-3 contextual follow-up suggestion chips for the user after each agent turn.
+   * Uses gemini-3.1-flash-lite-preview for fast, low-cost generation.
+   * Returns null on failure so the caller can fall back to client-side regex heuristics.
+   */
+  async generateSuggestedReplies(
+    lastAssistantMessage: string,
+    recentMessages: Array<{ role: string; content: string }>
+  ): Promise<string[] | null> {
+    const SUGGESTION_TIMEOUT_MS = 5_000;
+    try {
+      const context = recentMessages
+        .slice(-4)
+        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 300)}`)
+        .join('\n');
+
+      const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
+        {
+          role: 'system',
+          content: `You are a helpful assistant generating quick-reply suggestions for a marketing AI chat interface. Based on the conversation context, generate exactly 2-3 short, natural follow-up replies the user might send next. These should be genuinely useful continuations — questions, approvals, redirections, or clarifications. Return ONLY a JSON array of strings, e.g. ["Yes, looks good", "Change the tone to be more formal", "Show me another option"]. Each suggestion must be under 10 words. Do not include explanations or any text outside the JSON array.`,
+        },
+        {
+          role: 'user',
+          content: `Recent conversation:\n${context}\n\nLatest assistant message: ${lastAssistantMessage.slice(0, 600)}`,
+        },
+      ], {
+        max_completion_tokens: 120,
+        temperature: 0.7,
+        response_format: { type: 'text' },
+      });
+
+      const timeoutPromise = new Promise<null>(resolve =>
+        setTimeout(() => resolve(null), SUGGESTION_TIMEOUT_MS)
+      );
+
+      const response = await Promise.race([llmPromise, timeoutPromise]);
+      if (!response) {
+        console.warn('AgentMode: generateSuggestedReplies timed out');
+        return null;
+      }
+
+      const text = (response as any).choices?.[0]?.message?.content?.trim() || '';
+      // Extract JSON array from the response (model may wrap it in markdown)
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) return null;
+      const parsed = JSON.parse(match[0]);
+      if (!Array.isArray(parsed) || parsed.length === 0) return null;
+      return (parsed as any[]).filter(s => typeof s === 'string').slice(0, 3);
+    } catch (error) {
+      console.error('AgentMode: generateSuggestedReplies failed:', error);
       return null;
     }
   }

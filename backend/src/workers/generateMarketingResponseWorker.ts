@@ -69,7 +69,7 @@ process.on('message', async (message: any) => {
       const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare, isDelegatedAccess, excludeTools, screenshotUrl } = message.params;
 
       // Progress callback to forward progress updates to parent process
-      const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[] }) => {
+      const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => {
         process.send!({
           type: 'progress',
           requestId,
