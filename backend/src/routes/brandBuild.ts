@@ -104,9 +104,27 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
     await userDb.updateUser(userId, patch as any);
     // Fire-and-forget background work; route returns immediately so the UI
     // can poll /status without holding an HTTP connection open for ~30s.
-    void triggerBrandBuildForUser(userId).catch((e) => {
-      console.error("[brandBuild] background trigger crashed", e);
-    });
+    //
+    // Eager DAG sub-task 2: when the user is on `useEagerPipeline`, the
+    // orchestrator owns step ordering (its `brandDna` runner delegates to
+    // triggerBrandBuildForUser), so we kick reconcile instead of
+    // calling the legacy trigger directly. For everyone else, the legacy
+    // trigger is the source of truth.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const {
+      isEagerPipelineActiveFor,
+      reconcileForUser,
+    } = require("../services/onboardingOrchestratorWiring");
+    const current = await userDb.getUserById(userId);
+    if (isEagerPipelineActiveFor(current as any)) {
+      void reconcileForUser(userId).catch((e: unknown) => {
+        console.error("[brandBuild] background reconcile crashed", e);
+      });
+    } else {
+      void triggerBrandBuildForUser(userId).catch((e) => {
+        console.error("[brandBuild] background trigger crashed", e);
+      });
+    }
     const user = await userDb.getUserById(userId);
     return res.json({ status: snapshot(user || (patch as any)) });
   } catch (err) {
