@@ -120,7 +120,7 @@ can skip tasks with this field, and a new `local_proxy_agent.py` (or Hermes) han
 
 **Date:** 2026-04-30  
 **Branch:** `rui/check-landing-page-button-vs-generate`  
-**Status:** Investigation complete. Implementation deferred — no route for template selection in the UI today worth fixing yet.
+**Status:** Investigation complete. Implementation deferred — the saved HTML templates feature (stored in `/api/html-templates`) is not widely used yet.
 
 ---
 
@@ -151,9 +151,11 @@ And update the card selector to store `tpl.template_id ?? tpl.template_name` ins
 
 ### Why deferred
 
-The template feature for landing pages is still early. There are very few saved templates in practice, and the main value path (both UI button and agent tool) works fine without templates. Fixing the UI template picker is low priority until the templates feature matures and users are actively creating/reusing landing page templates.
+The Create Landing Page dialog has three options: (1) General Purpose (no template), (2) a saved HTML template from the Templates section (`/api/html-templates?type=landing_page`), and (3) Upload HTML file. The bug only affects option 2 — the saved templates path. The "Upload HTML" option sends `template_html` directly and works fine; this is a completely separate code path and is not affected.
 
-When templates become a core part of the landing pages workflow, implement the fix above — it's a small, isolated change.
+The saved HTML templates feature (`/api/html-templates`) is not yet widely used. Until users are actively creating and reusing landing page templates, this bug has minimal real impact. Deferring until the HTML templates feature matures.
+
+When ready to fix, the change is small and isolated.
 
 ### Other differences (by design, not bugs)
 
