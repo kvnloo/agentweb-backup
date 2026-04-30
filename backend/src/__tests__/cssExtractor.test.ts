@@ -231,6 +231,11 @@ jest.mock('jsdom', () => ({
   }),
 }));
 
+// Mock @projectwallace/css-analyzer (used inside analyzeDesignTokens)
+jest.mock('@projectwallace/css-analyzer', () => ({
+  analyze: jest.fn(),
+}));
+
 // Mock puppeteer-core
 const mockPage = {
   setUserAgent: jest.fn(),
@@ -512,6 +517,135 @@ describe('cssExtractor', () => {
         expect(tokens.typography.scale.h1).toBeDefined();
         expect(tokens.typography.scale.body).toBeDefined();
       }
+    });
+  });
+
+  describe('mergeWallaceWithRegex — wallace .unique is a frequency-map object', () => {
+    let mockWallaceAnalyze: jest.MockedFunction<any>;
+
+    beforeEach(() => {
+      // Get the mock from the module system
+      mockWallaceAnalyze = require('@projectwallace/css-analyzer').analyze;
+    });
+
+    // Note: can't use jest.requireActual here because @projectwallace/css-analyzer is ESM-only.
+    // The real library is verified to return { "value": count } objects via a Node script:
+    //   node -e "const{analyze}=require('@projectwallace/css-analyzer');
+    //           console.log(typeof analyze('body{color:red}').values.colors.unique)"
+    // Output: "object" (not "array")
+
+    it('does not throw when wallace returns frequency-map objects for all fields', async () => {
+      mockWallaceAnalyze.mockReturnValue({
+        values: {
+          colors: { unique: { '#ff0000': 3, '#0000ff': 1 } },
+          fontFamilies: { unique: { 'Arial, sans-serif': 2 } },
+          fontSizes: { unique: { '16px': 4, '24px': 2 } },
+          lineHeights: { unique: { '1.5': 3 } },
+          boxShadows: { unique: { '0 2px 4px rgba(0,0,0,0.1)': 1 } },
+          textShadows: { unique: { '1px 1px #000': 1 } },
+          borderRadiuses: { unique: { '8px': 5 } },
+        },
+      });
+
+      const cssData = {
+        url: 'https://example.com',
+        html: '<html></html>',
+        extractedAt: new Date().toISOString(),
+        stylesheets: [{ source: 'https://example.com/style.css', content: 'body { color: #ff0000; }', parsed: null }],
+        inlineStyles: [],
+      };
+
+      await expect(analyzeDesignTokens(cssData)).resolves.not.toThrow();
+    });
+
+    it('extracts colors from frequency-map .unique (the core bug fix)', async () => {
+      mockWallaceAnalyze.mockReturnValue({
+        values: {
+          colors: { unique: { '#ff0000': 3, '#0000ff': 1 } },
+          fontFamilies: { unique: {} },
+          fontSizes: { unique: {} },
+          lineHeights: { unique: {} },
+          boxShadows: { unique: {} },
+          textShadows: { unique: {} },
+          borderRadiuses: { unique: {} },
+        },
+      });
+
+      const cssData = {
+        url: 'https://example.com',
+        html: '<html></html>',
+        extractedAt: new Date().toISOString(),
+        stylesheets: [{ source: 'https://example.com/style.css', content: 'body { color: #ff0000; }', parsed: null }],
+        inlineStyles: [],
+      };
+
+      const tokens = await analyzeDesignTokens(cssData);
+      const colorValues = tokens.colors.all.map((c: { value: string }) => c.value);
+      // normalizeColor calls Color(v).hex() — the Color mock returns lowercase hex
+      expect(colorValues).toContain('#ff0000');
+      expect(colorValues).toContain('#0000ff');
+    });
+
+    it('handles empty .unique objects without errors', async () => {
+      mockWallaceAnalyze.mockReturnValue({
+        values: {
+          colors: { unique: {} },
+          fontFamilies: { unique: {} },
+          fontSizes: { unique: {} },
+          lineHeights: { unique: {} },
+          boxShadows: { unique: {} },
+          textShadows: { unique: {} },
+          borderRadiuses: { unique: {} },
+        },
+      });
+
+      const cssData = {
+        url: 'https://example.com',
+        html: '<html></html>',
+        extractedAt: new Date().toISOString(),
+        stylesheets: [{ source: 'https://example.com/style.css', content: 'body { color: red; }', parsed: null }],
+        inlineStyles: [],
+      };
+
+      const tokens = await analyzeDesignTokens(cssData);
+      expect(tokens).toBeDefined();
+      expect(tokens.colors).toBeDefined();
+    });
+
+    it('handles missing .unique fields without errors', async () => {
+      mockWallaceAnalyze.mockReturnValue({
+        values: {
+          colors: {},  // .unique missing
+        },
+      });
+
+      const cssData = {
+        url: 'https://example.com',
+        html: '<html></html>',
+        extractedAt: new Date().toISOString(),
+        stylesheets: [{ source: 'https://example.com/style.css', content: 'body { color: red; }', parsed: null }],
+        inlineStyles: [],
+      };
+
+      await expect(analyzeDesignTokens(cssData)).resolves.not.toThrow();
+    });
+
+    it('gracefully falls back to regex path when wallace throws', async () => {
+      mockWallaceAnalyze.mockImplementation(() => {
+        throw new Error('css-analyzer crashed');
+      });
+
+      const cssData = {
+        url: 'https://example.com',
+        html: '<html></html>',
+        extractedAt: new Date().toISOString(),
+        stylesheets: [{ source: 'https://example.com/style.css', content: 'body { color: #abc123; }', parsed: null }],
+        inlineStyles: [],
+      };
+
+      const tokens = await analyzeDesignTokens(cssData);
+      expect(tokens).toBeDefined();
+      expect(tokens.colors).toBeDefined();
     });
   });
 

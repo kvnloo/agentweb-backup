@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Fix: Brand Token Extraction No Longer Fails on CSS Analysis',
+      '- read_page_source with extractDesignTokens=true previously threw "wallaceColors is not iterable" for some websites',
+      '- The CSS analyzer returns color/font/shadow data as frequency-map objects, not arrays — the iteration logic now handles both formats',
+      '- Design tokens (colors, fonts, border radius, shadows) are now correctly extracted from CSS during landing page onboarding',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Fixed: Sequence Email CSS Styles Now Converted at Import Time',
       '- When loading an email template from a URL into a Sequence step (or CRM group email), CSS class-based styles are now converted to inline styles immediately on import',
       '- Previously, this conversion happened at send time (including test sends), causing delays and inconsistency — the stored email body could look different than what was sent',
@@ -5416,12 +5425,29 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-30',
+    changes: [
+      'Fixed: Emma No Longer Shows "Thinking..." After Responding',
+      '- Emma\'s "Thinking..." indicator now correctly disappears after she delivers a response',
+      '- Previously, if the HTTP connection dropped mid-request (e.g. a timeout), Emma would deliver her response via the background stream but the loading indicator would remain stuck on screen',
+    ],
+  },
+  {
     date: '2026-04-29',
     changes: [
       'Improved: CRM Sequences Now Auto-Enroll New Leads',
       '- When you enroll a lead list into a sequence, new leads added to that list are automatically enrolled in the sequence going forward',
       '- Auto-enrollment is on by default and can be toggled off per-list from the sequence enrollment detail view',
       '- Re-enrolling a list no longer re-enrolls leads who already completed or converted — they are correctly skipped',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: Sign-Up Now Requires a Company Email Address',
+      '- Personal email providers (Gmail, Yahoo, Hotmail, Outlook, iCloud, etc.) are no longer accepted at sign-up',
+      '- The sign-up page shows an inline error immediately when you tab away from a personal email field',
+      '- The registration URL supports an ?email= parameter to pre-fill and lock the email field for invite flows',
     ],
   },
   {

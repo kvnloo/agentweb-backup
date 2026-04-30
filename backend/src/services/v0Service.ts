@@ -762,16 +762,19 @@ async function addPageToExistingRepo(
       };
     }
 
-    // Update record to deployed
+    // Update record to deployed, re-persisting repo fields in case they were missing
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
-        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
+        UpdateExpression:
+          "SET #status = :status, updatedAt = :updatedAt, githubRepoUrl = :repoUrl, vercelProjectId = :vercelId",
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "deployed",
           ":updatedAt": new Date().toISOString(),
+          ":repoUrl": existingPage.githubRepoUrl ?? record.githubRepoUrl,
+          ":vercelId": existingPage.vercelProjectId ?? record.vercelProjectId,
         },
       })
       .promise();
