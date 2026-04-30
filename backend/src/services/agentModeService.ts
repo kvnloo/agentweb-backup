@@ -473,7 +473,7 @@ export class AgentModeService {
         type: 'function',
         function: {
           name: 'search_tool_response',
-          description: 'Search a large tool response that was stored in S3 because it exceeded the context size limit. When a previous tool result shows "[Full response stored at S3 key: ...]", use this tool with that key to find specific fields or values (e.g. destination URLs, link_url, creative details) in the full response.',
+          description: 'Search a large tool response that was stored in S3 because it exceeded the context size limit. When a previous tool result shows "[Full response stored at S3 key: ...]", use this tool with that key to find specific fields or values (e.g. destination URLs, link_url, creative details) in the full response. Returns ALL matches with total_matches_found so you can page through results using match_offset.',
           parameters: {
             type: 'object',
             properties: {
@@ -483,7 +483,19 @@ export class AgentModeService {
               },
               query: {
                 type: 'string',
-                description: 'The text or field name to search for (e.g. "link_url", "destination_url", "website")'
+                description: 'The text or field name to search for (e.g. "link_url", "destination_url", "sessionId")'
+              },
+              match_offset: {
+                type: 'number',
+                description: 'Number of matches to skip before returning results. Use 0 for the first page, 20 for the second page, etc. Default: 0'
+              },
+              max_matches: {
+                type: 'number',
+                description: 'Maximum number of matches to return in this call. Default: 20, max: 100'
+              },
+              context_chars: {
+                type: 'number',
+                description: 'Number of characters of context to include before and after each match. Use larger values (e.g. 2000) to capture full JSON objects. Default: 300'
               }
             },
             required: ['s3_key', 'query']
@@ -492,6 +504,38 @@ export class AgentModeService {
       },
       execute: async (args: any, _context: any) => {
         return this.executeSearchToolResponse(args);
+      }
+    });
+
+    this.toolRegistry.register({
+      name: 'read_tool_response',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'read_tool_response',
+          description: 'Read a raw slice of a large tool response stored in S3. Use this for linear traversal of any format (JSON arrays, CSV, plain text) when search_tool_response is not suitable. Specify char_offset and char_length to page through the file. The total file size is returned so you can calculate how many pages remain.',
+          parameters: {
+            type: 'object',
+            properties: {
+              s3_key: {
+                type: 'string',
+                description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
+              },
+              char_offset: {
+                type: 'number',
+                description: 'Character position to start reading from. Use 0 for the beginning of the file. Default: 0'
+              },
+              char_length: {
+                type: 'number',
+                description: 'Number of characters to read. Default: 8000, max: 50000'
+              }
+            },
+            required: ['s3_key']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        return this.executeReadToolResponse(args);
       }
     });
 
@@ -3183,7 +3227,7 @@ export class AgentModeService {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
     }
 
-    if (toolName === 'search_tool_response') {
+    if (toolName === 'search_tool_response' || toolName === 'read_tool_response') {
       return result;
     }
 
@@ -4439,11 +4483,21 @@ export class AgentModeService {
     }
   }
 
-  private async executeSearchToolResponse(args: { s3_key: string; query: string }): Promise<any> {
+  private async executeSearchToolResponse(args: {
+    s3_key: string;
+    query: string;
+    match_offset?: number;
+    max_matches?: number;
+    context_chars?: number;
+  }): Promise<any> {
     const { s3_key, query } = args;
     if (!s3_key || !query) {
       return { success: false, message: 'Both s3_key and query are required' };
     }
+
+    const matchOffset = Math.max(0, args.match_offset ?? 0);
+    const maxMatches = Math.min(100, Math.max(1, args.max_matches ?? 20));
+    const contextChars = Math.max(0, args.context_chars ?? 300);
 
     try {
       const content = await getS3ObjectAsString(s3_key);
@@ -4453,24 +4507,29 @@ export class AgentModeService {
 
       const queryLower = query.toLowerCase();
       const contentLower = content.toLowerCase();
-      const CONTEXT_WINDOW = 300;
-      const MAX_MATCHES = 20;
-      const matches: Array<{ offset: number; context: string }> = [];
+      const allOffsets: number[] = [];
 
       let searchPos = 0;
-      while (searchPos < contentLower.length && matches.length < MAX_MATCHES) {
+      while (searchPos < contentLower.length) {
         const matchIdx = contentLower.indexOf(queryLower, searchPos);
         if (matchIdx === -1) break;
-        const start = Math.max(0, matchIdx - CONTEXT_WINDOW);
-        const end = Math.min(content.length, matchIdx + query.length + CONTEXT_WINDOW);
-        matches.push({ offset: matchIdx, context: content.slice(start, end) });
+        allOffsets.push(matchIdx);
         searchPos = matchIdx + queryLower.length;
       }
+
+      const pageOffsets = allOffsets.slice(matchOffset, matchOffset + maxMatches);
+      const matches = pageOffsets.map(matchIdx => {
+        const start = Math.max(0, matchIdx - contextChars);
+        const end = Math.min(content.length, matchIdx + query.length + contextChars);
+        return { offset: matchIdx, context: content.slice(start, end) };
+      });
 
       return {
         success: true,
         query,
-        total_matches: matches.length,
+        total_matches_found: allOffsets.length,
+        match_offset: matchOffset,
+        matches_returned: matches.length,
         total_size: content.length,
         matches,
       };
@@ -4478,6 +4537,43 @@ export class AgentModeService {
       return {
         success: false,
         message: `Failed to search tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
+    }
+  }
+
+  private async executeReadToolResponse(args: {
+    s3_key: string;
+    char_offset?: number;
+    char_length?: number;
+  }): Promise<any> {
+    const { s3_key } = args;
+    if (!s3_key) {
+      return { success: false, message: 's3_key is required' };
+    }
+
+    const charOffset = Math.max(0, args.char_offset ?? 0);
+    const charLength = Math.min(50_000, Math.max(1, args.char_length ?? 8_000));
+
+    try {
+      const content = await getS3ObjectAsString(s3_key);
+      if (!content) {
+        return { success: false, message: 'Empty response from S3' };
+      }
+
+      const slice = content.slice(charOffset, charOffset + charLength);
+      return {
+        success: true,
+        char_offset: charOffset,
+        chars_returned: slice.length,
+        total_size: content.length,
+        has_more: charOffset + charLength < content.length,
+        next_offset: charOffset + slice.length,
+        content: slice,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: `Failed to read tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
       };
     }
   }
@@ -14152,6 +14248,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static readonly LARGE_TOOL_RESULT_LIMIT: Record<string, number> = {
     'read_market_strategy': 50000,
     'search_tool_response': 20000,
+    'read_tool_response': 60000,
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
