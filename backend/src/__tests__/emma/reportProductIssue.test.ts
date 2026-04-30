@@ -117,7 +117,7 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(1);
-    expect(result.results[0].notionUrl).toBe('https://notion.so/notionpageid');
+    expect(result.results[0].issueId).toBe('AGW-notion-page-id');
 
     expect(mockCreateOncallItem).toHaveBeenCalledWith({
       title: 'Login fails',
@@ -149,8 +149,8 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(2);
-    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, notionUrl: 'https://notion.so/p1' });
-    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, notionUrl: 'https://notion.so/p2' });
+    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1' });
+    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2' });
     expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
   });
@@ -184,10 +184,10 @@ describe('report_product_issues tool', () => {
 
     expect(mockResendSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: ['founders@agentweb.pro'],
-        subject: 'Product Issue from customer@example.com: Bug',
+        to: ['founders@agentweb.pro', 'customer@example.com'],
+        subject: 'We received your issue: Bug',
         replyTo: 'customer@example.com',
-        html: expect.stringContaining('https://notion.so/notionpageid'),
+        html: expect.stringContaining('AGW-notion-page-id'),
       })
     );
   });
