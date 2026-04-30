@@ -21,6 +21,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'Improvement: Emma Can Now Analyse All Sessions in Large Chat History Responses',
+      '- When get_chat_history returns too many sessions to fit in context, Emma previously could only see 20 sessions and reported inaccurate totals and percentages',
+      '- New read_tool_response tool: Emma can now page through any large S3-stored tool response in raw character chunks (generic — works for any tool output format)',
+      '- Extended search_tool_response: now returns total_matches_found (the true count across the whole file) plus new match_offset and context_chars params for paginated result browsing',
+      '- get_chat_history default limit raised from 100 to 500 for more complete day-over-day coverage; use limit: 1000 for full coverage on very active days',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'Fix: Chat History Tool Now Requires Time Range Args',
       '- Emma\'s get_chat_history tool previously silently returned empty results when called without start_time/end_time arguments',
       '- This caused Emma to fall back to stale cached data and report incorrect session counts',
