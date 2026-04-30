@@ -136,9 +136,40 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         break;
       }
 
-      case 'email.complained':
-        console.log(`Email complaint: ${event.data.email_id} - ${event.data.complaint?.reason || 'Unknown reason'}`);
+      case 'email.complained': {
+        const complaintReason = event.data.complaint?.reason || 'Unknown reason';
+        console.log(`Email complaint: ${event.data.email_id} - ${complaintReason}`);
+        // Auto-flag complained leads as do-not-contact (spam report)
+        const complainedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        void (async () => {
+          try {
+            const users = await userDb.getUsersByEmailDomain(emailDomain);
+            for (const user of users) {
+              const lists = await crmDb.getLeadListsByUserId(user.userId);
+              for (const list of (lists || [])) {
+                for (const recipientEmail of complainedTo) {
+                  const lead = await crmDb.getLeadByEmail(list.listId, recipientEmail);
+                  if (lead && !isDoNotContact(lead)) {
+                    await crmDb.updateLead(list.listId, lead.leadId, {
+                      contactStatus: 'do-not-contact',
+                      contactStatusReason: 'complained',
+                      contactStatusNote: `Marked email as spam: ${complaintReason}`,
+                      contactStatusUpdatedAt: new Date().toISOString(),
+                      contactStatusUpdatedBy: 'system',
+                      unsubscribedFromGroupEmail: true,
+                      unsubscribedFromGroupEmailAt: new Date().toISOString(),
+                    });
+                    console.log(`Auto-flagged lead ${lead.leadId} in list ${list.listId} as do-not-contact (spam complaint)`);
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            console.error('Error auto-flagging complained lead:', err);
+          }
+        })();
         break;
+      }
 
       case 'email.clicked':
         console.log(`Email clicked: ${event.data.email_id} - Link: ${event.data.click?.link}`);

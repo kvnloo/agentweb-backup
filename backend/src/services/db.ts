@@ -4082,7 +4082,7 @@ export const crmDb = {
     dealValue?: number | null;
     dealCurrency?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
-    contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
+    contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
     contactStatusUpdatedBy?: string;
     // CRM Unification v1 extensions (A1)
@@ -4497,7 +4497,7 @@ export const crmDb = {
     unsubscribedFromGroupEmail?: boolean;
     unsubscribedFromGroupEmailAt?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed' | null;
-    contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other' | null;
+    contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other' | null;
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;

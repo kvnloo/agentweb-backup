@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'New: CRM Now Detects When Leads Mark Emails as Spam',
+      '- When a lead marks one of your emails as spam (via Gmail, Yahoo, or any feedback-loop-enabled provider), the CRM now automatically flags them as Do Not Contact',
+      '- The spam complaint reason is recorded in the lead\'s contact status note so you can see exactly what happened',
+      '- On the engagement timeline, spam complaints appear with an orange warning badge ("spam complaint") and bounces now show a distinct red badge ("bounced") instead of the generic sent/received label',
+      '- Works via the Resend email.complained webhook — no manual intervention needed',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'Fix: Chat History Tool Now Requires Time Range Args',
       '- Emma\'s get_chat_history tool previously silently returned empty results when called without start_time/end_time arguments',
       '- This caused Emma to fall back to stale cached data and report incorrect session counts',
