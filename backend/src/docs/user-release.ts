@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'New: CRM List Email Metrics',
+      '- Each lead list now shows aggregate email metrics (Sent, Delivered, Open Rate, Click Rate, Bounce Rate) directly above the leads table',
+      '- Click the metrics bar to open a breakdown dialog showing performance per email subject',
+      '- Metrics are hidden when no Resend-tracked email activity exists for the list',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'New: CRM Now Detects When Leads Mark Emails as Spam',
       '- When a lead marks one of your emails as spam (via Gmail, Yahoo, or any feedback-loop-enabled provider), the CRM now automatically flags them as Do Not Contact',
       '- The spam complaint reason is recorded in the lead\'s contact status note so you can see exactly what happened',
