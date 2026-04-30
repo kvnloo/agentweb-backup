@@ -1784,7 +1784,7 @@ mcpToolRegistry.register({
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of sessions to return (1-1000, default: 100)',
+          description: 'Maximum number of sessions to return (1-1000, default: 100). The default of 100 may not cover a full day — use limit: 1000 when you need complete coverage for accurate counts or percentages.',
           default: 100
         },
         sync: {
