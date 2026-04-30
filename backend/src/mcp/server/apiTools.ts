@@ -1797,6 +1797,11 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    if (!args.start_time || !args.end_time) {
+      return jsonResult({
+        error: 'start_time and end_time are required. Provide ISO 8601 timestamps, e.g. start_time="2024-03-01T00:00:00.000Z"'
+      });
+    }
     const queryParams = new URLSearchParams({
       startTime: args.start_time,
       endTime: args.end_time,

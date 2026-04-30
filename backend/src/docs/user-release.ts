@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-04-30',
+    changes: [
+      'Fix: Chat History Tool Now Requires Time Range Args',
+      '- Emma\'s get_chat_history tool previously silently returned empty results when called without start_time/end_time arguments',
+      '- This caused Emma to fall back to stale cached data and report incorrect session counts',
+      '- The tool now returns a clear error message prompting Emma to retry with the correct time range',
+    ],
+  },
+  {
     date: '2026-04-29',
     changes: [
       'Fix: Brand Token Extraction No Longer Fails on CSS Analysis',
