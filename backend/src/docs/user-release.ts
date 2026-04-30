@@ -5425,6 +5425,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-04-30',
+    changes: [
+      'Fixed: Emma No Longer Shows "Thinking..." After Responding',
+      '- Emma\'s "Thinking..." indicator now correctly disappears after she delivers a response',
+      '- Previously, if the HTTP connection dropped mid-request (e.g. a timeout), Emma would deliver her response via the background stream but the loading indicator would remain stuck on screen',
+    ],
+  },
+  {
     date: '2026-04-29',
     changes: [
       'Improved: CRM Sequences Now Auto-Enroll New Leads',
