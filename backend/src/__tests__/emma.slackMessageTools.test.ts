@@ -8,6 +8,7 @@
 // Mock slackService before any imports
 jest.mock('../services/slackService', () => ({
   getSlackChannels: jest.fn(),
+  getSlackChannelInfo: jest.fn(),
   getRecentChannelMessages: jest.fn(),
   getThreadReplies: jest.fn(),
   postSlackMessage: jest.fn(),
@@ -24,6 +25,7 @@ import { emmaToolRegistry } from '../emma/registry';
 import '../emma/slackMessageTools';
 import {
   getSlackChannels,
+  getSlackChannelInfo,
   getRecentChannelMessages,
   getThreadReplies,
   postSlackMessage,
@@ -31,6 +33,7 @@ import {
 import { userDb } from '../services/db';
 
 const mockedGetChannels = getSlackChannels as jest.MockedFunction<typeof getSlackChannels>;
+const mockedGetChannelInfo = getSlackChannelInfo as jest.MockedFunction<typeof getSlackChannelInfo>;
 const mockedGetMessages = getRecentChannelMessages as jest.MockedFunction<typeof getRecentChannelMessages>;
 const mockedGetReplies = getThreadReplies as jest.MockedFunction<typeof getThreadReplies>;
 const mockedPostMessage = postSlackMessage as jest.MockedFunction<typeof postSlackMessage>;
@@ -150,10 +153,33 @@ describe('slack_list_channels', () => {
     expect(result.channels.find((c: any) => c.id === 'C001').name).toBe('general');
   });
 
-  it('multi-channel user: returns stub for channel not found in Slack API', async () => {
+  it('stub: resolves real channel name via getSlackChannelInfo for channels not in bot member list', async () => {
     const userWithUnknown = { userId: 'user-3', isAdmin: false, slackChannels: ['C001', 'C_UNKNOWN'] };
     mockedGetUserById.mockResolvedValue(userWithUnknown as any);
     mockedGetChannels.mockResolvedValue(CHANNELS as any);
+    mockedGetChannelInfo.mockResolvedValue({
+      id: 'C_UNKNOWN',
+      name: 'waldium-agentweb',
+      displayName: '#waldium-agentweb',
+      isPrivate: false,
+    } as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-3' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(2);
+    const unknown = result.channels.find((c: any) => c.id === 'C_UNKNOWN');
+    expect(unknown).toBeDefined();
+    expect(unknown.name).toBe('waldium-agentweb');
+    expect(unknown.display_name).toBe('#waldium-agentweb');
+    expect(mockedGetChannelInfo).toHaveBeenCalledWith('C_UNKNOWN');
+  });
+
+  it('stub: falls back to channel ID when getSlackChannelInfo returns null', async () => {
+    const userWithUnknown = { userId: 'user-3', isAdmin: false, slackChannels: ['C001', 'C_UNKNOWN'] };
+    mockedGetUserById.mockResolvedValue(userWithUnknown as any);
+    mockedGetChannels.mockResolvedValue(CHANNELS as any);
+    mockedGetChannelInfo.mockResolvedValue(null);
 
     const result = await executeTool('slack_list_channels', {}, { userId: 'user-3' });
 
@@ -162,6 +188,7 @@ describe('slack_list_channels', () => {
     const unknown = result.channels.find((c: any) => c.id === 'C_UNKNOWN');
     expect(unknown).toBeDefined();
     expect(unknown.name).toBe('C_UNKNOWN');
+    expect(unknown.display_name).toBe('C_UNKNOWN');
   });
 
   it('multi-channel user: slackChannels takes priority over legacy slackChannel', async () => {

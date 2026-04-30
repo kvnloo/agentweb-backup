@@ -2,6 +2,7 @@ import { emmaToolRegistry } from './registry';
 import { SlackMessage } from '../services/slackService';
 import {
   getSlackChannels,
+  getSlackChannelInfo,
   getRecentChannelMessages,
   getThreadReplies,
   postSlackMessage,
@@ -94,11 +95,18 @@ emmaToolRegistry.register({
         // Fetch all channels once and filter to the user's allowed set
         const allChannels = await getSlackChannels();
         const filtered = allChannels.filter((c) => allowed.includes(c.id));
-        // For any channel ID not found in Slack API response, return a stub so the list is complete
+        // For any channel ID not found in bot's member list, resolve real name via conversations.info
         const foundIds = new Set(filtered.map((c) => c.id));
-        const stubs = allowed
-          .filter((id) => !foundIds.has(id))
-          .map((id) => ({ id, name: id, display_name: id, is_private: false }));
+        const stubs = await Promise.all(
+          allowed
+            .filter((id) => !foundIds.has(id))
+            .map(async (id) => {
+              const info = await getSlackChannelInfo(id);
+              return info
+                ? { id, name: info.name, display_name: info.displayName, is_private: info.isPrivate }
+                : { id, name: id, display_name: id, is_private: false };
+            })
+        );
         const channels = [
           ...filtered.map((c) => ({ id: c.id, name: c.name, display_name: c.displayName, is_private: c.isPrivate })),
           ...stubs,
