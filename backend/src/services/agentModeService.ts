@@ -8611,8 +8611,8 @@ Format the response as JSON with this structure:
             f => f && normalize(f.name) === key
           );
           if (idx >= 0) {
-            // Replace the entire object for that founder name
-            mergedFounders[idx] = newFounder;
+            // Merge fields so a partial update (e.g. only voiceExamples) preserves other fields
+            mergedFounders[idx] = { ...mergedFounders[idx], ...newFounder };
           } else {
             // Append as new founder
             mergedFounders.push(newFounder);
@@ -14460,6 +14460,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (founder.signaturePosts) {
           formattedSummary += `  ✍️ <strong>Signature Posts:</strong> ${founder.signaturePosts}<br>`;
         }
+        if (founder.voiceExamples) {
+          formattedSummary += `  📝 <strong>Voice Examples (CRITICAL — use these as your style template):</strong><br>`;
+          formattedSummary += `  <em>When generating posts for this founder, study the sentence length, vocabulary, punctuation, line breaks, hooks, and overall rhythm of these examples. Do NOT default to generic LinkedIn templates or AI-industry clichés. Mirror this exact voice:</em><br>`;
+          formattedSummary += `  <blockquote>${founder.voiceExamples.replace(/\n/g, '<br>')}</blockquote>`;
+        }
         formattedSummary += `<br>`;
       });
     } else {
@@ -14546,6 +14551,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               }
               if (founder.signaturePosts) {
                 formattedSummary += `    ✍️ Signature Posts: ${founder.signaturePosts}<br>`;
+              }
+              if (founder.voiceExamples) {
+                formattedSummary += `    📝 Voice Examples: ${founder.voiceExamples.substring(0, 200)}${founder.voiceExamples.length > 200 ? '…' : ''}<br>`;
               }
             });
           } else if (Array.isArray(value)) {
