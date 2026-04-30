@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'Fixed: Slack Channel Names Now Display Correctly in Emma',
+      '- Emma\'s slack_list_channels tool was returning raw channel IDs (e.g. C0AJVBQ49TN) instead of human-readable names (e.g. #waldium-agentweb)',
+      '- The root cause was a missing pagination loop: the Slack API returns at most 100 channels per page, so channels beyond the first page were never fetched even when the bot was a member',
+      '- The fix adds cursor-based pagination to fetch all member channels, and also resolves names via conversations.info as a fallback for any remaining edge cases',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'Improvement: Issue Reports Now Send a Confirmation Email to the Reporter',
       '- When a user reports a product issue via Emma, they now receive a confirmation email at their account address',
       '- The email subject clearly references the issue title: "We received your issue: <title>"',
