@@ -5436,6 +5436,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-29',
     changes: [
+      'Improved: Sign-Up Now Requires a Company Email Address',
+      '- Personal email providers (Gmail, Yahoo, Hotmail, Outlook, iCloud, etc.) are no longer accepted at sign-up',
+      '- The sign-up page shows an inline error immediately when you tab away from a personal email field',
+      '- The registration URL supports an ?email= parameter to pre-fill and lock the email field for invite flows',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
       'Improved: Evaluation Scoring No Longer Penalizes Slack Suggest Sessions for Unresolvable User Input',
       '- When Emma drafts a suggested response to an inbound Slack message, the session scorer now understands her role is response drafting — not directly fulfilling the Slack contact\'s request',
       '- Previously, if a Slack contact sent garbled or misdirected messages, the scorer penalized goalCompletion even when Emma responded perfectly',

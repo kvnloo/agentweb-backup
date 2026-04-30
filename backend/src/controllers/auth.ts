@@ -11,6 +11,7 @@ import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
 import { onUserRegistered } from "../services/contactCaptureHooks";
+import { isCompanyEmail } from "../utils/validation";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -29,6 +30,13 @@ export const register = async (req: Request, res: Response) => {
         .json({ message: "Email and password are required" });
     }
     email = email.toLowerCase();
+
+    if (!isCompanyEmail(email)) {
+      return res.status(400).json({
+        message: "Please use a company email address to sign up.",
+        code: "personal_email_not_allowed",
+      });
+    }
 
     // Check if user exists
     const existingUser = await userDb.getUserByEmail(email);
@@ -267,6 +275,16 @@ export const googleCallback = async (
     let user = await userDb.getUserByEmail(email);
 
     const portalOrigin = (req.query.state as string) || "partner";
+
+    // Block new registrations from personal email domains on the customer portal.
+    // Existing users are allowed through regardless of domain.
+    if (!user && portalOrigin === "customer" && !isCompanyEmail(email)) {
+      return done({
+        statusCode: 400,
+        message: "Please use a company email address to sign up.",
+        code: "personal_email_not_allowed",
+      }, null);
+    }
 
     if (!user) {
       if (portalOrigin === "genius") {
