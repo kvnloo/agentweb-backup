@@ -457,6 +457,44 @@ describe("onboardingIcpService", () => {
       expect(startCompetitorStrategyForUser).not.toHaveBeenCalled();
     });
 
+    it("does NOT cross-call competitor when the user is on `useEagerPipeline` (orchestrator owns step ordering)", async () => {
+      // Eager DAG sub-task 2: the legacy ICP→Competitor cross-call must
+      // be skipped when the orchestrator is driving step ordering. The
+      // orchestrator's reconcile loop will pick up `competitor` once
+      // `icp` is `ready` in `User.steps`. Without the gate, both the
+      // legacy cascade AND the orchestrator would race to fire the
+      // competitor step.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          brandGuidelines: { brandData: { brandName: "Linear" } },
+          useEagerPipeline: true,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+          useEagerPipeline: true,
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const {
+        startCompetitorStrategyForUser,
+      } = require("../services/onboardingCompetitorService");
+      (startCompetitorStrategyForUser as jest.Mock).mockClear();
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      // ICP itself still completes normally — the read-and-write path
+      // is unchanged. Only the cross-call cascade is gated.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.updateUser.mock.calls[0][1].icpStatus).toBe("ready");
+
+      // No legacy cross-call cascade — orchestrator owns it.
+      expect(startCompetitorStrategyForUser).not.toHaveBeenCalled();
+    });
+
     it("does NOT trigger competitor when ICP fails (cascade should not fire on failure)", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({ userId: "user-1" })
