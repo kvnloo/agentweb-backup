@@ -241,15 +241,6 @@ export interface CreateOncallItemParams {
   description: string;
   additionalTags?: string[];
   context?: Record<string, any>;
-  /**
-   * If `true`, route the resulting task to the Backlog WITHOUT auto-promoting
-   * it into the current sprint. Used for low-urgency, high-volume oncall
-   * sources (cron-fired stuck/abandoned-user detectors) so they don't pollute
-   * the active sprint board. The task still appears in the Backlog view and
-   * Harsha can promote it manually if it warrants attention. See the
-   * 2026-04-28 stuck-detector cleanup (Bug 3).
-   */
-  routeToBacklog?: boolean;
 }
 
 export interface CreateOncallItemResult {
@@ -264,7 +255,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
   }
   const { apiToken } = await getNotionCredentials();
   const databaseId = await getSprintTasksDatabaseId();
-  const { title, description, additionalTags = [], context, routeToBacklog } = params;
+  const { title, description, additionalTags = [], context } = params;
 
   const tags = [{ name: 'Oncall' }, ...additionalTags.map(t => ({ name: t }))];
 
@@ -308,10 +299,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
         'Status': { status: { name: 'To-do' } },
         'Tags': { multi_select: tags },
         'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
-        // routeToBacklog=true → leave the auto-promote checkbox unchecked so
-        // cron noise stays out of the active sprint. Default behavior (manual
-        // oncall reports) keeps the legacy auto-promote.
-        'Move to Current Sprint': { checkbox: routeToBacklog ? false : true },
+        'Move to Current Sprint': { checkbox: true },
         'Owner': { people: [{ id: '1c8d872b-594c-816c-8935-00027d2a3a90' }] },
       },
       children,
