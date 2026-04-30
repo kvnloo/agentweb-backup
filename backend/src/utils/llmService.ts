@@ -277,6 +277,26 @@ export class LLMService {
   }
 
   /**
+   * Invoke the model and return the raw string response without any parsing.
+   * Use this when you need to extract custom XML tags from the response.
+   */
+  async generateRaw(
+    systemPrompt: string,
+    userPrompt: string,
+    onUsage?: OnUsageCallback,
+  ): Promise<string> {
+    const messages = [
+      new SystemMessage(systemPrompt),
+      new HumanMessage(userPrompt),
+    ];
+    const response = await this.chatModel.invoke(messages) as any;
+    if (onUsage) {
+      onUsage(this.extractUsage(response));
+    }
+    return typeof response.content === 'string' ? response.content : String(response.content || '');
+  }
+
+  /**
    * Generate HTML content with required output format
    * @param systemPrompt System prompt for HTML generation
    * @param userPrompt User prompt with HTML requirements

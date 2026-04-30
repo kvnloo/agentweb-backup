@@ -17,6 +17,7 @@ import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { LLMService } from '../utils/llmService';
 
 const router = express.Router();
 
@@ -339,6 +340,134 @@ router.post(
       failed: failedCount,
       failedEmails,
     });
+  },
+);
+
+/**
+ * @route POST /api/crm/sequences/:sequenceId/steps/spam-check
+ * @desc Use Claude to analyse the email for spam/deliverability issues
+ */
+router.post(
+  '/:sequenceId/steps/spam-check',
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { subject, htmlContent, senderEmail } = req.body;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!subject || !htmlContent) return res.status(400).json({ message: 'subject and htmlContent are required' });
+
+    try {
+      const llm = new LLMService('anthropic.claude-sonnet-4-6', 0, 2000);
+      const systemPrompt = `You are an email deliverability expert. Analyse the provided marketing email for spam and deliverability issues.
+
+Return a JSON object with this exact shape:
+{
+  "passed": boolean,
+  "issues": [
+    {
+      "severity": "error or warning",
+      "code": "SNAKE_CASE_CODE",
+      "message": "One-sentence description of the issue and why it matters."
+    }
+  ]
+}
+
+Severity rules:
+- "error": will definitely cause spam filtering (broken/missing unsubscribe link, deceptive content, URL mismatch)
+- "warning": reduces deliverability score (spam trigger words, missing physical address, external font loading, HTML-only with no text alternative, suspicious sender domain)
+
+IMPORTANT — template variables: This is a drip sequence template. Placeholders like {{unsubscribeUrl}}, {{firstName}}, {{email}}, {{companyName}} are intentional template variables that will be replaced with real values at send time. Do NOT flag these as broken links or missing content.
+
+IMPORTANT — image hosting: Images hosted on AWS S3 or CDNs are normal for transactional email systems. Do NOT flag S3-hosted images as suspicious.
+
+Be precise. Only report genuine issues. If the email looks clean, return an empty issues array.`;
+
+      const userPrompt = `Sender email: ${senderEmail ?? 'not provided'}\nSubject: ${subject}\n\nHTML:\n${htmlContent}`;
+
+      const parsed = await llm.generateJsonRobust<{ passed: boolean; issues: any[] }>(systemPrompt, userPrompt);
+      const issues = Array.isArray(parsed.issues) ? parsed.issues : [];
+      const errors = issues.filter((i: any) => i.severity === 'error');
+      return res.json({
+        passed: errors.length === 0,
+        issues,
+        errorCount: errors.length,
+        warningCount: issues.length - errors.length,
+      });
+    } catch (err: any) {
+      console.error('[spam-check] LLM error:', err.message || err);
+      return res.status(500).json({ message: 'Spam check failed' });
+    }
+  },
+);
+
+/**
+ * @route POST /api/crm/sequences/:sequenceId/steps/spam-repair
+ * @desc Use Claude to fix all spam/deliverability issues in the email.
+ *
+ * Body:
+ *   subject      — current subject line
+ *   htmlContent  — current email HTML
+ *   issues       — the issues array returned by spam-check
+ *   context      — optional free-text user context (e.g. "company is Acme Corp, address is 123 Main St")
+ */
+router.post(
+  '/:sequenceId/steps/spam-repair',
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { subject, htmlContent, issues, context = '' } = req.body as {
+      subject: string;
+      htmlContent: string;
+      issues: Array<{ severity: string; code: string; message: string }>;
+      context?: string;
+    };
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!htmlContent || !Array.isArray(issues) || issues.length === 0) {
+      return res.status(400).json({ message: 'htmlContent and issues[] are required' });
+    }
+
+    try {
+      const llm = new LLMService('anthropic.claude-sonnet-4-6', 0, 16000);
+      const issueList = issues.map(i => `- [${i.severity.toUpperCase()}] ${i.code}: ${i.message}`).join('\n');
+      const contextSection = context.trim() ? `\nUser-provided context:\n${context.trim()}\n` : '';
+
+      const systemPrompt = `You are an expert email developer fixing spam and deliverability issues in a marketing email.
+
+Fix EVERY issue listed below. Rules:
+1. For unsubscribe links: use {{unsubscribeUrl}} as the href — do NOT invent a URL. If there is no unsubscribe link at all, add a simple unsubscribe footer before </body>.
+2. For external font loading (Google Fonts <link> tags, @import url()): remove them entirely from the HTML.
+3. For missing physical address: add it to the footer using the user-provided context. If no address is given in context, add a placeholder "[Company Name, Street Address, City, State ZIP]" styled as small grey text.
+4. For spam trigger words in the subject: rewrite the subject to communicate the same intent without the triggering words.
+5. Preserve the email's visual design, brand, and all content exactly — only make the targeted fixes.
+
+Return your response in this exact format:
+<subject>updated subject line here</subject>
+<html_content>complete fixed HTML here</html_content>`;
+
+      const userPrompt = `Issues to fix:\n${issueList}\n${contextSection}\nSubject: ${subject}\n\nHTML:\n${htmlContent}`;
+
+      const rawText = await llm.generateRaw(systemPrompt, userPrompt);
+
+      const htmlMatch = rawText.match(/<html_content>([\s\S]*?)<\/html_content>/i);
+      const subjectMatch = rawText.match(/<subject>([\s\S]*?)<\/subject>/i);
+
+      if (!htmlMatch) {
+        console.error('[spam-repair] LLM did not return expected tags. Raw:', rawText.slice(0, 500));
+        return res.status(500).json({ message: 'Repair failed: model did not return expected format' });
+      }
+
+      return res.json({
+        subject: subjectMatch ? subjectMatch[1].trim() : subject,
+        htmlContent: htmlMatch[1].trim(),
+      });
+    } catch (err: any) {
+      console.error('[spam-repair] LLM error:', err.message || err);
+      return res.status(500).json({ message: 'Repair failed' });
+    }
   },
 );
 
