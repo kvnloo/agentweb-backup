@@ -1035,8 +1035,11 @@ export async function reconcileAllStripeUsers(): Promise<{
       const sub = sorted[0]; // best subscription, or undefined
 
       if (!sub) {
-        // No subscriptions in Stripe — ensure DynamoDB reflects that
-        if (user.subscription_status && user.subscription_status !== 'canceled' && user.subscription_status !== 'free') {
+        // No subscriptions in Stripe — ensure DynamoDB reflects that.
+        // Guard excludes null/free/canceled to avoid overwriting records that
+        // were manually provisioned or already cleaned up.
+        const noSubStatuses = new Set([undefined, null, 'canceled', 'free', '']);
+        if (!noSubStatuses.has(user.subscription_status as any)) {
           await userDb.updateUser(user.userId, {
             subscription_status: 'canceled',
             has_payment_method: false,

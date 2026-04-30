@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'Fix: Admin Dashboard No Longer Mislabels Paying Users as "Bounced"',
+      '- Users who have a recorded subscription amount but a missing subscription_status (caused by a webhook sync gap) were incorrectly shown as "Bounced Checkout" in the admin user list',
+      '- The bounced heuristic now excludes users with a non-zero subscription_amount, so legitimate paying customers are no longer counted in that bucket',
+      '- Also fixed a reconciliation bug where running "Reconcile Stripe" silently skipped users with a null subscription_status instead of syncing their status from Stripe',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'Fixed: Slack Channel Names Now Display Correctly in Emma',
       '- Emma\'s slack_list_channels tool was returning raw channel IDs (e.g. C0AJVBQ49TN) instead of human-readable names (e.g. #waldium-agentweb)',
       '- The root cause was a missing pagination loop: the Slack API returns at most 100 channels per page, so channels beyond the first page were never fetched even when the bot was a member',
