@@ -8619,16 +8619,6 @@ Format the response as JSON with this structure:
         if (readyPatch) {
           await userDb.updateUser(userId, readyPatch);
           logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
-          // Bug 1 backfill — if brand-build was the last `ready` slot, flip
-          // onboardingStage so the stuck detector stops alerting on this
-          // user. Best-effort; lazy require to avoid circular imports.
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const { markOnboardingCompletedIfTerminal } = require("../utils/onboardingStage");
-            await markOnboardingCompletedIfTerminal(userId);
-          } catch (terminalErr) {
-            console.warn("[brandBuild] terminal backfill failed (non-fatal):", terminalErr);
-          }
         }
       } catch (e) {
         console.warn("[brandBuild] ready-patch failed (agentMode path)", e);
