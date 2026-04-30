@@ -3849,3 +3849,40 @@ The email accounts that Thunderbird users configure are standard providers that 
 ### Decision
 
 Do not build a Thunderbird-specific connected account — it is not architecturally feasible without requiring users to install a local extension. Instead, direct Thunderbird users to connect the underlying email account they use in Thunderbird (e.g., Gmail via the existing Gmail connected account flow).
+
+## AI Eval Work Plan Duration — Investigation (2026-04-30)
+
+### Context
+
+Investigated a predefined-work-plan session (`AI_GTM_Position_Eval`, session `85aabd21`) that appeared to be still running after several minutes.
+
+### Findings
+
+**The session completed successfully — no stall or bug.** Timeline:
+
+- `06:31:49` — Session created, user sent their URL
+- `06:38:16` — Work plan step completed (~6.5 minutes of actual work)
+- `06:38:27` — Session record updated in DynamoDB
+- `06:44:48` — Satisfaction score evaluated (triggered ~6 min later by admin `GET /api/admin/chat-sessions?sync=true` poll)
+
+The 6.5 minutes was real work by the "AI GTM Positioning Audit" skill:
+- 3× `read_page_source` calls (scraping homepage and blog)
+- 2× `bravesearch_brave_web_search` (one failed and retried)
+- 1× `create_html_file` generating a full HTML audit report
+- 1× `save_file` to S3
+- 24,650 completion tokens of output (Sonnet 4.6 model)
+
+### Backend Architecture Notes
+
+- **Work plan step completion** is driven by `set_work_plan_status` tool, which validates `requiredFunctionCalls` counts before marking a step done.
+- **No artificial delays** exist in the work plan execution path — no polling loops, sleep, or retries beyond per-tool exponential backoff on transient errors.
+- **`install_skills` counted as 0** because the skill was auto-installed at session creation (`createSessionWithPlan` installs all associated skills upfront); the tool never needs to be called explicitly.
+- **Satisfaction scoring is not automatic** — it only triggers when an admin hits `GET /api/admin/chat-sessions?sync=true` (batch) or `POST /api/admin/chat-sessions/score`. The 6-minute post-completion gap was the admin dashboard sync polling interval.
+
+### Frontend Completion Detection
+
+The customer portal detects completion via SSE `complete` event → 800ms `setTimeout` → `GET /api/agent-mode/session/{sessionId}` refresh. UI shows completion as soon as work plan steps are `status: 'completed'`, independent of `satisfactionScore`. If the session appeared "still running" after `06:38`, that likely reflects a stale tab or the share link being opened before the SSE event was received.
+
+### Decision
+
+No action required. The execution time is expected given the volume of tool calls and token output. If we want to reduce perceived latency, options are: (a) use a faster model (Haiku 4.5) for the audit, or (b) stream intermediate progress messages to the UI as each tool call completes.
