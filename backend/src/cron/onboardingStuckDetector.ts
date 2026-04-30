@@ -66,6 +66,43 @@ interface StuckCandidate {
   classification: 'stuck' | 'abandoned';
 }
 
+// Step status fields the onboarding pipeline writes. If all six are 'ready',
+// the user has finished the actual work and the only thing missing is the
+// synthetic onboardingStage flip — Bug 1's helper backfills going forward,
+// but we ALSO short-circuit here as defense-in-depth so the stuck detector
+// doesn't alert on legacy users whose stage never advanced.
+const STEP_STATUS_FIELDS = [
+  'brandBuildStatus',
+  'icpStatus',
+  'competitorStatus',
+  'creativeDirStatus',
+  'adImageStatus',
+  'adCopyStatus',
+] as const;
+
+/**
+ * Test/QA email domain filter. Skip auto-fire on these so QA flows don't
+ * spam the oncall Notion view. Production users with real emails fire
+ * normally.
+ *
+ * Match rules (case-insensitive):
+ *   - `@agenttest.com`           — internal QA harness
+ *   - `@example.com`             — RFC-reserved test domain
+ *   - any localpart with `+qa`   — Gmail-style address marker
+ */
+function isTestDomainEmail(email: string | undefined | null): boolean {
+  if (!email || typeof email !== 'string') return false;
+  const lower = email.toLowerCase();
+  if (lower.endsWith('@agenttest.com')) return true;
+  if (lower.endsWith('@example.com')) return true;
+  // Anywhere `+qa` appears in the localpart counts (e.g. user+qa@x.com,
+  // user+qa-1@x.com). Strict on placement: only the localpart, before the @.
+  const at = lower.indexOf('@');
+  const localpart = at >= 0 ? lower.slice(0, at) : lower;
+  if (localpart.includes('+qa')) return true;
+  return false;
+}
+
 function classifyUser(
   user: any,
   now: number,
@@ -73,6 +110,20 @@ function classifyUser(
   const stage = user?.onboardingStage as string | undefined;
   if (!stage) return null;
   if (TERMINAL_STAGES.has(stage)) return null;
+
+  // Defense-in-depth (Bug 2): if every backend pipeline step is `ready`,
+  // the user has finished the actual work — the stage just didn't advance.
+  // Bug 1's helper now backfills this going forward; this check covers
+  // legacy users whose stage stayed stale, plus any future regression in
+  // the stage-emission path.
+  const allStepsReady = STEP_STATUS_FIELDS.every(
+    (field) => user[field] === 'ready',
+  );
+  if (allStepsReady) return null;
+
+  // Bug 2 part 2: skip test/QA accounts so the detector doesn't flood
+  // oncall when the test environment seeds stuck users intentionally.
+  if (isTestDomainEmail(user?.email)) return null;
 
   const events = Array.isArray(user.onboardingEvents) ? user.onboardingEvents : [];
   const lastEvent = events.length > 0 ? events[events.length - 1] : null;

@@ -23,6 +23,7 @@
 
 import { LLMService } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
+import { markOnboardingCompletedIfTerminal } from "../utils/onboardingStage";
 import { userDb } from "./db";
 import {
   icpFailedPatch,
@@ -293,6 +294,16 @@ export async function triggerIcpDiscoveryForUser(
     // finishes onboarding with an apparently-blank market strategy.
     // Best-effort — errors logged but do NOT block the cascade.
     await mirrorIcpsToMarketStrategy(userId, personas);
+
+    // Backfill onboardingStage if every step status is now `ready` — the
+    // synthetic `onboarding_completed` event the frontend usually emits is
+    // missed when the user closes the tab before clicking the final UI
+    // button. Best-effort, swallows errors. See the helper for details.
+    try {
+      await markOnboardingCompletedIfTerminal(userId);
+    } catch (e) {
+      console.warn("[onboardingIcpService] terminal backfill failed (non-fatal):", e);
+    }
 
     // Cascade kickoff: fire-and-forget the competitor step now that ICPs
     // are persisted and `icpStatus === 'ready'`. Without this, the user

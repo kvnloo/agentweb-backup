@@ -116,6 +116,68 @@ function normalizeError(message: string): string {
 }
 
 /**
+ * Detect whether this oncall report originated from a cron job. Cron-fired
+ * tasks get routed to Backlog (not the current sprint) and get a per-user
+ * title so identical-operation alerts stay visually distinct on the board.
+ *
+ * Heuristics:
+ *   - `context.Source === 'cron'` (set by all stuck/abandoned cron paths)
+ *   - operation contains `stuck` or `abandoned` substring (defense-in-depth
+ *     for any future cron without the explicit Source tag)
+ */
+function isCronSource(operation: string, context?: Record<string, any>): boolean {
+  if (context && typeof context === 'object') {
+    const src = (context as any).Source;
+    if (typeof src === 'string' && src.toLowerCase() === 'cron') return true;
+  }
+  const op = (operation || '').toLowerCase();
+  if (op.includes('stuck') || op.includes('abandoned')) return true;
+  return false;
+}
+
+/**
+ * Build a per-user title for cron-fired stuck/abandoned alerts so each user
+ * gets a distinguishable Notion task instead of 100 lookalikes.
+ *
+ * Format:
+ *   "Onboarding stuck: {email} @ {stage} ({hoursStuck}h)"
+ *   "Onboarding abandoned: {email} @ {stage} ({hoursStuck}h)"
+ *
+ * Falls back to userId or "<unknown user>" when the email is missing, and
+ * to the raw operation tail when the stage / hours fields aren't in context.
+ */
+function buildCronTitle(
+  operation: string,
+  userId: string | undefined,
+  context: Record<string, any> | undefined,
+): string {
+  const ctx = context ?? {};
+  // Prefer enriched email (set by enrichOnboardingContext), fall back to
+  // userId. Both are best-effort — if neither is present we still build
+  // something useful from the operation tag.
+  const identifier =
+    (typeof ctx['User Email'] === 'string' && ctx['User Email']) ||
+    (typeof userId === 'string' && userId) ||
+    '<unknown user>';
+  const stage =
+    (typeof ctx.Stage === 'string' && ctx.Stage) ||
+    (typeof ctx['Onboarding Stage'] === 'string' && ctx['Onboarding Stage']) ||
+    'unknown';
+  const hoursRaw = ctx['Hours Since Last Event'];
+  let hoursLabel = '?h';
+  if (typeof hoursRaw === 'string' || typeof hoursRaw === 'number') {
+    const n = Number(hoursRaw);
+    if (Number.isFinite(n)) hoursLabel = `${n.toFixed(1)}h`;
+  }
+
+  // Variant suffix — `onboarding:stuck` / `onboarding:abandoned` / etc.
+  let variant = 'stuck';
+  const lowerOp = (operation || '').toLowerCase();
+  if (lowerOp.includes('abandon')) variant = 'abandoned';
+  return `Onboarding ${variant}: ${identifier} @ ${stage} (${hoursLabel})`;
+}
+
+/**
  * Report a UI-facing error to Notion as an oncall issue.
  * Deduplicates by (operation + normalized error message) within a 30-minute window
  * to avoid flooding oncall when users repeatedly trigger the same failure.
@@ -134,7 +196,6 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
 
   dedupCache.set(fingerprint, now);
 
-  const subject = `UI Error: ${operation}`;
   let fullContext: Record<string, any> = {
     Operation: operation,
     ...(userId ? { 'User ID': userId } : {}),
@@ -149,6 +210,15 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
     fullContext = await enrichOnboardingContext(userId, fullContext);
   }
 
+  // Cron-fired alerts get (a) a per-user title so the sprint board doesn't
+  // collapse them visually, and (b) backlog routing so they don't pollute
+  // the current sprint. Manual oncall reports keep the legacy "UI Error: …"
+  // title and the auto-promote behavior.
+  const cron = isCronSource(operation, fullContext);
+  const subject = cron
+    ? buildCronTitle(operation, userId, fullContext)
+    : `UI Error: ${operation}`;
+
   try {
     const { createOncallItem } = await import('../services/notionService');
     const { notionUrl } = await createOncallItem({
@@ -156,6 +226,7 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
       description: errorMessage,
       additionalTags: ['UI Error'],
       context: fullContext,
+      routeToBacklog: cron,
     });
     // Pass notionUrl so sendOncallAlert sends the slim email (skips re-creating Notion item)
     await emailService.sendOncallAlert(subject, errorMessage, fullContext, notionUrl);

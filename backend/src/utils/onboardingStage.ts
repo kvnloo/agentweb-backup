@@ -151,3 +151,99 @@ export function isOnboardingStage(s: unknown): s is OnboardingStage {
     (ALL_ONBOARDING_STAGES as readonly string[]).includes(s)
   );
 }
+
+/**
+ * Per-step status fields the onboarding pipeline writes to the User record.
+ * Kept loose (string) so this helper doesn't import the per-axis status
+ * types — coupling here would force this util to depend on five service
+ * modules. We only care about the `'ready'` literal value.
+ */
+const TERMINAL_STEP_STATUS = "ready";
+const STEP_STATUS_FIELDS = [
+  "brandBuildStatus",
+  "icpStatus",
+  "competitorStatus",
+  "creativeDirStatus",
+  "adImageStatus",
+  "adCopyStatus",
+] as const;
+
+/**
+ * Backfill `onboardingStage = onboarding_completed` when every backend
+ * pipeline step is `ready` but the synthetic completion event was never
+ * emitted (typically because the user closed the tab before clicking the
+ * final UI "complete" button on `OnboardingV2.tsx`).
+ *
+ * Without this, the stuck-detector cron fires forever on users who finished
+ * the actual work. Bug 1 from the 2026-04-28 stuck-detector cleanup.
+ *
+ * Behavior:
+ *   - Loads the user via `userDb.getUserById`. No-op if not found.
+ *   - No-op if any of the 6 step statuses is not `'ready'`.
+ *   - No-op if `onboardingStage` is already `'onboarding_completed'`
+ *     (or `'active'` / `'stale'` — the user is past completion).
+ *   - Otherwise: append a synthetic `onboarding_completed` event,
+ *     re-derive the stage, and persist via `userDb.updateUser`.
+ *
+ * Always swallows errors — callers (per-step services) must not have their
+ * primary write rolled back by an enrichment-fetch hiccup.
+ */
+export async function markOnboardingCompletedIfTerminal(
+  userId: string,
+): Promise<void> {
+  try {
+    if (!userId || typeof userId !== "string") return;
+    // Lazy require to dodge the circular-import risk between utils/onboardingStage
+    // and services/db (db imports nothing from utils, but the per-step service
+    // files do, and they are imported transitively from db elsewhere).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { userDb } = require("../services/db");
+    const user: any = await userDb.getUserById(userId);
+    if (!user) return;
+
+    // Check all 6 step statuses are 'ready'. If any is missing or not ready,
+    // bail without writing.
+    for (const field of STEP_STATUS_FIELDS) {
+      if (user[field] !== TERMINAL_STEP_STATUS) return;
+    }
+
+    // Already past completion? Don't double-emit.
+    const stage = user.onboardingStage;
+    if (
+      stage === "onboarding_completed" ||
+      stage === "active" ||
+      stage === "stale"
+    ) {
+      return;
+    }
+
+    const events: OnboardingEvent[] = Array.isArray(user.onboardingEvents)
+      ? (user.onboardingEvents as OnboardingEvent[])
+      : [];
+    const synthetic: OnboardingEvent = {
+      event: "onboarding_completed",
+      ts: new Date().toISOString(),
+      data: { source: "backend:auto_terminal_backfill" },
+    };
+    // Same FIFO cap the route layer uses (see routes/onboardingEvents.ts).
+    const MAX_EVENTS_PER_USER = 50;
+    const appended = [...events, synthetic].slice(-MAX_EVENTS_PER_USER);
+
+    const newStage = deriveOnboardingStage(appended, {
+      lastActiveAt: user.lastActiveAt,
+    });
+
+    await userDb.updateUser(userId, {
+      onboardingEvents: appended,
+      onboardingStage: newStage,
+    });
+  } catch (err) {
+    // Best-effort — the original step write must succeed even if this
+    // backfill blows up. Log once so we can spot systemic issues.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      "[onboardingStage] markOnboardingCompletedIfTerminal failed",
+      { userId, err: msg },
+    );
+  }
+}

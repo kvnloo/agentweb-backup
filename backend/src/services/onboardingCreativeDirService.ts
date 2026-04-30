@@ -23,6 +23,7 @@
 
 import { LLMService } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
+import { markOnboardingCompletedIfTerminal } from "../utils/onboardingStage";
 import { userDb } from "./db";
 import {
   creativeDirFailedPatch,
@@ -238,6 +239,16 @@ export async function triggerCreativeDirForUser(
       return;
     }
     await userDb.updateUser(userId, patch as any);
+
+    // Bug 1 backfill — see onboardingIcpService for context.
+    try {
+      await markOnboardingCompletedIfTerminal(userId);
+    } catch (e) {
+      console.warn(
+        "[onboardingCreativeDirService] terminal backfill failed (non-fatal):",
+        e,
+      );
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);

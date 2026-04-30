@@ -1,10 +1,22 @@
+// Mock services/db BEFORE importing the SUT so the lazy `require` inside
+// markOnboardingCompletedIfTerminal hits this stub.
+jest.mock("../../services/db", () => ({
+  userDb: {
+    getUserById: jest.fn(),
+    updateUser: jest.fn(),
+  },
+}));
+
 import {
   deriveOnboardingStage,
   isOnboardingStage,
   ALL_ONBOARDING_STAGES,
   ALLOWED_ONBOARDING_EVENTS,
+  markOnboardingCompletedIfTerminal,
   OnboardingEvent,
 } from "../onboardingStage";
+
+const { userDb } = require("../../services/db");
 
 describe("deriveOnboardingStage", () => {
   const now = new Date("2026-04-18T12:00:00.000Z");
@@ -174,5 +186,166 @@ describe("ALLOWED_ONBOARDING_EVENTS", () => {
   it("rejects made-up event names — allowlist is strict", () => {
     expect(ALLOWED_ONBOARDING_EVENTS.has("totally_made_up")).toBe(false);
     expect(ALLOWED_ONBOARDING_EVENTS.has("")).toBe(false);
+  });
+});
+
+describe("markOnboardingCompletedIfTerminal", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  const ALL_READY = {
+    brandBuildStatus: "ready",
+    icpStatus: "ready",
+    competitorStatus: "ready",
+    creativeDirStatus: "ready",
+    adImageStatus: "ready",
+    adCopyStatus: "ready",
+  };
+
+  it("happy path: all 6 steps ready, stage advances to onboarding_completed", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "brand_submitted",
+      onboardingEvents: [
+        { event: "goal_selected", ts: "2026-04-28T11:00:00Z" },
+        { event: "brand_submitted", ts: "2026-04-28T11:01:00Z" },
+      ],
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    const [calledUserId, patch] = userDb.updateUser.mock.calls[0];
+    expect(calledUserId).toBe("u1");
+    expect(patch.onboardingStage).toBe("onboarding_completed");
+    expect(patch.onboardingEvents.length).toBe(3);
+    expect(patch.onboardingEvents[2].event).toBe("onboarding_completed");
+    // The synthetic event has the right shape — event name, ISO ts, source tag.
+    const synthetic = patch.onboardingEvents[2];
+    expect(typeof synthetic.ts).toBe("string");
+    expect(Number.isFinite(Date.parse(synthetic.ts))).toBe(true);
+    expect(synthetic.data?.source).toBe("backend:auto_terminal_backfill");
+  });
+
+  it("no-op when all 6 steps ready but stage is already onboarding_completed", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "onboarding_completed",
+      onboardingEvents: [{ event: "onboarding_completed", ts: "2026-04-28T11:00:00Z" }],
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no-op when stage is `active` (past onboarding_completed)", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "active",
+      onboardingEvents: [],
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no-op when stage is `stale`", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "stale",
+      onboardingEvents: [],
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no-op when one step status is not ready", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      adCopyStatus: "running",
+      onboardingStage: "brand_submitted",
+      onboardingEvents: [],
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no-op when a step status is missing", async () => {
+    const partial = { ...ALL_READY };
+    delete (partial as any).adImageStatus;
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...partial,
+      onboardingStage: "brand_submitted",
+      onboardingEvents: [],
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no throw when user not found", async () => {
+    userDb.getUserById.mockResolvedValue(undefined);
+    await expect(markOnboardingCompletedIfTerminal("u1")).resolves.toBeUndefined();
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no throw when getUserById rejects", async () => {
+    userDb.getUserById.mockRejectedValue(new Error("ddb timeout"));
+    await expect(markOnboardingCompletedIfTerminal("u1")).resolves.toBeUndefined();
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("no-op for empty/invalid userId", async () => {
+    await markOnboardingCompletedIfTerminal("");
+    await markOnboardingCompletedIfTerminal(undefined as any);
+    await markOnboardingCompletedIfTerminal(null as any);
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("handles missing onboardingEvents (treats as empty array)", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "brand_submitted",
+      // no onboardingEvents field
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    const patch = userDb.updateUser.mock.calls[0][1];
+    expect(patch.onboardingStage).toBe("onboarding_completed");
+    expect(patch.onboardingEvents.length).toBe(1);
+    expect(patch.onboardingEvents[0].event).toBe("onboarding_completed");
+  });
+
+  it("caps the event log at 50 entries (FIFO drop)", async () => {
+    const events: OnboardingEvent[] = Array.from({ length: 60 }, (_, i) => ({
+      event: "goal_selected",
+      ts: new Date(2026, 0, 1, i).toISOString(),
+    }));
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "brand_submitted",
+      onboardingEvents: events,
+    });
+    await markOnboardingCompletedIfTerminal("u1");
+    const patch = userDb.updateUser.mock.calls[0][1];
+    expect(patch.onboardingEvents.length).toBe(50);
+    // Last entry is the synthetic one we just appended.
+    expect(patch.onboardingEvents[49].event).toBe("onboarding_completed");
+  });
+
+  it("swallows updateUser errors silently (best-effort backfill)", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      ...ALL_READY,
+      onboardingStage: "brand_submitted",
+      onboardingEvents: [],
+    });
+    userDb.updateUser.mockRejectedValue(new Error("ddb write failed"));
+    await expect(markOnboardingCompletedIfTerminal("u1")).resolves.toBeUndefined();
   });
 });

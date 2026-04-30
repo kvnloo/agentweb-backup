@@ -36,6 +36,7 @@
 
 import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
+import { markOnboardingCompletedIfTerminal } from "../utils/onboardingStage";
 import { userDb } from "./db";
 import {
   adImageFailedPatch,
@@ -727,7 +728,18 @@ export async function triggerAdImageGenerationForUser(
   const finalPatch: any = chatSessionId
     ? { ...patch, adImageChatSessionId: chatSessionId }
     : patch;
+  // (terminal backfill happens after the write below)
   await userDb.updateUser(userId, finalPatch);
+
+  // Bug 1 backfill — see onboardingIcpService for context.
+  try {
+    await markOnboardingCompletedIfTerminal(userId);
+  } catch (e) {
+    console.warn(
+      "[onboardingAdImageService] terminal backfill failed (non-fatal):",
+      e,
+    );
+  }
 }
 
 /**

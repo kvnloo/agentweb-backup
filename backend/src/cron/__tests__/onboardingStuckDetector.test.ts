@@ -76,7 +76,7 @@ describe('runOnboardingStuckDetector', () => {
     userDb.getAllUsers.mockResolvedValue([
       {
         userId: 'u1',
-        email: 'u1@example.com',
+        email: 'u1@realuser.com',
         onboardingStage: 'signed_up_no_start',
         onboardingEvents: [{ event: 'goal_selected', ts: tsHoursAgo(2) }],
       },
@@ -100,7 +100,7 @@ describe('runOnboardingStuckDetector', () => {
     userDb.getAllUsers.mockResolvedValue([
       {
         userId: 'u1',
-        email: 'u1@example.com',
+        email: 'u1@realuser.com',
         onboardingStage: 'brand_submitted',
         onboardingEvents: [{ event: 'brand_submitted', ts: tsHoursAgo(48) }],
       },
@@ -118,19 +118,19 @@ describe('runOnboardingStuckDetector', () => {
     userDb.getAllUsers.mockResolvedValue([
       {
         userId: 'a',
-        email: 'a@example.com',
+        email: 'a@realuser.com',
         onboardingStage: 'goal_selected',
         onboardingEvents: [{ event: 'goal_selected', ts: tsHoursAgo(50) }],
       },
       {
         userId: 'b',
-        email: 'b@example.com',
+        email: 'b@realuser.com',
         onboardingStage: 'signed_up_no_start',
         onboardingEvents: [{ event: 'goal_selected', ts: tsHoursAgo(2) }],
       },
       {
         userId: 'c',
-        email: 'c@example.com',
+        email: 'c@realuser.com',
         onboardingStage: 'onboarding_completed',
         onboardingEvents: [{ event: 'onboarding_completed', ts: tsHoursAgo(50) }],
       },
@@ -140,5 +140,104 @@ describe('runOnboardingStuckDetector', () => {
     expect(r.fired).toBe(2);
     expect(r.byClassification.stuck).toBe(1);
     expect(r.byClassification.abandoned).toBe(1);
+  });
+
+  // Bug 2: all-steps-ready short-circuit + test-domain filter.
+  describe('Bug 2 — all-steps-ready short-circuit', () => {
+    const ALL_READY = {
+      brandBuildStatus: 'ready',
+      icpStatus: 'ready',
+      competitorStatus: 'ready',
+      creativeDirStatus: 'ready',
+      adImageStatus: 'ready',
+      adCopyStatus: 'ready',
+    };
+
+    it('skips users whose 6 step statuses are all ready, even if stage is stale', async () => {
+      userDb.getAllUsers.mockResolvedValue([
+        {
+          userId: 'u1',
+          email: 'u1@realuser.com',
+          onboardingStage: 'brand_submitted', // stale stage
+          onboardingEvents: [{ event: 'brand_submitted', ts: tsHoursAgo(48) }],
+          ...ALL_READY,
+        },
+      ]);
+      const r = await runOnboardingStuckDetector();
+      expect(r.fired).toBe(0);
+      expect(reportUIError).not.toHaveBeenCalled();
+    });
+
+    it('still fires for a real user with mid-flow stale stage and not all steps ready', async () => {
+      userDb.getAllUsers.mockResolvedValue([
+        {
+          userId: 'u1',
+          email: 'u1@realuser.com',
+          onboardingStage: 'brand_submitted',
+          onboardingEvents: [{ event: 'brand_submitted', ts: tsHoursAgo(48) }],
+          ...ALL_READY,
+          adCopyStatus: 'running', // one step not ready → still fires
+        },
+      ]);
+      const r = await runOnboardingStuckDetector();
+      expect(r.fired).toBe(1);
+      expect(r.byClassification.abandoned).toBe(1);
+    });
+
+    it('fires when no step statuses are present at all (legacy users)', async () => {
+      userDb.getAllUsers.mockResolvedValue([
+        {
+          userId: 'u1',
+          email: 'u1@realuser.com',
+          onboardingStage: 'brand_submitted',
+          onboardingEvents: [{ event: 'brand_submitted', ts: tsHoursAgo(48) }],
+          // No *Status fields at all.
+        },
+      ]);
+      const r = await runOnboardingStuckDetector();
+      expect(r.fired).toBe(1);
+    });
+  });
+
+  describe('Bug 2 — test-domain filter', () => {
+    const ENGAGED_STALE = {
+      onboardingStage: 'brand_submitted',
+      onboardingEvents: [{ event: 'brand_submitted', ts: tsHoursAgo(48) }],
+    };
+
+    it.each([
+      ['u@agenttest.com'],
+      ['rui@example.com'],
+      ['Harsha@AgentTest.com'], // case-insensitive
+      ['test+qa@gmail.com'],
+      ['someone+qa-batch3@workdomain.io'],
+    ])('skips test-domain email: %s', async (email) => {
+      userDb.getAllUsers.mockResolvedValue([
+        { userId: 'u1', email, ...ENGAGED_STALE },
+      ]);
+      const r = await runOnboardingStuckDetector();
+      expect(r.fired).toBe(0);
+      expect(reportUIError).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['real@gmail.com'],
+      ['founder@startup.io'],
+      ['plus.dot+marketing@company.com'], // `+marketing`, not `+qa`
+    ])('still fires for non-test email: %s', async (email) => {
+      userDb.getAllUsers.mockResolvedValue([
+        { userId: 'u1', email, ...ENGAGED_STALE },
+      ]);
+      const r = await runOnboardingStuckDetector();
+      expect(r.fired).toBe(1);
+    });
+
+    it('treats missing/undefined email as non-test (still fires)', async () => {
+      userDb.getAllUsers.mockResolvedValue([
+        { userId: 'u1', ...ENGAGED_STALE }, // no email field
+      ]);
+      const r = await runOnboardingStuckDetector();
+      expect(r.fired).toBe(1);
+    });
   });
 });
