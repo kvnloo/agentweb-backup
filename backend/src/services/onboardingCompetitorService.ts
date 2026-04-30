@@ -22,7 +22,6 @@
 
 import { LLMService } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
-import { markOnboardingCompletedIfTerminal } from "../utils/onboardingStage";
 import { userDb } from "./db";
 import {
   competitorFailedPatch,
@@ -495,18 +494,6 @@ export async function triggerCompetitorStrategyForUser(
     // competitors onboarding generated. See companion mirror in
     // onboardingIcpService for the same pattern. Best-effort.
     await mirrorCompetitorsToMarketStrategy(userId, result);
-
-    // Bug 1 backfill — see onboardingIcpService for context. Runs AFTER the
-    // marketStrategy mirror so the helper's `getUserById` doesn't interleave
-    // with the mirror's read sequence.
-    try {
-      await markOnboardingCompletedIfTerminal(userId);
-    } catch (e) {
-      console.warn(
-        "[onboardingCompetitorService] terminal backfill failed (non-fatal):",
-        e,
-      );
-    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
