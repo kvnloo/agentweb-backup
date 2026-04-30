@@ -15,6 +15,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma\'s get_chat_history tool previously silently returned empty results when called without start_time/end_time arguments',
       '- This caused Emma to fall back to stale cached data and report incorrect session counts',
       '- The tool now returns a clear error message prompting Emma to retry with the correct time range',
+      'New: Spam Check for Sequence Emails',
+      '- Each sequence step now has a Spam Check button that uses Claude AI to analyse the email for deliverability issues',
+      '- Issues are classified as errors (block publishing) or warnings (reduce deliverability score)',
+      '- One-click AI repair: select which issues to fix, optionally provide context (company address, etc.), and Claude rewrites the email to resolve them',
+      '- Spam check results are saved with the sequence — the button shows a green checkmark if the last check passed, red X if it failed, and resets automatically if the email content changes',
     ],
   },
   {

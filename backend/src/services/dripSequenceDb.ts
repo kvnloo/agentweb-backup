@@ -97,6 +97,9 @@ export interface SequenceStep {
   subject: string;
   bodyHtml: string;
   senderId?: string;          // sender config id; falls back to user default
+  spamCheckedAt?: string;     // ISO timestamp of last spam check
+  spamPassed?: boolean;       // result of last spam check
+  spamContentHash?: string;   // hash of subject+bodyHtml at check time; if content changes, result is stale
 }
 
 export interface DripSequence {
