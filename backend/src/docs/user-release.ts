@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'Improvement: Issue Reports Now Send a Confirmation Email to the Reporter',
+      '- When a user reports a product issue via Emma, they now receive a confirmation email at their account address',
+      '- The email subject clearly references the issue title: "We received your issue: <title>"',
+      '- The email includes the issue ID (AGW-<id>) so the user can reference it in follow-up communications',
+      '- Engineering team is still notified on the same email thread',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'New: CRM List Email Metrics',
       '- Each lead list now shows aggregate email metrics (Sent, Delivered, Open Rate, Click Rate, Bounce Rate) directly above the leads table',
       '- Click the metrics bar to open a breakdown dialog showing performance per email subject',
