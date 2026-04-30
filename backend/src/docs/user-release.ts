@@ -5470,6 +5470,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-04-30',
     changes: [
+      'Improved: Onboarding Stuck-User Alerts Now Consolidated Into a Daily Report',
+      '- The system previously sent one alert per stuck user per hour, generating 100+ duplicate notifications per day',
+      '- Alerts are now batched into a single daily summary showing how many users are stuck at each onboarding stage',
+      '- Days with no stuck users produce no alert, reducing noise',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
       'Fixed: Emma No Longer Shows "Thinking..." After Responding',
       '- Emma\'s "Thinking..." indicator now correctly disappears after she delivers a response',
       '- Previously, if the HTTP connection dropped mid-request (e.g. a timeout), Emma would deliver her response via the background stream but the loading indicator would remain stuck on screen',
