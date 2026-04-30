@@ -3811,6 +3811,7 @@ export async function generateChatResponse(
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
+          'report_product_issues',
           'get_temp_email', 'check_temp_inbox',
           'get_test_account', 'save_test_account', 'list_test_accounts',
         ] : []);

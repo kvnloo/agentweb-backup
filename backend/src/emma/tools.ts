@@ -5862,7 +5862,7 @@ emmaToolRegistry.register({
       throw new Error('User not found');
     }
 
-    const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string }> = [];
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
@@ -5888,17 +5888,17 @@ emmaToolRegistry.register({
 
         await resendService.sendEmail({
           from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-          to: productIssueEmails,
-          subject: `Product Issue from ${user.email}: ${issue.title}`,
+          to: [...productIssueEmails, user.email],
+          subject: `We received your issue: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
               <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
                 <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
               </div>
-              <div style="margin: 8px 0;"><strong>From:</strong> ${user.displayName || user.email} (${user.email})</div>
+              <p style="color: #444;">Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.</p>
+              ${result.pageId ? `<div style="margin: 8px 0;"><strong>Issue ID:</strong> AGW-${result.pageId}</div>` : ''}
               <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
               <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
-              <div style="margin: 8px 0;"><strong>Notion:</strong> <a href="${result.notionUrl}">${result.notionUrl}</a></div>
               <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
                 <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
                 <div>${issue.description.replace(/\n/g, '<br>')}</div>
@@ -5908,7 +5908,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         });
 
-        results.push({ title: issue.title, success: true, notionUrl: result.notionUrl });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
