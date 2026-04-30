@@ -1563,7 +1563,7 @@ export default function AdminDashboard() {
       // Paid filter
       if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
       if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
-      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status)) return false;
+      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status && !user.subscription_amount)) return false;
       // Has-usage filter — match the display logic: current-month tokens only
       if (userFilterHasUsage) {
         const currentMonth = new Date().toISOString().slice(0, 7);
@@ -3743,7 +3743,7 @@ export default function AdminDashboard() {
               const trialing = contextUsers.filter(u => u.subscription_status === "trialing");
               const pastDue = contextUsers.filter(u => u.subscription_status === "past_due");
               const canceled = contextUsers.filter(u => u.subscription_status === "canceled" || u.subscription_status === "canceling");
-              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status);
+              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status && !u.subscription_amount);
               // Churn rate: canceled / (paying + canceled) — lifetime simple churn
               const churnBase = paying.length + canceled.length;
               const churnRate = churnBase > 0 ? ((canceled.length / churnBase) * 100).toFixed(0) : "0";
@@ -3934,7 +3934,7 @@ export default function AdminDashboard() {
                       : user.subscription_status === "canceled" || user.subscription_status === "canceling" ? "canceled"
                       : user.subscription_status === "trialing" ? "trialing"
                       : user.subscription_status === "active" ? "paying"
-                      : user.stripe_customer_id && !user.subscription_status ? "bounced"
+                      : user.stripe_customer_id && !user.subscription_status && !user.subscription_amount ? "bounced"
                       : "free";
                     const lastActiveTimestamp = user.lastActiveAt || user.lastLoginTime;
                     const lastSeen = lastActiveTimestamp ? (() => {
