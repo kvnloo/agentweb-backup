@@ -20,6 +20,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-01',
     changes: [
+      'Improvement: Emma can now search leads across multiple lists in one call',
+      '- search_leads now accepts list_ids (up to 5 lists) in addition to the existing single list_id; each returned lead carries its listId/listName so Emma can attribute results when summarising across lists',
+      '- Pagination is now correct: previously, when the result limit was reached partway through a DynamoDB page, the cursor advanced past unread leads and silently dropped matches on subsequent pages; the cursor is now anchored to the last scanned leadId so paging never skips or duplicates results',
+      '- Multi-list cursor freezes the list set, so paging stays stable even if list_ids change between calls; inaccessible lists in a multi-list call are silently skipped instead of failing the whole call',
+      '- For broad cross-CRM strategic questions ("who should I reach out to today?"), continue to use ask_crm — search_leads is for structured field-level filtering on a known set of lists',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
       'New: Founder Voice Examples for Authentic LinkedIn Posts',
       '- Founders can now paste real post examples into Brand Guidelines → Founder Profile → Voice Examples',
       '- Emma reads these examples when generating LinkedIn and social posts, matching the exact sentence rhythm, hooks, vocabulary, and structure of the real posts',
