@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-01',
     changes: [
+      'Fix: Slack channel → client account mapping no longer gets stuck on the wrong user',
+      '- When a client\'s Slack channel was reassigned to a different account in the admin panel, the old cached mapping was never cleared, causing messages to keep routing to the previous account indefinitely',
+      '- The cache is now invalidated whenever an admin updates a user\'s Slack channel assignments, so the correct client is always matched on the next message',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
       'CRM Sequences: Per-Step Sender Selection',
       '- Each step in a drip sequence can now use a different configured sender email',
       '- A "From (sender)" dropdown appears in each step editor, letting you pick any sender from your configured list',
