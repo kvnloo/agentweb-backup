@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-01',
     changes: [
+      'Fix: CRM — Delete Button Now Always Visible When Leads Are Selected',
+      '- The "Delete" action is now present in the floating selection toolbar that appears at the bottom of the screen when leads are selected',
+      '- Previously, the delete button only appeared in the inline toolbar above the table, which scrolled out of view on long lists — making bulk delete appear broken',
+      'Fix: CRM — Page No Longer Resets to 1 After Editing or Deleting a Lead',
+      '- Editing a lead, deleting a single lead, bulk deleting, or marking leads as Do Not Contact while on page 2+ now keeps you on the same page',
+      '- Previously all these actions sent you back to page 1, losing your place when working through large lists',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
       'Fix: Slack channel → client account mapping no longer gets stuck on the wrong user',
       '- When a client\'s Slack channel was reassigned to a different account in the admin panel, the old cached mapping was never cleared, causing messages to keep routing to the previous account indefinitely',
       '- The cache is now invalidated whenever an admin updates a user\'s Slack channel assignments, so the correct client is always matched on the next message',
