@@ -2704,13 +2704,18 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm.',
     inputSchema: {
       type: 'object',
       properties: {
         list_id: {
           type: 'string',
-          description: 'The ID of the lead list to search'
+          description: 'The ID of a single lead list to search. Use this OR list_ids, not both.'
+        },
+        list_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'IDs of up to 5 lead lists to search across. Each returned lead includes its listId/listName. Inaccessible lists are silently skipped. Use this OR list_id, not both. For broader cross-CRM scope, prefer ask_crm.'
         },
         filters: {
           type: 'array',
@@ -2719,7 +2724,7 @@ emmaToolRegistry.register({
             properties: {
               field: {
                 type: 'string',
-                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt; ICP: icpScore, icpMatch; engagement: engagementCount; dot-notation paths like "customFields.createdAt"; or any custom field name)'
+                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt; ICP: icpScore, icpMatch; engagement: engagementCount; dot-notation paths like "customFields.createdAt"; or any custom field name). When searching multiple lists, missing fields on a list silently fail to match (no error).'
               },
               operator: {
                 type: 'string',
@@ -2744,16 +2749,17 @@ emmaToolRegistry.register({
         },
         cursor: {
           type: 'string',
-          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
+          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this verbatim to retrieve the next page; the cursor freezes the list_ids set so paging is stable even if your list_ids change between calls.'
         }
       },
-      required: ['list_id', 'filters']
+      required: ['filters']
     }
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
       search: args.search,
-      cursor: args.cursor
+      cursor: args.cursor,
+      listIds: args.list_ids,
     });
   }
 });
