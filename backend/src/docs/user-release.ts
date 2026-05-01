@@ -19,6 +19,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'System: Switched outbound sender address from no-reply@ to hi@',
       '- System emails (help requests, error reports, issue confirmations) now come from hi@updates.agentweb.pro instead of no-reply@updates.agentweb.pro',
       '- This improves deliverability and reduces the chance of messages being flagged as spam',
+      'Fix: Admin — Sync Stripe Subscription Status Per User',
+      '- Users whose Stripe subscription webhook was missed (e.g. signed up before Stripe customer was linked) could have a stripe_customer_id and payment amount on file but no subscription_status, causing the admin Users tab to show them as free instead of Paid',
+      '- A new Sync icon button (↺) next to the Stripe Customer ID field in each expanded user row lets admins pull the live subscription status directly from Stripe with one click',
+      '- Also removed the duplicate read-only "Stripe ID" field in the expanded row (same data as the editable Stripe Customer ID field)',
     ],
   },
   {
