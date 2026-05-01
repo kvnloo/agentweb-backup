@@ -17,6 +17,7 @@ jest.mock('../services/db', () => ({
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
     updateFieldNames: jest.fn(),
+    updateLeadList: jest.fn(),
     updateSearchQueryTemplates: jest.fn(),
     createEnrichmentSnapshotItem: jest.fn(),
     createEnrichmentJobMeta: jest.fn(),
@@ -108,6 +109,7 @@ describe('CrmEnrichmentService', () => {
     mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
     mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
     mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    mockCrmDb.updateLeadList.mockResolvedValue(undefined);
   });
 
   // ─── FAIL CASES ───────────────────────────────────────────────────────────
@@ -618,6 +620,82 @@ describe('CrmEnrichmentService', () => {
 
       await service.execute(spec);
       expect(mockCrmDb.updateFieldNames).toHaveBeenCalledWith('list1', ['company_size']);
+    });
+
+    it('should add output fields to displayFields so new columns appear in the UI', async () => {
+      mockCrmDb.getLeadListById
+        .mockResolvedValueOnce({ listId: 'list1', userId: 'user1' })
+        .mockResolvedValueOnce({ listId: 'list1', displayFields: ['email', 'firstName', 'lastName'] });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '100' }));
+      mockAgentModeService.searchWeb.mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find company size',
+        outputFields: ['company_size'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      expect(mockCrmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        displayFields: ['email', 'firstName', 'lastName', 'company_size'],
+      });
+    });
+
+    it('should not duplicate fields if output field already in displayFields', async () => {
+      mockCrmDb.getLeadListById
+        .mockResolvedValueOnce({ listId: 'list1', userId: 'user1' })
+        .mockResolvedValueOnce({ listId: 'list1', displayFields: ['email', 'company_size'] });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '100' }));
+      mockAgentModeService.searchWeb.mockResolvedValue({ success: true, results: [] });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find company size',
+        outputFields: ['company_size'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      expect(mockCrmDb.updateLeadList).not.toHaveBeenCalled();
+    });
+
+    it('should use default display fields when list has no displayFields', async () => {
+      mockCrmDb.getLeadListById
+        .mockResolvedValueOnce({ listId: 'list1', userId: 'user1' })
+        .mockResolvedValueOnce({ listId: 'list1' }); // No displayFields
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ qualifier: 'yes' }));
+      mockAgentModeService.searchWeb.mockResolvedValue({ success: true, results: [] });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find qualifier',
+        outputFields: ['qualifier'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      expect(mockCrmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        displayFields: ['qualifier'],
+      });
     });
 
     it('should use parallelism of 5 when linkedin source is enabled', async () => {

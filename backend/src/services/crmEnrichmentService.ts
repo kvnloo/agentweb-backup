@@ -905,9 +905,15 @@ export class CrmEnrichmentService {
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
     }
 
-    // Register new field names on the list
+    // Register new field names on the list and add them to displayFields so the UI shows the columns
     try {
       await crmDb.updateFieldNames(spec.listId, spec.outputFields);
+      const currentList = await crmDb.getLeadListById(spec.listId);
+      const existingDisplayFields: string[] = Array.isArray(currentList?.displayFields) ? (currentList!.displayFields as string[]) : [];
+      const newDisplayFields = Array.from(new Set([...existingDisplayFields, ...spec.outputFields]));
+      if (newDisplayFields.length > existingDisplayFields.length) {
+        await crmDb.updateLeadList(spec.listId, { displayFields: newDisplayFields });
+      }
     } catch (err) {
       console.error('[CrmEnrichment] Failed to update field names:', err);
     }
