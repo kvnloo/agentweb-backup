@@ -4093,10 +4093,6 @@ export default function AdminDashboard() {
                                   <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem", wordBreak: "break-all" }}>{user.userId}</Typography>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Stripe ID</Typography>
-                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
-                                </Grid>
-                                <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Created</Typography>
                                   <Typography variant="body2">{user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}</Typography>
                                 </Grid>
