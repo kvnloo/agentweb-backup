@@ -1634,10 +1634,11 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       originalMessage: string;
       emmaResponse: string;
       receivedAt: string;
+      senderDisplayName?: string;
     }
   ) {
     try {
-      const { sessionId, userEmail, channelName, originalMessage, emmaResponse, receivedAt } = params;
+      const { sessionId, userEmail, channelName, originalMessage, emmaResponse, receivedAt, senderDisplayName } = params;
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
@@ -1701,7 +1702,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
               </div>
 
               <div class="section">
-                <div class="section-title">Original Message</div>
+                <div class="section-title">Original Message from ${this.escapeHtml(senderDisplayName || 'Unknown')}</div>
                 <div class="message-box">${this.escapeHtml(originalMessage)}</div>
               </div>
 
@@ -1727,7 +1728,7 @@ Client: ${userEmail}
 Channel: #${channelName}
 Received: ${formattedDate}
 
-Original Message:
+Original Message from ${senderDisplayName || 'Unknown'}:
 ${originalMessage}
 
 Emma's Draft Response:
@@ -1735,7 +1736,7 @@ ${emmaResponse}
 
 View Session: ${sessionUrl}`;
 
-      const subject = `💬 Client question from #${channelName} (${userEmail})`;
+      const subject = `💬 Client question from #${channelName} — ${senderDisplayName || userEmail}`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmail(emailList, subject, text, html);
       console.log(`Slack triggered session email sent to: ${emailList.join(', ')} for session ${sessionId}`);

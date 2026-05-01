@@ -182,6 +182,7 @@ async function handleSlackTriggeredSession(params: {
       originalMessage: rawMessage,
       emmaResponse,
       receivedAt: new Date().toISOString(),
+      senderDisplayName: displayName,
     });
 
     console.log(`✅ [slack-triggered] session handled: ${session.sessionId}`);
