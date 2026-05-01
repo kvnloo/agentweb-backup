@@ -797,6 +797,7 @@ export default function AdminDashboard() {
   const [currentStripeCustomerIdText, setCurrentStripeCustomerIdText] = useState("");
   const [resyncPaymentsLoading, setResyncPaymentsLoading] = useState(false);
   const [stripeCustomerIdEditLoading, setStripeCustomerIdEditLoading] = useState(false);
+  const [syncStripeLoadingUserId, setSyncStripeLoadingUserId] = useState<string | null>(null);
   const [editingEmailUserId, setEditingEmailUserId] = useState<string | null>(null);
   const [currentEmailText, setCurrentEmailText] = useState("");
   const [emailEditLoading, setEmailEditLoading] = useState(false);
@@ -2209,6 +2210,33 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update Stripe Customer ID");
     } finally {
       setStripeCustomerIdEditLoading(false);
+    }
+  };
+
+  const handleSyncStripe = async (userId: string) => {
+    try {
+      setSyncStripeLoadingUserId(userId);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${userId}/sync-stripe`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const updatedUser = response.data.user;
+      if (updatedUser) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((u: User) => u.userId === userId ? { ...u, ...updatedUser } : u)
+        );
+      }
+      const updates = response.data.updates;
+      if (updates && Object.keys(updates).length > 0) {
+        setSuccess(`Stripe synced: updated ${Object.keys(updates).join(", ")}`);
+      } else {
+        setSuccess("Stripe sync complete — no new data found");
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to sync Stripe subscription");
+    } finally {
+      setSyncStripeLoadingUserId(null);
     }
   };
 
@@ -4065,10 +4093,6 @@ export default function AdminDashboard() {
                                   <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem", wordBreak: "break-all" }}>{user.userId}</Typography>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Stripe ID</Typography>
-                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
-                                </Grid>
-                                <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Created</Typography>
                                   <Typography variant="body2">{user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}</Typography>
                                 </Grid>
@@ -4155,6 +4179,11 @@ export default function AdminDashboard() {
                                       <>
                                         <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
                                         <IconButton size="small" onClick={() => { setEditingStripeCustomerIdUserId(user.userId); setCurrentStripeCustomerIdText(user.stripe_customer_id || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                        {user.stripe_customer_id && (
+                                          <IconButton size="small" title="Sync subscription status from Stripe" onClick={() => handleSyncStripe(user.userId)} disabled={syncStripeLoadingUserId === user.userId}>
+                                            {syncStripeLoadingUserId === user.userId ? <CircularProgress size={14} /> : <SyncIcon sx={{ fontSize: 14 }} />}
+                                          </IconButton>
+                                        )}
                                       </>
                                     )}
                                   </Box>

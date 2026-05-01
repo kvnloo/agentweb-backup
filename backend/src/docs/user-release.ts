@@ -11,6 +11,23 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-01',
     changes: [
+      'CRM Sequences: Per-Step Sender Selection',
+      '- Each step in a drip sequence can now use a different configured sender email',
+      '- A "From (sender)" dropdown appears in each step editor, letting you pick any sender from your configured list',
+      '- Defaults to "Account default" (your primary sender) if no specific sender is chosen',
+      '- The email worker now correctly uses the per-step sender when sending — previously all steps always used the account default regardless of what was saved',
+      'System: Switched outbound sender address from no-reply@ to hi@',
+      '- System emails (help requests, error reports, issue confirmations) now come from hi@updates.agentweb.pro instead of no-reply@updates.agentweb.pro',
+      '- This improves deliverability and reduces the chance of messages being flagged as spam',
+      'Fix: Admin — Sync Stripe Subscription Status Per User',
+      '- Users whose Stripe subscription webhook was missed (e.g. signed up before Stripe customer was linked) could have a stripe_customer_id and payment amount on file but no subscription_status, causing the admin Users tab to show them as free instead of Paid',
+      '- A new Sync icon button (↺) next to the Stripe Customer ID field in each expanded user row lets admins pull the live subscription status directly from Stripe with one click',
+      '- Also removed the duplicate read-only "Stripe ID" field in the expanded row (same data as the editable Stripe Customer ID field)',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
       'Fix: Emma No Longer Shows "Thinking…" After Completing a Response',
       '- Every session was incorrectly showing the Thinking… indicator even after Emma finished responding',
       '- Root cause: the suggested reply chips feature (added recently) emits a "suggestions" event after the "complete" event; if the session was reloaded during that brief window the backend mistakenly reported the session as still active',
@@ -5523,6 +5540,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Lead Engagements Now Load Correctly',
       '- Clicking on a lead in the CRM page no longer shows "Failed to load engagements" every time',
       '- The error was caused by a missing AWS region configuration in the email events service',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Improved: New Client Question Emails Now Show Who Sent the Slack Message',
+      '- The "New Client Question from Slack" notification email now identifies the sender under "Original Message from <name>"',
+      '- Previously the sender\'s name was missing, making it unclear who the client contact was',
     ],
   },
   {
