@@ -16,8 +16,16 @@ import type { RawWebResult, RawCacheData } from './enrichmentGroups';
 import {
   buildDataExtractionSystemPrompt,
   buildDataExtractionRetryPrompt,
-  buildSuggestEnrichmentSystemPrompt
+  buildSuggestEnrichmentSystemPrompt,
+  buildCriticSystemPrompt,
+  buildCriticUserPrompt,
 } from './enrichmentPrompts';
+import { EnrichedFieldMeta, trimQuote } from '../utils/enrichedFieldValue';
+import { normalizeFields, Normalized } from './enrichmentFieldTypes';
+import { fetchTopPages } from './webContentFetcher';
+import { runSpecialists } from './enrichmentSpecialists';
+import { resolveFieldAliases } from './enrichmentFieldAliasService';
+import { getOrCreateClustersForFields, type FieldCluster } from './enrichmentClusterService';
 
 /** LinkedIn API has stricter rate limits */
 const PARALLELISM_WITH_LINKEDIN = 5;
@@ -50,6 +58,15 @@ function defaultSocketEmit(): SocketEmitFn | null {
 }
 
 export type EnrichmentSource = 'web_search' | 'linkedin' | 'existing_data';
+
+/** Metadata returned by the LLM alongside each extracted field value, used to verify the claim is grounded in the sources. */
+export interface FieldCitation {
+  sourceQuote?: string;
+  sourceUrl?: string;
+  confidence?: 'high' | 'medium' | 'low';
+  /** Set by the critic pass (item #6) when it runs. */
+  criticVerdict?: 'supported' | 'partially-supported' | 'unsupported' | 'contradicted';
+}
 
 export interface LeadRecord {
   leadId: string;
@@ -84,6 +101,15 @@ export interface EnrichmentJobSpec {
   /** Bypass AW-EnrichmentRawCache and re-fetch from APIs. Distinct from forceOverwrite
    *  (which re-enriches leads that already have all output fields populated). */
   forceRefreshCache?: boolean;
+  /** User-field-name → canonical FIELD_GROUPS field-name map. Resolved once
+   *  per job at execute()/preview() entry by enrichmentFieldAliasService and
+   *  passed through to splitFieldsByGroup so user variants like
+   *  `funding_round` land in the right group instead of ungrouped. */
+  fieldAliases?: Record<string, string>;
+  /** Field-name → natural-language description map. Used by the clustering
+   *  service to generate per-cluster search templates for ungrouped fields.
+   *  Optional: if absent, the LLM clusters from field names alone. */
+  fieldDescriptions?: Record<string, string>;
 }
 
 interface EnrichmentPreviewResult {
@@ -190,8 +216,126 @@ export class CrmEnrichmentService {
     return linkedInOutreachService.resolveAccountId(userId);
   }
 
+  // Default to the better-quality preview model; on timeout we fall back to
+  // the GA model on retry so a stalled Gemini shard doesn't hang the pipeline.
   private static readonly DEFAULT_ENRICH_MODEL = 'gemini-3-flash-preview';
   private static readonly DEFAULT_SUGGEST_MODEL = 'gemini-3-flash-preview';
+
+  // Fallback used by llmCallWithTimeout when the primary model times out.
+  // GA models are capacity-stable (sub-10-s) where preview models can queue
+  // 200+ seconds intermittently. Trading a small quality dip for liveness.
+  private static readonly LLM_FALLBACK_MODEL = 'gemini-2.5-flash';
+
+  // Per-call ceiling. The OpenAI SDK aborts the underlying fetch when this
+  // fires. Chosen so the worst case for a 2-sample preview is ~2 min.
+  private static readonly LLM_CALL_TIMEOUT_MS = 60_000;
+
+  // ── Process-level LLM circuit breaker ────────────────────────────────────
+  // When Gemini's preview model is degraded (queueing requests for minutes),
+  // the per-call fallback eats a fresh 60-s timeout *before* every single
+  // call — wasted compute and latency. The breaker tracks recent timeouts
+  // and, once the threshold is hit, "opens" the circuit so all subsequent
+  // calls go straight to the fallback model for COOLDOWN_MS, then reset.
+  // State is in-memory (per-process) — fine for our single-instance EB
+  // backend; not persisted across restarts.
+  private static readonly LLM_CIRCUIT_THRESHOLD = 3;            // timeouts in window → open
+  private static readonly LLM_CIRCUIT_WINDOW_MS = 5 * 60_000;   // sliding window for counting
+  private static readonly LLM_CIRCUIT_COOLDOWN_MS = 10 * 60_000; // how long the breaker stays open
+  private static llmTimeoutTimestamps: number[] = [];
+  private static llmCircuitOpenUntil = 0;
+
+  private static isLlmCircuitOpen(): boolean {
+    return Date.now() < CrmEnrichmentService.llmCircuitOpenUntil;
+  }
+
+  private static recordLlmTimeout(): void {
+    const now = Date.now();
+    CrmEnrichmentService.llmTimeoutTimestamps =
+      CrmEnrichmentService.llmTimeoutTimestamps.filter(
+        t => now - t < CrmEnrichmentService.LLM_CIRCUIT_WINDOW_MS
+      );
+    CrmEnrichmentService.llmTimeoutTimestamps.push(now);
+    if (
+      CrmEnrichmentService.llmTimeoutTimestamps.length >=
+      CrmEnrichmentService.LLM_CIRCUIT_THRESHOLD
+    ) {
+      CrmEnrichmentService.llmCircuitOpenUntil =
+        now + CrmEnrichmentService.LLM_CIRCUIT_COOLDOWN_MS;
+      console.warn(
+        `[CrmEnrichment] LLM circuit OPEN — primary model is degraded ` +
+        `(${CrmEnrichmentService.LLM_CIRCUIT_THRESHOLD} timeouts in ${CrmEnrichmentService.LLM_CIRCUIT_WINDOW_MS / 60_000} min); ` +
+        `routing to fallback ${CrmEnrichmentService.LLM_FALLBACK_MODEL} for the next ` +
+        `${CrmEnrichmentService.LLM_CIRCUIT_COOLDOWN_MS / 60_000} min`
+      );
+      // Reset the counter so we don't re-open immediately on stale entries
+      // when the cooldown elapses.
+      CrmEnrichmentService.llmTimeoutTimestamps = [];
+    }
+  }
+
+  private static isLlmTimeoutError(err: any): boolean {
+    return (
+      err?.name === 'APIConnectionTimeoutError' ||
+      err?.code === 'ETIMEDOUT' ||
+      err?.message?.toLowerCase?.().includes('timed out') ||
+      err?.message?.toLowerCase?.().includes('timeout')
+    );
+  }
+
+  /**
+   * Run an LLM call with a per-call timeout. On timeout, retry once using
+   * LLM_FALLBACK_MODEL — Gemini occasionally queues `*-preview` requests for
+   * several minutes (we've seen 200–260 s on the same input that returns in
+   * 6 s elsewhere), and the GA model is consistently fast.
+   *
+   * The caller's `call` receives the model id to use so it can swap models
+   * between primary and fallback. Non-timeout errors propagate immediately —
+   * the caller's existing parse-retry path handles malformed responses.
+   */
+  // Returns `any` because the underlying llmClient.chat.completions.create
+  // is typed as `any` (Gemini wrapper around the OpenAI SDK), and a generic T
+  // would just resolve to `unknown` and force casts at every call site.
+  private static async llmCallWithTimeout(
+    call: (model: string) => Promise<any>,
+    primaryModel: string,
+    label: string,
+  ): Promise<any> {
+    const fallback = CrmEnrichmentService.LLM_FALLBACK_MODEL;
+
+    // Circuit open: skip the primary entirely for the cooldown period. Saves
+    // a 60s timeout per call when Gemini's preview model is broadly degraded.
+    if (CrmEnrichmentService.isLlmCircuitOpen()) {
+      console.log(
+        `[CrmEnrichment][llmCallWithTimeout] ${label} circuit OPEN, ` +
+        `routing directly to fallback ${fallback} (skipping ${primaryModel})`
+      );
+      return await call(fallback);
+    }
+
+    try {
+      return await call(primaryModel);
+    } catch (err: any) {
+      if (!CrmEnrichmentService.isLlmTimeoutError(err)) throw err;
+      // Tick the breaker. If this push trips the threshold, the circuit
+      // opens for COOLDOWN_MS and *next* calls skip the primary entirely.
+      CrmEnrichmentService.recordLlmTimeout();
+      console.warn(
+        `[CrmEnrichment][llmCallWithTimeout] ${label} timed out on ${primaryModel} after ` +
+        `${CrmEnrichmentService.LLM_CALL_TIMEOUT_MS}ms, retrying with fallback ${fallback}`
+      );
+      try {
+        return await call(fallback);
+      } catch (retryErr: any) {
+        if (CrmEnrichmentService.isLlmTimeoutError(retryErr)) {
+          throw Object.assign(
+            new Error(`LLM call timed out twice (${label}, primary=${primaryModel}, fallback=${fallback})`),
+            { step: 'llm', timedOut: true },
+          );
+        }
+        throw retryErr;
+      }
+    }
+  }
 
   static async getEnrichmentConfig(): Promise<{ enrichmentModel: string; dataExtractionModel: string }> {
     try {
@@ -212,26 +356,62 @@ export class CrmEnrichmentService {
     };
   }
 
-  // Free/personal email providers — using their domain as a company identifier produces wrong results
+  // Non-business email domains — using these as a company identifier produces wrong results.
+  // "Personal" is used loosely here to mean "not a sales-target company domain":
+  // free providers (gmail, hotmail), institutional TLDs (.edu, .gov, .mil, .ac.*),
+  // and disposable/throwaway email providers.
   private static readonly PERSONAL_EMAIL_DOMAINS = new Set([
+    // Major free providers
     'gmail.com', 'googlemail.com',
-    'yahoo.com', 'yahoo.co.uk', 'yahoo.co.jp', 'yahoo.fr', 'yahoo.de', 'yahoo.es', 'yahoo.it',
-    'hotmail.com', 'hotmail.co.uk', 'hotmail.fr', 'hotmail.de', 'hotmail.es',
-    'outlook.com', 'outlook.co.uk', 'live.com', 'live.co.uk',
+    'yahoo.com', 'yahoo.co.uk', 'yahoo.co.jp', 'yahoo.fr', 'yahoo.de', 'yahoo.es', 'yahoo.it', 'yahoo.com.br', 'yahoo.com.au', 'yahoo.in',
+    'hotmail.com', 'hotmail.co.uk', 'hotmail.fr', 'hotmail.de', 'hotmail.es', 'hotmail.it',
+    'outlook.com', 'outlook.co.uk', 'live.com', 'live.co.uk', 'live.fr', 'live.de',
     'msn.com',
-    'aol.com',
+    'aol.com', 'aim.com',
     'icloud.com', 'me.com', 'mac.com',
-    'protonmail.com', 'proton.me',
+    'protonmail.com', 'proton.me', 'pm.me',
     'mail.com', 'email.com',
-    'zoho.com',
+    'zoho.com', 'zohomail.com',
     'yandex.com', 'yandex.ru',
-    'qq.com', '163.com', '126.com',
-    'inbox.com', 'fastmail.com', 'tutanota.com',
+    'qq.com', '163.com', '126.com', '139.com', 'sina.com', 'sina.cn',
+    'naver.com', 'daum.net',
+    'rediffmail.com',
+    'inbox.com', 'fastmail.com', 'tutanota.com', 'tuta.io',
+    'gmx.com', 'gmx.de', 'gmx.net',
+    't-online.de', 'web.de', 'orange.fr', 'free.fr', 'laposte.net',
+    'libero.it',
+    'rambler.ru',
+    // Disposable / temporary mail (popular ones)
+    'mailinator.com', 'guerrillamail.com', 'throwawaymail.com', '10minutemail.com',
+    'yopmail.com', 'temp-mail.org', 'tempmail.com', 'getnada.com', 'sharklasers.com',
   ]);
+
+  /**
+   * Returns true for institutional / educational / government TLDs where the domain
+   * isn't a sales-target company. Includes:
+   *   .edu, .edu.{cc}            (universities, schools)
+   *   .gov, .gov.{cc}, .mil      (government, military)
+   *   .ac.{cc}                   (UK/India/etc. academic)
+   *   .gob.{cc}, .gouv.{cc}      (Spanish/French government)
+   */
+  static isInstitutionalDomain(domain: string): boolean {
+    const d = domain.toLowerCase().trim();
+    if (!d) return false;
+    if (/\.edu(\.[a-z]{2,3})?$/.test(d)) return true;
+    if (/\.gov(\.[a-z]{2,3})?$/.test(d)) return true;
+    if (/\.mil(\.[a-z]{2,3})?$/.test(d)) return true;
+    if (/\.ac\.[a-z]{2,3}$/.test(d)) return true;
+    if (/\.gob\.[a-z]{2,3}$/.test(d)) return true;
+    if (/\.gouv\.[a-z]{2,3}$/.test(d)) return true;
+    return false;
+  }
 
   static isPersonalEmailDomain(email: string): boolean {
     const domain = (email.split('@')[1] || '').toLowerCase().trim();
-    return CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(domain);
+    if (!domain) return false;
+    if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(domain)) return true;
+    if (CrmEnrichmentService.isInstitutionalDomain(domain)) return true;
+    return false;
   }
 
   /**
@@ -386,6 +566,25 @@ export class CrmEnrichmentService {
       if (result?.success && Array.isArray(result.results) && result.results.length > 0) {
         rawResults = result.results as RawWebResult[];
         webContext = JSON.stringify(rawResults, null, 2);
+
+        // Item #1 — Page-content fetch for top results.
+        // Snippets miss the actual data ~30-50% of the time. Fetch top 2 pages
+        // and append cleaned main text. Gated by env flag for staged rollout.
+        if (process.env.ENRICHMENT_PAGE_FETCH !== '0') {
+          const urls = rawResults.map(r => r.url).filter(u => typeof u === 'string' && /^https?:\/\//i.test(u));
+          if (urls.length > 0) {
+            try {
+              const pages = await fetchTopPages(urls, 2);
+              if (pages.length > 0) {
+                webContext += `\n\nFull page content (top results):\n${pages
+                  .map(p => `--- ${p.title} (${p.url}) ---\n${p.text}`)
+                  .join('\n\n')}`;
+              }
+            } catch (err: any) {
+              console.warn(`[CrmEnrichment] page fetch failed: ${err?.message}`);
+            }
+          }
+        }
       } else if (!result?.success) {
         const msg = result?.error || result?.message || '';
         if (!msg.toLowerCase().includes('no search results found')) {
@@ -439,6 +638,20 @@ export class CrmEnrichmentService {
     const groupTemplate = FIELD_GROUPS[groupName]?.searchTemplate;
     const groupSpec = groupTemplate ? { ...spec, webSearchTemplate: groupTemplate } : spec;
     return this.gatherWebContext(lead, groupSpec, groupFields);
+  }
+
+  /**
+   * For ungrouped fields, the cluster service provides an LLM-generated search
+   * template per ad-hoc cluster. This mirrors gatherWebContextForGroup —
+   * cluster.searchTemplate replaces the canonical group template.
+   */
+  private async gatherWebContextForCluster(
+    lead: LeadRecord,
+    spec: EnrichmentJobSpec,
+    cluster: FieldCluster
+  ): Promise<{ webContext: string; rawResults: RawWebResult[]; linkedinCompanyResults: RawWebResult[] | null; queryUsed: string }> {
+    const clusterSpec = { ...spec, webSearchTemplate: cluster.searchTemplate };
+    return this.gatherWebContext(lead, clusterSpec, cluster.fields);
   }
 
   private async gatherLinkedInContext(
@@ -541,7 +754,7 @@ export class CrmEnrichmentService {
     spec: EnrichmentJobSpec,
     lead: LeadRecord,
     enrichConfig: { enrichmentModel: string; dataExtractionModel: string }
-  ): Promise<Record<string, string | null>> {
+  ): Promise<{ fields: Record<string, string | null>; metadata: Record<string, FieldCitation> }> {
     const resolvedInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
     const { dataExtractionModel } = enrichConfig;
 
@@ -556,32 +769,43 @@ export class CrmEnrichmentService {
     const llmClient = await agentModeService.getClientForModel(dataExtractionModel);
     console.log(`[CrmEnrichment][extractFieldsViaLLM] calling LLM model=${dataExtractionModel} outputFields=${JSON.stringify(spec.outputFields)}`);
     const tLlm = Date.now();
-    let response: Record<string, string> | null = null;
+    let response: Record<string, unknown> | null = null;
 
     try {
-      const completion = await llmClient.chat.completions.create({
-        model: dataExtractionModel,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        response_format: { type: 'json_object' },
-      });
+      const completion = await CrmEnrichmentService.llmCallWithTimeout(
+        (model) => llmClient.chat.completions.create({
+          model,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: { type: 'json_object' },
+        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        dataExtractionModel,
+        'extractFieldsViaLLM:json',
+      );
       const raw = completion.choices?.[0]?.message?.content || '';
       console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
     } catch {
-      const strictRetryPrompt = buildDataExtractionRetryPrompt(userPrompt, spec.outputFields.map(f => `"${f}":"value"`).join(','));
+      const retryExample = spec.outputFields
+        .map(f => `"${f}":{"value":"...","sourceQuote":"...","sourceUrl":"...","confidence":"high"}`)
+        .join(',');
+      const strictRetryPrompt = buildDataExtractionRetryPrompt(userPrompt, retryExample);
 
-      const retry = await llmClient.chat.completions.create({
-        model: dataExtractionModel,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: strictRetryPrompt },
-        ],
-      });
+      const retry = await CrmEnrichmentService.llmCallWithTimeout(
+        (model) => llmClient.chat.completions.create({
+          model,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: strictRetryPrompt },
+          ],
+        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        dataExtractionModel,
+        'extractFieldsViaLLM:plain',
+      );
       const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
@@ -609,30 +833,202 @@ export class CrmEnrichmentService {
     }
 
     const fields: Record<string, string | null> = {};
+    const metadata: Record<string, FieldCitation> = {};
     for (const field of spec.outputFields) {
       const raw = response?.[field];
-      fields[field] = typeof raw === 'string' ? raw.trim() || null : null;
+
+      // Null / missing → null value, no metadata
+      if (raw === null || raw === undefined) {
+        fields[field] = null;
+        continue;
+      }
+
+      // Legacy flat-string format → keep as-is, no metadata (skips citation verification)
+      if (typeof raw === 'string') {
+        fields[field] = raw.trim() || null;
+        continue;
+      }
+
+      // Rich citation format → extract value and metadata
+      if (typeof raw === 'object') {
+        const rich = raw as Record<string, unknown>;
+        const valueRaw = rich.value;
+        // LLM may return value as JSON boolean (true/false), number (50000000), or string.
+        // Coerce to string so downstream consumers (verifyCitations, normalizeFields,
+        // customFields persistence) all work uniformly.
+        let value: string | null;
+        if (valueRaw === null || valueRaw === undefined) {
+          value = null;
+        } else if (typeof valueRaw === 'boolean') {
+          value = valueRaw ? 'true' : 'false';
+        } else if (typeof valueRaw === 'number') {
+          value = String(valueRaw);
+        } else if (typeof valueRaw === 'string') {
+          value = valueRaw.trim() || null;
+        } else {
+          value = null;
+        }
+        fields[field] = value;
+        if (value !== null) {
+          const conf = rich.confidence;
+          metadata[field] = {
+            // Cap the quote at parse time so a hallucinated multi-KB quote
+            // can't (a) bloat in-memory metadata across many parallel leads
+            // or (b) explode verifyCitations' 5-word soft-match window scan.
+            sourceQuote: trimQuote(typeof rich.sourceQuote === 'string' ? rich.sourceQuote : undefined),
+            sourceUrl: typeof rich.sourceUrl === 'string' ? rich.sourceUrl.trim() : undefined,
+            confidence: conf === 'high' || conf === 'medium' || conf === 'low' ? conf : undefined,
+          };
+        }
+        continue;
+      }
+
+      // Anything else (number, boolean, array) — treat as missing
+      fields[field] = null;
     }
-    return fields;
+    return { fields, metadata };
   }
 
-  private validateLinkedInUrls(fields: Record<string, string | null>, webContext: string, linkedinContext: string, outputFields: string[]): Record<string, string | null> {
-    const allContext = (webContext + linkedinContext).toLowerCase();
+  /**
+   * Item #6 — Critic / verifier pass. After extraction + citation verification,
+   * a cheap second LLM pass judges each remaining claim. Unsupported / contradicted
+   * claims are dropped to null. Partially-supported claims have confidence downgraded
+   * to "low" and a `criticVerdict` is recorded in metadata.
+   *
+   * Skipped if no claims have citations (legacy flat-string responses) or if the
+   * env flag ENRICHMENT_CRITIC=0 is set.
+   */
+  private async runCriticPass(
+    fields: Record<string, string | null>,
+    citations: Record<string, FieldCitation>,
+    sourceContext: string,
+    enrichConfig: { dataExtractionModel: string }
+  ): Promise<void> {
+    if (process.env.ENRICHMENT_CRITIC === '0') return;
+
+    const claims: { field: string; value: string; sourceQuote?: string }[] = [];
+    for (const [field, value] of Object.entries(fields)) {
+      if (value == null || value === '') continue;
+      // Only critique claims that have a citation (rich-format extractions). Legacy
+      // flat-string responses lack quotes; nothing for the critic to compare against.
+      const meta = citations[field];
+      if (!meta) continue;
+      claims.push({ field, value, sourceQuote: meta.sourceQuote });
+    }
+    if (claims.length === 0) return;
+
+    try {
+      const llmClient = await agentModeService.getClientForModel(enrichConfig.dataExtractionModel);
+      const completion = await CrmEnrichmentService.llmCallWithTimeout(
+        (model) => llmClient.chat.completions.create({
+          model,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: buildCriticSystemPrompt() },
+            { role: 'user', content: buildCriticUserPrompt(claims, sourceContext) },
+          ],
+          response_format: { type: 'json_object' },
+        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        enrichConfig.dataExtractionModel,
+        'criticPass',
+      );
+      const raw = completion.choices?.[0]?.message?.content || '';
+      const parsed = JSON.parse(raw) as Record<string, { verdict?: string; reason?: string }>;
+      for (const c of claims) {
+        const verdict = parsed[c.field]?.verdict;
+        if (!verdict) continue;
+        // Mutate citation entry with verdict for sidecar metadata
+        const cite = citations[c.field] as FieldCitation & { criticVerdict?: string };
+        cite.criticVerdict = verdict as any;
+        // Only DROP when the critic explicitly says the source contradicts the claim.
+        // "unsupported" is too aggressive for SERP snippets — they often lack the literal
+        // value but still corroborate the claim contextually. We keep the value at low
+        // confidence so the user can decide; verifyCitations already filtered out outright
+        // hallucinations via substring matching.
+        if (verdict === 'contradicted') {
+          console.warn(`[CrmEnrichment] Critic dropped "${c.field}"="${c.value}" verdict=contradicted`);
+          fields[c.field] = null;
+        } else if (verdict === 'unsupported' || verdict === 'partially-supported') {
+          if (cite.confidence !== 'low') cite.confidence = 'low';
+        }
+      }
+    } catch (err: any) {
+      // Critic failure is non-fatal — keep extraction results as-is
+      console.warn(`[CrmEnrichment] Critic pass failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * Verify each extracted value is supported by the provided sources.
+   *
+   * Rejection rules (set value to null):
+   *   - Field name contains "linkedin" but value isn't a valid /in/ or /company/ URL
+   *   - LinkedIn URL slug doesn't appear in the source context (defense vs. plausible hallucinations)
+   *   - Rich-format response present but sourceQuote is missing
+   *   - sourceQuote (case-insensitive, whitespace-collapsed) is not a substring of the source context
+   *
+   * Legacy flat-string responses (no metadata entry) bypass citation verification for back-compat.
+   */
+  static verifyCitations(
+    fields: Record<string, string | null>,
+    metadata: Record<string, FieldCitation>,
+    sourceContext: string,
+    outputFields: string[]
+  ): Record<string, string | null> {
+    const normalizedSource = sourceContext.toLowerCase().replace(/\s+/g, ' ').trim();
+
     for (const field of outputFields) {
-      if (!/linkedin/i.test(field)) continue;
       const value = fields[field];
       if (!value) continue;
-      const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
-      if (slugMatch) {
+
+      // LinkedIn URL slug-validation (kept as defense-in-depth alongside citation check)
+      if (/linkedin/i.test(field)) {
+        const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
+        if (!slugMatch) {
+          fields[field] = null;
+          continue;
+        }
         const slug = slugMatch[2].toLowerCase();
-        if (!allContext.includes(slug)) {
+        if (!normalizedSource.includes(slug)) {
           console.warn(`[CrmEnrichment] Rejected hallucinated LinkedIn URL "${value}" for field "${field}" — slug not in source data`);
           fields[field] = null;
+          continue;
         }
-      } else {
+      }
+
+      // Citation verification — only applies to rich-format responses (metadata entry exists)
+      const meta = metadata[field];
+      if (meta === undefined) continue;  // legacy flat-string → keep as-is
+
+      const quote = meta.sourceQuote ? meta.sourceQuote.toLowerCase().replace(/\s+/g, ' ').trim() : '';
+      if (!quote) {
+        console.warn(`[CrmEnrichment] Rejected unsupported claim for field "${field}" — sourceQuote missing`);
         fields[field] = null;
+        continue;
+      }
+      if (!normalizedSource.includes(quote)) {
+        // Soft-match fallback: accept if any 5-consecutive-word window from the quote
+        // appears verbatim in the source. Handles minor LLM rephrasing
+        // (e.g. punctuation changes, dropped articles) without letting hallucinations through.
+        // Defensive cap on the window-scan: trimQuote already enforces ~240 chars at
+        // parse time, but a future caller could still push a long quote through here.
+        const MAX_QUOTE_WORDS_FOR_SOFT_MATCH = 60;
+        const words = quote.split(' ').filter(w => w.length > 0).slice(0, MAX_QUOTE_WORDS_FOR_SOFT_MATCH);
+        let softMatch = false;
+        if (words.length >= 5) {
+          for (let i = 0; i + 5 <= words.length; i++) {
+            const window = words.slice(i, i + 5).join(' ');
+            if (normalizedSource.includes(window)) { softMatch = true; break; }
+          }
+        }
+        if (!softMatch) {
+          console.warn(`[CrmEnrichment] Rejected unsupported claim for field "${field}" — quote not found in source: "${meta.sourceQuote}"`);
+          fields[field] = null;
+          continue;
+        }
       }
     }
+
     return fields;
   }
 
@@ -641,7 +1037,11 @@ export class CrmEnrichmentService {
     spec: EnrichmentJobSpec,
     linkedInAccountId?: string | null,
     enrichConfig?: { enrichmentModel: string; dataExtractionModel: string }
-  ): Promise<{ fields: Record<string, string | null> }> {
+  ): Promise<{
+    fields: Record<string, string | null>;
+    metadata: Record<string, FieldCitation>;
+    normalized: Record<string, Normalized>;
+  }> {
     const t0 = Date.now();
     if (!enrichConfig) {
       enrichConfig = await CrmEnrichmentService.getEnrichmentConfig();
@@ -654,17 +1054,45 @@ export class CrmEnrichmentService {
     const webSearchFields = spec.outputFields.filter(f => effectiveSources(f).includes('web_search'));
     console.log(`[CrmEnrichment][enrichLead] lead=${lead.leadId} webSearchFields=${webSearchFields.length} linkedinFields=${linkedinFields.length} isEnrichingLinkedin=${isEnrichingLinkedin}`);
 
+    // ── Specialists (item #7) ────────────────────────────────────────────
+    // Field-specific resolvers (e.g., Crunchbase for funding_round) run BEFORE
+    // the LLM. Resolved values are removed from the LLM job to avoid duplicate
+    // work; their source contexts are appended to combinedSource so the
+    // pipeline's citation-verification step can still validate them.
+    const specialistOut = await runSpecialists(spec.outputFields, lead, {
+      userId: spec.userId,
+      linkedInAccountId: linkedInAccountId ?? null,
+    });
+    const specialistFields = specialistOut.resolvedFields;
+    const specialistMeta = specialistOut.resolvedMeta;
+    const specialistSourceContexts = specialistOut.sourceContexts;
+    const fieldsForLLM = spec.outputFields.filter(f => !(f in specialistFields));
+    if (Object.keys(specialistFields).length > 0) {
+      console.log(`[CrmEnrichment][enrichLead] specialists resolved ${Object.keys(specialistFields).length} fields lead=${lead.leadId}: ${Object.keys(specialistFields).join(',')}`);
+    }
+    if (specialistOut.failures.length > 0) {
+      // Non-fatal: LLM-extraction path still runs for these fields. Logged as
+      // structured warnings so an operator can see *why* a value fell back.
+      for (const f of specialistOut.failures) {
+        console.warn(`[CrmEnrichment][enrichLead] specialist ${f.label} failed for ${f.field} (lead=${lead.leadId}): ${f.message}`);
+      }
+    }
+
+    // Recompute effective field lists against the LLM-eligible set
+    const llmLinkedinFields = linkedinFields.filter(f => fieldsForLLM.includes(f));
+    const llmWebSearchFields = webSearchFields.filter(f => fieldsForLLM.includes(f));
+
     const forceRefreshCache = spec.forceRefreshCache ?? false;
 
-    // ── Web context (per-group cache-aware) ───────────────────────────────
-    // Each field is mapped to its FIELD_GROUP. Groups are checked independently
-    // so a 2-group job (e.g. firmographic + financial) still benefits from
-    // cache hits on individual groups. Ungrouped fields use the legacy single-
-    // query path. Results from all groups are concatenated into one webContext.
-    let webContext = '';
-    if (webSearchFields.length > 0) {
-      const { byGroup, ungrouped } = splitFieldsByGroup(webSearchFields);
-      const webContextParts: string[] = [];
+    // ── Build extraction units ────────────────────────────────────────────
+    // Each unit becomes one focused LLM call with only the context that field
+    // group needs. Groups are independent (cache hit/miss + extraction), so
+    // a 2-group job runs 2 parallel LLM calls instead of one mega-call.
+    type Unit = { webContext: string; linkedinContext: string; fields: string[]; label: string };
+    const units: Unit[] = [];
+
+    if (llmWebSearchFields.length > 0) {
+      const { byGroup, ungrouped } = splitFieldsByGroup(llmWebSearchFields, { aliases: spec.fieldAliases });
 
       for (const [groupName, groupFields] of byGroup) {
         const hasCompanyLinkedinField = groupFields.some(f =>
@@ -672,15 +1100,15 @@ export class CrmEnrichmentService {
         );
         const cachedData = await getRawDataFromCache(lead, groupName, forceRefreshCache);
 
+        let groupCtx = '';
         if (cachedData) {
           console.log(`[CrmEnrichment][enrichLead] web cache HIT group=${groupName} lead=${lead.leadId}`);
-          const ctx = buildWebContextFromCache(cachedData, hasCompanyLinkedinField);
-          if (ctx) webContextParts.push(ctx);
+          groupCtx = buildWebContextFromCache(cachedData, hasCompanyLinkedinField);
         } else {
           console.log(`[CrmEnrichment][enrichLead] web cache MISS group=${groupName} lead=${lead.leadId}, fetching`);
           const { webContext: ctx, rawResults, linkedinCompanyResults, queryUsed } =
             await this.gatherWebContextForGroup(lead, spec, groupName, groupFields);
-          if (ctx) webContextParts.push(ctx);
+          groupCtx = ctx;
           console.log(`[CrmEnrichment][enrichLead] gatherWebContextForGroup DONE group=${groupName} lead=${lead.leadId} results=${rawResults.length} elapsed=${Date.now()-t0}ms`);
 
           if (rawResults.length > 0) {
@@ -690,36 +1118,72 @@ export class CrmEnrichmentService {
             );
           }
         }
+
+        units.push({ webContext: groupCtx, linkedinContext: '', fields: groupFields, label: `web:${groupName}` });
       }
 
       if (ungrouped.length > 0) {
-        console.log(`[CrmEnrichment][enrichLead] ungrouped fields=${ungrouped} lead=${lead.leadId}, using legacy gatherWebContext`);
-        const { webContext: ctx } = await this.gatherWebContext(lead, spec, ungrouped);
-        if (ctx) webContextParts.push(ctx);
+        // Backward compat: if the caller explicitly provided a webSearchTemplate
+        // (older API clients, existing tests), use the legacy single-search path.
+        // New callers (UI, Emma) drop the template and get cluster-based dispatch.
+        if (spec.webSearchTemplate && spec.webSearchTemplate.trim().length > 0) {
+          console.log(`[CrmEnrichment][enrichLead] ungrouped fields=${ungrouped} lead=${lead.leadId}, using caller-provided webSearchTemplate (legacy path)`);
+          const { webContext: ctx } = await this.gatherWebContext(lead, spec, ungrouped);
+          units.push({ webContext: ctx, linkedinContext: '', fields: ungrouped, label: 'web:ungrouped-legacy' });
+        } else {
+          // Cluster ungrouped fields via the LLM-curated cluster service. Each
+          // cluster gets its own search query — like an ad-hoc canonical group —
+          // and bundles related fields together. Persisted per list so this
+          // LLM call only fires once per (list, novel-field-set).
+          const emailDomainForCtx = lead.email
+            ? (CrmEnrichmentService.isPersonalEmailDomain(lead.email) ? '' : (String(lead.email).split('@')[1] || ''))
+            : '';
+          try {
+            const clusterResult = await getOrCreateClustersForFields(
+              spec.listId,
+              ungrouped,
+              spec.fieldDescriptions || {},
+              { company: lead.company, emailDomain: emailDomainForCtx },
+            );
+            if (clusterResult.newlyCreated.length > 0) {
+              console.log(`[CrmEnrichment][enrichLead] LLM-clustered ungrouped fields lead=${lead.leadId}: ${JSON.stringify(clusterResult.newlyCreated.map(c => ({ fields: c.fields, q: c.searchTemplate })))}`);
+            }
+            for (const cluster of clusterResult.clusters) {
+              const { webContext: ctx } = await this.gatherWebContextForCluster(lead, spec, cluster);
+              units.push({
+                webContext: ctx,
+                linkedinContext: '',
+                fields: cluster.fields,
+                label: `cluster:${cluster.fields.slice(0, 2).join('+')}`,
+              });
+            }
+          } catch (err: any) {
+            // Defense-in-depth: if clustering throws, fall back to single legacy search
+            console.warn(`[CrmEnrichment][enrichLead] cluster service failed lead=${lead.leadId}: ${err?.message}`);
+            const { webContext: ctx } = await this.gatherWebContext(lead, spec, ungrouped);
+            units.push({ webContext: ctx, linkedinContext: '', fields: ungrouped, label: 'web:ungrouped-fallback' });
+          }
+        }
       }
-
-      webContext = webContextParts.join('\n\n');
     }
 
-    // ── LinkedIn context (cache-aware) ────────────────────────────────────
-    // Cache is keyed per person email. Only eligible when all linkedin fields
-    // belong to person_identity group.
-    let linkedinContext = '';
-    if (linkedinFields.length > 0 && linkedInAccountId) {
-      const linkedinCacheEligible = isLinkedInCacheEligible(linkedinFields);
+    // ── LinkedIn unit (cache-aware) ────────────────────────────────────────
+    if (llmLinkedinFields.length > 0 && linkedInAccountId) {
+      const linkedinCacheEligible = isLinkedInCacheEligible(llmLinkedinFields);
       const cachedLinkedinData = linkedinCacheEligible
         ? await getRawDataFromCache(lead, 'person_identity', forceRefreshCache)
         : null;
 
+      let linkedinCtx = '';
       if (cachedLinkedinData?.linkedinData) {
         console.log(`[CrmEnrichment][enrichLead] linkedin cache HIT lead=${lead.leadId}`);
-        linkedinContext = buildLinkedInContextFromCache(cachedLinkedinData, isEnrichingLinkedin);
+        linkedinCtx = buildLinkedInContextFromCache(cachedLinkedinData, isEnrichingLinkedin);
       } else {
         console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext START lead=${lead.leadId}`);
         const { linkedinContext: ctx, rawProfile, publicIdentifier, profileId } =
           await this.gatherLinkedInContext(lead, spec, linkedInAccountId, isEnrichingLinkedin);
-        linkedinContext = ctx;
-        console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinContext.length} elapsed=${Date.now()-t0}ms`);
+        linkedinCtx = ctx;
+        console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinCtx.length} elapsed=${Date.now()-t0}ms`);
 
         if (linkedinCacheEligible && rawProfile) {
           const rawCacheData: RawCacheData = {
@@ -737,24 +1201,180 @@ export class CrmEnrichmentService {
           );
         }
       }
+
+      // If we're enriching a LinkedIn URL, surface candidate URLs scraped from web results
+      // so the LinkedIn extraction unit can copy them verbatim instead of hallucinating.
+      if (isEnrichingLinkedin) {
+        const combinedWebForUrlHint = units.filter(u => u.webContext).map(u => u.webContext).join('\n\n');
+        if (combinedWebForUrlHint) {
+          const linkedinUrlMatches = combinedWebForUrlHint.match(/https?:\/\/[a-z]{0,3}\.?linkedin\.com\/in\/[^\s"\\]+/gi) || [];
+          if (linkedinUrlMatches.length > 0) {
+            const uniqueUrls = [...new Set(linkedinUrlMatches)];
+            linkedinCtx += `\n\nLinkedIn profile URLs found in search results (use these as candidates):\n${uniqueUrls.join('\n')}`;
+          }
+        }
+      }
+
+      units.push({ webContext: '', linkedinContext: linkedinCtx, fields: llmLinkedinFields, label: 'linkedin' });
+    }
+
+    // Fallback: a job with no LLM-eligible fields after specialists is fine —
+    // we'll skip the LLM dispatch entirely. If there ARE LLM-eligible fields
+    // but no context-bearing units, fall through with an empty-context unit.
+    if (units.length === 0 && fieldsForLLM.length > 0) {
+      units.push({ webContext: '', linkedinContext: '', fields: fieldsForLLM, label: 'no_context' });
     }
 
     const leadContext = this.buildLeadContext(lead, isEnrichingLinkedin);
 
-    if (isEnrichingLinkedin && webContext) {
-      const linkedinUrlMatches = webContext.match(/https?:\/\/[a-z]{0,3}\.?linkedin\.com\/in\/[^\s"\\]+/gi) || [];
-      if (linkedinUrlMatches.length > 0) {
-        const uniqueUrls = [...new Set(linkedinUrlMatches)];
-        webContext += `\n\nLinkedIn profile URLs found in search results (use these as candidates):\n${uniqueUrls.join('\n')}`;
+    console.log(`[CrmEnrichment][enrichLead] dispatching ${units.length} extraction unit(s) lead=${lead.leadId} labels=${units.map(u => u.label).join(',')}`);
+    const extractions = await Promise.all(units.map(unit =>
+      this.extractFieldsViaLLM(
+        leadContext,
+        unit.webContext,
+        unit.linkedinContext,
+        { ...spec, outputFields: unit.fields },
+        lead,
+        enrichConfig!
+      )
+    ));
+
+    // Merge: prefer non-null over null when same field appears in multiple units
+    const fieldsMerged: Record<string, string | null> = {};
+    const citationsMerged: Record<string, FieldCitation> = {};
+    for (const ext of extractions) {
+      for (const [k, v] of Object.entries(ext.fields)) {
+        if (v !== null || !(k in fieldsMerged)) fieldsMerged[k] = v;
+      }
+      for (const [k, m] of Object.entries(ext.metadata)) {
+        if (m && (!citationsMerged[k] || (m.sourceQuote && !citationsMerged[k].sourceQuote))) {
+          citationsMerged[k] = m;
+        }
       }
     }
 
-    console.log(`[CrmEnrichment][enrichLead] extractFieldsViaLLM START lead=${lead.leadId} model=${enrichConfig!.dataExtractionModel}`);
-    let fields = await this.extractFieldsViaLLM(leadContext, webContext, linkedinContext, spec, lead, enrichConfig!);
-    console.log(`[CrmEnrichment][enrichLead] extractFieldsViaLLM DONE lead=${lead.leadId} elapsed=${Date.now()-t0}ms fields=${JSON.stringify(fields)}`);
-    fields = this.validateLinkedInUrls(fields, webContext, linkedinContext, spec.outputFields);
+    // Merge specialist results — they take precedence over LLM if both present
+    // (specialists are higher-confidence by design)
+    for (const [k, v] of Object.entries(specialistFields)) {
+      if (v !== null && v !== undefined) fieldsMerged[k] = v;
+    }
+    for (const [k, m] of Object.entries(specialistMeta)) {
+      citationsMerged[k] = {
+        sourceQuote: (m as any).sourceQuote,
+        sourceUrl: (m as any).sourceUrl,
+        confidence: (m as any).confidence,
+      };
+    }
 
-    return { fields };
+    // ── Targeted re-search (item #4) ──────────────────────────────────────
+    // For each web unit where less than 50% of fields filled, do ONE more search
+    // with field-name keywords appended, then re-extract just the missing fields.
+    // Hard cap: 1 retry per group per lead. Gated by env flag for staged rollout.
+    const sourceContextParts: string[] = [
+      ...units.map(u => u.webContext + u.linkedinContext),
+      ...specialistSourceContexts,  // include specialists' source spans for verification
+    ];
+    if (process.env.ENRICHMENT_TARGETED_RESEARCH !== '0') {
+      const FILL_RATE_THRESHOLD = 0.5;
+      const emailDomainForRetry = lead.email
+        ? (CrmEnrichmentService.isPersonalEmailDomain(lead.email) ? '' : (String(lead.email).split('@')[1] || ''))
+        : '';
+      const companyForRetry = String(lead.company || '').trim();
+      const companyTermForRetry = emailDomainForRetry || companyForRetry;
+
+      for (const unit of units) {
+        if (!unit.label.startsWith('web:')) continue;
+        if (unit.fields.length === 0) continue;
+        const filled = unit.fields.filter(f => fieldsMerged[f] != null && fieldsMerged[f] !== '').length;
+        const fillRate = filled / unit.fields.length;
+        if (fillRate >= FILL_RATE_THRESHOLD) continue;
+
+        const missing = unit.fields.filter(f => fieldsMerged[f] == null || fieldsMerged[f] === '');
+        if (missing.length === 0) continue;
+        if (!companyTermForRetry) continue;
+
+        const targetedQuery = `${companyTermForRetry} ${missing.join(' ').replace(/_/g, ' ')}`.trim();
+        try {
+          const targetedResult = await agentModeService.searchWeb(targetedQuery, 5);
+          if (!targetedResult?.success || !Array.isArray(targetedResult.results) || targetedResult.results.length === 0) continue;
+          const targetedCtx = JSON.stringify(targetedResult.results, null, 2);
+          sourceContextParts.push(targetedCtx);
+
+          const retryExtraction = await this.extractFieldsViaLLM(
+            leadContext, targetedCtx, '',
+            { ...spec, outputFields: missing },
+            lead, enrichConfig!
+          );
+          for (const f of missing) {
+            const v = retryExtraction.fields[f];
+            if (v != null && v !== '') {
+              fieldsMerged[f] = v;
+              const m = retryExtraction.metadata[f];
+              if (m) citationsMerged[f] = m;
+            }
+          }
+        } catch (err: any) {
+          console.warn(`[CrmEnrichment] Targeted re-search failed group=${unit.label} lead=${lead.leadId}: ${err?.message}`);
+        }
+      }
+    }
+
+    // Verify against the union of all sources — a quote may originate in any unit's context.
+    // The lead's own context (existing customFields, name, email) is also a valid source —
+    // the LLM sees it in the user prompt, so it can legitimately cite from it. Without
+    // including it here, "city_orig: San Francisco" type quotes get false-rejected.
+    const leadContextStr = JSON.stringify(leadContext);
+    const combinedSource = leadContextStr + '\n\n' + sourceContextParts.join('\n\n');
+    let fields = CrmEnrichmentService.verifyCitations(fieldsMerged, citationsMerged, combinedSource, spec.outputFields);
+
+    // Critic / verifier pass (item #6) — drops unsupported claims, downgrades partial ones
+    await this.runCriticPass(fields, citationsMerged, combinedSource, enrichConfig!);
+
+    console.log(`[CrmEnrichment][enrichLead] extractFieldsViaLLM DONE lead=${lead.leadId} elapsed=${Date.now()-t0}ms fields=${JSON.stringify(fields)}`);
+
+    // Normalize recognized fields (funding_stage, employee_count, etc.) into canonical/typed forms
+    const normalizationResult = normalizeFields(fields);
+    fields = normalizationResult.fields;
+    return { fields, metadata: citationsMerged, normalized: normalizationResult.normalized };
+  }
+
+  /**
+   * For each non-null enriched field, build a sidecar EnrichedFieldMeta record.
+   * Standard fields get metadata too — UI joins by field name regardless of standard/custom.
+   */
+  private static buildEnrichmentMetadata(
+    fields: Record<string, string | null>,
+    citations: Record<string, FieldCitation>,
+    normalized: Record<string, Normalized>,
+    spec: EnrichmentJobSpec,
+    jobId: string,
+    enrichedAt: string
+  ): Record<string, EnrichedFieldMeta> {
+    const out: Record<string, EnrichedFieldMeta> = {};
+    for (const [field, value] of Object.entries(fields)) {
+      if (value === null || value === undefined || value === '') continue;
+      // Pick a primary source: per-field override > linkedin in name > web_search default
+      const perField = spec.sourcesPerField?.[field];
+      const sources = perField && perField.length > 0 ? perField : spec.sources;
+      const primarySource: EnrichedFieldMeta['source'] =
+        sources.includes('linkedin') && /linkedin/i.test(field) ? 'linkedin'
+        : sources.includes('web_search') ? 'web_search'
+        : sources.includes('linkedin') ? 'linkedin'
+        : sources.includes('existing_data') ? 'existing_data'
+        : 'web_search';
+      const citation = citations[field];
+      out[field] = {
+        source: primarySource,
+        sourceUrl: citation?.sourceUrl,
+        sourceQuote: trimQuote(citation?.sourceQuote),
+        confidence: citation?.confidence,
+        enrichedAt,
+        enrichedJobId: jobId,
+        normalized: normalized[field] ?? undefined,
+        criticVerdict: citation?.criticVerdict,
+      };
+    }
+    return out;
   }
 
   // Map of output field name patterns to standard lead field names
@@ -820,6 +1440,14 @@ export class CrmEnrichmentService {
     console.log(`[CrmEnrichment][preview] loadAndFilterLeads done: allLeads=${allLeads.length} leadsToProcess=${leadsToProcess.length} alreadyEnriched=${alreadyEnriched} elapsed=${Date.now()-t0}ms`);
 
     spec = this.mergeStoredConfig(spec, { storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate });
+
+    // Resolve user-named fields to canonical FIELD_GROUPS names. Once. Cached
+    // per list. See enrichmentFieldAliasService.
+    const aliasResult = await resolveFieldAliases(spec.listId, spec.outputFields);
+    spec = { ...spec, fieldAliases: aliasResult.effectiveMap };
+    if (Object.keys(aliasResult.newlyResolved).length > 0) {
+      console.log(`[CrmEnrichment][preview] LLM-resolved new aliases: ${JSON.stringify(aliasResult.newlyResolved)}`);
+    }
 
     // Process up to 2 samples
     const samples: EnrichmentPreviewResult['samples'] = [];
@@ -888,6 +1516,15 @@ export class CrmEnrichmentService {
 
     spec = this.mergeStoredConfig(spec, { storedSourcesPerField, storedWebSearchTemplate, storedLinkedinSearchTemplate });
 
+    // Resolve user-named fields to canonical FIELD_GROUPS names. Once per job.
+    // Persisted per list — subsequent jobs hit the cache without an LLM call.
+    const aliasResult = await resolveFieldAliases(spec.listId, spec.outputFields);
+    spec = { ...spec, fieldAliases: aliasResult.effectiveMap };
+    if (Object.keys(aliasResult.newlyResolved).length > 0) {
+      console.log(`[CrmEnrichment][execute] LLM-resolved new aliases: ${JSON.stringify(aliasResult.newlyResolved)}`);
+      warnings.push(`Mapped fields via LLM: ${Object.entries(aliasResult.newlyResolved).map(([k, v]) => `${k}→${v}`).join(', ')}`);
+    }
+
     if (leadsToProcess.length === 0) {
       return {
         jobId,
@@ -948,14 +1585,17 @@ export class CrmEnrichmentService {
       llmOrParseFailed: 0,
       updateFailed: 0,
     };
+    const failureRecords: Array<{ leadId: string; email?: string; step: string; message: string }> = [];
 
     emitProgress('Starting enrichment...', 0, 0, 0);
 
+    const enrichedAt = new Date().toISOString();
     const chunkProcessors = chunks.map(async (chunk) => {
       for (const lead of chunk) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
+          const { fields, metadata: citations, normalized } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
           const { standardUpdates, customUpdates } = CrmEnrichmentService.splitFields(fields);
+          const fieldMeta = CrmEnrichmentService.buildEnrichmentMetadata(fields, citations, normalized, spec, jobId, enrichedAt);
 
           // Snapshot previous values before overwriting
           const previousStandardFields = CrmEnrichmentService.pickMappedStandardFields(lead, standardUpdates);
@@ -970,12 +1610,22 @@ export class CrmEnrichmentService {
             console.error('[CrmEnrichment] Failed to write snapshot:', err);
           }
 
+          // Build merged enrichmentMetadata. When a field is cleared (customUpdates[k] is
+          // null/empty after a forced re-enrichment that found nothing), drop the prior
+          // metadata entry too — otherwise UI shows "—" with stale source/quote attached.
+          const mergedMeta: Record<string, EnrichedFieldMeta> = { ...((lead as any).enrichmentMetadata || {}) };
+          for (const [k, v] of Object.entries(customUpdates)) {
+            if (v === null || v === undefined || v === '') delete mergedMeta[k];
+          }
+          Object.assign(mergedMeta, fieldMeta);
+
           await crmDb.updateLead(spec.listId, lead.leadId, {
             ...standardUpdates,
             customFields: {
               ...(lead.customFields || {}),
               ...customUpdates,
             },
+            enrichmentMetadata: mergedMeta,
           });
 
           counters.processed++;
@@ -995,6 +1645,15 @@ export class CrmEnrichmentService {
               failureBreakdown.llmOrParseFailed++;
             }
             counters.failed++;
+            // Capture per-lead failure for the history dialog (item #11). Cap at 50 stored.
+            if (failureRecords.length < 50) {
+              failureRecords.push({
+                leadId: lead?.leadId,
+                email: lead?.email,
+                step,
+                message: String(error?.message || error).slice(0, 300),
+              });
+            }
             console.error(`[CrmEnrichment] Failed to enrich lead ${lead?.leadId}:`, error);
           }
         }
@@ -1012,7 +1671,7 @@ export class CrmEnrichmentService {
 
     await Promise.all(chunkProcessors);
 
-    // Persist enrichment job metadata for history/revert
+    // Persist enrichment job metadata for history/revert (item #11 — failures included)
     if (counters.processed > 0 || counters.failed > 0) {
       Promise.resolve(crmDb.createEnrichmentJobMeta({
         jobId,
@@ -1023,6 +1682,8 @@ export class CrmEnrichmentService {
         status: 'completed',
         expiresAt: jobExpiresAt,
         processedCount: counters.processed,
+        failureBreakdown,
+        failures: failureRecords,
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
     }
 
@@ -1084,10 +1745,13 @@ export class CrmEnrichmentService {
   ): Promise<{
     instruction: string;
     outputFields: string[];
+    /** Deprecated. Cluster service now produces per-cluster search templates;
+     *  this remains in the response shape only as a legacy fallback (always ''). */
     webSearchTemplate: string;
     linkedinSearchTemplate: string;
     sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>;
     sources: ('web_search' | 'linkedin' | 'existing_data')[];
+    fieldDescriptions: Record<string, string>;
   }> {
     const { enrichmentModel } = await CrmEnrichmentService.getEnrichmentConfig();
 
@@ -1118,6 +1782,7 @@ export class CrmEnrichmentService {
       linkedinSearchTemplate: '' as string,
       sourcesPerField: {} as Record<string, ('web_search' | 'linkedin' | 'existing_data')[]>,
       sources: ['web_search'] as ('web_search' | 'linkedin' | 'existing_data')[],
+      fieldDescriptions: {} as Record<string, string>,
     };
 
     let raw = '';
@@ -1179,6 +1844,8 @@ export class CrmEnrichmentService {
           .filter(Boolean)
       : [];
 
+    // Legacy: kept in the response for backward compat but no longer authored
+    // by the LLM. New ungrouped fields use fieldDescriptions + cluster service.
     const webSearchTemplate: string =
       typeof parsed.webSearchTemplate === 'string' && parsed.webSearchTemplate.trim()
         ? parsed.webSearchTemplate.trim()
@@ -1188,6 +1855,17 @@ export class CrmEnrichmentService {
       typeof parsed.linkedinSearchTemplate === 'string' && parsed.linkedinSearchTemplate.trim()
         ? parsed.linkedinSearchTemplate.trim()
         : '';
+
+    // Per-field 1-line descriptions for ungrouped/niche fields. Trimmed,
+    // non-empty, capped at 300 chars to match validateFieldDescriptions.
+    const fieldDescriptions: Record<string, string> =
+      parsed.fieldDescriptions && typeof parsed.fieldDescriptions === 'object' && !Array.isArray(parsed.fieldDescriptions)
+        ? Object.fromEntries(
+            Object.entries(parsed.fieldDescriptions)
+              .filter(([k, v]) => typeof k === 'string' && typeof v === 'string' && (v as string).trim().length > 0)
+              .map(([k, v]) => [k, (v as string).trim().slice(0, 300)])
+          )
+        : {};
 
     const validSources = new Set(['web_search', 'linkedin', 'existing_data']);
 
@@ -1225,6 +1903,7 @@ export class CrmEnrichmentService {
       linkedinSearchTemplate,
       sourcesPerField,
       sources,
+      fieldDescriptions,
     };
 
     // Auto-save config to the list
@@ -1239,6 +1918,7 @@ export class CrmEnrichmentService {
           result.webSearchTemplate || undefined,
           result.linkedinSearchTemplate || undefined,
           result.sources.length > 0 ? result.sources : undefined,
+          Object.keys(result.fieldDescriptions).length > 0 ? result.fieldDescriptions : undefined,
         );
       } catch (err) {
         console.warn('[CrmEnrichment] suggestEnrichment: failed to save config to list:', err);

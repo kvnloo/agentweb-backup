@@ -267,6 +267,46 @@ describe('splitFieldsByGroup', () => {
     expect(fg).toContain('founded_year');
     expect(byGroup.size).toBe(1);
   });
+
+  // ── alias resolution (Tier 1/2/3 from enrichmentFieldAliasService) ────────
+
+  it('routes a user field via alias map to its canonical group', () => {
+    // funding_round → funding_stage (financial)
+    const { byGroup, ungrouped } = splitFieldsByGroup(
+      ['funding_round'],
+      { aliases: { funding_round: 'funding_stage' } },
+    );
+    expect(byGroup.get('company_financial')).toEqual(['funding_round']);
+    expect(ungrouped).toHaveLength(0);
+  });
+
+  it('keeps the user-facing field name in the group bucket (not the canonical)', () => {
+    // The LLM extraction prompt + customFields persistence both use the user name.
+    const { byGroup } = splitFieldsByGroup(
+      ['my_overview'],
+      { aliases: { my_overview: 'company_description' } },
+    );
+    expect(byGroup.get('company_firmographic')).toEqual(['my_overview']);
+  });
+
+  it('falls through to ungrouped when alias points to a non-existent canonical', () => {
+    const { byGroup, ungrouped } = splitFieldsByGroup(
+      ['my_field'],
+      { aliases: { my_field: 'made_up_canonical' } },
+    );
+    expect(byGroup.size).toBe(0);
+    expect(ungrouped).toEqual(['my_field']);
+  });
+
+  it('mixes alias-resolved + canonical + unknown fields correctly', () => {
+    const { byGroup, ungrouped } = splitFieldsByGroup(
+      ['funding_round', 'industry', 'random_thing'],
+      { aliases: { funding_round: 'funding_stage' } },
+    );
+    expect(byGroup.get('company_financial')).toEqual(['funding_round']);
+    expect(byGroup.get('company_firmographic')).toEqual(['industry']);
+    expect(ungrouped).toEqual(['random_thing']);
+  });
 });
 
 // ─── buildLinkedInContextFromCache ───────────────────────────────────────────

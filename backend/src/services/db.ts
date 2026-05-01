@@ -3658,6 +3658,15 @@ export const crmDb = {
         externalPeopleListId?: string; // Attio people list ID
         externalCompaniesListId?: string; // Attio companies list ID
       } | null;
+      /** Persisted user-field-name → canonical FIELD_GROUPS field-name map.
+       * Populated lazily by the enrichment alias resolver — once we map
+       * 'funding_round' → 'funding_stage' for a list, never re-prompt the LLM. */
+      fieldCanonicalMap?: Record<string, string>;
+      /** LLM-curated clusters of ungrouped fields with their per-cluster search
+       * template. Each cluster behaves like an ad-hoc canonical group: one
+       * search query covers multiple related ungrouped fields. Populated by
+       * enrichmentClusterService at suggest/execute time. */
+      ungroupedClusters?: Array<{ fields: string[]; searchTemplate: string }>;
     }
   ) {
     try {
@@ -3765,6 +3774,18 @@ export const crmDb = {
         expressionAttributeNames['#syncConfig'] = 'syncConfig';
         updateExpressions.push('#syncConfig = :syncConfig');
         expressionAttributeValues[':syncConfig'] = updates.syncConfig;
+      }
+
+      if (updates.fieldCanonicalMap !== undefined) {
+        expressionAttributeNames['#fieldCanonicalMap'] = 'fieldCanonicalMap';
+        updateExpressions.push('#fieldCanonicalMap = :fieldCanonicalMap');
+        expressionAttributeValues[':fieldCanonicalMap'] = updates.fieldCanonicalMap;
+      }
+
+      if (updates.ungroupedClusters !== undefined) {
+        expressionAttributeNames['#ungroupedClusters'] = 'ungroupedClusters';
+        updateExpressions.push('#ungroupedClusters = :ungroupedClusters');
+        expressionAttributeValues[':ungroupedClusters'] = updates.ungroupedClusters;
       }
 
       if (updateExpressions.length === 0) {
@@ -3973,6 +3994,7 @@ export const crmDb = {
     webSearchTemplate?: string,
     linkedinSearchTemplate?: string,
     enrichSources?: string[],
+    fieldDescriptions?: Record<string, string>,
   ) {
     try {
       const expressionParts = ['searchQueryTemplates = :templates', 'updatedAt = :updatedAt'];
@@ -4009,6 +4031,11 @@ export const crmDb = {
       if (enrichSources !== undefined) {
         expressionParts.push('enrichSources = :enrichSources');
         expressionAttributeValues[':enrichSources'] = enrichSources;
+      }
+
+      if (fieldDescriptions !== undefined) {
+        expressionParts.push('fieldDescriptions = :fieldDescriptions');
+        expressionAttributeValues[':fieldDescriptions'] = fieldDescriptions;
       }
 
       const params = {
@@ -4464,6 +4491,8 @@ export const crmDb = {
     contactStatusUpdatedBy?: string;
     accountOwnerUserId?: string | null;
     syncMetadata?: Record<string, any>;
+    /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
+    enrichmentMetadata?: Record<string, any>;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4531,6 +4560,11 @@ export const crmDb = {
       if (updates.customFields !== undefined) {
         setExpressions.push('customFields = :customFields');
         expressionAttributeValues[':customFields'] = updates.customFields;
+      }
+
+      if (updates.enrichmentMetadata !== undefined) {
+        setExpressions.push('enrichmentMetadata = :enrichmentMetadata');
+        expressionAttributeValues[':enrichmentMetadata'] = updates.enrichmentMetadata;
       }
 
       if (updates.selectedSenderId !== undefined) {
@@ -4705,7 +4739,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -4905,7 +4939,7 @@ export const crmDb = {
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
 
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
 
       // Extract from new leads
       newLeads.forEach(lead => {
@@ -5605,21 +5639,31 @@ export const crmDb = {
     status: 'completed' | 'undone';
     expiresAt: number;
     processedCount: number;
+    /** Aggregate counts per failure step (search/linkedin/llm/update). Item #11. */
+    failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
+    /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
+    failures?: Array<{ leadId: string; email?: string; step: string; message: string }>;
   }): Promise<void> {
     try {
+      const item: any = {
+        jobId: meta.jobId,
+        leadId: '_meta',
+        listId: meta.listId,
+        userId: meta.userId,
+        outputFields: meta.outputFields,
+        createdAt: meta.createdAt,
+        status: meta.status,
+        expiresAt: meta.expiresAt,
+        processedCount: meta.processedCount,
+      };
+      if (meta.failureBreakdown) item.failureBreakdown = meta.failureBreakdown;
+      if (meta.failures && meta.failures.length > 0) {
+        // Cap to 50 entries to stay well under DynamoDB's 400KB row limit
+        item.failures = meta.failures.slice(0, 50);
+      }
       await dynamodb.put({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
-        Item: {
-          jobId: meta.jobId,
-          leadId: '_meta',
-          listId: meta.listId,
-          userId: meta.userId,
-          outputFields: meta.outputFields,
-          createdAt: meta.createdAt,
-          status: meta.status,
-          expiresAt: meta.expiresAt,
-          processedCount: meta.processedCount,
-        },
+        Item: item,
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'createEnrichmentJobMeta');

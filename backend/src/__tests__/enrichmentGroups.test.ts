@@ -169,14 +169,54 @@ describe('FIELD_GROUPS', () => {
   });
 
   it('company groups use company entityType', () => {
-    const companyGroups = ['company_firmographic', 'company_financial', 'company_technographic', 'company_social', 'intent_signals'];
+    const companyGroups = [
+      'company_firmographic', 'company_financial', 'company_technographic',
+      'company_social', 'intent_signals', 'company_geography', 'company_product',
+    ];
     for (const name of companyGroups) {
       expect(FIELD_GROUPS[name]?.entityType).toBe('company');
     }
   });
 
-  it('person_identity uses person entityType', () => {
+  it('person groups (identity + career) use person entityType', () => {
     expect(FIELD_GROUPS.person_identity?.entityType).toBe('person');
+    expect(FIELD_GROUPS.person_career?.entityType).toBe('person');
+  });
+
+  it('company_geography contains expected fields with appropriate search', () => {
+    const g = FIELD_GROUPS.company_geography;
+    expect(g.fields).toEqual(expect.arrayContaining(['country', 'region', 'time_zone', 'all_office_locations', 'hq_address']));
+    expect(g.searchTemplate).toContain('headquarters');
+    expect(g.ttlDays).toBeGreaterThanOrEqual(90);  // geography is stable
+  });
+
+  it('company_product contains expected fields with appropriate search', () => {
+    const g = FIELD_GROUPS.company_product;
+    expect(g.fields).toEqual(expect.arrayContaining(['product_categories', 'pricing_model', 'target_market', 'primary_offerings', 'customer_logos']));
+    expect(g.searchTemplate).toContain('products');
+    // Product info changes more often than firmographics — shorter TTL is fine
+    expect(g.ttlDays).toBeLessThanOrEqual(180);
+  });
+
+  it('person_career contains expected fields and uses linkedin as a source', () => {
+    const g = FIELD_GROUPS.person_career;
+    expect(g.fields).toEqual(expect.arrayContaining(['tenure_at_company', 'prior_companies', 'education', 'recent_role_change_date', 'years_experience']));
+    expect(g.sources).toContain('linkedin');
+    expect(g.searchTemplate).toContain('career');
+  });
+
+  it('all groups have unique field names — no field appears in two groups', () => {
+    // Cache keys are derived from group; if a field appeared in two groups the
+    // first-match-wins behavior of splitFieldsByGroup would silently mis-route it.
+    const seen = new Map<string, string>();
+    for (const [groupName, config] of Object.entries(FIELD_GROUPS)) {
+      for (const f of config.fields) {
+        if (seen.has(f)) {
+          throw new Error(`Field "${f}" appears in both "${seen.get(f)}" and "${groupName}"`);
+        }
+        seen.set(f, groupName);
+      }
+    }
   });
 
   it('company_firmographic includes company_linkedin_url', () => {

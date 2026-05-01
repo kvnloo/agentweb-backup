@@ -5181,8 +5181,10 @@ After showing the preview, ask the user to confirm before calling enrich_leads_e
 Field and source guidance:
 - output_fields: one snake_case field per distinct data point. Numeric values (dates, counts, amounts), categorical values (industry, funding stage), URLs (linkedin_url), and prose summaries (company_profile) each get their own field. When a prose request names sub-items ("profile describing industry, employee count, products"), create the prose field PLUS a separate field for each named item.
 - sources_per_field: map each field to its source. Use "web_search" for company info, funding, tech stack, company LinkedIn URL. Use "linkedin" ONLY for the lead's personal LinkedIn profile (field name: linkedin_url). Use "existing_data" for fields derivable from existing lead data.
-- web_search_template: ONE search query covering all web_search fields. Uses {{placeholder}} tokens ({{company}}, {{firstName}}, {{lastName}}, {{title}}). Example: "{{company}} company overview industry employees funding".
-- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.`,
+- field_descriptions: short natural-language description of each output field (what to find / where it lives). Required for any field that isn't a well-known canonical field — these descriptions guide the per-field web search. Common fields like industry, funding_stage, employee_count are auto-grouped and don't need a description; uncommon or domain-specific fields do (e.g. {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds"}).
+- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.
+
+Search queries are now built automatically per field group — do not pass a single global query template.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5212,9 +5214,10 @@ Field and source guidance:
           },
           description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search". Falls back to job-level sources when absent for a field.'
         },
-        web_search_template: {
-          type: 'string',
-          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}. Example: "{{company}} company overview industry employees funding". Keep concise (4-8 words after substitution).'
+        field_descriptions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for fields that are not well-known canonical fields. Used by the clustering service to build per-field web searches. Example: {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds", "ideal_customer_profile": "type of customer the company sells to"}'
         },
         linkedin_search_template: {
           type: 'string',
@@ -5258,8 +5261,8 @@ Field and source guidance:
       outputFields: args.output_fields,
       sources: args.sources,
       sourcesPerField: args.sources_per_field,
-      webSearchTemplate: args.web_search_template,
       linkedinSearchTemplate: args.linkedin_search_template,
+      fieldDescriptions: args.field_descriptions,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
       forceRefreshCache: args.force_refresh_cache,
@@ -5277,7 +5280,7 @@ Progress updates are sent via Socket.IO in real-time. This call blocks until the
 
 Call enrich_leads_preview first to show the user what will happen before executing.
 
-Pass the same output_fields, sources_per_field, web_search_template, and linkedin_search_template used in the preview call.`,
+Pass the same output_fields, sources_per_field, field_descriptions, and linkedin_search_template used in the preview call.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5307,9 +5310,10 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
           },
           description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search".'
         },
-        web_search_template: {
-          type: 'string',
-          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}.'
+        field_descriptions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for non-canonical fields. Used by the clustering service to build per-field web searches.'
         },
         linkedin_search_template: {
           type: 'string',
@@ -5353,8 +5357,8 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
       outputFields: args.output_fields,
       sources: args.sources,
       sourcesPerField: args.sources_per_field,
-      webSearchTemplate: args.web_search_template,
       linkedinSearchTemplate: args.linkedin_search_template,
+      fieldDescriptions: args.field_descriptions,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
       forceRefreshCache: args.force_refresh_cache,
@@ -5425,6 +5429,12 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
         return `- ${p.field_name}${type}: ${p.prompt}`;
       })
       .join('\n');
+    // Pass per-field prompts to the cluster service as field descriptions so
+    // any ungrouped fields get a search query tuned to what we're looking for.
+    const fieldDescriptions: Record<string, string> = {};
+    for (const p of prompts) {
+      if (p.field_name && p.prompt) fieldDescriptions[p.field_name] = p.prompt;
+    }
     const sources = Array.isArray(args.sources) && args.sources.length > 0
       ? args.sources
       : ['web_search', 'linkedin'];
@@ -5439,6 +5449,7 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
       outputFields,
       sources,
       leadIds: [args.lead_id],
+      fieldDescriptions,
       forceOverwrite: args.force_overwrite !== false,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
 

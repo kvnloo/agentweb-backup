@@ -109,6 +109,30 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
     ttlDays: 30,  // signals go stale faster than facts
   },
 
+  company_geography: {
+    entityType: 'company',
+    version: 1,
+    fields: [
+      'country', 'region', 'time_zone',
+      'all_office_locations', 'hq_address',
+    ],
+    sources: ['web_search'],
+    searchTemplate: '{{emailDomain}} headquarters offices locations',
+    ttlDays: 180,
+  },
+
+  company_product: {
+    entityType: 'company',
+    version: 1,
+    fields: [
+      'product_categories', 'pricing_model', 'target_market',
+      'primary_offerings', 'customer_logos',
+    ],
+    sources: ['web_search'],
+    searchTemplate: '{{emailDomain}} products pricing customers',
+    ttlDays: 90,
+  },
+
   // ── PERSON-LEVEL ─────────────────────────────────────────────────────────
   // Cached per work email. Leads with the same email get the same person entry.
 
@@ -121,6 +145,18 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
     ],
     sources: ['linkedin', 'web_search'],
     searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} linkedin',
+    ttlDays: 90,
+  },
+
+  person_career: {
+    entityType: 'person',
+    version: 1,
+    fields: [
+      'tenure_at_company', 'prior_companies', 'education',
+      'recent_role_change_date', 'years_experience',
+    ],
+    sources: ['linkedin', 'web_search'],
+    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} career history',
     ttlDays: 90,
   },
 };

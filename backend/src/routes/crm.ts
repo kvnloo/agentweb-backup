@@ -36,6 +36,17 @@ import {
 } from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { normalizeAttribution } from '../types/attribution';
+import {
+  EnrichmentInputError,
+  validateFieldDescriptions,
+  validateFieldName,
+  validateGoal,
+  validateInstruction,
+  validateOptionalTemplate,
+  validateOutputFields,
+  validateSources,
+  validateSourcesPerField,
+} from '../utils/enrichmentValidation';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const d1StripeClient = d1StripeSecretKey
@@ -2797,9 +2808,14 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     }
 
     if (mode === 'suggest') {
-      const goal = typeof req.body.goal === 'string' ? req.body.goal.trim() : '';
-      if (!goal) {
-        return res.status(400).json({ message: 'goal is required' });
+      let goal: string;
+      try {
+        goal = validateGoal(req.body.goal);
+      } catch (err: any) {
+        if (err instanceof EnrichmentInputError) {
+          return res.status(400).json({ message: err.message });
+        }
+        throw err;
       }
       try {
         const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
@@ -2829,7 +2845,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
           success: true,
           instruction: result.instruction,
           outputFields: result.outputFields,
-          webSearchTemplate: result.webSearchTemplate,
+          fieldDescriptions: result.fieldDescriptions,
           linkedinSearchTemplate: result.linkedinSearchTemplate,
           sourcesPerField: result.sourcesPerField,
           sources: result.sources,
@@ -2841,31 +2857,29 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     }
 
     const defaultInstruction = 'Write a 3-6 sentence company profile covering what they do, their industry, products, and notable context. If no good company information is available, return "Company information not found".';
-    const instruction: string = typeof req.body.instruction === 'string' && req.body.instruction.trim()
-      ? req.body.instruction.trim()
-      : defaultInstruction;
-    const outputFields: string[] = Array.isArray(req.body.outputFields) && req.body.outputFields.length > 0
-      ? req.body.outputFields
-      : ['web_company_info'];
-    const sources: ('web_search' | 'linkedin' | 'existing_data')[] =
-      Array.isArray(req.body.sources) && req.body.sources.length > 0
-        ? req.body.sources
-        : ['web_search'];
-
-    const webSearchTemplate: string | undefined =
-      typeof req.body.webSearchTemplate === 'string' && req.body.webSearchTemplate.trim()
-        ? req.body.webSearchTemplate.trim()
-        : undefined;
-
-    const linkedinSearchTemplate: string | undefined =
-      typeof req.body.linkedinSearchTemplate === 'string' && req.body.linkedinSearchTemplate.trim()
-        ? req.body.linkedinSearchTemplate.trim()
-        : undefined;
-
-    const sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> | undefined =
-      req.body.sourcesPerField && typeof req.body.sourcesPerField === 'object'
-        ? req.body.sourcesPerField
-        : undefined;
+    let instruction: string;
+    let outputFields: string[];
+    let sources: ('web_search' | 'linkedin' | 'existing_data')[];
+    let webSearchTemplate: string | undefined;
+    let linkedinSearchTemplate: string | undefined;
+    let sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> | undefined;
+    let fieldDescriptions: Record<string, string> | undefined;
+    try {
+      instruction = validateInstruction(req.body.instruction, defaultInstruction);
+      outputFields = req.body.outputFields !== undefined
+        ? validateOutputFields(req.body.outputFields)
+        : ['web_company_info'];
+      sources = validateSources(req.body.sources, ['web_search']) as typeof sources;
+      webSearchTemplate = validateOptionalTemplate(req.body.webSearchTemplate, 'webSearchTemplate');
+      linkedinSearchTemplate = validateOptionalTemplate(req.body.linkedinSearchTemplate, 'linkedinSearchTemplate');
+      sourcesPerField = validateSourcesPerField(req.body.sourcesPerField) as typeof sourcesPerField;
+      fieldDescriptions = validateFieldDescriptions(req.body.fieldDescriptions);
+    } catch (err: any) {
+      if (err instanceof EnrichmentInputError) {
+        return res.status(400).json({ message: err.message });
+      }
+      throw err;
+    }
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
 
@@ -2884,6 +2898,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         webSearchTemplate,
         linkedinSearchTemplate,
         sourcesPerField,
+        fieldDescriptions,
       });
       responseBody = {
         success: true,
@@ -2909,6 +2924,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         webSearchTemplate,
         linkedinSearchTemplate,
         sourcesPerField,
+        fieldDescriptions,
       }, socketId);
       responseBody = {
         success: true,
@@ -2939,6 +2955,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       webSearchTemplate,
       linkedinSearchTemplate,
       sources,
+      fieldDescriptions,
     ).catch((err: unknown) => console.warn(`[CRM] enrich-web ${mode}: failed to save config:`, err));
 
     return res.json(responseBody);
@@ -4690,6 +4707,165 @@ router.post('/lists/:listId/enrichment-jobs/:jobId/revert', async (req: Request,
     const status = error.message?.includes('No snapshot data') ? 400 : 500;
     return res.status(status).json({ message: error.message || 'Failed to revert enrichment job' });
   }
+});
+
+// ── Per-field enrichment actions (item #10) ─────────────────────────────────
+//
+// verify  → mark a field as user-verified (sets verifiedBy on enrichmentMetadata)
+// reject  → null out the field's value (records rejectedReason on metadata)
+// refresh → re-run enrichment for a single field (force-refresh that field's cache group)
+
+router.post('/lists/:listId/leads/:leadId/fields/:field/verify', async (req: Request, res: Response) => {
+  const { listId, leadId, field } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  const userEmail = (req as AuthenticatedRequest).user?.email;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  let validatedField: string;
+  try {
+    validatedField = validateFieldName(field, 'field');
+  } catch (err: any) {
+    if (err instanceof EnrichmentInputError) {
+      return res.status(400).json({ message: err.message });
+    }
+    throw err;
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const lead: any = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const now = new Date().toISOString();
+    const priorMeta = (lead.enrichmentMetadata || {})[validatedField] || {};
+    const updatedMeta = {
+      ...lead.enrichmentMetadata,
+      [validatedField]: { ...priorMeta, verifiedBy: { userId, at: now } },
+    };
+    await crmDb.updateLead(listId, leadId, { enrichmentMetadata: updatedMeta });
+
+    return res.json({ success: true, verifiedBy: { userId, email: userEmail, at: now } });
+  } catch (error: any) {
+    console.error('[CRM] verify field error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to verify field' });
+  }
+});
+
+router.post('/lists/:listId/leads/:leadId/fields/:field/reject', async (req: Request, res: Response) => {
+  const { listId, leadId, field } = req.params;
+  const reason: string | undefined = (req.body || {}).reason;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  let validatedField: string;
+  try {
+    validatedField = validateFieldName(field, 'field');
+  } catch (err: any) {
+    if (err instanceof EnrichmentInputError) {
+      return res.status(400).json({ message: err.message });
+    }
+    throw err;
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const lead: any = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const now = new Date().toISOString();
+
+    // Determine if field is standard vs custom
+    const STANDARD = new Set(['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin']);
+    const updates: any = {};
+    if (STANDARD.has(validatedField)) {
+      updates[validatedField] = '';
+    } else {
+      updates.customFields = { ...(lead.customFields || {}), [validatedField]: null };
+    }
+    const priorMeta = (lead.enrichmentMetadata || {})[validatedField] || {};
+    updates.enrichmentMetadata = {
+      ...lead.enrichmentMetadata,
+      [validatedField]: { ...priorMeta, rejectedReason: reason || 'user-rejected', rejectedAt: now },
+    };
+    await crmDb.updateLead(listId, leadId, updates);
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    console.error('[CRM] reject field error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to reject field' });
+  }
+});
+
+router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Request, res: Response) => {
+  const { listId, leadId, field } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  let validatedField: string;
+  try {
+    validatedField = validateFieldName(field, 'field');
+  } catch (err: any) {
+    if (err instanceof EnrichmentInputError) {
+      return res.status(400).json({ message: err.message });
+    }
+    throw err;
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const lead: any = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    const result = await service.execute({
+      listId,
+      userId,
+      instruction: (list as any).enrichmentInstruction || `Re-enrich field ${validatedField} for {{firstName}} {{lastName}} at {{company}}`,
+      outputFields: [validatedField],
+      sources: ['web_search', 'linkedin'],
+      leadIds: [leadId],
+      forceOverwrite: true,
+      forceRefreshCache: true,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error: any) {
+    console.error('[CRM] refresh field error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to refresh field' });
+  }
+});
+
+// ── TEMPORARY DEBUG: raw SERP probe ──────────────────────────────────────────
+// POST /api/crm/debug/serp { query: string, n?: number }
+// Returns the raw Google CSE results so we can iterate on specialist queries
+// without redeploying. Remove once enrichment specialists stabilize.
+router.post('/debug/serp', async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const query = (req.body?.query || '').toString().trim();
+  const n = Math.max(1, Math.min(10, Number(req.body?.n) || 5));
+  if (!query) return res.status(400).json({ message: 'query required' });
+
+  const { agentModeService } = await import('../services/agentModeService');
+  const result = await agentModeService.searchWeb(query, n);
+  return res.json({
+    query,
+    success: result?.success,
+    count: Array.isArray(result?.results) ? result.results.length : 0,
+    results: result?.results || [],
+  });
 });
 
 // ── TEMPORARY DEBUG: EnrichmentRawCache table inspection ─────────────────────

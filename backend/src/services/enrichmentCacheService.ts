@@ -11,14 +11,38 @@ import {
 
 // Maps each field to the first group that contains it.
 // Fields not in any group go to `ungrouped`.
-export function splitFieldsByGroup(fields: string[]): { byGroup: Map<string, string[]>; ungrouped: string[] } {
+//
+// `aliases` is an optional user-field-name → canonical-field-name map. The
+// caller (resolveFieldAliases in enrichmentFieldAliasService) populates it
+// from a static alias map, the list's persisted canonical map, and an LLM
+// mapping for novel field names. With this, a user field like `funding_round`
+// (alias for `funding_stage`) lands in `company_financial` group instead of
+// the legacy ungrouped path — which means cache reuse + targeted search.
+//
+// Behavior:
+//   • If aliases[field] is set and points to a canonical field that exists
+//     in some group, the user's original field name is bucketed into that
+//     group (so the LLM is asked for `funding_round` not `funding_stage`,
+//     but cache key + search template come from the canonical group).
+//   • Otherwise, exact match against group.fields wins.
+//   • Otherwise, the field goes to `ungrouped`.
+export function splitFieldsByGroup(
+  fields: string[],
+  options?: { aliases?: Record<string, string> }
+): { byGroup: Map<string, string[]>; ungrouped: string[] } {
+  const aliases = options?.aliases ?? {};
   const byGroup = new Map<string, string[]>();
   const ungrouped: string[] = [];
+
   for (const field of fields) {
+    // Resolve to canonical: alias > self
+    const canonical = aliases[field] ?? field;
     let found = false;
     for (const [groupName, config] of Object.entries(FIELD_GROUPS)) {
-      if (config.fields.includes(field)) {
+      if (config.fields.includes(canonical)) {
         if (!byGroup.has(groupName)) byGroup.set(groupName, []);
+        // KEEP user's original field name — the LLM extraction prompt and
+        // customFields persistence both use the user-facing name.
         byGroup.get(groupName)!.push(field);
         found = true;
         break;

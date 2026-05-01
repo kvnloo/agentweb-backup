@@ -354,6 +354,15 @@ createTestAccount().then(async () => {
     console.warn('Stripe credentials not available — billing features will be disabled:', (error as Error).message);
   }
 
+  // Register CRM enrichment specialists (Crunchbase et al.)
+  try {
+    const { registerAllEnrichmentSpecialists } = await import('./services/specialists');
+    registerAllEnrichmentSpecialists();
+    console.log('Enrichment specialists registered');
+  } catch (err) {
+    console.warn('Failed to register enrichment specialists:', (err as Error).message);
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);

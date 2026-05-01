@@ -943,6 +943,7 @@ describe('CRM Routes', () => {
         '{{company}} overview',
         '{{firstName}} {{company}}',
         ['web_search', 'linkedin'],
+        undefined,
       );
     });
 
@@ -980,6 +981,7 @@ describe('CRM Routes', () => {
         undefined,
         undefined,
         ['web_search'],
+        undefined,
       );
     });
   });
