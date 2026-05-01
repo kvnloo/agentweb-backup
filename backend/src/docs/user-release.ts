@@ -5516,6 +5516,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-01',
+    changes: [
+      'Improved: New Client Question Emails Now Show Who Sent the Slack Message',
+      '- The "New Client Question from Slack" notification email now identifies the sender under "Original Message from <name>"',
+      '- Previously the sender\'s name was missing, making it unclear who the client contact was',
+    ],
+  },
+  {
     date: '2026-04-30',
     changes: [
       'Improved: Onboarding Stuck-User Alerts Now Consolidated Into a Daily Report',
