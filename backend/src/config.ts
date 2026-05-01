@@ -13,7 +13,7 @@ export const CONTENT_RESTYLE_MODEL = 'gemini-3-flash-preview';
 
 // Resend System Email Configuration
 // This is used for all system-generated emails (notifications, announcements, etc.)
-export const RESEND_SYSTEM_EMAIL = 'no-reply@updates.agentweb.pro';
+export const RESEND_SYSTEM_EMAIL = 'hi@updates.agentweb.pro';
 export const RESEND_SYSTEM_NAME = 'AgentWeb';
 
 // Emma Email Configuration

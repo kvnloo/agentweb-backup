@@ -7,6 +7,7 @@ import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -5888,7 +5889,7 @@ emmaToolRegistry.register({
         });
 
         await resendService.sendEmail({
-          from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
+          from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: [...productIssueEmails, user.email],
           subject: `We received your issue: ${issue.title}`,
           html: `

@@ -3,6 +3,7 @@ import { authenticateToken } from "../middleware/auth";
 import { resendService } from "../services/resendService";
 import { userDb } from "../services/db";
 import { settingsService } from "../services/settingsService";
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
 
 const router = express.Router();
 
@@ -103,7 +104,7 @@ router.post("/send-help-message", async (req, res) => {
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
 
     await resendService.sendEmail({
-      from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
+      from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
       to: productIssueEmails,
       subject: emailSubject,
       html: emailHtml,
@@ -189,7 +190,7 @@ router.post("/report-error", async (req, res) => {
     const oncallEmails = await settingsService.getJsonArraySetting('oncall_emails', ['ruiw@agentweb.pro']);
 
     await resendService.sendEmail({
-      from: "AgentWeb Support <no-reply@updates.agentweb.pro>",
+      from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
       to: oncallEmails,
       subject: emailSubject,
       html: emailHtml,
