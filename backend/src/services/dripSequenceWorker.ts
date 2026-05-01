@@ -16,6 +16,7 @@ import { resendService } from './resendService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { substituteVariables } from '../utils/emailVariables';
+import { settingsService } from './settingsService';
 
 export async function processDueEnrollments(): Promise<{
   processed: number;
@@ -95,6 +96,9 @@ async function processEnrollment(
 
   const user = await userDb.getUserById(enrollment.userId).catch(() => null);
 
+  // Load configured senders for this user
+  const senderConfig = await loadSenderConfig(enrollment.userId);
+
   const emailVars: Record<string, string> = {
     firstName: lead?.firstName ?? '',
     lastName: lead?.lastName ?? '',
@@ -107,9 +111,9 @@ async function processEnrollment(
   const subject = substituteVariables(step.subject, emailVars);
   const bodyHtml = substituteVariables(step.bodyHtml, emailVars);
 
-  // Resolve sender config
-  const senderEmail = resolveSenderEmail(user, step.senderId);
-  const senderName = resolveSenderName(user, step.senderId);
+  // Resolve sender config — use step's senderId if set, else account default
+  const senderEmail = resolveSenderEmail(user, senderConfig, step.senderId);
+  const senderName = resolveSenderName(user, senderConfig, step.senderId);
 
   if (!senderEmail) {
     console.error(`[dripWorker] Skipping enrollment ${enrollment.enrollmentId}: user ${enrollment.userId} has no email sender configured (emailDomain + defaultSenderUsername + fromName required)`);
@@ -197,13 +201,35 @@ function addDays(date: Date, days: number): Date {
   return result;
 }
 
-function resolveSenderEmail(user: any, _senderId?: string): string | null {
-  if (user?.emailDomain && user?.defaultSenderUsername && user?.fromName) {
+async function loadSenderConfig(userId: string): Promise<{ senders: any[]; defaultSenderId: string | null }> {
+  try {
+    const setting = await settingsService.getSetting(`crm_sender_emails_${userId}`);
+    if (!setting?.settingValue) return { senders: [], defaultSenderId: null };
+    const config = JSON.parse(setting.settingValue);
+    return { senders: config.senders ?? [], defaultSenderId: config.defaultSenderId ?? null };
+  } catch {
+    return { senders: [], defaultSenderId: null };
+  }
+}
+
+function resolveSenderEmail(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string | null {
+  const id = senderId ?? senderConfig.defaultSenderId;
+  if (id) {
+    const match = senderConfig.senders.find((s: any) => s.id === id);
+    if (match?.email) return match.email;
+  }
+  // Legacy fallback: user-level defaultSenderUsername
+  if (user?.emailDomain && user?.defaultSenderUsername) {
     return `${user.defaultSenderUsername}@${user.emailDomain}`;
   }
   return null;
 }
 
-function resolveSenderName(user: any, _senderId?: string): string {
+function resolveSenderName(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string {
+  const id = senderId ?? senderConfig.defaultSenderId;
+  if (id) {
+    const match = senderConfig.senders.find((s: any) => s.id === id);
+    if (match?.fromName) return match.fromName;
+  }
   return user?.fromName ?? user?.displayName ?? user?.name ?? '';
 }
