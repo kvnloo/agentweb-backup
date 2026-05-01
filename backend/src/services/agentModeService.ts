@@ -6966,14 +6966,18 @@ export class AgentModeService {
       const searchQuery = (options?.search || '').trim().toLowerCase();
       const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
       const matchingLeads: any[] = [];
-      let cursor: any = decodedCursor;
+      let inputCursor: any = decodedCursor;
+      let lastScannedLeadId: string | null = null;
+      let hitLimit = false;
 
-      while (matchingLeads.length < effectiveLimit) {
-        const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
+      while (true) {
+        const pageResult = await crmDb.getLeadsByListId(listId, 200, inputCursor);
         const leads = pageResult.items || [];
 
         for (const lead of leads) {
-          if (matchingLeads.length >= effectiveLimit) break;
+          // Track the leadId we just looked at so the cursor can resume from
+          // here if we break before scanning the rest of the page.
+          lastScannedLeadId = lead.leadId;
 
           // Apply cross-field keyword search
           if (searchQuery) {
@@ -7057,14 +7061,29 @@ export class AgentModeService {
 
           if (allMatch) {
             matchingLeads.push(lead);
+            if (matchingLeads.length >= effectiveLimit) {
+              hitLimit = true;
+              break;
+            }
           }
         }
 
-        cursor = pageResult.lastEvaluatedKey;
-        if (!cursor) break;
+        if (hitLimit) break;
+        inputCursor = pageResult.lastEvaluatedKey;
+        if (!inputCursor) break;
       }
 
-      const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
+      // When the limit is hit mid-page, the underlying lastEvaluatedKey points
+      // past leads we never scanned. Anchor next_cursor at the last scanned
+      // leadId so the next call resumes immediately after it (the leads table
+      // sort key is leadId, so this is a native ExclusiveStartKey).
+      let cursorOut: any = null;
+      if (hitLimit && lastScannedLeadId) {
+        cursorOut = { listId, leadId: lastScannedLeadId };
+      } else if (inputCursor) {
+        cursorOut = inputCursor;
+      }
+      const nextCursor = cursorOut ? Buffer.from(JSON.stringify(cursorOut)).toString('base64') : undefined;
 
       return {
         success: true,
@@ -7084,7 +7103,7 @@ export class AgentModeService {
         })),
         matchCount: matchingLeads.length,
         listName: list.name,
-        has_more: !!cursor,
+        has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),
       };
     } catch (error) {
