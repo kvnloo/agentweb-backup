@@ -1,3 +1,42 @@
+## EB Autoscaling Flapping — Investigation (2026-05-01)
+
+### Context
+
+Multiple instance launches observed in production (`Agentweb-backend-env-prod-3`) within a short window: 3 new `t3.large` instances added between 16:31–16:46 UTC, one terminated, health warnings. Initially suspected OOM crashes or instance failures.
+
+### Root Cause: NetworkOut autoscaling threshold too low
+
+The EB autoscaling alarm was configured to trigger on **NetworkOut** (not CPU):
+- **Scale up:** `NetworkOut > 6 MB / 5-min period`
+- **Scale down:** `NetworkOut < 2 MB / 5-min period`
+
+The backend serves large API responses that easily exceed 6 MB on a single instance:
+- `GET /api/agent-mode/sessions?limit=50` → ~2.2 MB response
+- `GET /api/tasks/executions/with-html-reports?limit=1` → ~4.2 MB response
+
+A few concurrent users hitting these endpoints concentrate traffic on the single instance after a scale-down (min=1), causing the scale-up alarm to fire. The new instance takes ~7 minutes to become healthy, during which load stays on the original instance — appearing as repeated "crashes."
+
+Peak NetworkOut observed: **23.9 MB/instance** at 16:35 UTC.
+
+### Fix Applied
+
+Raised autoscaling thresholds via EB console:
+- **Scale up:** `NetworkOut > 30 MB / 5-min period` (was 6 MB)
+- **Scale down:** `NetworkOut < 6 MB / 5-min period` (was 2 MB)
+
+### Not Done: Minimum Instance Count
+
+Raising the minimum from 1 → 2 would eliminate the "all load on one instance" window after scale-down, but adds ~$140/month in EC2 cost. There is no convincing evidence this is necessary given the threshold fix — the flapping was the symptom, not instance capacity. Revisit if flapping resumes after the threshold change.
+
+### How to diagnose in future
+
+1. Check EB events: `aws elasticbeanstalk describe-events --environment-name Agentweb-backend-env-prod-3 --region us-west-2 --max-records 20`
+2. Check ASG scaling activities to distinguish scale-out (alarm-triggered) from crash-replacement (health-check failure)
+3. Check which alarm fired: `aws cloudwatch describe-alarms --alarm-names <AlarmName>` — look at `Metric` and `Threshold`
+4. Plot `NetworkOut` metric on the ASG to see what triggered the alarm
+
+---
+
 ## coding_agent "No GitHub / No Vercel" — Investigation (2026-04-29)
 
 ### Context
