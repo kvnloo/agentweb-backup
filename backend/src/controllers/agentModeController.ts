@@ -1373,7 +1373,8 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
 function hasActiveProgress(sessionId: string): boolean {
   const latestProgress = getLatestProgress(sessionId);
   if (!latestProgress) return false;
-  return latestProgress.status !== 'complete';
+  // 'suggestions' is emitted after 'complete' (post-processing) — treat as done
+  return latestProgress.status !== 'complete' && latestProgress.status !== 'suggestions';
 }
 
 // Helper to update a GTM work item's status in the GTM plan
@@ -4927,6 +4928,8 @@ export const agentModeController = {
         attachments
       );
 
+      progressStore.delete(session.sessionId);
+
       res.json({
         content: response.content,
         toolCalls: response.toolCalls,
@@ -5260,6 +5263,7 @@ export const agentModeController = {
         console.log(`AgentMode: Fire-and-forget starting for session ${sessionId}, model=${selectedModel}`);
         generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel)
           .then(() => {
+            progressStore.delete(sessionId);
             console.log(`AgentMode: Fire-and-forget completed successfully for session ${sessionId}`);
           })
           .catch(async (firstErr: any) => {
@@ -5277,6 +5281,7 @@ export const agentModeController = {
             try {
               console.log(`AgentMode: Retrying fire-and-forget for session ${sessionId}`);
               await generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel);
+              progressStore.delete(sessionId);
               console.log(`AgentMode: Retry succeeded for session ${sessionId}`);
               return; // Retry succeeded — done
             } catch (retryErr: any) {

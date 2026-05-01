@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-01',
     changes: [
+      'Fix: Emma No Longer Shows "Thinking…" After Completing a Response',
+      '- Every session was incorrectly showing the Thinking… indicator even after Emma finished responding',
+      '- Root cause: the suggested reply chips feature (added recently) emits a "suggestions" event after the "complete" event; if the session was reloaded during that brief window the backend mistakenly reported the session as still active',
+      '- The backend now correctly treats the post-completion "suggestions" status as inactive, so the Thinking… card disappears as expected',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
       'New: Founder Voice Examples for Authentic LinkedIn Posts',
       '- Founders can now paste real post examples into Brand Guidelines → Founder Profile → Voice Examples',
       '- Emma reads these examples when generating LinkedIn and social posts, matching the exact sentence rhythm, hooks, vocabulary, and structure of the real posts',
