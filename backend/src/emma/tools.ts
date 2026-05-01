@@ -5870,6 +5870,20 @@ emmaToolRegistry.register({
       throw new Error('User not found');
     }
 
+    // isDelegatedAdmin is set when called via chatbotService (Emma sidebar).
+    // isDelegatedAccess is set when called via agentModeService (agent mode chat).
+    // In both cases, look up the admin email from the session's delegateInfo in DB.
+    const isDelegate = context?.isDelegatedAdmin === true || context?.isDelegatedAccess === true;
+    let adminEmail: string | undefined = context?.adminEmail;
+    if (isDelegate && !adminEmail && context?.sessionId) {
+      const { chatbotDb } = await import('../services/chatbotService');
+      const session = await chatbotDb.getChatSession(context.sessionId);
+      if (session?.delegateInfo?.isDelegated && session.delegateInfo.adminEmail) {
+        adminEmail = session.delegateInfo.adminEmail;
+      }
+    }
+    const isDelegatedAdmin = isDelegate && !!adminEmail;
+
     const results: Array<{ title: string; success: boolean; issueId?: string; error?: string }> = [];
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
@@ -5887,6 +5901,10 @@ emmaToolRegistry.register({
           'Session ID': context?.sessionId || 'N/A',
         };
 
+        if (isDelegatedAdmin && adminEmail) {
+          issueContext['Reported By (Admin)'] = adminEmail;
+        }
+
         const result = await createOncallItem({
           title: issue.title,
           description: issue.description,
@@ -5894,16 +5912,25 @@ emmaToolRegistry.register({
           context: issueContext,
         });
 
+        // When an admin reports via delegate access, send only to the admin (not the customer).
+        // The admin initiated the report, not the customer.
+        const emailRecipients = isDelegatedAdmin && adminEmail
+          ? [...productIssueEmails, adminEmail]
+          : [...productIssueEmails, user.email];
+        const emailGreeting = isDelegatedAdmin && adminEmail
+          ? `Hi ${adminEmail}, you've submitted an issue report on behalf of ${user.displayName || user.email}.`
+          : `Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.`;
+
         await resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
-          to: [...productIssueEmails, user.email],
+          to: emailRecipients,
           subject: `We received your issue: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
               <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
                 <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
               </div>
-              <p style="color: #444;">Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.</p>
+              <p style="color: #444;">${emailGreeting} The AgentWeb engineering team has been notified.</p>
               ${result.pageId ? `<div style="margin: 8px 0;"><strong>Issue ID:</strong> AGW-${result.pageId}</div>` : ''}
               <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
               <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
@@ -5913,7 +5940,7 @@ emmaToolRegistry.register({
               </div>
             </div>
           `,
-          replyTo: user.email,
+          replyTo: isDelegatedAdmin && adminEmail ? adminEmail : user.email,
         });
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });

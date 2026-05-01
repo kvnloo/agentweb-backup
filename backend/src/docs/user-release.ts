@@ -23,6 +23,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users whose Stripe subscription webhook was missed (e.g. signed up before Stripe customer was linked) could have a stripe_customer_id and payment amount on file but no subscription_status, causing the admin Users tab to show them as free instead of Paid',
       '- A new Sync icon button (↺) next to the Stripe Customer ID field in each expanded user row lets admins pull the live subscription status directly from Stripe with one click',
       '- Also removed the duplicate read-only "Stripe ID" field in the expanded row (same data as the editable Stripe Customer ID field)',
+      'Fix: Issue Report Emails Now Go to the Right Person During Admin Delegate Access',
+      '- When an admin uses delegate access and asks Emma to report a product issue on behalf of a customer, the confirmation email now goes to the admin only — not the customer',
+      '- Previously the customer would receive the email even though it was the admin who triggered the report',
+      '- The Notion ticket also now records the "Reported By (Admin)" field so the engineering team knows who to follow up with',
     ],
   },
   {
