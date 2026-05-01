@@ -11,6 +11,19 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-01',
     changes: [
+      'CRM Sequences: Per-Step Sender Selection',
+      '- Each step in a drip sequence can now use a different configured sender email',
+      '- A "From (sender)" dropdown appears in each step editor, letting you pick any sender from your configured list',
+      '- Defaults to "Account default" (your primary sender) if no specific sender is chosen',
+      '- The email worker now correctly uses the per-step sender when sending — previously all steps always used the account default regardless of what was saved',
+      'System: Switched outbound sender address from no-reply@ to hi@',
+      '- System emails (help requests, error reports, issue confirmations) now come from hi@updates.agentweb.pro instead of no-reply@updates.agentweb.pro',
+      '- This improves deliverability and reduces the chance of messages being flagged as spam',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
       'Fix: Emma No Longer Shows "Thinking…" After Completing a Response',
       '- Every session was incorrectly showing the Thinking… indicator even after Emma finished responding',
       '- Root cause: the suggested reply chips feature (added recently) emits a "suggestions" event after the "complete" event; if the session was reloaded during that brief window the backend mistakenly reported the session as still active',
@@ -35,8 +48,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users who have a recorded subscription amount but a missing subscription_status (caused by a webhook sync gap) were incorrectly shown as "Bounced Checkout" in the admin user list',
       '- The bounced heuristic now excludes users with a non-zero subscription_amount, so legitimate paying customers are no longer counted in that bucket',
       '- Also fixed a reconciliation bug where running "Reconcile Stripe" silently skipped users with a null subscription_status instead of syncing their status from Stripe',
-    ],
-  },
   {
     date: '2026-04-30',
     changes: [
