@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-01',
+    changes: [
+      'New: Founder Voice Examples for Authentic LinkedIn Posts',
+      '- Founders can now paste real post examples into Brand Guidelines → Founder Profile → Voice Examples',
+      '- Emma reads these examples when generating LinkedIn and social posts, matching the exact sentence rhythm, hooks, vocabulary, and structure of the real posts',
+      '- Eliminates the generic AI-industry clichés ("Unpopular opinion:", "Here\'s what nobody tells you…") and produces content that genuinely sounds like the founder',
+      '- Emma can also update Voice Examples directly via chat (e.g. "add this post to my voice examples") — the field is available in the update_brand_guidelines tool',
+      '- If no Voice Examples are set, Emma now prompts the founder to provide 2–3 real posts before generating a batch',
+    ],
+  },
+  {
     date: '2026-04-30',
     changes: [
       'Fix: Admin Dashboard No Longer Mislabels Paying Users as "Bounced"',

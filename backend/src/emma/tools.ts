@@ -1103,7 +1103,8 @@ emmaToolRegistry.register({
                   name: { type: 'string', description: 'Founder name' },
                   jobTitle: { type: 'string', description: 'Founder job title' },
                   styleTone: { type: 'string', description: 'Founder communication style and tone' },
-                  signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' }
+                  signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' },
+                  voiceExamples: { type: 'string', description: 'Actual post examples (verbatim) written by or for this founder. Emma uses these as a direct style reference when generating LinkedIn and social posts — paste 2–3 real posts separated by blank lines.' }
                 },
                 required: ['name']
               },
