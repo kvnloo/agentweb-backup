@@ -100,6 +100,23 @@ describe('Agent Mode Controller - Session Loading', () => {
       );
     });
 
+    it('should treat suggestions status as inactive progress (not stuck thinking)', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      // 'suggestions' is emitted after 'complete' during post-processing — must not show Thinking...
+      progressStore.set('session-123', { iteration: 1, status: 'suggestions', suggestions: ['Follow up?'] });
+
+      const req = mockRequest(mockUser, 'session-123');
+      const res = mockResponse();
+
+      await agentModeController.getSession(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hasActiveProgress: false
+        })
+      );
+    });
+
     it('should return filtered session for admin user (same path as regular users)', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
 
