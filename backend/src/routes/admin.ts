@@ -20,7 +20,7 @@ import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
-import { resyncAllSubscriptionAmounts } from "../services/stripeService";
+import { resyncAllSubscriptionAmounts, syncSubscriptionFromStripe } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
@@ -5068,6 +5068,27 @@ router.get("/users/:userId/activities", isAdmin, async (req, res) => {
   } catch (error: any) {
     console.error("Error fetching user activities:", error.message);
     res.status(500).json({ message: "Failed to fetch user activities" });
+  }
+});
+
+// ─── Sync Stripe subscription status for a single user ───────────────────────
+
+router.post("/users/:userId/sync-stripe", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    if (!user.stripe_customer_id) {
+      return res.status(400).json({ message: "User has no Stripe Customer ID" });
+    }
+    const updates = await syncSubscriptionFromStripe(userId, user.stripe_customer_id);
+    const updatedUser = await userDb.getUserById(userId);
+    res.json({ updates, user: updatedUser });
+  } catch (error: any) {
+    console.error("Error syncing Stripe subscription:", error.message);
+    res.status(500).json({ message: "Failed to sync Stripe subscription" });
   }
 });
 
