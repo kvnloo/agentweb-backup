@@ -853,8 +853,9 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       : [];
 
     const { settingsService } = await import('../services/settingsService');
-    // Invalidate stale channel-to-user cache entries before saving new channels
-    await settingsService.invalidateSlackChannelMappingsForUser(userId);
+    // Invalidate by userId (old assignments) AND by channel ID (channels that may be cached under a different user)
+    const oldChannels: string[] = (user.slackChannels ?? []).concat(user.slackChannel ? [user.slackChannel] : []);
+    await settingsService.invalidateSlackChannelMappings(userId, [...new Set([...oldChannels, ...channels])]);
 
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),

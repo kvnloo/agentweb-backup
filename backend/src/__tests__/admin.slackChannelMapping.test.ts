@@ -20,7 +20,7 @@ jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
     setSetting: jest.fn(),
-    invalidateSlackChannelMappingsForUser: jest.fn().mockResolvedValue(undefined),
+    invalidateSlackChannelMappings: jest.fn().mockResolvedValue(undefined),
   },
 }));
 jest.mock('../middleware/auth', () => ({
@@ -64,7 +64,7 @@ const existingUser = {
   email: 'user@example.com',
   isAdmin: false,
   isActive: true,
-  slackChannels: ['C09HAPV2WM6'],
+  slackChannels: ['C_OLD'],
 };
 
 describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', () => {
@@ -78,7 +78,7 @@ describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', ()
     expect(res.status).toBe(404);
   });
 
-  it('invalidates stale cache before updating channels', async () => {
+  it('invalidates by userId and by channel ID when updating channels', async () => {
     mockUserDb.getUserById.mockResolvedValue(existingUser as any);
     mockUserDb.updateUser.mockResolvedValue({ ...existingUser, slackChannels: ['C_NEW'] } as any);
 
@@ -87,12 +87,34 @@ describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', ()
       .send({ slackChannels: ['C_NEW'] });
 
     expect(res.status).toBe(200);
-    expect(mockSettings.invalidateSlackChannelMappingsForUser).toHaveBeenCalledWith('user-abc');
-    expect(mockSettings.invalidateSlackChannelMappingsForUser).toHaveBeenCalledTimes(1);
+    expect(mockSettings.invalidateSlackChannelMappings).toHaveBeenCalledWith(
+      'user-abc',
+      expect.arrayContaining(['C_OLD', 'C_NEW'])
+    );
+    expect(mockSettings.invalidateSlackChannelMappings).toHaveBeenCalledTimes(1);
     expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-abc', { slackChannels: ['C_NEW'] });
   });
 
-  it('invalidates cache even when clearing channels to empty', async () => {
+  it('invalidates stale cache for a channel previously assigned to a different user', async () => {
+    // Simulates the waldium bug: channel C0AJVBQ49TN was cached under Jeff's userId,
+    // but now being assigned to amrutha. Both Jeff's old userId AND the channel ID
+    // must be cleared from the cache.
+    const amrutha = { userId: 'amrutha-id', email: 'amrutha@structuredlabs.com', slackChannels: ['C0AJVBQ49TN'] };
+    mockUserDb.getUserById.mockResolvedValue(amrutha as any);
+    mockUserDb.updateUser.mockResolvedValue(amrutha as any);
+
+    const res = await request(app)
+      .put('/api/admin/users/amrutha-id/slack-channel')
+      .send({ slackChannels: ['C0AJVBQ49TN'] });
+
+    expect(res.status).toBe(200);
+    expect(mockSettings.invalidateSlackChannelMappings).toHaveBeenCalledWith(
+      'amrutha-id',
+      expect.arrayContaining(['C0AJVBQ49TN'])
+    );
+  });
+
+  it('invalidates cache when clearing channels to empty', async () => {
     mockUserDb.getUserById.mockResolvedValue(existingUser as any);
     mockUserDb.updateUser.mockResolvedValue({ ...existingUser, slackChannels: null } as any);
 
@@ -101,21 +123,11 @@ describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', ()
       .send({ slackChannels: [] });
 
     expect(res.status).toBe(200);
-    expect(mockSettings.invalidateSlackChannelMappingsForUser).toHaveBeenCalledWith('user-abc');
+    expect(mockSettings.invalidateSlackChannelMappings).toHaveBeenCalledWith(
+      'user-abc',
+      expect.arrayContaining(['C_OLD'])
+    );
     expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-abc', { slackChannels: null });
-  });
-
-  it('invalidates cache when multiple channels are assigned', async () => {
-    mockUserDb.getUserById.mockResolvedValue(existingUser as any);
-    mockUserDb.updateUser.mockResolvedValue({ ...existingUser, slackChannels: ['C_A', 'C_B'] } as any);
-
-    const res = await request(app)
-      .put('/api/admin/users/user-abc/slack-channel')
-      .send({ slackChannels: ['C_A', 'C_B'] });
-
-    expect(res.status).toBe(200);
-    expect(mockSettings.invalidateSlackChannelMappingsForUser).toHaveBeenCalledWith('user-abc');
-    expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-abc', { slackChannels: ['C_A', 'C_B'] });
   });
 
   it('strips whitespace and filters empty strings from channel list', async () => {
