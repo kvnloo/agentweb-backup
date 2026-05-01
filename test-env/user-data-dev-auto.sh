@@ -130,6 +130,7 @@ cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
       "Bash(sed *)",
       "Bash(sort *)",
       "Bash(tmux *)",
+      "Bash(nohup *)",
       "Bash(kill *)",
       "Bash(chmod *)",
       "Bash(~/agentweb/test-env/*)",
@@ -397,6 +398,33 @@ cd ~/agentweb
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
 NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
 
+# Post a crash comment and reset status to Blocked if the script exits before normal completion
+_CLAUDE_COMPLETED=0
+_crash_notify() {
+  if [[ "$_CLAUDE_COMPLETED" == "0" && -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
+    CRASH_BODY=$(python3 -c "
+import json, sys
+page_id = sys.argv[1]
+body = {
+  'parent': {'page_id': page_id},
+  'rich_text': [{'type': 'text', 'text': {'content': 'Claude crashed or was killed before completing. No result was produced. Check the cloud instance logs.'}}]
+}
+print(json.dumps(body))
+" "$NOTION_PAGE_ID" 2>/dev/null)
+    [[ -n "$CRASH_BODY" ]] && curl -s -X POST "https://api.notion.com/v1/comments" \
+      -H "Authorization: Bearer $NOTION_TOKEN" \
+      -H "Notion-Version: 2022-06-28" \
+      -H "Content-Type: application/json" \
+      -d "$CRASH_BODY" > /dev/null
+    curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
+      -H "Authorization: Bearer $NOTION_TOKEN" \
+      -H "Notion-Version: 2022-06-28" \
+      -H "Content-Type: application/json" \
+      -d '{"properties": {"Status": {"status": {"name": "Blocked"}}}}' > /dev/null
+  fi
+}
+trap '_crash_notify' EXIT
+
 # Set status to In progress before starting work
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
   curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
@@ -425,10 +453,22 @@ for line in open('{}'):
 fi
 [[ -n "$SESSION_ID" ]] && echo "$SESSION_ID" > ~/agentweb/.claude-session-id
 
+_CLAUDE_COMPLETED=1
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
   printf '%s' "$RAW" > /tmp/.claude-raw.json
   python3 ~/agentweb/.claude-comment.py "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
   BODY=$(cat /tmp/.claude-comment.json)
+  if [[ -z "$BODY" ]]; then
+    # claude-comment.py produced nothing (e.g. RAW was truncated/empty) — post a fallback
+    BODY=$(python3 -c "
+import json, sys
+page_id = sys.argv[1]
+exit_code = sys.argv[2]
+msg = f'Claude exited (code {exit_code}) but produced no parseable output. The run may have been truncated or produced no result. Check the cloud instance logs.'
+body = {'parent': {'page_id': page_id}, 'rich_text': [{'type': 'text', 'text': {'content': msg}}]}
+print(json.dumps(body))
+" "$NOTION_PAGE_ID" "$EXIT_CODE" 2>/dev/null)
+  fi
   if [[ -n "$BODY" ]]; then
     curl -s -X POST "https://api.notion.com/v1/comments" \
       -H "Authorization: Bearer $NOTION_TOKEN" \
