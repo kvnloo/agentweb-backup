@@ -852,6 +852,10 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
       : [];
 
+    const { settingsService } = await import('../services/settingsService');
+    // Invalidate stale channel-to-user cache entries before saving new channels
+    await settingsService.invalidateSlackChannelMappingsForUser(userId);
+
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
