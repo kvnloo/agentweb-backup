@@ -217,4 +217,68 @@ describe('report_product_issues tool', () => {
       })
     );
   });
+
+  describe('delegate admin access', () => {
+    const delegateContext = {
+      userId: 'user-123',
+      sessionId: 'sess-789',
+      isDelegatedAdmin: true,
+      adminEmail: 'admin@agentweb.pro',
+    };
+
+    it('should send email only to admin (not customer) when isDelegatedAdmin', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
+        delegateContext
+      );
+
+      expect(mockResendSendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: ['founders@agentweb.pro', 'admin@agentweb.pro'],
+          replyTo: 'admin@agentweb.pro',
+        })
+      );
+      // Customer email must NOT be in recipients
+      const callArgs = mockResendSendEmail.mock.calls[0][0];
+      expect(callArgs.to).not.toContain('customer@example.com');
+    });
+
+    it('should include admin greeting in email body when isDelegatedAdmin', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
+        delegateContext
+      );
+
+      const callArgs = mockResendSendEmail.mock.calls[0][0];
+      expect(callArgs.html).toContain('admin@agentweb.pro');
+      expect(callArgs.html).toContain('on behalf of');
+      expect(callArgs.html).toContain('Test Customer');
+    });
+
+    it('should add Reported By (Admin) field to Notion context when isDelegatedAdmin', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
+        delegateContext
+      );
+
+      expect(mockCreateOncallItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: expect.objectContaining({
+            'Reported By (Admin)': 'admin@agentweb.pro',
+          }),
+        })
+      );
+    });
+
+    it('should fall back to normal (customer) recipients when isDelegatedAdmin but no adminEmail', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Bug', description: 'Desc' }] },
+        { userId: 'user-123', isDelegatedAdmin: true }
+      );
+
+      const callArgs = mockResendSendEmail.mock.calls[0][0];
+      expect(callArgs.to).toContain('customer@example.com');
+      expect(callArgs.replyTo).toBe('customer@example.com');
+    });
+  });
 });

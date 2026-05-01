@@ -3609,6 +3609,8 @@ export interface ChatResponseOptions {
   onToolStart?: (toolName: string) => void;
   /** True when the current message is from an admin via delegated access. Admin tools should be available. */
   isDelegatedAdmin?: boolean;
+  /** Email of the admin when isDelegatedAdmin is true. */
+  adminEmail?: string;
 }
 
 // Update generateChatResponse to use platform knowledge base when needed
@@ -3628,6 +3630,7 @@ export async function generateChatResponse(
     socketId,
     onToolStart,
     isDelegatedAdmin,
+    adminEmail,
   } = options;
   try {
     const timestamp = new Date().toISOString();
@@ -4022,6 +4025,7 @@ export async function generateChatResponse(
           const extraContext: Record<string, any> = {};
           if (socketId) extraContext.socketId = socketId;
           if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
+          if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
           const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs, result });

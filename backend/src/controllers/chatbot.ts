@@ -162,7 +162,10 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
 
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model });
+      const delegateInfo = (req as any).delegateInfo;
+      const isDelegatedAdmin = delegateInfo?.isDelegated === true;
+      const adminEmail = isDelegatedAdmin ? delegateInfo.adminEmail : undefined;
+      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model, isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail });
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -261,11 +264,15 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   };
 
   try {
+    const delegateInfo = (req as any).delegateInfo;
+    const isDelegatedAdmin = delegateInfo?.isDelegated === true;
+    const adminEmail = isDelegatedAdmin ? delegateInfo.adminEmail : undefined;
     const response = await generateChatResponse(
       sessionId, message,
       {
         currentUrl, pageContent: pageContext, portalType, userId,
         structuredContext, screenshot, model,
+        isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail,
         onToolStart: (toolName: string) => sendEvent({ type: 'tool_start', name: toolName })
       }
     );
