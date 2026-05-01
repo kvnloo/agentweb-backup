@@ -48,6 +48,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users who have a recorded subscription amount but a missing subscription_status (caused by a webhook sync gap) were incorrectly shown as "Bounced Checkout" in the admin user list',
       '- The bounced heuristic now excludes users with a non-zero subscription_amount, so legitimate paying customers are no longer counted in that bucket',
       '- Also fixed a reconciliation bug where running "Reconcile Stripe" silently skipped users with a null subscription_status instead of syncing their status from Stripe',
+    ],
+  },
   {
     date: '2026-04-30',
     changes: [
