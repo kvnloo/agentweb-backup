@@ -5583,6 +5583,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-01',
+    changes: [
+      'Improved: Admin Slack Channel Now Accepts Free-Form Messages',
+      '- Admins can now trigger sessions for any user using natural language in the admin Slack channel',
+      '- Previously, messages had to follow the exact format "for user@email.com <task>" — anything else was ignored',
+      '- Now any phrasing works, e.g. "Emma give me a Meta Spend analysis for juan@usehaven.ai"',
+    ],
+  },
+  {
     date: '2026-04-30',
     changes: [
       'Fixed: Emma No Longer Shows "Thinking..." After Responding',
