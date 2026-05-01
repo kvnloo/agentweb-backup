@@ -543,7 +543,11 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.success).toBe(true);
       expect(result.has_more).toBe(true);
-      expect(result.next_cursor).toBe(Buffer.from(JSON.stringify(dynKey)).toString('base64'));
+      // The cursor is anchored to the last scanned leadId (lead-level cursor),
+      // not the underlying DynamoDB page-end key, so paging never skips leads.
+      expect(result.next_cursor).toBe(
+        Buffer.from(JSON.stringify({ listId, leadId: mockLead.leadId })).toString('base64')
+      );
     });
 
     it('should return has_more false when no more results', async () => {
@@ -562,8 +566,10 @@ describe('AgentModeService - CRM Tools', () => {
     });
 
     it('should accept cursor input and pass decoded key to DB', async () => {
-      const dynKey = { pk: 'lead-xyz' };
-      const encodedCursor = Buffer.from(JSON.stringify(dynKey)).toString('base64');
+      // Cursors emitted by searchLeads are anchored to the last-scanned leadId,
+      // and DynamoDB ExclusiveStartKey is exactly {listId, leadId}.
+      const cursorKey = { listId, leadId: 'lead-prev' };
+      const encodedCursor = Buffer.from(JSON.stringify(cursorKey)).toString('base64');
 
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadsByListId.mockResolvedValue({
@@ -575,7 +581,7 @@ describe('AgentModeService - CRM Tools', () => {
         { field: 'email', operator: 'contains', value: 'john' }
       ], userId, undefined, { cursor: encodedCursor });
 
-      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledWith(listId, 200, dynKey);
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledWith(listId, 200, cursorKey);
     });
 
     it('should cap limit at 100', async () => {
