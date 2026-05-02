@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-02',
+    changes: [
+      'Fix: LinkedIn Outreach — Clear guidance when a connected account is disconnected',
+      '- When a scheduled LinkedIn outreach run fails because the Unipile-connected account is disconnected, the agent now explains the common reasons (LinkedIn revoked the session due to automation detection, you logged in from another browser/device, the session cookie expired, or Unipile lost the session internally)',
+      '- The agent now also provides step-by-step next steps: try Reconnect first in Settings > Connected Accounts, and if that does not work, remove the connection and add it again as a new connection',
+      '- Previously the session just silently ended with "Outreach failed" with no actionable guidance',
+    ],
+  },
+  {
     date: '2026-05-01',
     changes: [
       'Fix: CRM — Delete Button Now Always Visible When Leads Are Selected',

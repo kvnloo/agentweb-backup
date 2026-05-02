@@ -25,12 +25,14 @@ const mockSendMessage = jest.fn();
 const mockSendInMail = jest.fn();
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
+const mockSearchPeople = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
     sendInMail: (...args: any[]) => mockSendInMail(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
+    searchPeople: (...args: any[]) => mockSearchPeople(...args),
   },
 }));
 
@@ -410,6 +412,79 @@ describe('AgentModeService - LinkedIn Outreach', () => {
           eventType: 'linkedin.inmail.sent',
         })
       );
+    });
+  });
+
+  describe('disconnected account error handling', () => {
+    function makeDisconnectedError() {
+      const err = new Error('Disconnected account');
+      (err as any).structuredError = {
+        message: 'Disconnected account',
+        code: 'errors/disconnected_account',
+        status: 401,
+        details: 'The account appears to be disconnected from the provider service.',
+        classification: 'AUTH_ERROR',
+      };
+      return err;
+    }
+
+    it('returns actionable disconnected message for search-people with errors/disconnected_account code', async () => {
+      mockSearchPeople.mockRejectedValue(makeDisconnectedError());
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn account disconnected');
+      expect(result.error).toContain('disconnected from Unipile');
+      expect(result.error).toContain('Common reasons');
+      expect(result.error).toContain('Settings > Connected Accounts');
+      expect(result.error).toContain('remove the connection');
+    });
+
+    it('returns actionable disconnected message when classification is AUTH_ERROR without specific code', async () => {
+      const err = new Error('Unauthorized');
+      (err as any).structuredError = {
+        message: 'Unauthorized',
+        code: 'errors/unauthorized',
+        status: 401,
+        classification: 'AUTH_ERROR',
+      };
+      mockSearchPeople.mockRejectedValue(err);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn account disconnected');
+      expect(result.error).toContain('Settings > Connected Accounts');
+      expect(result.error).toContain('remove the connection');
+    });
+
+    it('returns generic error for non-auth errors (e.g. rate limit)', async () => {
+      const err = new Error('Rate limit exceeded');
+      (err as any).structuredError = {
+        message: 'Rate limit exceeded',
+        status: 429,
+        classification: 'RATE_LIMIT_ERROR',
+      };
+      mockSearchPeople.mockRejectedValue(err);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn outreach action failed');
+      expect(result.error).toBe('Rate limit exceeded');
     });
   });
 });
