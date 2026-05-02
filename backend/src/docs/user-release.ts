@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-02',
+    changes: [
+      'Fix: Analytics Pages No Longer Stuck in Skeleton Loading State',
+      '- Pages like the RankAI analytics dashboard that use IntersectionObserver or visibility-based rendering triggers now render correctly when accessed by the AI agent',
+      '- Previously, headless Chromium reported the page as hidden (visibilityState = "hidden"), causing React/Vue frameworks to skip skeleton-to-content transitions — leaving all content areas as grey placeholder animations even after 15+ seconds',
+      '- The AI agent browser now patches the visibility API and IntersectionObserver so pages fully hydrate and display real content before screenshots are taken',
+    ],
+  },
+  {
     date: '2026-05-01',
     changes: [
       'Fix: CRM — Delete Button Now Always Visible When Leads Are Selected',
