@@ -842,6 +842,19 @@ export class McpClientService {
           `try { Object.defineProperty(screen, 'colorDepth', { get: () => 24 }); Object.defineProperty(screen, 'pixelDepth', { get: () => 24 }); } catch(e) {}`,
           // Mask the HeadlessChrome string in userAgent if it slipped through
           `try { if (navigator.userAgent.includes('HeadlessChrome')) { Object.defineProperty(navigator, 'userAgent', { get: () => navigator.userAgent.replace('HeadlessChrome', 'Chrome') }); } } catch(e) {}`,
+          // Force page visibility to 'visible' — headless Chrome reports 'hidden' which causes
+          // many frameworks (React, Vue, Svelte) to skip rendering skeleton-to-content transitions.
+          // document.hidden and document.visibilityState must both be patched for full coverage.
+          `try { Object.defineProperty(document, 'hidden', { get: () => false }); Object.defineProperty(document, 'visibilityState', { get: () => 'visible' }); } catch(e) {}`,
+          // Patch document.hasFocus() — some frameworks use this to gate data loading
+          `try { document.hasFocus = () => true; } catch(e) {}`,
+          // Patch IntersectionObserver so all observed elements are immediately reported as
+          // intersecting. Pages that lazy-load content behind IntersectionObserver never fire
+          // in headless because there is no real viewport intersection event.
+          `try { const _NativeIO = window.IntersectionObserver; window.IntersectionObserver = function(cb, opts) { const io = new _NativeIO(cb, opts); const _observe = io.observe.bind(io); io.observe = (el) => { _observe(el); try { cb([{ isIntersecting: true, intersectionRatio: 1, target: el, boundingClientRect: el.getBoundingClientRect(), intersectionRect: el.getBoundingClientRect(), rootBounds: null, time: performance.now() }], io); } catch(e) {} }; return io; }; window.IntersectionObserver.prototype = _NativeIO.prototype; } catch(e) {}`,
+          // Dispatch a visibilitychange event after DOM loads so listeners that run once on
+          // visibility change (e.g. analytics dashboards that defer render until tab is visible) fire.
+          `try { document.addEventListener('DOMContentLoaded', () => { try { document.dispatchEvent(new Event('visibilitychange')); } catch(e) {} }, { once: true }); } catch(e) {}`,
         ].join('\n');
         const stealthScriptPath = path.join(configDir, `${configKey}-stealth.js`);
         fs.writeFileSync(stealthScriptPath, stealthScriptContent);
