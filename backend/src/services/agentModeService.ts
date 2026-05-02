@@ -20705,6 +20705,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (!alreadyLogged && !isExpectedUserError) {
         console.error('AgentMode: LinkedIn outreach failed:', error);
       }
+
+      const structuredError = (error as any).structuredError;
+      if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
+        return {
+          success: false,
+          message: 'LinkedIn account disconnected',
+          error: [
+            'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
+            '',
+            'Common reasons a connected account becomes disconnected:',
+            '1. LinkedIn detected automation activity and revoked the session',
+            '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
+            '3. The LinkedIn session cookie expired (typically every 30–90 days)',
+            '4. Unipile lost the session internally and requires a manual reconnect',
+            '',
+            'Next steps:',
+            '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
+            '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
+          ].join('\n')
+        };
+      }
+
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
