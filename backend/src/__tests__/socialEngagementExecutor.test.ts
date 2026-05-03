@@ -800,15 +800,29 @@ describe('SocialEngagementExecutor', () => {
       expect(mockAdapter.getPost).toHaveBeenCalled();
     });
 
-    it('should fall back to "[Post content unavailable]" when getPost throws', async () => {
-      const action = makeAction();
+    it('should still complete (like only) when getPost throws', async () => {
+      const action = makeAction(); // actionType: 'like' — no comment involved
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
       mockAdapter.getPost.mockRejectedValue(new Error('Post not found'));
       mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
-      // Should still complete (fallback content used)
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' })
+      );
+    });
+
+    it('should skip comment but still complete when getPost throws on comment action', async () => {
+      const action = makeAction({ variableValues: { postId: 'urn:li:share:123', platform: 'linkedin', ownerAccountId: 'acc-owner-1', engagingAccountId: 'acc-engager-1', actionType: 'comment', targetType: 'post' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAdapter.getPost.mockRejectedValue(new Error('Post not found'));
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Great post') as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      // Comment must NOT be posted — no LLM call, no createComment
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
       expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
         expect.objectContaining({ status: 'completed' })
       );
