@@ -223,21 +223,25 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doComment) {
-            // Real-time dedup: check if this account already commented on the post
-            const alreadyCommented = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, postId);
-            if (alreadyCommented) {
-                console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
+            if (!postContent) {
+                console.warn(`[Executor] Skipping comment on ${postId}: post content could not be fetched.`);
             } else {
-                generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext);
-                console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
-                await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
-                console.log(`[Executor] Comment posted on post ${postId}`);
+                // Real-time dedup: check if this account already commented on the post
+                const alreadyCommented = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, postId);
+                if (alreadyCommented) {
+                    console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
+                } else {
+                    generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext);
+                    console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
+                    await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
+                    console.log(`[Executor] Comment posted on post ${postId}`);
+                }
             }
         }
 
         if (doLike) {
             try {
-                reactionType = await this.generateReactionType(postContent);
+                reactionType = await this.generateReactionType(postContent || '');
                 await adapter.createReaction(engagingConnection, postId, reactionType, engagingUserId);
                 console.log(`[Executor] Reacted "${reactionType}" on post ${postId}`);
             } catch (likeErr: any) {
@@ -263,7 +267,7 @@ export class SocialEngagementExecutor {
         ownerAccountId: string | undefined,
         ownerUserId: string,
         postId: string
-    ): Promise<{ content: string; ownerConnection?: ConnectedAccount }> {
+    ): Promise<{ content: string | null; ownerConnection?: ConnectedAccount }> {
         let ownerConnection: ConnectedAccount | undefined;
         try {
             // Prefer fetching via the owner's account (has direct DB/API access to the post)
@@ -286,7 +290,7 @@ export class SocialEngagementExecutor {
         } catch (err) {
             console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
         }
-        return { content: '[Post content unavailable]', ownerConnection };
+        return { content: null, ownerConnection };
     }
 
     /**
