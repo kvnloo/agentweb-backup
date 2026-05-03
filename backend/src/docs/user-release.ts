@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-03',
+    changes: [
+      'Fix: Auto-engagement no longer posts AI meta-messages as LinkedIn comments',
+      '- When the system could not fetch a post\'s content (due to a LinkedIn API error or auth issue), it was passing a placeholder to the AI model, which responded with a clarification request ("Please provide the post content...") that was then posted to LinkedIn as a real comment',
+      '- The system now skips commenting entirely when post content cannot be fetched, rather than sending a broken placeholder to the AI',
+    ],
+  },
+  {
     date: '2026-05-02',
     changes: [
       'Fix: Analytics Pages No Longer Stuck in Skeleton Loading State',
