@@ -1,3 +1,41 @@
+## "Bounced" Users Investigation — info@pmps.ai, admin@btstravel.be (2026-05-04)
+
+### Context
+
+Two users appeared in the Admin Users tab with a "Bounced" subscription status despite having valid Stripe customer IDs (`cus_USLZ3JNSb1epH2` and `cus_UQlSsGMRJCJSZ0` respectively). No corresponding subscription records could be found in Stripe.
+
+### Root Cause: Abandoned Checkout
+
+The "Bounced" label is working correctly. It is a frontend-derived status defined in `partner-portal/src/pages/AdminDashboard.tsx` (around line 3774):
+
+```
+bounced = stripe_customer_id set  AND  subscription_status null  AND  subscription_amount null
+```
+
+The exact sequence that produces this state:
+
+1. User registers → `subscriptionType: Free`, no Stripe fields set
+2. User opens the checkout flow → `POST /create-checkout-session` (`backend/src/routes/stripe.ts:442–448`) runs a "find or create Stripe customer" step and saves the new `cus_xxx` ID to DynamoDB immediately
+3. User **abandons the checkout page before entering payment info** → no subscription is ever created on Stripe
+4. No `checkout.session.completed` webhook fires → `subscription_status`, `stripe_subscription_id`, `subscription_amount` are never populated
+
+Result: DynamoDB has a `stripe_customer_id` but zero subscription fields → frontend labels the user "Bounced."
+
+| User | Stripe Customer ID | Account Created |
+|------|--------------------|-----------------|
+| info@pmps.ai | cus_USLZ3JNSb1epH2 | 2026-05-04 |
+| admin@btstravel.be | cus_UQlSsGMRJCJSZ0 | 2026-04-30 |
+
+### Verification
+
+You can confirm by searching these customer IDs in the Stripe dashboard — the customer objects exist but have no subscriptions attached.
+
+### No Code Fix Required
+
+The system is behaving as designed. "Bounced" is an accurate label for users who started but did not complete checkout. These users are candidates for re-engagement outreach.
+
+---
+
 ## RankAI Meta Ads Account Security Investigation (2026-05-04)
 
 ### Context
