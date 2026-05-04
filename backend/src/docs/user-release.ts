@@ -5618,6 +5618,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-04',
+    changes: [
+      'Improved: Emma Now Produces Higher-Quality, Brand-Specific Content',
+      '- Emma is now explicitly instructed to draw on your brand voice, ICP, tone of voice, and knowledge base materials before generating any content',
+      '- Generic filler and templated boilerplate are no longer acceptable — all output must be specific to your business and audience',
+      '- After generating content, Emma briefly explains her quality choices and flags any gaps (e.g., missing brand context or knowledge base) with suggestions to strengthen the output',
+    ],
+  },
+  {
     date: '2026-04-30',
     changes: [
       'Fixed: Emma No Longer Shows "Thinking..." After Responding',

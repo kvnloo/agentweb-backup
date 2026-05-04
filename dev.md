@@ -3956,3 +3956,28 @@ No action yet. The schedule recovered on its own the next day. We will wait unti
 1. Detect `errors/already_invited_recently` specifically in `handleError()` and return a distinct `RATE_LIMIT_ERROR` type (separate from generic `VALIDATION_ERROR`)
 2. Surface a clear "rate limited — stop sending invitations" signal to the agent in the `send-invite` tool response
 3. Optionally add a pending-invite pre-flight check in `sendInvitation()` before calling Unipile
+
+## Quality Agent Tool for Emma — Design Decision (2026-05-04)
+
+### Context
+
+Explored adding a dedicated `assess_quality` tool that Emma could call after generating content (LinkedIn posts, blog articles, ad images, etc.) to score and justify the quality of her output. The existing `sessionScoringService.ts` already scores sessions on a 1–5 scale across three dimensions (goalCompletion, dataAccuracy, outputQuality) but operates at session level and is admin-only.
+
+### Options Considered
+
+1. **New `assess_quality` Emma tool** — standalone tool with per-content-type rubrics, called proactively or on-demand after content creation.
+2. **Quality built into creation tools** — modify `create_social_media_posts`, `create_blog_article`, etc. to return a quality object alongside the content.
+3. **Expose session scoring to Emma** — extend `scoreSessionIfNeeded` to extract and score individual artifacts from conversation history.
+
+### Decision
+
+**Defer all three options.** Chosen approach instead: add a Content Quality Standard section to Emma's system prompt (`agentModeSystemPrompt.ts`) instructing her to draw on brand/ICP context before generating content and briefly justify quality choices inline after generation. This is simpler, zero-latency, and directly addresses the root cause (generic/slop output) without added tooling complexity.
+
+The quality agent tool approach was set aside for the following reasons:
+- **UX impact**: Every content creation call would incur an additional LLM round-trip (~2–3s), visibly slowing Emma's responses.
+- **Complexity**: Per-content-type rubrics require ongoing maintenance; scoring prompts would drift from actual quality criteria over time.
+- **Diminishing returns**: The session scorer already captures output quality as a dimension. A separate per-artifact scorer adds infra without clear signal advantage until we have evidence the prompt-level fix is insufficient.
+
+### Future Consideration
+
+Revisit if prompt-level instruction proves insufficient — i.e., Emma continues producing generic content despite the quality standard directive. At that point, Option 1 (standalone `assess_quality` tool with content-type-specific rubrics) is the recommended starting point.
