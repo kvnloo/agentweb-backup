@@ -218,6 +218,29 @@ describe('reportUIError', () => {
       });
       expect(call.context).not.toHaveProperty('Onboarding Stage');
     });
+
+    it('assigns onboarding issues to Harsha', async () => {
+      userDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'u@example.com' });
+
+      await reportUIError({
+        operation: 'onboarding:brand:submit',
+        errorMessage: 'Submit failed',
+        userId: 'user-1',
+      });
+
+      const call = mockCreateOncallItem.mock.calls[0][0];
+      expect(call.assigneeId).toBe('1c8d872b-594c-8168-8c1b-00022b54e40d'); // Harsha
+    });
+
+    it('does not set assigneeId for non-onboarding operations', async () => {
+      await reportUIError({
+        operation: 'react-error-boundary',
+        errorMessage: 'Crash',
+      });
+
+      const call = mockCreateOncallItem.mock.calls[0][0];
+      expect(call.assigneeId).toBeUndefined();
+    });
   });
 
   describe('attribution enrichment', () => {

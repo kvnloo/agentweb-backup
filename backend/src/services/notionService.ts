@@ -241,6 +241,8 @@ export interface CreateOncallItemParams {
   description: string;
   additionalTags?: string[];
   context?: Record<string, any>;
+  /** Notion user ID to assign as Owner. Defaults to Rui (RUI_USER_ID). */
+  assigneeId?: string;
 }
 
 export interface CreateOncallItemResult {
@@ -255,7 +257,9 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
   }
   const { apiToken } = await getNotionCredentials();
   const databaseId = await getSprintTasksDatabaseId();
-  const { title, description, additionalTags = [], context } = params;
+  const { title, description, additionalTags = [], context, assigneeId } = params;
+  const RUI_USER_ID = '1c8d872b-594c-816c-8935-00027d2a3a90';
+  const ownerId = assigneeId ?? RUI_USER_ID;
 
   const tags = [{ name: 'Oncall' }, ...additionalTags.map(t => ({ name: t }))];
 
@@ -300,7 +304,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
         'Tags': { multi_select: tags },
         'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
         'Move to Current Sprint': { checkbox: true },
-        'Owner': { people: [{ id: '1c8d872b-594c-816c-8935-00027d2a3a90' }] },
+        'Owner': { people: [{ id: ownerId }] },
       },
       children,
     }),

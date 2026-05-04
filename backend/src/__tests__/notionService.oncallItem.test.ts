@@ -63,7 +63,24 @@ describe('notionService - createOncallItem', () => {
     expect(body.properties['Tags'].multi_select).toEqual([{ name: 'Oncall' }]);
     expect(body.properties['Sprint'].rich_text[0].text.content).toBe('Backlog');
     expect(body.properties['Move to Current Sprint'].checkbox).toBe(true);
+    expect(body.properties['Owner'].people[0].id).toBe('1c8d872b-594c-816c-8935-00027d2a3a90'); // Rui by default
     expect(body.children[0].paragraph.rich_text[0].text.content).toBe('Something broke');
+  });
+
+  it('should assign to custom assigneeId when provided', async () => {
+    mockFetch.mockResolvedValueOnce({
+      json: async () => ({ id: 'page-id', object: 'page' }),
+      status: 200,
+    });
+
+    await createOncallItem({
+      title: 'Onboarding issue',
+      description: 'User stuck',
+      assigneeId: '1c8d872b-594c-8168-8c1b-00022b54e40d', // Harsha
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.properties['Owner'].people[0].id).toBe('1c8d872b-594c-8168-8c1b-00022b54e40d');
   });
 
   it('should include additional tags merged with Oncall', async () => {
