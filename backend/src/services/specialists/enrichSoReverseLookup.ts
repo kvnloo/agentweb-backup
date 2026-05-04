@@ -67,6 +67,7 @@ function buildSpec(
         value,
         confidence: 'high',
         source: 'linkedin',
+        provider: 'enrich.so',
       } satisfies SpecialistResult;
     },
   };

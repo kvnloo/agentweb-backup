@@ -18,6 +18,9 @@ export interface SpecialistResult {
   value: string;
   confidence: 'high' | 'medium' | 'low';
   source: EnrichedFieldMeta['source'];
+  /** Specific data provider (e.g. 'enrich.so', 'unipile', 'crunchbase'). UI
+   *  prefers this label over `source` when set. Visible only to admins. */
+  provider?: string;
   sourceUrl?: string;
   sourceQuote?: string;
 }
@@ -61,7 +64,7 @@ export interface SpecialistFailure {
 
 export interface RunSpecialistsResult {
   resolvedFields: Record<string, string | null>;
-  resolvedMeta: Record<string, Pick<EnrichedFieldMeta, 'source' | 'sourceUrl' | 'sourceQuote' | 'confidence'>>;
+  resolvedMeta: Record<string, Pick<EnrichedFieldMeta, 'source' | 'provider' | 'sourceUrl' | 'sourceQuote' | 'confidence'>>;
   sourceContexts: string[];
   /**
    * Specialists that threw while resolving. Non-fatal — the LLM-extraction
@@ -107,6 +110,7 @@ export async function runSpecialists(
         resolvedFields[field] = r.value;
         resolvedMeta[field] = {
           source: r.source,
+          provider: r.provider,
           sourceUrl: r.sourceUrl,
           sourceQuote: r.sourceQuote,
           confidence: r.confidence,

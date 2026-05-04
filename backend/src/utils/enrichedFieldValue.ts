@@ -7,6 +7,14 @@
  */
 export interface EnrichedFieldMeta {
   source: 'web_search' | 'linkedin' | 'existing_data' | 'manual';
+  /**
+   * Specific data provider that produced this value, when known. `source` says
+   * what *kind* of data it is (web vs linkedin vs internal); `provider` says
+   * *who* supplied it (e.g. enrich.so, unipile, crunchbase, openmart). The
+   * provenance UI shows the provider when set, falling back to the source
+   * label. Visible only to admins / delegated sessions.
+   */
+  provider?: string;
   sourceUrl?: string;
   sourceQuote?: string;
   confidence?: 'high' | 'medium' | 'low';

@@ -232,7 +232,20 @@ async function findEmailsForLeadsInBackground(
         { userId },
       );
       if (r.found && r.email) {
-        await crmDb.updateLead(listId, lead.leadId, { email: r.email });
+        // Record provenance alongside the value so the UI badge shows where
+        // the email came from (admin/delegated only — gated in EnrichedValue).
+        const now = new Date().toISOString();
+        const enrichmentMetadata = {
+          ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
+          email: {
+            source: 'web_search' as const,
+            provider: 'enrich.so',
+            confidence: r.confidence,
+            enrichedAt: now,
+            sourceQuote: r.message,
+          },
+        };
+        await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
       }
     } catch (err) {
       console.error('[CRM enrich.so] bulk find-email failed for', lead.leadId, ':', (err as Error).message);
@@ -265,7 +278,20 @@ async function lookupProfilesForLeadsInBackground(
       if (!lead.title && r.jobTitle) updates.title = r.jobTitle;
       if (!lead.linkedin && r.profileUrl) updates.linkedin = r.profileUrl;
       if (Object.keys(updates).length > 0) {
-        await crmDb.updateLead(listId, lead.leadId, updates as any);
+        // Tag every newly-filled field with provenance so the UI badge can
+        // attribute it to enrich.so (admin/delegated only).
+        const now = new Date().toISOString();
+        const fieldMetaForProvider = {
+          source: 'linkedin' as const,
+          provider: 'enrich.so',
+          confidence: 'high' as const,
+          enrichedAt: now,
+        };
+        const newMeta: Record<string, any> = { ...((lead.enrichmentMetadata ?? {}) as Record<string, any>) };
+        for (const k of Object.keys(updates)) {
+          newMeta[k] = fieldMetaForProvider;
+        }
+        await crmDb.updateLead(listId, lead.leadId, { ...updates, enrichmentMetadata: newMeta } as any);
       }
     } catch (err) {
       console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);

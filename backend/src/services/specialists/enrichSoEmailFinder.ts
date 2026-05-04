@@ -54,6 +54,7 @@ async function resolveEmail(lead: any, ctx: { userId: string }): Promise<Special
       value: r.email,
       confidence: r.confidence ?? 'medium',
       source: 'web_search',
+      provider: 'enrich.so',
       sourceQuote: r.message,
     };
   } catch {

@@ -233,7 +233,7 @@ export function parseFundingRound(snippets: CrunchbaseSnippet[]): SpecialistResu
         return {
           value: stage.value,
           confidence: 'high',
-          source: 'web_search',
+          source: 'web_search', provider: 'crunchbase',
           sourceUrl: snip.url,
           sourceQuote: extractContextWindow(haystack, m.index, 60),
         };
@@ -260,7 +260,7 @@ export function parseTotalFunding(snippets: CrunchbaseSnippet[]): SpecialistResu
         value: String(Math.round(num * mult)),
         // Snippets often show last-round amount, not total — use medium confidence
         confidence: 'medium',
-        source: 'web_search',
+        source: 'web_search', provider: 'crunchbase',
         sourceUrl: snip.url,
         sourceQuote: extractContextWindow(haystack, m.index, 40),
       };
@@ -287,7 +287,7 @@ export function parseHqCity(snippets: CrunchbaseSnippet[]): SpecialistResult | n
         return {
           value: m[1].trim(),
           confidence: 'high',
-          source: 'web_search',
+          source: 'web_search', provider: 'crunchbase',
           sourceUrl: snip.url,
           sourceQuote: extractContextWindow(haystack, m.index, 50),
         };
