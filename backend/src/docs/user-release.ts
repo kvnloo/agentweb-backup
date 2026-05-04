@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-04',
+    changes: [
+      'Fix: Onboarding oncall issues in Notion are now automatically assigned to Harsha',
+      '- Previously all platform-reported issues defaulted to Rui as owner, requiring manual reassignment for onboarding issues',
+      '- Issues with titles starting with "Onboarding" (case-insensitive) are now routed directly to Harsha',
+    ],
+  },
+  {
     date: '2026-05-03',
     changes: [
       'Fix: Auto-engagement no longer posts AI meta-messages as LinkedIn comments',

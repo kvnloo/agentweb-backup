@@ -218,6 +218,29 @@ describe('reportUIError', () => {
       });
       expect(call.context).not.toHaveProperty('Onboarding Stage');
     });
+
+    it('uses "Onboarding Error:" title prefix for onboarding operations so Notion routes to Harsha', async () => {
+      userDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'u@example.com' });
+
+      await reportUIError({
+        operation: 'onboarding:brand:submit',
+        errorMessage: 'Submit failed',
+        userId: 'user-1',
+      });
+
+      const call = mockCreateOncallItem.mock.calls[0][0];
+      expect(call.title).toBe('Onboarding Error: onboarding:brand:submit');
+    });
+
+    it('uses "UI Error:" title prefix for non-onboarding operations', async () => {
+      await reportUIError({
+        operation: 'react-error-boundary',
+        errorMessage: 'Crash',
+      });
+
+      const call = mockCreateOncallItem.mock.calls[0][0];
+      expect(call.title).toBe('UI Error: react-error-boundary');
+    });
   });
 
   describe('attribution enrichment', () => {
