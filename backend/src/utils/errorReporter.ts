@@ -1,5 +1,4 @@
 import { emailService } from '../services/emailService';
-import { HARSHA_USER_ID } from '../services/swarm/types';
 
 export interface UIErrorReport {
   operation: string;
@@ -135,7 +134,8 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
 
   dedupCache.set(fingerprint, now);
 
-  const subject = `UI Error: ${operation}`;
+  const isOnboarding = operation.startsWith('onboarding:');
+  const subject = isOnboarding ? `Onboarding Error: ${operation}` : `UI Error: ${operation}`;
   let fullContext: Record<string, any> = {
     Operation: operation,
     ...(userId ? { 'User ID': userId } : {}),
@@ -152,13 +152,11 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
 
   try {
     const { createOncallItem } = await import('../services/notionService');
-    const isOnboarding = operation.startsWith('onboarding:');
     const { notionUrl } = await createOncallItem({
       title: subject,
       description: errorMessage,
       additionalTags: ['UI Error'],
       context: fullContext,
-      ...(isOnboarding ? { assigneeId: HARSHA_USER_ID } : {}),
     });
     // Pass notionUrl so sendOncallAlert sends the slim email (skips re-creating Notion item)
     await emailService.sendOncallAlert(subject, errorMessage, fullContext, notionUrl);

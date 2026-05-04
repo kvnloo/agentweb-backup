@@ -28,7 +28,6 @@
  *   - Users idle < STUCK_HOURS skipped
  */
 import { userDb } from '../services/db';
-import { HARSHA_USER_ID } from '../services/swarm/types';
 
 const STUCK_HOURS = Number(process.env.ONBOARDING_STUCK_HOURS ?? '1');
 
@@ -180,7 +179,6 @@ export async function runOnboardingStuckDetector(): Promise<DailyStuckReport> {
         description,
         additionalTags: ['Onboarding'],
         context,
-        assigneeId: HARSHA_USER_ID,
       });
       notionUrl = result.notionUrl || null;
     } catch (err) {

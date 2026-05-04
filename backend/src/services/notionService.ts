@@ -241,8 +241,6 @@ export interface CreateOncallItemParams {
   description: string;
   additionalTags?: string[];
   context?: Record<string, any>;
-  /** Notion user ID to assign as Owner. Defaults to Rui (RUI_USER_ID). */
-  assigneeId?: string;
 }
 
 export interface CreateOncallItemResult {
@@ -257,9 +255,10 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
   }
   const { apiToken } = await getNotionCredentials();
   const databaseId = await getSprintTasksDatabaseId();
-  const { title, description, additionalTags = [], context, assigneeId } = params;
+  const { title, description, additionalTags = [], context } = params;
   const RUI_USER_ID = '1c8d872b-594c-816c-8935-00027d2a3a90';
-  const ownerId = assigneeId ?? RUI_USER_ID;
+  const HARSHA_USER_ID = '1c8d872b-594c-8168-8c1b-00022b54e40d';
+  const ownerId = /^onboarding/i.test(title) ? HARSHA_USER_ID : RUI_USER_ID;
 
   const tags = [{ name: 'Oncall' }, ...additionalTags.map(t => ({ name: t }))];
 

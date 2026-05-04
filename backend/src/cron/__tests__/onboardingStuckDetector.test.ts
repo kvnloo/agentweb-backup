@@ -100,7 +100,6 @@ describe('runOnboardingStuckDetector — daily aggregated report', () => {
       expect.objectContaining({
         title: expect.stringMatching(/^Onboarding stuck users — daily report /),
         additionalTags: expect.arrayContaining(['Onboarding']),
-        assigneeId: '1c8d872b-594c-8168-8c1b-00022b54e40d', // Harsha
       }),
     );
     // Title carries today's date (YYYY-MM-DD)
