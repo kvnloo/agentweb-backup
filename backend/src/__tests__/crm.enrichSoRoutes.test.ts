@@ -318,6 +318,91 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
   });
 });
 
+// ─── bulk find-emails / lookup-emails / counts ───────────────────────────────
+
+describe('GET /api/crm/lists/:listId/leads/enrichment-counts', () => {
+  it('returns 404 when list missing', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(null);
+    const res = await request(app).get('/api/crm/lists/L1/leads/enrichment-counts');
+    expect(res.status).toBe(404);
+  });
+
+  it('tallies validate / find / lookup buckets', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        // Has email + validation + all profile fields → counted in alreadyDone for everything
+        { leadId: '1', email: 'a@b.com', firstName: 'A', lastName: 'B', company: 'X', title: 'T', linkedin: 'l',
+          customFields: { email_validation: { status: 'deliverable' } } },
+        // Has email but no validation yet → validate.pending
+        { leadId: '2', email: 'c@d.com', firstName: 'C', lastName: 'D', company: 'Y' },
+        // No email but has name+company → find.pending
+        { leadId: '3', firstName: 'E', lastName: 'F', company: 'Z' },
+        // Skipped — has nothing
+        { leadId: '4' },
+      ],
+      lastEvaluatedKey: undefined,
+    } as any);
+    const res = await request(app).get('/api/crm/lists/L1/leads/enrichment-counts');
+    expect(res.status).toBe(200);
+    expect(res.body.total).toBe(4);
+    expect(res.body.validate.pending).toBe(1);   // lead 2
+    expect(res.body.find.pending).toBe(1);       // lead 3
+    expect(res.body.lookup.pending).toBe(1);     // lead 2 (missing title/linkedin)
+    expect(res.body.lookup.alreadyDone).toBe(1); // lead 1
+  });
+});
+
+describe('POST /api/crm/lists/:listId/leads/find-emails (bulk)', () => {
+  it('returns 202 + counts; queues only applicable leads (name+company, no email)', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        { leadId: '1', firstName: 'A', lastName: 'B', company: 'Acme' },     // applicable
+        { leadId: '2', email: 'has@email.com', firstName: 'X' },              // alreadyDone
+        { leadId: '3', firstName: 'C' },                                       // skipped (no company)
+      ],
+      lastEvaluatedKey: undefined,
+    } as any);
+    const res = await request(app).post('/api/crm/lists/L1/leads/find-emails').send({});
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 1 });
+  });
+
+  it('returns 403 on cross-tenant access', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'someone-else' } as any);
+    const res = await request(app).post('/api/crm/lists/L1/leads/find-emails').send({});
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
+  it('returns 202 + counts; queues only leads with email AND missing profile fields', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        // Complete profile → alreadyDone (lookup), skipped from queue
+        { leadId: '1', email: 'a@b.com', firstName: 'A', lastName: 'B', company: 'X', title: 'T', linkedin: 'l' },
+        // Has email but missing fields → applicable
+        { leadId: '2', email: 'c@d.com', firstName: 'C' },
+        // No email → skipped entirely (counts as neither applicable nor alreadyDone)
+        { leadId: '3', firstName: 'E', company: 'Y' },
+      ],
+      lastEvaluatedKey: undefined,
+    } as any);
+    const res = await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    expect(res.status).toBe(202);
+    expect(res.body.queued).toBe(1);
+    expect(res.body.alreadyDone).toBe(1);
+  });
+
+  it('returns 404 when list missing', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(null);
+    const res = await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    expect(res.status).toBe(404);
+  });
+});
+
 // ─── lookup-by-email ─────────────────────────────────────────────────────────
 
 describe('POST /api/crm/leads/lookup-by-email', () => {

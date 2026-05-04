@@ -184,6 +184,211 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
   }
 });
 
+// ─── Bulk operations on the whole list ───────────────────────────────────────
+//
+// All three "Validate / Find / Lookup" bulk endpoints follow the same shape:
+//   1. Walk all leads in the list (paginated)
+//   2. Filter to "applicable" ones based on what data the lead already has
+//   3. Background-process each via the EnrichSoService (counts toward quota)
+//   4. Write results back to the lead, but ONLY into empty fields so we never
+//      clobber user-entered data
+// They return 202 with { queued, skipped, alreadyProcessed }.
+
+async function fetchAllLeads(listId: string): Promise<any[]> {
+  const out: any[] = [];
+  let lastKey: any = undefined;
+  do {
+    const page = await crmDb.getLeadsByListId(listId, 100, lastKey);
+    out.push(...page.items);
+    lastKey = page.lastEvaluatedKey;
+  } while (lastKey);
+  return out;
+}
+
+/**
+ * Background bulk find-email — for leads with name + (company or website) but
+ * no email, look up the email and write it back to the lead record. Does not
+ * block the response. Failures per-lead are swallowed (logged).
+ */
+async function findEmailsForLeadsInBackground(
+  listId: string,
+  leads: any[],
+  userId: string,
+): Promise<void> {
+  let svc;
+  try { svc = getEnrichSoService(); } catch { return; }
+  await Promise.allSettled(leads.map(async (lead) => {
+    const firstName = (lead.firstName ?? '').trim();
+    const lastName = (lead.lastName ?? '').trim();
+    const company = (lead.company ?? '').trim();
+    const website = (lead.website ?? '').trim();
+    const domain = website
+      ? website.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '')
+      : '';
+    if ((!firstName && !lastName) || (!domain && !company)) return;
+    try {
+      const r = await svc.findEmail(
+        { firstName, lastName, domain: domain || undefined, company: domain ? undefined : company },
+        { userId },
+      );
+      if (r.found && r.email) {
+        await crmDb.updateLead(listId, lead.leadId, { email: r.email });
+      }
+    } catch (err) {
+      console.error('[CRM enrich.so] bulk find-email failed for', lead.leadId, ':', (err as Error).message);
+    }
+  }));
+}
+
+/**
+ * Background bulk reverse-lookup — for leads with email but missing one or
+ * more profile fields (firstName/lastName/company/title/linkedin), fetch the
+ * profile and fill ONLY the empty fields. Never overwrites user data.
+ */
+async function lookupProfilesForLeadsInBackground(
+  listId: string,
+  leads: any[],
+  userId: string,
+): Promise<void> {
+  let svc;
+  try { svc = getEnrichSoService(); } catch { return; }
+  await Promise.allSettled(leads.map(async (lead) => {
+    const email = (lead.email ?? '').trim();
+    if (!email) return;
+    try {
+      const r = await svc.reverseLookup(email, { userId });
+      if (!r.found) return;
+      const updates: Record<string, string> = {};
+      if (!lead.firstName && r.firstName) updates.firstName = r.firstName;
+      if (!lead.lastName && r.lastName) updates.lastName = r.lastName;
+      if (!lead.company && r.companyName) updates.company = r.companyName;
+      if (!lead.title && r.jobTitle) updates.title = r.jobTitle;
+      if (!lead.linkedin && r.profileUrl) updates.linkedin = r.profileUrl;
+      if (Object.keys(updates).length > 0) {
+        await crmDb.updateLead(listId, lead.leadId, updates as any);
+      }
+    } catch (err) {
+      console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
+    }
+  }));
+}
+
+function isApplicableForFindEmail(lead: any): boolean {
+  return !lead.email
+    && (!!lead.firstName || !!lead.lastName)
+    && (!!lead.company || !!lead.website);
+}
+
+function isApplicableForLookup(lead: any): boolean {
+  if (!lead.email) return false;
+  // Applicable when at least one profile field is missing
+  return !lead.firstName || !lead.lastName || !lead.company || !lead.title || !lead.linkedin;
+}
+
+/**
+ * GET /lists/:listId/leads/enrichment-counts
+ * Returns counts that the bulk-confirm dialogs use to show "X will process,
+ * Y already processed" before the user confirms. Cheap — just walks the
+ * leads table once and tallies.
+ */
+router.get('/lists/:listId/leads/enrichment-counts', async (req: Request, res: Response) => {
+  const { listId } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const leads = await fetchAllLeads(listId);
+    const total = leads.length;
+    const withEmail = leads.filter((l: any) => !!l.email).length;
+    const validatePending = leads.filter((l: any) => l.email && !l.customFields?.email_validation).length;
+    const validateAlreadyDone = withEmail - validatePending;
+    const findPending = leads.filter(isApplicableForFindEmail).length;
+    const lookupPending = leads.filter(isApplicableForLookup).length;
+    // "Already processed" for find = leads that NOW have email (we can't tell
+    // if it was provider-found or user-typed, but for UX showing how many are
+    // "complete" is what matters).
+    const findAlreadyDone = withEmail;
+    // For lookup, "already done" = leads with all profile fields filled
+    const lookupAlreadyDone = leads.filter((l: any) =>
+      l.email && l.firstName && l.lastName && l.company && l.title && l.linkedin,
+    ).length;
+
+    return res.json({
+      total,
+      validate: { pending: validatePending, alreadyDone: validateAlreadyDone },
+      find:     { pending: findPending,     alreadyDone: findAlreadyDone },
+      lookup:   { pending: lookupPending,   alreadyDone: lookupAlreadyDone },
+    });
+  } catch (error: any) {
+    console.error('[CRM enrich.so] enrichment-counts error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to compute enrichment counts' });
+  }
+});
+
+/**
+ * POST /lists/:listId/leads/find-emails
+ * Body: (none — operates on the whole list)
+ * Returns: 202 { queued, skipped, alreadyDone }
+ */
+router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Response) => {
+  const { listId } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const leads = await fetchAllLeads(listId);
+    const applicable = leads.filter(isApplicableForFindEmail);
+    const alreadyDone = leads.filter((l: any) => !!l.email).length;
+    const skipped = leads.length - applicable.length - alreadyDone;
+    void findEmailsForLeadsInBackground(listId, applicable, userId);
+    return res.status(202).json({ queued: applicable.length, skipped, alreadyDone });
+  } catch (error: any) {
+    console.error('[CRM enrich.so] bulk find-emails error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to queue email finder' });
+  }
+});
+
+/**
+ * POST /lists/:listId/leads/lookup-emails
+ * Body: (none — operates on the whole list)
+ * Returns: 202 { queued, skipped, alreadyDone }
+ */
+router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Response) => {
+  const { listId } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const leads = await fetchAllLeads(listId);
+    const applicable = leads.filter(isApplicableForLookup);
+    const alreadyDone = leads.filter((l: any) =>
+      l.email && l.firstName && l.lastName && l.company && l.title && l.linkedin,
+    ).length;
+    const skipped = leads.length - applicable.length - alreadyDone;
+    void lookupProfilesForLeadsInBackground(listId, applicable, userId);
+    return res.status(202).json({ queued: applicable.length, skipped, alreadyDone });
+  } catch (error: any) {
+    console.error('[CRM enrich.so] bulk lookup-emails error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to queue profile lookup' });
+  }
+});
+
 /**
  * POST /lists/:listId/leads/validate-emails
  * Body: { leadIds?: string[] }  (omit → all leads in list)
