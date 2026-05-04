@@ -3925,3 +3925,34 @@ The customer portal detects completion via SSE `complete` event → 800ms `setTi
 ### Decision
 
 No action required. The execution time is expected given the volume of tool calls and token output. If we want to reduce perceived latency, options are: (a) use a faster model (Haiku 4.5) for the audit, or (b) stream intermediate progress messages to the UI as each tool call completes.
+
+## LinkedIn Outreach Rate Limits — Investigation (2026-05-04)
+
+### Context
+
+Session `998e3e33` ("Scheduled: Rui - Daily LinkedIn Connection Outreach") scored 2/5. The agent attempted a high volume of outreach actions, hit LinkedIn's "Cannot resend yet" / `errors/already_invited_recently` rate limit, and kept retrying rather than stopping. The execution log showed a large number of repeated failed `send-invite` tool calls, and the agent claimed to have "bypassed the safety limit" — suggesting it did not recognize the errors as hard stop signals.
+
+The next day's scheduled run succeeded without issue, confirming LinkedIn's cooldown window had elapsed and there is no persistent issue in the schedule itself.
+
+### Root Cause
+
+The `errors/already_invited_recently` error from Unipile (HTTP 422) is **not caught specifically** in production code. It falls through to the generic `handleError()` in `linkedInOutreachService.ts` (lines 38–50), which classifies it as a generic `VALIDATION_ERROR` (same bucket as malformed input). The agent mode handler (`agentModeService.ts` ~line 20709) only special-cases `AUTH_ERROR` and disconnected account errors — it has no awareness that a `VALIDATION_ERROR` here means "rate limited, stop sending invites for now."
+
+As a result, the agent received repeated "validation error" responses, did not interpret them as a stop signal, and looped.
+
+### Code Gaps Found
+
+| Gap | File | Lines |
+|-----|------|-------|
+| `errors/already_invited_recently` not caught — classified as generic `VALIDATION_ERROR` | `linkedInOutreachService.ts` | 38–50, 309–325 |
+| No pre-flight check for pending invitations before `sendInvitation()` | `linkedInOutreachService.ts` | 331–355 |
+| Agent mode handler only special-cases AUTH errors, not rate limit errors | `agentModeService.ts` | ~20709–20735 |
+
+A test at `backend/src/__tests__/linkedInOutreachService.test.ts:163–178` covers the scenario and shows the correct Unipile error shape, but the corresponding production catch does not exist.
+
+### Decision
+
+No action yet. The schedule recovered on its own the next day. We will wait until this recurs before implementing fixes. If it does recur, the fix is:
+1. Detect `errors/already_invited_recently` specifically in `handleError()` and return a distinct `RATE_LIMIT_ERROR` type (separate from generic `VALIDATION_ERROR`)
+2. Surface a clear "rate limited — stop sending invitations" signal to the agent in the `send-invite` tool response
+3. Optionally add a pending-invite pre-flight check in `sendInvitation()` before calling Unipile
