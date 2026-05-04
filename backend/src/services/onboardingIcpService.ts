@@ -319,15 +319,28 @@ export async function triggerIcpDiscoveryForUser(
     // even though icp is genuinely ready. Default is 2s (generous;
     // DynamoDB GSI propagation is typically <1s in us-west-2). Tests
     // inject 0 to assert the cascade synchronously.
+    //
+    // Eager DAG sub-task 2: when the user is on `useEagerPipeline`, the
+    // OnboardingPipelineOrchestrator owns step ordering — skip the
+    // legacy cross-call cascade entirely. The orchestrator's reconcile
+    // loop will pick up `competitor` once `icp` is `ready` in the
+    // `User.steps` table. For everyone else (the default path), keep
+    // the legacy cascade so this PR is a pure no-op for non-flag users.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { startCompetitorStrategyForUser } = require("./onboardingCompetitorService");
-    const delay = CASCADE_TRIGGER_DELAY_MS;
-    if (delay > 0) {
-      setTimeout(() => {
+    const {
+      isEagerPipelineActiveFor,
+    } = require("./onboardingOrchestratorWiring");
+    if (!isEagerPipelineActiveFor(current as any)) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { startCompetitorStrategyForUser } = require("./onboardingCompetitorService");
+      const delay = CASCADE_TRIGGER_DELAY_MS;
+      if (delay > 0) {
+        setTimeout(() => {
+          void startCompetitorStrategyForUser(userId);
+        }, delay);
+      } else {
         void startCompetitorStrategyForUser(userId);
-      }, delay);
-    } else {
-      void startCompetitorStrategyForUser(userId);
+      }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -360,6 +373,24 @@ export async function startIcpDiscoveryForUser(
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<void> {
   await userDb.updateUser(userId, icpStartPatch() as any);
+  // Eager DAG sub-task 2: kick the orchestrator. No-op for users not on
+  // `useEagerPipeline`; for opted-in users the orchestrator drives the
+  // ICP runner (which delegates to triggerIcpDiscoveryForUser), so we
+  // do NOT invoke the legacy trigger directly to avoid running the
+  // step twice in parallel. For everyone else, the legacy trigger is
+  // the source of truth.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    isEagerPipelineActiveFor,
+    reconcileForUser,
+  } = require("./onboardingOrchestratorWiring");
+  const current = (await userDb.getUserById(userId)) as
+    | { useEagerPipeline?: boolean }
+    | null;
+  if (isEagerPipelineActiveFor(current)) {
+    void reconcileForUser(userId);
+    return;
+  }
   // Intentionally not awaited — the route returns immediately.
   // Errors inside triggerIcpDiscoveryForUser are caught + persisted there.
   void triggerIcpDiscoveryForUser(userId, deps);

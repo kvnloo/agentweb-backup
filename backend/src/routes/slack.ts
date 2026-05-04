@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express"; // slack-triggered-session v2
 import { authenticateToken } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
+import { getSecret } from "../utils/secretsManager";
 import {
   getSlackChannels,
   sendApprovalRequest,
@@ -46,6 +47,61 @@ function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
   return (u.slackChannels && u.slackChannels.includes(channel)) || u.slackChannel === channel;
+}
+
+/**
+ * Use Gemini to extract the target user email and task description from a
+ * free-form admin channel message. Returns null if no email is found.
+ */
+async function extractAdminMessageIntent(
+  rawMessage: string
+): Promise<{ targetEmail: string; taskMessage: string } | null> {
+  try {
+    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const apiKey = process.env.GEMINI_API_KEY || (await getSecret(`${environment}/AgentWeb/GeminiAPIKey`));
+    if (!apiKey?.trim()) {
+      console.warn('⚠️ Gemini API key not available, falling back to regex for admin channel parsing');
+      return null;
+    }
+
+    const { GoogleGenAI } = await import('@google/genai');
+    const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
+
+    const prompt = `Extract the target user email address and task description from this admin Slack message.
+
+Message: "${rawMessage}"
+
+Rules:
+- targetEmail: the email address of the user the admin wants to run a task FOR (not the admin's own email). Return null if no email is present.
+- taskMessage: the actual task or request to run for that user. Remove the email and any surrounding words like "for", "regarding", "about" that were just part of directing the task to that user. Keep the core task intact.
+
+Respond with JSON only, no explanation:
+{"targetEmail": "user@example.com", "taskMessage": "the task description"}
+or if no email found:
+{"targetEmail": null, "taskMessage": null}`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.1-flash-lite-preview',
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: {
+        responseMimeType: 'application/json',
+      },
+    });
+
+    const text = response.text?.trim();
+    if (!text) return null;
+
+    const parsed = JSON.parse(text);
+    if (!parsed.targetEmail || !parsed.taskMessage) return null;
+
+    return {
+      targetEmail: parsed.targetEmail.toLowerCase(),
+      taskMessage: parsed.taskMessage.trim(),
+    };
+  } catch (err) {
+    console.error('⚠️ Failed to extract admin message intent via LLM:', err);
+    return null;
+  }
 }
 
 /**
@@ -182,6 +238,7 @@ async function handleSlackTriggeredSession(params: {
       originalMessage: rawMessage,
       emmaResponse,
       receivedAt: new Date().toISOString(),
+      senderDisplayName: displayName,
     });
 
     console.log(`✅ [slack-triggered] session handled: ${session.sessionId}`);
@@ -569,13 +626,12 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           let pageIdentifier = 'slack-bot';
 
           if (isAdminChannel) {
-            // Admin channel: parse "for user@email.com <message>" syntax
-            // Allow optional comma/colon after email: "for user@email.com, say hello"
-            const forMatch = rawMessage.match(/^for\s+(\S+@\S+?)[,:\s]\s*([\s\S]+)$/i);
+            // Admin channel: use LLM to flexibly extract target email and task from any phrasing
+            const extracted = await extractAdminMessageIntent(rawMessage);
 
-            if (forMatch) {
-              const targetEmail = forMatch[1].toLowerCase();
-              actualMessage = forMatch[2].trim();
+            if (extracted) {
+              const targetEmail = extracted.targetEmail;
+              actualMessage = extracted.taskMessage;
 
               // Look up the target user
               user = await userDb.getUserByEmail(targetEmail);

@@ -9,6 +9,191 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-03',
+    changes: [
+      'Fix: Auto-engagement no longer posts AI meta-messages as LinkedIn comments',
+      '- When the system could not fetch a post\'s content (due to a LinkedIn API error or auth issue), it was passing a placeholder to the AI model, which responded with a clarification request ("Please provide the post content...") that was then posted to LinkedIn as a real comment',
+      '- The system now skips commenting entirely when post content cannot be fetched, rather than sending a broken placeholder to the AI',
+    ],
+  },
+  {
+    date: '2026-05-02',
+    changes: [
+      'Fix: Analytics Pages No Longer Stuck in Skeleton Loading State',
+      '- Pages like the RankAI analytics dashboard that use IntersectionObserver or visibility-based rendering triggers now render correctly when accessed by the AI agent',
+      '- Previously, headless Chromium reported the page as hidden (visibilityState = "hidden"), causing React/Vue frameworks to skip skeleton-to-content transitions — leaving all content areas as grey placeholder animations even after 15+ seconds',
+      '- The AI agent browser now patches the visibility API and IntersectionObserver so pages fully hydrate and display real content before screenshots are taken',
+    ],
+  },
+  {
+    date: '2026-05-02',
+    changes: [
+      'Fix: LinkedIn Outreach — Clear guidance when a connected account is disconnected',
+      '- When a scheduled LinkedIn outreach run fails because the Unipile-connected account is disconnected, the agent now explains the common reasons (LinkedIn revoked the session due to automation detection, you logged in from another browser/device, the session cookie expired, or Unipile lost the session internally)',
+      '- The agent now also provides step-by-step next steps: try Reconnect first in Settings > Connected Accounts, and if that does not work, remove the connection and add it again as a new connection',
+      '- Previously the session just silently ended with "Outreach failed" with no actionable guidance',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Fix: CRM — Delete Button Now Always Visible When Leads Are Selected',
+      '- The "Delete" action is now present in the floating selection toolbar that appears at the bottom of the screen when leads are selected',
+      '- Previously, the delete button only appeared in the inline toolbar above the table, which scrolled out of view on long lists — making bulk delete appear broken',
+      'Fix: CRM — Page No Longer Resets to 1 After Editing or Deleting a Lead',
+      '- Editing a lead, deleting a single lead, bulk deleting, or marking leads as Do Not Contact while on page 2+ now keeps you on the same page',
+      '- Previously all these actions sent you back to page 1, losing your place when working through large lists',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Fix: Slack channel → client account mapping no longer gets stuck on the wrong user',
+      '- When a client\'s Slack channel was reassigned to a different account in the admin panel, the old cached mapping was never cleared, causing messages to keep routing to the previous account indefinitely',
+      '- The cache is now invalidated whenever an admin updates a user\'s Slack channel assignments, so the correct client is always matched on the next message',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'CRM Sequences: Per-Step Sender Selection',
+      '- Each step in a drip sequence can now use a different configured sender email',
+      '- A "From (sender)" dropdown appears in each step editor, letting you pick any sender from your configured list',
+      '- Defaults to "Account default" (your primary sender) if no specific sender is chosen',
+      '- The email worker now correctly uses the per-step sender when sending — previously all steps always used the account default regardless of what was saved',
+      'System: Switched outbound sender address from no-reply@ to hi@',
+      '- System emails (help requests, error reports, issue confirmations) now come from hi@updates.agentweb.pro instead of no-reply@updates.agentweb.pro',
+      '- This improves deliverability and reduces the chance of messages being flagged as spam',
+      'Fix: Admin — Sync Stripe Subscription Status Per User',
+      '- Users whose Stripe subscription webhook was missed (e.g. signed up before Stripe customer was linked) could have a stripe_customer_id and payment amount on file but no subscription_status, causing the admin Users tab to show them as free instead of Paid',
+      '- A new Sync icon button (↺) next to the Stripe Customer ID field in each expanded user row lets admins pull the live subscription status directly from Stripe with one click',
+      '- Also removed the duplicate read-only "Stripe ID" field in the expanded row (same data as the editable Stripe Customer ID field)',
+      'Fix: Issue Report Emails Now Go to the Right Person During Admin Delegate Access',
+      '- When an admin uses delegate access and asks Emma to report a product issue on behalf of a customer, the confirmation email now goes to the admin only — not the customer',
+      '- Previously the customer would receive the email even though it was the admin who triggered the report',
+      '- The Notion ticket also now records the "Reported By (Admin)" field so the engineering team knows who to follow up with',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Fix: Emma No Longer Shows "Thinking…" After Completing a Response',
+      '- Every session was incorrectly showing the Thinking… indicator even after Emma finished responding',
+      '- Root cause: the suggested reply chips feature (added recently) emits a "suggestions" event after the "complete" event; if the session was reloaded during that brief window the backend mistakenly reported the session as still active',
+      '- The backend now correctly treats the post-completion "suggestions" status as inactive, so the Thinking… card disappears as expected',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Improvement: Emma can now search leads across multiple lists in one call',
+      '- search_leads now accepts list_ids (up to 5 lists) in addition to the existing single list_id; each returned lead carries its listId/listName so Emma can attribute results when summarising across lists',
+      '- Pagination is now correct: previously, when the result limit was reached partway through a DynamoDB page, the cursor advanced past unread leads and silently dropped matches on subsequent pages; the cursor is now anchored to the last scanned leadId so paging never skips or duplicates results',
+      '- Multi-list cursor freezes the list set, so paging stays stable even if list_ids change between calls; inaccessible lists in a multi-list call are silently skipped instead of failing the whole call',
+      '- For broad cross-CRM strategic questions ("who should I reach out to today?"), continue to use ask_crm — search_leads is for structured field-level filtering on a known set of lists',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'New: Founder Voice Examples for Authentic LinkedIn Posts',
+      '- Founders can now paste real post examples into Brand Guidelines → Founder Profile → Voice Examples',
+      '- Emma reads these examples when generating LinkedIn and social posts, matching the exact sentence rhythm, hooks, vocabulary, and structure of the real posts',
+      '- Eliminates the generic AI-industry clichés ("Unpopular opinion:", "Here\'s what nobody tells you…") and produces content that genuinely sounds like the founder',
+      '- Emma can also update Voice Examples directly via chat (e.g. "add this post to my voice examples") — the field is available in the update_brand_guidelines tool',
+      '- If no Voice Examples are set, Emma now prompts the founder to provide 2–3 real posts before generating a batch',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Fix: Admin Dashboard No Longer Mislabels Paying Users as "Bounced"',
+      '- Users who have a recorded subscription amount but a missing subscription_status (caused by a webhook sync gap) were incorrectly shown as "Bounced Checkout" in the admin user list',
+      '- The bounced heuristic now excludes users with a non-zero subscription_amount, so legitimate paying customers are no longer counted in that bucket',
+      '- Also fixed a reconciliation bug where running "Reconcile Stripe" silently skipped users with a null subscription_status instead of syncing their status from Stripe',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Fixed: Slack Channel Names Now Display Correctly in Emma',
+      '- Emma\'s slack_list_channels tool was returning raw channel IDs (e.g. C0AJVBQ49TN) instead of human-readable names (e.g. #waldium-agentweb)',
+      '- The root cause was a missing pagination loop: the Slack API returns at most 100 channels per page, so channels beyond the first page were never fetched even when the bot was a member',
+      '- The fix adds cursor-based pagination to fetch all member channels, and also resolves names via conversations.info as a fallback for any remaining edge cases',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Improvement: Issue Reports Now Send a Confirmation Email to the Reporter',
+      '- When a user reports a product issue via Emma, they now receive a confirmation email at their account address',
+      '- The email subject clearly references the issue title: "We received your issue: <title>"',
+      '- The email includes the issue ID (AGW-<id>) so the user can reference it in follow-up communications',
+      '- Engineering team is still notified on the same email thread',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'New: CRM List Email Metrics',
+      '- Each lead list now shows aggregate email metrics (Sent, Delivered, Open Rate, Click Rate, Bounce Rate) directly above the leads table',
+      '- Click the metrics bar to open a breakdown dialog showing performance per email subject',
+      '- Metrics are hidden when no Resend-tracked email activity exists for the list',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'New: CRM Now Detects When Leads Mark Emails as Spam',
+      '- When a lead marks one of your emails as spam (via Gmail, Yahoo, or any feedback-loop-enabled provider), the CRM now automatically flags them as Do Not Contact',
+      '- The spam complaint reason is recorded in the lead\'s contact status note so you can see exactly what happened',
+      '- On the engagement timeline, spam complaints appear with an orange warning badge ("spam complaint") and bounces now show a distinct red badge ("bounced") instead of the generic sent/received label',
+      '- Works via the Resend email.complained webhook — no manual intervention needed',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Improvement: Emma Can Now Analyse All Sessions in Large Chat History Responses',
+      '- When get_chat_history returns too many sessions to fit in context, Emma previously could only see 20 sessions and reported inaccurate totals and percentages',
+      '- New read_tool_response tool: Emma can now page through any large S3-stored tool response in raw character chunks (generic — works for any tool output format)',
+      '- Extended search_tool_response: now returns total_matches_found (the true count across the whole file) plus new match_offset and context_chars params for paginated result browsing',
+      '- get_chat_history default limit raised from 100 to 500 for more complete day-over-day coverage; use limit: 1000 for full coverage on very active days',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Fix: Chat History Tool Now Requires Time Range Args',
+      '- Emma\'s get_chat_history tool previously silently returned empty results when called without start_time/end_time arguments',
+      '- This caused Emma to fall back to stale cached data and report incorrect session counts',
+      '- The tool now returns a clear error message prompting Emma to retry with the correct time range',
+      'New: Spam Check for Sequence Emails',
+      '- Each sequence step now has a Spam Check button that uses Claude AI to analyse the email for deliverability issues',
+      '- Issues are classified as errors (block publishing) or warnings (reduce deliverability score)',
+      '- One-click AI repair: select which issues to fix, optionally provide context (company address, etc.), and Claude rewrites the email to resolve them',
+      '- Spam check results are saved with the sequence — the button shows a green checkmark if the last check passed, red X if it failed, and resets automatically if the email content changes',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Fix: Brand Token Extraction No Longer Fails on CSS Analysis',
+      '- read_page_source with extractDesignTokens=true previously threw "wallaceColors is not iterable" for some websites',
+      '- The CSS analyzer returns color/font/shadow data as frequency-map objects, not arrays — the iteration logic now handles both formats',
+      '- Design tokens (colors, fonts, border radius, shadows) are now correctly extracted from CSS during landing page onboarding',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Fixed: Sequence Email CSS Styles Now Converted at Import Time',
+      '- When loading an email template from a URL into a Sequence step (or CRM group email), CSS class-based styles are now converted to inline styles immediately on import',
+      '- Previously, this conversion happened at send time (including test sends), causing delays and inconsistency — the stored email body could look different than what was sent',
+      '- The stored bodyHtml is now already email-client-safe after loading from URL, so test sends and real sends are fast and consistent',
+    ],
+  },
+  {
     date: '2026-04-29',
     changes: [
       'Fix: PR Digest Now Returns All PRs for Large Date Ranges',
@@ -5404,6 +5589,76 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Lead Engagements Now Load Correctly',
       '- Clicking on a lead in the CRM page no longer shows "Failed to load engagements" every time',
       '- The error was caused by a missing AWS region configuration in the email events service',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Improved: New Client Question Emails Now Show Who Sent the Slack Message',
+      '- The "New Client Question from Slack" notification email now identifies the sender under "Original Message from <name>"',
+      '- Previously the sender\'s name was missing, making it unclear who the client contact was',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Improved: Onboarding Stuck-User Alerts Now Consolidated Into a Daily Report',
+      '- The system previously sent one alert per stuck user per hour, generating 100+ duplicate notifications per day',
+      '- Alerts are now batched into a single daily summary showing how many users are stuck at each onboarding stage',
+      '- Days with no stuck users produce no alert, reducing noise',
+    ],
+  },
+  {
+    date: '2026-05-01',
+    changes: [
+      'Improved: Admin Slack Channel Now Accepts Free-Form Messages',
+      '- Admins can now trigger sessions for any user using natural language in the admin Slack channel',
+      '- Previously, messages had to follow the exact format "for user@email.com <task>" — anything else was ignored',
+      '- Now any phrasing works, e.g. "Emma give me a Meta Spend analysis for juan@usehaven.ai"',
+    ],
+  },
+  {
+    date: '2026-05-04',
+    changes: [
+      'Improved: Emma Now Produces Higher-Quality, Brand-Specific Content',
+      '- Emma is now explicitly instructed to draw on your brand voice, ICP, tone of voice, and knowledge base materials before generating any content',
+      '- Generic filler and templated boilerplate are no longer acceptable — all output must be specific to your business and audience',
+      '- After generating content, Emma briefly explains her quality choices and flags any gaps (e.g., missing brand context or knowledge base) with suggestions to strengthen the output',
+    ],
+  },
+  {
+    date: '2026-04-30',
+    changes: [
+      'Fixed: Emma No Longer Shows "Thinking..." After Responding',
+      '- Emma\'s "Thinking..." indicator now correctly disappears after she delivers a response',
+      '- Previously, if the HTTP connection dropped mid-request (e.g. a timeout), Emma would deliver her response via the background stream but the loading indicator would remain stuck on screen',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: CRM Sequences Now Auto-Enroll New Leads',
+      '- When you enroll a lead list into a sequence, new leads added to that list are automatically enrolled in the sequence going forward',
+      '- Auto-enrollment is on by default and can be toggled off per-list from the sequence enrollment detail view',
+      '- Re-enrolling a list no longer re-enrolls leads who already completed or converted — they are correctly skipped',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: Sign-Up Now Requires a Company Email Address',
+      '- Personal email providers (Gmail, Yahoo, Hotmail, Outlook, iCloud, etc.) are no longer accepted at sign-up',
+      '- The sign-up page shows an inline error immediately when you tab away from a personal email field',
+      '- The registration URL supports an ?email= parameter to pre-fill and lock the email field for invite flows',
+    ],
+  },
+  {
+    date: '2026-04-29',
+    changes: [
+      'Improved: Evaluation Scoring No Longer Penalizes Slack Suggest Sessions for Unresolvable User Input',
+      '- When Emma drafts a suggested response to an inbound Slack message, the session scorer now understands her role is response drafting — not directly fulfilling the Slack contact\'s request',
+      '- Previously, if a Slack contact sent garbled or misdirected messages, the scorer penalized goalCompletion even when Emma responded perfectly',
+      '- The fix injects session context into the conversation transcript so the scorer evaluates draft quality, not end-user goal fulfillment',
     ],
   },
 ];

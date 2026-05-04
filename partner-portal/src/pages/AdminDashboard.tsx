@@ -797,6 +797,7 @@ export default function AdminDashboard() {
   const [currentStripeCustomerIdText, setCurrentStripeCustomerIdText] = useState("");
   const [resyncPaymentsLoading, setResyncPaymentsLoading] = useState(false);
   const [stripeCustomerIdEditLoading, setStripeCustomerIdEditLoading] = useState(false);
+  const [syncStripeLoadingUserId, setSyncStripeLoadingUserId] = useState<string | null>(null);
   const [editingEmailUserId, setEditingEmailUserId] = useState<string | null>(null);
   const [currentEmailText, setCurrentEmailText] = useState("");
   const [emailEditLoading, setEmailEditLoading] = useState(false);
@@ -1563,7 +1564,7 @@ export default function AdminDashboard() {
       // Paid filter
       if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
       if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
-      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status)) return false;
+      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status && !user.subscription_amount)) return false;
       // Has-usage filter — match the display logic: current-month tokens only
       if (userFilterHasUsage) {
         const currentMonth = new Date().toISOString().slice(0, 7);
@@ -2209,6 +2210,33 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update Stripe Customer ID");
     } finally {
       setStripeCustomerIdEditLoading(false);
+    }
+  };
+
+  const handleSyncStripe = async (userId: string) => {
+    try {
+      setSyncStripeLoadingUserId(userId);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${userId}/sync-stripe`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const updatedUser = response.data.user;
+      if (updatedUser) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((u: User) => u.userId === userId ? { ...u, ...updatedUser } : u)
+        );
+      }
+      const updates = response.data.updates;
+      if (updates && Object.keys(updates).length > 0) {
+        setSuccess(`Stripe synced: updated ${Object.keys(updates).join(", ")}`);
+      } else {
+        setSuccess("Stripe sync complete — no new data found");
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to sync Stripe subscription");
+    } finally {
+      setSyncStripeLoadingUserId(null);
     }
   };
 
@@ -3743,7 +3771,7 @@ export default function AdminDashboard() {
               const trialing = contextUsers.filter(u => u.subscription_status === "trialing");
               const pastDue = contextUsers.filter(u => u.subscription_status === "past_due");
               const canceled = contextUsers.filter(u => u.subscription_status === "canceled" || u.subscription_status === "canceling");
-              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status);
+              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status && !u.subscription_amount);
               // Churn rate: canceled / (paying + canceled) — lifetime simple churn
               const churnBase = paying.length + canceled.length;
               const churnRate = churnBase > 0 ? ((canceled.length / churnBase) * 100).toFixed(0) : "0";
@@ -3934,7 +3962,7 @@ export default function AdminDashboard() {
                       : user.subscription_status === "canceled" || user.subscription_status === "canceling" ? "canceled"
                       : user.subscription_status === "trialing" ? "trialing"
                       : user.subscription_status === "active" ? "paying"
-                      : user.stripe_customer_id && !user.subscription_status ? "bounced"
+                      : user.stripe_customer_id && !user.subscription_status && !user.subscription_amount ? "bounced"
                       : "free";
                     const lastActiveTimestamp = user.lastActiveAt || user.lastLoginTime;
                     const lastSeen = lastActiveTimestamp ? (() => {
@@ -4065,10 +4093,6 @@ export default function AdminDashboard() {
                                   <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem", wordBreak: "break-all" }}>{user.userId}</Typography>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Stripe ID</Typography>
-                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
-                                </Grid>
-                                <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Created</Typography>
                                   <Typography variant="body2">{user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}</Typography>
                                 </Grid>
@@ -4155,6 +4179,11 @@ export default function AdminDashboard() {
                                       <>
                                         <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
                                         <IconButton size="small" onClick={() => { setEditingStripeCustomerIdUserId(user.userId); setCurrentStripeCustomerIdText(user.stripe_customer_id || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                        {user.stripe_customer_id && (
+                                          <IconButton size="small" title="Sync subscription status from Stripe" onClick={() => handleSyncStripe(user.userId)} disabled={syncStripeLoadingUserId === user.userId}>
+                                            {syncStripeLoadingUserId === user.userId ? <CircularProgress size={14} /> : <SyncIcon sx={{ fontSize: 14 }} />}
+                                          </IconButton>
+                                        )}
                                       </>
                                     )}
                                   </Box>

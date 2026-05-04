@@ -117,7 +117,7 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(1);
-    expect(result.results[0].notionUrl).toBe('https://notion.so/notionpageid');
+    expect(result.results[0].issueId).toBe('AGW-notion-page-id');
 
     expect(mockCreateOncallItem).toHaveBeenCalledWith({
       title: 'Login fails',
@@ -149,8 +149,8 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(2);
-    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, notionUrl: 'https://notion.so/p1' });
-    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, notionUrl: 'https://notion.so/p2' });
+    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1' });
+    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2' });
     expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
   });
@@ -184,10 +184,10 @@ describe('report_product_issues tool', () => {
 
     expect(mockResendSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: ['founders@agentweb.pro'],
-        subject: 'Product Issue from customer@example.com: Bug',
+        to: ['founders@agentweb.pro', 'customer@example.com'],
+        subject: 'We received your issue: Bug',
         replyTo: 'customer@example.com',
-        html: expect.stringContaining('https://notion.so/notionpageid'),
+        html: expect.stringContaining('AGW-notion-page-id'),
       })
     );
   });
@@ -216,5 +216,69 @@ describe('report_product_issues tool', () => {
         }),
       })
     );
+  });
+
+  describe('delegate admin access', () => {
+    const delegateContext = {
+      userId: 'user-123',
+      sessionId: 'sess-789',
+      isDelegatedAdmin: true,
+      adminEmail: 'admin@agentweb.pro',
+    };
+
+    it('should send email only to admin (not customer) when isDelegatedAdmin', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
+        delegateContext
+      );
+
+      expect(mockResendSendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: ['founders@agentweb.pro', 'admin@agentweb.pro'],
+          replyTo: 'admin@agentweb.pro',
+        })
+      );
+      // Customer email must NOT be in recipients
+      const callArgs = mockResendSendEmail.mock.calls[0][0];
+      expect(callArgs.to).not.toContain('customer@example.com');
+    });
+
+    it('should include admin greeting in email body when isDelegatedAdmin', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
+        delegateContext
+      );
+
+      const callArgs = mockResendSendEmail.mock.calls[0][0];
+      expect(callArgs.html).toContain('admin@agentweb.pro');
+      expect(callArgs.html).toContain('on behalf of');
+      expect(callArgs.html).toContain('Test Customer');
+    });
+
+    it('should add Reported By (Admin) field to Notion context when isDelegatedAdmin', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
+        delegateContext
+      );
+
+      expect(mockCreateOncallItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: expect.objectContaining({
+            'Reported By (Admin)': 'admin@agentweb.pro',
+          }),
+        })
+      );
+    });
+
+    it('should fall back to normal (customer) recipients when isDelegatedAdmin but no adminEmail', async () => {
+      await toolExecute(
+        { issues: [{ title: 'Bug', description: 'Desc' }] },
+        { userId: 'user-123', isDelegatedAdmin: true }
+      );
+
+      const callArgs = mockResendSendEmail.mock.calls[0][0];
+      expect(callArgs.to).toContain('customer@example.com');
+      expect(callArgs.replyTo).toBe('customer@example.com');
+    });
   });
 });

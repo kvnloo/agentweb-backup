@@ -72,36 +72,36 @@ export async function getSlackChannels(): Promise<SlackChannel[]> {
   try {
     console.log("🔍 Fetching Slack channels...");
 
-    const result = await slackClient.conversations.list({
-      types: "public_channel,private_channel",
-      exclude_archived: true,
-      limit: 100,
-    });
+    const allChannels: SlackChannel[] = [];
+    let cursor: string | undefined;
 
-    if (!result.channels) {
-      console.log("❌ No channels found in response");
-      return [];
-    }
+    do {
+      const result = await slackClient.conversations.list({
+        types: "public_channel,private_channel",
+        exclude_archived: true,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
 
-    // Filter channels where bot is a member and format them
-    const channels = result.channels
-      .filter((channel) => {
-        const shouldInclude = channel.is_member === true;
-        console.log(
-          `🔍 Channel ${channel.name}: is_member=${channel.is_member}, including=${shouldInclude}`,
-        );
-        return shouldInclude;
-      })
-      .map((channel) => ({
-        id: channel.id!,
-        name: channel.name!,
-        displayName: `#${channel.name}`,
-        isPrivate: channel.is_private || false,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      if (!result.channels) break;
 
-    console.log("✅ Filtered channels:", channels);
-    return channels;
+      for (const channel of result.channels) {
+        if (channel.is_member === true) {
+          allChannels.push({
+            id: channel.id!,
+            name: channel.name!,
+            displayName: `#${channel.name}`,
+            isPrivate: channel.is_private || false,
+          });
+        }
+      }
+
+      cursor = result.response_metadata?.next_cursor;
+    } while (cursor);
+
+    allChannels.sort((a, b) => a.name.localeCompare(b.name));
+    console.log("✅ Filtered channels:", allChannels);
+    return allChannels;
   } catch (error) {
     console.error("❌ Error fetching Slack channels:", error);
     throw error;

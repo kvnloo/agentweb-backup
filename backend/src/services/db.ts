@@ -490,6 +490,45 @@ export interface User {
     isPreset?: false; // user-saved views are never preset
     createdAt: string;
   }>;
+  /**
+   * Eager DAG onboarding pipeline — Phase 2.
+   *
+   * Replaces the per-axis status fields (icpStatus / competitorStatus /
+   * creativeDirStatus / adImageStatus / adCopyStatus) with a unified
+   * record per pipeline step. Each step carries an `inputsHash` for
+   * dedup, a `generation` counter for cancel-and-replace concurrency,
+   * and a `provenance` field so user-authored data is never overwritten
+   * by anticipated runs.
+   *
+   * Read by `OnboardingPipelineOrchestrator.reconcile()` (services/
+   * onboardingPipelineOrchestrator.ts). Writes are gated on the
+   * `useEagerPipeline` field below + the env-level
+   * `EAGER_ONBOARDING_PIPELINE_ENABLED` flag — when both are off, this
+   * field is never read or written and the legacy per-axis status
+   * machinery owns onboarding state.
+   *
+   * Sub-task 2 of the Eager DAG epic refactors the existing
+   * `onboardingXService` files to delegate to the orchestrator rather
+   * than cross-call each other. Sub-task 3 wires the FE polling hooks
+   * to read `steps` instead of the per-axis status fields. This
+   * sub-task (1) only adds the schema + the orchestrator service.
+   */
+  steps?: {
+    brandDna?: import("./onboardingPipelineOrchestrator").StepRecord<unknown>;
+    icp?: import("./onboardingPipelineOrchestrator").StepRecord<unknown>;
+    competitor?: import("./onboardingPipelineOrchestrator").StepRecord<unknown>;
+    creativeDir?: import("./onboardingPipelineOrchestrator").StepRecord<unknown>;
+    adImage?: import("./onboardingPipelineOrchestrator").StepRecord<unknown>;
+    adCopy?: import("./onboardingPipelineOrchestrator").StepRecord<unknown>;
+  };
+  /**
+   * Per-user opt-in for the eager DAG onboarding pipeline. When `true`,
+   * `OnboardingPipelineOrchestrator.reconcile()` runs even if the
+   * env-level `EAGER_ONBOARDING_PIPELINE_ENABLED` flag is off. Lets us
+   * roll the orchestrator out per-user before flipping it globally.
+   * Default `undefined` / falsy = legacy per-axis status flow.
+   */
+  useEagerPipeline?: boolean;
 }
 
 export interface Organization {
@@ -4070,7 +4109,7 @@ export const crmDb = {
     dealValue?: number | null;
     dealCurrency?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
-    contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
+    contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
     contactStatusUpdatedBy?: string;
     // CRM Unification v1 extensions (A1)
@@ -4485,7 +4524,7 @@ export const crmDb = {
     unsubscribedFromGroupEmail?: boolean;
     unsubscribedFromGroupEmailAt?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed' | null;
-    contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other' | null;
+    contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other' | null;
     contactStatusNote?: string | null;
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;

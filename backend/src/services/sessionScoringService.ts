@@ -118,12 +118,21 @@ function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   };
 }
 
+const SESSION_TYPE_HEADERS: Record<string, string> = {
+  "slack-triggered": "[Session context: Emma is drafting a suggested response to an inbound Slack message on behalf of the team. She is NOT directly serving an end user. Evaluate goalCompletion based on whether she produced an appropriate draft — not whether the Slack contact's underlying request was fulfilled.]",
+};
+
 export async function scoreSession(
   messages: ChatMessage[],
-  currentMessageCount: number
+  currentMessageCount: number,
+  pageIdentifier?: string
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const conversationText = serializeMessagesForScoring(recentMessages);
+  const baseConversationText = serializeMessagesForScoring(recentMessages);
+  const header = pageIdentifier ? (SESSION_TYPE_HEADERS[pageIdentifier] ?? "") : "";
+  const conversationText = header
+    ? `${header}\n\n${baseConversationText}`
+    : baseConversationText;
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
@@ -269,7 +278,7 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
-  const result = await scoreSession(session.messages || [], messageCount);
+  const result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier);
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {
     score: result.score,

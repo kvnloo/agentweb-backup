@@ -473,7 +473,7 @@ export class AgentModeService {
         type: 'function',
         function: {
           name: 'search_tool_response',
-          description: 'Search a large tool response that was stored in S3 because it exceeded the context size limit. When a previous tool result shows "[Full response stored at S3 key: ...]", use this tool with that key to find specific fields or values (e.g. destination URLs, link_url, creative details) in the full response.',
+          description: 'Search a large tool response that was stored in S3 because it exceeded the context size limit. When a previous tool result shows "[Full response stored at S3 key: ...]", use this tool with that key to find specific fields or values (e.g. destination URLs, link_url, creative details) in the full response. Returns ALL matches with total_matches_found so you can page through results using match_offset.',
           parameters: {
             type: 'object',
             properties: {
@@ -483,7 +483,19 @@ export class AgentModeService {
               },
               query: {
                 type: 'string',
-                description: 'The text or field name to search for (e.g. "link_url", "destination_url", "website")'
+                description: 'The text or field name to search for (e.g. "link_url", "destination_url", "sessionId")'
+              },
+              match_offset: {
+                type: 'number',
+                description: 'Number of matches to skip before returning results. Use 0 for the first page, 20 for the second page, etc. Default: 0'
+              },
+              max_matches: {
+                type: 'number',
+                description: 'Maximum number of matches to return in this call. Default: 20, max: 100'
+              },
+              context_chars: {
+                type: 'number',
+                description: 'Number of characters of context to include before and after each match. Use larger values (e.g. 2000) to capture full JSON objects. Default: 300'
               }
             },
             required: ['s3_key', 'query']
@@ -492,6 +504,38 @@ export class AgentModeService {
       },
       execute: async (args: any, _context: any) => {
         return this.executeSearchToolResponse(args);
+      }
+    });
+
+    this.toolRegistry.register({
+      name: 'read_tool_response',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'read_tool_response',
+          description: 'Read a raw slice of a large tool response stored in S3. Use this for linear traversal of any format (JSON arrays, CSV, plain text) when search_tool_response is not suitable. Specify char_offset and char_length to page through the file. The total file size is returned so you can calculate how many pages remain.',
+          parameters: {
+            type: 'object',
+            properties: {
+              s3_key: {
+                type: 'string',
+                description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
+              },
+              char_offset: {
+                type: 'number',
+                description: 'Character position to start reading from. Use 0 for the beginning of the file. Default: 0'
+              },
+              char_length: {
+                type: 'number',
+                description: 'Number of characters to read. Default: 8000, max: 50000'
+              }
+            },
+            required: ['s3_key']
+          }
+        }
+      },
+      execute: async (args: any, _context: any) => {
+        return this.executeReadToolResponse(args);
       }
     });
 
@@ -3183,7 +3227,7 @@ export class AgentModeService {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
     }
 
-    if (toolName === 'search_tool_response') {
+    if (toolName === 'search_tool_response' || toolName === 'read_tool_response') {
       return result;
     }
 
@@ -4439,11 +4483,21 @@ export class AgentModeService {
     }
   }
 
-  private async executeSearchToolResponse(args: { s3_key: string; query: string }): Promise<any> {
+  private async executeSearchToolResponse(args: {
+    s3_key: string;
+    query: string;
+    match_offset?: number;
+    max_matches?: number;
+    context_chars?: number;
+  }): Promise<any> {
     const { s3_key, query } = args;
     if (!s3_key || !query) {
       return { success: false, message: 'Both s3_key and query are required' };
     }
+
+    const matchOffset = Math.max(0, args.match_offset ?? 0);
+    const maxMatches = Math.min(100, Math.max(1, args.max_matches ?? 20));
+    const contextChars = Math.max(0, args.context_chars ?? 300);
 
     try {
       const content = await getS3ObjectAsString(s3_key);
@@ -4453,24 +4507,29 @@ export class AgentModeService {
 
       const queryLower = query.toLowerCase();
       const contentLower = content.toLowerCase();
-      const CONTEXT_WINDOW = 300;
-      const MAX_MATCHES = 20;
-      const matches: Array<{ offset: number; context: string }> = [];
+      const allOffsets: number[] = [];
 
       let searchPos = 0;
-      while (searchPos < contentLower.length && matches.length < MAX_MATCHES) {
+      while (searchPos < contentLower.length) {
         const matchIdx = contentLower.indexOf(queryLower, searchPos);
         if (matchIdx === -1) break;
-        const start = Math.max(0, matchIdx - CONTEXT_WINDOW);
-        const end = Math.min(content.length, matchIdx + query.length + CONTEXT_WINDOW);
-        matches.push({ offset: matchIdx, context: content.slice(start, end) });
+        allOffsets.push(matchIdx);
         searchPos = matchIdx + queryLower.length;
       }
+
+      const pageOffsets = allOffsets.slice(matchOffset, matchOffset + maxMatches);
+      const matches = pageOffsets.map(matchIdx => {
+        const start = Math.max(0, matchIdx - contextChars);
+        const end = Math.min(content.length, matchIdx + query.length + contextChars);
+        return { offset: matchIdx, context: content.slice(start, end) };
+      });
 
       return {
         success: true,
         query,
-        total_matches: matches.length,
+        total_matches_found: allOffsets.length,
+        match_offset: matchOffset,
+        matches_returned: matches.length,
         total_size: content.length,
         matches,
       };
@@ -4478,6 +4537,43 @@ export class AgentModeService {
       return {
         success: false,
         message: `Failed to search tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
+    }
+  }
+
+  private async executeReadToolResponse(args: {
+    s3_key: string;
+    char_offset?: number;
+    char_length?: number;
+  }): Promise<any> {
+    const { s3_key } = args;
+    if (!s3_key) {
+      return { success: false, message: 's3_key is required' };
+    }
+
+    const charOffset = Math.max(0, args.char_offset ?? 0);
+    const charLength = Math.min(50_000, Math.max(1, args.char_length ?? 8_000));
+
+    try {
+      const content = await getS3ObjectAsString(s3_key);
+      if (!content) {
+        return { success: false, message: 'Empty response from S3' };
+      }
+
+      const slice = content.slice(charOffset, charOffset + charLength);
+      return {
+        success: true,
+        char_offset: charOffset,
+        chars_returned: slice.length,
+        total_size: content.length,
+        has_more: charOffset + charLength < content.length,
+        next_offset: charOffset + slice.length,
+        content: slice,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: `Failed to read tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
       };
     }
   }
@@ -6838,157 +6934,257 @@ export class AgentModeService {
     }
   }
 
-  public async searchLeads(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, limit?: number, options?: { search?: string; cursor?: string }): Promise<any> {
+  private leadMatchesSearchAndFilters(
+    lead: any,
+    filters: Array<{ field: string; operator: string; value?: any }>,
+    searchQuery: string,
+    standardFields: string[],
+  ): boolean {
+    if (searchQuery) {
+      const fields = [
+        lead.email, lead.firstName, lead.lastName,
+        `${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        lead.company, lead.phone, lead.title, lead.notes, lead.linkedin
+      ];
+      const standardMatch = fields.some((v: any) => String(v || '').toLowerCase().includes(searchQuery));
+      if (!standardMatch) {
+        const customFields = lead.customFields && typeof lead.customFields === 'object' ? lead.customFields : {};
+        const customMatch = Object.values(customFields).some((v: any) => String(v || '').toLowerCase().includes(searchQuery))
+          || Object.keys(customFields).some((k: string) => k.toLowerCase().includes(searchQuery));
+        if (!customMatch) return false;
+      }
+    }
+
+    return filters.every((filter: any) => {
+      const { field, operator, value } = filter;
+      let fieldValue: any;
+      if (field === 'icpScore') {
+        fieldValue = lead.icpMatch?.score;
+      } else if (field === 'icpMatch') {
+        fieldValue = lead.icpMatch?.isMatch;
+      } else if (field === 'engagementCount') {
+        fieldValue = lead.engagementCount;
+      } else if (standardFields.includes(field)) {
+        fieldValue = lead[field];
+      } else if (field.includes('.')) {
+        const parts = field.split('.');
+        fieldValue = parts.reduce((obj: any, part: string) => obj?.[part], lead);
+      } else {
+        fieldValue = lead.customFields?.[field];
+      }
+
+      switch (operator) {
+        case 'is_empty':
+          return fieldValue === null || fieldValue === undefined || fieldValue === '';
+        case 'is_not_empty':
+          return fieldValue !== null && fieldValue !== undefined && fieldValue !== '';
+        case 'equals':
+          if (typeof fieldValue === 'boolean') return fieldValue === value;
+          return String(fieldValue || '').toLowerCase() === String(value || '').toLowerCase();
+        case 'not_equals':
+          return String(fieldValue || '').toLowerCase() !== String(value || '').toLowerCase();
+        case 'contains':
+          return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
+        case 'starts_with':
+          return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
+        case 'ilike': {
+          const pattern = String(value ?? '');
+          const regexStr = pattern.split('').map((c: string) => {
+            if (c === '%') return '.*';
+            if (c === '_') return '.';
+            return c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          }).join('');
+          return new RegExp(`^${regexStr}$`, 'i').test(String(fieldValue ?? ''));
+        }
+        case 'greater_than': {
+          const numFv = Number(fieldValue);
+          const numV = Number(value);
+          if (!isNaN(numFv) && !isNaN(numV)) return numFv > numV;
+          return String(fieldValue || '') > String(value || '');
+        }
+        case 'less_than': {
+          const numFv = Number(fieldValue);
+          const numV = Number(value);
+          if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
+          return String(fieldValue || '') < String(value || '');
+        }
+        default:
+          return false;
+      }
+    });
+  }
+
+  public async searchLeads(
+    listId: string | undefined,
+    filters: Array<{ field: string; operator: string; value?: any }>,
+    userId: string,
+    limit?: number,
+    options?: { search?: string; cursor?: string; listIds?: string[] },
+  ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
-
-      // Verify list ownership (org members can access lists owned by other org members)
-      const list = await crmDb.getLeadListById(listId);
-      if (!list) {
-        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
-      }
-      const hasAccessSearchLeads = await crmDb.canOrgMemberAccessList(userId, list);
-      if (!hasAccessSearchLeads) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
-      }
 
       if (!filters || filters.length === 0) {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
-      // Decode cursor from base64 JSON
+      // Resolve target list set. list_ids takes precedence over single list_id.
+      let targetListIds: string[];
+      let isMultiList: boolean;
+      if (options?.listIds && options.listIds.length > 0) {
+        if (options.listIds.length > 5) {
+          return {
+            success: false,
+            message: 'Too many lists. Pass at most 5 list_ids per call (use ask_crm for cross-CRM questions).',
+            error: 'list_ids exceeds the 5-list cap',
+          };
+        }
+        isMultiList = true;
+        targetListIds = options.listIds;
+      } else if (listId) {
+        isMultiList = false;
+        targetListIds = [listId];
+      } else {
+        return { success: false, message: 'list_id or list_ids is required', error: 'Provide either list_id or list_ids' };
+      }
+
+      // Decode cursor (supports new multi-list shape and legacy single-list {listId, leadId}).
       let decodedCursor: any = undefined;
       if (options?.cursor) {
         try {
           decodedCursor = JSON.parse(Buffer.from(options.cursor, 'base64').toString('utf8'));
         } catch {
-          // Invalid cursor — start from beginning
+          // Invalid cursor — treat as start.
         }
+      }
+
+      let cursorListIds: string[] = targetListIds;
+      let cursorStartIdx = 0;
+      let cursorInnerLeadId: string | null = null;
+      if (decodedCursor) {
+        if (Array.isArray(decodedCursor.listIds)) {
+          // New multi-list cursor: trust the frozen list set so the page sequence
+          // is stable even if the caller's list_ids changed between calls.
+          cursorListIds = decodedCursor.listIds;
+          cursorStartIdx = Math.max(0, Number(decodedCursor.currentIdx) || 0);
+          cursorInnerLeadId = decodedCursor.leadId || null;
+        } else if (decodedCursor.leadId) {
+          // Legacy single-list cursor.
+          cursorInnerLeadId = decodedCursor.leadId;
+        }
+      }
+
+      // Resolve and access-check each list. In single-list mode an inaccessible
+      // list_id is a hard error; in multi-list mode we silently skip so the
+      // caller still gets results from the lists they CAN see.
+      type ListEntry = { listId: string; list: any } | null;
+      const lists: ListEntry[] = [];
+      for (let i = 0; i < cursorListIds.length; i++) {
+        const id = cursorListIds[i];
+        const list = await crmDb.getLeadListById(id);
+        if (!list) {
+          if (!isMultiList) return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+          lists.push(null);
+          continue;
+        }
+        const access = await crmDb.canOrgMemberAccessList(userId, list);
+        if (!access) {
+          if (!isMultiList) return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+          lists.push(null);
+          continue;
+        }
+        lists.push({ listId: id, list });
       }
 
       const searchQuery = (options?.search || '').trim().toLowerCase();
       const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
-      const matchingLeads: any[] = [];
-      let cursor: any = decodedCursor;
+      const matchingLeads: Array<{ lead: any; listId: string; listName: string }> = [];
 
-      while (matchingLeads.length < effectiveLimit) {
-        const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
-        const leads = pageResult.items || [];
+      let stopIdx = -1;
+      let stopLeadId: string | null = null;
 
-        for (const lead of leads) {
-          if (matchingLeads.length >= effectiveLimit) break;
+      outer:
+      for (let listIdx = cursorStartIdx; listIdx < lists.length; listIdx++) {
+        const entry = lists[listIdx];
+        if (!entry) continue;
+        const { listId: curListId, list } = entry;
 
-          // Apply cross-field keyword search
-          if (searchQuery) {
-            const fields = [
-              lead.email, lead.firstName, lead.lastName,
-              `${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
-              lead.company, lead.phone, lead.title, lead.notes, lead.linkedin
-            ];
-            const standardMatch = fields.some((v: any) => String(v || '').toLowerCase().includes(searchQuery));
-            if (!standardMatch) {
-              const customFields = lead.customFields && typeof lead.customFields === 'object' ? lead.customFields : {};
-              const customMatch = Object.values(customFields).some((v: any) => String(v || '').toLowerCase().includes(searchQuery))
-                || Object.keys(customFields).some((k: string) => k.toLowerCase().includes(searchQuery));
-              if (!customMatch) continue;
-            }
-          }
-
-          const allMatch = filters.every((filter: any) => {
-            const { field, operator, value } = filter;
-
-            // Resolve the field value
-            let fieldValue: any;
-            if (field === 'icpScore') {
-              fieldValue = lead.icpMatch?.score;
-            } else if (field === 'icpMatch') {
-              fieldValue = lead.icpMatch?.isMatch;
-            } else if (field === 'engagementCount') {
-              fieldValue = lead.engagementCount;
-            } else if (standardFields.includes(field)) {
-              fieldValue = lead[field];
-            } else if (field.includes('.')) {
-              // Dot-notation path (e.g. "customFields.createdAt" → lead.customFields?.createdAt)
-              const parts = field.split('.');
-              fieldValue = parts.reduce((obj: any, part: string) => obj?.[part], lead);
-            } else {
-              // Custom field
-              fieldValue = lead.customFields?.[field];
-            }
-
-            // Evaluate operator
-            switch (operator) {
-              case 'is_empty':
-                return fieldValue === null || fieldValue === undefined || fieldValue === '';
-              case 'is_not_empty':
-                return fieldValue !== null && fieldValue !== undefined && fieldValue !== '';
-              case 'equals':
-                if (typeof fieldValue === 'boolean') return fieldValue === value;
-                return String(fieldValue || '').toLowerCase() === String(value || '').toLowerCase();
-              case 'not_equals':
-                return String(fieldValue || '').toLowerCase() !== String(value || '').toLowerCase();
-              case 'contains':
-                return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
-              case 'starts_with':
-                return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
-              case 'ilike': {
-                // SQL LIKE pattern: % = any sequence, _ = any single char (case-insensitive)
-                const pattern = String(value ?? '');
-                const regexStr = pattern.split('').map((c: string) => {
-                  if (c === '%') return '.*';
-                  if (c === '_') return '.';
-                  return c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                }).join('');
-                return new RegExp(`^${regexStr}$`, 'i').test(String(fieldValue ?? ''));
-              }
-              case 'greater_than': {
-                const numFv = Number(fieldValue);
-                const numV = Number(value);
-                if (!isNaN(numFv) && !isNaN(numV)) return numFv > numV;
-                return String(fieldValue || '') > String(value || '');
-              }
-              case 'less_than': {
-                const numFv = Number(fieldValue);
-                const numV = Number(value);
-                if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
-                return String(fieldValue || '') < String(value || '');
-              }
-              default:
-                return false;
-            }
-          });
-
-          if (allMatch) {
-            matchingLeads.push(lead);
-          }
+        // Inner cursor only applies to the very first list scanned; subsequent
+        // lists in the same call always start from the top.
+        let inputCursor: any = undefined;
+        if (listIdx === cursorStartIdx && cursorInnerLeadId) {
+          inputCursor = { listId: curListId, leadId: cursorInnerLeadId };
         }
 
-        cursor = pageResult.lastEvaluatedKey;
-        if (!cursor) break;
+        let lastScannedLeadId: string | null = null;
+        let hitLimit = false;
+
+        while (true) {
+          const pageResult = await crmDb.getLeadsByListId(curListId, 200, inputCursor);
+          const leads = pageResult.items || [];
+
+          for (const lead of leads) {
+            lastScannedLeadId = lead.leadId;
+            if (this.leadMatchesSearchAndFilters(lead, filters, searchQuery, standardFields)) {
+              matchingLeads.push({ lead, listId: curListId, listName: list.name });
+              if (matchingLeads.length >= effectiveLimit) {
+                hitLimit = true;
+                break;
+              }
+            }
+          }
+
+          if (hitLimit) break;
+          inputCursor = pageResult.lastEvaluatedKey;
+          if (!inputCursor) break;
+        }
+
+        if (hitLimit) {
+          stopIdx = listIdx;
+          stopLeadId = lastScannedLeadId;
+          break outer;
+        }
       }
 
-      const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
+      // Build next cursor. Use the multi-list shape when in multi-list mode so
+      // callers can resume; legacy mode keeps the {listId, leadId} shape.
+      let cursorOut: any = null;
+      if (stopIdx >= 0 && stopLeadId) {
+        if (isMultiList) {
+          cursorOut = { listIds: cursorListIds, currentIdx: stopIdx, leadId: stopLeadId };
+        } else {
+          cursorOut = { listId: cursorListIds[stopIdx], leadId: stopLeadId };
+        }
+      }
+      const nextCursor = cursorOut ? Buffer.from(JSON.stringify(cursorOut)).toString('base64') : undefined;
+
+      const firstResolved = lists.find((e: ListEntry) => !!e);
 
       return {
         success: true,
         message: `Found ${matchingLeads.length} matching lead(s)`,
-        leads: matchingLeads.map((lead: any) => ({
-          leadId: lead.leadId,
-          email: lead.email || '',
-          firstName: lead.firstName || '',
-          lastName: lead.lastName || '',
-          company: lead.company || '',
-          title: lead.title || '',
-          icpMatch: lead.icpMatch?.isMatch || false,
-          icpScore: lead.icpMatch?.score || null,
-          engagementCount: lead.engagementCount || 0,
-          isEngaged: lead.isEngaged || false,
-          customFields: lead.customFields || {}
+        leads: matchingLeads.map((entry) => ({
+          leadId: entry.lead.leadId,
+          ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
+          email: entry.lead.email || '',
+          firstName: entry.lead.firstName || '',
+          lastName: entry.lead.lastName || '',
+          company: entry.lead.company || '',
+          title: entry.lead.title || '',
+          icpMatch: entry.lead.icpMatch?.isMatch || false,
+          icpScore: entry.lead.icpMatch?.score || null,
+          engagementCount: entry.lead.engagementCount || 0,
+          isEngaged: entry.lead.isEngaged || false,
+          customFields: entry.lead.customFields || {}
         })),
         matchCount: matchingLeads.length,
-        listName: list.name,
-        has_more: !!cursor,
+        ...(!isMultiList && firstResolved ? { listName: firstResolved.list.name } : {}),
+        ...(isMultiList ? {
+          listsScanned: lists.filter((e: ListEntry): e is { listId: string; list: any } => !!e)
+            .map((e) => ({ listId: e.listId, listName: e.list.name })),
+        } : {}),
+        has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),
       };
     } catch (error) {
@@ -8515,8 +8711,8 @@ Format the response as JSON with this structure:
             f => f && normalize(f.name) === key
           );
           if (idx >= 0) {
-            // Replace the entire object for that founder name
-            mergedFounders[idx] = newFounder;
+            // Merge fields so a partial update (e.g. only voiceExamples) preserves other fields
+            mergedFounders[idx] = { ...mergedFounders[idx], ...newFounder };
           } else {
             // Append as new founder
             mergedFounders.push(newFounder);
@@ -14152,6 +14348,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static readonly LARGE_TOOL_RESULT_LIMIT: Record<string, number> = {
     'read_market_strategy': 50000,
     'search_tool_response': 20000,
+    'read_tool_response': 60000,
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
@@ -14363,6 +14560,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (founder.signaturePosts) {
           formattedSummary += `  ✍️ <strong>Signature Posts:</strong> ${founder.signaturePosts}<br>`;
         }
+        if (founder.voiceExamples) {
+          formattedSummary += `  📝 <strong>Voice Examples (CRITICAL — use these as your style template):</strong><br>`;
+          formattedSummary += `  <em>When generating posts for this founder, study the sentence length, vocabulary, punctuation, line breaks, hooks, and overall rhythm of these examples. Do NOT default to generic LinkedIn templates or AI-industry clichés. Mirror this exact voice:</em><br>`;
+          formattedSummary += `  <blockquote>${founder.voiceExamples.replace(/\n/g, '<br>')}</blockquote>`;
+        }
         formattedSummary += `<br>`;
       });
     } else {
@@ -14449,6 +14651,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               }
               if (founder.signaturePosts) {
                 formattedSummary += `    ✍️ Signature Posts: ${founder.signaturePosts}<br>`;
+              }
+              if (founder.voiceExamples) {
+                formattedSummary += `    📝 Voice Examples: ${founder.voiceExamples.substring(0, 200)}${founder.voiceExamples.length > 200 ? '…' : ''}<br>`;
               }
             });
           } else if (Array.isArray(value)) {
@@ -20500,6 +20705,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (!alreadyLogged && !isExpectedUserError) {
         console.error('AgentMode: LinkedIn outreach failed:', error);
       }
+
+      const structuredError = (error as any).structuredError;
+      if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
+        return {
+          success: false,
+          message: 'LinkedIn account disconnected',
+          error: [
+            'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
+            '',
+            'Common reasons a connected account becomes disconnected:',
+            '1. LinkedIn detected automation activity and revoked the session',
+            '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
+            '3. The LinkedIn session cookie expired (typically every 30–90 days)',
+            '4. Unipile lost the session internally and requires a manual reconnect',
+            '',
+            'Next steps:',
+            '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
+            '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
+          ].join('\n')
+        };
+      }
+
       return {
         success: false,
         message: 'LinkedIn outreach action failed',

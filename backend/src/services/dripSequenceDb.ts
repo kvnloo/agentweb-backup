@@ -97,6 +97,9 @@ export interface SequenceStep {
   subject: string;
   bodyHtml: string;
   senderId?: string;          // sender config id; falls back to user default
+  spamCheckedAt?: string;     // ISO timestamp of last spam check
+  spamPassed?: boolean;       // result of last spam check
+  spamContentHash?: string;   // hash of subject+bodyHtml at check time; if content changes, result is stale
 }
 
 export interface DripSequence {
@@ -119,6 +122,10 @@ export interface DripSequence {
   };
 
   enrollmentCondition?: StepCondition;  // if set, checked before every send; exits if not met
+
+  // Lists configured to auto-enroll new leads into this sequence.
+  // Set automatically when user enrolls via by-list; can be cleared to disable.
+  autoEnrollListIds?: string[];
 
   steps: SequenceStep[];
   status: SequenceStatus;
@@ -145,6 +152,7 @@ export interface UpdateSequenceInput {
   enrollmentTrigger?: DripSequence['enrollmentTrigger'];
   enrollmentCondition?: StepCondition | null;
   exitConditions?: Partial<DripSequence['exitConditions']>;
+  autoEnrollListIds?: string[] | null;
   steps?: Omit<SequenceStep, 'stepId'>[];
   status?: SequenceStatus;
 }
@@ -263,12 +271,12 @@ async function updateSequence(
 
   const updates: Partial<DripSequence> = { updatedAt: now() };
   if (input.name !== undefined) updates.name = input.name;
-  if (input.description !== undefined) updates.description = input.description ?? undefined;
+  if (input.description !== undefined) (updates as any).description = input.description ?? null;
   if (input.campaignType !== undefined) updates.campaignType = input.campaignType;
   if (input.enrollmentTrigger !== undefined) updates.enrollmentTrigger = input.enrollmentTrigger;
   if (input.enrollmentCondition !== undefined) {
-    // null means "remove condition"
-    (updates as any).enrollmentCondition = input.enrollmentCondition ?? undefined;
+    // null means "remove condition" → REMOVE in DynamoDB
+    (updates as any).enrollmentCondition = input.enrollmentCondition ?? null;
   }
   if (input.exitConditions !== undefined) {
     updates.exitConditions = {
@@ -276,6 +284,10 @@ async function updateSequence(
       ...input.exitConditions,
       onUnsubscribe: true,  // always enforced
     };
+  }
+  if (input.autoEnrollListIds !== undefined) {
+    // null means "clear all auto-enroll lists" (disable auto-enroll) → REMOVE in DynamoDB
+    (updates as any).autoEnrollListIds = input.autoEnrollListIds ?? null;
   }
   if (input.steps !== undefined) {
     updates.steps = input.steps.map((s, i) => ({
@@ -286,27 +298,36 @@ async function updateSequence(
   }
   if (input.status !== undefined) updates.status = input.status;
 
-  // Build DynamoDB update expression
+  // Build DynamoDB update expression. Fields explicitly set to null get REMOVED.
   const setExpressions: string[] = [];
+  const removeExpressions: string[] = [];
   const names: Record<string, string> = {};
   const values: Record<string, any> = {};
 
   let idx = 0;
   for (const [k, v] of Object.entries(updates)) {
     const nameKey = `#f${idx}`;
-    const valKey = `:v${idx}`;
     names[nameKey] = k;
-    values[valKey] = v;
-    setExpressions.push(`${nameKey} = ${valKey}`);
+    if (v === null || v === undefined) {
+      removeExpressions.push(nameKey);
+    } else {
+      const valKey = `:v${idx}`;
+      values[valKey] = v;
+      setExpressions.push(`${nameKey} = ${valKey}`);
+    }
     idx++;
   }
+
+  let updateExpression = '';
+  if (setExpressions.length > 0) updateExpression += `SET ${setExpressions.join(', ')}`;
+  if (removeExpressions.length > 0) updateExpression += ` REMOVE ${removeExpressions.join(', ')}`;
 
   const result = await dynamodb.update({
     TableName: SEQUENCES_TABLE,
     Key: { sequenceId },
-    UpdateExpression: `SET ${setExpressions.join(', ')}`,
+    UpdateExpression: updateExpression.trim(),
     ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values,
+    ...(Object.keys(values).length > 0 ? { ExpressionAttributeValues: values } : {}),
     ConditionExpression: 'attribute_exists(sequenceId)',
     ReturnValues: 'ALL_NEW',
   }).promise();
@@ -349,7 +370,7 @@ async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollm
   return enrollment;
 }
 
-/** Bulk-enroll multiple leads; skips leads already actively enrolled in this sequence. */
+/** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted). */
 async function bulkEnroll(
   inputs: CreateEnrollmentInput[],
 ): Promise<{ enrolled: number; skipped: number }> {
@@ -357,8 +378,8 @@ async function bulkEnroll(
   let skipped = 0;
 
   for (const input of inputs) {
-    const alreadyActive = await getActiveEnrollment(input.sequenceId, input.leadEmail);
-    if (alreadyActive) {
+    const existing = await getExistingEnrollment(input.sequenceId, input.leadEmail);
+    if (existing) {
       skipped++;
       continue;
     }
@@ -369,12 +390,34 @@ async function bulkEnroll(
   return { enrolled, skipped };
 }
 
+/**
+ * Returns any existing enrollment for this lead+sequence regardless of status.
+ * Used by bulkEnroll to skip leads who are active, completed, or converted —
+ * only truly fresh leads (never enrolled) get added.
+ */
+async function getExistingEnrollment(
+  sequenceId: string,
+  leadEmail: string,
+): Promise<SequenceEnrollment | null> {
+  const result = await dynamodb.query({
+    TableName: ENROLLMENTS_TABLE,
+    IndexName: 'leadEmail-index',
+    KeyConditionExpression: 'leadEmail = :email',
+    FilterExpression: 'sequenceId = :sid',
+    ExpressionAttributeValues: {
+      ':email': leadEmail,
+      ':sid': sequenceId,
+    },
+  }).promise();
+
+  const items = (result.Items ?? []) as SequenceEnrollment[];
+  return items[0] ?? null;
+}
+
 async function getActiveEnrollment(
   sequenceId: string,
   leadEmail: string,
 ): Promise<SequenceEnrollment | null> {
-  // Query by leadEmail GSI, then filter to matching sequenceId + active status in memory
-  // (email is low-cardinality per user so this is fine)
   const result = await dynamodb.query({
     TableName: ENROLLMENTS_TABLE,
     IndexName: 'leadEmail-index',
@@ -513,6 +556,20 @@ async function getEnrollmentStats(sequenceId: string): Promise<{
   return counts;
 }
 
+/**
+ * Returns all active sequences for a user that have autoEnrollListIds containing listId.
+ * Called when a new lead is added to a list to auto-enroll them.
+ */
+async function getSequencesByAutoEnrollList(userId: string, listId: string): Promise<DripSequence[]> {
+  const all = await listSequences(userId);
+  return all.filter(
+    (s) =>
+      s.status === 'active' &&
+      Array.isArray(s.autoEnrollListIds) &&
+      s.autoEnrollListIds.includes(listId),
+  );
+}
+
 // ─── Error classes ────────────────────────────────────────────────────────────
 
 export class SequenceNotFoundError extends Error {
@@ -538,12 +595,14 @@ export const dripSequenceDb = {
   listSequences,
   updateSequence,
   deleteSequence,
+  getSequencesByAutoEnrollList,
 
   // Enrollments
   enrollLead,
   bulkEnroll,
   getEnrollment,
   getActiveEnrollment,
+  getExistingEnrollment,
   listEnrollmentsForSequence,
   getDueEnrollments,
   getAllDueEnrollments,

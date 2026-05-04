@@ -25,6 +25,11 @@ jest.mock('../services/db', () => ({
       { leadId: 'lead-2', email: 'b@example.com' },
     ]),
     getLead: jest.fn().mockResolvedValue({ leadId: 'lead-1', email: 'a@example.com', lifecycle: 'inbox' }),
+    getLeadsByListId: jest.fn().mockResolvedValue([
+      { leadId: 'lead-1', email: 'a@example.com' },
+      { leadId: 'lead-2', email: 'b@example.com' },
+    ]),
+    getLeadsByStatus: jest.fn().mockResolvedValue([]),
   },
   userDb: {
     getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@example.com' }),
@@ -272,5 +277,90 @@ describe('GET /:sequenceId/enrollments - list enrollments', () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce(null);
     const res = await request(app).get('/unknown/enrollments');
     expect(res.status).toBe(404);
+  });
+});
+
+// ─── POST /:sequenceId/enrollments/by-list — auto-enroll list wiring ──────────
+
+describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
+  beforeEach(() => {
+    // Reset updateSequence mock to default (returns updated sequence)
+    dripSequenceDb.updateSequence.mockResolvedValue({ ...mockSequence, autoEnrollListIds: ['list-1'] });
+  });
+
+  it('sets autoEnrollListIds on the sequence after by-list enrollment', async () => {
+    // Simulate sequence without autoEnrollListIds yet
+    dripSequenceDb.getSequence.mockResolvedValueOnce({ ...mockSequence, autoEnrollListIds: undefined });
+
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'lead-1', email: 'a@example.com' },
+    ]);
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.enrolled).toBe(2); // bulkEnroll mock returns 2
+
+    // updateSequence should have been called to add listId to autoEnrollListIds
+    // (called fire-and-forget, so we wait a tick)
+    await new Promise((r) => setTimeout(r, 10));
+    expect(dripSequenceDb.updateSequence).toHaveBeenCalledWith(
+      'seq_1',
+      'user-123',
+      expect.objectContaining({ autoEnrollListIds: ['list-1'] }),
+    );
+  });
+
+  it('does not call updateSequence again if listId is already in autoEnrollListIds', async () => {
+    dripSequenceDb.getSequence.mockResolvedValueOnce({
+      ...mockSequence,
+      autoEnrollListIds: ['list-1'],
+    });
+    dripSequenceDb.updateSequence.mockClear();
+
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue([]);
+
+    await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+  });
+
+  it('rejects missing listId', async () => {
+    const res = await request(app).post('/seq_1/enrollments/by-list').send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/listId/i);
+  });
+});
+
+// ─── PUT /:sequenceId — autoEnrollListIds passthrough ─────────────────────────
+
+describe('PUT /:sequenceId - autoEnrollListIds', () => {
+  it('passes autoEnrollListIds to updateSequence', async () => {
+    const res = await request(app)
+      .put('/seq_1')
+      .send({ autoEnrollListIds: ['list-1', 'list-2'] });
+    expect(res.status).toBe(200);
+    expect(dripSequenceDb.updateSequence).toHaveBeenCalledWith(
+      'seq_1',
+      'user-123',
+      expect.objectContaining({ autoEnrollListIds: ['list-1', 'list-2'] }),
+    );
+  });
+
+  it('passes null autoEnrollListIds to disable auto-enroll', async () => {
+    const res = await request(app)
+      .put('/seq_1')
+      .send({ autoEnrollListIds: null });
+    expect(res.status).toBe(200);
+    expect(dripSequenceDb.updateSequence).toHaveBeenCalledWith(
+      'seq_1',
+      'user-123',
+      expect.objectContaining({ autoEnrollListIds: null }),
+    );
   });
 });

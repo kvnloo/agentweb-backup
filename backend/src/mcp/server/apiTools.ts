@@ -1784,8 +1784,8 @@ mcpToolRegistry.register({
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of sessions to return (1-1000, default: 100)',
-          default: 100
+          description: 'Maximum number of sessions to return (1-1000, default: 500). Use limit: 1000 when you need complete coverage for accurate counts or percentages over busy time ranges.',
+          default: 500
         },
         sync: {
           type: 'boolean',
@@ -1797,10 +1797,15 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    if (!args.start_time || !args.end_time) {
+      return jsonResult({
+        error: 'start_time and end_time are required. Provide ISO 8601 timestamps, e.g. start_time="2024-03-01T00:00:00.000Z"'
+      });
+    }
     const queryParams = new URLSearchParams({
       startTime: args.start_time,
       endTime: args.end_time,
-      ...(args.limit && { limit: args.limit.toString() }),
+      limit: (args.limit ?? 500).toString(),
       ...(args.sync && { sync: args.sync.toString() })
     });
     const data = await mcpFetch({

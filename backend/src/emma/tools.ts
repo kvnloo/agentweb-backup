@@ -7,6 +7,7 @@ import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -1103,7 +1104,8 @@ emmaToolRegistry.register({
                   name: { type: 'string', description: 'Founder name' },
                   jobTitle: { type: 'string', description: 'Founder job title' },
                   styleTone: { type: 'string', description: 'Founder communication style and tone' },
-                  signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' }
+                  signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' },
+                  voiceExamples: { type: 'string', description: 'Actual post examples (verbatim) written by or for this founder. Emma uses these as a direct style reference when generating LinkedIn and social posts — paste 2–3 real posts separated by blank lines.' }
                 },
                 required: ['name']
               },
@@ -2703,13 +2705,18 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm.',
     inputSchema: {
       type: 'object',
       properties: {
         list_id: {
           type: 'string',
-          description: 'The ID of the lead list to search'
+          description: 'The ID of a single lead list to search. Use this OR list_ids, not both.'
+        },
+        list_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'IDs of up to 5 lead lists to search across. Each returned lead includes its listId/listName. Inaccessible lists are silently skipped. Use this OR list_id, not both. For broader cross-CRM scope, prefer ask_crm.'
         },
         filters: {
           type: 'array',
@@ -2718,7 +2725,7 @@ emmaToolRegistry.register({
             properties: {
               field: {
                 type: 'string',
-                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt; ICP: icpScore, icpMatch; engagement: engagementCount; dot-notation paths like "customFields.createdAt"; or any custom field name)'
+                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt; ICP: icpScore, icpMatch; engagement: engagementCount; dot-notation paths like "customFields.createdAt"; or any custom field name). When searching multiple lists, missing fields on a list silently fail to match (no error).'
               },
               operator: {
                 type: 'string',
@@ -2743,16 +2750,17 @@ emmaToolRegistry.register({
         },
         cursor: {
           type: 'string',
-          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
+          description: 'Pagination cursor returned as next_cursor from a previous call. Pass this verbatim to retrieve the next page; the cursor freezes the list_ids set so paging is stable even if your list_ids change between calls.'
         }
       },
-      required: ['list_id', 'filters']
+      required: ['filters']
     }
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
       search: args.search,
-      cursor: args.cursor
+      cursor: args.cursor,
+      listIds: args.list_ids,
     });
   }
 });
@@ -5883,7 +5891,21 @@ emmaToolRegistry.register({
       throw new Error('User not found');
     }
 
-    const results: Array<{ title: string; success: boolean; notionUrl?: string; error?: string }> = [];
+    // isDelegatedAdmin is set when called via chatbotService (Emma sidebar).
+    // isDelegatedAccess is set when called via agentModeService (agent mode chat).
+    // In both cases, look up the admin email from the session's delegateInfo in DB.
+    const isDelegate = context?.isDelegatedAdmin === true || context?.isDelegatedAccess === true;
+    let adminEmail: string | undefined = context?.adminEmail;
+    if (isDelegate && !adminEmail && context?.sessionId) {
+      const { chatbotDb } = await import('../services/chatbotService');
+      const session = await chatbotDb.getChatSession(context.sessionId);
+      if (session?.delegateInfo?.isDelegated && session.delegateInfo.adminEmail) {
+        adminEmail = session.delegateInfo.adminEmail;
+      }
+    }
+    const isDelegatedAdmin = isDelegate && !!adminEmail;
+
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string }> = [];
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
@@ -5900,6 +5922,10 @@ emmaToolRegistry.register({
           'Session ID': context?.sessionId || 'N/A',
         };
 
+        if (isDelegatedAdmin && adminEmail) {
+          issueContext['Reported By (Admin)'] = adminEmail;
+        }
+
         const result = await createOncallItem({
           title: issue.title,
           description: issue.description,
@@ -5907,29 +5933,38 @@ emmaToolRegistry.register({
           context: issueContext,
         });
 
+        // When an admin reports via delegate access, send only to the admin (not the customer).
+        // The admin initiated the report, not the customer.
+        const emailRecipients = isDelegatedAdmin && adminEmail
+          ? [...productIssueEmails, adminEmail]
+          : [...productIssueEmails, user.email];
+        const emailGreeting = isDelegatedAdmin && adminEmail
+          ? `Hi ${adminEmail}, you've submitted an issue report on behalf of ${user.displayName || user.email}.`
+          : `Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.`;
+
         await resendService.sendEmail({
-          from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-          to: productIssueEmails,
-          subject: `Product Issue from ${user.email}: ${issue.title}`,
+          from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
+          to: emailRecipients,
+          subject: `We received your issue: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
               <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
                 <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
               </div>
-              <div style="margin: 8px 0;"><strong>From:</strong> ${user.displayName || user.email} (${user.email})</div>
+              <p style="color: #444;">${emailGreeting} The AgentWeb engineering team has been notified.</p>
+              ${result.pageId ? `<div style="margin: 8px 0;"><strong>Issue ID:</strong> AGW-${result.pageId}</div>` : ''}
               <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
               <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
-              <div style="margin: 8px 0;"><strong>Notion:</strong> <a href="${result.notionUrl}">${result.notionUrl}</a></div>
               <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
                 <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
                 <div>${issue.description.replace(/\n/g, '<br>')}</div>
               </div>
             </div>
           `,
-          replyTo: user.email,
+          replyTo: isDelegatedAdmin && adminEmail ? adminEmail : user.email,
         });
 
-        results.push({ title: issue.title, success: true, notionUrl: result.notionUrl });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }

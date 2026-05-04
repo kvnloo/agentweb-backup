@@ -1,3 +1,74 @@
+## EB Autoscaling Flapping — Investigation (2026-05-01)
+
+### Context
+
+Multiple instance launches observed in production (`Agentweb-backend-env-prod-3`) within a short window: 3 new `t3.large` instances added between 16:31–16:46 UTC, one terminated, health warnings. Initially suspected OOM crashes or instance failures.
+
+### Root Cause: NetworkOut autoscaling threshold too low
+
+The EB autoscaling alarm was configured to trigger on **NetworkOut** (not CPU):
+- **Scale up:** `NetworkOut > 6 MB / 5-min period`
+- **Scale down:** `NetworkOut < 2 MB / 5-min period`
+
+The backend serves large API responses that easily exceed 6 MB on a single instance:
+- `GET /api/agent-mode/sessions?limit=50` → ~2.2 MB response
+- `GET /api/tasks/executions/with-html-reports?limit=1` → ~4.2 MB response
+
+A few concurrent users hitting these endpoints concentrate traffic on the single instance after a scale-down (min=1), causing the scale-up alarm to fire. The new instance takes ~7 minutes to become healthy, during which load stays on the original instance — appearing as repeated "crashes."
+
+Peak NetworkOut observed: **23.9 MB/instance** at 16:35 UTC.
+
+### Fix Applied
+
+Raised autoscaling thresholds via EB console:
+- **Scale up:** `NetworkOut > 30 MB / 5-min period` (was 6 MB)
+- **Scale down:** `NetworkOut < 6 MB / 5-min period` (was 2 MB)
+
+### Not Done: Minimum Instance Count
+
+Raising the minimum from 1 → 2 would eliminate the "all load on one instance" window after scale-down, but adds ~$140/month in EC2 cost. There is no convincing evidence this is necessary given the threshold fix — the flapping was the symptom, not instance capacity. Revisit if flapping resumes after the threshold change.
+
+### How to diagnose in future
+
+1. Check EB events: `aws elasticbeanstalk describe-events --environment-name Agentweb-backend-env-prod-3 --region us-west-2 --max-records 20`
+2. Check ASG scaling activities to distinguish scale-out (alarm-triggered) from crash-replacement (health-check failure)
+3. Check which alarm fired: `aws cloudwatch describe-alarms --alarm-names <AlarmName>` — look at `Metric` and `Threshold`
+4. Plot `NetworkOut` metric on the ASG to see what triggered the alarm
+
+---
+
+## coding_agent "No GitHub / No Vercel" — Investigation (2026-04-29)
+
+### Context
+
+John (`founders@agentweb.pro`) reported that the `coding_agent` tool failed on the "Free AI Eval" landing page (`ai-eval-85a928ad`, `https://audit.agentweb.pro/ai-eval`) after 8 iterations with "No GitHub repository / No Vercel project" errors on all file-editing and deployment tools.
+
+### Root Cause 1: Missing `githubRepoUrl` / `vercelProjectId` on DynamoDB record
+
+The page record existed with `status: deployed` and a live `deployedUrl`, but `githubRepoUrl` and `vercelProjectId` were completely absent. Every coding agent tool — `list_files`, `read_file`, `edit_file`, `check_deployment` — calls `getLandingPage()` and checks these fields before doing anything.
+
+**Why it happened:** `addPageToExistingRepo()` copies these fields from a sibling page at record creation, but the final deployed-status `UPDATE` only wrote `status` and `updatedAt`. If the initial PUT was incomplete for any reason, the record was permanently broken.
+
+**Fix:** The `UPDATE` in `addPageToExistingRepo()` now also re-writes `githubRepoUrl` and `vercelProjectId` (`v0Service.ts`). Backfilled the specific record in production using `repair-landing-page-repo-fields.ts`.
+
+### Root Cause 2: Stale `vercelProjectId` across all pages
+
+After fixing root cause 1, `get_landing_page_preview_url` and `get_deployment_status` failed with 500. The stored Vercel project ID `prj_8MJIkLDVNod9XRj5Kbl0FIk7EhJ3` was stale — the Vercel project had been recreated. All 5 of john's pages had the old ID.
+
+**Fix:** Checked the Vercel dashboard (`vercel.com/agentweb/agentweb-landing-page`), found the new project ID `prj_lH8z68FO47QtpLrLa45FnFRc2xwV`, and ran `repair-vercel-project-id.ts` to update all 5 pages in production.
+
+### How to diagnose this in future
+
+1. Check the DynamoDB record directly: `aws dynamodb get-item --table-name AW-LandingPages --key '{"id":{"S":"<page-id>"}}'` — look for `githubRepoUrl` and `vercelProjectId`.
+2. If `vercelProjectId` is present but deployment APIs return 500, test it: `curl -H "Authorization: Bearer <VERCEL_TOKEN>" "https://api.vercel.com/v9/projects/<vercelProjectId>"`. A 404 means the project was recreated — check the Vercel dashboard for the new project ID.
+3. When a Vercel project is recreated, update all pages sharing the old ID using `repair-vercel-project-id.ts` (update `OLD_ID`/`NEW_ID` constants first).
+
+### Lesson
+
+When the Vercel project is recreated or migrated, all `AW-LandingPages` records pointing to the old project ID become silently broken. There is no automatic sync. Any time Vercel project management happens (delete, transfer, recreate), run the repair script immediately.
+
+---
+
 ## Emma 3-Dimension Scores Missing — Investigation (2026-04-28)
 
 ### Context
@@ -3817,3 +3888,96 @@ The email accounts that Thunderbird users configure are standard providers that 
 ### Decision
 
 Do not build a Thunderbird-specific connected account — it is not architecturally feasible without requiring users to install a local extension. Instead, direct Thunderbird users to connect the underlying email account they use in Thunderbird (e.g., Gmail via the existing Gmail connected account flow).
+
+## AI Eval Work Plan Duration — Investigation (2026-04-30)
+
+### Context
+
+Investigated a predefined-work-plan session (`AI_GTM_Position_Eval`, session `85aabd21`) that appeared to be still running after several minutes.
+
+### Findings
+
+**The session completed successfully — no stall or bug.** Timeline:
+
+- `06:31:49` — Session created, user sent their URL
+- `06:38:16` — Work plan step completed (~6.5 minutes of actual work)
+- `06:38:27` — Session record updated in DynamoDB
+- `06:44:48` — Satisfaction score evaluated (triggered ~6 min later by admin `GET /api/admin/chat-sessions?sync=true` poll)
+
+The 6.5 minutes was real work by the "AI GTM Positioning Audit" skill:
+- 3× `read_page_source` calls (scraping homepage and blog)
+- 2× `bravesearch_brave_web_search` (one failed and retried)
+- 1× `create_html_file` generating a full HTML audit report
+- 1× `save_file` to S3
+- 24,650 completion tokens of output (Sonnet 4.6 model)
+
+### Backend Architecture Notes
+
+- **Work plan step completion** is driven by `set_work_plan_status` tool, which validates `requiredFunctionCalls` counts before marking a step done.
+- **No artificial delays** exist in the work plan execution path — no polling loops, sleep, or retries beyond per-tool exponential backoff on transient errors.
+- **`install_skills` counted as 0** because the skill was auto-installed at session creation (`createSessionWithPlan` installs all associated skills upfront); the tool never needs to be called explicitly.
+- **Satisfaction scoring is not automatic** — it only triggers when an admin hits `GET /api/admin/chat-sessions?sync=true` (batch) or `POST /api/admin/chat-sessions/score`. The 6-minute post-completion gap was the admin dashboard sync polling interval.
+
+### Frontend Completion Detection
+
+The customer portal detects completion via SSE `complete` event → 800ms `setTimeout` → `GET /api/agent-mode/session/{sessionId}` refresh. UI shows completion as soon as work plan steps are `status: 'completed'`, independent of `satisfactionScore`. If the session appeared "still running" after `06:38`, that likely reflects a stale tab or the share link being opened before the SSE event was received.
+
+### Decision
+
+No action required. The execution time is expected given the volume of tool calls and token output. If we want to reduce perceived latency, options are: (a) use a faster model (Haiku 4.5) for the audit, or (b) stream intermediate progress messages to the UI as each tool call completes.
+
+## LinkedIn Outreach Rate Limits — Investigation (2026-05-04)
+
+### Context
+
+Session `998e3e33` ("Scheduled: Rui - Daily LinkedIn Connection Outreach") scored 2/5. The agent attempted a high volume of outreach actions, hit LinkedIn's "Cannot resend yet" / `errors/already_invited_recently` rate limit, and kept retrying rather than stopping. The execution log showed a large number of repeated failed `send-invite` tool calls, and the agent claimed to have "bypassed the safety limit" — suggesting it did not recognize the errors as hard stop signals.
+
+The next day's scheduled run succeeded without issue, confirming LinkedIn's cooldown window had elapsed and there is no persistent issue in the schedule itself.
+
+### Root Cause
+
+The `errors/already_invited_recently` error from Unipile (HTTP 422) is **not caught specifically** in production code. It falls through to the generic `handleError()` in `linkedInOutreachService.ts` (lines 38–50), which classifies it as a generic `VALIDATION_ERROR` (same bucket as malformed input). The agent mode handler (`agentModeService.ts` ~line 20709) only special-cases `AUTH_ERROR` and disconnected account errors — it has no awareness that a `VALIDATION_ERROR` here means "rate limited, stop sending invites for now."
+
+As a result, the agent received repeated "validation error" responses, did not interpret them as a stop signal, and looped.
+
+### Code Gaps Found
+
+| Gap | File | Lines |
+|-----|------|-------|
+| `errors/already_invited_recently` not caught — classified as generic `VALIDATION_ERROR` | `linkedInOutreachService.ts` | 38–50, 309–325 |
+| No pre-flight check for pending invitations before `sendInvitation()` | `linkedInOutreachService.ts` | 331–355 |
+| Agent mode handler only special-cases AUTH errors, not rate limit errors | `agentModeService.ts` | ~20709–20735 |
+
+A test at `backend/src/__tests__/linkedInOutreachService.test.ts:163–178` covers the scenario and shows the correct Unipile error shape, but the corresponding production catch does not exist.
+
+### Decision
+
+No action yet. The schedule recovered on its own the next day. We will wait until this recurs before implementing fixes. If it does recur, the fix is:
+1. Detect `errors/already_invited_recently` specifically in `handleError()` and return a distinct `RATE_LIMIT_ERROR` type (separate from generic `VALIDATION_ERROR`)
+2. Surface a clear "rate limited — stop sending invitations" signal to the agent in the `send-invite` tool response
+3. Optionally add a pending-invite pre-flight check in `sendInvitation()` before calling Unipile
+
+## Quality Agent Tool for Emma — Design Decision (2026-05-04)
+
+### Context
+
+Explored adding a dedicated `assess_quality` tool that Emma could call after generating content (LinkedIn posts, blog articles, ad images, etc.) to score and justify the quality of her output. The existing `sessionScoringService.ts` already scores sessions on a 1–5 scale across three dimensions (goalCompletion, dataAccuracy, outputQuality) but operates at session level and is admin-only.
+
+### Options Considered
+
+1. **New `assess_quality` Emma tool** — standalone tool with per-content-type rubrics, called proactively or on-demand after content creation.
+2. **Quality built into creation tools** — modify `create_social_media_posts`, `create_blog_article`, etc. to return a quality object alongside the content.
+3. **Expose session scoring to Emma** — extend `scoreSessionIfNeeded` to extract and score individual artifacts from conversation history.
+
+### Decision
+
+**Defer all three options.** Chosen approach instead: add a Content Quality Standard section to Emma's system prompt (`agentModeSystemPrompt.ts`) instructing her to draw on brand/ICP context before generating content and briefly justify quality choices inline after generation. This is simpler, zero-latency, and directly addresses the root cause (generic/slop output) without added tooling complexity.
+
+The quality agent tool approach was set aside for the following reasons:
+- **UX impact**: Every content creation call would incur an additional LLM round-trip (~2–3s), visibly slowing Emma's responses.
+- **Complexity**: Per-content-type rubrics require ongoing maintenance; scoring prompts would drift from actual quality criteria over time.
+- **Diminishing returns**: The session scorer already captures output quality as a dimension. A separate per-artifact scorer adds infra without clear signal advantage until we have evidence the prompt-level fix is insufficient.
+
+### Future Consideration
+
+Revisit if prompt-level instruction proves insufficient — i.e., Emma continues producing generic content despite the quality standard directive. At that point, Option 1 (standalone `assess_quality` tool with content-type-specific rubrics) is the recommended starting point.

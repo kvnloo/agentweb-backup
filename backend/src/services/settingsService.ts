@@ -127,6 +127,26 @@ export class SettingsService {
     return fallback;
   }
 
+  async invalidateSlackChannelMappings(userId: string, channelIds: string[]): Promise<void> {
+    try {
+      const allSettings = await this.getAllSettings();
+      const byChannelKeys = channelIds.map(ch => `slack_channel_mapping_${ch}`);
+      const staleKeys = allSettings
+        .filter(s =>
+          s.settingName.startsWith('slack_channel_mapping_') &&
+          (s.settingValue === userId || byChannelKeys.includes(s.settingName))
+        )
+        .map(s => s.settingName);
+      await Promise.all(staleKeys.map(k => this.deleteSetting(k)));
+      if (staleKeys.length > 0) {
+        console.log(`🗑️ Invalidated ${staleKeys.length} stale slack channel mapping cache entries for user ${userId}`);
+      }
+    } catch (error) {
+      console.error('Error invalidating slack channel mappings:', error);
+      throw error;
+    }
+  }
+
   async deleteSetting(settingName: string): Promise<void> {
     try {
       const params = {

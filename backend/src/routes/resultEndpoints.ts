@@ -279,7 +279,7 @@ reviewRouter.post('/:sessionId/send', async (req, res) => {
         </div>
       </div>`;
 
-    // Send via Resend with no-reply@updates.agentweb.pro, CC reviewer
+    // Send via Resend, CC reviewer
     const fromAddress = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
     const ccEmail = metadata.reviewerEmail && metadata.reviewerEmail !== recipientEmail.trim()
       ? metadata.reviewerEmail

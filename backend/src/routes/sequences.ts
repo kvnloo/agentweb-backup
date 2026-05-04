@@ -16,7 +16,8 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, hasUnsafeEmailStyles } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { LLMService } from '../utils/llmService';
 
 const router = express.Router();
 
@@ -79,7 +80,7 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
   try {
     const input: UpdateSequenceInput = {
       name,
@@ -88,6 +89,7 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
       enrollmentTrigger,
       enrollmentCondition,
       exitConditions,
+      autoEnrollListIds,
       steps,
       status,
     };
@@ -219,6 +221,17 @@ router.post(
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
+
+      // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
+      // unless it's already there. This means new leads added to this list later
+      // will be automatically enrolled.
+      const existing = sequence.autoEnrollListIds ?? [];
+      if (!existing.includes(listId)) {
+        void dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, {
+          autoEnrollListIds: [...existing, listId],
+        }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));
+      }
+
       res.json(result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
@@ -285,19 +298,12 @@ router.post(
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=TEST&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
 
-    // Detect and fix class-based CSS that most email clients strip
-    const needsInlining = hasUnsafeEmailStyles(htmlContent);
-    const { html: processedHtml, wasFixed } = await inlineEmailStyles(htmlContent);
-
-    const stylesNote = wasFixed
-      ? ' | ✅ Styles auto-fixed: CSS classes converted to inline styles'
-      : '';
-    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email${stylesNote}</div>`;
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test sequence step email</div>`;
 
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(processedHtml)
-      ? processedHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + processedHtml;
+    const withBanner = /<body\b/i.test(htmlContent)
+      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + htmlContent;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
@@ -334,6 +340,134 @@ router.post(
       failed: failedCount,
       failedEmails,
     });
+  },
+);
+
+/**
+ * @route POST /api/crm/sequences/:sequenceId/steps/spam-check
+ * @desc Use Claude to analyse the email for spam/deliverability issues
+ */
+router.post(
+  '/:sequenceId/steps/spam-check',
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { subject, htmlContent, senderEmail } = req.body;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!subject || !htmlContent) return res.status(400).json({ message: 'subject and htmlContent are required' });
+
+    try {
+      const llm = new LLMService('anthropic.claude-sonnet-4-6', 0, 2000);
+      const systemPrompt = `You are an email deliverability expert. Analyse the provided marketing email for spam and deliverability issues.
+
+Return a JSON object with this exact shape:
+{
+  "passed": boolean,
+  "issues": [
+    {
+      "severity": "error or warning",
+      "code": "SNAKE_CASE_CODE",
+      "message": "One-sentence description of the issue and why it matters."
+    }
+  ]
+}
+
+Severity rules:
+- "error": will definitely cause spam filtering (broken/missing unsubscribe link, deceptive content, URL mismatch)
+- "warning": reduces deliverability score (spam trigger words, missing physical address, external font loading, HTML-only with no text alternative, suspicious sender domain)
+
+IMPORTANT — template variables: This is a drip sequence template. Placeholders like {{unsubscribeUrl}}, {{firstName}}, {{email}}, {{companyName}} are intentional template variables that will be replaced with real values at send time. Do NOT flag these as broken links or missing content.
+
+IMPORTANT — image hosting: Images hosted on AWS S3 or CDNs are normal for transactional email systems. Do NOT flag S3-hosted images as suspicious.
+
+Be precise. Only report genuine issues. If the email looks clean, return an empty issues array.`;
+
+      const userPrompt = `Sender email: ${senderEmail ?? 'not provided'}\nSubject: ${subject}\n\nHTML:\n${htmlContent}`;
+
+      const parsed = await llm.generateJsonRobust<{ passed: boolean; issues: any[] }>(systemPrompt, userPrompt);
+      const issues = Array.isArray(parsed.issues) ? parsed.issues : [];
+      const errors = issues.filter((i: any) => i.severity === 'error');
+      return res.json({
+        passed: errors.length === 0,
+        issues,
+        errorCount: errors.length,
+        warningCount: issues.length - errors.length,
+      });
+    } catch (err: any) {
+      console.error('[spam-check] LLM error:', err.message || err);
+      return res.status(500).json({ message: 'Spam check failed' });
+    }
+  },
+);
+
+/**
+ * @route POST /api/crm/sequences/:sequenceId/steps/spam-repair
+ * @desc Use Claude to fix all spam/deliverability issues in the email.
+ *
+ * Body:
+ *   subject      — current subject line
+ *   htmlContent  — current email HTML
+ *   issues       — the issues array returned by spam-check
+ *   context      — optional free-text user context (e.g. "company is Acme Corp, address is 123 Main St")
+ */
+router.post(
+  '/:sequenceId/steps/spam-repair',
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { subject, htmlContent, issues, context = '' } = req.body as {
+      subject: string;
+      htmlContent: string;
+      issues: Array<{ severity: string; code: string; message: string }>;
+      context?: string;
+    };
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!htmlContent || !Array.isArray(issues) || issues.length === 0) {
+      return res.status(400).json({ message: 'htmlContent and issues[] are required' });
+    }
+
+    try {
+      const llm = new LLMService('anthropic.claude-sonnet-4-6', 0, 16000);
+      const issueList = issues.map(i => `- [${i.severity.toUpperCase()}] ${i.code}: ${i.message}`).join('\n');
+      const contextSection = context.trim() ? `\nUser-provided context:\n${context.trim()}\n` : '';
+
+      const systemPrompt = `You are an expert email developer fixing spam and deliverability issues in a marketing email.
+
+Fix EVERY issue listed below. Rules:
+1. For unsubscribe links: use {{unsubscribeUrl}} as the href — do NOT invent a URL. If there is no unsubscribe link at all, add a simple unsubscribe footer before </body>.
+2. For external font loading (Google Fonts <link> tags, @import url()): remove them entirely from the HTML.
+3. For missing physical address: add it to the footer using the user-provided context. If no address is given in context, add a placeholder "[Company Name, Street Address, City, State ZIP]" styled as small grey text.
+4. For spam trigger words in the subject: rewrite the subject to communicate the same intent without the triggering words.
+5. Preserve the email's visual design, brand, and all content exactly — only make the targeted fixes.
+
+Return your response in this exact format:
+<subject>updated subject line here</subject>
+<html_content>complete fixed HTML here</html_content>`;
+
+      const userPrompt = `Issues to fix:\n${issueList}\n${contextSection}\nSubject: ${subject}\n\nHTML:\n${htmlContent}`;
+
+      const rawText = await llm.generateRaw(systemPrompt, userPrompt);
+
+      const htmlMatch = rawText.match(/<html_content>([\s\S]*?)<\/html_content>/i);
+      const subjectMatch = rawText.match(/<subject>([\s\S]*?)<\/subject>/i);
+
+      if (!htmlMatch) {
+        console.error('[spam-repair] LLM did not return expected tags. Raw:', rawText.slice(0, 500));
+        return res.status(500).json({ message: 'Repair failed: model did not return expected format' });
+      }
+
+      return res.json({
+        subject: subjectMatch ? subjectMatch[1].trim() : subject,
+        htmlContent: htmlMatch[1].trim(),
+      });
+    } catch (err: any) {
+      console.error('[spam-repair] LLM error:', err.message || err);
+      return res.status(500).json({ message: 'Repair failed' });
+    }
   },
 );
 
@@ -489,10 +623,14 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
       bodyContent = bodyContent.substring(0, 200000);
     }
 
+    // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
+    // Doing this at import time avoids the LLM call at every test-send or real send.
+    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
+
     return res.json({
       success: true,
       title: extractedTitle,
-      message: bodyContent,
+      message: inlinedContent,
     });
   } catch (error: any) {
     console.error('[sequences] load-from-url error:', error.message || error);

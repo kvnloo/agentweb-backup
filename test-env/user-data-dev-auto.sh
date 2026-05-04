@@ -130,6 +130,7 @@ cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
       "Bash(sed *)",
       "Bash(sort *)",
       "Bash(tmux *)",
+      "Bash(nohup *)",
       "Bash(kill *)",
       "Bash(chmod *)",
       "Bash(~/agentweb/test-env/*)",
@@ -389,63 +390,7 @@ chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
 cp "$APP_DIR/test-env/claude-comment.py" "$APP_DIR/.claude-comment.py"
 chown ec2-user:ec2-user "$APP_DIR/.claude-comment.py"
 
-cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
-#!/bin/bash
-source ~/.bashrc
-cd ~/agentweb
-
-NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
-NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
-
-# Set status to In progress before starting work
-if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
-  curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
-    -H "Authorization: Bearer $NOTION_TOKEN" \
-    -H "Notion-Version: 2022-06-28" \
-    -H "Content-Type: application/json" \
-    -d '{"properties": {"Status": {"status": {"name": "In progress"}}}}' > /dev/null
-fi
-
-RAW=$(claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
-EXIT_CODE=$?
-
-# Save session ID so the relay can resume the exact same session on follow-up prompts
-SESSION_ID=$(echo "$RAW" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('session_id',''))" 2>/dev/null)
-if [[ -z "$SESSION_ID" ]]; then
-  # Fall back to reading sessionId from the most recently modified JSONL
-  SESSION_ID=$(ls -t ~/.claude/projects/-home-ec2-user-agentweb/*.jsonl 2>/dev/null | head -1 | xargs -I{} python3 -c "
-import json
-for line in open('{}'):
-    try:
-        d = json.loads(line.strip())
-        if d.get('type') == 'last-prompt':
-            print(d.get('sessionId', ''))
-    except: pass
-" 2>/dev/null | tail -1)
-fi
-[[ -n "$SESSION_ID" ]] && echo "$SESSION_ID" > ~/agentweb/.claude-session-id
-
-if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
-  printf '%s' "$RAW" > /tmp/.claude-raw.json
-  python3 ~/agentweb/.claude-comment.py "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
-  BODY=$(cat /tmp/.claude-comment.json)
-  if [[ -n "$BODY" ]]; then
-    curl -s -X POST "https://api.notion.com/v1/comments" \
-      -H "Authorization: Bearer $NOTION_TOKEN" \
-      -H "Notion-Version: 2022-06-28" \
-      -H "Content-Type: application/json" \
-      -d "$BODY"
-  fi
-  rm -f /tmp/.claude-raw.json /tmp/.claude-comment.json
-  # Set status to In Review after work is done
-  curl -s -X PATCH "https://api.notion.com/v1/pages/${NOTION_PAGE_ID}" \
-    -H "Authorization: Bearer $NOTION_TOKEN" \
-    -H "Notion-Version: 2022-06-28" \
-    -H "Content-Type: application/json" \
-    -d '{"properties": {"Status": {"status": {"name": "In Review"}}}}' > /dev/null
-fi
-exec bash
-RUNEOF
+cp "$APP_DIR/test-env/claude-run.sh" "$APP_DIR/.claude-run.sh"
 chmod +x "$APP_DIR/.claude-run.sh"
 
 echo "$NOTION_PAGE_ID" > "$APP_DIR/.notion-page-id"

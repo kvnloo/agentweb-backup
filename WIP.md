@@ -113,3 +113,56 @@ can skip tasks with this field, and a new `local_proxy_agent.py` (or Hermes) han
 - `backend/src/__tests__/localProxy.test.ts` — new
 - `partner-portal/src/pages/admin/WhatsAppScanner.tsx` — new
 - DynamoDB: add `agentType` to `AW-TaskExecutions` (no migration needed — optional field)
+
+---
+
+# WIP: Landing Page Create Button vs. Generate Tool — Template Alignment
+
+**Date:** 2026-04-30  
+**Branch:** `rui/check-landing-page-button-vs-generate`  
+**Status:** Investigation complete. Implementation deferred — the saved HTML templates feature (stored in `/api/html-templates`) is not widely used yet.
+
+---
+
+## Problem Statement
+
+The "Create Landing Page" button in the Landing Pages UI and the `generate_landing_page` Emma agent tool both call `POST /api/landing-pages/v0/generate`, but they build the request differently. We investigated whether this causes bugs.
+
+---
+
+## Findings
+
+### Bug Found: Template selection silently ignored in the UI
+
+When a user picks a saved template in the Create Landing Page dialog, the selection is silently dropped:
+
+- **UI sends:** `{ template_name: "event-marketing", ... }` — a display name string
+- **Backend reads:** `template_id` (UUID) — looks it up in DynamoDB; `template_name` is never destructured
+- **Agent tool sends:** `{ template_id: "...", ... }` — correct
+
+**Result:** Template cards in the UI dialog are non-functional. The backend ignores `template_name` and generates without the template.
+
+**Fix is one line** in `customer-portal/src/pages/LandingPages.tsx` (`handleGenerate`):
+```diff
+- body.template_name = selectedTemplate;   // stores display name, backend ignores it
++ body.template_id = selectedTemplate;     // store template_id instead, requires selector to use template_id too
+```
+And update the card selector to store `tpl.template_id ?? tpl.template_name` instead of `tpl.template_name`.
+
+### Why deferred
+
+The Create Landing Page dialog has three options: (1) General Purpose (no template), (2) a saved HTML template from the Templates section (`/api/html-templates?type=landing_page`), and (3) Upload HTML file. The bug only affects option 2 — the saved templates path. The "Upload HTML" option sends `template_html` directly and works fine; this is a completely separate code path and is not affected.
+
+The saved HTML templates feature (`/api/html-templates`) is not yet widely used. Until users are actively creating and reusing landing page templates, this bug has minimal real impact. Deferring until the HTML templates feature matures.
+
+When ready to fix, the change is small and isolated.
+
+### Other differences (by design, not bugs)
+
+| Aspect | UI Button | Agent Tool |
+|--------|-----------|------------|
+| `lead_list_id` | Never passed — no CRM lead list wired up | Pre-creates a lead list and passes its ID |
+| `template_html` (upload) | Supports uploading raw HTML | Not exposed |
+| Brand guidelines | Auto-injected by backend from user account | Same |
+
+The `lead_list_id` gap means landing pages created via the UI button have no contact form lead capture configured. This is also deferred — addressable when the UI dialog is upgraded to include a lead list selector step.
