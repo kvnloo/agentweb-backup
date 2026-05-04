@@ -377,6 +377,16 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
   OUTCOME_APP_PROMOTION → APP_INSTALLS
 
+AD LIST COMPLETENESS:
+  AD LIST returns ALL non-deleted ads including those paused at the campaign or adset level.
+  Each ad includes effective_status which shows the true running state:
+    ACTIVE           → ad is running
+    PAUSED           → ad itself is paused
+    CAMPAIGN_PAUSED  → ad's campaign is paused (ad would run if campaign is unpaused)
+    ADSET_PAUSED     → ad's adset is paused (ad would run if adset is unpaused)
+  To fully pause all spend, you must pause ads/adsets/campaigns in ALL effective statuses, not just ACTIVE.
+  When asked to "pause all ads", always LIST first then UPDATE every ad regardless of effective_status.
+
 GETTING DESTINATION URLS / CREATIVE DETAILS:
   AD LIST now returns creative sub-fields directly (name, body, title, image_url, thumbnail_url, object_story_spec).
   Extract link from: image creative → creative.object_story_spec.link_data.link
