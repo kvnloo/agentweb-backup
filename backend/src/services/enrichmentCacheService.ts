@@ -116,6 +116,7 @@ export async function writeRawDataToCache(
       canonicalKey,
       entityKey,
       entityType: config.entityType,
+      cacheType: 'field_group',
       rawData,
       queryUsed,
       sourcesUsed,

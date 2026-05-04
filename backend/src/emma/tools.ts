@@ -12,6 +12,9 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 // Register browser cookie persistence tools
 import './browserCookieTools';
 
+// Register email lookup / find tool (provider-agnostic)
+import './emailLookupTool';
+
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {

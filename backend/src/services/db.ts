@@ -4854,6 +4854,10 @@ export const crmDb = {
         mergedCount: 0,
         errorCount: 0,
         errors: [] as string[],
+        // IDs of newly created leads (excludes merged updates). Used by callers
+        // that need to act on freshly-imported leads — e.g., the CSV importer
+        // queues these for enrich.so email validation when the user opts in.
+        created: [] as Array<{ leadId: string; email?: string }>,
       };
 
       // Get existing leads to check for duplicates by email
@@ -4912,9 +4916,11 @@ export const crmDb = {
       for (let i = 0; i < newLeads.length; i += batchSize) {
         const batch = newLeads.slice(i, i + batchSize);
 
+        const batchCreated: Array<{ leadId: string; email?: string }> = [];
         const writeRequests = batch.map(lead => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
+          batchCreated.push({ leadId, email: emailValue });
 
           const item: any = {
             listId,
@@ -4966,6 +4972,9 @@ export const crmDb = {
           await dynamodb.batchWrite(params).promise();
           results.successCount += batch.length;
           results.newCount += batch.length;
+          // Promote batch IDs into the global created list only after the write
+          // succeeds — keeps results.created in sync with what's actually persisted.
+          results.created.push(...batchCreated);
         } catch (batchError: any) {
           batch.forEach((lead, index) => {
             results.errorCount++;
@@ -5155,6 +5164,7 @@ export const crmDb = {
         mergedCount: 0,
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
+        created: [] as Array<{ leadId: string; email?: string }>,
       };
     }
   },
@@ -5784,6 +5794,11 @@ export const crmDb = {
     schemaVersion: number;
     fetchedAt: string;
     expiresAt: number;
+    // Required discriminator. Forces every caller to declare which producer
+    // owns this row, so a future caller cannot silently mislabel an enrich.so
+    // row as a field-group row (or vice versa). Note: this used to be optional
+    // with a 'field_group' default — review C1 flagged that as fragile.
+    cacheType: 'field_group' | 'enrichso';
   }): Promise<void> {
     try {
       await dynamodb.put({
@@ -5798,6 +5813,78 @@ export const crmDb = {
       if (error.code === 'ConditionalCheckFailedException') return;  // another worker won the race
       handleDynamoDbError(error, 'putEnrichmentCacheItem');
       throw error;
+    }
+  },
+
+  /**
+   * Targeted write for the email-validation result that avoids clobbering
+   * concurrent customFields edits.
+   *
+   * The standard `updateLead({customFields: {...}})` path does a full SET on
+   * `customFields`, so a read-modify-write race against a parallel user edit
+   * can lose the user's change. This uses DDB document-path syntax to update
+   * only the two leaf keys, which DDB applies atomically without touching
+   * sibling keys.
+   *
+   * Cold-start fallback: if `enrichmentMetadata` doesn't exist on the lead
+   * yet (it's lazily created), the path SET fails with ValidationException.
+   * We then bootstrap the parent map and retry.
+   */
+  async setLeadEmailValidation(
+    listId: string,
+    leadId: string,
+    validation: Record<string, any>,
+    metadata: Record<string, any>,
+  ): Promise<void> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const params: any = {
+      TableName: tableName,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET customFields.email_validation = :v, ' +
+        'enrichmentMetadata.email_validation = :m, ' +
+        'updatedAt = :ts',
+      ExpressionAttributeValues: {
+        ':v': validation,
+        ':m': metadata,
+        ':ts': new Date().toISOString(),
+      },
+      // Don't auto-create the lead if it disappeared between create and validation.
+      ConditionExpression: 'attribute_exists(leadId)',
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return;
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;  // lead deleted
+      // ValidationException fires when `enrichmentMetadata` doesn't exist as a map.
+      if (err.code !== 'ValidationException') {
+        handleDynamoDbError(err, 'setLeadEmailValidation');
+        throw err;
+      }
+    }
+    // Bootstrap missing parent maps, then retry.
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: { listId, leadId },
+        UpdateExpression:
+          'SET customFields = if_not_exists(customFields, :emptyMap), ' +
+          'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;
+      handleDynamoDbError(err, 'setLeadEmailValidation:bootstrap');
+      throw err;
+    }
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;
+      handleDynamoDbError(err, 'setLeadEmailValidation:retry');
+      throw err;
     }
   },
 

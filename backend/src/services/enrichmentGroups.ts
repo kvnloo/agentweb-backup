@@ -209,7 +209,7 @@ export function toFieldGroupSk(groupName: string, version: number): string {
 
 // ── Normalizers (private) ─────────────────────────────────────────────────────
 
-function normalizeCompanyName(name: string): string {
+export function normalizeCompanyName(name: string): string {
   return name
     .toLowerCase()
     .trim()

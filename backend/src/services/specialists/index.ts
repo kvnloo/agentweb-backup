@@ -12,11 +12,17 @@ import {
   crunchbaseTotalFunding,
   crunchbaseHqCity,
 } from './crunchbaseSpecialist';
+import { enrichSoEmailFinderSpecialist } from './enrichSoEmailFinder';
+import { enrichSoReverseLookupSpecialists } from './enrichSoReverseLookup';
 
 export function registerAllEnrichmentSpecialists(): void {
   registerSpecialist(crunchbaseFundingRound);
   registerSpecialist(crunchbaseTotalFunding);
   registerSpecialist(crunchbaseHqCity);
+  registerSpecialist(enrichSoEmailFinderSpecialist);
+  for (const spec of enrichSoReverseLookupSpecialists) {
+    registerSpecialist(spec);
+  }
 }
 
 export function clearAllEnrichmentSpecialists(): void {

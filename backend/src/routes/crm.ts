@@ -179,6 +179,12 @@ const upload = multer({
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
 
+// enrich.so routes (validate-email, lookup-by-email) live in their own
+// sub-router so they can be unit-tested without mocking all of crm.ts.
+import enrichSoSubRouter from './crmEnrichSo';
+import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+router.use(enrichSoSubRouter);
+
 const normalizeAlertEvents = (alertEvents: any) => {
   if (alertEvents === undefined) {
     return undefined;
@@ -1671,6 +1677,9 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
       autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, leadData.email ?? ''),
+      // Single-lead create always validates the email in background (locked design).
+      // Failures are swallowed so a transient enrich.so outage doesn't block creation.
+      validateLeadEmailInBackground(listId, (lead as any).leadId, leadData.email ?? '', userId),
     ]);
 
     res.status(201).json(lead);
@@ -4166,7 +4175,25 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const totalLeads = leads.length;
     const doNotContactCount = leads.filter((l: any) => isDoNotContact(l)).length;
     const noEmailCount = leads.filter((l: any) => !l.email).length;
-    const eligibleLeads = totalLeads - doNotContactCount - noEmailCount;
+    // Email-deliverability buckets — surfaces risky/undeliverable in the UI so
+    // the user can decide before sending. Undeliverable is blocked by default
+    // in the send endpoint; user can override per-address.
+    const validationStatus = (l: any): string | undefined => l?.customFields?.email_validation?.status;
+    const undeliverableLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'undeliverable');
+    const riskyLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'risky');
+    const undeliverableCount = undeliverableLeadsList.length;
+    const riskyCount = riskyLeadsList.length;
+    // Eligibility = has email && not DNC && not undeliverable. Single boolean
+    // filter (not arithmetic subtraction) so overlapping categories don't
+    // produce negative counts.
+    const eligibleLeads = leads.filter((l: any) =>
+      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable',
+    ).length;
+
+    // Return small samples (first 50) of email lists so the UI modals can show
+    // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
+    const undeliverableEmails = undeliverableLeadsList.slice(0, 50).map((l: any) => l.email);
+    const riskyEmails = riskyLeadsList.slice(0, 50).map((l: any) => l.email);
 
     return res.json({
       totalLeads,
@@ -4174,6 +4201,10 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       unsubscribedCount: doNotContactCount,
       doNotContactCount,
       noEmailCount,
+      undeliverableCount,
+      riskyCount,
+      undeliverableEmails,
+      riskyEmails,
     });
   } catch (error) {
     console.error('Error previewing group email:', error);
@@ -4271,7 +4302,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml } = req.body;
+    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -4300,6 +4331,26 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+
+    // Filter undeliverable emails. Two override modes:
+    //   - includeUndeliverableEmails: string[]  → per-address whitelist (Proposal B)
+    //   - includeUndeliverable: true            → blanket override (legacy/Emma)
+    // Default: block all undeliverable.
+    let skippedUndeliverable = 0;
+    if (!includeUndeliverable) {
+      const whitelist = new Set<string>(
+        Array.isArray(includeUndeliverableEmails)
+          ? includeUndeliverableEmails.map((e: string) => String(e).trim().toLowerCase()).filter(Boolean)
+          : [],
+      );
+      const beforeCount = eligibleLeads.length;
+      eligibleLeads = eligibleLeads.filter((l: any) => {
+        const status = l?.customFields?.email_validation?.status;
+        if (status !== 'undeliverable') return true;
+        return whitelist.has(String(l.email ?? '').trim().toLowerCase());
+      });
+      skippedUndeliverable = beforeCount - eligibleLeads.length;
+    }
 
     // Filter out leads missing required variable values
     const allTemplate = (subject || '') + (htmlContent || '');
@@ -4367,6 +4418,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
       skippedMissingVars,
+      skippedUndeliverable,
     });
   } catch (error) {
     console.error('Error sending group email:', error);

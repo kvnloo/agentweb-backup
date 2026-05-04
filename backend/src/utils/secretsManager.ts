@@ -637,6 +637,22 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+/**
+ * Get the email-verification provider API key from AWS Secrets Manager.
+ * Secret format: plain string API key.
+ */
+export async function getEnrichSoApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/EnrichSo'
+    : 'dev/AgentWeb/EnrichSo';
+  const key = await getSecret(secretName);
+  if (!key || key.trim() === '') {
+    throw new Error(`Email verification API key is empty. Store it in Secrets Manager at ${secretName}.`);
+  }
+  return key.trim();
+}
+
 export interface AttioCredentials {
   clientId: string;
   clientSecret: string;

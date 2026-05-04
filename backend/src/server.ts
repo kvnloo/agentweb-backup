@@ -354,7 +354,17 @@ createTestAccount().then(async () => {
     console.warn('Stripe credentials not available — billing features will be disabled:', (error as Error).message);
   }
 
-  // Register CRM enrichment specialists (Crunchbase et al.)
+  // Initialize enrich.so service (must run BEFORE specialist registration so the
+  // enrich.so specialists can resolve via getEnrichSoService()).
+  try {
+    const { initEnrichSoServiceFromEnv } = await import('./services/enrichSoServiceFactory');
+    await initEnrichSoServiceFromEnv();
+    console.log('enrich.so service initialized');
+  } catch (err) {
+    console.warn('enrich.so service not initialized — email finder/reverse lookup specialists will fall back to LLM:', (err as Error).message);
+  }
+
+  // Register CRM enrichment specialists (Crunchbase, enrich.so, et al.)
   try {
     const { registerAllEnrichmentSpecialists } = await import('./services/specialists');
     registerAllEnrichmentSpecialists();
