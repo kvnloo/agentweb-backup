@@ -1,7 +1,9 @@
 import {
   EnrichmentInputError,
+  MAX_FIELD_DESCRIPTION_CHARS,
   MAX_INSTRUCTION_CHARS,
   MAX_OUTPUT_FIELDS,
+  validateFieldDescriptions,
   validateFieldName,
   validateGoal,
   validateInstruction,
@@ -95,12 +97,21 @@ describe('validateInstruction', () => {
 describe('validateOptionalTemplate', () => {
   it('returns undefined when missing or blank', () => {
     expect(validateOptionalTemplate(undefined, 'webSearchTemplate')).toBeUndefined();
+    expect(validateOptionalTemplate(null, 'webSearchTemplate')).toBeUndefined();
     expect(validateOptionalTemplate('', 'webSearchTemplate')).toBeUndefined();
     expect(validateOptionalTemplate('   ', 'webSearchTemplate')).toBeUndefined();
   });
 
+  it('rejects non-string', () => {
+    expect(() => validateOptionalTemplate(42 as any, 'webSearchTemplate')).toThrow(/must be a string/);
+  });
+
   it('rejects oversized strings', () => {
     expect(() => validateOptionalTemplate('x'.repeat(1001), 'webSearchTemplate')).toThrow(/exceeds/);
+  });
+
+  it('trims and returns valid input', () => {
+    expect(validateOptionalTemplate('  hi  ', 'webSearchTemplate')).toBe('hi');
   });
 });
 
@@ -161,6 +172,68 @@ describe('validateSourcesPerField', () => {
     expect(protoOut).toEqual({ ok: ['web_search'] });
     // Sanity: prototype unchanged
     expect(({} as any).__proto__).toBe(Object.prototype);
+  });
+
+  it('rejects when key count exceeds MAX_OUTPUT_FIELDS', () => {
+    const tooMany: Record<string, string[]> = {};
+    for (let i = 0; i <= MAX_OUTPUT_FIELDS; i++) tooMany[`field_${i}`] = ['web_search'];
+    expect(() => validateSourcesPerField(tooMany)).toThrow(/exceeds max/);
+  });
+});
+
+describe('validateFieldDescriptions', () => {
+  it('returns undefined when missing', () => {
+    expect(validateFieldDescriptions(undefined)).toBeUndefined();
+    expect(validateFieldDescriptions(null)).toBeUndefined();
+  });
+
+  it('rejects arrays / primitives', () => {
+    expect(() => validateFieldDescriptions(['x'])).toThrow(/must be an object/);
+    expect(() => validateFieldDescriptions('foo')).toThrow(/must be an object/);
+  });
+
+  it('rejects when key count exceeds MAX_OUTPUT_FIELDS', () => {
+    const tooMany: Record<string, string> = {};
+    for (let i = 0; i <= MAX_OUTPUT_FIELDS; i++) tooMany[`field_${i}`] = 'desc';
+    expect(() => validateFieldDescriptions(tooMany)).toThrow(/exceeds max/);
+  });
+
+  it('drops reserved/invalid keys silently', () => {
+    const out = validateFieldDescriptions({
+      email: 'reserved key — drop',
+      'bad-key': 'invalid shape — drop',
+      good_field: 'keep me',
+    });
+    expect(out).toEqual({ good_field: 'keep me' });
+  });
+
+  it('rejects non-string values', () => {
+    expect(() => validateFieldDescriptions({ good_field: 42 })).toThrow(/must be a string/);
+  });
+
+  it('drops empty/whitespace descriptions silently', () => {
+    const out = validateFieldDescriptions({
+      good_field: 'real desc',
+      blank_one: '',
+      whitespace: '   ',
+    });
+    expect(out).toEqual({ good_field: 'real desc' });
+  });
+
+  it('trims values before length check', () => {
+    expect(validateFieldDescriptions({ good_field: '  trimmed desc  ' })).toEqual({
+      good_field: 'trimmed desc',
+    });
+  });
+
+  it('rejects oversized descriptions', () => {
+    expect(() =>
+      validateFieldDescriptions({ good_field: 'x'.repeat(MAX_FIELD_DESCRIPTION_CHARS + 1) })
+    ).toThrow(/exceeds/);
+  });
+
+  it('returns undefined when all entries dropped', () => {
+    expect(validateFieldDescriptions({ email: 'reserved', '': 'invalid' })).toBeUndefined();
   });
 });
 
