@@ -145,16 +145,16 @@ describe('DynamoDB pagination in chatbotService', () => {
   });
 
   describe('getRecentSessionsPage with time range', () => {
-    it('should exclude sessions whose createdAt is outside the time range (updatedAt leak bug)', async () => {
-      // A session created a week ago but with updatedAt bumped into the range (e.g., by scoring)
+    it('should include sessions created before the window if they had messages within it', async () => {
+      // updatedAt only changes when real messages are written, so any session returned by
+      // the DynamoDB BETWEEN query was genuinely active during the window — include it.
       const oldSession = {
         sessionId: 'old-session',
         adminListPartition: 'all',
         createdAt: '2026-03-29T03:00:00.000Z',
         updatedAt: '2026-04-05T03:34:58.926Z',
-        title: 'LinkedIn Profile Visit',
+        title: 'Multi-day Task',
       };
-      // A normal session created within the range
       const newSession = {
         sessionId: 'new-session',
         adminListPartition: 'all',
@@ -170,8 +170,7 @@ describe('DynamoDB pagination in chatbotService', () => {
       const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
       const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
 
-      expect(result.sessions).toHaveLength(1);
-      expect(result.sessions[0].sessionId).toBe('new-session');
+      expect(result.sessions).toHaveLength(2);
     });
 
     it('should include sessions whose createdAt is within the time range', async () => {
@@ -218,24 +217,28 @@ describe('DynamoDB pagination in chatbotService', () => {
       expect(result.sessions).toHaveLength(1);
     });
 
-    it('should filter out sessions created before startTime', async () => {
-      const tooOld = {
-        sessionId: 'too-old',
+    it('should include sessions created just before startTime if they had messages within the window', async () => {
+      // A session started 1 second before midnight but with a message sent during the window.
+      // Since updatedAt only changes on real messages, this session was active in the window.
+      const spanningSession = {
+        sessionId: 'spanning-midnight',
         adminListPartition: 'all',
         createdAt: '2026-04-03T23:59:59.000Z',
         updatedAt: '2026-04-05T10:00:00.000Z',
-        title: 'Too Old',
+        title: 'Late Night Start',
       };
 
       queryPromiseMock.mockResolvedValueOnce({
-        Items: [tooOld],
+        Items: [spanningSession],
       });
 
       const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
       const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
 
-      expect(result.sessions).toHaveLength(0);
+      expect(result.sessions).toHaveLength(1);
+      expect(result.sessions[0].sessionId).toBe('spanning-midnight');
     });
+
   });
 
   describe('getMessageCountFromMessagesTable', () => {
