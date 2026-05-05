@@ -63,7 +63,30 @@ describe('notionService - createOncallItem', () => {
     expect(body.properties['Tags'].multi_select).toEqual([{ name: 'Oncall' }]);
     expect(body.properties['Sprint'].rich_text[0].text.content).toBe('Backlog');
     expect(body.properties['Move to Current Sprint'].checkbox).toBe(true);
+    expect(body.properties['Owner'].people[0].id).toBe('1c8d872b-594c-816c-8935-00027d2a3a90'); // Rui — non-onboarding title
     expect(body.children[0].paragraph.rich_text[0].text.content).toBe('Something broke');
+  });
+
+  it('should assign to Harsha when title starts with "Onboarding" (case-insensitive)', async () => {
+    for (const title of ['Onboarding stuck users — daily report 2026-05-04', 'onboarding Error: brand:submit', 'ONBOARDING issue']) {
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({ id: 'page-id', object: 'page' }),
+        status: 200,
+      });
+      await createOncallItem({ title, description: 'desc' });
+      const body = JSON.parse(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1].body);
+      expect(body.properties['Owner'].people[0].id).toBe('1c8d872b-594c-8168-8c1b-00022b54e40d'); // Harsha
+    }
+  });
+
+  it('should assign to Rui when title does not start with "Onboarding"', async () => {
+    mockFetch.mockResolvedValueOnce({
+      json: async () => ({ id: 'page-id', object: 'page' }),
+      status: 200,
+    });
+    await createOncallItem({ title: 'UI Error: schedule-manual-run', description: 'desc' });
+    const body = JSON.parse(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1].body);
+    expect(body.properties['Owner'].people[0].id).toBe('1c8d872b-594c-816c-8935-00027d2a3a90'); // Rui
   });
 
   it('should include additional tags merged with Oncall', async () => {

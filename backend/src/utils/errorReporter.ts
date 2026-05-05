@@ -134,7 +134,8 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
 
   dedupCache.set(fingerprint, now);
 
-  const subject = `UI Error: ${operation}`;
+  const isOnboarding = operation.startsWith('onboarding:');
+  const subject = isOnboarding ? `Onboarding Error: ${operation}` : `UI Error: ${operation}`;
   let fullContext: Record<string, any> = {
     Operation: operation,
     ...(userId ? { 'User ID': userId } : {}),

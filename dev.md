@@ -1,3 +1,82 @@
+## "Bounced" Users Investigation — info@pmps.ai, admin@btstravel.be (2026-05-04)
+
+### Context
+
+Two users appeared in the Admin Users tab with a "Bounced" subscription status despite having valid Stripe customer IDs (`cus_USLZ3JNSb1epH2` and `cus_UQlSsGMRJCJSZ0` respectively). No corresponding subscription records could be found in Stripe.
+
+### Root Cause: Abandoned Checkout
+
+The "Bounced" label is working correctly. It is a frontend-derived status defined in `partner-portal/src/pages/AdminDashboard.tsx` (around line 3774):
+
+```
+bounced = stripe_customer_id set  AND  subscription_status null  AND  subscription_amount null
+```
+
+The exact sequence that produces this state:
+
+1. User registers → `subscriptionType: Free`, no Stripe fields set
+2. User opens the checkout flow → `POST /create-checkout-session` (`backend/src/routes/stripe.ts:442–448`) runs a "find or create Stripe customer" step and saves the new `cus_xxx` ID to DynamoDB immediately
+3. User **abandons the checkout page before entering payment info** → no subscription is ever created on Stripe
+4. No `checkout.session.completed` webhook fires → `subscription_status`, `stripe_subscription_id`, `subscription_amount` are never populated
+
+Result: DynamoDB has a `stripe_customer_id` but zero subscription fields → frontend labels the user "Bounced."
+
+| User | Stripe Customer ID | Account Created |
+|------|--------------------|-----------------|
+| info@pmps.ai | cus_USLZ3JNSb1epH2 | 2026-05-04 |
+| admin@btstravel.be | cus_UQlSsGMRJCJSZ0 | 2026-04-30 |
+
+### Verification
+
+You can confirm by searching these customer IDs in the Stripe dashboard — the customer objects exist but have no subscriptions attached.
+
+### No Code Fix Required
+
+The system is behaving as designed. "Bounced" is an accurate label for users who started but did not complete checkout. These users are candidates for re-engagement outreach.
+
+---
+
+## RankAI Meta Ads Account Security Investigation (2026-05-04)
+
+### Context
+
+Matthew Wilmer received a Meta Business Manager email notification at 12:56 AM on April 29, 2026: `Dmitriy Lizin (dmitriylizin@gmail.com)` had joined RankAI's ad account. The client is `dyllan@rankai.ai` (userId: `4e29ce4e-8661-45bd-9881-3075d9a76971`). Matthew removed Dmitriy immediately and flagged the incident for investigation.
+
+Question: was AgentWeb the attack vector, and who added Dmitriy?
+
+### Findings
+
+**AgentWeb was not the attack vector.** Evidence:
+
+- `dmitriylizin@gmail.com` has zero presence in AgentWeb — no account, no sessions, never authenticated against our system
+- On April 29, 2026 (the incident date), the only AgentWeb activity for Dyllan's account was a scheduled **Website Scan** of rankai.ai — a pure Playwright browser audit with zero Meta API calls
+- All three Meta Ads report schedules were paused before April 29
+- No `AW-EmailEvents` records for this user — no phishing or exfiltration pattern through our platform
+
+**Access structure is expected.** The Rankai Meta ad account has 3 AgentWeb team members with Full Control (Harsha Vankayalapati, Matthew Wilmer, Rui Wang) plus 3 system users (AdMgmt Integration, 2× Conversions API System User) — this reflects the managed-services agency relationship where AgentWeb operates Meta Ads on RankAI's behalf.
+
+**Live token with elevated scope.** The Meta access token stored in `AW-Users.connected_accounts[].config.access_token` for this user was verified still valid as of the investigation date:
+- `is_valid: true`, non-expiring long-lived token
+- Scopes include `business_management` — grants ability to add/remove users from Meta Business Manager
+- Token belongs to Matthew Wilmer's Meta account (Meta user ID `10240394354459797`), issued 2026-03-27
+
+**Who added Dmitriy — inconclusive.** The Meta Graph API `/{business_id}/activity_logs` endpoint has been removed (returns OAuthException 2500 on all API versions). Production nginx logs from April 29 are unrecoverable — the EB instance that was running then has been terminated and logs rotated. Matthew confirmed he cannot see the Security Center activity log in the Meta Business Suite UI either.
+
+### Current Status
+
+**Investigation closed pending Dyllan's response.** Matthew will ask Dyllan whether they recognize adding Dmitriy Lizin. If Dyllan confirms they did not add this user, the investigation will be reopened.
+
+### Reopen Criteria
+
+If Dyllan does not recognize the add action, next steps are:
+1. File a formal support request with Meta referencing Business Manager ID `1900317767512083` for April 29 audit trail — Meta retains internal logs even after the API endpoint was removed
+2. Audit whether the `business_management`-scoped token was exposed anywhere (agent session logs, S3-hosted HTML reports, or API responses)
+3. Rotate the Meta access token immediately (revoke via Meta app settings for app ID `1842366079956363`, re-authenticate via AgentWeb)
+
+### Platform Risk Item (Separate from Incident)
+
+Meta access tokens are stored **in plaintext** in `AW-Users.connected_accounts[].config.access_token`. Any DynamoDB read access exposes live third-party OAuth tokens. This is a pre-existing platform-level risk unrelated to this incident but should be addressed — tokens should be encrypted at rest.
+
 ## EB Autoscaling Flapping — Investigation (2026-05-01)
 
 ### Context

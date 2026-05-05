@@ -9,6 +9,23 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-04',
+    changes: [
+      'Fix: Emma now pauses all ads when asked, including ads whose parent campaign is already paused',
+      '- Previously, ads with effective_status CAMPAIGN_PAUSED or ADSET_PAUSED were invisible to Emma because the Meta API omits them from default ad listings',
+      '- Emma could report "all ads paused" while those ads would resume spending the moment the parent campaign was unpaused',
+      '- Emma now sees all non-deleted ads regardless of parent hierarchy status and pauses them individually',
+    ],
+  },
+  {
+    date: '2026-05-04',
+    changes: [
+      'Fix: Onboarding oncall issues in Notion are now automatically assigned to Harsha',
+      '- Previously all platform-reported issues defaulted to Rui as owner, requiring manual reassignment for onboarding issues',
+      '- Issues with titles starting with "Onboarding" (case-insensitive) are now routed directly to Harsha',
+    ],
+  },
+  {
     date: '2026-05-03',
     changes: [
       'Fix: Auto-engagement no longer posts AI meta-messages as LinkedIn comments',

@@ -713,10 +713,19 @@ export class MetaService {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
       const fields = [
-        'id', 'name', 'status', 'adset_id', 'campaign_id',
+        'id', 'name', 'status', 'effective_status', 'adset_id', 'campaign_id',
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
       ];
-      const params = adSetId ? { adset_id: adSetId } : {};
+      // Include all non-deleted effective statuses so ads paused at the campaign/adset
+      // level (effective_status=CAMPAIGN_PAUSED or ADSET_PAUSED) are not silently omitted.
+      const params: Record<string, any> = {
+        effective_status: [
+          'ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED',
+          'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
+          'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
+        ]
+      };
+      if (adSetId) params.adset_id = adSetId;
       this.log(`Listing ads for account: ${adAccountId}`, { fields, ...params });
       const ads = await account.getAds(fields, params);
       return ads.map((a: any) => a._data);

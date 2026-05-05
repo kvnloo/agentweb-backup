@@ -256,6 +256,9 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
   const { apiToken } = await getNotionCredentials();
   const databaseId = await getSprintTasksDatabaseId();
   const { title, description, additionalTags = [], context } = params;
+  const RUI_USER_ID = '1c8d872b-594c-816c-8935-00027d2a3a90';
+  const HARSHA_USER_ID = '1c8d872b-594c-8168-8c1b-00022b54e40d';
+  const ownerId = /^onboarding/i.test(title) ? HARSHA_USER_ID : RUI_USER_ID;
 
   const tags = [{ name: 'Oncall' }, ...additionalTags.map(t => ({ name: t }))];
 
@@ -300,7 +303,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
         'Tags': { multi_select: tags },
         'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
         'Move to Current Sprint': { checkbox: true },
-        'Owner': { people: [{ id: '1c8d872b-594c-816c-8935-00027d2a3a90' }] },
+        'Owner': { people: [{ id: ownerId }] },
       },
       children,
     }),

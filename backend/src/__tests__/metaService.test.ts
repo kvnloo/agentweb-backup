@@ -302,8 +302,8 @@ describe('MetaService', () => {
     });
 
     describe('Ad Operations', () => {
-        it('should list ads', async () => {
-            const mockAds = [{ _data: { id: 'ad_1', name: 'Ad 1' } }];
+        it('should list ads with all non-deleted effective_status values', async () => {
+            const mockAds = [{ _data: { id: 'ad_1', name: 'Ad 1', effective_status: 'ACTIVE' } }];
             const mockGetAds = jest.fn().mockResolvedValue(mockAds);
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
                 getAds: mockGetAds,
@@ -311,8 +311,47 @@ describe('MetaService', () => {
 
             const result = await service.listAds(mockAdAccountId, mockAccessToken);
 
-            expect(mockGetAds).toHaveBeenCalled();
-            expect(result).toEqual([{ id: 'ad_1', name: 'Ad 1' }]);
+            expect(mockGetAds).toHaveBeenCalledWith(
+                expect.arrayContaining(['effective_status']),
+                expect.objectContaining({
+                    effective_status: expect.arrayContaining(['ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'])
+                })
+            );
+            expect(result).toEqual([{ id: 'ad_1', name: 'Ad 1', effective_status: 'ACTIVE' }]);
+        });
+
+        it('should include CAMPAIGN_PAUSED and ADSET_PAUSED ads when listing', async () => {
+            const mockAds = [
+                { _data: { id: 'ad_1', name: 'Active Ad', effective_status: 'ACTIVE' } },
+                { _data: { id: 'ad_2', name: 'Campaign Paused Ad', effective_status: 'CAMPAIGN_PAUSED' } },
+                { _data: { id: 'ad_3', name: 'Adset Paused Ad', effective_status: 'ADSET_PAUSED' } },
+            ];
+            const mockGetAds = jest.fn().mockResolvedValue(mockAds);
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                getAds: mockGetAds,
+            }));
+
+            const result = await service.listAds(mockAdAccountId, mockAccessToken);
+
+            expect(result).toHaveLength(3);
+            expect(result.map((a: any) => a.effective_status)).toEqual(
+                expect.arrayContaining(['ACTIVE', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'])
+            );
+        });
+
+        it('should filter by adset_id when provided', async () => {
+            const mockAds = [{ _data: { id: 'ad_1', name: 'Ad 1', effective_status: 'PAUSED' } }];
+            const mockGetAds = jest.fn().mockResolvedValue(mockAds);
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                getAds: mockGetAds,
+            }));
+
+            await service.listAds(mockAdAccountId, mockAccessToken, 'adset_999');
+
+            expect(mockGetAds).toHaveBeenCalledWith(
+                expect.any(Array),
+                expect.objectContaining({ adset_id: 'adset_999' })
+            );
         });
 
         it('should create an ad', async () => {
