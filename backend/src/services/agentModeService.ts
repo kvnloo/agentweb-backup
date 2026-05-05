@@ -15398,6 +15398,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  // ---- Video character management ----
+
+  public async listVideoCharacters(userId: string): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const characters = await characterDb.listCharacters(userId);
+      return { success: true, characters };
+    } catch (error: any) {
+      console.error('AgentMode: Error listing characters:', error);
+      return { success: false, message: 'Failed to list characters', error: error.message };
+    }
+  }
+
+  public async getVideoCharacter(characterId: string): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const character = await characterDb.getCharacterById(characterId);
+      if (!character) return { success: false, message: 'Character not found' };
+      return { success: true, character };
+    } catch (error: any) {
+      console.error('AgentMode: Error getting character:', error);
+      return { success: false, message: 'Failed to get character', error: error.message };
+    }
+  }
+
+  public async createVideoCharacter(userId: string, input: {
+    name: string;
+    description: string;
+    referenceImageUrl: string;
+    referenceImageKey: string;
+    prompt: string;
+  }): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const character = await characterDb.createCharacter(userId, input);
+      return { success: true, character };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating character:', error);
+      return { success: false, message: 'Failed to create character', error: error.message };
+    }
+  }
+
+  public async deleteVideoCharacter(userId: string, characterId: string): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const character = await characterDb.getCharacterById(characterId);
+      if (!character) return { success: false, message: 'Character not found' };
+      if (character.userId !== userId) return { success: false, message: 'Not authorized' };
+      await characterDb.deleteCharacter(userId, characterId);
+      return { success: true, message: 'Character deleted' };
+    } catch (error: any) {
+      console.error('AgentMode: Error deleting character:', error);
+      return { success: false, message: 'Failed to delete character', error: error.message };
+    }
+  }
+
   /**
    * Remove C2PA metadata from an image by downloading it, stripping metadata, and uploading to S3
    */

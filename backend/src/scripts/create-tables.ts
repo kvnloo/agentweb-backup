@@ -1892,6 +1892,7 @@ const main = async () => {
     await createDripCampaignsTable();
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
+    await createCharactersTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2293,6 +2294,43 @@ const createDripSendsTable = async () => {
     ],
     KeySchema: [
       { AttributeName: 'sendId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createCharactersTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Characters`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'characterId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'characterId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'CharacterIdIndex',
+        KeySchema: [
+          { AttributeName: 'characterId', KeyType: 'HASH' },
+        ],
+        Projection: {
+          ProjectionType: 'ALL',
+        },
+      },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };
