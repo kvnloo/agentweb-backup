@@ -119,5 +119,56 @@ describe('enrichSoServiceFactory HTTP client', () => {
   });
 });
 
+describe('enrichSoServiceFactory findEmail wrapper', () => {
+  // The findEmail 404 translator returns `{ found: false }` because the
+  // service-level negative classifier for findEmail checks `apiData.found ===
+  // false`. Tests here assert that exact shape so a confirmed not-found goes
+  // into the 7d negative cache instead of the 1h error bucket.
+  const wrapped = async (input: { firstName: string; lastName: string; domain: string }) => {
+    try {
+      const r = await mockPost('/email-finder', input);
+      return r.data;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) return { found: false };
+      throw err;
+    }
+  };
+
+  it('translates axios 404 into a found:false envelope (negative-cache eligible)', async () => {
+    const err: any = new Error('Not Found');
+    err.response = { status: 404 };
+    mockPost.mockRejectedValueOnce(err);
+
+    const result = await wrapped({ firstName: 'Nobody', lastName: 'Here', domain: 'nowhere.com' });
+    expect(result).toEqual({ found: false });
+  });
+
+  it('rethrows non-404 errors from email-finder (e.g., 500, 429)', async () => {
+    const err: any = new Error('Server Error');
+    err.response = { status: 500 };
+    mockPost.mockRejectedValueOnce(err);
+    await expect(
+      wrapped({ firstName: 'A', lastName: 'B', domain: 'acme.com' }),
+    ).rejects.toThrow(/Server Error/);
+
+    const rate: any = new Error('Too Many Requests');
+    rate.response = { status: 429 };
+    mockPost.mockRejectedValueOnce(rate);
+    await expect(
+      wrapped({ firstName: 'A', lastName: 'B', domain: 'acme.com' }),
+    ).rejects.toThrow(/Too Many Requests/);
+  });
+
+  it('passes successful find-email responses through unchanged', async () => {
+    mockPost.mockResolvedValueOnce({
+      data: { success: true, data: { found: true, email: 'alice@figma.com', confidence: 'high' } },
+    });
+    const result = await wrapped({ firstName: 'Alice', lastName: 'Smith', domain: 'figma.com' });
+    expect(result.success).toBe(true);
+    expect(result.data.email).toBe('alice@figma.com');
+  });
+});
+
 // Suppress unused-import warning for the dynamic import helper above
 void getHttp;

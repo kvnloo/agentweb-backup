@@ -84,6 +84,38 @@ describe('fetchAndExtract', () => {
     expect(await fetchAndExtract('https://acme.com/x')).toBeNull();
   });
 
+  it('caps body bytes when a hostile server sends one oversized chunk', async () => {
+    // Single chunk much larger than the 1MB body cap. The reader must slice
+    // it to fit and stop reading rather than allocating the full payload.
+    const oversized = new Uint8Array(5_000_000);
+    // Fill with valid UTF-8 'a' bytes so the decode succeeds
+    oversized.fill(97);
+    let read = false;
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: (k: string) => k.toLowerCase() === 'content-type' ? 'text/html' : null },
+      body: {
+        getReader: () => ({
+          read: async () => {
+            if (read) return { done: true, value: undefined };
+            read = true;
+            return { done: false, value: oversized };
+          },
+          cancel,
+        }),
+      },
+    });
+
+    const r = await fetchAndExtract('https://acme.com/huge');
+    // No <main> wrapping — the extracted text falls back to <body>, then is
+    // capped at 4000 chars by the existing output cap. The point of this test
+    // is that the decode/extract didn't OOM on a 5MB chunk.
+    expect(r).not.toBeNull();
+    expect(r!.text.length).toBeLessThanOrEqual(4001);
+    expect(cancel).toHaveBeenCalled();
+  });
+
   it('caps output at 4000 chars', async () => {
     const longText = 'lorem ipsum '.repeat(1000);
     (global as any).fetch = jest.fn().mockResolvedValue(mockHtmlResponse(

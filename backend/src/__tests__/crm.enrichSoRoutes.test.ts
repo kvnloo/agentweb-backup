@@ -265,7 +265,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     const res = await request(app).post('/api/crm/lists/list-1/leads/validate-emails').send({});
 
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 1 });
+    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 0 });
   });
 
   it('queues only the selected leadIds when provided', async () => {
@@ -277,7 +277,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
       .post('/api/crm/lists/list-1/leads/validate-emails')
       .send({ leadIds: ['X', 'Y'] });
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 1, skipped: 1 });
+    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 0 });
   });
 
   it('treats explicit empty leadIds: [] as a no-op (does NOT fall through to fetch-all)', async () => {
@@ -295,7 +295,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
 
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({ leadIds: [] });
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 0, skipped: 0 });
+    expect(res.body).toEqual({ queued: 0, skipped: 0, alreadyDone: 0 });
     // Critical assertion: the route must NOT enumerate the list when [] is passed.
     expect(mockCrmDb.getLeadsByListId).not.toHaveBeenCalled();
     expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
@@ -314,8 +314,28 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     // No leadIds in body — should fetch the whole list.
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 0 });
+    expect(res.body).toEqual({ queued: 2, skipped: 0, alreadyDone: 0 });
     expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports alreadyDone count for leads that already carry email_validation', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        // already validated
+        { leadId: 'L1', email: 'a@b.com',
+          customFields: { email_validation: { status: 'deliverable' } } },
+        // not yet validated
+        { leadId: 'L2', email: 'c@d.com' },
+        // no email — counted in skipped
+        { leadId: 'L3', email: '' },
+      ],
+      lastEvaluatedKey: undefined,
+    } as any);
+
+    const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 1 });
   });
 });
 
@@ -594,6 +614,21 @@ describe('POST /api/crm/leads/lookup-by-email', () => {
 
     it('returns 400 for invalid email format (no TLD)', async () => {
       const res = await request(app).post('/api/crm/leads/lookup-by-email').send({ email: 'a@b' });
+      expect(res.status).toBe(400);
+      expect(mockEnrichSo.reverseLookup).not.toHaveBeenCalled();
+    });
+
+    it('rejects single-character TLD (e.g., a@b.c)', async () => {
+      // The TLD floor of 2 ASCII letters keeps us aligned with real-world
+      // domains and excludes single-letter junk like `a@b.c` that would
+      // otherwise pass `\.[^\s@]+$`.
+      const res = await request(app).post('/api/crm/leads/lookup-by-email').send({ email: 'a@b.c' });
+      expect(res.status).toBe(400);
+      expect(mockEnrichSo.reverseLookup).not.toHaveBeenCalled();
+    });
+
+    it('rejects numeric/IP-literal TLDs', async () => {
+      const res = await request(app).post('/api/crm/leads/lookup-by-email').send({ email: 'a@b.123' });
       expect(res.status).toBe(400);
       expect(mockEnrichSo.reverseLookup).not.toHaveBeenCalled();
     });
