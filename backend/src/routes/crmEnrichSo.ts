@@ -27,10 +27,48 @@ import {
 // Conservative RFC-5322-ish check — sufficient to reject obvious garbage and
 // catch typos. Real deliverability is what enrich.so checks; this is just a
 // gate to prevent burning credits on `__proto__` etc.
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// TLD must be ≥2 ASCII letters — rejects `x@y.z` and IP-literal hosts.
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
 function isValidEmailFormat(email: string): boolean {
   return EMAIL_REGEX.test(email) && email.length <= 254;
 }
+
+/**
+ * Run an async fn over each item with a bounded concurrency window.
+ * Used by bulk enrichment fan-out so a 5K-lead list doesn't fire 5K
+ * simultaneous enrich.so + DDB calls.
+ *
+ * Per-item failures are returned as `Promise.allSettled`-style results so the
+ * caller can log without aborting the rest of the batch.
+ */
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  const cap = Math.max(1, limit);
+  let i = 0;
+  const runners = Array.from({ length: Math.min(cap, items.length) }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      try {
+        await worker(items[idx]);
+      } catch {
+        // Worker is expected to handle its own errors; this catch is
+        // belt-and-suspenders so one rejection doesn't kill the runner.
+      }
+    }
+  });
+  await Promise.all(runners);
+}
+
+/**
+ * Concurrency cap for background bulk enrichment fan-out. Tuned to stay well
+ * under enrich.so per-second rate limits while still finishing a 1K-lead list
+ * in a few minutes.
+ */
+const BULK_ENRICH_CONCURRENCY = 8;
 
 // Quota tracker is owned by the EnrichSoService singleton; the route reaches
 // it via this thin accessor so tests can inject a fake.
@@ -197,7 +235,7 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
 //   3. Background-process each via the EnrichSoService (counts toward quota)
 //   4. Write results back to the lead, but ONLY into empty fields so we never
 //      clobber user-entered data
-// They return 202 with { queued, skipped, alreadyProcessed }.
+// They return 202 with { queued, skipped, alreadyDone }.
 
 async function fetchAllLeads(listId: string): Promise<any[]> {
   const out: any[] = [];
@@ -222,7 +260,7 @@ async function findEmailsForLeadsInBackground(
 ): Promise<void> {
   let svc;
   try { svc = getEnrichSoService(); } catch { return; }
-  await Promise.allSettled(leads.map(async (lead) => {
+  await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
     const firstName = (lead.firstName ?? '').trim();
     const lastName = (lead.lastName ?? '').trim();
     const company = (lead.company ?? '').trim();
@@ -255,7 +293,7 @@ async function findEmailsForLeadsInBackground(
     } catch (err) {
       console.error('[CRM enrich.so] bulk find-email failed for', lead.leadId, ':', (err as Error).message);
     }
-  }));
+  });
 }
 
 /**
@@ -289,7 +327,7 @@ async function lookupProfilesForLeadsInBackground(
 ): Promise<void> {
   let svc;
   try { svc = getEnrichSoService(); } catch { return; }
-  await Promise.allSettled(leads.map(async (lead) => {
+  await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
     const email = (lead.email ?? '').trim();
     if (!email) return;
     try {
@@ -342,7 +380,7 @@ async function lookupProfilesForLeadsInBackground(
     } catch (err) {
       console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
     }
-  }));
+  });
 }
 
 function isApplicableForFindEmail(lead: any): boolean {
@@ -490,10 +528,15 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
 /**
  * POST /lists/:listId/leads/validate-emails
  * Body: { leadIds?: string[] }  (omit → all leads in list)
- * Returns: 202 { queued: number, skipped: number }
+ * Returns: 202 { queued: number, skipped: number, alreadyDone: number }
  *
  * Kicks off background validation. Pills update on individual leads as each
- * call completes. Skipped count = leads with no email (or empty email).
+ * call completes.
+ *   queued      = leads with email that will be (re-)validated
+ *   skipped     = leads with no email
+ *   alreadyDone = informational — leads with email that already carry an
+ *                 email_validation entry (still queued; the cache layer
+ *                 short-circuits to the cached result inside its TTL).
  */
 router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Response) => {
   const { listId } = req.params;
@@ -517,21 +560,30 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
     //   - leadIds provided & empty ([]) → no-op (explicit "validate nothing");
     //     prevents a buggy UI from silently re-validating every lead and burning quota
     //   - leadIds omitted (undefined) → fetch every lead in the list
-    let targetLeads: Array<{ leadId: string; email?: string }> = [];
+    let targetLeads: Array<{ leadId: string; email?: string; alreadyValidated: boolean }> = [];
     if (Array.isArray(leadIds)) {
       if (leadIds.length === 0) {
-        return res.status(202).json({ queued: 0, skipped: 0 });
+        return res.status(202).json({ queued: 0, skipped: 0, alreadyDone: 0 });
       }
       const fetched = await Promise.all(
         leadIds.map((id: string) => crmDb.getLeadById(listId, id).catch(() => null)),
       );
-      targetLeads = fetched.filter(Boolean).map((l: any) => ({ leadId: l.leadId, email: l.email }));
+      targetLeads = fetched.filter(Boolean).map((l: any) => ({
+        leadId: l.leadId,
+        email: l.email,
+        alreadyValidated: !!l.customFields?.email_validation,
+      }));
     } else {
       let lastKey: any = undefined;
       do {
         const page = await crmDb.getLeadsByListId(listId, 100, lastKey);
         for (const l of page.items) {
-          targetLeads.push({ leadId: (l as any).leadId, email: (l as any).email });
+          const lead = l as any;
+          targetLeads.push({
+            leadId: lead.leadId,
+            email: lead.email,
+            alreadyValidated: !!lead.customFields?.email_validation,
+          });
         }
         lastKey = page.lastEvaluatedKey;
       } while (lastKey);
@@ -539,11 +591,12 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
 
     const validatable = targetLeads.filter((l) => l.email && l.email.trim());
     const skipped = targetLeads.length - validatable.length;
+    const alreadyDone = validatable.filter((l) => l.alreadyValidated).length;
 
     // Fire and forget — pills update as each completes.
     void validateLeadsInBackground(listId, validatable, userId);
 
-    return res.status(202).json({ queued: validatable.length, skipped });
+    return res.status(202).json({ queued: validatable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] validate-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue email validation' });

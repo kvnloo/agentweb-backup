@@ -17,6 +17,35 @@ export interface ValidatableLead {
   email?: string;
 }
 
+/**
+ * Concurrency cap for bulk background validation. Bounded so a 5K-lead list
+ * doesn't fan out 5K simultaneous enrich.so + DDB writes. Tuned to stay well
+ * under the upstream rate limit while still finishing in a few minutes.
+ */
+const VALIDATION_CONCURRENCY = 8;
+
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  const cap = Math.max(1, limit);
+  let i = 0;
+  const runners = Array.from({ length: Math.min(cap, items.length) }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      try {
+        await worker(items[idx]);
+      } catch {
+        // Worker is expected to handle its own errors; this catch keeps the
+        // runner alive even if the worker rejects unexpectedly.
+      }
+    }
+  });
+  await Promise.all(runners);
+}
+
 export async function validateLeadEmailInBackground(
   listId: string,
   leadId: string,
@@ -69,7 +98,7 @@ export async function validateLeadsInBackground(
   leads: ValidatableLead[],
   userId?: string,
 ): Promise<void> {
-  await Promise.allSettled(
-    leads.map((l) => validateLeadEmailInBackground(listId, l.leadId, l.email ?? '', userId)),
+  await runWithConcurrency(leads, VALIDATION_CONCURRENCY, (l) =>
+    validateLeadEmailInBackground(listId, l.leadId, l.email ?? '', userId),
   );
 }
