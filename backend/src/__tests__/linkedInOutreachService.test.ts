@@ -406,9 +406,26 @@ describe('LinkedInOutreachService', () => {
       expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
         method: 'GET',
         path: ['users', 'john-doe'],
-        parameters: { account_id: 'account-123' }
+        parameters: { account_id: 'account-123', linkedin_sections: '*' }
       });
       expect(result).toEqual(mockProfile);
+    });
+
+    it('passes linkedin_sections=* so all profile sections (experience/education/skills) are returned', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({ provider_id: 'x' });
+      await linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const callArgs = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0];
+      expect(callArgs.parameters.linkedin_sections).toBe('*');
+    });
+
+    it('connection-degree check (used by sendInvitation pre-flight) does NOT request sections — viewer-relative call kept lean', async () => {
+      // The check is a network_distance lookup; sections would just waste credits.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({ network_distance: 'SECOND_DEGREE' });
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false);
+      // The first request.send call here is the connection check, not the invitation itself.
+      const params = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].parameters;
+      expect(params.linkedin_sections).toBeUndefined();
+      expect(params.account_id).toBe('account-id');
     });
 
     it('should throw a structured error when profile is not found', async () => {

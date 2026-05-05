@@ -20406,11 +20406,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
     }
 
-    // For read-only actions (get-profile, search-people), fall back to site-wide Unipile
-    // accounts when the user has no personally-connected account.
+    // For read-only actions (get-profile, search-people, get-company), fall back to
+    // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
     // they already block non-owned accounts above.
-    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people'];
+    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company'];
     if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
       account_id = await linkedInOutreachService.resolveAccountId(userId);
       if (account_id) {
@@ -20470,12 +20470,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'get-profile': {
           if (!target) throw new Error('Either profile_url or provider_id is required for get-profile');
-          if (isUrl) {
-            const profileResult = await linkedInOutreachService.getLinkedInProfile(target, account_id);
-            return { success: true, data: profileResult };
-          }
-          const profileResult = await linkedInOutreachService.getProfile(target, account_id);
-          return { success: true, data: profileResult };
+          // Route through the cache-first wrapper so repeated lookups for the
+          // same person across sessions don't re-hit Unipile. The wrapper asks
+          // Unipile for linkedin_sections=* (full profile incl. experience /
+          // education / skills) and strips viewer-relative fields before
+          // persisting — see unipileProfileService.ts.
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profileResult = await getUnipileProfileService().getProfile(target, account_id);
+          return { success: true, data: profileResult.rawData };
         }
 
         case 'list-connections': {
@@ -20680,8 +20682,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'get-company': {
           const companyId = args.company_id;
           if (!companyId) throw new Error('company_id is required for get-company');
-          const companyResult = await linkedInOutreachService.getCompanyProfile(companyId, account_id);
-          return { success: true, data: companyResult };
+          // Route through the cache-first wrapper so repeated lookups for the
+          // same company across sessions don't re-hit Unipile. 30-day TTL.
+          // Viewer-relative fields (is_following, etc.) are stripped before
+          // persisting — see unipileCompanyService.ts.
+          const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+          const companyResult = await getUnipileCompanyService().getCompany(companyId, account_id);
+          return { success: true, data: companyResult.rawData };
         }
 
         case 'cancel-invitation': {

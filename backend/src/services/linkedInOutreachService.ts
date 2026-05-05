@@ -290,7 +290,10 @@ export class LinkedInOutreachService {
       const profile = await client.request.send({
         method: 'GET',
         path: ['users', identifier],
-        parameters: { account_id }
+        // linkedin_sections='*' returns ALL profile sections (experience,
+        // education, skills, languages, certifications, volunteer, etc.).
+        // Without it, Unipile returns only the base profile fields.
+        parameters: { account_id, linkedin_sections: '*' }
       });
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
@@ -456,7 +459,8 @@ export class LinkedInOutreachService {
       const profile = await client.request.send({
         method: 'GET',
         path: ['users', identifier],
-        parameters: { account_id: accountId }
+        // See getLinkedInProfile — linkedin_sections=* pulls all sections.
+        parameters: { account_id: accountId, linkedin_sections: '*' }
       });
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
@@ -532,18 +536,26 @@ export class LinkedInOutreachService {
             provider_id: inviter.inviter_id || null,
           };
 
-          // Optionally fetch a full profile for richer data (location, network_distance)
+          // Optionally fetch a full profile for richer data (location, etc).
+          // Routed through the cache-first wrapper to avoid hammering Unipile
+          // when the same inviter shows up across multiple invitations or page
+          // refreshes. network_distance is viewer-relative so the cached path
+          // can't return it; not required here since received invitations are
+          // by definition from non-1st-degree senders.
           if (senderProfile.public_id) {
             try {
-              const profile = await client.request.send({
-                method: 'GET',
-                path: ['users', senderProfile.public_id],
-                parameters: { account_id: accountId },
-              }) as any;
+              const { getUnipileProfileServiceSingleton } = await import('./unipileProfileService');
+              const svc = getUnipileProfileServiceSingleton();
+              const profile = svc
+                ? (await svc.getProfile(senderProfile.public_id, accountId)).rawData
+                : await client.request.send({
+                    method: 'GET',
+                    path: ['users', senderProfile.public_id],
+                    parameters: { account_id: accountId, linkedin_sections: '*' },
+                  }) as any;
               senderProfile.full_name = profile?.full_name || senderProfile.full_name;
               senderProfile.headline = profile?.headline || senderProfile.headline;
               senderProfile.location = profile?.location || null;
-              senderProfile.network_distance = profile?.network_distance || null;
               senderProfile.profile_picture_url = profile?.profile_picture_url || senderProfile.profile_picture_url;
             } catch {
               // Profile fetch failed — inline data is still returned

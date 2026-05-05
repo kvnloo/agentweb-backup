@@ -364,6 +364,25 @@ createTestAccount().then(async () => {
     console.warn('enrich.so service not initialized — email finder/reverse lookup specialists will fall back to LLM:', (err as Error).message);
   }
 
+  // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of
+  // Unipile /users/{id} backed by AW-EnrichmentRawCache, cacheType='unipile').
+  try {
+    const { initUnipileProfileService } = await import('./services/unipileProfileServiceFactory');
+    initUnipileProfileService();
+    console.log('Unipile profile cache initialized');
+  } catch (err) {
+    console.warn('Unipile profile cache not initialized — LinkedIn lookups will hit Unipile live:', (err as Error).message);
+  }
+
+  // Initialize Unipile LinkedIn-company cache wrapper (cacheType='unipile_company').
+  try {
+    const { initUnipileCompanyService } = await import('./services/unipileCompanyServiceFactory');
+    initUnipileCompanyService();
+    console.log('Unipile company cache initialized');
+  } catch (err) {
+    console.warn('Unipile company cache not initialized — LinkedIn company lookups will hit Unipile live:', (err as Error).message);
+  }
+
   // Register CRM enrichment specialists (Crunchbase, enrich.so, et al.)
   try {
     const { registerAllEnrichmentSpecialists } = await import('./services/specialists');
