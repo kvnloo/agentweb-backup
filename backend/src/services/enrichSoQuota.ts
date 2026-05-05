@@ -68,8 +68,10 @@ function todayUtc(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
 }
 
-function counterKey(endpoint: EnrichSoEndpoint): keyof Pick<UsageRow, 'validateCount' | 'findCount' | 'reverseCount'> {
-  return `${endpoint}Count` as any;
+type EndpointCounterKey = `${EnrichSoEndpoint}Count`;
+
+function counterKey(endpoint: EnrichSoEndpoint): EndpointCounterKey {
+  return `${endpoint}Count`;
 }
 
 // ─── In-memory implementation ────────────────────────────────────────────────
