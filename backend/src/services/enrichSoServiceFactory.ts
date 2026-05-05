@@ -41,8 +41,19 @@ function buildHttpClient(apiKey: string): EnrichSoHttpClient {
       return r.data;
     },
     async findEmail(input) {
-      const r = await client.post('/email-finder', input);
-      return r.data;
+      try {
+        const r = await client.post('/email-finder', input);
+        return r.data;
+      } catch (err: any) {
+        // Translate 404 to the same shape the service's negative classifier
+        // recognizes (`apiData.found === false`) so a confirmed not-found
+        // goes into the 7d negative cache instead of the 1h error bucket.
+        // Without this we'd re-hit the API every hour for every
+        // known-not-found name.
+        const status = err?.response?.status;
+        if (status === 404) return { found: false };
+        throw err;
+      }
     },
     async reverseLookup(email) {
       try {
@@ -115,14 +126,21 @@ function buildQuotaTracker(): QuotaTracker {
         }
       }
     }
-    // Final attempt: atomic ADD without condition (best-effort fallback if the
-    // table state is wedged from above retries).
-    await dynamodb.update({
+    // Final fallback: overwrite with a fresh same-day row. Using `put` (not
+    // `update with if_not_exists(#date)`) guarantees that a stale-date row
+    // from yesterday is replaced rather than carried forward — otherwise the
+    // bumped counter would be associated with the wrong day and wouldn't
+    // reset until the date naturally rolls.
+    const fresh: UsageRow = {
+      date: today,
+      validateCount: counterAttr === 'validateCount' ? 1 : 0,
+      findCount: counterAttr === 'findCount' ? 1 : 0,
+      reverseCount: counterAttr === 'reverseCount' ? 1 : 0,
+      lookupByEmailCount: counterAttr === 'lookupByEmailCount' ? 1 : 0,
+    };
+    await dynamodb.put({
       TableName: CONFIGS_TABLE,
-      Key: { userId, configId: ENRICHSO_USAGE_CONFIG_ID },
-      UpdateExpression: 'ADD #c :one SET #date = if_not_exists(#date, :today)',
-      ExpressionAttributeNames: { '#c': counterAttr, '#date': 'date' },
-      ExpressionAttributeValues: { ':one': 1, ':today': today },
+      Item: { userId, configId: ENRICHSO_USAGE_CONFIG_ID, ...fresh },
     }).promise();
   }
 
