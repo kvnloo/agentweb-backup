@@ -19,6 +19,7 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
+    updateLeadList: jest.fn(),
     setLeadEmailValidation: jest.fn(),
     getLeadsByListId: jest.fn(),
   },
@@ -401,6 +402,121 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
     const res = await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
     expect(res.status).toBe(404);
   });
+
+  it('writes only standard fields when no extended fields enabled (default config)', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ leadId: '1', email: 'a@b.com' }],
+      lastEvaluatedKey: undefined,
+    } as any);
+    mockEnrichSo.reverseLookup.mockResolvedValue({
+      found: true,
+      firstName: 'Alice',
+      lastName: 'Smith',
+      companyName: 'Acme',
+      jobTitle: 'CEO',
+      profileUrl: 'https://www.linkedin.com/in/alice',
+      summary: 'Bio.',
+      skills: ['A', 'B'],
+      pastCompanies: ['Old Co'],
+      fromCache: false, checkedAt: 'x',
+    });
+    await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    // Background runs after response; flush microtasks.
+    await new Promise((r) => setImmediate(r));
+    expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+    const payload = mockCrmDb.updateLead.mock.calls[0][2] as any;
+    expect(payload.firstName).toBe('Alice');
+    expect(payload.lastName).toBe('Smith');
+    expect(payload.company).toBe('Acme');
+    expect(payload.title).toBe('CEO');
+    expect(payload.linkedin).toContain('linkedin.com/in/alice');
+    // Extended fields disabled by default → not written.
+    expect(payload.customFields).toBeUndefined();
+  });
+
+  it('writes extended fields to customFields when enabled in config', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      userId: 'u1',
+      enrichmentFieldConfig: { skills: true, summary: true, pastCompanies: true },
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ leadId: '1', email: 'a@b.com' }],
+      lastEvaluatedKey: undefined,
+    } as any);
+    mockEnrichSo.reverseLookup.mockResolvedValue({
+      found: true,
+      firstName: 'Alice', lastName: 'Smith', companyName: 'Acme', jobTitle: 'CEO',
+      profileUrl: 'https://www.linkedin.com/in/alice',
+      summary: 'Designer who ships.',
+      skills: ['Figma', 'UX', 'Prototyping'],
+      pastCompanies: ['Airbnb', 'Stripe'],
+      fromCache: false, checkedAt: 'x',
+    });
+    await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    await new Promise((r) => setImmediate(r));
+    expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+    const payload = mockCrmDb.updateLead.mock.calls[0][2] as any;
+    expect(payload.customFields).toEqual({
+      summary: 'Designer who ships.',
+      skills: 'Figma, UX, Prototyping',
+      pastCompanies: 'Airbnb; Stripe',
+    });
+    // Provenance metadata also tagged for each new field.
+    expect(payload.enrichmentMetadata.skills.provider).toBe('enrich.so');
+    expect(payload.enrichmentMetadata.summary.provider).toBe('enrich.so');
+  });
+
+  it('does not overwrite existing customFields entries', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      userId: 'u1',
+      enrichmentFieldConfig: { skills: true },
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{
+        leadId: '1', email: 'a@b.com',
+        customFields: { skills: 'pre-existing value' },
+      }],
+      lastEvaluatedKey: undefined,
+    } as any);
+    mockEnrichSo.reverseLookup.mockResolvedValue({
+      found: true, firstName: 'A',
+      skills: ['Should', 'Not', 'Overwrite'],
+      fromCache: false, checkedAt: 'x',
+    });
+    await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    await new Promise((r) => setImmediate(r));
+    if (mockCrmDb.updateLead.mock.calls.length > 0) {
+      const payload = mockCrmDb.updateLead.mock.calls[0][2] as any;
+      // Either no customFields write (because nothing new), or skills preserved
+      if (payload.customFields) {
+        expect(payload.customFields.skills).toBe('pre-existing value');
+      }
+    }
+    // Whatever happens, the pre-existing value must not be replaced.
+    for (const call of mockCrmDb.updateLead.mock.calls) {
+      const cf = (call[2] as any).customFields;
+      if (cf && 'skills' in cf) expect(cf.skills).toBe('pre-existing value');
+    }
+  });
+
+  it('queues a lead with all 5 standards filled when an extended field is enabled and missing', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      userId: 'u1',
+      enrichmentFieldConfig: { skills: true },   // skills extended, on
+    } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{
+        leadId: '1', email: 'a@b.com',
+        firstName: 'A', lastName: 'B', company: 'X', title: 'T', linkedin: 'l',
+        customFields: {},   // skills not yet set
+      }],
+      lastEvaluatedKey: undefined,
+    } as any);
+    const res = await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    expect(res.status).toBe(202);
+    expect(res.body.queued).toBe(1);   // applicable because skills missing
+  });
 });
 
 // ─── lookup-by-email ─────────────────────────────────────────────────────────
@@ -513,5 +629,111 @@ describe('POST /api/crm/leads/lookup-by-email', () => {
       expect(tracker.checkLookupByEmailQuota).toHaveBeenCalledWith('u1');
       expect(tracker.recordLookupByEmailUsage).toHaveBeenCalledWith('u1');
     });
+  });
+});
+
+// ─── enrichment-field-config (per-list) ──────────────────────────────────────
+
+describe('GET /lists/:listId/enrichment-field-config', () => {
+  it('returns 404 when list does not exist', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(undefined as any);
+    const res = await request(app).get('/api/crm/lists/missing/enrichment-field-config');
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 403 when user does not own the list and is not in same org', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'other' } as any);
+    // both users have no orgId → not in same org
+    require('../services/db').userDb.getUserById.mockResolvedValue({ userId: 'x' } as any);
+    const res = await request(app).get('/api/crm/lists/l1/enrichment-field-config');
+    expect(res.status).toBe(403);
+  });
+
+  it('returns defaults (standards on, extended off) when list has no config saved', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' } as any);
+    const res = await request(app).get('/api/crm/lists/l1/enrichment-field-config');
+    expect(res.status).toBe(200);
+    expect(res.body.config).toEqual({
+      firstName: true, lastName: true, company: true, title: true, linkedin: true,
+      summary: false, skills: false, connectionCount: false, location: false,
+      headline: false, pastCompanies: false, education: false,
+    });
+  });
+
+  it('returns the merged config when list has partial values saved', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'l1', userId: 'u1',
+      enrichmentFieldConfig: { skills: true, summary: true, firstName: false },
+    } as any);
+    const res = await request(app).get('/api/crm/lists/l1/enrichment-field-config');
+    expect(res.body.config.skills).toBe(true);
+    expect(res.body.config.summary).toBe(true);
+    expect(res.body.config.firstName).toBe(false);
+    expect(res.body.config.lastName).toBe(true);   // unset → standard default
+    expect(res.body.config.education).toBe(false); // unset → extended default
+  });
+});
+
+describe('PATCH /lists/:listId/enrichment-field-config', () => {
+  it('empty body is a no-op — returns current config without an update', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'l1', userId: 'u1',
+      enrichmentFieldConfig: { skills: true },
+    } as any);
+    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
+    const res = await request(app).patch('/api/crm/lists/l1/enrichment-field-config').send({});
+    expect(res.status).toBe(200);
+    expect(res.body.config.skills).toBe(true);
+  });
+
+  it('persists only known boolean keys, drops unknowns silently', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' } as any);
+    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
+    const res = await request(app)
+      .patch('/api/crm/lists/l1/enrichment-field-config')
+      .send({ config: { skills: true, banana: 'yes', firstName: 'not-bool' } });
+    expect(res.status).toBe(200);
+    const written = mockCrmDb.updateLeadList.mock.calls[0][1].enrichmentFieldConfig as any;
+    expect(written.skills).toBe(true);
+    expect(written.banana).toBeUndefined();
+    expect(written.firstName).toBe(true); // unchanged from default (string ignored)
+  });
+
+  it('partial PATCH preserves previously-saved values that the client did not send', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'l1', userId: 'u1',
+      enrichmentFieldConfig: { summary: true, skills: true },
+    } as any);
+    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
+    const res = await request(app)
+      .patch('/api/crm/lists/l1/enrichment-field-config')
+      .send({ config: { education: true } });    // only toggling education on
+    expect(res.status).toBe(200);
+    const written = mockCrmDb.updateLeadList.mock.calls[0][1].enrichmentFieldConfig as any;
+    expect(written.education).toBe(true);   // toggled
+    expect(written.summary).toBe(true);     // preserved
+    expect(written.skills).toBe(true);      // preserved
+  });
+
+  it('accepts the config-without-wrapper shape (body IS the config)', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' } as any);
+    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
+    const res = await request(app)
+      .patch('/api/crm/lists/l1/enrichment-field-config')
+      .send({ skills: true });
+    expect(res.status).toBe(200);
+    const written = mockCrmDb.updateLeadList.mock.calls[0][1].enrichmentFieldConfig as any;
+    expect(written.skills).toBe(true);
+  });
+
+  it('returns 404 when list missing, 403 when not authorized', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(undefined as any);
+    let res = await request(app).patch('/api/crm/lists/l1/enrichment-field-config').send({ config: { skills: true } });
+    expect(res.status).toBe(404);
+
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'someone-else' } as any);
+    require('../services/db').userDb.getUserById.mockResolvedValue({ userId: 'x' } as any);
+    res = await request(app).patch('/api/crm/lists/l1/enrichment-field-config').send({ config: { skills: true } });
+    expect(res.status).toBe(403);
   });
 });

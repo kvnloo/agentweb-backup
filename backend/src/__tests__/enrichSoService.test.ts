@@ -404,4 +404,99 @@ describe('EnrichSoService.reverseLookup', () => {
     const http = makeHttp({ reverseLookup: jest.fn() });
     await expect(makeService(http).reverseLookup('')).rejects.toThrow(/email/i);
   });
+
+  // Extended-field surfacing — for the per-list enrichmentFieldConfig feature.
+  // The service always extracts these from rawData; specialists decide whether to write them.
+
+  it('extracts summary, skills, and connectionCount when present', async () => {
+    const http = makeHttp({
+      reverseLookup: jest.fn().mockResolvedValue({
+        success: true,
+        data: {
+          firstName: 'Emily', lastName: 'Zhang',
+          summary: 'Designer who ships.',
+          skills: ['Figma', 'UX', 'Prototyping'],
+          connectionCount: 432,
+          isConnectionCountObfuscated: false,
+        },
+      }),
+    });
+    const r = await makeService(http).reverseLookup('emily@figma.com');
+    expect(r.summary).toBe('Designer who ships.');
+    expect(r.skills).toEqual(['Figma', 'UX', 'Prototyping']);
+    expect(r.connectionCount).toBe(432);
+  });
+
+  it('omits connectionCount when obfuscated by LinkedIn', async () => {
+    const http = makeHttp({
+      reverseLookup: jest.fn().mockResolvedValue({
+        success: true,
+        data: { firstName: 'A', connectionCount: 500, isConnectionCountObfuscated: true },
+      }),
+    });
+    const r = await makeService(http).reverseLookup('a@b.com');
+    expect(r.connectionCount).toBeUndefined();
+  });
+
+  it('omits skills when array is empty (not stored as []) ', async () => {
+    const http = makeHttp({
+      reverseLookup: jest.fn().mockResolvedValue({
+        success: true, data: { firstName: 'A', skills: [] },
+      }),
+    });
+    const r = await makeService(http).reverseLookup('a@b.com');
+    expect(r.skills).toBeUndefined();
+  });
+
+  it('extracts pastCompanies from positionHistory[1+] and excludes the current company', async () => {
+    const http = makeHttp({
+      reverseLookup: jest.fn().mockResolvedValue({
+        success: true,
+        data: {
+          firstName: 'A', companyName: 'Figma',
+          positions: { positionHistory: [
+            { title: 'Staff', companyName: 'Figma' },        // current
+            { title: 'Senior', companyName: 'Airbnb' },      // past
+            { title: 'IC',     companyName: 'Stripe' },      // past
+            { title: 'Intern', companyName: 'Figma' },       // dup of current — excluded
+            { title: 'Intern', companyName: 'Stripe' },      // dup of past — excluded
+          ] },
+        },
+      }),
+    });
+    const r = await makeService(http).reverseLookup('a@b.com');
+    expect(r.pastCompanies).toEqual(['Airbnb', 'Stripe']);
+  });
+
+  it('formats education entries as "School (Degree)" or just school when degree missing', async () => {
+    const http = makeHttp({
+      reverseLookup: jest.fn().mockResolvedValue({
+        success: true,
+        data: {
+          firstName: 'A',
+          schools: { educationHistory: [
+            { schoolName: 'MIT', degreeName: 'BS Computer Science' },
+            { schoolName: 'Stanford' },
+            { schoolName: '   ', degreeName: 'PhD' },        // empty school dropped
+          ] },
+        },
+      }),
+    });
+    const r = await makeService(http).reverseLookup('a@b.com');
+    expect(r.education).toEqual(['MIT (BS Computer Science)', 'Stanford']);
+  });
+
+  it('leaves all extended fields undefined when raw data has none of them', async () => {
+    const http = makeHttp({
+      reverseLookup: jest.fn().mockResolvedValue({
+        success: true, data: { firstName: 'A', lastName: 'B', companyName: 'X' },
+      }),
+    });
+    const r = await makeService(http).reverseLookup('a@b.com');
+    expect(r.summary).toBeUndefined();
+    expect(r.skills).toBeUndefined();
+    expect(r.connectionCount).toBeUndefined();
+    expect(r.pastCompanies).toBeUndefined();
+    expect(r.education).toBeUndefined();
+  });
 });

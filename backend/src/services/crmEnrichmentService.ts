@@ -24,6 +24,7 @@ import { EnrichedFieldMeta, trimQuote } from '../utils/enrichedFieldValue';
 import { normalizeFields, Normalized } from './enrichmentFieldTypes';
 import { fetchTopPages } from './webContentFetcher';
 import { runSpecialists } from './enrichmentSpecialists';
+import { normalizeEnrichmentFieldConfig } from './enrichmentFieldConfig';
 import { resolveFieldAliases } from './enrichmentFieldAliasService';
 import { getOrCreateClustersForFields, type FieldCluster } from './enrichmentClusterService';
 
@@ -110,6 +111,11 @@ export interface EnrichmentJobSpec {
    *  service to generate per-cluster search templates for ungrouped fields.
    *  Optional: if absent, the LLM clusters from field names alone. */
   fieldDescriptions?: Record<string, string>;
+  /** Per-list enrich.so field config — gates which fields the reverse-lookup
+   *  specialists write to a lead. Loaded from `AW-LeadLists.enrichmentFieldConfig`
+   *  in loadAndFilterLeads and passed through to runSpecialists. Optional: when
+   *  absent, defaults apply (standard fields ON, extended fields OFF). */
+  enrichmentFieldConfig?: import('./enrichmentFieldConfig').EnrichmentFieldConfig;
 }
 
 interface EnrichmentPreviewResult {
@@ -163,6 +169,12 @@ export class CrmEnrichmentService {
 
     const storedLinkedinSearchTemplate: string =
       typeof list.linkedinSearchTemplate === 'string' ? list.linkedinSearchTemplate : '';
+
+    // Per-list enrichment field config — passed through to specialists so they
+    // can decide which enrich.so fields to write to each lead.
+    spec.enrichmentFieldConfig = normalizeEnrichmentFieldConfig(
+      list.enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
+    );
 
     // Load all leads with pagination
     const allLeads: LeadRecord[] = [];
@@ -1062,6 +1074,7 @@ export class CrmEnrichmentService {
     const specialistOut = await runSpecialists(spec.outputFields, lead, {
       userId: spec.userId,
       linkedInAccountId: linkedInAccountId ?? null,
+      enrichmentFieldConfig: spec.enrichmentFieldConfig,
     });
     const specialistFields = specialistOut.resolvedFields;
     const specialistMeta = specialistOut.resolvedMeta;

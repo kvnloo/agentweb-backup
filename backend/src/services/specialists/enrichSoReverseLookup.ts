@@ -1,21 +1,28 @@
 /**
  * Reverse-lookup specialists (enrich.so).
  *
- * Five specialists share a single reverseLookup call per (lead.email):
- *   firstName, lastName, company, title, linkedin
+ * Specialists share a single reverseLookup call per (lead.email):
+ *   firstName, lastName, company, title, linkedin   ← standard (default ON)
+ *   summary, skills, connectionCount, location,
+ *   headline, pastCompanies, education              ← extended (default OFF)
  *
- * The runSpecialists pipeline runs them in parallel via Promise.all, so without
- * dedup we'd issue N concurrent identical lookups. The in-flight promise cache
- * collapses parallel calls to one; once the first resolves, the EnrichSoService
- * memory LRU + DDB cache handle the rest.
+ * Each specialist consults `ctx.enrichmentFieldConfig` to decide whether to
+ * write to the lead. The underlying API call is unaffected — every reverse
+ * lookup still fetches and caches the full profile, so toggling a field ON
+ * later is a free (cache-hit) operation.
  *
- * Scope: cache holds *in-flight* promises only. The service handles longer-term
- * caching. Entries are removed when the promise settles — this map never grows
- * beyond the number of distinct emails currently being looked up at once.
+ * runSpecialists runs them in parallel via Promise.all, so without dedup we'd
+ * issue N concurrent identical lookups. The in-flight promise cache collapses
+ * parallel calls to one; once the first resolves, the EnrichSoService memory
+ * LRU + DDB cache handle the rest.
  */
 
 import type { FieldSpecialist, SpecialistResult } from '../enrichmentSpecialists';
 import { getEnrichSoService, type ReverseResult } from '../enrichSoService';
+import {
+  type EnrichmentFieldName,
+  normalizeEnrichmentFieldConfig,
+} from '../enrichmentFieldConfig';
 
 const inflight = new Map<string, Promise<ReverseResult | null>>();
 
@@ -28,9 +35,6 @@ async function getReverseLookupForLead(lead: any, ctx: { userId: string }): Prom
   const email = (lead.email ?? '').trim().toLowerCase();
   if (!email) return null;
 
-  // Dedup key includes userId so two users hitting the same email in parallel
-  // each get their own quota counted, but a single user's parallel specialists
-  // collapse to one call.
   const dedupKey = `${ctx.userId}:${email}`;
   const existing = inflight.get(dedupKey);
   if (existing) return existing;
@@ -51,18 +55,43 @@ async function getReverseLookupForLead(lead: any, ctx: { userId: string }): Prom
   }
 }
 
-function buildSpec(
-  fieldName: string,
-  pick: (r: ReverseResult) => string | undefined,
-): FieldSpecialist {
+/** Pick a string from the reverse result for a given field. Returns null when
+ * the field can't be derived from the response. Arrays are joined with the
+ * convention documented for each field. */
+function pickFieldValue(r: ReverseResult, field: EnrichmentFieldName): string | null {
+  switch (field) {
+    case 'firstName':       return r.firstName ?? null;
+    case 'lastName':        return r.lastName ?? null;
+    case 'company':         return r.companyName ?? null;
+    case 'title':           return r.jobTitle ?? null;
+    case 'linkedin':        return r.profileUrl ?? null;
+    case 'summary':         return r.summary ?? null;
+    case 'location':        return r.location ?? null;
+    case 'headline':        return r.headline ?? null;
+    case 'connectionCount': return typeof r.connectionCount === 'number' ? String(r.connectionCount) : null;
+    case 'skills':          return r.skills && r.skills.length ? r.skills.slice(0, 5).join(', ') : null;
+    case 'pastCompanies':   return r.pastCompanies && r.pastCompanies.length ? r.pastCompanies.join('; ') : null;
+    case 'education':       return r.education && r.education.length ? r.education.join('; ') : null;
+  }
+}
+
+function buildSpec(field: EnrichmentFieldName): FieldSpecialist {
   return {
-    fieldName,
+    fieldName: field,
     label: 'enrichso-reverse-lookup',
     resolve: async (lead, ctx) => {
+      // Gate on per-list config: defaults applied for missing keys (standard
+      // fields ON, extended OFF). When ctx has no config at all (legacy
+      // callers), the same defaults apply.
+      const cfg = normalizeEnrichmentFieldConfig(ctx.enrichmentFieldConfig);
+      if (!cfg[field]) return null;
+
       const r = await getReverseLookupForLead(lead, ctx);
       if (!r || !r.found) return null;
-      const value = pick(r);
+
+      const value = pickFieldValue(r, field);
       if (!value) return null;
+
       return {
         value,
         confidence: 'high',
@@ -74,9 +103,16 @@ function buildSpec(
 }
 
 export const enrichSoReverseLookupSpecialists: FieldSpecialist[] = [
-  buildSpec('firstName', r => r.firstName),
-  buildSpec('lastName', r => r.lastName),
-  buildSpec('company', r => r.companyName),
-  buildSpec('title', r => r.jobTitle),
-  buildSpec('linkedin', r => r.profileUrl),
+  buildSpec('firstName'),
+  buildSpec('lastName'),
+  buildSpec('company'),
+  buildSpec('title'),
+  buildSpec('linkedin'),
+  buildSpec('summary'),
+  buildSpec('skills'),
+  buildSpec('connectionCount'),
+  buildSpec('location'),
+  buildSpec('headline'),
+  buildSpec('pastCompanies'),
+  buildSpec('education'),
 ];

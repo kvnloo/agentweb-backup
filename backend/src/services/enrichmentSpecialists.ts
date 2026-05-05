@@ -13,6 +13,7 @@
 
 import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
+import type { EnrichmentFieldConfig } from './enrichmentFieldConfig';
 
 export interface SpecialistResult {
   value: string;
@@ -40,6 +41,13 @@ export interface FieldSpecialist {
 export interface SpecialistContext {
   userId: string;
   linkedInAccountId?: string | null;
+  /**
+   * Per-list config that gates which enrich.so fields a lead receives.
+   * When undefined, specialists fall back to defaults (standard fields ON,
+   * extended fields OFF) — matches behavior before the config existed.
+   * For leads that belong to multiple lists, the caller should pass the union.
+   */
+  enrichmentFieldConfig?: EnrichmentFieldConfig;
 }
 
 const REGISTRY: Map<string, FieldSpecialist> = new Map();

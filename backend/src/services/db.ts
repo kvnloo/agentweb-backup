@@ -3706,6 +3706,9 @@ export const crmDb = {
        * search query covers multiple related ungrouped fields. Populated by
        * enrichmentClusterService at suggest/execute time. */
       ungroupedClusters?: Array<{ fields: string[]; searchTemplate: string }>;
+      /** Per-list enrich.so field config — gates which fields the reverse-lookup
+       * specialists write to a lead. See enrichmentFieldConfig.ts. */
+      enrichmentFieldConfig?: Record<string, boolean>;
     }
   ) {
     try {
@@ -3825,6 +3828,12 @@ export const crmDb = {
         expressionAttributeNames['#ungroupedClusters'] = 'ungroupedClusters';
         updateExpressions.push('#ungroupedClusters = :ungroupedClusters');
         expressionAttributeValues[':ungroupedClusters'] = updates.ungroupedClusters;
+      }
+
+      if (updates.enrichmentFieldConfig !== undefined) {
+        expressionAttributeNames['#enrichmentFieldConfig'] = 'enrichmentFieldConfig';
+        updateExpressions.push('#enrichmentFieldConfig = :enrichmentFieldConfig');
+        expressionAttributeValues[':enrichmentFieldConfig'] = updates.enrichmentFieldConfig;
       }
 
       if (updateExpressions.length === 0) {

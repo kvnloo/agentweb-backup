@@ -51,6 +51,16 @@ export interface ReverseResult {
   companyName?: string;
   location?: string;
   profileUrl?: string;
+  /** Bio / about text from LinkedIn. */
+  summary?: string;
+  /** Top skills, in the order returned by the API. Empty when none. */
+  skills?: string[];
+  /** Connection count when known and not obfuscated. */
+  connectionCount?: number;
+  /** Past employers — `positionHistory[1+].companyName`, deduped, in chronological-from-LinkedIn order. */
+  pastCompanies?: string[];
+  /** Education entries formatted as "School (Degree)" or just "School" when degree unknown. */
+  education?: string[];
   fromCache: boolean;
   checkedAt: string;
 }
@@ -215,8 +225,39 @@ function rowToReverse(row: CacheRow, fromCache: boolean): ReverseResult {
     return { found: false, fromCache, checkedAt: row.fetchedAt };
   }
   const d = row.rawData ?? {};
-  const positions = d.positions?.positionHistory ?? [];
+  const positions = Array.isArray(d.positions?.positionHistory) ? d.positions.positionHistory : [];
   const currentTitle = positions[0]?.title;
+
+  // Past companies = positionHistory[1..], deduped by name (case-insensitive),
+  // skipping anything matching the current company so we don't echo it back.
+  const currentCompany = (d.companyName ?? '').trim().toLowerCase();
+  const pastCompanies: string[] = [];
+  const seen = new Set<string>();
+  for (const p of positions.slice(1)) {
+    const name = typeof p?.companyName === 'string' ? p.companyName.trim() : '';
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (key === currentCompany || seen.has(key)) continue;
+    seen.add(key);
+    pastCompanies.push(name);
+  }
+
+  // Education = "<School> (<Degree>)" or just "<School>" when degree missing.
+  const eduList = Array.isArray(d.schools?.educationHistory) ? d.schools.educationHistory : [];
+  const education: string[] = [];
+  for (const e of eduList) {
+    const school = typeof e?.schoolName === 'string' ? e.schoolName.trim() : '';
+    if (!school) continue;
+    const degree = typeof e?.degreeName === 'string' ? e.degreeName.trim() : '';
+    education.push(degree ? `${school} (${degree})` : school);
+  }
+
+  const skillsRaw = Array.isArray(d.skills) ? d.skills.filter((s: any) => typeof s === 'string' && s.trim()) : [];
+  const connectionCount =
+    typeof d.connectionCount === 'number' && !d.isConnectionCountObfuscated
+      ? d.connectionCount
+      : undefined;
+
   return {
     found: true,
     firstName: d.firstName,
@@ -227,6 +268,11 @@ function rowToReverse(row: CacheRow, fromCache: boolean): ReverseResult {
     companyName: d.companyName,
     location: d.location,
     profileUrl: d.profileUrl,
+    summary: typeof d.summary === 'string' && d.summary.trim() ? d.summary : undefined,
+    skills: skillsRaw.length ? skillsRaw : undefined,
+    connectionCount,
+    pastCompanies: pastCompanies.length ? pastCompanies : undefined,
+    education: education.length ? education : undefined,
     fromCache,
     checkedAt: row.fetchedAt,
   };
