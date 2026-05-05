@@ -2412,6 +2412,221 @@ describe('CRM Routes', () => {
     });
   });
 
+  describe('POST /api/crm/lists/:listId/leads/:leadId/fields/:field/reject', () => {
+    const findRejectHandler = () => router.stack.find((r: any) =>
+      r.route?.path === '/lists/:listId/leads/:leadId/fields/:field/reject' && r.route?.methods?.post
+    );
+
+    it('preserves a custom field value (does not null out customFields[field]) when marked wrong', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = {
+        leadId: 'lead1',
+        email: 'a@b.com',
+        customFields: { funding_stage: 'Series B', industry: 'SaaS' },
+        enrichmentMetadata: { funding_stage: { provider: 'enrich.so' } },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = { reason: 'outdated' };
+
+      const handler = findRejectHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updateCall).toBeDefined();
+      const updates = updateCall[2];
+      expect(updates).not.toHaveProperty('customFields');
+    });
+
+    it('stamps enrichmentMetadata[field] with rejectedReason and rejectedAt while preserving prior metadata', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const priorMeta = { provider: 'enrich.so', enrichedAt: '2026-01-01T00:00:00.000Z', sourceQuote: 'q' };
+      const existingLead = {
+        leadId: 'lead1',
+        email: 'a@b.com',
+        customFields: { funding_stage: 'Series B' },
+        enrichmentMetadata: { funding_stage: priorMeta, industry: { provider: 'web' } },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = { reason: 'outdated' };
+
+      const handler = findRejectHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updates = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updates.enrichmentMetadata.funding_stage).toEqual(expect.objectContaining({
+        ...priorMeta,
+        rejectedReason: 'outdated',
+        rejectedAt: expect.any(String),
+      }));
+      // prior metadata for other fields is preserved
+      expect(updates.enrichmentMetadata.industry).toEqual({ provider: 'web' });
+    });
+
+    it("defaults rejectedReason to 'user-rejected' when no reason is provided", async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = {
+        leadId: 'lead1',
+        email: 'a@b.com',
+        customFields: { funding_stage: 'Series B' },
+        enrichmentMetadata: {},
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = {};
+
+      const handler = findRejectHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updates = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updates.enrichmentMetadata.funding_stage.rejectedReason).toBe('user-rejected');
+    });
+
+    it('strips a prior verifiedBy stamp when re-marking the same field wrong', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const priorMeta = {
+        provider: 'enrich.so',
+        sourceUrl: 'https://x.example',
+        verifiedBy: { userId: 'someone', at: '2026-01-01T00:00:00.000Z' },
+      };
+      const existingLead = {
+        leadId: 'lead1',
+        customFields: { funding_stage: 'Series B' },
+        enrichmentMetadata: { funding_stage: priorMeta },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = { reason: 'changed-my-mind' };
+
+      const handler = findRejectHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updated = (crmDb.updateLead as jest.Mock).mock.calls[0][2].enrichmentMetadata.funding_stage;
+      expect(updated).not.toHaveProperty('verifiedBy');
+      expect(updated.rejectedReason).toBe('changed-my-mind');
+      expect(updated.provider).toBe('enrich.so');
+      expect(updated.sourceUrl).toBe('https://x.example');
+    });
+  });
+
+  describe('POST /api/crm/lists/:listId/leads/:leadId/fields/:field/verify', () => {
+    const findVerifyHandler = () => router.stack.find((r: any) =>
+      r.route?.path === '/lists/:listId/leads/:leadId/fields/:field/verify' && r.route?.methods?.post
+    );
+
+    it('stamps verifiedBy with userId and timestamp on a fresh field', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = {
+        leadId: 'lead1',
+        customFields: { funding_stage: 'Series B' },
+        enrichmentMetadata: { funding_stage: { provider: 'enrich.so' } },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = {};
+
+      const handler = findVerifyHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updated = (crmDb.updateLead as jest.Mock).mock.calls[0][2].enrichmentMetadata.funding_stage;
+      expect(updated.verifiedBy).toEqual({ userId: 'test-user-id', at: expect.any(String) });
+      expect(updated.provider).toBe('enrich.so');
+    });
+
+    it('strips prior rejectedReason and rejectedAt when verifying a previously-wrong field', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const priorMeta = {
+        provider: 'enrich.so',
+        sourceUrl: 'https://x.example',
+        rejectedReason: 'marked-wrong',
+        rejectedAt: '2026-01-01T00:00:00.000Z',
+      };
+      const existingLead = {
+        leadId: 'lead1',
+        customFields: { funding_stage: 'Series B' },
+        enrichmentMetadata: { funding_stage: priorMeta },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = {};
+
+      const handler = findVerifyHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updated = (crmDb.updateLead as jest.Mock).mock.calls[0][2].enrichmentMetadata.funding_stage;
+      expect(updated).not.toHaveProperty('rejectedReason');
+      expect(updated).not.toHaveProperty('rejectedAt');
+      expect(updated.verifiedBy).toEqual({ userId: 'test-user-id', at: expect.any(String) });
+      expect(updated.provider).toBe('enrich.so');
+      expect(updated.sourceUrl).toBe('https://x.example');
+    });
+
+    it('does not affect metadata for other fields on the lead', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = {
+        leadId: 'lead1',
+        customFields: {},
+        enrichmentMetadata: {
+          funding_stage: { provider: 'enrich.so' },
+          industry:      { provider: 'web', rejectedAt: '2026-01-01T00:00:00.000Z' },
+        },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1', field: 'funding_stage' };
+      mockRequest.body = {};
+
+      const handler = findVerifyHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updatedMeta = (crmDb.updateLead as jest.Mock).mock.calls[0][2].enrichmentMetadata;
+      // Other field's reject stamp must NOT be cleared by a verify on a sibling.
+      expect(updatedMeta.industry).toEqual({ provider: 'web', rejectedAt: '2026-01-01T00:00:00.000Z' });
+    });
+  });
+
   describe('GET /api/crm/lists/:listId/leads - status filtering', () => {
     it('should use status GSI when status filter is provided alone', async () => {
       const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };

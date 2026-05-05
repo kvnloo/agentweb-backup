@@ -5025,9 +5025,14 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/verify', async (req: Req
 
     const now = new Date().toISOString();
     const priorMeta = (lead.enrichmentMetadata || {})[validatedField] || {};
+    // Strip a prior reject stamp so flipping wrong → verify leaves a clean
+    // current state on disk. Reporting queries that ask "is this field
+    // currently rejected?" can then check rejectedAt directly without also
+    // having to compare timestamps against verifiedBy.at.
+    const { rejectedReason: _r, rejectedAt: _ra, ...restPrior } = priorMeta as any;
     const updatedMeta = {
       ...lead.enrichmentMetadata,
-      [validatedField]: { ...priorMeta, verifiedBy: { userId, at: now } },
+      [validatedField]: { ...restPrior, verifiedBy: { userId, at: now } },
     };
     await crmDb.updateLead(listId, leadId, { enrichmentMetadata: updatedMeta });
 
@@ -5065,18 +5070,17 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/reject', async (req: Req
 
     const now = new Date().toISOString();
 
-    // Determine if field is standard vs custom
-    const STANDARD = new Set(['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin']);
-    const updates: any = {};
-    if (STANDARD.has(validatedField)) {
-      updates[validatedField] = '';
-    } else {
-      updates.customFields = { ...(lead.customFields || {}), [validatedField]: null };
-    }
+    // Mark the field as rejected in metadata but preserve the value itself, so
+    // the data remains visible in the UI and we can still report on it later.
+    // Strip a prior verifiedBy stamp so flipping verify → wrong leaves a clean
+    // current state on disk (mirror of the verify endpoint's stamp cleanup).
     const priorMeta = (lead.enrichmentMetadata || {})[validatedField] || {};
-    updates.enrichmentMetadata = {
-      ...lead.enrichmentMetadata,
-      [validatedField]: { ...priorMeta, rejectedReason: reason || 'user-rejected', rejectedAt: now },
+    const { verifiedBy: _v, ...restPrior } = priorMeta as any;
+    const updates: any = {
+      enrichmentMetadata: {
+        ...lead.enrichmentMetadata,
+        [validatedField]: { ...restPrior, rejectedReason: reason || 'user-rejected', rejectedAt: now },
+      },
     };
     await crmDb.updateLead(listId, leadId, updates);
 
