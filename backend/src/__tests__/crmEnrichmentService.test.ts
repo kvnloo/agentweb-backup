@@ -2003,6 +2003,11 @@ describe('CrmEnrichmentService - revertJob', () => {
 describe('CrmEnrichmentService - citation verification', () => {
   let service: CrmEnrichmentService;
 
+  // Each test exercises the full enrichment pipeline (cluster grouping,
+  // multi-LLM extraction, critic pass), which can exceed Jest's 5s default
+  // when CI workers are saturated.
+  jest.setTimeout(20000);
+
   beforeEach(() => {
     jest.clearAllMocks();
     service = new CrmEnrichmentService();
