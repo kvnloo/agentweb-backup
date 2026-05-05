@@ -163,18 +163,28 @@ export async function fetchAndExtract(url: string): Promise<{ title: string; tex
     if (!res.ok) return null;
     const ctype = res.headers.get('content-type') || '';
     if (!/text\/html|application\/xhtml/i.test(ctype)) return null;
-    // Cap body size
+    // Cap body size. Check the size BEFORE appending so a single oversized
+    // chunk (a hostile server can send one >100MB chunk) cannot push us past
+    // MAX_BODY_BYTES — we slice the offending chunk to fit and stop reading.
     const reader = res.body?.getReader();
     if (!reader) return null;
     const chunks: Uint8Array[] = [];
     let total = 0;
-    while (total < MAX_BODY_BYTES) {
+    while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value) {
-        chunks.push(value);
-        total += value.byteLength;
+      if (!value) continue;
+      const remaining = MAX_BODY_BYTES - total;
+      if (remaining <= 0) break;
+      if (value.byteLength > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        total += remaining;
+        // Best-effort cancel; ignore failures (some implementations no-op).
+        try { await reader.cancel(); } catch { /* ignore */ }
+        break;
       }
+      chunks.push(value);
+      total += value.byteLength;
     }
     const buffer = new Uint8Array(total);
     let pos = 0;
