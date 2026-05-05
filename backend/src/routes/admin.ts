@@ -2887,15 +2887,13 @@ router.get("/chat-sessions", async (req, res) => {
         }
       }
 
-      // Re-fetch sessions so response includes newly generated scores
-      if (judges.length > 0) {
-        for (let i = 0; i < sessionsWithMessages.length; i++) {
-          try {
-            const refreshed = await chatbotDb.getChatSession((sessionsWithMessages[i] as any).sessionId);
-            if (refreshed) sessionsWithMessages[i] = refreshed;
-          } catch (error) {
-            // Keep original session data on refresh failure
-          }
+      // Re-fetch sessions so response includes newly generated scores (both default and judge)
+      for (let i = 0; i < sessionsWithMessages.length; i++) {
+        try {
+          const refreshed = await chatbotDb.getChatSession((sessionsWithMessages[i] as any).sessionId);
+          if (refreshed) sessionsWithMessages[i] = refreshed;
+        } catch (error) {
+          // Keep original session data on refresh failure
         }
       }
     }
