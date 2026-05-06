@@ -1152,6 +1152,24 @@ export async function getSlackUserDisplayName(slackUserId: string): Promise<stri
 }
 
 /**
+ * Replace all <@USERID> mentions in a Slack message text with the user's display name.
+ * Falls back to the raw ID if the lookup fails or Slack client is unavailable.
+ */
+export async function resolveSlackMentionsInText(text: string): Promise<string> {
+  const mentionPattern = /<@([A-Z0-9]+)>/g;
+  const userIds = [...new Set([...text.matchAll(mentionPattern)].map((m) => m[1]))];
+  if (userIds.length === 0) return text;
+
+  const nameMap = new Map(
+    await Promise.all(
+      userIds.map(async (id) => [id, await getSlackUserDisplayName(id)] as const)
+    )
+  );
+
+  return text.replace(mentionPattern, (_, id) => `@${nameMap.get(id) ?? id}`);
+}
+
+/**
  * Resolve display names for a list of Slack messages, deduplicating user ID lookups.
  */
 async function resolveDisplayNames(messages: any[]): Promise<Map<string, string>> {
