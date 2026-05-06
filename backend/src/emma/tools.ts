@@ -194,6 +194,7 @@ Actions:
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
+- search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
@@ -203,7 +204,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -248,11 +249,44 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         company: {
           type: 'string',
-          description: 'Company name filter for search-people.'
+          description: 'Company name filter for search-people — free text, auto-resolved to a LinkedIn company id if no company_id is provided.'
         },
         company_id: {
           type: 'string',
-          description: 'LinkedIn company identifier/slug for get-company action.'
+          description: 'LinkedIn company identifier/slug. Used for get-company. Optional pre-resolved LinkedIn company entity ID for search-people — when provided, skips the resolver.'
+        },
+        location: {
+          type: 'string',
+          description: 'Location filter for search-people — free text, auto-resolved if no location_id is provided.'
+        },
+        location_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn location entity ID for search-people — when provided, skips the resolver.'
+        },
+        industry: {
+          type: 'string',
+          description: 'Industry filter for search-people — free text, auto-resolved if no industry_id is provided.'
+        },
+        industry_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn industry entity ID for search-people — when provided, skips the resolver.'
+        },
+        school: {
+          type: 'string',
+          description: 'School filter for search-people — free text, auto-resolved if no school_id is provided.'
+        },
+        school_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn school entity ID for search-people — when provided, skips the resolver.'
+        },
+        type: {
+          type: 'string',
+          enum: ['COMPANY', 'LOCATION', 'INDUSTRY', 'SCHOOL', 'SERVICE'],
+          description: 'Entity type to resolve for search-parameters action.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Max number of candidates to return for search-parameters. Optional; the resolver picks a sensible default.'
         },
         invitation_id: {
           type: 'string',

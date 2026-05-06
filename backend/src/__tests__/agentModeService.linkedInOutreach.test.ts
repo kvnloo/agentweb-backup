@@ -26,6 +26,7 @@ const mockSendInMail = jest.fn();
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
+const mockResolveAccountId = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
@@ -33,6 +34,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
+    resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
   },
 }));
 
@@ -485,6 +487,130 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe('LinkedIn outreach action failed');
       expect(result.error).toBe('Rate limit exceeded');
+    });
+  });
+
+  describe('search-parameters', () => {
+    const { setUnipileSearchParamServiceForTesting, __resetUnipileSearchParamServiceForTesting } =
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      require('../services/unipileSearchParamService');
+    const mockResolve = jest.fn();
+
+    beforeEach(() => {
+      mockResolve.mockReset();
+      __resetUnipileSearchParamServiceForTesting();
+      setUnipileSearchParamServiceForTesting({ resolve: (...a: any[]) => mockResolve(...a) });
+    });
+
+    it('returns trimmed candidates with fromCache and source on success', async () => {
+      mockResolve.mockResolvedValue({
+        candidates: [
+          { id: 'co_123', title: 'Acme Inc', subtitle: 'Software · 2k employees', extra: 'should-be-stripped' },
+          { id: 'co_456', title: 'Acme Holdings', subtitle: 'Holding company' },
+        ],
+        fromCache: true,
+        source: 'cache',
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        type: 'COMPANY',
+        keywords: 'Acme',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockResolve).toHaveBeenCalledWith('test-account-id', {
+        type: 'COMPANY',
+        keywords: 'Acme',
+        limit: undefined,
+      });
+      expect(result.data).toEqual({
+        candidates: [
+          { id: 'co_123', title: 'Acme Inc', subtitle: 'Software · 2k employees' },
+          { id: 'co_456', title: 'Acme Holdings', subtitle: 'Holding company' },
+        ],
+        fromCache: true,
+        source: 'cache',
+      });
+    });
+
+    it('passes through limit and surfaces source=api', async () => {
+      mockResolve.mockResolvedValue({
+        candidates: [{ id: 'loc_1', title: 'San Francisco' }],
+        fromCache: false,
+        source: 'api',
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        type: 'LOCATION',
+        keywords: 'San Francisco',
+        limit: 5,
+      });
+
+      expect(mockResolve).toHaveBeenCalledWith('test-account-id', {
+        type: 'LOCATION',
+        keywords: 'San Francisco',
+        limit: 5,
+      });
+      expect(result.success).toBe(true);
+      expect(result.data.fromCache).toBe(false);
+      expect(result.data.source).toBe('api');
+    });
+
+    it('returns error when type is missing', async () => {
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        keywords: 'Acme',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('type');
+      expect(mockResolve).not.toHaveBeenCalled();
+    });
+
+    it('returns error when keywords is missing', async () => {
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        type: 'COMPANY',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('keywords');
+      expect(mockResolve).not.toHaveBeenCalled();
+    });
+
+    it('catches resolver errors and returns success: false', async () => {
+      mockResolve.mockRejectedValue(new Error('Unipile boom'));
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        type: 'COMPANY',
+        keywords: 'Acme',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Unipile boom');
+    });
+
+    it('falls back to site-wide account_id when none is provided', async () => {
+      mockResolveAccountId.mockResolvedValue('site-wide-account');
+      mockResolve.mockResolvedValue({ candidates: [], fromCache: false, source: 'api' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        type: 'COMPANY',
+        keywords: 'Acme',
+      });
+
+      expect(mockResolveAccountId).toHaveBeenCalledWith('user-1');
+      expect(mockResolve).toHaveBeenCalledWith('site-wide-account', expect.any(Object));
+      expect(result.success).toBe(true);
     });
   });
 });

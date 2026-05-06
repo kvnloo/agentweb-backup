@@ -20410,7 +20410,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
     // they already block non-owned accounts above.
-    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company'];
+    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
     if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
       account_id = await linkedInOutreachService.resolveAccountId(userId);
       if (account_id) {
@@ -20704,8 +20704,38 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: cancelResult };
         }
 
+        case 'search-parameters': {
+          // Resolve a free-text query (company / location / industry / school / service)
+          // to LinkedIn entity IDs via the cache-first wrapper around Unipile's
+          // /linkedin/search/parameters endpoint. See unipileSearchParamService.ts.
+          const { type, keywords, limit } = args;
+          if (!type) throw new Error('type is required for search-parameters (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE)');
+          if (!keywords) throw new Error('keywords is required for search-parameters');
+          const { getUnipileSearchParamService } = await import('./unipileSearchParamService');
+          const resolveResult = await getUnipileSearchParamService().resolve(account_id, {
+            type,
+            keywords,
+            limit,
+          });
+          // Trim each candidate to id/title/subtitle so the LLM doesn't see internal
+          // resolver fields (mirrors the trimming pattern used by search-people above).
+          const trimmedCandidates = (resolveResult.candidates || []).map((c: any) => ({
+            id: c.id,
+            title: c.title,
+            ...(c.subtitle !== undefined ? { subtitle: c.subtitle } : {}),
+          }));
+          return {
+            success: true,
+            data: {
+              candidates: trimmedCandidates,
+              fromCache: resolveResult.fromCache,
+              source: resolveResult.source,
+            },
+          };
+        }
+
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
