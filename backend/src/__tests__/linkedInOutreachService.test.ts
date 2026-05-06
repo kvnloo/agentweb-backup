@@ -498,6 +498,84 @@ describe('LinkedInOutreachService', () => {
         expect(sentBody.advanced_keywords).toEqual({ company: 'Acme' });
       });
     });
+
+    // ─── Auto-injected keywords (Unipile classic search rejects calls without
+    // one of keywords/search_url/cursor; backend synthesizes from filters)
+    describe('keywords auto-injection for filter-only calls', () => {
+      const {
+        setUnipileSearchParamServiceForTesting,
+        __resetUnipileSearchParamServiceForTesting,
+      } = require('../services/unipileSearchParamService');
+
+      beforeEach(() => {
+        __resetUnipileSearchParamServiceForTesting();
+        setUnipileSearchParamServiceForTesting({
+          resolveTopId: jest.fn().mockResolvedValue('1441'),
+          resolve: jest.fn(),
+        } as any);
+        (mockUnipileClient.request.send as jest.Mock).mockResolvedValue({
+          object: 'SearchResults', items: [], cursor: null,
+        });
+      });
+
+      afterEach(() => {
+        __resetUnipileSearchParamServiceForTesting();
+      });
+
+      it('synthesizes keywords from title when caller omits keywords', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          title: 'CTO',
+          company: 'Microsoft',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.keywords).toBe('CTO');
+      });
+
+      it('falls back to company when title is absent', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          company: 'Microsoft',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.keywords).toBe('Microsoft');
+      });
+
+      it('user-provided keywords always wins over auto-injection', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'AI engineer',
+          title: 'CTO',
+          company: 'Microsoft',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.keywords).toBe('AI engineer');
+      });
+
+      it('falls back through the precedence chain title > company > location > industry > school', async () => {
+        // Only school provided
+        await linkedInOutreachService.searchPeople('account-123', {
+          school: 'Stanford',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.keywords).toBe('Stanford');
+      });
+
+      it('does not inject keywords on URL-based search', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          url: 'https://www.linkedin.com/search/results/people/?keywords=foo',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.keywords).toBeUndefined();
+        expect(sentBody.url).toBeDefined();
+      });
+
+      it('does not inject keywords on cursor pagination', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          cursor: 'next-page-token',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.keywords).toBeUndefined();
+        expect(sentBody.cursor).toBe('next-page-token');
+      });
+    });
   });
 
   describe('searchParameters', () => {

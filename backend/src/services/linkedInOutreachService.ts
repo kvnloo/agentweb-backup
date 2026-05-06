@@ -449,7 +449,20 @@ export class LinkedInOutreachService {
           api: 'classic',
           category: 'people',
         };
-        if (keywords) body.keywords = keywords;
+
+        // Unipile's classic /linkedin/search rejects calls without one of
+        // keywords / search_url / cursor — even when structured filters
+        // (company, title, etc.) are provided. Empty string also fails.
+        // To keep the Emma tool surface honest ("just pass title+company"),
+        // synthesize keywords from the most-specific filter when omitted.
+        // User-provided keywords always wins.
+        const synthesizedKeywords = keywords
+          || title
+          || company
+          || location
+          || industry
+          || school;
+        if (synthesizedKeywords) body.keywords = synthesizedKeywords;
 
         // Resolve free-text → ID for each structured filter when the *_id
         // companion isn't already provided. Pre-resolved *_id always wins.

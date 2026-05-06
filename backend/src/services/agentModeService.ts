@@ -20441,7 +20441,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             company_id, location, location_id,
             industry, industry_id, school, school_id,
           } = args;
-          if (!keywords && !search_url && !cursor) throw new Error('Either keywords, search_url, or cursor is required for search-people');
+          // Unipile classic search needs at least one of keywords/search_url/cursor.
+          // The downstream linkedInOutreachService.searchPeople synthesizes keywords
+          // from any of these structured filters when keywords is omitted, so we
+          // accept the call as long as the caller gave us SOMETHING to search by.
+          const hasFilter = !!(title || company || company_id
+            || location || location_id || industry || industry_id || school || school_id);
+          if (!keywords && !search_url && !cursor && !hasFilter) {
+            throw new Error('Provide at least one of: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)');
+          }
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
             keywords, url: search_url, title, company, cursor,
             company_id, location, location_id,

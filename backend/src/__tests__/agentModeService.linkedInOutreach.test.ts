@@ -488,6 +488,52 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.message).toBe('LinkedIn outreach action failed');
       expect(result.error).toBe('Rate limit exceeded');
     });
+
+    // The handler used to reject calls without keywords/search_url/cursor.
+    // Now that linkedInOutreachService.searchPeople auto-synthesizes keywords
+    // from the most-specific structured filter, the early-validation gate must
+    // accept any of: keywords, search_url, cursor, OR any structured filter
+    // (title / company / location / industry / school + their *_id companions).
+    it('accepts a filter-only call (title + company, no keywords) and forwards to searchPeople', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [{ provider_id: 'p1', first_name: 'A', last_name: 'B' }], cursor: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        title: 'CTO',
+        company: 'Microsoft',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockSearchPeople).toHaveBeenCalledWith('test-account-id', expect.objectContaining({
+        title: 'CTO',
+        company: 'Microsoft',
+      }));
+    });
+
+    it('accepts a school-only call', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        school: 'Stanford',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockSearchPeople).toHaveBeenCalled();
+    });
+
+    it('rejects a call with no keywords AND no filters at all', async () => {
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error || '').toMatch(/keyword|filter|search_url|cursor/i);
+      expect(mockSearchPeople).not.toHaveBeenCalled();
+    });
   });
 
   describe('search-parameters', () => {

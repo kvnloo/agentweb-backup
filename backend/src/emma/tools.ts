@@ -182,7 +182,7 @@ emmaToolRegistry.register({
     description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
 
 Actions:
-- search-people: Search LinkedIn for people by keywords, title, company. Pass keywords for broad search, or use title/company for targeted search. Alternatively pass search_url with a LinkedIn search URL copied from the browser. Returns paginated results with provider_id for each person.
+- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person.
 - get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
@@ -237,7 +237,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         keywords: {
           type: 'string',
-          description: 'Free text search keywords for search-people action.'
+          description: 'Optional free-text search keywords for search-people. Pass when you want a broad match across name/headline/bio. Omit when using structured filters alone — the backend will synthesize a keyword from your most-specific filter (title > company > location > industry > school) so the Unipile classic-search keyword requirement is satisfied transparently.'
         },
         search_url: {
           type: 'string',
