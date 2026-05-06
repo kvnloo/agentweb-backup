@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-06',
     changes: [
+      'New: Characters for Video Creation',
+      '- Save reusable characters (name, visual description, reference portrait image) in the new Characters tab on the Videos page',
+      '- When creating a video task, select a saved character to include them as a visual reference — their appearance is used to anchor the character consistently across generated clips',
+      '- In Agent Mode with the Video Production skill, Emma now automatically lists your saved characters and incorporates the chosen character\'s portrait as a visual reference when generating videos',
+      '- Characters can be created, previewed, and deleted directly from the Characters tab',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
       'Fixed: Satisfaction Score Reports Now Include All Active Sessions',
       '- Sessions that started before the report window but had messages within it are now correctly included in satisfaction score counts',
       '- Previously, a session that began late at night and continued past midnight would be silently excluded from the 24-hour report, potentially hiding unsatisfied sessions',
