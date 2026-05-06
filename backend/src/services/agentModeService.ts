@@ -21300,10 +21300,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Call batchCreateLeads directly (same path as the bulk-import endpoint)
     const result = await crmDb.batchCreateLeads(listId, leads);
 
+    // Surface the post-import list count so callers (especially Emma running
+    // multiple paginated searches) can trust ground truth instead of summing
+    // per-call `imported` values — the same lead can match multiple search
+    // queries and is correctly dedup'd by batchCreateLeads, but the per-call
+    // count alone doesn't reflect that overlap across calls.
+    let listTotalAfterImport = 0;
+    try {
+      const list = await crmDb.getLeadListById(listId);
+      listTotalAfterImport = (list as any)?.leadCount ?? 0;
+    } catch {
+      // List read failure must not fail the import — count of 0 signals
+      // "unknown" to the caller and they can re-fetch separately.
+    }
+
     const response: any = {
       success: true,
       imported: result.newCount,
       skipped: result.mergedCount,
+      list_total_after_import: listTotalAfterImport,
       errors: result.errors,
       total: itemsToImport.length,
       cursor: searchResult.cursor,

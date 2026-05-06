@@ -6645,6 +6645,8 @@ Free-text company/location/industry/school are auto-resolved to LinkedIn entity 
 
 For more than ~30 results from a single query, use the cursor returned in the response to paginate through subsequent pages.
 
+When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
+
 After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
     inputSchema: {
       type: 'object',

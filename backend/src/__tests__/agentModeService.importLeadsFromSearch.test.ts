@@ -153,4 +153,52 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
     expect(result.success).toBe(false);
     expect(mockSearchPeople).not.toHaveBeenCalled();
   });
+
+  // Fix 1: Emma was over-reporting cumulative imports across multiple
+  // import_leads_from_search calls because the same lead can appear in two
+  // searches and her per-call sum double-counts what batchCreateLeads
+  // correctly dedups. The response now surfaces the post-import list size
+  // so Emma trusts ground truth instead of summing.
+  describe('list_total_after_import field', () => {
+    it('includes list_total_after_import populated from getLeadListById', async () => {
+      mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+      mockGetLeadListById.mockResolvedValueOnce({ listId: 'list-1', leadCount: 42 });
+
+      const result = await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      expect(result.list_total_after_import).toBe(42);
+    });
+
+    it('falls back to 0 when getLeadListById returns null', async () => {
+      mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+      mockGetLeadListById.mockResolvedValueOnce(null);
+
+      const result = await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      expect(result.list_total_after_import).toBe(0);
+    });
+
+    it('does not fail the import when getLeadListById throws', async () => {
+      mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+      mockGetLeadListById.mockRejectedValueOnce(new Error('boom'));
+
+      const result = await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.imported).toBe(1);
+      expect(result.list_total_after_import).toBe(0);
+    });
+  });
 });
