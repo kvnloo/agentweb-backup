@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-06',
     changes: [
+      'New: Admins Can Now Hide Pages from the Customer Portal Sidebar',
+      '- In the Subscriptions tab, each page now has three access levels: Allowed (user can access), Locked (shown with an upgrade prompt), or Hidden (not shown in the sidebar at all)',
+      '- Previously only Allowed/Locked were supported — Hidden is new and lets you remove pages entirely for certain subscription tiers rather than showing a lock icon',
+      '- Configure per-tier page visibility in Admin → Subscriptions → Edit a subscription type',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
       'Fixed: LinkedIn Outbound Messages Now Visible in CRM Engagement History',
       '- Manual replies sent directly on LinkedIn (outside the app) were previously invisible in the CRM — only the lead\'s inbound messages were shown',
       '- A new "Sync LinkedIn" button in the engagement history section pulls all messages (sent and received) from LinkedIn via Unipile and refreshes the timeline immediately',

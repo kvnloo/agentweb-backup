@@ -86,7 +86,7 @@ router.get('/me', authenticateToken, async (req, res) => {
     // Add subscription type, allowed pages, and allowed skills for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
-        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills } = await import('../services/subscriptionService');
+        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getHiddenPages } = await import('../services/subscriptionService');
         const { skillService } = await import('../services/skillService');
 
         // If user is an org member, resolve subscription from the org owner
@@ -97,6 +97,9 @@ router.get('/me', authenticateToken, async (req, res) => {
 
         // Get allowed pages (expands "*" to actual list) — use org owner's if in org
         response.allowedPages = await getAllowedPages(subscriptionUserId);
+
+        // Get hidden pages — use org owner's if in org
+        response.hiddenPages = await getHiddenPages(subscriptionUserId);
 
         // Get allowed skills resolved to { skillId, name } for display — use org owner's if in org
         const allowedSkillIds = await getAllowedSkills(subscriptionUserId);

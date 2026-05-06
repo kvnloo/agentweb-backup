@@ -22,6 +22,7 @@ jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionType: jest.fn(async () => 'Pro'),
   getAllowedPages: jest.fn(async () => ['/tasks', '/seo']),
   getAllowedSkills: jest.fn(async () => ['skill-1', 'skill-2']),
+  getHiddenPages: jest.fn(async () => []),
 }));
 
 jest.mock('../services/skillService', () => ({
