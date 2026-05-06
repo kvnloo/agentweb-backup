@@ -290,7 +290,10 @@ export class LinkedInOutreachService {
       const profile = await client.request.send({
         method: 'GET',
         path: ['users', identifier],
-        parameters: { account_id }
+        // linkedin_sections='*' returns ALL profile sections (experience,
+        // education, skills, languages, certifications, volunteer, etc.).
+        // Without it, Unipile returns only the base profile fields.
+        parameters: { account_id, linkedin_sections: '*' }
       });
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
@@ -394,16 +397,41 @@ export class LinkedInOutreachService {
   /**
    * Search LinkedIn for people using the Unipile search endpoint.
    * Supports keyword-based search or URL-based search (passing a LinkedIn search URL).
+   *
+   * Structured ID filters (`company_id`, `location_id`, `industry_id`,
+   * `school_id`) are forwarded as top-level body keys per Unipile's classic
+   * people-search schema (arrays of numeric IDs; `industry` is an object with
+   * include/exclude arrays). See https://developer.unipile.com/docs/linkedin-search.
+   *
+   * When the caller passes free-text (e.g. `company: 'Microsoft'`) without the
+   * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
+   * to look up the LinkedIn entity ID. Resolver miss (null) or resolver error
+   * → fall back to the original `advanced_keywords` free-text behavior so the
+   * search never blocks on resolution failures.
    */
   async searchPeople(accountId: string, params: {
     keywords?: string;
     url?: string;
     title?: string;
     company?: string;
+    company_id?: string;
+    location?: string;
+    location_id?: string;
+    industry?: string;
+    industry_id?: string;
+    school?: string;
+    school_id?: string;
     cursor?: string;
   }): Promise<any> {
     try {
-      const { keywords, url, title, company, cursor } = params;
+      const {
+        keywords, url, title,
+        company, company_id,
+        location, location_id,
+        industry, industry_id,
+        school, school_id,
+        cursor,
+      } = params;
       this.log(`Searching LinkedIn people`, { accountId, keywords, url });
       const client = await this.getClient();
 
@@ -421,12 +449,48 @@ export class LinkedInOutreachService {
           api: 'classic',
           category: 'people',
         };
-        if (keywords) body.keywords = keywords;
-        // title and company go into advanced_keywords for free-text matching
-        if (title || company) {
-          body.advanced_keywords = {};
-          if (title) body.advanced_keywords.title = title;
-          if (company) body.advanced_keywords.company = company;
+
+        // Unipile's classic /linkedin/search rejects calls without one of
+        // keywords / search_url / cursor — even when structured filters
+        // (company, title, etc.) are provided. Empty string also fails.
+        // To keep the Emma tool surface honest ("just pass title+company"),
+        // synthesize keywords from the most-specific filter when omitted.
+        // User-provided keywords always wins.
+        const synthesizedKeywords = keywords
+          || title
+          || company
+          || location
+          || industry
+          || school;
+        if (synthesizedKeywords) body.keywords = synthesizedKeywords;
+
+        // Resolve free-text → ID for each structured filter when the *_id
+        // companion isn't already provided. Pre-resolved *_id always wins.
+        const resolvedCompanyId = company_id
+          || (company ? await this.resolveSearchParamId('COMPANY', company, accountId) : null);
+        const resolvedLocationId = location_id
+          || (location ? await this.resolveSearchParamId('LOCATION', location, accountId) : null);
+        const resolvedIndustryId = industry_id
+          || (industry ? await this.resolveSearchParamId('INDUSTRY', industry, accountId) : null);
+        const resolvedSchoolId = school_id
+          || (school ? await this.resolveSearchParamId('SCHOOL', school, accountId) : null);
+
+        if (resolvedCompanyId) body.company = [resolvedCompanyId];
+        if (resolvedLocationId) body.location = [resolvedLocationId];
+        if (resolvedIndustryId) body.industry = { include: [resolvedIndustryId], exclude: [] };
+        if (resolvedSchoolId) body.school = [resolvedSchoolId];
+
+        // Free-text fallback for anything that didn't resolve (and for title
+        // which has no ID equivalent). Preserves the previous behavior so
+        // searches never block on resolver misses or resolver outages.
+        const advanced: Record<string, string> = {};
+        if (title) advanced.title = title;
+        if (company && !resolvedCompanyId) advanced.company = company;
+        if (location && !resolvedLocationId) advanced.location = location;
+        if (industry && !resolvedIndustryId) advanced.industry = industry;
+        if (school && !resolvedSchoolId) advanced.school = school;
+        if (Object.keys(advanced).length > 0) {
+          body.advanced_keywords = advanced;
         }
       }
 
@@ -445,6 +509,66 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * Best-effort lookup of a LinkedIn entity ID via UnipileSearchParamService.
+   * Returns null on any failure (resolver not initialized, cache/API error,
+   * empty result) so the caller can fall back to free-text. Never throws —
+   * resolver outages must not block the underlying search.
+   */
+  private async resolveSearchParamId(
+    type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE',
+    keywords: string,
+    accountId: string,
+  ): Promise<string | null> {
+    try {
+      // Use the factory's lazy-init getter, not the bare service's throwing
+      // getter. The factory transparently constructs the singleton in forked
+      // worker subprocesses (e.g. generateMarketingResponseWorker) where
+      // server.ts's boot wiring never runs.
+      const { getUnipileSearchParamService } = await import('./unipileSearchParamServiceFactory');
+      const svc = getUnipileSearchParamService();
+      const id = await svc.resolveTopId(accountId, { type, keywords });
+      return id ?? null;
+    } catch (error: any) {
+      this.log(`Search-param resolve failed (${type}=${keywords}); falling back to free-text`, {
+        reason: error?.message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Resolve free-text keywords to LinkedIn entity candidates (company,
+   * location, industry, school, service). Maps to Unipile's
+   * GET /linkedin/search/parameters endpoint.
+   *
+   * Callers should go through UnipileSearchParamService for caching +
+   * telemetry; this raw method is the HTTP transport that factory wires.
+   */
+  async searchParameters(
+    accountId: string,
+    args: { type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE'; keywords: string; limit?: number }
+  ): Promise<any> {
+    try {
+      this.log(`Searching LinkedIn parameters`, { accountId, type: args.type, keywords: args.keywords });
+      const client = await this.getClient();
+      const parameters: Record<string, any> = {
+        account_id: accountId,
+        type: args.type,
+        keywords: args.keywords,
+      };
+      if (args.limit !== undefined) parameters.limit = args.limit;
+      const result = await client.request.send({
+        method: 'GET',
+        path: ['linkedin', 'search', 'parameters'],
+        parameters,
+      });
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'searchParameters');
+    }
+  }
+
+  /**
    * Get a full LinkedIn profile by provider_id or identifier.
    * Exposes the internal getLinkedInProfile resolution as a public method
    * that works with raw provider_id strings (not just URLs).
@@ -456,7 +580,8 @@ export class LinkedInOutreachService {
       const profile = await client.request.send({
         method: 'GET',
         path: ['users', identifier],
-        parameters: { account_id: accountId }
+        // See getLinkedInProfile — linkedin_sections=* pulls all sections.
+        parameters: { account_id: accountId, linkedin_sections: '*' }
       });
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
@@ -532,18 +657,26 @@ export class LinkedInOutreachService {
             provider_id: inviter.inviter_id || null,
           };
 
-          // Optionally fetch a full profile for richer data (location, network_distance)
+          // Optionally fetch a full profile for richer data (location, etc).
+          // Routed through the cache-first wrapper to avoid hammering Unipile
+          // when the same inviter shows up across multiple invitations or page
+          // refreshes. network_distance is viewer-relative so the cached path
+          // can't return it; not required here since received invitations are
+          // by definition from non-1st-degree senders.
           if (senderProfile.public_id) {
             try {
-              const profile = await client.request.send({
-                method: 'GET',
-                path: ['users', senderProfile.public_id],
-                parameters: { account_id: accountId },
-              }) as any;
+              const { getUnipileProfileServiceSingleton } = await import('./unipileProfileService');
+              const svc = getUnipileProfileServiceSingleton();
+              const profile = svc
+                ? (await svc.getProfile(senderProfile.public_id, accountId)).rawData
+                : await client.request.send({
+                    method: 'GET',
+                    path: ['users', senderProfile.public_id],
+                    parameters: { account_id: accountId, linkedin_sections: '*' },
+                  }) as any;
               senderProfile.full_name = profile?.full_name || senderProfile.full_name;
               senderProfile.headline = profile?.headline || senderProfile.headline;
               senderProfile.location = profile?.location || null;
-              senderProfile.network_distance = profile?.network_distance || null;
               senderProfile.profile_picture_url = profile?.profile_picture_url || senderProfile.profile_picture_url;
             } catch {
               // Profile fetch failed — inline data is still returned

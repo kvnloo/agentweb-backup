@@ -20462,11 +20462,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
     }
 
-    // For read-only actions (get-profile, search-people), fall back to site-wide Unipile
-    // accounts when the user has no personally-connected account.
+    // For read-only actions (get-profile, search-people, get-company), fall back to
+    // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
     // they already block non-owned accounts above.
-    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people'];
+    const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
     if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
       account_id = await linkedInOutreachService.resolveAccountId(userId);
       if (account_id) {
@@ -20492,10 +20492,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     try {
       switch (action) {
         case 'search-people': {
-          const { keywords, search_url, title, company, cursor } = args;
-          if (!keywords && !search_url && !cursor) throw new Error('Either keywords, search_url, or cursor is required for search-people');
+          const {
+            keywords, search_url, title, company, cursor,
+            company_id, location, location_id,
+            industry, industry_id, school, school_id,
+          } = args;
+          // Unipile classic search needs at least one of keywords/search_url/cursor.
+          // The downstream linkedInOutreachService.searchPeople synthesizes keywords
+          // from any of these structured filters when keywords is omitted, so we
+          // accept the call as long as the caller gave us SOMETHING to search by.
+          const hasFilter = !!(title || company || company_id
+            || location || location_id || industry || industry_id || school || school_id);
+          if (!keywords && !search_url && !cursor && !hasFilter) {
+            throw new Error('Provide at least one of: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)');
+          }
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
-            keywords, url: search_url, title, company, cursor
+            keywords, url: search_url, title, company, cursor,
+            company_id, location, location_id,
+            industry, industry_id, school, school_id,
           });
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.
@@ -20526,12 +20540,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'get-profile': {
           if (!target) throw new Error('Either profile_url or provider_id is required for get-profile');
-          if (isUrl) {
-            const profileResult = await linkedInOutreachService.getLinkedInProfile(target, account_id);
-            return { success: true, data: profileResult };
-          }
-          const profileResult = await linkedInOutreachService.getProfile(target, account_id);
-          return { success: true, data: profileResult };
+          // Route through the cache-first wrapper so repeated lookups for the
+          // same person across sessions don't re-hit Unipile. The wrapper asks
+          // Unipile for linkedin_sections=* (full profile incl. experience /
+          // education / skills) and strips viewer-relative fields before
+          // persisting — see unipileProfileService.ts.
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profileResult = await getUnipileProfileService().getProfile(target, account_id);
+          return { success: true, data: profileResult.rawData };
         }
 
         case 'list-connections': {
@@ -20736,8 +20752,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'get-company': {
           const companyId = args.company_id;
           if (!companyId) throw new Error('company_id is required for get-company');
-          const companyResult = await linkedInOutreachService.getCompanyProfile(companyId, account_id);
-          return { success: true, data: companyResult };
+          // Route through the cache-first wrapper so repeated lookups for the
+          // same company across sessions don't re-hit Unipile. 30-day TTL.
+          // Viewer-relative fields (is_following, etc.) are stripped before
+          // persisting — see unipileCompanyService.ts.
+          const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+          const companyResult = await getUnipileCompanyService().getCompany(companyId, account_id);
+          return { success: true, data: companyResult.rawData };
         }
 
         case 'cancel-invitation': {
@@ -20747,8 +20768,38 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: cancelResult };
         }
 
+        case 'search-parameters': {
+          // Resolve a free-text query (company / location / industry / school / service)
+          // to LinkedIn entity IDs via the cache-first wrapper around Unipile's
+          // /linkedin/search/parameters endpoint. See unipileSearchParamService.ts.
+          const { type, keywords, limit } = args;
+          if (!type) throw new Error('type is required for search-parameters (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE)');
+          if (!keywords) throw new Error('keywords is required for search-parameters');
+          const { getUnipileSearchParamService } = await import('./unipileSearchParamServiceFactory');
+          const resolveResult = await getUnipileSearchParamService().resolve(account_id, {
+            type,
+            keywords,
+            limit,
+          });
+          // Trim each candidate to id/title/subtitle so the LLM doesn't see internal
+          // resolver fields (mirrors the trimming pattern used by search-people above).
+          const trimmedCandidates = (resolveResult.candidates || []).map((c: any) => ({
+            id: c.id,
+            title: c.title,
+            ...(c.subtitle !== undefined ? { subtitle: c.subtitle } : {}),
+          }));
+          return {
+            success: true,
+            data: {
+              candidates: trimmedCandidates,
+              fromCache: resolveResult.fromCache,
+              source: resolveResult.source,
+            },
+          };
+        }
+
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
@@ -21198,14 +21249,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     search_url?: string;
     title?: string;
     company?: string;
+    company_id?: string;
+    location?: string;
+    location_id?: string;
+    industry?: string;
+    industry_id?: string;
+    school?: string;
+    school_id?: string;
+    cursor?: string;
     limit?: number;
     auto_enrich?: boolean;
   }): Promise<any> {
-    const { listId, keywords, search_url, title, company, limit = 20, auto_enrich = false } = args;
+    const {
+      listId, keywords, search_url, title, company, company_id,
+      location, location_id, industry, industry_id, school, school_id,
+      cursor, limit = 20, auto_enrich = false,
+    } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
-    if (!keywords && !search_url && !title && !company) {
-      return { success: false, error: 'At least one search filter is required: keywords, search_url, title, or company' };
+    // Accept any of: keywords / search_url / cursor / structured filter.
+    // Mirrors the search-people handler gate after Stage 2 + the keyword-synth fix.
+    const hasFilter = !!(title || company || company_id
+      || location || location_id || industry || industry_id || school || school_id);
+    if (!keywords && !search_url && !cursor && !hasFilter) {
+      return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
     }
 
     // Resolve account: user's own or platform-wide fallback
@@ -21217,12 +21284,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       };
     }
 
-    // Search for people
+    // Search for people. The structured filters (location/industry/school) are
+    // auto-resolved to LinkedIn entity IDs by linkedInOutreachService when only
+    // free text is supplied; pre-resolved *_id always wins. cursor enables
+    // pagination through a single query.
     const searchResult = await linkedInOutreachService.searchPeople(accountId, {
       keywords,
       url: search_url,
       title,
       company,
+      company_id,
+      location,
+      location_id,
+      industry,
+      industry_id,
+      school,
+      school_id,
+      cursor,
     });
 
     if (!searchResult?.items?.length) {
@@ -21278,10 +21356,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Call batchCreateLeads directly (same path as the bulk-import endpoint)
     const result = await crmDb.batchCreateLeads(listId, leads);
 
+    // Surface the post-import list count so callers (especially Emma running
+    // multiple paginated searches) can trust ground truth instead of summing
+    // per-call `imported` values — the same lead can match multiple search
+    // queries and is correctly dedup'd by batchCreateLeads, but the per-call
+    // count alone doesn't reflect that overlap across calls.
+    let listTotalAfterImport = 0;
+    try {
+      const list = await crmDb.getLeadListById(listId);
+      listTotalAfterImport = (list as any)?.leadCount ?? 0;
+    } catch {
+      // List read failure must not fail the import — count of 0 signals
+      // "unknown" to the caller and they can re-fetch separately.
+    }
+
     const response: any = {
       success: true,
       imported: result.newCount,
       skipped: result.mergedCount,
+      list_total_after_import: listTotalAfterImport,
       errors: result.errors,
       total: itemsToImport.length,
       cursor: searchResult.cursor,

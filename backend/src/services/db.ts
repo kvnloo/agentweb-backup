@@ -8,6 +8,7 @@ import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSch
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
+import { normalizeLinkedInUrl } from "./enrichmentGroups";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3697,6 +3698,18 @@ export const crmDb = {
         externalPeopleListId?: string; // Attio people list ID
         externalCompaniesListId?: string; // Attio companies list ID
       } | null;
+      /** Persisted user-field-name → canonical FIELD_GROUPS field-name map.
+       * Populated lazily by the enrichment alias resolver — once we map
+       * 'funding_round' → 'funding_stage' for a list, never re-prompt the LLM. */
+      fieldCanonicalMap?: Record<string, string>;
+      /** LLM-curated clusters of ungrouped fields with their per-cluster search
+       * template. Each cluster behaves like an ad-hoc canonical group: one
+       * search query covers multiple related ungrouped fields. Populated by
+       * enrichmentClusterService at suggest/execute time. */
+      ungroupedClusters?: Array<{ fields: string[]; searchTemplate: string }>;
+      /** Per-list enrich.so field config — gates which fields the reverse-lookup
+       * specialists write to a lead. See enrichmentFieldConfig.ts. */
+      enrichmentFieldConfig?: Record<string, boolean>;
     }
   ) {
     try {
@@ -3804,6 +3817,24 @@ export const crmDb = {
         expressionAttributeNames['#syncConfig'] = 'syncConfig';
         updateExpressions.push('#syncConfig = :syncConfig');
         expressionAttributeValues[':syncConfig'] = updates.syncConfig;
+      }
+
+      if (updates.fieldCanonicalMap !== undefined) {
+        expressionAttributeNames['#fieldCanonicalMap'] = 'fieldCanonicalMap';
+        updateExpressions.push('#fieldCanonicalMap = :fieldCanonicalMap');
+        expressionAttributeValues[':fieldCanonicalMap'] = updates.fieldCanonicalMap;
+      }
+
+      if (updates.ungroupedClusters !== undefined) {
+        expressionAttributeNames['#ungroupedClusters'] = 'ungroupedClusters';
+        updateExpressions.push('#ungroupedClusters = :ungroupedClusters');
+        expressionAttributeValues[':ungroupedClusters'] = updates.ungroupedClusters;
+      }
+
+      if (updates.enrichmentFieldConfig !== undefined) {
+        expressionAttributeNames['#enrichmentFieldConfig'] = 'enrichmentFieldConfig';
+        updateExpressions.push('#enrichmentFieldConfig = :enrichmentFieldConfig');
+        expressionAttributeValues[':enrichmentFieldConfig'] = updates.enrichmentFieldConfig;
       }
 
       if (updateExpressions.length === 0) {
@@ -4012,6 +4043,7 @@ export const crmDb = {
     webSearchTemplate?: string,
     linkedinSearchTemplate?: string,
     enrichSources?: string[],
+    fieldDescriptions?: Record<string, string>,
   ) {
     try {
       const expressionParts = ['searchQueryTemplates = :templates', 'updatedAt = :updatedAt'];
@@ -4048,6 +4080,11 @@ export const crmDb = {
       if (enrichSources !== undefined) {
         expressionParts.push('enrichSources = :enrichSources');
         expressionAttributeValues[':enrichSources'] = enrichSources;
+      }
+
+      if (fieldDescriptions !== undefined) {
+        expressionParts.push('fieldDescriptions = :fieldDescriptions');
+        expressionAttributeValues[':fieldDescriptions'] = fieldDescriptions;
       }
 
       const params = {
@@ -4503,6 +4540,8 @@ export const crmDb = {
     contactStatusUpdatedBy?: string;
     accountOwnerUserId?: string | null;
     syncMetadata?: Record<string, any>;
+    /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
+    enrichmentMetadata?: Record<string, any>;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4570,6 +4609,11 @@ export const crmDb = {
       if (updates.customFields !== undefined) {
         setExpressions.push('customFields = :customFields');
         expressionAttributeValues[':customFields'] = updates.customFields;
+      }
+
+      if (updates.enrichmentMetadata !== undefined) {
+        setExpressions.push('enrichmentMetadata = :enrichmentMetadata');
+        expressionAttributeValues[':enrichmentMetadata'] = updates.enrichmentMetadata;
       }
 
       if (updates.selectedSenderId !== undefined) {
@@ -4744,7 +4788,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -4820,6 +4864,10 @@ export const crmDb = {
         mergedCount: 0,
         errorCount: 0,
         errors: [] as string[],
+        // IDs of newly created leads (excludes merged updates). Used by callers
+        // that need to act on freshly-imported leads — e.g., the CSV importer
+        // queues these for enrich.so email validation when the user opts in.
+        created: [] as Array<{ leadId: string; email?: string }>,
       };
 
       // Get existing leads to check for duplicates by email
@@ -4832,24 +4880,31 @@ export const crmDb = {
         lastKey = result.lastEvaluatedKey;
       } while (lastKey);
 
-      // Create a map of existing leads by email for quick lookup
+      // Build dedup maps keyed by both email AND normalized LinkedIn URL.
+      // Same person can appear with no email but a LinkedIn URL (typical for
+      // Unipile-sourced leads), or vice versa — both axes must dedup or
+      // imports inflate the list with duplicates.
       const existingLeadsByEmail = new Map<string, any>();
+      const existingLeadsByLinkedIn = new Map<string, any>();
       allExistingLeads.forEach(lead => {
         if (lead.email && lead.email.trim()) {
           existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
         }
+        const liKey = normalizeLinkedInUrl(lead.linkedin);
+        if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
       });
 
       // Separate leads into new leads and leads to update
       const newLeads: typeof leads = [];
       const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
 
-      // Deduplicate leads within the upload by email (case-insensitive)
+      // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
       const uniqueLeads = new Map<string, typeof leads[0]>();
+      const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
+        const liKey = normalizeLinkedInUrl(lead.linkedin);
 
-        // Only deduplicate if email is provided
         if (lead.email && lead.email.trim()) {
           if (uniqueLeads.has(emailKey)) {
             results.errorCount++;
@@ -4857,12 +4912,31 @@ export const crmDb = {
             return;
           }
 
-          // Check against existing leads - if exists, mark for update instead of error
+          // Check against existing leads — if exists, mark for update instead of error
           const existingLead = existingLeadsByEmail.get(emailKey);
           if (existingLead) {
             leadsToUpdate.push({ existingLead, newData: lead });
-            return; // Skip adding to uniqueLeads, will be handled separately
+            return;
           }
+        }
+
+        // LinkedIn URL dedup — covers the case where email is missing or
+        // both leads share a URL even if their emails differ.
+        if (liKey) {
+          // Within-batch dedup: skip if we've already seen this normalized URL.
+          if (seenLinkedIn.has(liKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate LinkedIn URL "${lead.linkedin}" found in upload data`);
+            return;
+          }
+          // Existing-list dedup: same URL → merge into existing lead.
+          const existingByLi = existingLeadsByLinkedIn.get(liKey);
+          if (existingByLi) {
+            leadsToUpdate.push({ existingLead: existingByLi, newData: lead });
+            seenLinkedIn.add(liKey);
+            return;
+          }
+          seenLinkedIn.add(liKey);
         }
 
         uniqueLeads.set(emailKey, lead);
@@ -4878,9 +4952,11 @@ export const crmDb = {
       for (let i = 0; i < newLeads.length; i += batchSize) {
         const batch = newLeads.slice(i, i + batchSize);
 
+        const batchCreated: Array<{ leadId: string; email?: string }> = [];
         const writeRequests = batch.map(lead => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
+          batchCreated.push({ leadId, email: emailValue });
 
           const item: any = {
             listId,
@@ -4891,7 +4967,9 @@ export const crmDb = {
             company: lead.company || '',
             title: lead.title || '',
             notes: lead.notes || '',
-            linkedin: lead.linkedin?.trim() || '',
+            // Store LinkedIn URL in canonical form so future dedup reads match
+            // regardless of the source's formatting (Unipile, CSV upload, manual entry).
+            linkedin: normalizeLinkedInUrl(lead.linkedin),
             customFields: lead.customFields || {},
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
@@ -4932,6 +5010,9 @@ export const crmDb = {
           await dynamodb.batchWrite(params).promise();
           results.successCount += batch.length;
           results.newCount += batch.length;
+          // Promote batch IDs into the global created list only after the write
+          // succeeds — keeps results.created in sync with what's actually persisted.
+          results.created.push(...batchCreated);
         } catch (batchError: any) {
           batch.forEach((lead, index) => {
             results.errorCount++;
@@ -4944,7 +5025,7 @@ export const crmDb = {
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
 
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
 
       // Extract from new leads
       newLeads.forEach(lead => {
@@ -5121,6 +5202,7 @@ export const crmDb = {
         mergedCount: 0,
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
+        created: [] as Array<{ leadId: string; email?: string }>,
       };
     }
   },
@@ -5644,21 +5726,31 @@ export const crmDb = {
     status: 'completed' | 'undone';
     expiresAt: number;
     processedCount: number;
+    /** Aggregate counts per failure step (search/linkedin/llm/update). Item #11. */
+    failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
+    /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
+    failures?: Array<{ leadId: string; email?: string; step: string; message: string }>;
   }): Promise<void> {
     try {
+      const item: any = {
+        jobId: meta.jobId,
+        leadId: '_meta',
+        listId: meta.listId,
+        userId: meta.userId,
+        outputFields: meta.outputFields,
+        createdAt: meta.createdAt,
+        status: meta.status,
+        expiresAt: meta.expiresAt,
+        processedCount: meta.processedCount,
+      };
+      if (meta.failureBreakdown) item.failureBreakdown = meta.failureBreakdown;
+      if (meta.failures && meta.failures.length > 0) {
+        // Cap to 50 entries to stay well under DynamoDB's 400KB row limit
+        item.failures = meta.failures.slice(0, 50);
+      }
       await dynamodb.put({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
-        Item: {
-          jobId: meta.jobId,
-          leadId: '_meta',
-          listId: meta.listId,
-          userId: meta.userId,
-          outputFields: meta.outputFields,
-          createdAt: meta.createdAt,
-          status: meta.status,
-          expiresAt: meta.expiresAt,
-          processedCount: meta.processedCount,
-        },
+        Item: item,
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'createEnrichmentJobMeta');
@@ -5708,6 +5800,149 @@ export const crmDb = {
       return (result.Items || []).filter((item: any) => item.leadId !== '_meta');
     } catch (error) {
       handleDynamoDbError(error, 'getEnrichmentSnapshotsByJobId');
+      throw error;
+    }
+  },
+
+  // ─── Enrichment Raw Cache ─────────────────────────────────────────────
+
+  async getEnrichmentCacheItem(canonicalId: string, fieldGroup: string): Promise<any | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+        Key: { canonicalId, fieldGroup },
+      }).promise();
+      return result.Item ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentCacheItem');
+      throw error;
+    }
+  },
+
+  async putEnrichmentCacheItem(item: {
+    canonicalId: string;
+    fieldGroup: string;
+    canonicalKey: string;
+    entityKey: string;
+    entityType: string;
+    rawData: any;
+    queryUsed: string;
+    sourcesUsed: string[];
+    resultCount: number;
+    schemaVersion: number;
+    fetchedAt: string;
+    expiresAt: number;
+    // Required discriminator. Forces every caller to declare which producer
+    // owns this row, so a future caller cannot silently mislabel an enrich.so
+    // row as a field-group row (or vice versa). Note: this used to be optional
+    // with a 'field_group' default — review C1 flagged that as fragile.
+    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param';
+  }): Promise<void> {
+    try {
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+        Item: item,
+        // Only insert if item doesn't exist OR is already expired.
+        // Prevents race when multiple clients simultaneously miss the same cache entry.
+        ConditionExpression: 'attribute_not_exists(canonicalId) OR expiresAt < :now',
+        ExpressionAttributeValues: { ':now': Math.floor(Date.now() / 1000) },
+      }).promise();
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return;  // another worker won the race
+      handleDynamoDbError(error, 'putEnrichmentCacheItem');
+      throw error;
+    }
+  },
+
+  /**
+   * Targeted write for the email-validation result that avoids clobbering
+   * concurrent customFields edits.
+   *
+   * The standard `updateLead({customFields: {...}})` path does a full SET on
+   * `customFields`, so a read-modify-write race against a parallel user edit
+   * can lose the user's change. This uses DDB document-path syntax to update
+   * only the two leaf keys, which DDB applies atomically without touching
+   * sibling keys.
+   *
+   * Cold-start fallback: if `enrichmentMetadata` doesn't exist on the lead
+   * yet (it's lazily created), the path SET fails with ValidationException.
+   * We then bootstrap the parent map and retry.
+   */
+  async setLeadEmailValidation(
+    listId: string,
+    leadId: string,
+    validation: Record<string, any>,
+    metadata: Record<string, any>,
+  ): Promise<void> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const params: any = {
+      TableName: tableName,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET customFields.email_validation = :v, ' +
+        'enrichmentMetadata.email_validation = :m, ' +
+        'updatedAt = :ts',
+      ExpressionAttributeValues: {
+        ':v': validation,
+        ':m': metadata,
+        ':ts': new Date().toISOString(),
+      },
+      // Don't auto-create the lead if it disappeared between create and validation.
+      ConditionExpression: 'attribute_exists(leadId)',
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return;
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;  // lead deleted
+      // ValidationException fires when `enrichmentMetadata` doesn't exist as a map.
+      if (err.code !== 'ValidationException') {
+        handleDynamoDbError(err, 'setLeadEmailValidation');
+        throw err;
+      }
+    }
+    // Bootstrap missing parent maps, then retry.
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: { listId, leadId },
+        UpdateExpression:
+          'SET customFields = if_not_exists(customFields, :emptyMap), ' +
+          'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;
+      handleDynamoDbError(err, 'setLeadEmailValidation:bootstrap');
+      throw err;
+    }
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;
+      handleDynamoDbError(err, 'setLeadEmailValidation:retry');
+      throw err;
+    }
+  },
+
+  async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+        IndexName: 'entityKey-fieldGroup-index',
+        KeyConditionExpression: 'entityKey = :ek',
+        ExpressionAttributeValues: { ':ek': entityKey },
+      }).promise();
+
+      for (const item of result.Items ?? []) {
+        await dynamodb.delete({
+          TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
+          Key: { canonicalId: item.canonicalId, fieldGroup: item.fieldGroup },
+        }).promise();
+      }
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteEnrichmentCacheByEntityKey');
       throw error;
     }
   },

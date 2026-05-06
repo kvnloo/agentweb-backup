@@ -36,6 +36,17 @@ import {
 } from '../utils/savedViews';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { normalizeAttribution } from '../types/attribution';
+import {
+  EnrichmentInputError,
+  validateFieldDescriptions,
+  validateFieldName,
+  validateGoal,
+  validateInstruction,
+  validateOptionalTemplate,
+  validateOutputFields,
+  validateSources,
+  validateSourcesPerField,
+} from '../utils/enrichmentValidation';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -167,6 +178,12 @@ const upload = multer({
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
+
+// enrich.so routes (validate-email, lookup-by-email) live in their own
+// sub-router so they can be unit-tested without mocking all of crm.ts.
+import enrichSoSubRouter from './crmEnrichSo';
+import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+router.use(enrichSoSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
   if (alertEvents === undefined) {
@@ -1660,6 +1677,9 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
       autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, leadData.email ?? ''),
+      // Single-lead create always validates the email in background (locked design).
+      // Failures are swallowed so a transient enrich.so outage doesn't block creation.
+      validateLeadEmailInBackground(listId, (lead as any).leadId, leadData.email ?? '', userId),
     ]);
 
     res.status(201).json(lead);
@@ -3030,9 +3050,14 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     }
 
     if (mode === 'suggest') {
-      const goal = typeof req.body.goal === 'string' ? req.body.goal.trim() : '';
-      if (!goal) {
-        return res.status(400).json({ message: 'goal is required' });
+      let goal: string;
+      try {
+        goal = validateGoal(req.body.goal);
+      } catch (err: any) {
+        if (err instanceof EnrichmentInputError) {
+          return res.status(400).json({ message: err.message });
+        }
+        throw err;
       }
       try {
         const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
@@ -3062,7 +3087,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
           success: true,
           instruction: result.instruction,
           outputFields: result.outputFields,
-          webSearchTemplate: result.webSearchTemplate,
+          fieldDescriptions: result.fieldDescriptions,
           linkedinSearchTemplate: result.linkedinSearchTemplate,
           sourcesPerField: result.sourcesPerField,
           sources: result.sources,
@@ -3074,31 +3099,29 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     }
 
     const defaultInstruction = 'Write a 3-6 sentence company profile covering what they do, their industry, products, and notable context. If no good company information is available, return "Company information not found".';
-    const instruction: string = typeof req.body.instruction === 'string' && req.body.instruction.trim()
-      ? req.body.instruction.trim()
-      : defaultInstruction;
-    const outputFields: string[] = Array.isArray(req.body.outputFields) && req.body.outputFields.length > 0
-      ? req.body.outputFields
-      : ['web_company_info'];
-    const sources: ('web_search' | 'linkedin' | 'existing_data')[] =
-      Array.isArray(req.body.sources) && req.body.sources.length > 0
-        ? req.body.sources
-        : ['web_search'];
-
-    const webSearchTemplate: string | undefined =
-      typeof req.body.webSearchTemplate === 'string' && req.body.webSearchTemplate.trim()
-        ? req.body.webSearchTemplate.trim()
-        : undefined;
-
-    const linkedinSearchTemplate: string | undefined =
-      typeof req.body.linkedinSearchTemplate === 'string' && req.body.linkedinSearchTemplate.trim()
-        ? req.body.linkedinSearchTemplate.trim()
-        : undefined;
-
-    const sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> | undefined =
-      req.body.sourcesPerField && typeof req.body.sourcesPerField === 'object'
-        ? req.body.sourcesPerField
-        : undefined;
+    let instruction: string;
+    let outputFields: string[];
+    let sources: ('web_search' | 'linkedin' | 'existing_data')[];
+    let webSearchTemplate: string | undefined;
+    let linkedinSearchTemplate: string | undefined;
+    let sourcesPerField: Record<string, ('web_search' | 'linkedin' | 'existing_data')[]> | undefined;
+    let fieldDescriptions: Record<string, string> | undefined;
+    try {
+      instruction = validateInstruction(req.body.instruction, defaultInstruction);
+      outputFields = req.body.outputFields !== undefined
+        ? validateOutputFields(req.body.outputFields)
+        : ['web_company_info'];
+      sources = validateSources(req.body.sources, ['web_search']) as typeof sources;
+      webSearchTemplate = validateOptionalTemplate(req.body.webSearchTemplate, 'webSearchTemplate');
+      linkedinSearchTemplate = validateOptionalTemplate(req.body.linkedinSearchTemplate, 'linkedinSearchTemplate');
+      sourcesPerField = validateSourcesPerField(req.body.sourcesPerField) as typeof sourcesPerField;
+      fieldDescriptions = validateFieldDescriptions(req.body.fieldDescriptions);
+    } catch (err: any) {
+      if (err instanceof EnrichmentInputError) {
+        return res.status(400).json({ message: err.message });
+      }
+      throw err;
+    }
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
 
@@ -3117,6 +3140,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         webSearchTemplate,
         linkedinSearchTemplate,
         sourcesPerField,
+        fieldDescriptions,
       });
       responseBody = {
         success: true,
@@ -3142,6 +3166,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         webSearchTemplate,
         linkedinSearchTemplate,
         sourcesPerField,
+        fieldDescriptions,
       }, socketId);
       responseBody = {
         success: true,
@@ -3172,6 +3197,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       webSearchTemplate,
       linkedinSearchTemplate,
       sources,
+      fieldDescriptions,
     ).catch((err: unknown) => console.warn(`[CRM] enrich-web ${mode}: failed to save config:`, err));
 
     return res.json(responseBody);
@@ -4149,7 +4175,25 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const totalLeads = leads.length;
     const doNotContactCount = leads.filter((l: any) => isDoNotContact(l)).length;
     const noEmailCount = leads.filter((l: any) => !l.email).length;
-    const eligibleLeads = totalLeads - doNotContactCount - noEmailCount;
+    // Email-deliverability buckets — surfaces risky/undeliverable in the UI so
+    // the user can decide before sending. Undeliverable is blocked by default
+    // in the send endpoint; user can override per-address.
+    const validationStatus = (l: any): string | undefined => l?.customFields?.email_validation?.status;
+    const undeliverableLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'undeliverable');
+    const riskyLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'risky');
+    const undeliverableCount = undeliverableLeadsList.length;
+    const riskyCount = riskyLeadsList.length;
+    // Eligibility = has email && not DNC && not undeliverable. Single boolean
+    // filter (not arithmetic subtraction) so overlapping categories don't
+    // produce negative counts.
+    const eligibleLeads = leads.filter((l: any) =>
+      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable',
+    ).length;
+
+    // Return small samples (first 50) of email lists so the UI modals can show
+    // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
+    const undeliverableEmails = undeliverableLeadsList.slice(0, 50).map((l: any) => l.email);
+    const riskyEmails = riskyLeadsList.slice(0, 50).map((l: any) => l.email);
 
     return res.json({
       totalLeads,
@@ -4157,6 +4201,10 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       unsubscribedCount: doNotContactCount,
       doNotContactCount,
       noEmailCount,
+      undeliverableCount,
+      riskyCount,
+      undeliverableEmails,
+      riskyEmails,
     });
   } catch (error) {
     console.error('Error previewing group email:', error);
@@ -4254,7 +4302,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml } = req.body;
+    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -4283,6 +4331,26 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+
+    // Filter undeliverable emails. Two override modes:
+    //   - includeUndeliverableEmails: string[]  → per-address whitelist (Proposal B)
+    //   - includeUndeliverable: true            → blanket override (legacy/Emma)
+    // Default: block all undeliverable.
+    let skippedUndeliverable = 0;
+    if (!includeUndeliverable) {
+      const whitelist = new Set<string>(
+        Array.isArray(includeUndeliverableEmails)
+          ? includeUndeliverableEmails.map((e: string) => String(e).trim().toLowerCase()).filter(Boolean)
+          : [],
+      );
+      const beforeCount = eligibleLeads.length;
+      eligibleLeads = eligibleLeads.filter((l: any) => {
+        const status = l?.customFields?.email_validation?.status;
+        if (status !== 'undeliverable') return true;
+        return whitelist.has(String(l.email ?? '').trim().toLowerCase());
+      });
+      skippedUndeliverable = beforeCount - eligibleLeads.length;
+    }
 
     // Filter out leads missing required variable values
     const allTemplate = (subject || '') + (htmlContent || '');
@@ -4350,6 +4418,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
       skippedMissingVars,
+      skippedUndeliverable,
     });
   } catch (error) {
     console.error('Error sending group email:', error);
@@ -4920,6 +4989,237 @@ router.post('/lists/:listId/enrichment-jobs/:jobId/revert', async (req: Request,
     console.error('[CRM] enrichment revert error:', error);
     const status = error.message?.includes('No snapshot data') ? 400 : 500;
     return res.status(status).json({ message: error.message || 'Failed to revert enrichment job' });
+  }
+});
+
+// ── Per-field enrichment actions (item #10) ─────────────────────────────────
+//
+// verify  → mark a field as user-verified (sets verifiedBy on enrichmentMetadata)
+// reject  → null out the field's value (records rejectedReason on metadata)
+// refresh → re-run enrichment for a single field (force-refresh that field's cache group)
+
+router.post('/lists/:listId/leads/:leadId/fields/:field/verify', async (req: Request, res: Response) => {
+  const { listId, leadId, field } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  const userEmail = (req as AuthenticatedRequest).user?.email;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  let validatedField: string;
+  try {
+    validatedField = validateFieldName(field, 'field');
+  } catch (err: any) {
+    if (err instanceof EnrichmentInputError) {
+      return res.status(400).json({ message: err.message });
+    }
+    throw err;
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const lead: any = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const now = new Date().toISOString();
+    const priorMeta = (lead.enrichmentMetadata || {})[validatedField] || {};
+    // Strip a prior reject stamp so flipping wrong → verify leaves a clean
+    // current state on disk. Reporting queries that ask "is this field
+    // currently rejected?" can then check rejectedAt directly without also
+    // having to compare timestamps against verifiedBy.at.
+    const { rejectedReason: _r, rejectedAt: _ra, ...restPrior } = priorMeta as any;
+    const updatedMeta = {
+      ...lead.enrichmentMetadata,
+      [validatedField]: { ...restPrior, verifiedBy: { userId, at: now } },
+    };
+    await crmDb.updateLead(listId, leadId, { enrichmentMetadata: updatedMeta });
+
+    return res.json({ success: true, verifiedBy: { userId, email: userEmail, at: now } });
+  } catch (error: any) {
+    console.error('[CRM] verify field error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to verify field' });
+  }
+});
+
+router.post('/lists/:listId/leads/:leadId/fields/:field/reject', async (req: Request, res: Response) => {
+  const { listId, leadId, field } = req.params;
+  const reason: string | undefined = (req.body || {}).reason;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  let validatedField: string;
+  try {
+    validatedField = validateFieldName(field, 'field');
+  } catch (err: any) {
+    if (err instanceof EnrichmentInputError) {
+      return res.status(400).json({ message: err.message });
+    }
+    throw err;
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const lead: any = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const now = new Date().toISOString();
+
+    // Mark the field as rejected in metadata but preserve the value itself, so
+    // the data remains visible in the UI and we can still report on it later.
+    // Strip a prior verifiedBy stamp so flipping verify → wrong leaves a clean
+    // current state on disk (mirror of the verify endpoint's stamp cleanup).
+    const priorMeta = (lead.enrichmentMetadata || {})[validatedField] || {};
+    const { verifiedBy: _v, ...restPrior } = priorMeta as any;
+    const updates: any = {
+      enrichmentMetadata: {
+        ...lead.enrichmentMetadata,
+        [validatedField]: { ...restPrior, rejectedReason: reason || 'user-rejected', rejectedAt: now },
+      },
+    };
+    await crmDb.updateLead(listId, leadId, updates);
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    console.error('[CRM] reject field error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to reject field' });
+  }
+});
+
+router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Request, res: Response) => {
+  const { listId, leadId, field } = req.params;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  let validatedField: string;
+  try {
+    validatedField = validateFieldName(field, 'field');
+  } catch (err: any) {
+    if (err instanceof EnrichmentInputError) {
+      return res.status(400).json({ message: err.message });
+    }
+    throw err;
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list as any))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const lead: any = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    const result = await service.execute({
+      listId,
+      userId,
+      instruction: (list as any).enrichmentInstruction || `Re-enrich field ${validatedField} for {{firstName}} {{lastName}} at {{company}}`,
+      outputFields: [validatedField],
+      sources: ['web_search', 'linkedin'],
+      leadIds: [leadId],
+      forceOverwrite: true,
+      forceRefreshCache: true,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error: any) {
+    console.error('[CRM] refresh field error:', error);
+    return res.status(500).json({ message: error.message || 'Failed to refresh field' });
+  }
+});
+
+// ── TEMPORARY DEBUG: raw SERP probe ──────────────────────────────────────────
+// POST /api/crm/debug/serp { query: string, n?: number }
+// Returns the raw Google CSE results so we can iterate on specialist queries
+// without redeploying. Remove once enrichment specialists stabilize.
+router.post('/debug/serp', async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const query = (req.body?.query || '').toString().trim();
+  const n = Math.max(1, Math.min(10, Number(req.body?.n) || 5));
+  if (!query) return res.status(400).json({ message: 'query required' });
+
+  const { agentModeService } = await import('../services/agentModeService');
+  const result = await agentModeService.searchWeb(query, n);
+  return res.json({
+    query,
+    success: result?.success,
+    count: Array.isArray(result?.results) ? result.results.length : 0,
+    results: result?.results || [],
+  });
+});
+
+// ── TEMPORARY DEBUG: EnrichmentRawCache table inspection ─────────────────────
+// Remove this endpoint once cache behaviour is confirmed working in the test env.
+router.get('/debug/enrichment-raw-cache', async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  const AWS = require('aws-sdk');
+  const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  const tableName = `${TABLE_PREFIX}AW-EnrichmentRawCache`;
+  const region = process.env.AWS_REGION || 'us-west-2';
+  const dynamo = new AWS.DynamoDB.DocumentClient({ region });
+  const ddl = new AWS.DynamoDB({ region });
+
+  // Try scanning first
+  try {
+    const result = await dynamo.scan({
+      TableName: tableName,
+      Limit: 10,
+      ProjectionExpression: 'canonicalId, fieldGroup, canonicalKey, entityKey, entityType, queryUsed, resultCount, schemaVersion, fetchedAt, expiresAt',
+    }).promise();
+    return res.json({
+      tableName, region,
+      count: result.Count,
+      scannedCount: result.ScannedCount,
+      hasMore: !!result.LastEvaluatedKey,
+      items: result.Items,
+    });
+  } catch (scanErr: any) {
+    if (scanErr.code !== 'ResourceNotFoundException') {
+      return res.status(500).json({ error: scanErr.code, message: scanErr.message });
+    }
+  }
+
+  // Table missing — attempt to create it
+  try {
+    await ddl.createTable({
+      TableName: tableName,
+      AttributeDefinitions: [
+        { AttributeName: 'canonicalId', AttributeType: 'S' },
+        { AttributeName: 'fieldGroup',  AttributeType: 'S' },
+        { AttributeName: 'entityKey',   AttributeType: 'S' },
+      ],
+      KeySchema: [
+        { AttributeName: 'canonicalId', KeyType: 'HASH' },
+        { AttributeName: 'fieldGroup',  KeyType: 'RANGE' },
+      ],
+      GlobalSecondaryIndexes: [{
+        IndexName: 'entityKey-fieldGroup-index',
+        KeySchema: [
+          { AttributeName: 'entityKey',  KeyType: 'HASH' },
+          { AttributeName: 'fieldGroup', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      }],
+      BillingMode: 'PAY_PER_REQUEST',
+    }).promise();
+
+    // Wait for table to become ACTIVE
+    await ddl.waitFor('tableExists', { TableName: tableName }).promise();
+    return res.json({ tableName, region, created: true, message: 'Table created successfully' });
+  } catch (createErr: any) {
+    if (createErr.code === 'ResourceInUseException') {
+      return res.json({ tableName, region, created: false, message: 'Table already exists (race condition)' });
+    }
+    return res.status(500).json({ createError: createErr.code, message: createErr.message });
   }
 });
 

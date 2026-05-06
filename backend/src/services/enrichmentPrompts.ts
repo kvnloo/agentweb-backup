@@ -10,7 +10,29 @@ CRITICAL RULE: Only return values that are explicitly stated in the provided Lea
 Your task: ${options.resolvedInstruction}
 
 Return ONLY a JSON object with these exact keys: ${options.outputFieldsJson}
-Each value must be a string.
+Each value must be an object with this exact shape:
+  {
+    "value": <extracted string, or null if not found>,
+    "sourceQuote": <verbatim excerpt (≤30 words) from the sources that contains the value, or null when value is null>,
+    "sourceUrl": <URL of the source containing the quote, or null>,
+    "confidence": "high" | "medium" | "low"
+  }
+
+CITATION REQUIREMENT (mandatory): The sourceQuote MUST appear verbatim as a substring of the provided source text. Copy-paste an exact span from the data. Any value whose sourceQuote does not appear in the source will be automatically rejected. If you cannot find a verbatim quote that supports a value, set both "value" and "sourceQuote" to null for that field.
+
+QUOTE RULES FOR BOOLEAN / CATEGORICAL / NUMERIC FIELDS:
+- The quote does NOT need to literally contain the value you extracted. It needs to be a span of source text that, taken at face value, SUPPORTS the answer.
+- Boolean field example — "is_vc_firm": true. Valid quote: "Sequoia Capital is a venture capital firm that invests in early-stage startups." (the words "venture capital firm" support value=true; you don't need to find the literal "true" anywhere).
+- Boolean field example — "is_vc_firm": false. Valid quote: "Acme builds B2B SaaS analytics for finance teams." (clearly an operating company, not a VC).
+- Categorical field example — "funding_round": "Series B". Valid quote: "raised a $40M Series B led by Accel".
+- Numeric field example — "total_funding_usd": "50000000". Valid quote: "has raised $50M in total funding to date".
+- Categorical / enum value — pick the closest fit from the allowed values when the source uses synonyms (e.g. source says "growth round" and the enum has "Series C" / "Series D+" — pick "Series D+" if amount or context suggests later-stage; otherwise return null).
+- Pre-IPO / Public / Acquired statuses are valid funding_round answers when the source says the company is "public", "trades on NYSE/NASDAQ", "was acquired by", etc.
+
+PREFER A VALUE OVER NULL when you can find any supporting span. Only return null when the source has nothing relevant. Confidence levels:
+- "high": source explicitly states the value.
+- "medium": source supports the value indirectly (e.g. company description implies industry).
+- "low": tenuous support — return only if you'd be willing to defend the inference.
 
 JSON formatting rules (mandatory):
 - Output must be valid JSON parsable by JSON.parse
@@ -27,8 +49,154 @@ export function buildDataExtractionRetryPrompt(userPrompt: string, outputFieldsM
 CRITICAL RETRY INSTRUCTIONS:
 Return exactly one JSON object.
 No markdown, no backticks, no comments, no trailing commas.
+Each field's value MUST be an object with shape: {"value":..., "sourceQuote":..., "sourceUrl":..., "confidence":"high"|"medium"|"low"}.
 Valid example:
 {${outputFieldsMap}}`;
+}
+
+/**
+ * Item #6 — Critic prompt. Runs after extraction + citation verification as a
+ * cheap second-opinion pass. Each claim is judged against the source. Verdicts:
+ *  - supported: source contains the value as stated
+ *  - partially-supported: source mentions the topic but value is approximate or partial
+ *  - unsupported: source does not contain the value
+ *  - contradicted: source contains a different / opposing value
+ */
+export function buildCriticSystemPrompt(): string {
+  return `You are a fact-checking critic for B2B sales data enrichment.
+
+For each claim provided, decide whether the source text supports the claim.
+
+Verdicts:
+  - "supported": source explicitly contains the value or an exact paraphrase
+  - "partially-supported": source mentions the topic but the value is approximate, outdated, or partial
+  - "unsupported": source does not contain the value at all
+  - "contradicted": source contains a different / conflicting value
+
+Return ONLY a JSON object where each key is a field name and the value is:
+  { "verdict": "supported" | "partially-supported" | "unsupported" | "contradicted",
+    "reason": "<≤20-word reason>" }
+
+Do not invent any verdicts. If unsure, prefer "partially-supported" over "supported".
+No markdown, no backticks.`;
+}
+
+export function buildCriticUserPrompt(
+  claims: { field: string; value: string; sourceQuote?: string }[],
+  source: string
+): string {
+  const claimsText = claims.map(c =>
+    `- field: ${c.field}\n  value: ${JSON.stringify(c.value)}${c.sourceQuote ? `\n  sourceQuote: ${JSON.stringify(c.sourceQuote)}` : ''}`
+  ).join('\n');
+  // Cap source length so critic call stays cheap
+  const cappedSource = source.length > 8000 ? source.slice(0, 8000) + '\n…[truncated]' : source;
+  return `Claims to verify:
+${claimsText}
+
+Source text:
+${cappedSource}`;
+}
+
+/**
+ * Field-alias mapping prompt — maps user-named fields to canonical FIELD_GROUPS
+ * field names so the enrichment pipeline can group/cache them correctly.
+ *
+ * Result is persisted on the list so this LLM call only fires once per
+ * (list, novel-field-name) pair.
+ */
+export function buildFieldMappingSystemPrompt(canonicalFieldDescriptions: string): string {
+  return `You map user-named CRM custom fields to a canonical schema.
+
+Canonical fields:
+${canonicalFieldDescriptions}
+
+For each user field you receive, return its closest canonical equivalent, or null if no canonical field is a reasonable match. Do NOT invent canonical names — only pick from the list above.
+
+Examples:
+  "funding_round"      → "funding_stage"
+  "company_overview"   → "company_description"
+  "team_size"          → "employee_count"
+  "is_decision_maker"  → null (no canonical match)
+  "twitter"            → "twitter_handle"
+  "company_url"        → "website"
+
+Return ONLY a JSON object: { "<userField>": "<canonicalField>" | null }
+No markdown, no backticks, no extra text.`;
+}
+
+export function buildFieldMappingUserPrompt(userFields: string[]): string {
+  return `Map these user-named fields to canonical equivalents:
+${JSON.stringify(userFields)}
+
+Return JSON: { "${userFields[0] ?? '<field>'}": "<canonical-or-null>", ... }`;
+}
+
+/**
+ * Cluster ungrouped fields into ad-hoc groups, each with one search template.
+ *
+ * Why: the user has provided custom fields that don't map to any canonical
+ * FIELD_GROUP. We want to enrich them efficiently by sharing search calls
+ * across semantically-related fields. The LLM groups fields by what data
+ * source / search query would find them, and produces ONE template per group.
+ */
+export function buildClusterFieldsSystemPrompt(): string {
+  return `You group user-defined CRM custom fields into "search clusters" — sets of fields that can be answered by the same web search.
+
+For each cluster, produce:
+  - "fields": array of field names that belong together
+  - "searchTemplate": ONE Google search query covering all fields in the cluster, using {{placeholder}} tokens
+
+Available {{placeholder}} tokens (substituted at runtime per lead):
+  - {{firstName}}, {{lastName}}     — person's name
+  - {{company}}                      — company name
+  - {{email}}, {{emailDomain}}       — work email and domain
+  - {{title}}                        — job title
+
+Guidelines:
+1. Group fields that share a data source. e.g. "is_decision_maker" + "budget_owner" + "approval_authority" all relate to role/responsibility — one cluster, one query.
+2. Don't put unrelated fields together. e.g. don't cluster "tech_stack" with "speaker_topics" — they need different searches.
+3. Each cluster's searchTemplate should be 4-8 words after substitution. Use site: filters when relevant (e.g. "site:crunchbase.com" for funding, "site:linkedin.com/in/" for person info).
+4. Prefer {{emailDomain}} over {{company}} for company-level searches (more unique). Use {{firstName}} {{lastName}} {{company}} for person-level searches.
+5. A cluster of one field is fine when the field is unique.
+
+Return JSON: an array of clusters. NO markdown, NO backticks.
+
+Example input:
+  [
+    { "name": "is_decision_maker", "description": "whether person can approve software purchases" },
+    { "name": "budget_owner", "description": "controls department budget" },
+    { "name": "speaker_topics", "description": "topics they speak about publicly" }
+  ]
+
+Example output:
+[
+  {
+    "fields": ["is_decision_maker", "budget_owner"],
+    "searchTemplate": "{{firstName}} {{lastName}} {{company}} role responsibilities authority"
+  },
+  {
+    "fields": ["speaker_topics"],
+    "searchTemplate": "{{firstName}} {{lastName}} {{emailDomain}} speaker conference"
+  }
+]`;
+}
+
+export function buildClusterFieldsUserPrompt(
+  fields: Array<{ name: string; description?: string }>,
+  exampleLead?: { company?: string; emailDomain?: string }
+): string {
+  const fieldsJson = JSON.stringify(
+    fields.map(f => ({ name: f.name, description: f.description || '' })),
+    null, 2
+  );
+  const ctx = exampleLead
+    ? `\nExample lead context (for grounding the queries):\n  company: ${exampleLead.company || '(unknown)'}\n  emailDomain: ${exampleLead.emailDomain || '(unknown)'}\n`
+    : '';
+  return `Cluster these fields by what data source / search would find them, then produce ONE search template per cluster:
+
+${fieldsJson}
+${ctx}
+Return ONLY a JSON array of { "fields": [...], "searchTemplate": "..." } objects.`;
 }
 
 export function buildSuggestEnrichmentSystemPrompt(): string {
@@ -64,16 +232,12 @@ Given a user's enrichment goal or instruction, produce:
    - Do NOT suggest fields already populated on the leads — skip those. EXCEPTION: fields listed as "commonly EMPTY" below are valid targets and MUST be included. Special case: always include "linkedin_url" when the goal mentions personal LinkedIn URL (it is almost always empty even though "linkedin" is a standard field).
    - CONSISTENCY RULE: if you set a linkedinSearchTemplate, you MUST include at least one output field with source ["linkedin"] — typically "linkedin_url". Never generate a linkedinSearchTemplate without a matching linkedin output field.
 
-3. A webSearchTemplate string — ONE search query template used for ALL web_search fields combined. Uses {{placeholder}} tokens: {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{emailDomain}}, {{title}}.
-   - Prefer {{emailDomain}} over {{company}} as the company identifier — domains are unique and unambiguous; company names like "Apple" or "CWS" match thousands of unrelated results
-   - CRITICAL: Do NOT include field names or data types as search keywords. Words like "funding stage", "employee count", "linkedin", "business model", "industry" are metadata — they pollute the query and cause irrelevant results
-   - Add only 1-2 topic keywords that help Google find the right page category (e.g. "company", "startup", "funding", "investors")
-   - Keep it 3-5 words total after placeholder substitution
-   - Examples:
-     - Company research (default): "{{emailDomain}} company overview"
-     - Funding focused: "{{emailDomain}} funding investors"
-     - Person lookup: "{{firstName}} {{lastName}} {{emailDomain}}"
-     - When no email domain available: "{{company}} company overview"
+3. A fieldDescriptions object — short 1-line description for each web_search outputField that is NOT a well-known canonical field. Keys are field names, values are 1-line descriptions of what to find. This guides the per-field web search query at runtime.
+   - Canonical fields (industry, employee_count, founded_year, hq_location, company_description, funding_stage, total_funding, investors, last_funding_date, valuation, tech_stack, twitter_handle, country, time_zone, recent_news, etc.) auto-cluster from the field name alone — DO NOT include descriptions for these.
+   - DO include descriptions for niche or domain-specific fields (e.g. "product_certifications": "ISO/SOC2/HIPAA certifications the company holds", "ideal_customer_profile": "type of customer the company sells to").
+   - Keep descriptions under 20 words. They become part of a search query at runtime.
+   - Omit fields whose source is "linkedin" or "existing_data" (only web_search fields need descriptions).
+   - The fieldDescriptions object can be empty {} if all fields are canonical.
 
 4. A linkedinSearchTemplate string — ONE LinkedIn search query for person-level LinkedIn lookup (only set if any field needs LinkedIn). Format: "{{firstName}} {{lastName}} {{company}}"
    - Omit (null) if no field requires LinkedIn
@@ -92,7 +256,10 @@ Return ONLY valid JSON:
 {
   "instruction": "...",
   "outputFields": ["field1", "field2"],
-  "webSearchTemplate": "{{company}} company overview employees funding",
+  "fieldDescriptions": {
+    "product_certifications": "ISO/SOC2/HIPAA certifications the company holds",
+    "ideal_customer_profile": "type of customer the company sells to"
+  },
   "linkedinSearchTemplate": "{{firstName}} {{lastName}} {{company}}",
   "sourcesPerField": {
     "company_profile": ["web_search"],

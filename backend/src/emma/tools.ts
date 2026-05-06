@@ -12,6 +12,9 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 // Register browser cookie persistence tools
 import './browserCookieTools';
 
+// Register email lookup / find tool (provider-agnostic)
+import './emailLookupTool';
+
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
@@ -179,7 +182,7 @@ emmaToolRegistry.register({
     description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
 
 Actions:
-- search-people: Search LinkedIn for people by keywords, title, company. Pass keywords for broad search, or use title/company for targeted search. Alternatively pass search_url with a LinkedIn search URL copied from the browser. Returns paginated results with provider_id for each person.
+- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person.
 - get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
@@ -191,6 +194,7 @@ Actions:
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
+- search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
@@ -200,7 +204,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -233,7 +237,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         keywords: {
           type: 'string',
-          description: 'Free text search keywords for search-people action.'
+          description: 'Optional free-text search keywords for search-people. Pass when you want a broad match across name/headline/bio. Omit when using structured filters alone — the backend will synthesize a keyword from your most-specific filter (title > company > location > industry > school) so the Unipile classic-search keyword requirement is satisfied transparently.'
         },
         search_url: {
           type: 'string',
@@ -245,11 +249,44 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         company: {
           type: 'string',
-          description: 'Company name filter for search-people.'
+          description: 'Company name filter for search-people — free text, auto-resolved to a LinkedIn company id if no company_id is provided.'
         },
         company_id: {
           type: 'string',
-          description: 'LinkedIn company identifier/slug for get-company action.'
+          description: 'LinkedIn company identifier/slug. Used for get-company. Optional pre-resolved LinkedIn company entity ID for search-people — when provided, skips the resolver.'
+        },
+        location: {
+          type: 'string',
+          description: 'Location filter for search-people — free text, auto-resolved if no location_id is provided.'
+        },
+        location_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn location entity ID for search-people — when provided, skips the resolver.'
+        },
+        industry: {
+          type: 'string',
+          description: 'Industry filter for search-people — free text, auto-resolved if no industry_id is provided.'
+        },
+        industry_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn industry entity ID for search-people — when provided, skips the resolver.'
+        },
+        school: {
+          type: 'string',
+          description: 'School filter for search-people — free text, auto-resolved if no school_id is provided.'
+        },
+        school_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn school entity ID for search-people — when provided, skips the resolver.'
+        },
+        type: {
+          type: 'string',
+          enum: ['COMPANY', 'LOCATION', 'INDUSTRY', 'SCHOOL', 'SERVICE'],
+          description: 'Entity type to resolve for search-parameters action.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Max number of candidates to return for search-parameters. Optional; the resolver picks a sensible default.'
         },
         invitation_id: {
           type: 'string',
@@ -5297,8 +5334,10 @@ After showing the preview, ask the user to confirm before calling enrich_leads_e
 Field and source guidance:
 - output_fields: one snake_case field per distinct data point. Numeric values (dates, counts, amounts), categorical values (industry, funding stage), URLs (linkedin_url), and prose summaries (company_profile) each get their own field. When a prose request names sub-items ("profile describing industry, employee count, products"), create the prose field PLUS a separate field for each named item.
 - sources_per_field: map each field to its source. Use "web_search" for company info, funding, tech stack, company LinkedIn URL. Use "linkedin" ONLY for the lead's personal LinkedIn profile (field name: linkedin_url). Use "existing_data" for fields derivable from existing lead data.
-- web_search_template: ONE search query covering all web_search fields. Uses {{placeholder}} tokens ({{company}}, {{firstName}}, {{lastName}}, {{title}}). Example: "{{company}} company overview industry employees funding".
-- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.`,
+- field_descriptions: short natural-language description of each output field (what to find / where it lives). Required for any field that isn't a well-known canonical field — these descriptions guide the per-field web search. Common fields like industry, funding_stage, employee_count are auto-grouped and don't need a description; uncommon or domain-specific fields do (e.g. {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds"}).
+- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.
+
+Search queries are now built automatically per field group — do not pass a single global query template.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5328,9 +5367,10 @@ Field and source guidance:
           },
           description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search". Falls back to job-level sources when absent for a field.'
         },
-        web_search_template: {
-          type: 'string',
-          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}. Example: "{{company}} company overview industry employees funding". Keep concise (4-8 words after substitution).'
+        field_descriptions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for fields that are not well-known canonical fields. Used by the clustering service to build per-field web searches. Example: {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds", "ideal_customer_profile": "type of customer the company sells to"}'
         },
         linkedin_search_template: {
           type: 'string',
@@ -5352,6 +5392,10 @@ Field and source guidance:
         force_overwrite: {
           type: 'boolean',
           description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        },
+        force_refresh_cache: {
+          type: 'boolean',
+          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
         }
       },
       required: ['list_id', 'instruction', 'output_fields', 'sources']
@@ -5370,10 +5414,11 @@ Field and source guidance:
       outputFields: args.output_fields,
       sources: args.sources,
       sourcesPerField: args.sources_per_field,
-      webSearchTemplate: args.web_search_template,
       linkedinSearchTemplate: args.linkedin_search_template,
+      fieldDescriptions: args.field_descriptions,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
+      forceRefreshCache: args.force_refresh_cache,
     });
   }
 });
@@ -5388,7 +5433,7 @@ Progress updates are sent via Socket.IO in real-time. This call blocks until the
 
 Call enrich_leads_preview first to show the user what will happen before executing.
 
-Pass the same output_fields, sources_per_field, web_search_template, and linkedin_search_template used in the preview call.`,
+Pass the same output_fields, sources_per_field, field_descriptions, and linkedin_search_template used in the preview call.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5418,9 +5463,10 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
           },
           description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search".'
         },
-        web_search_template: {
-          type: 'string',
-          description: 'ONE search query template covering all web_search fields. Uses {{placeholder}} tokens: {{company}}, {{firstName}}, {{lastName}}, {{email}}, {{emailDomain}}, {{title}}.'
+        field_descriptions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for non-canonical fields. Used by the clustering service to build per-field web searches.'
         },
         linkedin_search_template: {
           type: 'string',
@@ -5442,6 +5488,10 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
         force_overwrite: {
           type: 'boolean',
           description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        },
+        force_refresh_cache: {
+          type: 'boolean',
+          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
         }
       },
       required: ['list_id', 'instruction', 'output_fields', 'sources']
@@ -5460,10 +5510,11 @@ Pass the same output_fields, sources_per_field, web_search_template, and linkedi
       outputFields: args.output_fields,
       sources: args.sources,
       sourcesPerField: args.sources_per_field,
-      webSearchTemplate: args.web_search_template,
       linkedinSearchTemplate: args.linkedin_search_template,
+      fieldDescriptions: args.field_descriptions,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
+      forceRefreshCache: args.force_refresh_cache,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
   }
 });
@@ -5531,6 +5582,12 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
         return `- ${p.field_name}${type}: ${p.prompt}`;
       })
       .join('\n');
+    // Pass per-field prompts to the cluster service as field descriptions so
+    // any ungrouped fields get a search query tuned to what we're looking for.
+    const fieldDescriptions: Record<string, string> = {};
+    for (const p of prompts) {
+      if (p.field_name && p.prompt) fieldDescriptions[p.field_name] = p.prompt;
+    }
     const sources = Array.isArray(args.sources) && args.sources.length > 0
       ? args.sources
       : ['web_search', 'linkedin'];
@@ -5545,6 +5602,7 @@ Pass one entry in custom_field_prompts per field you want populated. Each prompt
       outputFields,
       sources,
       leadIds: [args.lead_id],
+      fieldDescriptions,
       forceOverwrite: args.force_overwrite !== false,
     }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
 
@@ -6677,9 +6735,15 @@ emmaToolRegistry.register({
 Uses the user's connected LinkedIn account if available, otherwise falls back to platform-wide outreach accounts — so this works even without a personal LinkedIn connection.
 
 Use this when the user wants to:
-- Find leads matching a job title, company, or keyword
+- Find leads matching a job title, company, location, industry, school, or keyword
 - Populate a CRM list with discovered prospects
 - Discover new contacts to reach out to
+
+Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend (via the search-parameter resolver), giving precise structured filtering. Pass keywords ONLY for free-text broad search — when you have structured filters, the backend handles Unipile's keyword requirement transparently.
+
+For more than ~30 results from a single query, use the cursor returned in the response to paginate through subsequent pages.
+
+When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
 
 After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
     inputSchema: {
@@ -6691,19 +6755,51 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
         },
         keywords: {
           type: 'string',
-          description: 'Free-text search keywords (e.g. "software engineer San Francisco").'
+          description: 'Optional free-text search keywords. Omit when using structured filters — the backend will synthesize a keyword from your most-specific filter (title > company > location > industry > school) so the Unipile classic-search keyword requirement is satisfied transparently.'
         },
         title: {
           type: 'string',
-          description: 'Job title filter (e.g. "CTO", "VP Sales"). Combined with keywords/company for targeted search.'
+          description: 'Job title filter (e.g. "CTO", "VP Sales").'
         },
         company: {
           type: 'string',
-          description: 'Company name filter. Combined with title/keywords for targeted search.'
+          description: 'Company name filter — free text, auto-resolved to a LinkedIn company id if no company_id is provided.'
+        },
+        company_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn company entity ID — when provided, skips the resolver.'
+        },
+        location: {
+          type: 'string',
+          description: 'Location filter — free text (e.g. "San Francisco Bay Area"), auto-resolved to a LinkedIn location entity id if no location_id is provided.'
+        },
+        location_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn location entity ID — when provided, skips the resolver.'
+        },
+        industry: {
+          type: 'string',
+          description: 'Industry filter — free text, auto-resolved to a LinkedIn industry entity id if no industry_id is provided.'
+        },
+        industry_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn industry entity ID — when provided, skips the resolver.'
+        },
+        school: {
+          type: 'string',
+          description: 'School filter — free text, auto-resolved to a LinkedIn school entity id if no school_id is provided.'
+        },
+        school_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn school entity ID — when provided, skips the resolver.'
         },
         search_url: {
           type: 'string',
-          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company.'
+          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company/etc.'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor for fetching the next page of results from a previous import_leads_from_search call. Use the cursor value returned in the previous response to fetch the next ~30 results from the same query.'
         },
         limit: {
           type: 'number',
@@ -6722,6 +6818,14 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
       search_url: args.search_url,
       title: args.title,
       company: args.company,
+      company_id: args.company_id,
+      location: args.location,
+      location_id: args.location_id,
+      industry: args.industry,
+      industry_id: args.industry_id,
+      school: args.school,
+      school_id: args.school_id,
+      cursor: args.cursor,
       limit,
     });
   }

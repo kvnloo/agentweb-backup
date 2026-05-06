@@ -175,6 +175,10 @@ describe('CRM Group Email Endpoints', () => {
         unsubscribedCount: 1,
         doNotContactCount: 1,
         noEmailCount: 1,
+        undeliverableCount: 0,
+        riskyCount: 0,
+        undeliverableEmails: [],
+        riskyEmails: [],
       });
     });
 
@@ -202,6 +206,10 @@ describe('CRM Group Email Endpoints', () => {
         unsubscribedCount: 0,
         doNotContactCount: 0,
         noEmailCount: 0,
+        undeliverableCount: 0,
+        riskyCount: 0,
+        undeliverableEmails: [],
+        riskyEmails: [],
       });
     });
   });

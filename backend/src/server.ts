@@ -354,6 +354,55 @@ createTestAccount().then(async () => {
     console.warn('Stripe credentials not available — billing features will be disabled:', (error as Error).message);
   }
 
+  // Initialize enrich.so service (must run BEFORE specialist registration so the
+  // enrich.so specialists can resolve via getEnrichSoService()).
+  try {
+    const { initEnrichSoServiceFromEnv } = await import('./services/enrichSoServiceFactory');
+    await initEnrichSoServiceFromEnv();
+    console.log('enrich.so service initialized');
+  } catch (err) {
+    console.warn('enrich.so service not initialized — email finder/reverse lookup specialists will fall back to LLM:', (err as Error).message);
+  }
+
+  // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of
+  // Unipile /users/{id} backed by AW-EnrichmentRawCache, cacheType='unipile').
+  try {
+    const { initUnipileProfileService } = await import('./services/unipileProfileServiceFactory');
+    initUnipileProfileService();
+    console.log('Unipile profile cache initialized');
+  } catch (err) {
+    console.warn('Unipile profile cache not initialized — LinkedIn lookups will hit Unipile live:', (err as Error).message);
+  }
+
+  // Initialize Unipile LinkedIn-company cache wrapper (cacheType='unipile_company').
+  try {
+    const { initUnipileCompanyService } = await import('./services/unipileCompanyServiceFactory');
+    initUnipileCompanyService();
+    console.log('Unipile company cache initialized');
+  } catch (err) {
+    console.warn('Unipile company cache not initialized — LinkedIn company lookups will hit Unipile live:', (err as Error).message);
+  }
+
+  // Initialize Unipile LinkedIn search-parameter resolver (cacheType='unipile_search_param').
+  // Resolves free-text company/location/industry/school → LinkedIn entity IDs
+  // for use in classic + sales-navigator search filters.
+  try {
+    const { initUnipileSearchParamServiceFromEnv } = await import('./services/unipileSearchParamServiceFactory');
+    initUnipileSearchParamServiceFromEnv();
+    console.log('Unipile search-parameter resolver initialized');
+  } catch (err) {
+    console.warn('Unipile search-parameter resolver not initialized — searches will not auto-resolve company IDs:', (err as Error).message);
+  }
+
+  // Register CRM enrichment specialists (Crunchbase, enrich.so, et al.)
+  try {
+    const { registerAllEnrichmentSpecialists } = await import('./services/specialists');
+    registerAllEnrichmentSpecialists();
+    console.log('Enrichment specialists registered');
+  } catch (err) {
+    console.warn('Failed to register enrichment specialists:', (err as Error).message);
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);

@@ -52,6 +52,22 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
 }));
 
+jest.mock('../services/enrichmentCacheService', () => ({
+  getRawDataFromCache: jest.fn().mockResolvedValue(null),
+  writeRawDataToCache: jest.fn().mockResolvedValue(undefined),
+  buildWebContextFromCache: jest.fn().mockReturnValue(''),
+  buildLinkedInContextFromCache: jest.fn().mockReturnValue(''),
+  isLinkedInCacheEligible: jest.fn().mockReturnValue(false),
+  splitFieldsByGroup: jest.fn().mockImplementation((fields: string[]) => ({ byGroup: new Map(), ungrouped: fields })),
+}));
+
+// Default cluster-service stub: reject so enrichLead's catch path falls through
+// to the legacy gatherWebContext (no template → buildSearchQuery uses company
+// name). Tests of cluster behavior live in enrichmentClusterService.test.ts.
+jest.mock('../services/enrichmentClusterService', () => ({
+  getOrCreateClustersForFields: jest.fn().mockRejectedValue(new Error('cluster service stubbed off in this test')),
+}));
+
 jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
@@ -79,7 +95,10 @@ const mockSettingsService = settingsService as jest.Mocked<typeof settingsServic
 const mockIo = io as any;
 
 // Helper: mock a successful Gemini completion response
-function geminiResponse(content: Record<string, string>) {
+// Accepts either legacy flat-string format or new rich-citation format:
+//   legacy:  { field: "value" }
+//   citation: { field: { value: "...", sourceQuote: "...", sourceUrl: "...", confidence: "high" } }
+function geminiResponse(content: Record<string, any>) {
   return {
     choices: [{ message: { content: JSON.stringify(content) } }],
   };
@@ -529,11 +548,13 @@ describe('CrmEnrichmentService', () => {
       expect(result.processedCount).toBe(1);
       expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
       expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalled();
-      // Both data sources fed into the same Gemini call
-      const geminiCall = mockGeminiCreate.mock.calls[0][0];
-      const userMsg = geminiCall.messages.find((m: any) => m.role === 'user')?.content || '';
-      expect(userMsg).toContain('Web search');
-      expect(userMsg).toContain('LinkedIn');
+      // Both data sources fed into Gemini (per-group dispatch — web and linkedin
+      // go to separate parallel calls; assert both contexts surface across calls).
+      const allUserMsgs = mockGeminiCreate.mock.calls
+        .map(call => (call[0].messages.find((m: any) => m.role === 'user')?.content) || '')
+        .join('\n---\n');
+      expect(allUserMsgs).toContain('Web search');
+      expect(allUserMsgs).toContain('LinkedIn');
     });
 
     it('should re-process already-enriched leads when forceOverwrite=true', async () => {
@@ -873,6 +894,31 @@ describe('CrmEnrichmentService', () => {
 
   // ─── PERSONAL EMAIL DOMAIN GUARD ─────────────────────────────────────────
 
+  describe('isInstitutionalDomain', () => {
+    it('identifies .edu/.gov/.mil', () => {
+      expect(CrmEnrichmentService.isInstitutionalDomain('stanford.edu')).toBe(true);
+      expect(CrmEnrichmentService.isInstitutionalDomain('whitehouse.gov')).toBe(true);
+      expect(CrmEnrichmentService.isInstitutionalDomain('army.mil')).toBe(true);
+    });
+
+    it('identifies country-coded academic and gov TLDs', () => {
+      expect(CrmEnrichmentService.isInstitutionalDomain('ox.ac.uk')).toBe(true);
+      expect(CrmEnrichmentService.isInstitutionalDomain('iitb.ac.in')).toBe(true);
+      expect(CrmEnrichmentService.isInstitutionalDomain('cabinetoffice.gov.uk')).toBe(true);
+      expect(CrmEnrichmentService.isInstitutionalDomain('education.gob.es')).toBe(true);
+    });
+
+    it('does not flag commercial domains', () => {
+      expect(CrmEnrichmentService.isInstitutionalDomain('acme.com')).toBe(false);
+      expect(CrmEnrichmentService.isInstitutionalDomain('startup.io')).toBe(false);
+      expect(CrmEnrichmentService.isInstitutionalDomain('education-startup.com')).toBe(false);
+    });
+
+    it('returns false for empty input', () => {
+      expect(CrmEnrichmentService.isInstitutionalDomain('')).toBe(false);
+    });
+  });
+
   describe('isPersonalEmailDomain', () => {
     it('identifies common personal providers', () => {
       expect(CrmEnrichmentService.isPersonalEmailDomain('user@gmail.com')).toBe(true);
@@ -893,6 +939,17 @@ describe('CrmEnrichmentService', () => {
     it('handles missing or malformed email gracefully', () => {
       expect(CrmEnrichmentService.isPersonalEmailDomain('')).toBe(false);
       expect(CrmEnrichmentService.isPersonalEmailDomain('nodomain')).toBe(false);
+    });
+
+    it('flags institutional domains as personal (skips company-target enrichment)', () => {
+      expect(CrmEnrichmentService.isPersonalEmailDomain('jane@stanford.edu')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('john@whitehouse.gov')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('alex@ox.ac.uk')).toBe(true);
+    });
+
+    it('flags disposable email domains as personal', () => {
+      expect(CrmEnrichmentService.isPersonalEmailDomain('throw@mailinator.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('temp@yopmail.com')).toBe(true);
     });
   });
 
@@ -1537,7 +1594,7 @@ describe('CrmEnrichmentService.suggestEnrichment', () => {
 
     expect(mockCrmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
       'list_s1', {}, undefined, 'test', ['funding_stage'],
-      '{{company}} funding investors', undefined, ['web_search']
+      '{{company}} funding investors', undefined, ['web_search'], undefined
     );
   });
 
@@ -1560,7 +1617,7 @@ describe('CrmEnrichmentService.suggestEnrichment', () => {
     expect(result.sourcesPerField).toEqual(sourcesPerField);
     expect(mockCrmDb.updateSearchQueryTemplates).toHaveBeenCalledWith(
       'list_s2', {}, sourcesPerField, 'test', ['linkedin_url', 'company_info'],
-      '{{company}} overview', '{{firstName}} {{lastName}} {{company}}', ['linkedin', 'web_search']
+      '{{company}} overview', '{{firstName}} {{lastName}} {{company}}', ['linkedin', 'web_search'], undefined
     );
   });
 
@@ -1931,5 +1988,733 @@ describe('CrmEnrichmentService - revertJob', () => {
     expect(updatedCustomFields).not.toHaveProperty('tech_stack');
     // New column added after enrichment must be preserved
     expect(updatedCustomFields['phone']).toBe('123-456');
+  });
+});
+
+// ─── Citation Verification ────────────────────────────────────────────────────
+//
+// LLM extraction now returns a rich format per field:
+//   { value: "...", sourceQuote: "...", sourceUrl: "...", confidence: "high|medium|low" }
+//
+// After parsing, we verify the sourceQuote appears (substring, case-insensitive,
+// whitespace-collapsed) inside the web/linkedin source context. Unsupported claims
+// are dropped to null. Legacy flat-string responses are kept as-is for back-compat.
+
+describe('CrmEnrichmentService - citation verification', () => {
+  let service: CrmEnrichmentService;
+
+  // Each test exercises the full enrichment pipeline (cluster grouping,
+  // multi-LLM extraction, critic pass), which can exceed Jest's 5s default
+  // when CI workers are saturated.
+  jest.setTimeout(20000);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+  });
+
+  function setupSingleLeadJob(searchSnippet: string) {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead1' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', url: 'https://acme.com', snippet: searchSnippet }],
+    });
+  }
+
+  function lastUpdateCustomFields(): Record<string, any> {
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    return (updateCall[2] as any).customFields || {};
+  }
+
+  it('keeps a value when sourceQuote appears verbatim in the web context', async () => {
+    setupSingleLeadJob('Acme is a Series B startup with 200 employees');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        funding_stage: {
+          value: 'Series B',
+          sourceQuote: 'Series B startup',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    expect(lastUpdateCustomFields().funding_stage).toBe('Series B');
+  });
+
+  it('rejects (sets to null) a value when sourceQuote is not found in any source', async () => {
+    setupSingleLeadJob('Acme is an early-stage startup');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        funding_stage: {
+          value: 'Series B',
+          sourceQuote: 'raised $100M Series B',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    expect(lastUpdateCustomFields().funding_stage).toBeNull();
+  });
+
+  it('rejects a value when rich-format response omits sourceQuote', async () => {
+    setupSingleLeadJob('Acme is a Series B startup');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        funding_stage: { value: 'Series B', confidence: 'high' },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    expect(lastUpdateCustomFields().funding_stage).toBeNull();
+  });
+
+  it('keeps a value from a legacy flat-string LLM response (backwards compat)', async () => {
+    setupSingleLeadJob('Acme is a Series B startup');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ funding_stage: 'Series B' })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    expect(lastUpdateCustomFields().funding_stage).toBe('Series B');
+  });
+
+  it('matches sourceQuote case-insensitively', async () => {
+    setupSingleLeadJob('Acme operates in the FinTech sector');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        industry: {
+          value: 'FinTech',
+          sourceQuote: 'FINTECH SECTOR',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get industry',
+      outputFields: ['industry'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    expect(lastUpdateCustomFields().industry).toBe('FinTech');
+  });
+
+  it('matches sourceQuote with whitespace collapsed', async () => {
+    setupSingleLeadJob('Founded in 2018, Acme employs 200 people');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        founded_year: {
+          value: '2018',
+          // Multi-line / multi-space quote — should match the source after whitespace collapse
+          sourceQuote: 'Founded\n  in   2018',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get founded year',
+      outputFields: ['founded_year'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    expect(lastUpdateCustomFields().founded_year).toBe('2018');
+  });
+
+  it('preserves existing LinkedIn slug-validation behavior (rejects URL whose slug is not in source)', async () => {
+    setupSingleLeadJob('Acme is a Series B startup');
+    // Hallucinated LinkedIn URL — slug "fake-slug-not-anywhere" is not in any source
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        company_linkedin_url: {
+          value: 'https://www.linkedin.com/company/fake-slug-not-anywhere',
+          sourceQuote: 'Acme is a Series B startup',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get LinkedIn',
+      outputFields: ['company_linkedin_url'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    // Even though the quote is in source, the slug-check should still reject the URL
+    expect(lastUpdateCustomFields().company_linkedin_url).toBeNull();
+  });
+
+  it('persists enrichmentMetadata sidecar with source, sourceUrl, sourceQuote, confidence, jobId, enrichedAt', async () => {
+    setupSingleLeadJob('Acme is a Series B startup with 200 employees');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        funding_stage: {
+          value: 'Series B',
+          sourceQuote: 'Series B startup',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    await service.execute(spec);
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const meta = (updateCall[2] as any).enrichmentMetadata;
+    expect(meta).toBeDefined();
+    expect(meta.funding_stage).toMatchObject({
+      source: 'web_search',
+      sourceQuote: 'Series B startup',
+      sourceUrl: 'https://acme.com',
+      confidence: 'high',
+    });
+    expect(meta.funding_stage.enrichedJobId).toEqual(expect.any(String));
+    expect(meta.funding_stage.enrichedAt).toEqual(expect.any(String));
+  });
+
+  it('drops stale enrichmentMetadata when forceOverwrite clears a field to null', async () => {
+    // Simulate: lead already has industry="Tech" with metadata from a prior run.
+    // forceOverwrite re-runs enrichment; new LLM extraction finds nothing → field cleared.
+    // The stale metadata for that field MUST be removed (otherwise UI shows empty
+    // value with source/quote/confidence still attached, which is confusing).
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({
+        leadId: 'lead1',
+        customFields: { industry: 'Tech' },
+        enrichmentMetadata: {
+          industry: {
+            source: 'web_search',
+            sourceQuote: 'old quote',
+            confidence: 'high',
+            enrichedAt: '2026-01-01T00:00:00Z',
+            enrichedJobId: 'old-job',
+          },
+          other_field: { source: 'web_search', enrichedAt: '2026-01-01T00:00:00Z' },
+        },
+      })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', url: 'https://acme.com', snippet: 'no industry info here' }],
+    });
+    // LLM returns null for industry (rich format) → verifyCitations rejects → null
+    mockGeminiCreate.mockResolvedValue(geminiResponse({
+      industry: { value: null, sourceQuote: null, confidence: 'low' },
+    }));
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get industry',
+      outputFields: ['industry'],
+      sources: ['web_search'],
+      forceOverwrite: true,
+    };
+
+    await service.execute(spec);
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const meta = (updateCall[2] as any).enrichmentMetadata;
+    // Cleared field's metadata is dropped...
+    expect(meta.industry).toBeUndefined();
+    // ...but unrelated metadata is preserved
+    expect(meta.other_field).toBeDefined();
+    expect(meta.other_field.source).toBe('web_search');
+  });
+
+  it('omits enrichmentMetadata for null/rejected fields', async () => {
+    setupSingleLeadJob('Acme is an early-stage startup');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        funding_stage: {
+          value: 'Series B',
+          sourceQuote: 'raised $100M Series B',  // not in source → rejected
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    await service.execute(spec);
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const meta = (updateCall[2] as any).enrichmentMetadata || {};
+    expect(meta.funding_stage).toBeUndefined();
+  });
+
+  it('targeted re-search: when first pass yields >50% nulls, retries with field-name keywords and fills in missing values', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead1', email: 'jane@acme.com', company: 'Acme Corp' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    // First search returns generic info; targeted retry finds revenue & funding details
+    mockAgentModeService.searchWeb
+      .mockResolvedValueOnce({
+        success: true,
+        results: [{ title: 'Acme', url: 'https://acme.com', snippet: 'Acme is a tech company' }],
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        results: [{
+          title: 'Acme Funding',
+          url: 'https://news.com/acme',
+          snippet: 'Acme raised Series B for $30M annual revenue $8M',
+        }],
+      });
+
+    // First LLM call: only first field has a citation; revenue/funding null
+    // Second LLM call (targeted retry): fills in revenue and funding
+    mockGeminiCreate
+      .mockResolvedValueOnce(geminiResponse({
+        industry: { value: 'Tech', sourceQuote: 'tech company', sourceUrl: 'https://acme.com', confidence: 'high' },
+        revenue_range: { value: null, sourceQuote: null, confidence: 'low' },
+        funding_stage: { value: null, sourceQuote: null, confidence: 'low' },
+      }))
+      .mockResolvedValueOnce(geminiResponse({
+        revenue_range: { value: '$8M', sourceQuote: 'annual revenue $8M', sourceUrl: 'https://news.com/acme', confidence: 'high' },
+        funding_stage: { value: 'Series B', sourceQuote: 'Series B for $30M', sourceUrl: 'https://news.com/acme', confidence: 'high' },
+      }));
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get details',
+      outputFields: ['industry', 'revenue_range', 'funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    // Targeted re-search produced an extra searchWeb call.
+    // Gemini is called >= 2 times (extraction + retargeted extraction; critic adds 1 more if enabled).
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(2);
+    expect(mockGeminiCreate.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const cf = lastUpdateCustomFields();
+    expect(cf.industry).toBe('Tech');
+    // Note: revenue_range "$8M" gets bucketed by normalizer to "$1-10M"
+    expect(cf.revenue_range).toBe('$1-10M');
+    expect(cf.funding_stage).toBe('Series B');
+  });
+
+  it('critic pass: drops claims the critic marks as CONTRADICTED, downgrades unsupported/partial to low confidence', async () => {
+    setupSingleLeadJob('Acme operates in the SaaS sector with multiple products');
+    // `market_size` is non-canonical and not in the static alias map, so the
+    // alias resolver would fire an LLM call to map it. Pre-populate the list's
+    // canonical map so the resolver short-circuits and the mockGeminiCreate
+    // queue lines up with the extraction + critic calls only.
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'list1', userId: 'user1',
+      fieldCanonicalMap: { market_size: 'revenue_range' },
+    } as any);
+    // Three claims, all present in source (so verifyCitations keeps them).
+    // Critic produces three different verdicts — only "contradicted" should drop.
+    mockGeminiCreate
+      .mockResolvedValueOnce(geminiResponse({
+        industry: { value: 'SaaS', sourceQuote: 'SaaS sector', sourceUrl: 'https://acme.com', confidence: 'high' },
+        market_size: { value: '$10B', sourceQuote: 'multiple products', sourceUrl: 'https://acme.com', confidence: 'high' },
+        funding_stage: { value: 'Series Z', sourceQuote: 'multiple products', sourceUrl: 'https://acme.com', confidence: 'high' },
+      }))
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          industry:      { verdict: 'supported',          reason: 'sector explicitly named' },
+          market_size:   { verdict: 'unsupported',        reason: 'no figure in source' },
+          funding_stage: { verdict: 'contradicted',       reason: 'source says bootstrapped' },
+        }) } }],
+      });
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get details',
+      outputFields: ['industry', 'market_size', 'funding_stage'],
+      sources: ['web_search'],
+    };
+
+    await service.execute(spec);
+    const cf = lastUpdateCustomFields();
+    expect(cf.industry).toBe('SaaS');                                  // supported → kept high
+    expect(cf.market_size).toBe('$10B');                               // unsupported → kept but low confidence
+    expect(cf.funding_stage).toBeNull();                               // contradicted → dropped
+
+    const meta = (mockCrmDb.updateLead.mock.calls[0][2] as any).enrichmentMetadata;
+    expect(meta.industry.criticVerdict).toBe('supported');
+    expect(meta.market_size.criticVerdict).toBe('unsupported');
+    expect(meta.market_size.confidence).toBe('low');
+  });
+
+  it('keeps a mix of supported and unsupported fields independently', async () => {
+    setupSingleLeadJob('Acme operates in the SaaS sector with 200 employees');
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        industry: {
+          value: 'SaaS',
+          sourceQuote: 'SaaS sector',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+        funding_stage: {
+          value: 'Series C',
+          sourceQuote: 'closed Series C round of $50M',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get details',
+      outputFields: ['industry', 'funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    const cf = lastUpdateCustomFields();
+    expect(cf.industry).toBe('SaaS');           // supported → kept
+    expect(cf.funding_stage).toBeNull();        // unsupported → rejected
+  });
+});
+
+// ─── Stage 3: LinkedIn confidence scoring via company-id resolver ─────────────
+
+describe('CrmEnrichmentService - LinkedIn confidence scoring (Stage 3)', () => {
+  const {
+    setUnipileSearchParamServiceForTesting,
+    __resetUnipileSearchParamServiceForTesting,
+  } = require('../services/unipileSearchParamService');
+  const enrichmentLogger = require('../utils/enrichmentLogger');
+
+  let service: CrmEnrichmentService;
+  let warnSpy: jest.SpyInstance;
+  let originalFlag: string | undefined;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    originalFlag = process.env.CRM_USE_LINKEDIN_ID_RESOLUTION;
+    warnSpy = jest.spyOn(enrichmentLogger.enrichLog, 'warn').mockImplementation(() => {});
+    __resetUnipileSearchParamServiceForTesting();
+  });
+
+  afterEach(() => {
+    if (originalFlag === undefined) delete process.env.CRM_USE_LINKEDIN_ID_RESOLUTION;
+    else process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = originalFlag;
+    warnSpy.mockRestore();
+    __resetUnipileSearchParamServiceForTesting();
+  });
+
+  function setupSearchPeopleJob(opts: {
+    leadOverrides?: any;
+    searchPeopleItems: any[];
+  }) {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead(opts.leadOverrides ?? {})],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    mockGetAccountsByUserId.mockResolvedValue([
+      { account_id: 'acc1', platform: 'unipile' },
+    ] as any);
+    // search-people → first call returns items; if a get-profile is invoked
+    // afterwards we satisfy it with a basic profile shape.
+    mockAgentModeService.linkedinOutreach
+      .mockResolvedValueOnce({ success: true, data: { items: opts.searchPeopleItems } })
+      .mockResolvedValue({ success: true, data: { public_identifier: 'picked', headline: 'CEO' } });
+
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ seniority: 'C-level' }));
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+  }
+
+  function buildSpec(): EnrichmentJobSpec {
+    return {
+      listId: 'list1',
+      userId: 'user1',
+      instruction: 'Determine seniority',
+      outputFields: ['seniority'],
+      sources: ['linkedin'],
+      sourcesPerField: { seniority: ['linkedin'] },
+    };
+  }
+
+  function setupResolver(returnValue: { topId: string | null; throws?: boolean }) {
+    const resolveTopId = returnValue.throws
+      ? jest.fn().mockRejectedValue(new Error('resolver boom'))
+      : jest.fn().mockResolvedValue(returnValue.topId);
+    setUnipileSearchParamServiceForTesting({ resolveTopId } as any);
+    return resolveTopId;
+  }
+
+  function lastUserMessageAcrossLLMCalls(): string {
+    return mockGeminiCreate.mock.calls
+      .map((call: any[]) => (call[0].messages.find((m: any) => m.role === 'user')?.content) || '')
+      .join('\n---\n');
+  }
+
+  it('flag OFF → preserves blind items[0] behavior, no resolver call, confidence=unspecified', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'false';
+    const resolveTopId = setupResolver({ topId: 'company-acme-id' });
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'p1', current_role: { company: { id: 'wrong-co' } } },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+    expect(resolveTopId).not.toHaveBeenCalled();
+
+    // No low-confidence warning emitted in legacy path
+    const warnEvents = warnSpy.mock.calls.map((c: any[]) => c[0]?.event);
+    expect(warnEvents).not.toContain('linkedin_context_low_confidence');
+
+    // search-people called with combined keywords (legacy free-text behavior)
+    expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+      'user1',
+      expect.objectContaining({
+        action: 'search-people',
+        keywords: 'John Doe Acme Corp',
+      }),
+    );
+  });
+
+  it('flag ON + resolver hit + matching candidate → confidence=high, correct profile fed to LLM', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    const resolveTopId = setupResolver({ topId: 'company-acme-id' });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'wrong', current_role: { company: { id: 'unrelated-co' } } },
+        { provider_id: 'right', current_role: { company: { id: 'company-acme-id' } }, public_identifier: 'right-person' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+    expect(resolveTopId).toHaveBeenCalledWith(
+      'acc1',
+      expect.objectContaining({ type: 'COMPANY', keywords: 'Acme Corp' }),
+    );
+
+    // search-people was passed company_id (Stage 2 will accept this field)
+    expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+      'user1',
+      expect.objectContaining({ action: 'search-people', company_id: 'company-acme-id' }),
+    );
+
+    // get-profile was invoked on the *matching* provider_id, not items[0]
+    expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+      'user1',
+      expect.objectContaining({ action: 'get-profile', provider_id: 'right' }),
+    );
+
+    // No low-confidence warning
+    const warnEvents = warnSpy.mock.calls.map((c: any[]) => c[0]?.event);
+    expect(warnEvents).not.toContain('linkedin_context_low_confidence');
+  });
+
+  it('flag ON + resolver hit + NO matching candidate → confidence=low, LinkedIn fields dropped from prompt, warn logged', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: 'company-acme-id' });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        // None of the candidates match the resolved company id
+        { provider_id: 'p1', public_identifier: 'wrong-1', current_role: { company: { id: 'co-x' } }, headline: 'Director', summary: 'Old summary' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+
+    // LLM prompt should NOT contain Unipile-derived structured fields
+    const allUserMsgs = lastUserMessageAcrossLLMCalls();
+    expect(allUserMsgs).not.toContain('LinkedIn profile data');
+    expect(allUserMsgs).not.toContain('Resolved LinkedIn profile URL');
+    expect(allUserMsgs).not.toContain('Old summary');
+
+    // Telemetry warn emitted
+    const lowConfWarn = warnSpy.mock.calls
+      .map((c: any[]) => c[0])
+      .find((f: any) => f?.event === 'linkedin_context_low_confidence');
+    expect(lowConfWarn).toBeDefined();
+    expect(lowConfWarn).toMatchObject({
+      event: 'linkedin_context_low_confidence',
+      company: 'Acme Corp',
+      candidateCount: 1,
+      resolvedCompanyId: 'company-acme-id',
+    });
+  });
+
+  it('flag ON + resolver returns null → confidence=low, LinkedIn fields dropped, warn logged', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: null });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'p1', public_identifier: 'maybe', current_role: { company: { id: 'co-x' } }, headline: 'CTO', summary: 'Bio' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+
+    const allUserMsgs = lastUserMessageAcrossLLMCalls();
+    expect(allUserMsgs).not.toContain('LinkedIn profile data');
+    expect(allUserMsgs).not.toContain('Bio');
+
+    const lowConfWarn = warnSpy.mock.calls
+      .map((c: any[]) => c[0])
+      .find((f: any) => f?.event === 'linkedin_context_low_confidence');
+    expect(lowConfWarn).toBeDefined();
+    expect(lowConfWarn?.resolvedCompanyId).toBeNull();
+  });
+
+  it('flag ON + resolver throws → confidence=low, enrichment still completes', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: null, throws: true });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'p1', public_identifier: 'fallback', current_role: { company: { id: 'co-x' } }, headline: 'CTO' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    // Enrichment still completes — resolver errors don't fail the lead
+    expect(result.processedCount).toBe(1);
+    expect(result.failedCount).toBe(0);
+
+    const lowConfWarn = warnSpy.mock.calls
+      .map((c: any[]) => c[0])
+      .find((f: any) => f?.event === 'linkedin_context_low_confidence');
+    expect(lowConfWarn).toBeDefined();
+  });
+
+  it('flag ON + low confidence: web-search-regex LinkedIn URLs from web context survive', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: 'company-acme-id' });
+
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead1' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    mockGetAccountsByUserId.mockResolvedValue([
+      { account_id: 'acc1', platform: 'unipile' },
+    ] as any);
+
+    // Web search returns a snippet containing a LinkedIn URL — regex picks it up
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [
+        { title: 'John Doe', url: 'https://example.com', snippet: 'See https://www.linkedin.com/in/john-doe-from-web' },
+      ],
+    });
+    // search-people returns a candidate with WRONG company → low confidence
+    mockAgentModeService.linkedinOutreach
+      .mockResolvedValueOnce({ success: true, data: { items: [
+        { provider_id: 'wrong-p', public_identifier: 'wrong-p', current_role: { company: { id: 'co-x' } } },
+      ] } })
+      .mockResolvedValue({ success: true, data: { public_identifier: 'wrong-p', headline: 'X' } });
+
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/john-doe-from-web' }));
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1',
+      userId: 'user1',
+      instruction: 'Find the personal LinkedIn URL',
+      outputFields: ['linkedin_url'],
+      sources: ['web_search', 'linkedin'],
+      sourcesPerField: { linkedin_url: ['web_search', 'linkedin'] },
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+
+    // The web-search-regex URL must still appear in the prompt context
+    const allUserMsgs = lastUserMessageAcrossLLMCalls();
+    expect(allUserMsgs).toContain('john-doe-from-web');
+    // But Unipile-derived structured profile data must NOT
+    expect(allUserMsgs).not.toContain('LinkedIn profile data');
   });
 });

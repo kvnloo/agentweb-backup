@@ -1,0 +1,45 @@
+[
+  {
+    "id": "stripe",
+    "lead": {
+      "firstName": "Patrick",
+      "lastName": "Collison",
+      "email": "patrick@stripe.com",
+      "company": "Stripe"
+    },
+    "outputFields": ["industry", "founded_year", "funding_stage"],
+    "expected": {
+      "industry": ["Payments", "FinTech", "Financial Technology"],
+      "founded_year": ["2010"],
+      "funding_stage": ["Series I", "Series H", "Late Stage", "Private"]
+    }
+  },
+  {
+    "id": "anthropic",
+    "lead": {
+      "firstName": "Dario",
+      "lastName": "Amodei",
+      "email": "dario@anthropic.com",
+      "company": "Anthropic"
+    },
+    "outputFields": ["industry", "company_description"],
+    "expected": {
+      "industry": ["AI", "Artificial Intelligence", "AI Safety"],
+      "company_description": ["AI safety", "Claude", "language model"]
+    }
+  },
+  {
+    "id": "vercel",
+    "lead": {
+      "firstName": "Guillermo",
+      "lastName": "Rauch",
+      "email": "guillermo@vercel.com",
+      "company": "Vercel"
+    },
+    "outputFields": ["industry", "founded_year"],
+    "expected": {
+      "industry": ["Cloud", "Developer Tools", "Hosting", "Platform"],
+      "founded_year": ["2015"]
+    }
+  }
+]
