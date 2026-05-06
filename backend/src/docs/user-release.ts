@@ -5744,5 +5744,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The fix injects session context into the conversation transcript so the scorer evaluates draft quality, not end-user goal fulfillment',
     ],
   },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Improved: Organization Members Now See Their Owner\'s Subscription Plan',
+      '- Members of an organization now see the correct subscription plan and status (e.g. Super Premium / Active) on their Subscription settings page, instead of Free',
+      '- Billing controls (Manage Billing, View Plans) are replaced with a message explaining the subscription is managed by the org owner',
+      '- Admin Users tab now shows org role and org name under each user\'s email, and in the expanded detail panel',
+    ],
+  },
 ];
 
