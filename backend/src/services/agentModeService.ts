@@ -221,8 +221,46 @@ export class AgentModeService {
     // Ensure built-in skills exist in the database
     await this.ensureBuiltInSkills();
 
+    // Bootstrap downstream service singletons. Server boot also calls these
+    // (server.ts post-createTestAccount), but the forked Emma worker subprocess
+    // (generateMarketingResponseWorker) doesn't run that path — so any tool
+    // that resolves a singleton via getEnrichSoService / getUnipile*Service
+    // would throw "service not initialized" inside the worker. Each init is
+    // idempotent and wrapped in try/catch so a single failure (e.g. missing
+    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // initialize() returns fast — the inits resolve in the background by
+    // the time the first tool call lands.
+    void this.initializeDownstreamSingletons();
+
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
+  }
+
+  private async initializeDownstreamSingletons(): Promise<void> {
+    try {
+      const { initEnrichSoServiceFromEnv } = await import('./enrichSoServiceFactory');
+      await initEnrichSoServiceFromEnv();
+    } catch (err) {
+      console.warn('[AgentMode] enrich.so service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initUnipileProfileService } = await import('./unipileProfileServiceFactory');
+      initUnipileProfileService();
+    } catch (err) {
+      console.warn('[AgentMode] Unipile profile service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+      initUnipileCompanyService();
+    } catch (err) {
+      console.warn('[AgentMode] Unipile company service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initUnipileSearchParamServiceFromEnv } = await import('./unipileSearchParamServiceFactory');
+      initUnipileSearchParamServiceFromEnv();
+    } catch (err) {
+      console.warn('[AgentMode] Unipile search-param resolver init skipped:', (err as Error).message);
+    }
   }
 
   /**
