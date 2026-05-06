@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middle
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
+import { LLMService } from '../utils/llmService';
 import multer from 'multer';
 import { MAX_FILE_SIZE } from '../config';
 
@@ -127,6 +128,31 @@ router.post('/ishare/:shareId/email-report', asyncHandler(agentModeController.em
 
 // All other routes require authentication
 router.use(authenticateToken);
+
+// POST /api/agent-mode/tips
+// Generate 3 contextual tips from Emma based on the user's current prompt.
+// Called immediately when generation starts; returns before the 5s carousel timer fires.
+router.post('/tips', asyncHandlerAuth(async (_req: AuthenticatedRequest, res: Response) => {
+  const { userPrompt } = _req.body as { userPrompt?: string };
+  if (!userPrompt?.trim()) {
+    return res.status(400).json({ error: 'userPrompt is required' });
+  }
+
+  const llm = new LLMService(undefined, 0.7, 300);
+  const systemPrompt = `You are Emma, an expert AI marketing teammate. Given a user's task prompt, generate exactly 3 short, practical tips that will help them get better results with that specific task. Each tip must be directly relevant to the specific task — never generic.
+
+Respond with valid JSON only, no markdown. Format: {{"tips": [{{"headline": "...", "body": "..."}}, {{"headline": "...", "body": "..."}}, {{"headline": "...", "body": "..."}}]}}
+
+Rules:
+- headline: 1 sentence, states the insight directly (no questions, no fluff)
+- body: 2-3 lines of specific, actionable guidance
+- All 3 tips must be different angles on the same task
+- No generic advice like "know your audience" — be specific to what they're building`;
+
+  const result = await llm.generateContent(systemPrompt, `Task: ${userPrompt.trim()}`, 'json');
+  const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+  return res.json({ tips: parsed.tips });
+}));
 
 // PUT /api/agent-mode/session/:sessionId/transfer
 // Transfer anonymous session to authenticated user (requires authentication)
