@@ -4089,6 +4089,104 @@ emmaToolRegistry.register({
   }
 });
 
+// --- Character management tools for Video Production ---
+emmaToolRegistry.register({
+  name: 'list_characters',
+  definition: {
+    name: 'list_characters',
+    description: 'List all saved video characters for the user. Each character has a name, visual description, and a reference image URL. Call this at the start of video production to offer character selection. Pass the referenceImageUrl as startFrame in generate_video to anchor the character visually.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    return await agentModeService.listVideoCharacters(context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_character',
+  definition: {
+    name: 'get_character',
+    description: 'Get full details of a saved video character by ID, including their referenceImageUrl. Use the referenceImageUrl as startFrame in generate_video to anchor the character appearance in the video.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        character_id: {
+          type: 'string',
+          description: 'The characterId from list_characters'
+        }
+      },
+      required: ['character_id']
+    }
+  },
+  execute: async (args: any, _context?: any) => {
+    return await agentModeService.getVideoCharacter(args.character_id);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'create_character',
+  definition: {
+    name: 'create_character',
+    description: 'Save a new video character. First call generate_image with the character description to create a reference portrait, then pass the returned S3 URL here along with the name and description. The character will be saved and available for future video productions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Display name for the character (e.g. "Maya")'
+        },
+        description: {
+          type: 'string',
+          description: 'Visual description of the character (e.g. "confident woman in her 30s, blue blazer, professional studio background")'
+        },
+        reference_image_url: {
+          type: 'string',
+          description: 'S3 URL of the character portrait image, returned by generate_image'
+        },
+        prompt: {
+          type: 'string',
+          description: 'The exact prompt passed to generate_image to create the reference image'
+        }
+      },
+      required: ['name', 'description', 'reference_image_url']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createVideoCharacter(context?.userId, {
+      name: args.name,
+      description: args.description,
+      referenceImageUrl: args.reference_image_url,
+      referenceImageKey: '',
+      prompt: args.prompt || args.description,
+    });
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'delete_character',
+  definition: {
+    name: 'delete_character',
+    description: 'Delete a saved video character by ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        character_id: {
+          type: 'string',
+          description: 'The characterId to delete'
+        }
+      },
+      required: ['character_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.deleteVideoCharacter(context?.userId, args.character_id);
+  }
+});
+
 // --- Tools from searchTools.ts ---
 emmaToolRegistry.register({
   name: "search_web",

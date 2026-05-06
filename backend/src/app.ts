@@ -80,6 +80,7 @@ import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
 import usersRoutes from "./routes/users";
+import charactersRoutes from "./routes/characters";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -299,6 +300,7 @@ app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
+app.use("/api/characters", charactersRoutes);
 
 
 // Agent API documentation (public, no auth)
