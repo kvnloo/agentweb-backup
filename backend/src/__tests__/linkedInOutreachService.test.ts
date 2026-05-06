@@ -389,6 +389,57 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('searchParameters', () => {
+    it('should call GET /linkedin/search/parameters with type and keywords', async () => {
+      const mockResp = {
+        items: [
+          { id: '1441', title: 'Microsoft', subtitle: 'Software Development' },
+          { id: '99', title: 'Microsoft Research' },
+        ],
+      };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockResp);
+
+      const result = await linkedInOutreachService.searchParameters('account-123', {
+        type: 'COMPANY',
+        keywords: 'Microsoft',
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'GET',
+        path: ['linkedin', 'search', 'parameters'],
+        parameters: { account_id: 'account-123', type: 'COMPANY', keywords: 'Microsoft' },
+      });
+      expect(result).toEqual(mockResp);
+    });
+
+    it('should pass limit when provided', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({ items: [] });
+
+      await linkedInOutreachService.searchParameters('account-123', {
+        type: 'LOCATION',
+        keywords: 'San Francisco',
+        limit: 5,
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'GET',
+        path: ['linkedin', 'search', 'parameters'],
+        parameters: { account_id: 'account-123', type: 'LOCATION', keywords: 'San Francisco', limit: 5 },
+      });
+    });
+
+    it('should throw a structured error on API failure', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 429, title: 'Rate limited' },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.searchParameters('account-123', { type: 'COMPANY', keywords: 'X' })
+      ).rejects.toThrow('Rate limited');
+    });
+  });
+
   describe('getProfile', () => {
     it('should return full profile for a provider_id', async () => {
       const mockProfile = {

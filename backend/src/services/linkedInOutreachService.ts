@@ -448,6 +448,38 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * Resolve free-text keywords to LinkedIn entity candidates (company,
+   * location, industry, school, service). Maps to Unipile's
+   * GET /linkedin/search/parameters endpoint.
+   *
+   * Callers should go through UnipileSearchParamService for caching +
+   * telemetry; this raw method is the HTTP transport that factory wires.
+   */
+  async searchParameters(
+    accountId: string,
+    args: { type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE'; keywords: string; limit?: number }
+  ): Promise<any> {
+    try {
+      this.log(`Searching LinkedIn parameters`, { accountId, type: args.type, keywords: args.keywords });
+      const client = await this.getClient();
+      const parameters: Record<string, any> = {
+        account_id: accountId,
+        type: args.type,
+        keywords: args.keywords,
+      };
+      if (args.limit !== undefined) parameters.limit = args.limit;
+      const result = await client.request.send({
+        method: 'GET',
+        path: ['linkedin', 'search', 'parameters'],
+        parameters,
+      });
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'searchParameters');
+    }
+  }
+
+  /**
    * Get a full LinkedIn profile by provider_id or identifier.
    * Exposes the internal getLinkedInProfile resolution as a public method
    * that works with raw provider_id strings (not just URLs).

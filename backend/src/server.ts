@@ -383,6 +383,17 @@ createTestAccount().then(async () => {
     console.warn('Unipile company cache not initialized — LinkedIn company lookups will hit Unipile live:', (err as Error).message);
   }
 
+  // Initialize Unipile LinkedIn search-parameter resolver (cacheType='unipile_search_param').
+  // Resolves free-text company/location/industry/school → LinkedIn entity IDs
+  // for use in classic + sales-navigator search filters.
+  try {
+    const { initUnipileSearchParamServiceFromEnv } = await import('./services/unipileSearchParamServiceFactory');
+    initUnipileSearchParamServiceFromEnv();
+    console.log('Unipile search-parameter resolver initialized');
+  } catch (err) {
+    console.warn('Unipile search-parameter resolver not initialized — searches will not auto-resolve company IDs:', (err as Error).message);
+  }
+
   // Register CRM enrichment specialists (Crunchbase, enrich.so, et al.)
   try {
     const { registerAllEnrichmentSpecialists } = await import('./services/specialists');
