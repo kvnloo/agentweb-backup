@@ -306,6 +306,16 @@ export function getUnipileSearchParamService(): UnipileSearchParamService {
   return _singleton;
 }
 
+/**
+ * Non-throwing peek at the singleton. Used by the factory to implement
+ * lazy-init in forked worker subprocesses where the parent's boot wiring
+ * doesn't run. Application code should import the lazy getter from
+ * unipileSearchParamServiceFactory instead.
+ */
+export function peekUnipileSearchParamServiceSingleton(): UnipileSearchParamService | null {
+  return _singleton;
+}
+
 export function initUnipileSearchParamService(svc: UnipileSearchParamService): void {
   _singleton = svc;
 }

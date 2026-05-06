@@ -27,7 +27,7 @@ import { runSpecialists } from './enrichmentSpecialists';
 import { normalizeEnrichmentFieldConfig } from './enrichmentFieldConfig';
 import { resolveFieldAliases } from './enrichmentFieldAliasService';
 import { getOrCreateClustersForFields, type FieldCluster } from './enrichmentClusterService';
-import { getUnipileSearchParamService } from './unipileSearchParamService';
+import { getUnipileSearchParamService } from './unipileSearchParamServiceFactory';
 import { enrichLog } from '../utils/enrichmentLogger';
 
 /**
@@ -40,7 +40,9 @@ function isLinkedInIdResolutionEnabled(): boolean {
   const v = process.env.CRM_USE_LINKEDIN_ID_RESOLUTION;
   if (v === 'true') return true;
   if (v === 'false') return false;
-  return process.env.NODE_ENV !== 'production';
+  // Default ON outside production + tests. Tests must opt in explicitly so
+  // pre-Stage-3 fixtures continue exercising the legacy code path.
+  return process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test';
 }
 
 /** LinkedIn API has stricter rate limits */

@@ -20711,7 +20711,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { type, keywords, limit } = args;
           if (!type) throw new Error('type is required for search-parameters (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE)');
           if (!keywords) throw new Error('keywords is required for search-parameters');
-          const { getUnipileSearchParamService } = await import('./unipileSearchParamService');
+          const { getUnipileSearchParamService } = await import('./unipileSearchParamServiceFactory');
           const resolveResult = await getUnipileSearchParamService().resolve(account_id, {
             type,
             keywords,
