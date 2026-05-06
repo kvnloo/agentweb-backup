@@ -4378,9 +4378,13 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      // Pass through hiddenPages as-is (these are never wildcarded)
+      const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
+        ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
@@ -4453,9 +4457,15 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyTokenAllowance)
         : null;
 
+      // Pass through hiddenPages as-is; validate it's an array of strings
+      const hiddenPages: string[] = Array.isArray(type.hiddenPages)
+        ? type.hiddenPages.filter((p: any) => typeof p === 'string')
+        : [];
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
+        ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),

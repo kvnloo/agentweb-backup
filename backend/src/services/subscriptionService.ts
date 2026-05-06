@@ -6,6 +6,7 @@ import { skillService } from "./skillService";
 export interface SubscriptionType {
   name: string;
   allowedPages: string[]; // Array of page paths (e.g., ["/marketing/research", "/marketing/blog"]) or ["*"] for all
+  hiddenPages?: string[]; // Array of page paths to hide entirely (not shown as locked); subset of pages not in allowedPages
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
@@ -289,6 +290,26 @@ export function getAllAvailablePages(): string[] {
   const defaultPages = ["/", "/agent-mode", "/settings", "/guide"];
   const customerPages = CUSTOMER_PORTAL_PAGES.map((page) => page.path);
   return [...defaultPages, ...customerPages];
+}
+
+/**
+ * Get hidden pages for a user based on their subscription type.
+ * Hidden pages are not shown at all in the sidebar (not even as locked/upgrade prompts).
+ */
+export async function getHiddenPages(userId: string): Promise<string[]> {
+  try {
+    const subscriptionTypeName = await getUserSubscriptionType(userId);
+    const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
+
+    if (!subscriptionType || !subscriptionType.hiddenPages) {
+      return [];
+    }
+
+    return subscriptionType.hiddenPages;
+  } catch (error) {
+    console.error("Error getting hidden pages:", error);
+    return [];
+  }
 }
 
 /**
