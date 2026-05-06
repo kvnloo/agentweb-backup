@@ -4922,16 +4922,15 @@ export class AgentModeService {
         };
       }
 
-      // Gemini code execution runs in an isolated sandbox — it cannot access local file paths or
-      // S3-offloaded tool responses from previous tool calls. Detect this pattern early so the
-      // LLM knows to fetch the data via read_tool_response / search_tool_response and pass it
-      // inline or via file_urls instead.
+      // Gemini code execution runs in a remote isolated sandbox — it cannot access local file paths
+      // or S3-offloaded tool response paths from previous tool calls. Detect this pattern early so
+      // the LLM knows all data must arrive via file_urls or embedded in analysis_instruction.
       const localPathPattern = /(?:open|read|load)\s*\(\s*['"`]\/|with open\(['"`]\//i;
       const s3KeyPathPattern = /tool-responses\/[a-z0-9-]{36}\//i;
       if (localPathPattern.test(analysisInstruction) || s3KeyPathPattern.test(analysisInstruction)) {
         return {
           success: false,
-          message: `The analysis_instruction contains local file paths (e.g. open('/home/bard/...') or tool-responses paths). Gemini code execution runs in an isolated sandbox with no access to local files or previous tool response paths. To analyze data from a previous tool call: use read_tool_response to read the data, then either (1) pass the data directly in analysis_instruction, or (2) use save_file to save it as a .csv/.txt and pass the returned S3 URL in the file_urls parameter.`
+          message: `The analysis_instruction references local file paths or tool-response paths (e.g. open('/home/bard/...') or tool-responses/...). The code execution sandbox is remote and isolated — it has no access to any local files or previous tool responses. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
         };
       }
 

@@ -4650,18 +4650,18 @@ emmaToolRegistry.register({
   name: "perform_data_analysis",
   definition: {
     name: "perform_data_analysis",
-    description: 'Perform data analysis with code execution on files from URLs. If no files are attached, treat the information in the instruction as the complete dataset.',
+    description: 'Perform data analysis with code execution on files from URLs. IMPORTANT: The code execution runs in a remote isolated sandbox with no access to local files, tool response paths, or any previous context. All data must be provided either via file_urls (S3 URLs) or embedded directly in analysis_instruction. If data from a previous tool call is too large to embed inline, first save it using the save_file tool to get an S3 URL, then pass that URL in file_urls.',
     inputSchema: {
       type: "object",
       properties: {
         file_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'List of file URLs to analyze (URLs from uploaded files or previous task results)'
+          description: 'List of S3 or HTTPS file URLs to fetch and analyze. Use this for large datasets — save data via save_file first to get a URL if needed.'
         },
         analysis_instruction: {
           type: 'string',
-          description: 'Description of the analysis task to perform on the provided files'
+          description: 'The analysis task and any small inline datasets. Do NOT reference local file paths or tool-response paths — the sandbox cannot access them. For large datasets use file_urls instead.'
         }
       },
       required: ['file_urls', 'analysis_instruction']
