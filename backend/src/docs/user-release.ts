@@ -18,6 +18,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-06',
+    changes: [
+      'Improved: Emma now clarifies Slack channel access limits for non-admin accounts',
+      '- When a non-admin user asks Emma to search across all Slack channels, Emma explains that only an admin account can do a broad channel search',
+      '- Emma suggests asking an admin to run the search instead of silently returning limited results',
+    ],
+  },
+  {
     date: '2026-05-04',
     changes: [
       'Fix: Emma now pauses all ads when asked, including ads whose parent campaign is already paused',
