@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-06',
     changes: [
+      'Improved: Slack Suggest Sessions Now Show Sender Names Instead of User IDs',
+      '- When an inbound Slack message mentions another person (e.g. "let me know if @Jane is available"), the mention now shows the person\'s display name instead of a raw Slack user ID like <@U0B0XGBEDT>',
+      '- This applies to both the email notification and the session content Emma uses to draft a response',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
       'New: Characters for Video Creation',
       '- Save reusable characters (name, visual description, reference portrait image) in the new Characters tab on the Videos page',
       '- When creating a video task, select a saved character to include them as a visual reference — their appearance is used to anchor the character consistently across generated clips',
