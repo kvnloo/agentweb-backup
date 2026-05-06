@@ -80,16 +80,17 @@ router.get('/me', authenticateToken, async (req, res) => {
       }
     }
 
+    // Fetch org once here so we can reuse it for both subscription resolution and org info below
+    let org = user.orgId ? await orgDb.getOrgById(user.orgId) : null;
+
     // Add subscription type, allowed pages, and allowed skills for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
         const { getUserSubscriptionType, getAllowedPages, getAllowedSkills } = await import('../services/subscriptionService');
         const { skillService } = await import('../services/skillService');
 
-        // If user is in an org, resolve subscription from the org owner
-        const subscriptionUserId = user.orgId
-          ? (await orgDb.getOrgById(user.orgId))?.ownerUserId || userId
-          : userId;
+        // If user is an org member, resolve subscription from the org owner
+        const subscriptionUserId = (org?.ownerUserId) || userId;
         const subscriptionTypeName = await getUserSubscriptionType(subscriptionUserId);
 
         response.subscriptionType = subscriptionTypeName;
@@ -113,6 +114,19 @@ router.get('/me', authenticateToken, async (req, res) => {
         }
 
         response.allowedSkills = skills;
+
+        // For org members, overlay the owner's Stripe subscription status fields so
+        // the customer portal displays the correct plan status, billing date, etc.
+        if (user.orgRole === 'member' && org?.ownerUserId && org.ownerUserId !== userId) {
+          const ownerUser = await userDb.getUserById(org.ownerUserId);
+          if (ownerUser) {
+            response.subscription_status = ownerUser.subscription_status;
+            response.current_period_end = ownerUser.current_period_end;
+            response.has_payment_method = ownerUser.has_payment_method;
+            response.scheduledChange = ownerUser.scheduledChange;
+            response.orgManagedSubscription = true;
+          }
+        }
       } catch (error) {
         console.error('Error fetching subscription info:', error);
         // Default to Basic subscription with all pages and all skills on error
@@ -126,14 +140,11 @@ router.get('/me', authenticateToken, async (req, res) => {
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
 
     // Include org info if user is in an org
-    if (user.orgId) {
-      const org = await orgDb.getOrgById(user.orgId);
-      if (org) {
-        response.orgId = org.orgId;
-        response.orgName = org.name;
-        response.orgRole = user.orgRole;
-        response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
-      }
+    if (org) {
+      response.orgId = org.orgId;
+      response.orgName = org.name;
+      response.orgRole = user.orgRole;
+      response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
     }
 
     res.json(response);

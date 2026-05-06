@@ -2,7 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import authRoutes from '../routes/auth';
 import { authenticateToken } from '../middleware/auth';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 
 jest.mock('../middleware/auth');
 const mockedAuthenticate = authenticateToken as jest.MockedFunction<typeof authenticateToken>;
@@ -13,6 +13,9 @@ jest.mock('../services/db', () => ({
   },
   taskDb: {},
   subscriberDb: {},
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 jest.mock('../services/subscriptionService', () => ({
@@ -34,6 +37,7 @@ jest.mock('../services/skillService', () => ({
 import { getUserSubscriptionType, getAllowedPages, getAllowedSkills } from '../services/subscriptionService';
 
 const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 const mockedGetUserSubscriptionType = getUserSubscriptionType as jest.MockedFunction<typeof getUserSubscriptionType>;
 const mockedGetAllowedPages = getAllowedPages as jest.MockedFunction<typeof getAllowedPages>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
@@ -101,5 +105,121 @@ describe('GET /api/auth/me subscription fields', () => {
     expect(mockedGetUserSubscriptionType).not.toHaveBeenCalled();
     expect(mockedGetAllowedPages).not.toHaveBeenCalled();
     expect(mockedGetAllowedSkills).not.toHaveBeenCalled();
+  });
+
+  it('resolves subscription from org owner for org member', async () => {
+    mockedAuthenticate.mockImplementationOnce(async (req: any, _res: any, next: any) => {
+      req.user = { userId: 'member-1' };
+      next();
+      return undefined;
+    });
+
+    mockedUserDb.getUserById
+      // member user
+      .mockResolvedValueOnce({
+        userId: 'member-1',
+        email: 'member@example.com',
+        roles: ['customer'],
+        orgId: 'org-1',
+        orgRole: 'member',
+        password: 'secret',
+      } as any)
+      // owner user (fetched to overlay Stripe fields)
+      .mockResolvedValueOnce({
+        userId: 'owner-1',
+        email: 'owner@example.com',
+        subscription_status: 'active',
+        current_period_end: '2026-06-01T00:00:00.000Z',
+        has_payment_method: true,
+        scheduledChange: null,
+      } as any);
+
+    mockedOrgDb.getOrgById.mockResolvedValue({
+      orgId: 'org-1',
+      ownerUserId: 'owner-1',
+      name: 'Test Org',
+    } as any);
+
+    mockedGetUserSubscriptionType.mockResolvedValueOnce('Pro');
+    mockedGetAllowedPages.mockResolvedValueOnce(['/tasks']);
+    mockedGetAllowedSkills.mockResolvedValueOnce(['skill-1']);
+
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    // Subscription fields come from owner
+    expect(res.body.subscriptionType).toBe('Pro');
+    expect(res.body.subscription_status).toBe('active');
+    expect(res.body.current_period_end).toBe('2026-06-01T00:00:00.000Z');
+    expect(res.body.has_payment_method).toBe(true);
+    expect(res.body.orgManagedSubscription).toBe(true);
+
+    // Subscription service called with owner's userId
+    expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('owner-1');
+    expect(mockedGetAllowedPages).toHaveBeenCalledWith('owner-1');
+    expect(mockedGetAllowedSkills).toHaveBeenCalledWith('owner-1');
+  });
+
+  it('does not set orgManagedSubscription for org owner', async () => {
+    mockedAuthenticate.mockImplementationOnce(async (req: any, _res: any, next: any) => {
+      req.user = { userId: 'owner-1' };
+      next();
+      return undefined;
+    });
+
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'owner-1',
+      email: 'owner@example.com',
+      roles: ['customer'],
+      orgId: 'org-1',
+      orgRole: 'owner',
+      subscription_status: 'active',
+      password: 'secret',
+    } as any);
+
+    mockedOrgDb.getOrgById.mockResolvedValue({
+      orgId: 'org-1',
+      ownerUserId: 'owner-1',
+      name: 'Test Org',
+    } as any);
+
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    expect(res.body.orgManagedSubscription).toBeUndefined();
+    expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('owner-1');
+  });
+
+  it('falls back to member userId when org lookup returns null', async () => {
+    // Override auth middleware to inject member's userId for this test
+    mockedAuthenticate.mockImplementationOnce(async (req: any, _res: any, next: any) => {
+      req.user = { userId: 'member-1' };
+      next();
+      return undefined;
+    });
+
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'member-1',
+      email: 'member@example.com',
+      roles: ['customer'],
+      orgId: 'org-missing',
+      orgRole: 'member',
+      password: 'secret',
+    } as any);
+
+    mockedOrgDb.getOrgById.mockResolvedValue(null as any);
+
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    // Falls back to member's own userId for subscription resolution
+    expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('member-1');
+    expect(res.body.orgManagedSubscription).toBeUndefined();
   });
 });
