@@ -4,7 +4,7 @@ import bcrypt from "bcryptjs";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
-import { userDb, taskDb, subscriberDb, crmDb } from "../services/db";
+import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -400,6 +400,21 @@ router.get("/users", async (req, res) => {
         secretNames: secrets ? Object.keys(secrets) : [],
       };
     });
+
+    // Batch-fetch org names for users who belong to an org
+    const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
+    const orgMap: Record<string, string> = {};
+    await Promise.all(
+      orgIds.map(async (orgId) => {
+        const org = await orgDb.getOrgById(orgId).catch(() => null);
+        if (org) orgMap[orgId] = org.name;
+      })
+    );
+    for (const user of sanitized) {
+      if (user.orgId && orgMap[user.orgId]) {
+        user.orgName = orgMap[user.orgId];
+      }
+    }
 
     // Batch-fetch Clarity replay session URLs for all users
     const replayResults = await Promise.all(
