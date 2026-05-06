@@ -397,16 +397,41 @@ export class LinkedInOutreachService {
   /**
    * Search LinkedIn for people using the Unipile search endpoint.
    * Supports keyword-based search or URL-based search (passing a LinkedIn search URL).
+   *
+   * Structured ID filters (`company_id`, `location_id`, `industry_id`,
+   * `school_id`) are forwarded as top-level body keys per Unipile's classic
+   * people-search schema (arrays of numeric IDs; `industry` is an object with
+   * include/exclude arrays). See https://developer.unipile.com/docs/linkedin-search.
+   *
+   * When the caller passes free-text (e.g. `company: 'Microsoft'`) without the
+   * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
+   * to look up the LinkedIn entity ID. Resolver miss (null) or resolver error
+   * → fall back to the original `advanced_keywords` free-text behavior so the
+   * search never blocks on resolution failures.
    */
   async searchPeople(accountId: string, params: {
     keywords?: string;
     url?: string;
     title?: string;
     company?: string;
+    company_id?: string;
+    location?: string;
+    location_id?: string;
+    industry?: string;
+    industry_id?: string;
+    school?: string;
+    school_id?: string;
     cursor?: string;
   }): Promise<any> {
     try {
-      const { keywords, url, title, company, cursor } = params;
+      const {
+        keywords, url, title,
+        company, company_id,
+        location, location_id,
+        industry, industry_id,
+        school, school_id,
+        cursor,
+      } = params;
       this.log(`Searching LinkedIn people`, { accountId, keywords, url });
       const client = await this.getClient();
 
@@ -425,11 +450,34 @@ export class LinkedInOutreachService {
           category: 'people',
         };
         if (keywords) body.keywords = keywords;
-        // title and company go into advanced_keywords for free-text matching
-        if (title || company) {
-          body.advanced_keywords = {};
-          if (title) body.advanced_keywords.title = title;
-          if (company) body.advanced_keywords.company = company;
+
+        // Resolve free-text → ID for each structured filter when the *_id
+        // companion isn't already provided. Pre-resolved *_id always wins.
+        const resolvedCompanyId = company_id
+          || (company ? await this.resolveSearchParamId('COMPANY', company, accountId) : null);
+        const resolvedLocationId = location_id
+          || (location ? await this.resolveSearchParamId('LOCATION', location, accountId) : null);
+        const resolvedIndustryId = industry_id
+          || (industry ? await this.resolveSearchParamId('INDUSTRY', industry, accountId) : null);
+        const resolvedSchoolId = school_id
+          || (school ? await this.resolveSearchParamId('SCHOOL', school, accountId) : null);
+
+        if (resolvedCompanyId) body.company = [resolvedCompanyId];
+        if (resolvedLocationId) body.location = [resolvedLocationId];
+        if (resolvedIndustryId) body.industry = { include: [resolvedIndustryId], exclude: [] };
+        if (resolvedSchoolId) body.school = [resolvedSchoolId];
+
+        // Free-text fallback for anything that didn't resolve (and for title
+        // which has no ID equivalent). Preserves the previous behavior so
+        // searches never block on resolver misses or resolver outages.
+        const advanced: Record<string, string> = {};
+        if (title) advanced.title = title;
+        if (company && !resolvedCompanyId) advanced.company = company;
+        if (location && !resolvedLocationId) advanced.location = location;
+        if (industry && !resolvedIndustryId) advanced.industry = industry;
+        if (school && !resolvedSchoolId) advanced.school = school;
+        if (Object.keys(advanced).length > 0) {
+          body.advanced_keywords = advanced;
         }
       }
 
@@ -444,6 +492,30 @@ export class LinkedInOutreachService {
       return result;
     } catch (error: any) {
       return this.handleError(error, 'searchPeople');
+    }
+  }
+
+  /**
+   * Best-effort lookup of a LinkedIn entity ID via UnipileSearchParamService.
+   * Returns null on any failure (resolver not initialized, cache/API error,
+   * empty result) so the caller can fall back to free-text. Never throws —
+   * resolver outages must not block the underlying search.
+   */
+  private async resolveSearchParamId(
+    type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE',
+    keywords: string,
+    accountId: string,
+  ): Promise<string | null> {
+    try {
+      const { getUnipileSearchParamService } = await import('./unipileSearchParamService');
+      const svc = getUnipileSearchParamService();
+      const id = await svc.resolveTopId(accountId, { type, keywords });
+      return id ?? null;
+    } catch (error: any) {
+      this.log(`Search-param resolve failed (${type}=${keywords}); falling back to free-text`, {
+        reason: error?.message,
+      });
+      return null;
     }
   }
 

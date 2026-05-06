@@ -20436,10 +20436,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     try {
       switch (action) {
         case 'search-people': {
-          const { keywords, search_url, title, company, cursor } = args;
+          const {
+            keywords, search_url, title, company, cursor,
+            company_id, location, location_id,
+            industry, industry_id, school, school_id,
+          } = args;
           if (!keywords && !search_url && !cursor) throw new Error('Either keywords, search_url, or cursor is required for search-people');
           const searchResult = await linkedInOutreachService.searchPeople(account_id, {
-            keywords, url: search_url, title, company, cursor
+            keywords, url: search_url, title, company, cursor,
+            company_id, location, location_id,
+            industry, industry_id, school, school_id,
           });
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.

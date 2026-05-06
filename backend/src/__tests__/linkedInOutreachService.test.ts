@@ -387,6 +387,117 @@ describe('LinkedInOutreachService', () => {
         linkedInOutreachService.searchPeople('account-123', { keywords: '' })
       ).rejects.toThrow('Bad search request');
     });
+
+    // ─── Stage 2: ID-based filters + auto-resolve free-text via UnipileSearchParamService
+    describe('id-based filters and auto-resolve', () => {
+      const {
+        setUnipileSearchParamServiceForTesting,
+        __resetUnipileSearchParamServiceForTesting,
+      } = require('../services/unipileSearchParamService');
+
+      let mockResolveTopId: jest.Mock;
+
+      beforeEach(() => {
+        __resetUnipileSearchParamServiceForTesting();
+        mockResolveTopId = jest.fn();
+        setUnipileSearchParamServiceForTesting({
+          resolveTopId: mockResolveTopId,
+          resolve: jest.fn(),
+        } as any);
+        (mockUnipileClient.request.send as jest.Mock).mockResolvedValue({
+          object: 'SearchResults', items: [], cursor: null,
+        });
+      });
+
+      afterEach(() => {
+        __resetUnipileSearchParamServiceForTesting();
+      });
+
+      it('passes pre-resolved company_id through without calling resolver', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          company_id: '1441',
+        });
+        expect(mockResolveTopId).not.toHaveBeenCalled();
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.company).toEqual(['1441']);
+        expect(sentBody.advanced_keywords?.company).toBeUndefined();
+      });
+
+      it('auto-resolves free-text company to id and uses id in body', async () => {
+        mockResolveTopId.mockResolvedValueOnce('1441');
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          company: 'Microsoft',
+        });
+        expect(mockResolveTopId).toHaveBeenCalledWith(
+          'account-123',
+          expect.objectContaining({ type: 'COMPANY', keywords: 'Microsoft' }),
+        );
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.company).toEqual(['1441']);
+        expect(sentBody.advanced_keywords?.company).toBeUndefined();
+      });
+
+      it('falls back to free-text advanced_keywords.company when resolver returns null', async () => {
+        mockResolveTopId.mockResolvedValueOnce(null);
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          company: 'NonexistentCo',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.company).toBeUndefined();
+        expect(sentBody.advanced_keywords).toEqual({ company: 'NonexistentCo' });
+      });
+
+      it('falls back to free-text when resolver throws (search must not fail)', async () => {
+        mockResolveTopId.mockRejectedValueOnce(new Error('resolver dead'));
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          company: 'Acme',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.company).toBeUndefined();
+        expect(sentBody.advanced_keywords).toEqual({ company: 'Acme' });
+      });
+
+      it('prefers company_id when both company and company_id are provided', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          company: 'Microsoft',
+          company_id: '999',
+        });
+        expect(mockResolveTopId).not.toHaveBeenCalled();
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.company).toEqual(['999']);
+        expect(sentBody.advanced_keywords?.company).toBeUndefined();
+      });
+
+      it('passes location_id, industry_id, school_id with correct shapes', async () => {
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          location_id: '103644278',
+          industry_id: '6',
+          school_id: '12345',
+        });
+        expect(mockResolveTopId).not.toHaveBeenCalled();
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.location).toEqual(['103644278']);
+        expect(sentBody.industry).toEqual({ include: ['6'], exclude: [] });
+        expect(sentBody.school).toEqual(['12345']);
+      });
+
+      it('continues to work with no resolver registered (singleton not initialized)', async () => {
+        __resetUnipileSearchParamServiceForTesting(); // clear singleton
+        await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          company: 'Acme',
+        });
+        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        expect(sentBody.company).toBeUndefined();
+        expect(sentBody.advanced_keywords).toEqual({ company: 'Acme' });
+      });
+    });
   });
 
   describe('searchParameters', () => {
