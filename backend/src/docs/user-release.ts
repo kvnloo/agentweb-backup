@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-06',
+    changes: [
+      'Fixed: Satisfaction Score Reports Now Include All Active Sessions',
+      '- Sessions that started before the report window but had messages within it are now correctly included in satisfaction score counts',
+      '- Previously, a session that began late at night and continued past midnight would be silently excluded from the 24-hour report, potentially hiding unsatisfied sessions',
+      '- Also fixed: when satisfaction scores are generated during a sync call, they are now returned in the same response — previously the response would show null even after the score was successfully computed',
+    ],
+  },
+  {
     date: '2026-05-04',
     changes: [
       'Fix: Emma now pauses all ads when asked, including ads whose parent campaign is already paused',
