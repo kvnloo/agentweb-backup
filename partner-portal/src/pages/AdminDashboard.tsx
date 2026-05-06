@@ -278,6 +278,9 @@ interface User {
   utmCampaign?: string;
   utmContent?: string;
   utmTerm?: string;
+  orgId?: string;
+  orgRole?: "owner" | "member";
+  orgName?: string;
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -4008,9 +4011,15 @@ export default function AdminDashboard() {
                             <Typography variant="body2" sx={{ fontWeight: 500 }}>
                               {user.email}
                             </Typography>
-                            <Typography variant="caption" color="text.secondary">
-                              {user.supportNote || (user.roles?.includes("partner") ? "Partner" : "")}
-                            </Typography>
+                            {user.orgId ? (
+                              <Typography variant="caption" color="text.secondary">
+                                {user.orgRole === "owner" ? "Org Owner" : "Org Member"}{user.orgName ? ` · ${user.orgName}` : ""}
+                              </Typography>
+                            ) : (
+                              <Typography variant="caption" color="text.secondary">
+                                {user.supportNote || (user.roles?.includes("partner") ? "Partner" : "")}
+                              </Typography>
+                            )}
                           </Box>
                         </TableCell>
                         <TableCell>
@@ -4107,6 +4116,25 @@ export default function AdminDashboard() {
                                     {(!user.roles || user.roles.length === 0) && <Typography variant="body2" color="text.disabled">—</Typography>}
                                   </Box>
                                 </Grid>
+                                {user.orgId && (
+                                  <Grid item xs={3}>
+                                    <Typography variant="caption" color="text.secondary">Organization</Typography>
+                                    <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "wrap", mt: 0.5 }}>
+                                      <Chip
+                                        label={user.orgRole === "owner" ? "Owner" : "Member"}
+                                        size="small"
+                                        color={user.orgRole === "owner" ? "primary" : "default"}
+                                        variant="outlined"
+                                      />
+                                      {user.orgName && (
+                                        <Typography variant="body2">{user.orgName}</Typography>
+                                      )}
+                                      <Typography variant="caption" color="text.disabled" sx={{ fontFamily: "monospace", fontSize: "0.7rem" }}>
+                                        {user.orgId}
+                                      </Typography>
+                                    </Box>
+                                  </Grid>
+                                )}
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Tasks / Workflows</Typography>
                                   <Box sx={{ display: "flex", gap: 1, mt: 0.5 }}>
