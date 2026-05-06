@@ -4912,13 +4912,26 @@ export class AgentModeService {
         };
       }
 
-      // Gemini inline content limit: reject oversized instructions early so the LLM can self-correct
-      // rather than sending a payload that will be rejected and cause it to simulate results.
+      // Reject oversized instructions early so the LLM can self-correct rather than sending a
+      // payload that will be rejected and cause it to simulate results.
       const MAX_INLINE_INSTRUCTION_CHARS = 200_000; // ~50K tokens — well within Gemini's 1M context
       if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
         return {
           success: false,
           message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). The dataset embedded in the instruction is too large to send inline. Please use the save_file tool first to upload the dataset as a .csv or .txt file, then call perform_data_analysis again with the returned file URL in the file_urls parameter and a concise analysis_instruction describing what to analyze.`
+        };
+      }
+
+      // Gemini code execution runs in an isolated sandbox — it cannot access local file paths or
+      // S3-offloaded tool responses from previous tool calls. Detect this pattern early so the
+      // LLM knows to fetch the data via read_tool_response / search_tool_response and pass it
+      // inline or via file_urls instead.
+      const localPathPattern = /(?:open|read|load)\s*\(\s*['"`]\/|with open\(['"`]\//i;
+      const s3KeyPathPattern = /tool-responses\/[a-z0-9-]{36}\//i;
+      if (localPathPattern.test(analysisInstruction) || s3KeyPathPattern.test(analysisInstruction)) {
+        return {
+          success: false,
+          message: `The analysis_instruction contains local file paths (e.g. open('/home/bard/...') or tool-responses paths). Gemini code execution runs in an isolated sandbox with no access to local files or previous tool response paths. To analyze data from a previous tool call: use read_tool_response to read the data, then either (1) pass the data directly in analysis_instruction, or (2) use save_file to save it as a .csv/.txt and pass the returned S3 URL in the file_urls parameter.`
         };
       }
 
