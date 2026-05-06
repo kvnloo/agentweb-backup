@@ -15,6 +15,7 @@ import {
   deleteSlackMessage,
   getSlackUserDisplayName,
   getSlackUserEmail,
+  resolveSlackMentionsInText,
   downloadSlackFile
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
@@ -123,8 +124,8 @@ async function handleSlackTriggeredSession(params: {
     const { agentModeService } = await import('../services/agentModeService');
     const { settingsService } = await import('../services/settingsService');
 
-    // Normalize Slack formatting
-    const rawMessage = text
+    // Normalize Slack formatting and resolve user mentions to display names
+    const rawMessage = (await resolveSlackMentionsInText(text))
       .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
       .replace(/<mailto:([^|>]+)>/g, '$1')
       .trim();
@@ -599,10 +600,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           const { WebClient } = await import('@slack/web-api');
           const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
-          // Extract the message (remove bot mention and normalize Slack formatting)
-          const botMentionPattern = /<@[A-Z0-9]+>/g;
-          const rawMessage = text
-            .replace(botMentionPattern, '')
+          // Extract the message (remove bot mention, resolve other user mentions, normalize Slack formatting)
+          const textWithoutBotMention = text.replace(/<@[A-Z0-9]+>/, ''); // strip the first mention (the bot)
+          const rawMessage = (await resolveSlackMentionsInText(textWithoutBotMention))
             .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1') // <mailto:email|email> → email
             .replace(/<mailto:([^|>]+)>/g, '$1')         // <mailto:email> → email
             .trim();
