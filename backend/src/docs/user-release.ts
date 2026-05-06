@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-06',
     changes: [
+      'Fixed: LinkedIn Outbound Messages Now Visible in CRM Engagement History',
+      '- Manual replies sent directly on LinkedIn (outside the app) were previously invisible in the CRM — only the lead\'s inbound messages were shown',
+      '- A new "Sync LinkedIn" button in the engagement history section pulls all messages (sent and received) from LinkedIn via Unipile and refreshes the timeline immediately',
+      '- The button appears automatically on any lead that has a LinkedIn profile URL',
+      '- Also fixed: LinkedIn InMail events now display correctly as "LinkedIn InMail sent" instead of a raw event type string',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
       'Improved: Slack Suggest Sessions Now Show Sender Names Instead of User IDs',
       '- When an inbound Slack message mentions another person (e.g. "let me know if @Jane is available"), the mention now shows the person\'s display name instead of a raw Slack user ID like <@U0B0XGBEDT>',
       '- This applies to both the email notification and the session content Emma uses to draft a response',
