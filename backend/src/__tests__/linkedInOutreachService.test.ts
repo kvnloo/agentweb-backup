@@ -7,6 +7,12 @@ jest.mock('../utils/secretsManager');
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn()
+  },
+  // crmDb is used by the unipileSearchParamServiceFactory when searchPeople
+  // lazy-inits the resolver (worker-subprocess path).
+  crmDb: {
+    getEnrichmentCacheItem: jest.fn().mockResolvedValue(null),
+    putEnrichmentCacheItem: jest.fn().mockResolvedValue(undefined),
   }
 }));
 
@@ -489,13 +495,53 @@ describe('LinkedInOutreachService', () => {
 
       it('continues to work with no resolver registered (singleton not initialized)', async () => {
         __resetUnipileSearchParamServiceForTesting(); // clear singleton
+        // Resolver lazy-inits via the factory; the mocked Unipile request.send
+        // returns the default shape (no `items`), so resolveTopId normalizes to
+        // empty candidates and we fall back to free-text in advanced_keywords.
         await linkedInOutreachService.searchPeople('account-123', {
           keywords: 'engineer',
           company: 'Acme',
         });
-        const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
+        const calls = (mockUnipileClient.request.send as jest.Mock).mock.calls;
+        // The POST /linkedin/search call is the LAST one (resolver GETs come first).
+        const searchCall = calls.find(c => c[0]?.method === 'POST' && c[0]?.path?.[1] === 'search');
+        expect(searchCall).toBeDefined();
+        const sentBody = searchCall![0].body;
         expect(sentBody.company).toBeUndefined();
         expect(sentBody.advanced_keywords).toEqual({ company: 'Acme' });
+      });
+
+      // Regression test for the worker-subprocess bug: searchPeople used to
+      // import getUnipileSearchParamService from the bare service file (which
+      // throws when the singleton isn't pre-initialized). In a forked worker
+      // (e.g. generateMarketingResponseWorker) the singleton was never set, so
+      // the resolver always silently returned null and free-text fell through
+      // to Unipile's weak advanced_keywords match. Caught in production by
+      // Playwright when an SF-Bay-Area location filter returned mostly Seattle
+      // and NYC leads. The fix routes the import through the factory's lazy
+      // getter so the singleton initializes on first access.
+      it('lazy-inits the resolver via the factory when singleton is unset (worker subprocess path)', async () => {
+        __resetUnipileSearchParamServiceForTesting(); // simulate fresh worker
+        // Mock ONE call (the resolver's GET /search/parameters) to return a real
+        // candidate; THEN the search call gets the default empty shape.
+        (mockUnipileClient.request.send as jest.Mock)
+          .mockResolvedValueOnce({ items: [{ id: '90000084', title: 'San Francisco Bay Area' }] })
+          .mockResolvedValueOnce({ object: 'SearchResults', items: [], cursor: null });
+
+        await linkedInOutreachService.searchPeople('account-123', {
+          location: 'San Francisco Bay Area',
+        });
+
+        const calls = (mockUnipileClient.request.send as jest.Mock).mock.calls;
+        // First call: GET /linkedin/search/parameters (resolver lazy-init)
+        expect(calls[0][0]).toMatchObject({
+          method: 'GET',
+          path: ['linkedin', 'search', 'parameters'],
+          parameters: expect.objectContaining({ type: 'LOCATION', keywords: 'San Francisco Bay Area' }),
+        });
+        // Second call: POST /linkedin/search with the resolved id at top-level body.location
+        expect(calls[1][0].body.location).toEqual(['90000084']);
+        expect(calls[1][0].body.advanced_keywords?.location).toBeUndefined();
       });
     });
 

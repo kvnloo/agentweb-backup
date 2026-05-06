@@ -520,7 +520,11 @@ export class LinkedInOutreachService {
     accountId: string,
   ): Promise<string | null> {
     try {
-      const { getUnipileSearchParamService } = await import('./unipileSearchParamService');
+      // Use the factory's lazy-init getter, not the bare service's throwing
+      // getter. The factory transparently constructs the singleton in forked
+      // worker subprocesses (e.g. generateMarketingResponseWorker) where
+      // server.ts's boot wiring never runs.
+      const { getUnipileSearchParamService } = await import('./unipileSearchParamServiceFactory');
       const svc = getUnipileSearchParamService();
       const id = await svc.resolveTopId(accountId, { type, keywords });
       return id ?? null;
