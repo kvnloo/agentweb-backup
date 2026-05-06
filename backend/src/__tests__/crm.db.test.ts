@@ -860,6 +860,121 @@ describe('CRM Database Service', () => {
       expect(result.successCount).toBe(1);
       expect(mockDocumentClientMethods.update).toHaveBeenCalled();
     });
+
+    // Fix 2: dedup against existing leads' LinkedIn URL (in addition to email).
+    // Caught in production: Emma's import_leads_from_search produced 21 leads
+    // that overlapped with existing list members on LinkedIn URL but had no
+    // email — bypassing the email-only dedup and inserting duplicates.
+    describe('LinkedIn URL deduplication', () => {
+      it('merges incoming lead with existing lead when LinkedIn URLs match (different format)', async () => {
+        const listId = 'list_123';
+        const leads = [
+          // No email; LinkedIn URL with trailing slash + http scheme
+          { firstName: 'New', linkedin: 'http://linkedin.com/in/jdoe/' },
+        ];
+
+        // Existing lead has the canonical form: https://www.linkedin.com/in/jdoe
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Items: [
+              { leadId: 'lead1', listId, email: 'old@example.com', linkedin: 'https://www.linkedin.com/in/jdoe', firstName: 'Old' },
+            ],
+          }),
+        });
+        mockDocumentClientMethods.update.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Attributes: { leadId: 'lead1', listId, firstName: 'New' },
+          }),
+        });
+        mockDocumentClientMethods.get.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+        });
+
+        const result = await crmDb.batchCreateLeads(listId, leads);
+
+        expect(result.mergedCount).toBe(1);
+        expect(result.newCount).toBe(0);
+        // No new lead written via batchWrite — would have been a dup
+        expect(mockDocumentClientMethods.batchWrite).not.toHaveBeenCalled();
+      });
+
+      it('treats two incoming leads with same normalized LinkedIn URL as one (within-batch dedup)', async () => {
+        const listId = 'list_123';
+        const leads = [
+          { firstName: 'A', linkedin: 'https://www.linkedin.com/in/jdoe' },
+          { firstName: 'B', linkedin: 'https://linkedin.com/in/jdoe/' },  // same person, different format
+        ];
+
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Items: [] }),
+        });
+        mockDocumentClientMethods.batchWrite.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({}),
+        });
+        mockDocumentClientMethods.get.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+        });
+
+        const result = await crmDb.batchCreateLeads(listId, leads);
+
+        // Only ONE unique lead should be written
+        const batchCall = mockDocumentClientMethods.batchWrite.mock.calls[0]?.[0];
+        const writes = batchCall?.RequestItems?.[Object.keys(batchCall.RequestItems)[0]] ?? [];
+        expect(writes.length).toBe(1);
+        expect(result.successCount).toBe(1);
+      });
+
+      it('stores the canonical normalized LinkedIn URL on write so future reads are clean', async () => {
+        const listId = 'list_123';
+        const leads = [
+          { firstName: 'A', linkedin: 'http://LinkedIn.com/in/JDoe/?ref=foo' },
+        ];
+
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Items: [] }),
+        });
+        mockDocumentClientMethods.batchWrite.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({}),
+        });
+        mockDocumentClientMethods.get.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+        });
+
+        await crmDb.batchCreateLeads(listId, leads);
+
+        const batchCall = mockDocumentClientMethods.batchWrite.mock.calls[0][0];
+        const tableKey = Object.keys(batchCall.RequestItems)[0];
+        const stored = batchCall.RequestItems[tableKey][0].PutRequest.Item;
+        expect(stored.linkedin).toBe('https://www.linkedin.com/in/jdoe');
+      });
+
+      it('does not match leads whose linkedin field is empty', async () => {
+        const listId = 'list_123';
+        const leads = [
+          { firstName: 'A', linkedin: '' },
+          { firstName: 'B' },  // no linkedin at all
+        ];
+
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Items: [
+              { leadId: 'lead1', listId, email: 'x@y.com', linkedin: '' },
+            ],
+          }),
+        });
+        mockDocumentClientMethods.batchWrite.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({}),
+        });
+        mockDocumentClientMethods.get.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+        });
+
+        const result = await crmDb.batchCreateLeads(listId, leads);
+
+        // Both incoming should be inserted — empty-linkedin shouldn't merge to anything
+        expect(result.successCount).toBe(2);
+      });
+    });
   });
 
   describe('getLeadEngagements', () => {

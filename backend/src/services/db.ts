@@ -8,6 +8,7 @@ import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSch
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
+import { normalizeLinkedInUrl } from "./enrichmentGroups";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -4879,24 +4880,31 @@ export const crmDb = {
         lastKey = result.lastEvaluatedKey;
       } while (lastKey);
 
-      // Create a map of existing leads by email for quick lookup
+      // Build dedup maps keyed by both email AND normalized LinkedIn URL.
+      // Same person can appear with no email but a LinkedIn URL (typical for
+      // Unipile-sourced leads), or vice versa — both axes must dedup or
+      // imports inflate the list with duplicates.
       const existingLeadsByEmail = new Map<string, any>();
+      const existingLeadsByLinkedIn = new Map<string, any>();
       allExistingLeads.forEach(lead => {
         if (lead.email && lead.email.trim()) {
           existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
         }
+        const liKey = normalizeLinkedInUrl(lead.linkedin);
+        if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
       });
 
       // Separate leads into new leads and leads to update
       const newLeads: typeof leads = [];
       const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
 
-      // Deduplicate leads within the upload by email (case-insensitive)
+      // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
       const uniqueLeads = new Map<string, typeof leads[0]>();
+      const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
+        const liKey = normalizeLinkedInUrl(lead.linkedin);
 
-        // Only deduplicate if email is provided
         if (lead.email && lead.email.trim()) {
           if (uniqueLeads.has(emailKey)) {
             results.errorCount++;
@@ -4904,12 +4912,31 @@ export const crmDb = {
             return;
           }
 
-          // Check against existing leads - if exists, mark for update instead of error
+          // Check against existing leads — if exists, mark for update instead of error
           const existingLead = existingLeadsByEmail.get(emailKey);
           if (existingLead) {
             leadsToUpdate.push({ existingLead, newData: lead });
-            return; // Skip adding to uniqueLeads, will be handled separately
+            return;
           }
+        }
+
+        // LinkedIn URL dedup — covers the case where email is missing or
+        // both leads share a URL even if their emails differ.
+        if (liKey) {
+          // Within-batch dedup: skip if we've already seen this normalized URL.
+          if (seenLinkedIn.has(liKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate LinkedIn URL "${lead.linkedin}" found in upload data`);
+            return;
+          }
+          // Existing-list dedup: same URL → merge into existing lead.
+          const existingByLi = existingLeadsByLinkedIn.get(liKey);
+          if (existingByLi) {
+            leadsToUpdate.push({ existingLead: existingByLi, newData: lead });
+            seenLinkedIn.add(liKey);
+            return;
+          }
+          seenLinkedIn.add(liKey);
         }
 
         uniqueLeads.set(emailKey, lead);
@@ -4940,7 +4967,9 @@ export const crmDb = {
             company: lead.company || '',
             title: lead.title || '',
             notes: lead.notes || '',
-            linkedin: lead.linkedin?.trim() || '',
+            // Store LinkedIn URL in canonical form so future dedup reads match
+            // regardless of the source's formatting (Unipile, CSV upload, manual entry).
+            linkedin: normalizeLinkedInUrl(lead.linkedin),
             customFields: lead.customFields || {},
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array

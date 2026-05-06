@@ -218,6 +218,26 @@ export function normalizeCompanyName(name: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
+/**
+ * Canonicalize a LinkedIn profile URL so dedup keys don't depend on
+ * scheme / www / trailing slash / query string variants. Used by
+ * batchCreateLeads to merge incoming leads against existing rows when only
+ * the LinkedIn URL is shared (no email).
+ *
+ * Returns '' for empty/non-string input so callers can use it as a
+ * truthy check without a separate guard.
+ */
+export function normalizeLinkedInUrl(url: string | null | undefined): string {
+  if (!url || typeof url !== 'string') return '';
+  const trimmed = url.trim().toLowerCase();
+  if (!trimmed) return '';
+  return trimmed
+    .replace(/^https?:\/\/(?:www\.)?/, 'https://www.')   // canonical scheme + www
+    .split('?')[0]                                        // drop query (miniProfileUrn etc.)
+    .split('#')[0]                                        // drop fragment
+    .replace(/\/+$/, '');                                 // drop any trailing slashes
+}
+
 function normalizeName(name: string): string {
   return name
     .toLowerCase()

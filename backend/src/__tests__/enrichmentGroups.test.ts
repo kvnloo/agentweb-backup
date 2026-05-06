@@ -6,8 +6,69 @@ import {
   toCanonicalId,
   toFieldGroupSk,
   FIELD_GROUPS,
+  normalizeLinkedInUrl,
   type LeadInfo,
 } from '../services/enrichmentGroups';
+
+// ─── normalizeLinkedInUrl ─────────────────────────────────────────────────────
+// Used by batchCreateLeads to dedup leads whose LinkedIn URLs differ only by
+// trailing slash, scheme (http vs https), www subdomain, or query/fragment
+// (e.g. miniProfileUrn that Unipile sometimes appends).
+
+describe('normalizeLinkedInUrl', () => {
+  it('returns empty string for null/undefined/non-string', () => {
+    expect(normalizeLinkedInUrl(null)).toBe('');
+    expect(normalizeLinkedInUrl(undefined)).toBe('');
+    expect(normalizeLinkedInUrl('' as any)).toBe('');
+    expect(normalizeLinkedInUrl(42 as any)).toBe('');
+  });
+
+  it('strips trailing slash', () => {
+    expect(normalizeLinkedInUrl('https://www.linkedin.com/in/jdoe/'))
+      .toBe('https://www.linkedin.com/in/jdoe');
+  });
+
+  it('canonicalizes scheme to https', () => {
+    expect(normalizeLinkedInUrl('http://www.linkedin.com/in/jdoe'))
+      .toBe('https://www.linkedin.com/in/jdoe');
+  });
+
+  it('adds www when missing', () => {
+    expect(normalizeLinkedInUrl('https://linkedin.com/in/jdoe'))
+      .toBe('https://www.linkedin.com/in/jdoe');
+  });
+
+  it('strips query string (e.g. miniProfileUrn)', () => {
+    expect(normalizeLinkedInUrl('https://www.linkedin.com/in/jdoe?miniProfileUrn=xyz'))
+      .toBe('https://www.linkedin.com/in/jdoe');
+  });
+
+  it('strips fragment', () => {
+    expect(normalizeLinkedInUrl('https://www.linkedin.com/in/jdoe#about'))
+      .toBe('https://www.linkedin.com/in/jdoe');
+  });
+
+  it('lowercases the URL', () => {
+    expect(normalizeLinkedInUrl('https://www.LinkedIn.com/in/JDoe'))
+      .toBe('https://www.linkedin.com/in/jdoe');
+  });
+
+  it('all the variants converge to the same canonical form', () => {
+    const variants = [
+      'https://www.linkedin.com/in/jdoe',
+      'https://www.linkedin.com/in/jdoe/',
+      'http://www.linkedin.com/in/jdoe',
+      'https://linkedin.com/in/jdoe',
+      'http://linkedin.com/in/jdoe/',
+      'https://www.linkedin.com/in/jdoe?miniProfileUrn=urn:li:fs_miniProfile:xyz',
+      '  https://www.LINKEDIN.com/in/JDoe/  ',
+    ];
+    const canonical = normalizeLinkedInUrl(variants[0]);
+    for (const v of variants) {
+      expect(normalizeLinkedInUrl(v)).toBe(canonical);
+    }
+  });
+});
 
 // ─── buildCompanyCanonicalKey ─────────────────────────────────────────────────
 
