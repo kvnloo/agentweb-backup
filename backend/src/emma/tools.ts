@@ -6637,9 +6637,13 @@ emmaToolRegistry.register({
 Uses the user's connected LinkedIn account if available, otherwise falls back to platform-wide outreach accounts — so this works even without a personal LinkedIn connection.
 
 Use this when the user wants to:
-- Find leads matching a job title, company, or keyword
+- Find leads matching a job title, company, location, industry, school, or keyword
 - Populate a CRM list with discovered prospects
 - Discover new contacts to reach out to
+
+Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend (via the search-parameter resolver), giving precise structured filtering. Pass keywords ONLY for free-text broad search — when you have structured filters, the backend handles Unipile's keyword requirement transparently.
+
+For more than ~30 results from a single query, use the cursor returned in the response to paginate through subsequent pages.
 
 After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
     inputSchema: {
@@ -6651,19 +6655,51 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
         },
         keywords: {
           type: 'string',
-          description: 'Free-text search keywords (e.g. "software engineer San Francisco").'
+          description: 'Optional free-text search keywords. Omit when using structured filters — the backend will synthesize a keyword from your most-specific filter (title > company > location > industry > school) so the Unipile classic-search keyword requirement is satisfied transparently.'
         },
         title: {
           type: 'string',
-          description: 'Job title filter (e.g. "CTO", "VP Sales"). Combined with keywords/company for targeted search.'
+          description: 'Job title filter (e.g. "CTO", "VP Sales").'
         },
         company: {
           type: 'string',
-          description: 'Company name filter. Combined with title/keywords for targeted search.'
+          description: 'Company name filter — free text, auto-resolved to a LinkedIn company id if no company_id is provided.'
+        },
+        company_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn company entity ID — when provided, skips the resolver.'
+        },
+        location: {
+          type: 'string',
+          description: 'Location filter — free text (e.g. "San Francisco Bay Area"), auto-resolved to a LinkedIn location entity id if no location_id is provided.'
+        },
+        location_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn location entity ID — when provided, skips the resolver.'
+        },
+        industry: {
+          type: 'string',
+          description: 'Industry filter — free text, auto-resolved to a LinkedIn industry entity id if no industry_id is provided.'
+        },
+        industry_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn industry entity ID — when provided, skips the resolver.'
+        },
+        school: {
+          type: 'string',
+          description: 'School filter — free text, auto-resolved to a LinkedIn school entity id if no school_id is provided.'
+        },
+        school_id: {
+          type: 'string',
+          description: 'Optional pre-resolved LinkedIn school entity ID — when provided, skips the resolver.'
         },
         search_url: {
           type: 'string',
-          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company.'
+          description: 'A LinkedIn search URL copied from the browser. Overrides keywords/title/company/etc.'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor for fetching the next page of results from a previous import_leads_from_search call. Use the cursor value returned in the previous response to fetch the next ~30 results from the same query.'
         },
         limit: {
           type: 'number',
@@ -6682,6 +6718,14 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
       search_url: args.search_url,
       title: args.title,
       company: args.company,
+      company_id: args.company_id,
+      location: args.location,
+      location_id: args.location_id,
+      industry: args.industry,
+      industry_id: args.industry_id,
+      school: args.school,
+      school_id: args.school_id,
+      cursor: args.cursor,
       limit,
     });
   }

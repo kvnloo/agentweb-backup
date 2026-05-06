@@ -21193,14 +21193,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     search_url?: string;
     title?: string;
     company?: string;
+    company_id?: string;
+    location?: string;
+    location_id?: string;
+    industry?: string;
+    industry_id?: string;
+    school?: string;
+    school_id?: string;
+    cursor?: string;
     limit?: number;
     auto_enrich?: boolean;
   }): Promise<any> {
-    const { listId, keywords, search_url, title, company, limit = 20, auto_enrich = false } = args;
+    const {
+      listId, keywords, search_url, title, company, company_id,
+      location, location_id, industry, industry_id, school, school_id,
+      cursor, limit = 20, auto_enrich = false,
+    } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
-    if (!keywords && !search_url && !title && !company) {
-      return { success: false, error: 'At least one search filter is required: keywords, search_url, title, or company' };
+    // Accept any of: keywords / search_url / cursor / structured filter.
+    // Mirrors the search-people handler gate after Stage 2 + the keyword-synth fix.
+    const hasFilter = !!(title || company || company_id
+      || location || location_id || industry || industry_id || school || school_id);
+    if (!keywords && !search_url && !cursor && !hasFilter) {
+      return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
     }
 
     // Resolve account: user's own or platform-wide fallback
@@ -21212,12 +21228,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       };
     }
 
-    // Search for people
+    // Search for people. The structured filters (location/industry/school) are
+    // auto-resolved to LinkedIn entity IDs by linkedInOutreachService when only
+    // free text is supplied; pre-resolved *_id always wins. cursor enables
+    // pagination through a single query.
     const searchResult = await linkedInOutreachService.searchPeople(accountId, {
       keywords,
       url: search_url,
       title,
       company,
+      company_id,
+      location,
+      location_id,
+      industry,
+      industry_id,
+      school,
+      school_id,
+      cursor,
     });
 
     if (!searchResult?.items?.length) {
