@@ -36,6 +36,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-06',
+    changes: [
+      'Fix: Data Analysis Tool Now Fails Gracefully on Large or Misrouted Datasets',
+      '- The perform_data_analysis tool now detects when Python code references local file paths or tool-response paths and immediately returns a clear error explaining that the sandbox is remote and isolated',
+      '- Previously, the tool would silently fail or return simulated results when given paths it could not access, causing the agent to retry the same broken call repeatedly',
+      '- The tool description and parameter docs have been updated to make clear that all data must arrive via file_urls (S3 URLs) or inline in analysis_instruction — not via local paths',
+      '- For large datasets, the correct workflow is: use save_file to upload the data and get an S3 URL, then pass that URL in file_urls',
+    ],
+  },
+  {
     date: '2026-05-04',
     changes: [
       'Fix: Emma now pauses all ads when asked, including ads whose parent campaign is already paused',

@@ -4912,6 +4912,28 @@ export class AgentModeService {
         };
       }
 
+      // Reject oversized instructions early so the LLM can self-correct rather than sending a
+      // payload that will be rejected and cause it to simulate results.
+      const MAX_INLINE_INSTRUCTION_CHARS = 200_000; // ~50K tokens — well within Gemini's 1M context
+      if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
+        return {
+          success: false,
+          message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). The dataset embedded in the instruction is too large to send inline. Please use the save_file tool first to upload the dataset as a .csv or .txt file, then call perform_data_analysis again with the returned file URL in the file_urls parameter and a concise analysis_instruction describing what to analyze.`
+        };
+      }
+
+      // Gemini code execution runs in a remote isolated sandbox — it cannot access local file paths
+      // or S3-offloaded tool response paths from previous tool calls. Detect this pattern early so
+      // the LLM knows all data must arrive via file_urls or embedded in analysis_instruction.
+      const localPathPattern = /(?:open|read|load)\s*\(\s*['"`]\/|with open\(['"`]\//i;
+      const s3KeyPathPattern = /tool-responses\/[a-z0-9-]{36}\//i;
+      if (localPathPattern.test(analysisInstruction) || s3KeyPathPattern.test(analysisInstruction)) {
+        return {
+          success: false,
+          message: `The analysis_instruction references local file paths or tool-response paths (e.g. open('/home/bard/...') or tool-responses/...). The code execution sandbox is remote and isolated — it has no access to any local files or previous tool responses. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
+        };
+      }
+
       // Get Gemini API key from Secrets Manager
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
       const geminiSecretName = environment === 'prod'
@@ -5152,10 +5174,21 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error performing data analysis:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const statusCode = (error as any)?.response?.status;
+      const isPayloadTooLarge = statusCode === 413 ||
+        /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
+      if (isPayloadTooLarge) {
+        return {
+          success: false,
+          message: `The data payload sent to Gemini was too large. Please use the save_file tool to upload the dataset as a .csv or .txt file first, then call perform_data_analysis with the returned file URL in the file_urls parameter instead of embedding the data inline.`,
+          error: errorMessage
+        };
+      }
       return {
         success: false,
         message: 'Failed to perform data analysis. Please check that the file URLs are accessible.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: errorMessage
       };
     }
   }
