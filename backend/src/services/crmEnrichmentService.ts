@@ -27,6 +27,21 @@ import { runSpecialists } from './enrichmentSpecialists';
 import { normalizeEnrichmentFieldConfig } from './enrichmentFieldConfig';
 import { resolveFieldAliases } from './enrichmentFieldAliasService';
 import { getOrCreateClustersForFields, type FieldCluster } from './enrichmentClusterService';
+import { getUnipileSearchParamService } from './unipileSearchParamService';
+import { enrichLog } from '../utils/enrichmentLogger';
+
+/**
+ * Stage 3 rollout flag — gates the LinkedIn company-id resolver + confidence
+ * scoring path inside gatherLinkedInContext. Default is ON outside production
+ * so dev/staging see the new behavior; prod stays on the legacy blind-items[0]
+ * path until the flag is explicitly enabled.
+ */
+function isLinkedInIdResolutionEnabled(): boolean {
+  const v = process.env.CRM_USE_LINKEDIN_ID_RESOLUTION;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return process.env.NODE_ENV !== 'production';
+}
 
 /** LinkedIn API has stricter rate limits */
 const PARALLELISM_WITH_LINKEDIN = 5;
@@ -671,11 +686,22 @@ export class CrmEnrichmentService {
     spec: EnrichmentJobSpec,
     linkedInAccountId: string,
     isEnrichingLinkedin: boolean
-  ): Promise<{ linkedinContext: string; rawProfile: Record<string, unknown> | null; publicIdentifier: string | null; profileId: string | null }> {
+  ): Promise<{
+    linkedinContext: string;
+    rawProfile: Record<string, unknown> | null;
+    publicIdentifier: string | null;
+    profileId: string | null;
+    /** 'high' = picked candidate matches resolved company_id; 'low' = fallback /
+     *  resolver miss / no match; 'unspecified' = legacy path (flag off). */
+    confidence: 'high' | 'low' | 'unspecified';
+  }> {
     let linkedinContext = '';
     let rawProfile: Record<string, unknown> | null = null;
     let publicIdentifier: string | null = null;
     let profileId: string | null = null;
+    let confidence: 'high' | 'low' | 'unspecified' = 'unspecified';
+
+    const useIdResolution = isLinkedInIdResolutionEnabled();
 
     try {
       const linkedinUrl = lead.linkedin ? String(lead.linkedin).trim() : '';
@@ -699,22 +725,84 @@ export class CrmEnrichmentService {
         const company = existingCompany || domainCompany;
 
         if (name && company) {
-          const searchResult = await agentModeService.linkedinOutreach(spec.userId, {
+          // ── Stage 3: resolve company → company_id and pick the matching
+          // candidate. Resolver failures degrade gracefully to the legacy
+          // free-text path with confidence='low'. If the resolver singleton
+          // isn't initialized at all (test env or pre-Stage-3 deploy), fully
+          // fall back to the legacy unspecified-confidence path.
+          let resolvedCompanyId: string | null = null;
+          let resolverActive = useIdResolution;
+          if (useIdResolution) {
+            try {
+              resolvedCompanyId = await getUnipileSearchParamService().resolveTopId(
+                linkedInAccountId,
+                { type: 'COMPANY', keywords: company },
+              );
+            } catch (err: any) {
+              if (typeof err?.message === 'string' && err.message.includes('not initialized')) {
+                resolverActive = false;
+              } else {
+                console.warn(`[CrmEnrichment][LinkedIn] company-id resolver failed for lead ${lead?.leadId}: ${err?.message}`);
+              }
+              resolvedCompanyId = null;
+            }
+          }
+
+          const searchArgs: Record<string, unknown> = {
             action: 'search-people',
             account_id: linkedInAccountId,
-            keywords: `${name} ${company}`,
-          });
+          };
+          if (resolverActive && resolvedCompanyId) {
+            searchArgs.keywords = name;
+            searchArgs.company_id = resolvedCompanyId;
+          } else {
+            // Legacy path (flag off OR resolver miss OR resolver uninitialized)
+            // — preserves existing behavior.
+            searchArgs.keywords = `${name} ${company}`;
+          }
+
+          const searchResult = await agentModeService.linkedinOutreach(spec.userId, searchArgs as any);
           const items = searchResult?.data?.items || [];
-          const topResult = items[0];
-          if (topResult?.provider_id) {
+
+          // ── Selection logic (replaces blind items[0]) ─────────────────────
+          let pickedItem: any = null;
+          if (resolverActive) {
+            if (resolvedCompanyId) {
+              const matched = items.find((it: any) => it?.current_role?.company?.id === resolvedCompanyId);
+              if (matched) {
+                pickedItem = matched;
+                confidence = 'high';
+              } else {
+                pickedItem = items[0] ?? null;
+                confidence = 'low';
+              }
+            } else {
+              pickedItem = items[0] ?? null;
+              confidence = 'low';
+            }
+            if (confidence === 'low') {
+              enrichLog.warn({
+                event: 'linkedin_context_low_confidence',
+                leadId: lead?.leadId,
+                company,
+                candidateCount: items.length,
+                resolvedCompanyId,
+              });
+            }
+          } else {
+            pickedItem = items[0] ?? null;
+            // confidence stays 'unspecified' in legacy / uninitialized path
+          }
+
+          if (pickedItem?.provider_id) {
             const profileResult = await agentModeService.linkedinOutreach(spec.userId, {
               action: 'get-profile',
               account_id: linkedInAccountId,
-              provider_id: topResult.provider_id,
+              provider_id: pickedItem.provider_id,
             });
             if (profileResult?.success) profileData = profileResult.data;
-          } else if (topResult?.public_identifier || topResult?.public_profile_url) {
-            profileData = topResult;
+          } else if (pickedItem?.public_identifier || pickedItem?.public_profile_url) {
+            profileData = pickedItem;
           }
         }
       }
@@ -724,22 +812,30 @@ export class CrmEnrichmentService {
         publicIdentifier = profileData?.public_identifier ?? null;
         profileId = profileData?.provider_id ?? null;
 
-        const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
-        const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
-        const profileUrl = publicIdentifier
-          ? `https://www.linkedin.com/in/${publicIdentifier}`
-          : cleanUrl;
-        linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
-        if (profileUrl && isEnrichingLinkedin) {
-          linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
+        if (confidence === 'low') {
+          // Drop Unipile-derived structured fields and the resolved profile URL
+          // from the LLM context — wrong-company contamination would corrupt
+          // downstream extraction. Web-search-regex URLs (added later in
+          // enrichLead) are independent and survive.
+          linkedinContext = '';
+        } else {
+          const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
+          const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
+          const profileUrl = publicIdentifier
+            ? `https://www.linkedin.com/in/${publicIdentifier}`
+            : cleanUrl;
+          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
+          if (profileUrl && isEnrichingLinkedin) {
+            linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
+          }
         }
-      } else if (isEnrichingLinkedin && isValidLinkedInUrl) {
+      } else if (isEnrichingLinkedin && isValidLinkedInUrl && confidence !== 'low') {
         linkedinContext = `\n\nResolved LinkedIn profile URL: ${linkedinUrl}`;
       }
     } catch (err: any) {
       console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);
     }
-    return { linkedinContext, rawProfile, publicIdentifier, profileId };
+    return { linkedinContext, rawProfile, publicIdentifier, profileId, confidence };
   }
 
   private buildLeadContext(lead: LeadRecord, isEnrichingLinkedin: boolean): Record<string, string> {
@@ -1193,12 +1289,14 @@ export class CrmEnrichmentService {
         linkedinCtx = buildLinkedInContextFromCache(cachedLinkedinData, isEnrichingLinkedin);
       } else {
         console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext START lead=${lead.leadId}`);
-        const { linkedinContext: ctx, rawProfile, publicIdentifier, profileId } =
+        const { linkedinContext: ctx, rawProfile, publicIdentifier, profileId, confidence } =
           await this.gatherLinkedInContext(lead, spec, linkedInAccountId, isEnrichingLinkedin);
         linkedinCtx = ctx;
-        console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinCtx.length} elapsed=${Date.now()-t0}ms`);
+        console.log(`[CrmEnrichment][enrichLead] gatherLinkedInContext DONE lead=${lead.leadId} contextLen=${linkedinCtx.length} confidence=${confidence} elapsed=${Date.now()-t0}ms`);
 
-        if (linkedinCacheEligible && rawProfile) {
+        // Don't cache low-confidence (wrong-company) profile data — that would
+        // poison future enrichment runs for this lead.
+        if (linkedinCacheEligible && rawProfile && confidence !== 'low') {
           const rawCacheData: RawCacheData = {
             webResults: [],
             linkedinCompanyResults: null,

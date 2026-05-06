@@ -2446,3 +2446,275 @@ describe('CrmEnrichmentService - citation verification', () => {
     expect(cf.funding_stage).toBeNull();        // unsupported → rejected
   });
 });
+
+// ─── Stage 3: LinkedIn confidence scoring via company-id resolver ─────────────
+
+describe('CrmEnrichmentService - LinkedIn confidence scoring (Stage 3)', () => {
+  const {
+    setUnipileSearchParamServiceForTesting,
+    __resetUnipileSearchParamServiceForTesting,
+  } = require('../services/unipileSearchParamService');
+  const enrichmentLogger = require('../utils/enrichmentLogger');
+
+  let service: CrmEnrichmentService;
+  let warnSpy: jest.SpyInstance;
+  let originalFlag: string | undefined;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    originalFlag = process.env.CRM_USE_LINKEDIN_ID_RESOLUTION;
+    warnSpy = jest.spyOn(enrichmentLogger.enrichLog, 'warn').mockImplementation(() => {});
+    __resetUnipileSearchParamServiceForTesting();
+  });
+
+  afterEach(() => {
+    if (originalFlag === undefined) delete process.env.CRM_USE_LINKEDIN_ID_RESOLUTION;
+    else process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = originalFlag;
+    warnSpy.mockRestore();
+    __resetUnipileSearchParamServiceForTesting();
+  });
+
+  function setupSearchPeopleJob(opts: {
+    leadOverrides?: any;
+    searchPeopleItems: any[];
+  }) {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead(opts.leadOverrides ?? {})],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    mockGetAccountsByUserId.mockResolvedValue([
+      { account_id: 'acc1', platform: 'unipile' },
+    ] as any);
+    // search-people → first call returns items; if a get-profile is invoked
+    // afterwards we satisfy it with a basic profile shape.
+    mockAgentModeService.linkedinOutreach
+      .mockResolvedValueOnce({ success: true, data: { items: opts.searchPeopleItems } })
+      .mockResolvedValue({ success: true, data: { public_identifier: 'picked', headline: 'CEO' } });
+
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ seniority: 'C-level' }));
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+  }
+
+  function buildSpec(): EnrichmentJobSpec {
+    return {
+      listId: 'list1',
+      userId: 'user1',
+      instruction: 'Determine seniority',
+      outputFields: ['seniority'],
+      sources: ['linkedin'],
+      sourcesPerField: { seniority: ['linkedin'] },
+    };
+  }
+
+  function setupResolver(returnValue: { topId: string | null; throws?: boolean }) {
+    const resolveTopId = returnValue.throws
+      ? jest.fn().mockRejectedValue(new Error('resolver boom'))
+      : jest.fn().mockResolvedValue(returnValue.topId);
+    setUnipileSearchParamServiceForTesting({ resolveTopId } as any);
+    return resolveTopId;
+  }
+
+  function lastUserMessageAcrossLLMCalls(): string {
+    return mockGeminiCreate.mock.calls
+      .map((call: any[]) => (call[0].messages.find((m: any) => m.role === 'user')?.content) || '')
+      .join('\n---\n');
+  }
+
+  it('flag OFF → preserves blind items[0] behavior, no resolver call, confidence=unspecified', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'false';
+    const resolveTopId = setupResolver({ topId: 'company-acme-id' });
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'p1', current_role: { company: { id: 'wrong-co' } } },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+    expect(resolveTopId).not.toHaveBeenCalled();
+
+    // No low-confidence warning emitted in legacy path
+    const warnEvents = warnSpy.mock.calls.map((c: any[]) => c[0]?.event);
+    expect(warnEvents).not.toContain('linkedin_context_low_confidence');
+
+    // search-people called with combined keywords (legacy free-text behavior)
+    expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+      'user1',
+      expect.objectContaining({
+        action: 'search-people',
+        keywords: 'John Doe Acme Corp',
+      }),
+    );
+  });
+
+  it('flag ON + resolver hit + matching candidate → confidence=high, correct profile fed to LLM', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    const resolveTopId = setupResolver({ topId: 'company-acme-id' });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'wrong', current_role: { company: { id: 'unrelated-co' } } },
+        { provider_id: 'right', current_role: { company: { id: 'company-acme-id' } }, public_identifier: 'right-person' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+    expect(resolveTopId).toHaveBeenCalledWith(
+      'acc1',
+      expect.objectContaining({ type: 'COMPANY', keywords: 'Acme Corp' }),
+    );
+
+    // search-people was passed company_id (Stage 2 will accept this field)
+    expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+      'user1',
+      expect.objectContaining({ action: 'search-people', company_id: 'company-acme-id' }),
+    );
+
+    // get-profile was invoked on the *matching* provider_id, not items[0]
+    expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+      'user1',
+      expect.objectContaining({ action: 'get-profile', provider_id: 'right' }),
+    );
+
+    // No low-confidence warning
+    const warnEvents = warnSpy.mock.calls.map((c: any[]) => c[0]?.event);
+    expect(warnEvents).not.toContain('linkedin_context_low_confidence');
+  });
+
+  it('flag ON + resolver hit + NO matching candidate → confidence=low, LinkedIn fields dropped from prompt, warn logged', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: 'company-acme-id' });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        // None of the candidates match the resolved company id
+        { provider_id: 'p1', public_identifier: 'wrong-1', current_role: { company: { id: 'co-x' } }, headline: 'Director', summary: 'Old summary' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+
+    // LLM prompt should NOT contain Unipile-derived structured fields
+    const allUserMsgs = lastUserMessageAcrossLLMCalls();
+    expect(allUserMsgs).not.toContain('LinkedIn profile data');
+    expect(allUserMsgs).not.toContain('Resolved LinkedIn profile URL');
+    expect(allUserMsgs).not.toContain('Old summary');
+
+    // Telemetry warn emitted
+    const lowConfWarn = warnSpy.mock.calls
+      .map((c: any[]) => c[0])
+      .find((f: any) => f?.event === 'linkedin_context_low_confidence');
+    expect(lowConfWarn).toBeDefined();
+    expect(lowConfWarn).toMatchObject({
+      event: 'linkedin_context_low_confidence',
+      company: 'Acme Corp',
+      candidateCount: 1,
+      resolvedCompanyId: 'company-acme-id',
+    });
+  });
+
+  it('flag ON + resolver returns null → confidence=low, LinkedIn fields dropped, warn logged', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: null });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'p1', public_identifier: 'maybe', current_role: { company: { id: 'co-x' } }, headline: 'CTO', summary: 'Bio' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    expect(result.processedCount).toBe(1);
+
+    const allUserMsgs = lastUserMessageAcrossLLMCalls();
+    expect(allUserMsgs).not.toContain('LinkedIn profile data');
+    expect(allUserMsgs).not.toContain('Bio');
+
+    const lowConfWarn = warnSpy.mock.calls
+      .map((c: any[]) => c[0])
+      .find((f: any) => f?.event === 'linkedin_context_low_confidence');
+    expect(lowConfWarn).toBeDefined();
+    expect(lowConfWarn?.resolvedCompanyId).toBeNull();
+  });
+
+  it('flag ON + resolver throws → confidence=low, enrichment still completes', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: null, throws: true });
+
+    setupSearchPeopleJob({
+      searchPeopleItems: [
+        { provider_id: 'p1', public_identifier: 'fallback', current_role: { company: { id: 'co-x' } }, headline: 'CTO' },
+      ],
+    });
+
+    const result = await service.execute(buildSpec());
+    // Enrichment still completes — resolver errors don't fail the lead
+    expect(result.processedCount).toBe(1);
+    expect(result.failedCount).toBe(0);
+
+    const lowConfWarn = warnSpy.mock.calls
+      .map((c: any[]) => c[0])
+      .find((f: any) => f?.event === 'linkedin_context_low_confidence');
+    expect(lowConfWarn).toBeDefined();
+  });
+
+  it('flag ON + low confidence: web-search-regex LinkedIn URLs from web context survive', async () => {
+    process.env.CRM_USE_LINKEDIN_ID_RESOLUTION = 'true';
+    setupResolver({ topId: 'company-acme-id' });
+
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead1' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+    mockGetAccountsByUserId.mockResolvedValue([
+      { account_id: 'acc1', platform: 'unipile' },
+    ] as any);
+
+    // Web search returns a snippet containing a LinkedIn URL — regex picks it up
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [
+        { title: 'John Doe', url: 'https://example.com', snippet: 'See https://www.linkedin.com/in/john-doe-from-web' },
+      ],
+    });
+    // search-people returns a candidate with WRONG company → low confidence
+    mockAgentModeService.linkedinOutreach
+      .mockResolvedValueOnce({ success: true, data: { items: [
+        { provider_id: 'wrong-p', public_identifier: 'wrong-p', current_role: { company: { id: 'co-x' } } },
+      ] } })
+      .mockResolvedValue({ success: true, data: { public_identifier: 'wrong-p', headline: 'X' } });
+
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/john-doe-from-web' }));
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1',
+      userId: 'user1',
+      instruction: 'Find the personal LinkedIn URL',
+      outputFields: ['linkedin_url'],
+      sources: ['web_search', 'linkedin'],
+      sourcesPerField: { linkedin_url: ['web_search', 'linkedin'] },
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+
+    // The web-search-regex URL must still appear in the prompt context
+    const allUserMsgs = lastUserMessageAcrossLLMCalls();
+    expect(allUserMsgs).toContain('john-doe-from-web');
+    // But Unipile-derived structured profile data must NOT
+    expect(allUserMsgs).not.toContain('LinkedIn profile data');
+  });
+});
