@@ -26,10 +26,13 @@ router.get("/metrics", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has SEO domains or GA Property ID configured
-    if ((!user.seoDomains || user.seoDomains.length === 0) && !user.googleAnalyticsPropertyId) {
-      return res.status(400).json({ 
-        message: "No SEO domains or Google Analytics Property ID configured. Please configure SEO/AEO settings in the admin panel." 
+    // Check if user has SEO domains or GA Property ID configured.
+    // When ?domain= is passed (e.g. from a landing page link) we still proceed so the
+    // frontend can show the "not configured yet" callout with setup instructions.
+    const domainFilterParam = (req.query.domain as string) || null;
+    if ((!user.seoDomains || user.seoDomains.length === 0) && !user.googleAnalyticsPropertyId && !domainFilterParam) {
+      return res.status(400).json({
+        message: "No SEO domains or Google Analytics Property ID configured. Please configure SEO/AEO settings in the admin panel."
       });
     }
 
@@ -44,8 +47,38 @@ router.get("/metrics", async (req, res) => {
     // Get timeframe from query parameter (default to 30d)
     const timeframe = (req.query.timeframe as string) || "30d";
 
+    // Optional: filter to a single domain (e.g., when navigating from a landing page card)
+    const domainFilter = (req.query.domain as string) || null;
+
+    // Helper to extract bare hostname from a domain entry (handles both "example.com" and "https://example.com")
+    function bareHost(d: string): string {
+      try { return new URL(d.startsWith("http") ? d : `https://${d}`).hostname; } catch { return d; }
+    }
+
+    // Filter seoDomains to only the requested domain if ?domain= is specified.
+    // Special case: if ?domain= is a subdomain of a managed root domain (e.g., foo.agentwebforms.com)
+    // and the root domain (agentwebforms.com) is configured, use the root domain entry but apply
+    // a GSC page filter to scope results to the specific subdomain.
+    let gscPageFilter: string | null = null; // hostname to use as GSC page dimensionFilter
+    const domainsToFetch: string[] = (() => {
+      if (!domainFilter) return (user.seoDomains || []);
+      const filtered = (user.seoDomains || []).filter((d: string) => bareHost(d) === bareHost(domainFilter));
+      if (filtered.length > 0) return filtered;
+      // No exact match — check if any configured domain is the parent of domainFilter
+      const parent = (user.seoDomains || []).find((d: string) => {
+        const h = bareHost(d);
+        return domainFilter.endsWith(`.${h}`);
+      });
+      if (parent) {
+        // Use the parent domain entry but filter GSC pages to just the subdomain
+        gscPageFilter = domainFilter;
+        return [parent];
+      }
+      return [];
+    })();
+
     // Fetch metrics for each domain
-    const metricsPromises = user.seoDomains.map(async (domain: string) => {
+    const metricsPromises = domainsToFetch.map(async (domain: string) => {
       try {
         // Format domain for Search Console API (sc-domain:example.com or https://example.com)
         console.log(`[GSC Fetch] Raw domain from DB: "${domain}"`);
@@ -84,7 +117,14 @@ router.get("/metrics", async (req, res) => {
         const daysInRange = Math.floor((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
 
         const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
-        
+
+        // When viewing a specific subdomain that lives under a managed root property (e.g.,
+        // foo.agentwebforms.com under sc-domain:agentwebforms.com), scope all GSC requests
+        // to pages whose URL contains that subdomain hostname.
+        const gscDimFilterGroups = gscPageFilter
+          ? [{ filters: [{ dimension: "page", operator: "contains", expression: gscPageFilter }] }]
+          : undefined;
+
         // Fetch daily data for timeline chart
         const dailyDataResponse = await fetch(searchAnalyticsUrl, {
           method: "POST",
@@ -97,6 +137,7 @@ router.get("/metrics", async (req, res) => {
             endDate: endDateStr,
             dimensions: ["date"],
             rowLimit: 25000, // Increased to ensure we get all daily data
+            ...(gscDimFilterGroups && { dimensionFilterGroups: gscDimFilterGroups }),
           }),
         });
 
@@ -142,6 +183,7 @@ router.get("/metrics", async (req, res) => {
             startDate: startDateStr,
             endDate: endDateStr,
             // No dimensions = overall totals (matches Google UI calculation exactly)
+            ...(gscDimFilterGroups && { dimensionFilterGroups: gscDimFilterGroups }),
           }),
         });
 
@@ -185,6 +227,7 @@ router.get("/metrics", async (req, res) => {
             endDate: endDateStr,
             dimensions: ["query"],
             rowLimit: 25000, // Increased to get all queries
+            ...(gscDimFilterGroups && { dimensionFilterGroups: gscDimFilterGroups }),
           }),
         });
 
@@ -234,6 +277,7 @@ router.get("/metrics", async (req, res) => {
             endDate: endDateStr,
             dimensions: ["page"],
             rowLimit: 25000, // Increased to get all pages
+            ...(gscDimFilterGroups && { dimensionFilterGroups: gscDimFilterGroups }),
           }),
         });
 
@@ -325,26 +369,36 @@ router.get("/metrics", async (req, res) => {
 
             const propertyId = property.propertyId;
 
-            // Build dimension filter to exclude filtered domains
+            // Build dimension filter to exclude filtered domains (and optionally include only one host)
             let dimensionFilter: any = undefined;
+            const filterExpressions: any[] = [];
+
             if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
-              const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
-                notExpression: {
-                  filter: {
-                    fieldName: "hostName",
-                    stringFilter: {
-                      matchType: "CONTAINS" as const,
-                      value: domain,
+              filterExpressions.push(
+                ...user.gaFilteredDomains.map((domain: string) => ({
+                  notExpression: {
+                    filter: {
+                      fieldName: "hostName",
+                      stringFilter: { matchType: "CONTAINS" as const, value: domain },
                     },
                   },
-                },
-              }));
+                }))
+              );
+            }
 
-              dimensionFilter = {
-                andGroup: {
-                  expressions: notExpressions,
+            if (domainFilter) {
+              filterExpressions.push({
+                filter: {
+                  fieldName: "hostName",
+                  stringFilter: { matchType: "EXACT" as const, value: bareHost(domainFilter) },
                 },
-              };
+              });
+            }
+
+            if (filterExpressions.length === 1) {
+              dimensionFilter = filterExpressions[0];
+            } else if (filterExpressions.length > 1) {
+              dimensionFilter = { andGroup: { expressions: filterExpressions } };
             }
 
             // Fetch overall metrics (basic metrics first)

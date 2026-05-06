@@ -684,3 +684,45 @@ export async function getAttioCredentials(): Promise<AttioCredentials> {
   }
 }
 
+export interface LandingPagesConfig {
+  ga4PropertyId: string;
+  gscDomain: string;
+}
+
+/**
+ * Get landing pages analytics config from AWS Secrets Manager.
+ * Used to auto-configure GSC domain and GA4 property when a landing page is deployed
+ * to a subdomain of the configured gscDomain (e.g., agentwebforms.com).
+ *
+ * Secret location: dev/AgentWeb/LandingPages (or prod/AgentWeb/LandingPages)
+ * Secret format: { "ga4PropertyId": "123456789", "gscDomain": "agentwebforms.com" }
+ *
+ * Returns null (non-throwing) if the secret does not exist or is inaccessible —
+ * the deploy succeeds regardless, just without auto-configuration.
+ */
+export async function getLandingPagesConfig(): Promise<LandingPagesConfig | null> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/LandingPages'
+      : 'dev/AgentWeb/LandingPages';
+
+    const secretString = await getSecret(secretName);
+    if (!secretString || secretString.trim() === '') {
+      console.warn('[LandingPages] Config secret is empty — skipping auto-configure');
+      return null;
+    }
+
+    const config = JSON.parse(secretString) as LandingPagesConfig;
+    if (!config.ga4PropertyId || !config.gscDomain) {
+      console.warn('[LandingPages] Config secret missing ga4PropertyId or gscDomain — skipping auto-configure');
+      return null;
+    }
+
+    return config;
+  } catch (error: any) {
+    console.warn(`[LandingPages] Could not load config from Secrets Manager — skipping auto-configure: ${error.message}`);
+    return null;
+  }
+}
+
