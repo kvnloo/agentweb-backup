@@ -20,6 +20,9 @@ import {
   TableHead,
   TableRow,
   TextField,
+  ToggleButton,
+  ToggleButtonGroup,
+  Tooltip,
   Typography,
   Alert,
   CircularProgress,
@@ -30,16 +33,22 @@ import {
   Delete as DeleteIcon,
   Save as SaveIcon,
   Cancel as CancelIcon,
+  CheckCircle as CheckCircleIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
+  Lock as LockIcon,
+  VisibilityOff as VisibilityOffIcon,
 } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../../config';
 import { useAuth } from '../../contexts/AuthContext';
 
+type PageAccessState = 'allowed' | 'locked' | 'hidden';
+
 interface SubscriptionType {
   name: string;
   allowedPages: string[];
+  hiddenPages?: string[];
   allowedSkills: string[];
   allowedConnectedAccounts?: string[];
   monthlyTokenAllowance?: number | null;
@@ -83,6 +92,7 @@ const SubscriptionTypesTab: React.FC = () => {
   const [formData, setFormData] = useState<SubscriptionType>({
     name: '',
     allowedPages: [],
+    hiddenPages: [],
     allowedSkills: [],
     allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
     monthlyTokenAllowance: null,
@@ -105,6 +115,7 @@ const SubscriptionTypesTab: React.FC = () => {
           setFormData((prev) => ({
             ...prev,
             allowedPages: availablePages.map((p) => p.path),
+            hiddenPages: [],
             allowedSkills: availableSkills.map((s) => s.skillId),
           }));
         }
@@ -203,6 +214,7 @@ const SubscriptionTypesTab: React.FC = () => {
       const expandedData: SubscriptionType = {
         name: type.name,
         allowedPages: normalizedPages,
+        hiddenPages: type.hiddenPages || [],
         allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
@@ -217,6 +229,7 @@ const SubscriptionTypesTab: React.FC = () => {
       setFormData({
         name: '',
         allowedPages: availablePages.map((p) => p.path),
+        hiddenPages: [],
         allowedSkills: availableSkills.map((s) => s.skillId),
         allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
         monthlyTokenAllowance: null,
@@ -233,6 +246,7 @@ const SubscriptionTypesTab: React.FC = () => {
     setFormData({
       name: '',
       allowedPages: [],
+      hiddenPages: [],
       allowedSkills: [],
       allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
       monthlyTokenAllowance: null,
@@ -267,6 +281,7 @@ const SubscriptionTypesTab: React.FC = () => {
           formData.allowedPages.length === availablePages.length && availablePages.length > 0
             ? ['*']
             : formData.allowedPages,
+        hiddenPages: formData.hiddenPages || [],
         allowedSkills:
           formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
             ? ['*']
@@ -335,26 +350,29 @@ const SubscriptionTypesTab: React.FC = () => {
     }
   };
 
-  const handleTogglePage = (pagePath: string) => {
-    const isSelected = formData.allowedPages.includes(pagePath);
-    if (isSelected) {
-      setFormData({
-        ...formData,
-        allowedPages: formData.allowedPages.filter((p) => p !== pagePath),
-      });
-    } else {
-      setFormData({
-        ...formData,
-        allowedPages: [...formData.allowedPages, pagePath],
-      });
-    }
+  const getPageAccessState = (pagePath: string): PageAccessState => {
+    if (formData.allowedPages.includes(pagePath)) return 'allowed';
+    if ((formData.hiddenPages || []).includes(pagePath)) return 'hidden';
+    return 'locked';
+  };
+
+  const handlePageAccessChange = (pagePath: string, newState: PageAccessState) => {
+    setFormData({
+      ...formData,
+      allowedPages: newState === 'allowed'
+        ? [...formData.allowedPages.filter((p) => p !== pagePath), pagePath]
+        : formData.allowedPages.filter((p) => p !== pagePath),
+      hiddenPages: newState === 'hidden'
+        ? [...(formData.hiddenPages || []).filter((p) => p !== pagePath), pagePath]
+        : (formData.hiddenPages || []).filter((p) => p !== pagePath),
+    });
   };
 
   const handleToggleAllPages = () => {
     if (formData.allowedPages.length === availablePages.length) {
-      setFormData({ ...formData, allowedPages: [] });
+      setFormData({ ...formData, allowedPages: [], hiddenPages: [] });
     } else {
-      setFormData({ ...formData, allowedPages: availablePages.map((p) => p.path) });
+      setFormData({ ...formData, allowedPages: availablePages.map((p) => p.path), hiddenPages: [] });
     }
   };
 
@@ -597,59 +615,96 @@ const SubscriptionTypesTab: React.FC = () => {
             />
 
             <Typography variant="h6" gutterBottom>
-              Allowed Pages
+              Page Access
             </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Select which customer portal pages users with this subscription type can access. Note: Agent Mode, User Guide, and Settings are always available.
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+              Set access level for each page. Note: Agent Mode, User Guide, and Settings are always available.
             </Typography>
-            <FormGroup>
-              <FormControlLabel
-                control={
-                  <Checkbox
-                    checked={formData.allowedPages.length === availablePages.length && availablePages.length > 0}
-                    indeterminate={
-                      formData.allowedPages.length > 0 &&
-                      formData.allowedPages.length < availablePages.length
-                    }
-                    onChange={handleToggleAllPages}
-                    disabled={availablePages.length === 0}
-                  />
-                }
-                label="Select All Pages"
-              />
-              {availablePages.length === 0 ? (
-                <Typography variant="body2" color="text.secondary" sx={{ ml: 2 }}>
-                  Loading pages...
-                </Typography>
-              ) : (
-                availablePages.map((page) => (
-                  <FormControlLabel
-                    key={page.path}
-                    control={
-                      <Checkbox
-                        checked={formData.allowedPages.includes(page.path)}
-                        onChange={() => handleTogglePage(page.path)}
-                      />
-                    }
-                    label={
-                      <Box>
+            <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <CheckCircleIcon sx={{ fontSize: 16, color: 'success.main' }} />
+                <Typography variant="caption">Allowed — user can access</Typography>
+              </Box>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <LockIcon sx={{ fontSize: 16, color: 'warning.main' }} />
+                <Typography variant="caption">Locked — shown with upgrade prompt</Typography>
+              </Box>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <VisibilityOffIcon sx={{ fontSize: 16, color: 'text.disabled' }} />
+                <Typography variant="caption">Hidden — not shown at all</Typography>
+              </Box>
+            </Box>
+            <Box sx={{ mb: 1 }}>
+              <Button
+                size="small"
+                onClick={handleToggleAllPages}
+                disabled={availablePages.length === 0}
+              >
+                {formData.allowedPages.length === availablePages.length && availablePages.length > 0
+                  ? 'Set All Locked'
+                  : 'Set All Allowed'}
+              </Button>
+            </Box>
+            {availablePages.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ ml: 2 }}>
+                Loading pages...
+              </Typography>
+            ) : (
+              <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+                {availablePages.map((page, idx) => {
+                  const state = getPageAccessState(page.path);
+                  return (
+                    <Box
+                      key={page.path}
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        px: 2,
+                        py: 1,
+                        borderBottom: idx < availablePages.length - 1 ? '1px solid' : 'none',
+                        borderColor: 'divider',
+                        gap: 2,
+                      }}
+                    >
+                      <Box sx={{ flex: 1, minWidth: 0 }}>
                         <Typography variant="body2" fontWeight="medium">
                           {page.label}
                         </Typography>
                         <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
                           {page.path}
                         </Typography>
-                        {page.description && (
-                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                            {page.description}
-                          </Typography>
-                        )}
                       </Box>
-                    }
-                  />
-                ))
-              )}
-            </FormGroup>
+                      <ToggleButtonGroup
+                        value={state}
+                        exclusive
+                        size="small"
+                        onChange={(_e, val) => { if (val !== null) handlePageAccessChange(page.path, val as PageAccessState); }}
+                        aria-label={`Access for ${page.label}`}
+                      >
+                        <Tooltip title="Allowed — user can access this page">
+                          <ToggleButton value="allowed" aria-label="allowed" sx={{ px: 1.5 }}>
+                            <CheckCircleIcon sx={{ fontSize: 16, mr: 0.5, color: state === 'allowed' ? 'success.main' : 'inherit' }} />
+                            <Typography variant="caption">Allow</Typography>
+                          </ToggleButton>
+                        </Tooltip>
+                        <Tooltip title="Locked — shown in sidebar with lock icon and upgrade prompt">
+                          <ToggleButton value="locked" aria-label="locked" sx={{ px: 1.5 }}>
+                            <LockIcon sx={{ fontSize: 16, mr: 0.5, color: state === 'locked' ? 'warning.main' : 'inherit' }} />
+                            <Typography variant="caption">Lock</Typography>
+                          </ToggleButton>
+                        </Tooltip>
+                        <Tooltip title="Hidden — not shown in sidebar at all">
+                          <ToggleButton value="hidden" aria-label="hidden" sx={{ px: 1.5 }}>
+                            <VisibilityOffIcon sx={{ fontSize: 16, mr: 0.5, color: state === 'hidden' ? 'text.disabled' : 'inherit' }} />
+                            <Typography variant="caption">Hide</Typography>
+                          </ToggleButton>
+                        </Tooltip>
+                      </ToggleButtonGroup>
+                    </Box>
+                  );
+                })}
+              </Box>
+            )}
 
             <Typography variant="h6" gutterBottom sx={{ mt: 4 }}>
               Allowed Skills
