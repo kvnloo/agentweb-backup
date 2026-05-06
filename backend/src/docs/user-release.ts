@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-06',
     changes: [
+      'Improved: Emma Voice Mode — Barge-In and Error Visibility',
+      '- Emma now stops speaking immediately when you start talking, instead of talking over you',
+      '- When the voice session ends due to a quota limit or unexpected error, a clear message is shown so you know what happened and can try again',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
       'New: Admins Can Now Hide Pages from the Customer Portal Sidebar',
       '- In the Subscriptions tab, each page now has three access levels: Allowed (user can access), Locked (shown with an upgrade prompt), or Hidden (not shown in the sidebar at all)',
       '- Previously only Allowed/Locked were supported — Hidden is new and lets you remove pages entirely for certain subscription tiers rather than showing a lock icon',

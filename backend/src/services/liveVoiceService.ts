@@ -32,15 +32,7 @@ const LIVE_VOICE_NAME = 'Zephyr';
  */
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
 Respond naturally and conversationally — keep answers concise and direct.
-Use emotion markers in your text to make speech expressive and engaging:
-- [warm] when being friendly or reassuring
-- [excited] for great news or achievements
-- [thoughtful] when analyzing data or thinking through a problem
-- [encouraging] when motivating the user
-- [concerned] when flagging a problem or risk
-- [pause] for natural conversational breaks
-Embed these markers naturally before the relevant phrase — don't announce them or explain them.
-Example: "[warm] Great question! [thoughtful] Your ad spend is trending up — [excited] 23% higher than last month."`;
+Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -303,9 +295,9 @@ async function openGeminiSession(
           return;
         }
 
-        // Abnormal close or no handle — surface to client
+        // Abnormal close or no handle — surface to client with reason
         activeSessions.delete(sessionId);
-        currentEntry.emitFn('live:closed', { sessionId });
+        currentEntry.emitFn('live:closed', { sessionId, code: e.code, reason: e.reason });
       },
     },
   });
@@ -425,6 +417,7 @@ export async function startLiveSession(
  */
 export async function sendAudioChunk(sessionId: string, base64Chunk: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (!entry.session) return; // Gemini session still opening — drop chunk
   entry.session.sendRealtimeInput({
     audio: {
       data: base64Chunk,
@@ -438,6 +431,7 @@ export async function sendAudioChunk(sessionId: string, base64Chunk: string): Pr
  */
 export async function sendTextTurn(sessionId: string, text: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (!entry.session) return; // Gemini session still opening
   entry.pendingUserText = text;
   entry.session.sendClientContent({
     turns: [
@@ -538,19 +532,6 @@ export function hasLiveSession(sessionId: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Internal: strip voice-director emotion tags (e.g. [warm], [excited]) from text
-// before displaying it in the chat UI. These tags are instructions for Gemini's
-// TTS layer and should never appear in the transcript visible to the user.
-// Matches emotion tags with optional trailing punctuation inside the brackets:
-// [warm] [warm,] [warm.] [warm!] etc.
-const EMOTION_TAG_RE = /\[\s*(warm|excited|thoughtful|encouraging|concerned|pause)\s*[.,!?;:]*\s*\]/gi;
-
-function stripEmotionTags(text: string): string {
-  // Do NOT trim individual chunks — Gemini streams words with trailing spaces and
-  // trimming each chunk would concatenate words without spaces. Normalize double-spaces
-  // that emotion tag removal might leave behind, but preserve all leading/trailing space.
-  return text.replace(EMOTION_TAG_RE, '').replace(/\s{2,}/g, ' ');
-}
 
 // Single-word affirmations/negations that are short but meaningful — always persist.
 const MEANINGFUL_SINGLE_WORDS = new Set([
@@ -624,9 +605,8 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
       // Accumulate inline text (present in text-mode; empty in audio-only mode)
       if (part.text) {
-        const displayText = stripEmotionTags(part.text);
-        entry.currentTurnText += displayText;
-        if (displayText) emitFn('live:transcript', { sessionId, text: displayText });
+        entry.currentTurnText += part.text;
+        emitFn('live:transcript', { sessionId, text: part.text });
       }
     }
   }
@@ -635,21 +615,18 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   // (requires outputAudioTranscription: {} in session config)
   const outputTranscript = message.serverContent?.outputTranscription;
   if (outputTranscript?.text) {
-    const displayText = stripEmotionTags(outputTranscript.text);
-    console.log(`[liveVoiceService] outputTranscription for ${sessionId}: "${displayText}"`);
-    entry.currentTurnText += displayText;
-    if (displayText) emitFn('live:transcript', { sessionId, text: displayText });
+    console.log(`[liveVoiceService] outputTranscription for ${sessionId}: "${outputTranscript.text}"`);
+    entry.currentTurnText += outputTranscript.text;
+    emitFn('live:transcript', { sessionId, text: outputTranscript.text });
   }
 
   // Input transcription: Gemini's speech-to-text of what the user said
   // (requires inputAudioTranscription: {} in session config)
   const inputTranscript = message.serverContent?.inputTranscription;
   if (inputTranscript?.text) {
-    const displayText = stripEmotionTags(inputTranscript.text);
-    console.log(`[liveVoiceService] inputTranscription for ${sessionId}: "${displayText}"`);
-    entry.pendingUserText += displayText;
-    // Forward to browser so user's words appear in real-time as they speak
-    if (displayText) emitFn('live:user-transcript', { sessionId, text: displayText });
+    console.log(`[liveVoiceService] inputTranscription for ${sessionId}: "${inputTranscript.text}"`);
+    entry.pendingUserText += inputTranscript.text;
+    emitFn('live:user-transcript', { sessionId, text: inputTranscript.text });
   }
 
   // Capture resumption handle so onclose can reconnect transparently
