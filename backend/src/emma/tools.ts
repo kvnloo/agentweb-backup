@@ -4000,12 +4000,14 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
+    // If the LLM didn't specify a model, fall back to the admin-configured video API default
+    const videoModel = args.videoModel || await agentModeService.getVideoApiDefaultModel();
     return await agentModeService.generateVideo(
       args.prompt,
       args.filename,
       context?.userId,
       context?.sessionId,
-      args.videoModel,
+      videoModel,
       args.startFrame,
       args.endFrame,
       args.compose,
