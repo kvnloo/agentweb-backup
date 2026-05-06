@@ -83,6 +83,9 @@ interface User {
   utmCampaign?: string;
   utmContent?: string;
   utmTerm?: string;
+  orgId?: string;
+  orgRole?: "owner" | "member";
+  orgName?: string;
 }
 
 interface AdminContextType {
