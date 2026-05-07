@@ -6091,26 +6091,22 @@ emmaToolRegistry.register({
           context: issueContext,
         });
 
-        // Delegate access: never email the customer — it's the admin acting on their behalf.
-        // Send to productIssueEmails + adminEmail (if known). If adminEmail lookup failed,
-        // still a delegate session — just send to productIssueEmails only.
-        const emailRecipients = isDelegate
-          ? adminEmail ? [...productIssueEmails, adminEmail] : [...productIssueEmails]
-          : [...productIssueEmails, user.email];
-        const emailGreeting = isDelegate && adminEmail
-          ? `Hi ${adminEmail}, you've submitted an issue report on behalf of ${user.displayName || user.email}.`
-          : `Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.`;
+        // Never email the customer — internal team + admin (if known) only.
+        const emailRecipients = adminEmail
+          ? [...productIssueEmails, adminEmail]
+          : [...productIssueEmails];
 
         await resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: emailRecipients,
-          subject: `We received your issue: ${issue.title}`,
+          subject: `Product issue reported: ${issue.title}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
               <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
                 <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
               </div>
-              <p style="color: #444;">${emailGreeting} The AgentWeb engineering team has been notified.</p>
+              <div style="margin: 8px 0;"><strong>Reported by:</strong> ${user.displayName || user.email} (${user.email})</div>
+              ${isDelegatedAdmin && adminEmail ? `<div style="margin: 8px 0;"><strong>Submitted via admin delegation by:</strong> ${adminEmail}</div>` : ''}
               ${result.pageId ? `<div style="margin: 8px 0;"><strong>Issue ID:</strong> AGW-${result.pageId}</div>` : ''}
               <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
               <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
@@ -6120,7 +6116,7 @@ emmaToolRegistry.register({
               </div>
             </div>
           `,
-          replyTo: isDelegate && adminEmail ? adminEmail : user.email,
+          replyTo: user.email,
         });
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
