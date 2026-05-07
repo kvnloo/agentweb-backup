@@ -258,6 +258,42 @@ describe('POST /api/crm/lists/:listId/leads/find', () => {
     );
   });
 
+  it('defaults to 20 when limit is "abc" (NaN)', async () => {
+    mockReq.body = { title: 'CTO', limit: 'abc' };
+    await handler!(mockReq, mockRes);
+    expect(mockImportLeadsFromSearch).toHaveBeenCalledWith(
+      'test-user-id',
+      expect.objectContaining({ limit: 20 }),
+    );
+  });
+
+  it('defaults to 20 when limit is -1', async () => {
+    mockReq.body = { title: 'CTO', limit: -1 };
+    await handler!(mockReq, mockRes);
+    expect(mockImportLeadsFromSearch).toHaveBeenCalledWith(
+      'test-user-id',
+      expect.objectContaining({ limit: 20 }),
+    );
+  });
+
+  it('defaults to 20 when limit is 0', async () => {
+    mockReq.body = { title: 'CTO', limit: 0 };
+    await handler!(mockReq, mockRes);
+    expect(mockImportLeadsFromSearch).toHaveBeenCalledWith(
+      'test-user-id',
+      expect.objectContaining({ limit: 20 }),
+    );
+  });
+
+  it('floors fractional limit (e.g. 50.7 → 50)', async () => {
+    mockReq.body = { title: 'CTO', limit: 50.7 };
+    await handler!(mockReq, mockRes);
+    expect(mockImportLeadsFromSearch).toHaveBeenCalledWith(
+      'test-user-id',
+      expect.objectContaining({ limit: 50 }),
+    );
+  });
+
   it('403 when user cannot access list (canAccessCrmList false)', async () => {
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'other-user' });
     mockReq.body = { title: 'CTO' };

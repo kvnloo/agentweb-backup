@@ -1783,6 +1783,19 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 });
 
 /**
+ * Normalize the `limit` query/body parameter for the find-leads routes.
+ * Guards against NaN, non-finite, non-positive, or non-numeric inputs and
+ * caps to 500. Floors fractional values. Returns the default (20) when the
+ * input is missing or invalid.
+ */
+function normalizeFindLeadsLimit(raw: any): number {
+  if (raw === undefined || raw === null) return 20;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 20;
+  return Math.min(Math.floor(n), 500);
+}
+
+/**
  * @route POST /api/crm/lists/:listId/leads/find
  * @desc Search LinkedIn for people using platform-wide outreach accounts and import results into the list.
  * @access Private
@@ -1837,7 +1850,7 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
       cursor,
       auto_enrich,
       // Cap at 500 (was 100) to support larger ICP-sourcing runs.
-      limit: limit ? Math.min(Number(limit), 500) : 20,
+      limit: normalizeFindLeadsLimit(limit),
     });
 
     if (!result.success) {
@@ -1896,7 +1909,7 @@ router.post('/lists/:listId/leads/find/from-icp', async (req: Request, res: Resp
       title: filters.title,
       industry: filters.industry,
       location: filters.location,
-      limit: limit ? Math.min(Number(limit), 500) : 20,
+      limit: normalizeFindLeadsLimit(limit),
       auto_enrich: auto_enrich === true,
       icpSource: persona.name,
     });

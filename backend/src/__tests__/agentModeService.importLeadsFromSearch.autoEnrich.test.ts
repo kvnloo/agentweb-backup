@@ -133,6 +133,26 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
     stubSpy.mockRestore();
   });
 
+  it('does NOT surface autoEnrichJobId when autoEnrich glue returns the quota-exhausted sentinel', async () => {
+    mockBatchCreateLeads.mockResolvedValueOnce({
+      newCount: 1, mergedCount: 0, errors: [],
+      created: [{ leadId: 'lead-quota-1' }],
+    });
+    const stubSpy = jest.spyOn(agentModeServiceTestHooks, 'enqueueFindEmailJobForNewLeads')
+      .mockResolvedValue({ jobId: '', queued: 0, reason: 'quota-exhausted' } as any);
+
+    const result = await service.importLeadsFromSearch('user-1', {
+      listId: 'list-1',
+      title: 'CTO',
+      auto_enrich: true,
+    });
+
+    expect(stubSpy).toHaveBeenCalled();
+    expect(result).not.toHaveProperty('autoEnrichJobId');
+    expect(result.success).toBe(true);
+    stubSpy.mockRestore();
+  });
+
   describe('response shape compatibility (regression)', () => {
     it('preserves all existing response keys', async () => {
       const result = await service.importLeadsFromSearch('user-1', {
