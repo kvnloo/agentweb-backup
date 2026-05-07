@@ -509,7 +509,18 @@ export async function waterfallFindEmail(
             fetchedAt: new Date().toISOString(),
             expiresAt: Math.floor(Date.now() / 1000) + ttl,
             cacheType: 'apollo',
-          }).catch(() => undefined);
+          }).catch((err) => {
+            // C9: surface placeholder write failures. Without the placeholder,
+            // the eventual webhook arrival has no way to attribute the result
+            // to a lead — the email is silently lost. Log loudly so this is
+            // visible in dashboards/alerts.
+            console.error(
+              '[waterfall] Tier 3 placeholder write failed for request_id',
+              f.asyncRequestId,
+              '— webhook will not be attributable:',
+              (err as Error).message,
+            );
+          });
         }
         // Don't return — fall through to Tier 4 so we still have a sync answer.
       }
