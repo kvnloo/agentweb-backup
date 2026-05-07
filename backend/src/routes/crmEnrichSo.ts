@@ -26,6 +26,7 @@ import {
   getJob,
 } from '../services/emailJobTracker';
 import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
+import type { LeadRecord } from '../services/crmEnrichmentService';
 import {
   ALL_ENRICHMENT_FIELDS,
   EnrichmentFieldConfig,
@@ -262,7 +263,7 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
       if (!(await canAccessCrmList(userId, persistList as any))) {
         return res.status(403).json({ message: 'Access denied' });
       }
-      const lead: any = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null);
+      const lead = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null) as LeadRecord | null;
       if (lead) {
         if (result.apolloMatch) {
           // Apollo win: full projection (single source of truth lives here).
@@ -272,9 +273,12 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
             proj.enrichmentMetadata.email.sourceQuote = `Apollo (${result.emailStatus})`;
           }
           if (proj.changed.size > 0) {
-            const payload: any = { ...proj.updates, enrichmentMetadata: proj.enrichmentMetadata };
+            const payload: Parameters<typeof crmDb.updateLead>[2] = {
+              ...proj.updates,
+              enrichmentMetadata: proj.enrichmentMetadata,
+            };
             if (Object.keys(proj.customFields).length > 0) {
-              payload.customFields = { ...((lead.customFields ?? {}) as Record<string, any>), ...proj.customFields };
+              payload.customFields = { ...(lead.customFields ?? {}), ...proj.customFields };
             }
             if (!payload.email) payload.email = result.email;   // belt + suspenders
             await crmDb.updateLead(persistToListId, persistToLeadId, payload);
