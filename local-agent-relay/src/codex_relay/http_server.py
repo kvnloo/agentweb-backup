@@ -18,6 +18,7 @@ import os
 import threading
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 from .config import CodexConfig
@@ -127,7 +128,10 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         })
 
 
-class RelayHTTPServer(HTTPServer):
+class RelayHTTPServer(ThreadingMixIn, HTTPServer):
+    """Each incoming request is handled in its own thread, allowing concurrent tasks."""
+    daemon_threads = True
+
     def __init__(
         self,
         host: str,
