@@ -497,10 +497,6 @@ export class ApolloService {
 
 let _singleton: ApolloService | null = null;
 
-export function setApolloServiceForTesting(svc: ApolloService): void {
-  _singleton = svc;
-}
-
 export function getApolloService(): ApolloService {
   if (!_singleton) {
     throw new Error('ApolloService not initialized. Call initApolloService() at server boot.');
@@ -511,6 +507,13 @@ export function getApolloService(): ApolloService {
 export function initApolloService(svc: ApolloService): void {
   _singleton = svc;
 }
+
+/**
+ * Test-only alias. Kept as a separate exported name so test files reading as
+ * "set the singleton for this test" stay readable even though it does the
+ * exact same thing as initApolloService.
+ */
+export const setApolloServiceForTesting = initApolloService;
 
 export function isApolloServiceReady(): boolean {
   return _singleton !== null;
