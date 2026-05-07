@@ -113,8 +113,10 @@ async function processEnrollment(
 
   // Rewrite S3 image URLs through the /asset/ proxy so image hostnames match the
   // sending domain — reduces spam filtering by Gmail and other providers.
-  const backendUrl = process.env.BACKEND_URL || 'https://api.agentweb.pro';
-  bodyHtml = rewriteS3ImageUrls(bodyHtml, backendUrl);
+  // Use EMAIL_ASSET_BASE_URL so emails always contain publicly accessible URLs,
+  // even when sent from a dev environment where BACKEND_URL is a private IP.
+  const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
+  bodyHtml = rewriteS3ImageUrls(bodyHtml, assetBaseUrl);
 
   // Inject unsubscribe URL — replaces {{unsubscribeUrl}} variable, updates an existing
   // unsubscribe anchor href, or appends a footer if no unsubscribe link is present.

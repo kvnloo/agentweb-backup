@@ -304,9 +304,11 @@ router.post(
     const withBanner = /<body\b/i.test(htmlContent)
       ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
       : testBanner + htmlContent;
-    // Rewrite S3 image URLs through the asset proxy (same as production send path)
-    const backendUrl = process.env.BACKEND_URL || 'https://api.agentweb.pro';
-    const withRewrittenImages = rewriteS3ImageUrls(withBanner, backendUrl);
+    // Rewrite S3 image URLs through the asset proxy (same as production send path).
+    // Use EMAIL_ASSET_BASE_URL so URLs in emails are publicly accessible even when
+    // the test send originates from a dev environment with a private BACKEND_URL.
+    const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
+    const withRewrittenImages = rewriteS3ImageUrls(withBanner, assetBaseUrl);
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withRewrittenImages, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
