@@ -154,7 +154,10 @@ export interface ApolloServiceDeps {
 const TTL_SECONDS: Record<ApolloEndpoint, number> = {
   match: 60 * 86400,
   find: 90 * 86400,
-  org: 30 * 86400,
+  // S12: org data (funding stage, headcount growth, tech stack) shifts on the
+  // order of weeks. 30d masked late-stage funding rounds and recent layoffs;
+  // drop to 7d so those signals reach Emma/UI within a week.
+  org: 7 * 86400,
 };
 const NEGATIVE_TTL_SECONDS = 7 * 86400;
 /** Default cache window for an unexpected upstream error (network glitch,
