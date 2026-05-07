@@ -131,6 +131,24 @@ export function injectUnsubscribeUrl(html: string, unsubscribeUrl: string, fallb
   return html.replace(/<\/body>/i, `${footer}</body>`) + (/<\/body>/i.test(html) ? '' : footer);
 }
 
+/**
+ * Converts youtu.be short URLs to full youtube.com/watch?v=... URLs.
+ * Gmail's spam filters flag youtu.be links as potential phishing attempts.
+ */
+export function normalizeYoutubeUrls(html: string): string {
+  if (!html) return html;
+  return html.replace(
+    /https?:\/\/youtu\.be\/([a-zA-Z0-9_-]+)(\?[^\s"'<>]*)?/g,
+    (_match, videoId, query) => {
+      const base = `https://www.youtube.com/watch?v=${videoId}`;
+      if (!query) return base;
+      // Append existing query params (e.g. si=...) after v=
+      const extraParams = query.slice(1); // strip leading '?'
+      return `${base}&${extraParams}`;
+    },
+  );
+}
+
 const S3_BUCKET_HOST = 'agentweb-user-files.s3.us-west-2.amazonaws.com';
 
 /**

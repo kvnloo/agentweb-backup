@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 const router = express.Router();
@@ -309,8 +309,9 @@ router.post(
     // the test send originates from a dev environment with a private BACKEND_URL.
     const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
     const withRewrittenImages = rewriteS3ImageUrls(withBanner, assetBaseUrl);
+    const withNormalizedUrls = normalizeYoutubeUrls(withRewrittenImages);
     // Wire up unsubscribe URL with the real portal domain
-    const testHtml = injectUnsubscribeUrl(withRewrittenImages, testUnsubscribeUrl);
+    const testHtml = injectUnsubscribeUrl(withNormalizedUrls, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
