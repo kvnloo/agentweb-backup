@@ -119,6 +119,26 @@ export function getJob(jobId: string): EmailJobState | null {
   return _jobs.get(jobId) ?? null;
 }
 
+/**
+ * Find an active (status === 'running') job for a (listId, kind) pair.
+ * Used by callers that need idempotency — e.g. the post-import auto-enrich
+ * glue should not start a second 'find' job if one is already running for
+ * the same list. Linear scan is fine: the in-memory map is bounded by the
+ * 30min TTL on completed jobs and the 2h TTL on stuck-running jobs.
+ */
+export function findActiveJob(
+  listId: string,
+  kind: EmailJobKind,
+): EmailJobState | null {
+  gc();
+  for (const j of _jobs.values()) {
+    if (j.listId === listId && j.kind === kind && j.status === 'running') {
+      return j;
+    }
+  }
+  return null;
+}
+
 /** Test-only: wipe all jobs. */
 export function __resetJobsForTesting(): void {
   _jobs.clear();
