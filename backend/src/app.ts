@@ -252,6 +252,11 @@ app.use("/api/funnels", funnelRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm/public", crmPublicRoutes);
 app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be after /public, before main crm routes
+// Apollo run_waterfall_email async callback. Public route (Apollo doesn't
+// send a JWT); auth is via shared secret in the URL query string. Must be
+// mounted BEFORE crmRoutes which applies authenticateToken to everything.
+import apolloWebhookRoutes from "./routes/apolloWebhook";
+app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);

@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-07',
+    changes: [
+      'Feature: CRM CSV import now has a 3-step wizard with column mapping',
+      '- Upload your CSV and we auto-detect each column to the matching lead field (First Name, Email, Company LinkedIn, etc.) using fuzzy matching that tolerates synonyms like "Co. Linkedin", "Mobile", "Given Name"',
+      '- Step 2 lets you review and override the auto-mapping per column, including marking columns as Custom Field, Skip, or Split Full Name into First + Last',
+      '- New top-level Company LinkedIn URL field is now distinct from the person\'s LinkedIn — searchable, exportable, and visible in the lead detail panel',
+      '- Your last successful mapping is remembered per list, so re-importing the same template is one-click',
+    ],
+  },
+  {
     date: '2026-05-04',
     changes: [
       'Fix: Emma now pauses all ads when asked, including ads whose parent campaign is already paused',

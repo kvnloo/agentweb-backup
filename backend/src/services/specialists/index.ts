@@ -12,15 +12,28 @@ import {
   crunchbaseTotalFunding,
   crunchbaseHqCity,
 } from './crunchbaseSpecialist';
-import { enrichSoEmailFinderSpecialist } from './enrichSoEmailFinder';
-import { enrichSoReverseLookupSpecialists } from './enrichSoReverseLookup';
+import {
+  waterfallEmailFinderSpecialist,
+  waterfallReverseLookupSpecialists,
+} from '../enrichmentWaterfall';
+import { apolloEmploymentHistorySpecialist } from './apolloEmploymentHistory';
+import { apolloOrgEnrichmentSpecialists } from './apolloOrgEnrichment';
 
 export function registerAllEnrichmentSpecialists(): void {
   registerSpecialist(crunchbaseFundingRound);
   registerSpecialist(crunchbaseTotalFunding);
   registerSpecialist(crunchbaseHqCity);
-  registerSpecialist(enrichSoEmailFinderSpecialist);
-  for (const spec of enrichSoReverseLookupSpecialists) {
+  // Email finder + 12 reverse-lookup fields go through the waterfall so leads
+  // with a LinkedIn URL try Apollo first (richest match) and email-only leads
+  // try enrich.so first (cheaper). The original enrich.so specialists remain
+  // exported (for direct test imports) but are no longer registered globally.
+  registerSpecialist(waterfallEmailFinderSpecialist);
+  for (const spec of waterfallReverseLookupSpecialists) {
+    registerSpecialist(spec);
+  }
+  // Apollo-only fields — no waterfall, single provider.
+  registerSpecialist(apolloEmploymentHistorySpecialist);
+  for (const spec of apolloOrgEnrichmentSpecialists) {
     registerSpecialist(spec);
   }
 }

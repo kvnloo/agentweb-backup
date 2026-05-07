@@ -244,6 +244,12 @@ export class AgentModeService {
       console.warn('[AgentMode] enrich.so service init skipped:', (err as Error).message);
     }
     try {
+      const { initApolloServiceFromEnv } = await import('./apolloServiceFactory');
+      await initApolloServiceFromEnv();
+    } catch (err) {
+      console.warn('[AgentMode] Apollo service init skipped:', (err as Error).message);
+    }
+    try {
       const { initUnipileProfileService } = await import('./unipileProfileServiceFactory');
       initUnipileProfileService();
     } catch (err) {

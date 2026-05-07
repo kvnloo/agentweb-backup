@@ -364,6 +364,17 @@ createTestAccount().then(async () => {
     console.warn('enrich.so service not initialized — email finder/reverse lookup specialists will fall back to LLM:', (err as Error).message);
   }
 
+  // Initialize Apollo people-enrichment service. Defensive — a missing API key
+  // (Secrets Manager not yet provisioned) must not crash boot. Apollo features
+  // simply stay dormant; waterfall router falls back to enrich.so / LLM.
+  try {
+    const { initApolloServiceFromEnv } = await import('./services/apolloServiceFactory');
+    await initApolloServiceFromEnv();
+    console.log('Apollo service initialized');
+  } catch (err) {
+    console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
+  }
+
   // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of
   // Unipile /users/{id} backed by AW-EnrichmentRawCache, cacheType='unipile').
   try {

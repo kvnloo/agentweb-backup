@@ -40,9 +40,12 @@ describe('validateLeadEmailInBackground', () => {
     expect(mockEnrichSo.validateEmail).not.toHaveBeenCalled();
   });
 
-  it('returns silently (does not throw) when service errors', async () => {
+  it('returns null (does not throw) when service errors', async () => {
+    // Returns null on service error instead of undefined so upstream callers
+    // (validateLeadsInBackground) can distinguish success/failure when feeding
+    // the per-lead email-job tracker counters.
     mockEnrichSo.validateEmail.mockRejectedValue(new Error('rate limit'));
-    await expect(validateLeadEmailInBackground('L1', 'LD1', 'a@b.com')).resolves.toBeUndefined();
+    await expect(validateLeadEmailInBackground('L1', 'LD1', 'a@b.com')).resolves.toBeNull();
     expect(mockCrmDb.setLeadEmailValidation).not.toHaveBeenCalled();
   });
 
