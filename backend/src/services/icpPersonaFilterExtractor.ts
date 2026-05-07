@@ -45,15 +45,35 @@ function firstSentence(brief: string): string {
 
 /** "in <Region>" idiom — match common location phrases. */
 function extractLocation(brief: string): string | undefined {
+  // Existing regions/cities — keep first to preserve current behaviour.
   const m = brief.match(/\bin\s+(North America|United States|US|USA|Europe|EMEA|EU|APAC|Asia|UK|Canada|Australia|San Francisco Bay Area|New York|London|Berlin)\b/i);
-  return m ? m[1] : undefined;
+  if (m) return m[1];
+  // Additional major cities — appended so existing matches still win.
+  const m2 = brief.match(/\b(?:in|based in)\s+(Tokyo|Singapore|Toronto|Sydney|Dubai|Tel Aviv|Paris|Amsterdam|Stockholm|Dublin|Boston|Seattle|Austin|Chicago|Miami|Los Angeles|Atlanta|Denver|Portland|Vancouver|Montreal)\b/i);
+  if (m2) return m2[1];
+  // Generic "based in <City>" idiom — capture 1-3 Capitalised words.
+  const m3 = brief.match(/\bbased in\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})\b/);
+  return m3 ? m3[1] : undefined;
 }
 
 /** "<Industry> companies" or "<Industry>-focused" idiom. */
 function extractIndustry(brief: string): string | undefined {
-  const m = brief.match(/\b(SaaS|FinTech|HealthTech|EdTech|MarTech|AdTech|BioTech|CleanTech|PropTech|InsurTech|E-commerce|Marketplace|DevTools|Cybersecurity|AI|Machine Learning)\s+(companies|startups|firms|businesses|industry)\b/i);
+  // Multi-word industries first so they win over single-word matches like "SaaS".
+  const multi = brief.match(/\b(B2B SaaS|Consumer SaaS|Climate Tech|Real Estate Tech|Machine Learning)\b/i);
+  if (multi) {
+    // Normalise casing to canonical form.
+    const canonical: Record<string, string> = {
+      'b2b saas': 'B2B SaaS',
+      'consumer saas': 'Consumer SaaS',
+      'climate tech': 'Climate Tech',
+      'real estate tech': 'Real Estate Tech',
+      'machine learning': 'Machine Learning',
+    };
+    return canonical[multi[1].toLowerCase()] ?? multi[1];
+  }
+  const m = brief.match(/\b(SaaS|FinTech|HealthTech|EdTech|MarTech|AdTech|BioTech|CleanTech|PropTech|InsurTech|E-commerce|Marketplace|DevTools|Cybersecurity|AI|Machine Learning|ClimateTech|Robotics|Logistics|Web3|Crypto|DTC|D2C)\s+(companies|startups|firms|businesses|industry|brands)\b/i);
   if (m) return m[1];
-  const m2 = brief.match(/\b(SaaS|FinTech|HealthTech|EdTech|MarTech|AdTech|BioTech|CleanTech|PropTech|InsurTech|E-commerce|Marketplace|DevTools|Cybersecurity)\b/);
+  const m2 = brief.match(/\b(SaaS|FinTech|HealthTech|EdTech|MarTech|AdTech|BioTech|CleanTech|PropTech|InsurTech|E-commerce|Marketplace|DevTools|Cybersecurity|ClimateTech|Robotics|Logistics|Web3|Crypto|DTC|D2C)\b/);
   return m2 ? m2[1] : undefined;
 }
 

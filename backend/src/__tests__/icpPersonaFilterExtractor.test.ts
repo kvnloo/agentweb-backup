@@ -80,4 +80,35 @@ describe('extractIcpFilters', () => {
     });
     expect(r).toEqual({});
   });
+
+  it('extracts location from "based in <City>" idiom', () => {
+    expect(extractIcpFilters(persona({
+      meta_targeting_brief: 'Founders based in Berlin building dev tools.',
+    })).location).toBe('Berlin');
+  });
+
+  it('matches additional major cities', () => {
+    for (const city of ['Tokyo', 'Singapore', 'Tel Aviv', 'Boston']) {
+      const r = extractIcpFilters(persona({
+        meta_targeting_brief: `Engineers in ${city} working on infra.`,
+      }));
+      expect(r.location).toBe(city);
+    }
+  });
+
+  it('extracts B2B SaaS as industry (multi-word)', () => {
+    const r = extractIcpFilters(persona({
+      meta_targeting_brief: 'CTOs at B2B SaaS startups in North America.',
+    }));
+    expect(r.industry).toBe('B2B SaaS');
+  });
+
+  it('extracts DTC and Web3 as industries', () => {
+    expect(extractIcpFilters(persona({
+      meta_targeting_brief: 'Founders running DTC brands on Shopify.',
+    })).industry).toBe('DTC');
+    expect(extractIcpFilters(persona({
+      meta_targeting_brief: 'Engineers building Web3 wallets.',
+    })).industry).toBe('Web3');
+  });
 });
