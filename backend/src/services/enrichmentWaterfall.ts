@@ -501,7 +501,10 @@ export async function waterfallFindEmail(
         // sync response should still be a useful answer if Tier 4 hits.
         const key = apolloAsyncRequestCacheKey({ requestId: f.asyncRequestId });
         if (key) {
-          const ttl = 90 * 86400;   // 90 days — Apollo's broker chain typically lands within minutes
+          // S13: Apollo's broker chain typically lands within minutes; the
+          // placeholder only needs to survive that window plus a generous
+          // buffer for retries / stuck queues. 7 days is plenty.
+          const ttl = 7 * 86400;
           await crmDb.putEnrichmentCacheItem({
             canonicalId: key.canonicalId,
             fieldGroup: key.sk,
