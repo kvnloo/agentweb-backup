@@ -6,6 +6,8 @@ import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
 import axios from 'axios';
+import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
+import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
@@ -541,6 +543,16 @@ router.post('/sync', async (req: Request, res: Response) => {
           'Invalid body. Required: source, sourceRecordId, eventType, identity.',
       });
     }
+
+    // IDOR guard: tenantId is the partition for downstream contact storage.
+    // If a client supplies a tenantId that doesn't match their auth identity,
+    // they're attempting to write into another tenant's timeline. Reject.
+    // If absent, stamp it from the authenticated user (or the delegation
+    // target — req.user.userId is already the customer in delegated sessions).
+    if (body.tenantId && body.tenantId !== authReq.user.userId) {
+      return res.status(403).json({ message: 'tenantId mismatch' });
+    }
+    body.tenantId = authReq.user.userId;
 
     const result = await syncContact(body as SyncInput);
     return res.json(result);
@@ -1782,10 +1794,27 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const { listId } = req.params;
-    const { keywords, title, company, search_url, limit } = req.body;
+    const {
+      keywords,
+      title,
+      company,
+      search_url,
+      location,
+      location_id,
+      industry,
+      industry_id,
+      school,
+      school_id,
+      cursor,
+      auto_enrich,
+      limit,
+    } = req.body;
 
-    if (!keywords && !title && !company && !search_url) {
-      return res.status(400).json({ message: 'At least one search filter is required: keywords, title, company, or search_url' });
+    // Cursor alone is a valid filter for pagination through a prior search.
+    // Same gate as importLeadsFromSearch — see agentModeService.ts.
+    if (!keywords && !title && !company && !search_url
+      && !location && !industry && !school && !cursor) {
+      return res.status(400).json({ message: 'At least one search filter is required: keywords, title, company, search_url, location, industry, school, or cursor' });
     }
 
     const list = await crmDb.getLeadListById(listId);
@@ -1799,7 +1828,16 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
       title,
       company,
       search_url,
-      limit: limit ? Math.min(Number(limit), 100) : 20,
+      location,
+      location_id,
+      industry,
+      industry_id,
+      school,
+      school_id,
+      cursor,
+      auto_enrich,
+      // Cap at 500 (was 100) to support larger ICP-sourcing runs.
+      limit: limit ? Math.min(Number(limit), 500) : 20,
     });
 
     if (!result.success) {
@@ -4610,7 +4648,15 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
 
         // Inject unsubscribe URL — updates existing link or appends footer if none found
-        const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=${encodeURIComponent(lead.leadId)}&email=${encodeURIComponent(lead.email)}`;
+        // Signed URL — see backend/src/utils/unsubscribeUrl.ts. Verifier in
+        // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
+        // for emails sent before this change.
+        const unsubscribeUrl = signUnsubscribeUrl({
+          baseUrl: `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe`,
+          listId,
+          leadId: lead.leadId,
+          email: lead.email,
+        });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
 
         const result = await resendService.sendEmail({
@@ -4694,7 +4740,12 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     }
 
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
-    const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
+    const testUnsubscribeUrl = signUnsubscribeUrl({
+      baseUrl: `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe`,
+      listId,
+      leadId: 'TEST',
+      email: recipients[0]?.trim() || 'test@example.com',
+    });
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
 
@@ -4776,11 +4827,31 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       return res.status(400).json({ message: 'Invalid URL format. Must be HTTP or HTTPS.' });
     }
 
+    // SSRF guard: refuse hostnames that resolve to private/internal IPs
+    // (RFC1918, loopback, cloud metadata, link-local, broadcast, multicast).
+    try {
+      await assertPublicHostname(url);
+    } catch (ssrfErr) {
+      if (ssrfErr instanceof SsrfBlockedError) {
+        return res.status(400).json({ message: 'URL resolves to a private/internal address' });
+      }
+      return res.status(400).json({ message: 'URL is not safe to fetch' });
+    }
+
+    // SSRF defence-in-depth: refuse to follow redirects. assertPublicHostname
+    // only validates the user-supplied URL; if axios follows a 302 to e.g.
+    // http://169.254.169.254/, the guard is bypassed. maxRedirects:0 makes
+    // axios surface the redirect as an error instead. validateStatus accepts
+    // only 2xx so 3xx becomes an error. The `as any` cast routes around the
+    // legacy @types/axios shim installed in this repo that doesn't carry
+    // maxRedirects/validateStatus on its config interface.
     const response = await axios.get(url, {
       timeout: 15000,
       responseType: 'text',
       headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
-    });
+      maxRedirects: 0,
+      validateStatus: (s: number) => s >= 200 && s < 300,
+    } as any);
 
     const html = response.data as string;
 
@@ -5368,8 +5439,12 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Re
 // Returns the raw Google CSE results so we can iterate on specialist queries
 // without redeploying. Remove once enrichment specialists stabilize.
 router.post('/debug/serp', async (req: Request, res: Response) => {
-  const userId = (req as AuthenticatedRequest).user?.userId;
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  if (!authReq.user?.isAdmin) {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
   const query = (req.body?.query || '').toString().trim();
   const n = Math.max(1, Math.min(10, Number(req.body?.n) || 5));
   if (!query) return res.status(400).json({ message: 'query required' });
@@ -5387,8 +5462,12 @@ router.post('/debug/serp', async (req: Request, res: Response) => {
 // ── TEMPORARY DEBUG: EnrichmentRawCache table inspection ─────────────────────
 // Remove this endpoint once cache behaviour is confirmed working in the test env.
 router.get('/debug/enrichment-raw-cache', async (req: Request, res: Response) => {
-  const userId = (req as AuthenticatedRequest).user?.userId;
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  if (!authReq.user?.isAdmin) {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
 
   const AWS = require('aws-sdk');
   const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
