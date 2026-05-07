@@ -15,7 +15,7 @@ import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition } from 
 import { resendService } from './resendService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
-import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls } from '../utils/emailVariables';
+import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { settingsService } from './settingsService';
 
 export async function processDueEnrollments(): Promise<{
@@ -117,6 +117,9 @@ async function processEnrollment(
   // even when sent from a dev environment where BACKEND_URL is a private IP.
   const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
   bodyHtml = rewriteS3ImageUrls(bodyHtml, assetBaseUrl);
+
+  // Convert youtu.be short URLs to full youtube.com URLs to avoid Gmail spam filters.
+  bodyHtml = normalizeYoutubeUrls(bodyHtml);
 
   // Inject unsubscribe URL — replaces {{unsubscribeUrl}} variable, updates an existing
   // unsubscribe anchor href, or appends a footer if no unsubscribe link is present.

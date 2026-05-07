@@ -1,4 +1,4 @@
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 jest.mock('../utils/llmService');
@@ -281,6 +281,64 @@ describe('rewriteS3ImageUrls', () => {
     const result = rewriteS3ImageUrls(html, 'https://api.agentweb.pro/');
     expect(result).toMatch(/src="https:\/\/api\.agentweb\.pro\/asset\//);
     expect(result).not.toMatch(/\/\/asset\//);
+  });
+});
+
+describe('normalizeYoutubeUrls', () => {
+  // FAIL cases — inputs that should not be transformed
+  it('should return empty string unchanged', () => {
+    expect(normalizeYoutubeUrls('')).toBe('');
+  });
+
+  it('should not modify HTML with no YouTube URLs', () => {
+    const html = '<p>Check out <a href="https://example.com">this site</a></p>';
+    expect(normalizeYoutubeUrls(html)).toBe(html);
+  });
+
+  it('should not modify full youtube.com/watch URLs', () => {
+    const html = '<a href="https://www.youtube.com/watch?v=gtTodHxuEp8">Watch</a>';
+    expect(normalizeYoutubeUrls(html)).toBe(html);
+  });
+
+  it('should not modify other youtube.com URLs (channel, playlist, etc.)', () => {
+    const html = '<a href="https://www.youtube.com/channel/UC123">Channel</a>';
+    expect(normalizeYoutubeUrls(html)).toBe(html);
+  });
+
+  // SUCCESS cases — youtu.be short URLs should be expanded
+  it('should convert a plain youtu.be href to full youtube.com/watch URL', () => {
+    const html = '<a href="https://youtu.be/gtTodHxuEp8">Watch</a>';
+    const result = normalizeYoutubeUrls(html);
+    expect(result).toBe('<a href="https://www.youtube.com/watch?v=gtTodHxuEp8">Watch</a>');
+  });
+
+  it('should preserve the si= query parameter as additional param', () => {
+    const html = '<a href="https://youtu.be/gtTodHxuEp8?si=3ugFPHb5pXxylgps">Watch</a>';
+    const result = normalizeYoutubeUrls(html);
+    expect(result).toContain('https://www.youtube.com/watch?v=gtTodHxuEp8');
+    expect(result).toContain('si=3ugFPHb5pXxylgps');
+  });
+
+  it('should convert youtu.be URLs appearing as plain text (not in href)', () => {
+    const html = '<p>Watch: https://youtu.be/abc123XYZ</p>';
+    const result = normalizeYoutubeUrls(html);
+    expect(result).toContain('https://www.youtube.com/watch?v=abc123XYZ');
+    expect(result).not.toContain('youtu.be');
+  });
+
+  it('should convert multiple youtu.be URLs in one HTML string', () => {
+    const html = '<a href="https://youtu.be/vid1abc">One</a> and <a href="https://youtu.be/vid2def">Two</a>';
+    const result = normalizeYoutubeUrls(html);
+    expect(result).toContain('https://www.youtube.com/watch?v=vid1abc');
+    expect(result).toContain('https://www.youtube.com/watch?v=vid2def');
+    expect(result).not.toContain('youtu.be');
+  });
+
+  it('should handle http:// youtu.be links', () => {
+    const html = '<a href="http://youtu.be/testId123">Watch</a>';
+    const result = normalizeYoutubeUrls(html);
+    expect(result).toContain('https://www.youtube.com/watch?v=testId123');
+    expect(result).not.toContain('youtu.be');
   });
 });
 
