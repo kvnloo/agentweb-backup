@@ -24,6 +24,7 @@ import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
+import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -21419,11 +21420,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     if (auto_enrich && result.newCount > 0) {
       const newLeadIds: string[] = (result as any).created?.map((c: any) => c.leadId) ?? [];
       if (newLeadIds.length > 0) {
-        // Indirected through __testHooks so tests can spy and stub. The real
-        // implementation lands in a follow-up commit; until then the stub
-        // returns null (graceful no-op).
+        // Indirected through __testHooks so tests can spy and stub.
         const job = await __testHooks.enqueueFindEmailJobForNewLeads(userId, listId, newLeadIds);
-        if (job) (response as any).autoEnrichJobId = job.jobId;
+        // Guard on jobId rather than truthiness — autoEnrich returns a
+        // sentinel { jobId: '', queued: 0, reason: 'quota-exhausted' } in
+        // the no-budget path that we must not surface as a job id.
+        if (job?.jobId) (response as any).autoEnrichJobId = job.jobId;
       }
     }
 
@@ -21432,26 +21434,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 }
 
 /**
- * Inline stub — replaced post-merge by an import from
- * agentModeService.autoEnrich (Subagent B's slice). Keeps Subagent A
- * independent: tests can spy on this stub today, and the import-swap is a
- * trivial diff later.
- */
-async function enqueueFindEmailJobForNewLeads_stub(
-  _userId: string,
-  _listId: string,
-  _leadIds: string[],
-): Promise<{ jobId: string; queued: number } | null> {
-  return null;
-}
-
-/**
- * Test seam — exposes internal helpers so unit tests can spy/stub them
- * without exporting them as production API. Mutating __testHooks in tests
+ * Test seam — exposes the autoEnrich glue so unit tests can spy/stub
+ * without exporting it as production API. Mutating __testHooks in tests
  * is safe because each test file imports a fresh module instance.
  */
 export const __testHooks = {
-  enqueueFindEmailJobForNewLeads: enqueueFindEmailJobForNewLeads_stub,
+  enqueueFindEmailJobForNewLeads,
 };
 
 export const agentModeService = new AgentModeService();
