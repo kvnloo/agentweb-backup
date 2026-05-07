@@ -30,6 +30,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-07',
+    changes: [
+      'Improved: CRM Sequences — Better Email Deliverability',
+      '- Images in sequence emails are now served through a consistent domain (api.agentweb.pro) instead of raw S3 URLs, reducing the chance of emails landing in spam',
+      '- Unsubscribe links are now properly injected into every sequence email at send time, ensuring compliance and improving deliverability',
+      '- Both fixes apply automatically to all users — no action required',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Emma Voice Mode — Barge-In and Error Visibility',
