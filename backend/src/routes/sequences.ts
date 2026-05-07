@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 const router = express.Router();
@@ -304,8 +304,11 @@ router.post(
     const withBanner = /<body\b/i.test(htmlContent)
       ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
       : testBanner + htmlContent;
+    // Rewrite S3 image URLs through the asset proxy (same as production send path)
+    const backendUrl = process.env.BACKEND_URL || 'https://api.agentweb.pro';
+    const withRewrittenImages = rewriteS3ImageUrls(withBanner, backendUrl);
     // Wire up unsubscribe URL with the real portal domain
-    const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl);
+    const testHtml = injectUnsubscribeUrl(withRewrittenImages, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
