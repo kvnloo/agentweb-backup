@@ -28,11 +28,18 @@ export interface RemotionComposeParams {
   /** User ID for S3 path scoping */
   userId: string;
   /**
-   * Duration of the source clip in seconds.
-   * Used to calculate durationInFrames for the composition.
+   * Duration of each source clip in seconds.
+   * Used as a fallback when targetDurationSeconds is not provided.
    * If not provided, defaults to 8 seconds (Veo default clip length).
    */
   clipDurationSeconds?: number;
+  /**
+   * Exact total duration to render in seconds.
+   * When provided, overrides clipDurationSeconds × clipCount so the
+   * composition matches the requested duration (e.g. 30s) rather than
+   * the raw clip total (e.g. 4 clips × 8s = 32s).
+   */
+  targetDurationSeconds?: number;
 }
 
 export interface RemotionComposeResult {
@@ -196,9 +203,11 @@ export class RemotionService {
       // Each Veo clip is at most 8 seconds; use the per-clip duration for total calculation
       const MAX_VEO_CLIP_SECONDS = 8;
       const perClipSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
-      const totalDurationSeconds = perClipSeconds * clipCount;
+      // If the caller specifies an exact target duration (e.g. 30s from 4×8s clips), use it
+      // directly so the composition doesn't run over (e.g. 32s instead of 30s).
+      const totalDurationSeconds = params.targetDurationSeconds ?? perClipSeconds * clipCount;
       const durationInFrames = Math.round(totalDurationSeconds * FPS);
-      console.log(`RemotionService: ${clipCount} clip(s) × ${perClipSeconds}s = ${totalDurationSeconds}s → durationInFrames=${durationInFrames}`);
+      console.log(`RemotionService: ${clipCount} clip(s) × ${perClipSeconds}s = ${totalDurationSeconds}s (target=${params.targetDurationSeconds ?? 'none'}) → durationInFrames=${durationInFrames}`);
 
       // Ensure filename ends with .mp4
       let filename = params.filename;

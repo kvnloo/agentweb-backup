@@ -616,6 +616,9 @@ export class VideoService {
             clipUrl: clipUrls[0],
             extraClipUrls: clipUrls.slice(1),
             clipDurationSeconds: perClipDuration,
+            // Pass the original requested duration so Remotion trims to e.g. 30s
+            // instead of clipCount × perClipDuration (e.g. 4 × 8 = 32s).
+            targetDurationSeconds: params.durationSeconds,
             filename: params.filename,
             userId: params.userId,
           });

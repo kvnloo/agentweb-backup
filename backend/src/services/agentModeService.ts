@@ -15588,7 +15588,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     composeParams: Record<string, any>,
-    clipDurationSeconds?: number
+    clipDurationSeconds?: number,
+    targetDurationSeconds?: number
   ): Promise<any> {
     try {
       if (!clipUrls || clipUrls.length === 0) {
@@ -15609,6 +15610,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
+        targetDurationSeconds,
         filename,
         userId,
       });
