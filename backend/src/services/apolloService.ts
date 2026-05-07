@@ -280,6 +280,12 @@ export class ApolloService {
     // and tier-2's cache row is what would be reused; we just don't write
     // a misleading "not_found" row from tier 3.
     if (opts.runWaterfall) {
+      // C4: Tier-3 bypasses runCachedCall (cache is disabled here, see comment
+      // above) but still consumes Apollo credits — variable cost when the
+      // broker chain fires. Apply quota the same as cached calls.
+      if (this.deps.quota && opts.userId) {
+        await this.deps.quota.checkQuota(opts.userId, 'find');
+      }
       const apiResp = await this.deps.http.findEmail({
         firstName: (input.firstName ?? '').trim(),
         lastName: (input.lastName ?? '').trim(),
@@ -288,6 +294,11 @@ export class ApolloService {
         runWaterfall: true,
         // The factory's HTTP client supplies the webhook URL from env config.
       });
+      if (this.deps.quota && opts.userId) {
+        try { await this.deps.quota.recordUsage(opts.userId, 'find'); } catch (e) {
+          console.error('[apollo] recordUsage failed (Tier 3):', (e as Error).message);
+        }
+      }
       const d = apiResp?.data ?? apiResp ?? {};
       const email = d.person?.email ?? d.email;
       const requestId: string | undefined = d.request_id ?? d.person?.request_id ?? d.requestId;

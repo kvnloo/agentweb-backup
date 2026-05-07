@@ -260,6 +260,42 @@ describe('ApolloService', () => {
 });
 
 describe('ApolloService — input validation', () => {
+  describe('findEmail — Tier-3 runWaterfall quota (C4)', () => {
+    it('checks quota before issuing the waterfall API call', async () => {
+      const http = makeHttp({
+        findEmail: jest.fn().mockResolvedValue({ person: { email: 'a@b.com' }, request_id: 'r1' }),
+      });
+      const store = makeStore();
+      const quota = new InMemoryApolloQuotaTracker({ limits: { match: 500, find: 0, org: 500 } });
+      const svc = new ApolloService({ http, store, quota });
+
+      await expect(
+        svc.findEmail(
+          { firstName: 'A', lastName: 'B', domain: 'b.com' },
+          { userId: 'u1', runWaterfall: true },
+        ),
+      ).rejects.toThrow(ApolloQuotaExceededError);
+      expect(http.findEmail).not.toHaveBeenCalled();
+    });
+
+    it('records usage on a successful waterfall call', async () => {
+      const http = makeHttp({
+        findEmail: jest.fn().mockResolvedValue({ person: { email: 'a@b.com' }, request_id: 'r1' }),
+      });
+      const store = makeStore();
+      const quota = new InMemoryApolloQuotaTracker({ limits: { match: 500, find: 5, org: 500 } });
+      const svc = new ApolloService({ http, store, quota });
+
+      const before = await quota.getUsage('u1');
+      await svc.findEmail(
+        { firstName: 'A', lastName: 'B', domain: 'b.com' },
+        { userId: 'u1', runWaterfall: true },
+      );
+      const after = await quota.getUsage('u1');
+      expect(after.findCount).toBe(before.findCount + 1);
+    });
+  });
+
   it('matchPerson throws when no identifier provided', async () => {
     const svc = new ApolloService({ http: makeHttp(), store: makeStore() });
     await expect(svc.matchPerson({})).rejects.toThrow();
