@@ -157,7 +157,8 @@ describe('POST /api/crm/leads/find-email', () => {
   it('returns 400 when no name is provided', async () => {
     const res = await request(app).post('/api/crm/leads/find-email').send({ domain: 'acme.com' });
     expect(res.status).toBe(400);
-    expect(res.body.message).toMatch(/firstName|lastName/);
+    // Combined gate: requires (linkedin) OR (name + domain/company).
+    expect(res.body.message).toMatch(/linkedin|name/i);
   });
 
   it('returns 400 when no domain or company', async () => {
@@ -368,7 +369,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     const res = await request(app).post('/api/crm/lists/list-1/leads/validate-emails').send({});
 
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 0 });
+    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 0, jobId: expect.any(String) });
   });
 
   it('queues only the selected leadIds when provided', async () => {
@@ -380,7 +381,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
       .post('/api/crm/lists/list-1/leads/validate-emails')
       .send({ leadIds: ['X', 'Y'] });
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 0 });
+    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 0, jobId: expect.any(String) });
   });
 
   it('treats explicit empty leadIds: [] as a no-op (does NOT fall through to fetch-all)', async () => {
@@ -417,7 +418,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     // No leadIds in body — should fetch the whole list.
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 0, alreadyDone: 0 });
+    expect(res.body).toEqual({ queued: 2, skipped: 0, alreadyDone: 0, jobId: expect.any(String) });
     expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(1);
   });
 
@@ -438,7 +439,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
 
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 1 });
+    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 1, jobId: expect.any(String) });
   });
 });
 
@@ -490,7 +491,7 @@ describe('POST /api/crm/lists/:listId/leads/find-emails (bulk)', () => {
     } as any);
     const res = await request(app).post('/api/crm/lists/L1/leads/find-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 1 });
+    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 1, jobId: expect.any(String) });
   });
 
   it('returns 403 on cross-tenant access', async () => {
