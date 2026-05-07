@@ -2209,6 +2209,23 @@ function validateColumnMappingSize(mapping: Record<string, any>): string | null 
  * when no mapping is provided (legacy behavior, preserved so old clients keep
  * working).
  */
+/**
+ * S11: per-value/per-key caps for CSV import. Adversarial CSVs with multi-MB
+ * cells or hundreds of columns shouldn't push the lead row past the DDB
+ * 400KB item limit. Truncation is silent — users importing a 10KB blob into
+ * a single field weren't going to render it sensibly anyway.
+ */
+const MAX_CUSTOM_FIELD_VALUE_BYTES = 8 * 1024;
+const MAX_CUSTOM_FIELDS_PER_LEAD = 100;
+function truncateForLead(value: string): string {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (bytes <= MAX_CUSTOM_FIELD_VALUE_BYTES) return value;
+  // Slice by JS char index — close enough; we'd rather under-truncate by a
+  // few multibyte chars than introduce a fast utf8 byte-walker for this.
+  const approxCharCap = Math.floor(MAX_CUSTOM_FIELD_VALUE_BYTES / 2);
+  return value.slice(0, approxCharCap);
+}
+
 function projectRecordWithMapping(
   record: Record<string, any>,
   mapping: Record<string, ColumnMappingTarget> | null,
@@ -2241,7 +2258,8 @@ function projectRecordWithMapping(
 
       if (typeof target === 'object' && target !== null) {
         if ('customField' in target && target.customField) {
-          customFields[target.customField] = value;
+          if (Object.keys(customFields).length >= MAX_CUSTOM_FIELDS_PER_LEAD) continue;
+          customFields[target.customField] = truncateForLead(value);
           continue;
         }
         if ('splitFullName' in target) {
@@ -2280,7 +2298,8 @@ function projectRecordWithMapping(
       if (matching) {
         lead[matching] = value;
       } else {
-        customFields[key] = value;
+        if (Object.keys(customFields).length >= MAX_CUSTOM_FIELDS_PER_LEAD) return;
+        customFields[key] = truncateForLead(value);
       }
     });
   }
