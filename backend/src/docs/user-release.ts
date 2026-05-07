@@ -34,6 +34,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Each deployed landing page now has a "View Metrics" button that opens a dedicated metrics view filtered to that page\'s domain',
       '- Google Search Console data is scoped to just that subdomain (e.g. mysite.agentwebforms.com) using GSC page filters',
       '- Google Analytics 4 traffic is automatically shown for all agentwebforms.com landing pages — no manual configuration needed',
+      '- GA4 tracking script is automatically injected into newly generated landing pages so visitor events are collected from day one',
       '- A "Back to Landing Pages" breadcrumb makes it easy to return from metrics to the landing pages list',
       '- Domains are automatically registered in your SEO config when a landing page is deployed',
     ],
