@@ -395,6 +395,13 @@ export class ApolloService {
       }
     }
 
+    // Quota is check-then-record, NOT atomic. Concurrent workers (bulk enrich
+    // runs at concurrency=8) can each pass checkQuota at limit-1 and then all
+    // hit the API, so daily caps can be exceeded by up to (concurrency-1) on
+    // the day they're first exhausted. Accepted: matches the enrich.so quota
+    // tracker pattern, and the over-shoot is bounded and small. An atomic
+    // increment-then-rollback-on-error would require a second DDB write per
+    // call — not worth the latency for a single-digit overshoot.
     if (this.deps.quota && opts.userId) {
       await this.deps.quota.checkQuota(opts.userId, endpoint);
     }
