@@ -32,6 +32,11 @@ import {
   EnrichmentFieldConfig,
   normalizeEnrichmentFieldConfig,
 } from '../services/enrichmentFieldConfig';
+import {
+  runWithConcurrency,
+  BULK_ENRICH_CONCURRENCY,
+} from '../services/crmEnrichmentConcurrency';
+import { findEmailsForLeadsInBackground } from '../services/crmFindEmailRunner';
 
 // Conservative RFC-5322-ish check — sufficient to reject obvious garbage and
 // catch typos. Real deliverability is what enrich.so checks; this is just a
@@ -42,42 +47,8 @@ function isValidEmailFormat(email: string): boolean {
   return EMAIL_REGEX.test(email) && email.length <= 254;
 }
 
-/**
- * Run an async fn over each item with a bounded concurrency window.
- * Used by bulk enrichment fan-out so a 5K-lead list doesn't fire 5K
- * simultaneous enrich.so + DDB calls.
- *
- * Per-item failures are returned as `Promise.allSettled`-style results so the
- * caller can log without aborting the rest of the batch.
- */
-async function runWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  const cap = Math.max(1, limit);
-  let i = 0;
-  const runners = Array.from({ length: Math.min(cap, items.length) }, async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) return;
-      try {
-        await worker(items[idx]);
-      } catch {
-        // Worker is expected to handle its own errors; this catch is
-        // belt-and-suspenders so one rejection doesn't kill the runner.
-      }
-    }
-  });
-  await Promise.all(runners);
-}
-
-/**
- * Concurrency cap for background bulk enrichment fan-out. Tuned to stay well
- * under enrich.so per-second rate limits while still finishing a 1K-lead list
- * in a few minutes.
- */
-const BULK_ENRICH_CONCURRENCY = 8;
+// runWithConcurrency + BULK_ENRICH_CONCURRENCY moved to
+// services/crmEnrichmentConcurrency.ts so non-route callers can share them.
 
 // Quota tracker is owned by the EnrichSoService singleton; the route reaches
 // it via this thin accessor so tests can inject a fake.
@@ -352,95 +323,9 @@ async function fetchAllLeads(listId: string): Promise<any[]> {
   return out;
 }
 
-/**
- * Background bulk find-email — for leads with name + (company or website) OR
- * a LinkedIn URL but no email, look up the email and write it back to the lead
- * record. Does not block the response. Failures per-lead are swallowed (logged).
- */
-async function findEmailsForLeadsInBackground(
-  listId: string,
-  leads: any[],
-  userId: string,
-  jobId?: string,
-): Promise<void> {
-  try {
-    await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
-      const firstName = (lead.firstName ?? '').trim();
-      const lastName = (lead.lastName ?? '').trim();
-      const company = (lead.company ?? '').trim();
-      const website = (lead.website ?? '').trim();
-      const linkedin = (lead.linkedin ?? '').trim();
-      const haveName = !!(firstName || lastName);
-      const haveOrg = !!(company || website);
-      if (!linkedin && !(haveName && haveOrg)) {
-        if (jobId) recordResult(jobId, { found: false });
-        return;
-      }
-      try {
-        const r = await waterfallFindEmail(
-          {
-            firstName,
-            lastName,
-            company: company || undefined,
-            website: website || undefined,
-            linkedin: lead.linkedin || undefined,
-            leadHint: { listId, leadId: lead.leadId },
-          },
-          { userId },
-        );
-        if (r.found && r.email) {
-          // When Apollo's matchPerson was the source (Tier 2 first leg, has
-          // r.apolloMatch), project the full payload onto missing fields too —
-          // title, linkedin, company, employment history, tech stack, funding,
-          // headcount growth. Never overwrites existing values.
-          //
-          // For non-Apollo hits (enrich.so finder, pattern, Apollo findEmail
-          // basic) we only have the email itself, so just write that.
-          if (r.apolloMatch) {
-            const proj = applyApolloMatchToLead(lead, r.apolloMatch, { fillEmail: true });
-            // The waterfall already returned r.email which equals proj.updates.email
-            // (or the existing lead email if user filled). Ensure the email
-            // metadata sourceQuote includes Apollo's emailStatus where available.
-            if (r.emailStatus && proj.enrichmentMetadata.email) {
-              proj.enrichmentMetadata.email.sourceQuote = `Apollo (${r.emailStatus})`;
-            }
-            const payload: any = { ...proj.updates, enrichmentMetadata: proj.enrichmentMetadata };
-            if (Object.keys(proj.customFields).length > 0) {
-              payload.customFields = { ...((lead.customFields ?? {}) as Record<string, any>), ...proj.customFields };
-            }
-            // Ensure email always lands even if applyApolloMatchToLead's
-            // never-overwrite rule skipped it for some edge case.
-            if (!payload.email) payload.email = r.email;
-            await crmDb.updateLead(listId, lead.leadId, payload);
-          } else {
-            const now = new Date().toISOString();
-            const enrichmentMetadata = {
-              ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
-              email: {
-                source: 'web_search' as const,
-                provider: r.provider ?? 'enrich.so',
-                confidence: r.confidence ?? 'medium',
-                enrichedAt: now,
-                sourceQuote: r.message ?? (r.emailStatus ? `Apollo (${r.emailStatus})` : undefined),
-              },
-            };
-            await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
-          }
-          if (jobId) recordResult(jobId, { found: true, tier: r.tier });
-        } else {
-          if (jobId) recordResult(jobId, { found: false });
-        }
-      } catch (err) {
-        console.error('[CRM bulk find-email] failed for', lead.leadId, ':', (err as Error).message);
-        if (jobId) recordResult(jobId, { found: false, error: true });
-      }
-    });
-    if (jobId) completeJob(jobId);
-  } catch (err) {
-    if (jobId) completeJob(jobId, (err as Error).message);
-    throw err;
-  }
-}
+// findEmailsForLeadsInBackground moved to services/crmFindEmailRunner.ts
+// so non-route callers (Phase 1 auto-enrich glue) can invoke it without a
+// service → route import smell.
 
 /**
  * Background bulk reverse-lookup — for leads with email but missing one or
