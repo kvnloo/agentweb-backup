@@ -16,6 +16,9 @@ export interface BrandedVideoProps {
   extraClipUrls?: string[];
   /** Duration of each individual clip in frames (all clips have the same duration) */
   perClipDurationInFrames?: number;
+  /** Per-clip durations in frames. When provided, overrides perClipDurationInFrames
+   *  and allows variable-length clips (e.g. [240, 240, 240, 180] for 8,8,8,6s at 30fps). */
+  clipDurationInFrames?: number[];
   /** Brand display name shown as headline */
   brandName: string;
   /** Optional tagline or subtitle */
@@ -206,11 +209,64 @@ const OutroOverlay: React.FC<{
   );
 };
 
+// Cross-fade duration in frames (~200ms at 30fps). Short enough to read as a hard cut
+// but long enough to hide the raw Veo clip boundary seam.
+const CLIP_FADE_FRAMES = 6;
+
+/** Wraps a single clip with optional fade-in and fade-out */
+const ClipWithFade: React.FC<{
+  src: string;
+  fadeInFrames: number;
+  fadeOutFrames: number;
+  seqDuration: number;
+}> = ({ src, fadeInFrames, fadeOutFrames, seqDuration }) => {
+  const frame = useCurrentFrame();
+
+  // Build opacity curve only for the transitions that actually exist
+  let opacity: number;
+  if (fadeInFrames > 0 && fadeOutFrames > 0) {
+    opacity = interpolate(
+      frame,
+      [0, fadeInFrames, seqDuration - fadeOutFrames, seqDuration],
+      [0, 1, 1, 0],
+      {
+        extrapolateLeft: "clamp",
+        extrapolateRight: "clamp",
+        easing: Easing.bezier(0.65, 0, 0.35, 1), // EASE_IN_OUT_CUB — smooth cross-fade
+      }
+    );
+  } else if (fadeInFrames > 0) {
+    opacity = interpolate(frame, [0, fadeInFrames], [0, 1], {
+      extrapolateLeft: "clamp",
+      extrapolateRight: "clamp",
+      easing: Easing.bezier(0.22, 1, 0.36, 1), // EASE_OUT_QUART — arrival
+    });
+  } else if (fadeOutFrames > 0) {
+    opacity = interpolate(frame, [seqDuration - fadeOutFrames, seqDuration], [1, 0], {
+      extrapolateLeft: "clamp",
+      extrapolateRight: "clamp",
+      easing: Easing.bezier(0.5, 0, 0.75, 0), // EASE_IN_QUART — exit
+    });
+  } else {
+    opacity = 1;
+  }
+
+  return (
+    <AbsoluteFill style={{ opacity }}>
+      <OffthreadVideo
+        src={src}
+        style={{ width: "100%", height: "100%", objectFit: "cover" }}
+      />
+    </AbsoluteFill>
+  );
+};
+
 /** Root composition: one or more clips concatenated + intro overlay + optional outro */
 export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   clipUrl,
   extraClipUrls = [],
   perClipDurationInFrames,
+  clipDurationInFrames,
   brandName,
   tagline,
   primaryColor,
@@ -233,26 +289,57 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   const allClips = [clipUrl, ...extraClipUrls];
   const clipCount = allClips.length;
 
-  // Duration for each clip segment: either from props or evenly divide total
-  const perClipFrames = perClipDurationInFrames
-    ? Math.max(1, perClipDurationInFrames)
-    : Math.floor(durationInFrames / clipCount);
+  // Resolve per-clip frame durations:
+  // 1. clipDurationInFrames array (variable lengths, e.g. [240, 240, 240, 180])
+  // 2. perClipDurationInFrames scalar (uniform)
+  // 3. fallback: divide total composition duration equally
+  const fallbackPerClip = Math.max(1, Math.floor(durationInFrames / clipCount));
+  const clipFrames: number[] = allClips.map((_, i) => {
+    if (clipDurationInFrames && clipDurationInFrames[i] != null) {
+      return Math.max(1, clipDurationInFrames[i]);
+    }
+    if (perClipDurationInFrames) {
+      return Math.max(1, perClipDurationInFrames);
+    }
+    return fallbackPerClip;
+  });
+
+  // Build cumulative start offsets from the per-clip durations
+  const clipStarts: number[] = [];
+  let cursor = 0;
+  for (let i = 0; i < clipCount; i++) {
+    clipStarts.push(cursor);
+    cursor += clipFrames[i];
+  }
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      {/* Concatenate all clips sequentially */}
-      {allClips.map((url, i) => (
-        <Sequence
-          key={`clip-${i}`}
-          from={i * perClipFrames}
-          durationInFrames={perClipFrames}
-        >
-          <OffthreadVideo
-            src={url}
-            style={{ width: "100%", height: "100%", objectFit: "cover" }}
-          />
-        </Sequence>
-      ))}
+      {/* Clips with cross-fade transitions at each boundary.
+          Non-last sequences extend by CLIP_FADE_FRAMES so they overlap the next clip,
+          creating a true cross-dissolve without changing total composition duration. */}
+      {allClips.map((url, i) => {
+        const isFirst = i === 0;
+        const isLast = i === clipCount - 1;
+        const fadeIn = isFirst ? 0 : CLIP_FADE_FRAMES;
+        const fadeOut = isLast ? 0 : CLIP_FADE_FRAMES;
+        // Extend non-last clips by CLIP_FADE_FRAMES so they overlap the start of the next clip
+        const seqDuration = isLast ? clipFrames[i] : clipFrames[i] + CLIP_FADE_FRAMES;
+
+        return (
+          <Sequence
+            key={`clip-${i}`}
+            from={clipStarts[i]}
+            durationInFrames={seqDuration}
+          >
+            <ClipWithFade
+              src={url}
+              fadeInFrames={fadeIn}
+              fadeOutFrames={fadeOut}
+              seqDuration={seqDuration}
+            />
+          </Sequence>
+        );
+      })}
 
       {/* Intro brand overlay */}
       <Sequence from={0} durationInFrames={safeIntroDuration}>

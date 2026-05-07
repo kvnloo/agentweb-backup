@@ -4000,12 +4000,14 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
+    // If the LLM didn't specify a model, fall back to the admin-configured video API default
+    const videoModel = args.videoModel || await agentModeService.getVideoApiDefaultModel();
     return await agentModeService.generateVideo(
       args.prompt,
       args.filename,
       context?.userId,
       context?.sessionId,
-      args.videoModel,
+      videoModel,
       args.startFrame,
       args.endFrame,
       args.compose,
@@ -4036,6 +4038,15 @@ emmaToolRegistry.register({
         clip_duration_seconds: {
           type: 'number',
           description: 'Duration of each individual clip in seconds (all clips must have the same duration). Defaults to 8.'
+        },
+        target_duration_seconds: {
+          type: 'number',
+          description: 'Optional: Exact total duration for the composed video in seconds. Use this to trim the output to the desired length (e.g. 30) when clips total more (e.g. 4 clips × 8s = 32s). If omitted, defaults to clip_duration_seconds × number of clips.'
+        },
+        clip_durations_seconds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional: Per-clip playback durations in seconds (variable-length support). E.g. [8, 8, 8, 6] for a 30s video with 3 full clips and one 6s clip. Overrides clip_duration_seconds for each individual clip. Use when clips have different lengths.'
         },
         brand_name: {
           type: 'string',
@@ -4084,7 +4095,9 @@ emmaToolRegistry.register({
         ctaText: args.cta_text,
         ctaUrl: args.cta_url,
       },
-      args.clip_duration_seconds
+      args.clip_duration_seconds,
+      args.target_duration_seconds,
+      args.clip_durations_seconds
     );
   }
 });

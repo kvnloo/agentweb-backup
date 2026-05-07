@@ -200,6 +200,7 @@ export class AgentModeService {
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private imageApiDefaultModelSettingName = 'agent_mode_image_api_default_model';
+  private videoApiDefaultModelSettingName = 'agent_mode_video_api_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
@@ -234,6 +235,7 @@ export class AgentModeService {
     description: string;
     toolNames: string[];
     category?: string;
+    systemPrompt?: string;
   }> = [
       {
         name: 'Meeting Intelligence',
@@ -271,7 +273,7 @@ export class AgentModeService {
           builtin.name,
           builtin.description,
           builtin.toolNames,
-          undefined, // systemPrompt
+          builtin.systemPrompt,
           true       // isPublished — available immediately
         );
 
@@ -720,6 +722,26 @@ export class AgentModeService {
       console.error('AgentMode: Error getting image API default model setting:', error);
     }
     // Return undefined to let imageGeneration.ts use its own hardcoded default
+    return undefined;
+  }
+
+  // Supported video API models
+  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+
+  async getVideoApiDefaultModel(): Promise<string | undefined> {
+    try {
+      const setting = await settingsService.getSetting(this.videoApiDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (AgentModeService.VIDEO_API_MODELS.includes(configuredModel)) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported video API default model "${configuredModel}" in settings; using hardcoded default.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting video API default model setting:', error);
+    }
+    // Return undefined to let the video generation service use its own hardcoded default
     return undefined;
   }
 
@@ -15386,7 +15408,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     composeParams: Record<string, any>,
-    clipDurationSeconds?: number
+    clipDurationSeconds?: number,
+    targetDurationSeconds?: number,
+    clipDurationsSeconds?: number[]
   ): Promise<any> {
     try {
       if (!clipUrls || clipUrls.length === 0) {
@@ -15407,6 +15431,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
+        targetDurationSeconds,
+        clipDurationsSeconds,
         filename,
         userId,
       });

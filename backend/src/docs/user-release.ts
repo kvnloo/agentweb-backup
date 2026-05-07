@@ -1,5 +1,5 @@
 // Define the interface for release notes
-
+// Last updated: 2026-05-07
 
 export interface UserReleaseNote {
   date: string;
@@ -17,6 +17,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Google Analytics 4 traffic is automatically shown for all agentwebforms.com landing pages — no manual configuration needed',
       '- A "Back to Landing Pages" breadcrumb makes it easy to return from metrics to the landing pages list',
       '- Domains are automatically registered in your SEO config when a landing page is deployed',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'Improved: Video Production — Exact-Length Videos and Better Motion Craft',
+      '- Videos now render to the exact requested duration (e.g. 30s) instead of rounding up to the nearest clip boundary (e.g. 32s). For a 30s video, clips are assigned variable playback durations [8, 8, 8, 6s] so the total is always correct.',
+      '- Smooth cross-fade transitions between clips: each clip boundary now uses a 6-frame cross-dissolve with cinematic easing curves (EASE_IN_OUT_CUB at boundaries, EASE_OUT_QUART on arrivals, EASE_IN_QUART on exits) instead of raw hard cuts.',
+      '- Video Production skill system prompt updated with full motion craft guidelines: spring config cheat sheet, named easing bezier curves, entry/exit grammar by motion type, hold-time discipline, follow-through rules, and audio-reactive timing.',
+      '- New admin setting: Video API Default Model — choose the default Veo model for the generate_video tool from the Agent Mode tab of the admin page, matching the existing Image API Default Model pattern.',
     ],
   },
   {
