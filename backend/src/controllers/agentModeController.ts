@@ -617,7 +617,8 @@ export async function runVerifiedChat(
       }
     }
   }
-  const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
+  let defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
+  let backupModelSwitched = false;
 
   // Auto-install skills that contain required function calls so the LLM has
   // access to them from the start (avoids relying on the LLM to call install_skills).
@@ -853,8 +854,18 @@ export async function runVerifiedChat(
         throw error;
       }
       // Transient LLM errors (503, 500, timeout): callLLM already retried 3× internally.
-      // Cap outer transient retries at MAX_TRANSIENT_RETRIES to prevent multi-minute hangs
-      // when the LLM provider is having an extended outage (e.g. 8 attempts × 90s = 760s).
+      // On first transient failure, try switching to the backup model before giving up.
+      // If no backup is configured or backup also fails, cap retries at MAX_TRANSIENT_RETRIES.
+      if (!backupModelSwitched) {
+        const backup = await agentModeService.getBackupModel(defaultModel);
+        if (backup) {
+          console.warn(`AgentMode runVerifiedChat: Primary model "${defaultModel}" failed with transient error, switching to backup model "${backup}" for session ${sessionId}`);
+          defaultModel = backup;
+          backupModelSwitched = true;
+          await chatbotDb.updateSessionLlmModel(sessionId, backup);
+          continue; // retry immediately with backup model, don't increment transientRetryCount
+        }
+      }
       transientRetryCount++;
       if (transientRetryCount > MAX_TRANSIENT_RETRIES || attempt === maxAttempts) {
         throw error;
