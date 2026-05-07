@@ -687,6 +687,7 @@ export async function getAttioCredentials(): Promise<AttioCredentials> {
 export interface LandingPagesConfig {
   ga4PropertyId: string;
   gscDomain: string;
+  ga4MeasurementId?: string;
 }
 
 /**
