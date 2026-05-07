@@ -1,9 +1,10 @@
-const mockGetSecretValue = jest.fn();
+// Tests for getLandingPagesConfig in secretsManager.ts
+const mockGetLpSecretValue = jest.fn();
 
 jest.mock('aws-sdk', () => ({
   SecretsManager: jest.fn(() => ({
     getSecretValue: jest.fn((params: any) => ({
-      promise: () => mockGetSecretValue(params),
+      promise: () => mockGetLpSecretValue(params),
     })),
   })),
 }));
@@ -17,7 +18,7 @@ describe('getLandingPagesConfig', () => {
 
   it('returns config from dev secret in development', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({
+    mockGetLpSecretValue.mockResolvedValue({
       SecretString: JSON.stringify({ ga4PropertyId: '123456789', gscDomain: 'agentwebforms.com' }),
     });
 
@@ -25,24 +26,24 @@ describe('getLandingPagesConfig', () => {
     const config = await getLandingPagesConfig();
 
     expect(config).toEqual({ ga4PropertyId: '123456789', gscDomain: 'agentwebforms.com' });
-    expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/LandingPages' });
+    expect(mockGetLpSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/LandingPages' });
   });
 
   it('uses prod secret name in production', async () => {
     process.env.NODE_ENV = 'production';
-    mockGetSecretValue.mockResolvedValue({
+    mockGetLpSecretValue.mockResolvedValue({
       SecretString: JSON.stringify({ ga4PropertyId: '987654321', gscDomain: 'agentwebforms.com' }),
     });
 
     const { getLandingPagesConfig } = require('../utils/secretsManager');
     await getLandingPagesConfig();
 
-    expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/LandingPages' });
+    expect(mockGetLpSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/LandingPages' });
   });
 
   it('returns null when secret string is empty', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({ SecretString: '' });
+    mockGetLpSecretValue.mockResolvedValue({ SecretString: '' });
 
     const { getLandingPagesConfig } = require('../utils/secretsManager');
     const config = await getLandingPagesConfig();
@@ -52,7 +53,7 @@ describe('getLandingPagesConfig', () => {
 
   it('returns null when secret string is whitespace', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({ SecretString: '   ' });
+    mockGetLpSecretValue.mockResolvedValue({ SecretString: '   ' });
 
     const { getLandingPagesConfig } = require('../utils/secretsManager');
     const config = await getLandingPagesConfig();
@@ -62,7 +63,7 @@ describe('getLandingPagesConfig', () => {
 
   it('returns null when ga4PropertyId is missing', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({
+    mockGetLpSecretValue.mockResolvedValue({
       SecretString: JSON.stringify({ gscDomain: 'agentwebforms.com' }),
     });
 
@@ -74,7 +75,7 @@ describe('getLandingPagesConfig', () => {
 
   it('returns null when gscDomain is missing', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({
+    mockGetLpSecretValue.mockResolvedValue({
       SecretString: JSON.stringify({ ga4PropertyId: '123456789' }),
     });
 
@@ -86,7 +87,7 @@ describe('getLandingPagesConfig', () => {
 
   it('returns null when Secrets Manager throws', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockRejectedValue(new Error('ResourceNotFoundException'));
+    mockGetLpSecretValue.mockRejectedValue(new Error('ResourceNotFoundException'));
 
     const { getLandingPagesConfig } = require('../utils/secretsManager');
     const config = await getLandingPagesConfig();
