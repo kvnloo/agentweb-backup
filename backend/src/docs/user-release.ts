@@ -19,6 +19,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-07',
     changes: [
+      'New: Local Agent — Emma Can Now Browse Your Browser',
+      '- Emma can now use a local Codex agent running on your machine to extract data from websites you\'re already logged into (LinkedIn, HubSpot, Reddit, GitHub, and more)',
+      '- Set up takes 3 steps: run codex-relay serve locally, expose it via ngrok, and store the endpoint + secret in AWS Secrets Manager',
+      '- All tasks are strictly browser read-only — shell commands, file access, and account modifications are blocked',
+      '- The account owner\'s personal data is automatically stripped from all results to protect privacy',
+      '- Multiple requests are handled concurrently — parallel users don\'t block each other',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
       'New: Landing Page Metrics — View GSC & GA4 Traffic Per Landing Page',
       '- Each deployed landing page now has a "View Metrics" button that opens a dedicated metrics view filtered to that page\'s domain',
       '- Google Search Console data is scoped to just that subdomain (e.g. mysite.agentwebforms.com) using GSC page filters',

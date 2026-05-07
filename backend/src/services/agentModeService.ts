@@ -432,6 +432,7 @@ export class AgentModeService {
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/calendarTools');
+        await import('../emma/localAgentTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -2866,6 +2867,10 @@ export class AgentModeService {
 
     // Session Notifications (no email integration required)
     'notify_session',
+
+    // Local Agent Relay (Codex agent running on user's machine)
+    'run_local_agent_task',
+    'check_local_agent_status',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
