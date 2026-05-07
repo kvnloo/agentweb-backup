@@ -24,6 +24,7 @@ jest.mock('../services/db', () => ({
     getEnrichmentCacheItem: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
+    getLeadListById: jest.fn(),
   },
 }));
 
@@ -41,6 +42,9 @@ const SECRET = 'wh_secret_value_123';
 beforeEach(() => {
   jest.clearAllMocks();
   mockGetWebhookSecret.mockResolvedValue(SECRET);
+  // Default ownership mock: list exists and is owned by u1 (matches the
+  // userId stamped on placeholders in the happy-path fixtures).
+  (mockCrmDb as any).getLeadListById = jest.fn().mockResolvedValue({ listId: 'L1', userId: 'u1' });
 });
 
 describe('POST /api/crm/webhooks/apollo — auth', () => {
@@ -108,7 +112,7 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
 
   it('returns 202 leadDeleted:true when the lead has since been removed', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
-      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1' },
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
     } as any);
     mockCrmDb.getLeadById.mockResolvedValue(null);
     const res = await send({ request_id: 'r1', person: { email: 'a@b.com' } });
@@ -119,7 +123,7 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
 
   it('is idempotent: returns alreadyProcessed when apolloRequestId matches', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
-      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1' },
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
     } as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'LD1', email: 'old@b.com',
@@ -134,7 +138,7 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
 
   it('skips when lead already has a different email', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
-      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1' },
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
     } as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'LD1', email: 'existing@b.com',
@@ -148,8 +152,9 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
 
   it('writes the email and confidence metadata on the happy path', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
-      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1' },
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
     } as any);
+    (mockCrmDb as any).getLeadListById = jest.fn().mockResolvedValue({ listId: 'L1', userId: 'u1' });
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'LD1', email: '', enrichmentMetadata: {},
     } as any);
@@ -163,5 +168,54 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     expect(payload.email).toBe('apollo@b.com');
     expect(payload.enrichmentMetadata.email.confidence).toBe('high');
     expect(payload.enrichmentMetadata.email.apolloRequestId).toBe('r1');
+  });
+});
+
+describe('POST /api/crm/webhooks/apollo — ownership reverification (C1)', () => {
+  function send(body: any) {
+    return request(app)
+      .post('/api/crm/webhooks/apollo')
+      .set('X-Apollo-Webhook-Secret', SECRET)
+      .send(body);
+  }
+
+  // All cases below use a real lead that WOULD be writable if ownership
+  // wasn't enforced. The assertion that updateLead was NOT called is what
+  // proves the ownership gate caught the request.
+  beforeEach(() => {
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'LD1', email: '', enrichmentMetadata: {},
+    } as any);
+  });
+
+  it('rejects when placeholder has no userId stamp (legacy/forged)', async () => {
+    mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1' /* no userId */ },
+    } as any);
+    const res = await send({ request_id: 'r1', person: { email: 'apollo@b.com' } });
+    expect(res.body.matched).toBe(false);
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('rejects when list owner no longer matches placeholder userId', async () => {
+    mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+    } as any);
+    (mockCrmDb as any).getLeadListById = jest.fn().mockResolvedValue({ listId: 'L1', userId: 'someone-else' });
+
+    const res = await send({ request_id: 'r1', person: { email: 'apollo@b.com' } });
+    expect(res.body.matched).toBe(false);
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the list itself has been deleted', async () => {
+    mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+    } as any);
+    (mockCrmDb as any).getLeadListById = jest.fn().mockResolvedValue(null);
+
+    const res = await send({ request_id: 'r1', person: { email: 'apollo@b.com' } });
+    expect(res.body.matched).toBe(false);
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
   });
 });

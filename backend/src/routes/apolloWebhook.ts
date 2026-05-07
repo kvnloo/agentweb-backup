@@ -78,7 +78,21 @@ router.post('/', async (req: Request, res: Response) => {
       console.warn('[apollo webhook] no placeholder for request_id', requestId);
       return res.status(202).json({ accepted: true, matched: false });
     }
-    const { listId, leadId } = placeholder.rawData;
+    const { listId, leadId, userId: placeholderUserId } = placeholder.rawData;
+
+    // C1: re-verify ownership. The placeholder is our own write (Tier 3 stamps
+    // userId before handing the URL to Apollo), so a missing or mismatched
+    // userId means: legacy placeholder pre-this-fix, the lead/list moved
+    // between tenants, or a forged/replayed placeholder. Refuse to write.
+    if (!placeholderUserId) {
+      console.warn('[apollo webhook] placeholder missing userId — refusing to write', requestId);
+      return res.status(202).json({ accepted: true, matched: false });
+    }
+    const list: any = await crmDb.getLeadListById(listId).catch(() => null);
+    if (!list || list.userId !== placeholderUserId) {
+      console.warn('[apollo webhook] list missing or owner changed since Tier 3 — refusing', requestId);
+      return res.status(202).json({ accepted: true, matched: false });
+    }
     const lead: any = await crmDb.getLeadById(listId, leadId);
     if (!lead) {
       return res.status(202).json({ accepted: true, matched: false, leadDeleted: true });
