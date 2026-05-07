@@ -282,9 +282,9 @@ Gather: client name, URL, product/service, target audience temperature (cold/war
 
 **Layer 2 — Strategy & Hook**
 Declare a single named hook archetype before writing the script. Allowed archetypes:
-- **Data-Led**: Opens with a surprising, relatable number. Number must appear in the first line.
-- **Pain Agitation**: Names a specific daily pain with sensory/temporal specificity ("Another 2 AM maintenance text"), then amplifies it.
-- **Social Proof Lead**: Opens with a credibility signal (percentage-based outperforms name-based on Meta).
+- **Data-Led**: Opens with a surprising, relatable number. Number must appear in the first line. Rehook: second line explains what the number *costs* the reader personally.
+- **Pain Agitation**: Names a specific daily pain with sensory/temporal specificity ("Another 2 AM maintenance text"), then amplifies it. Rehook: stack two micro-pains in rapid succession before amplifying.
+- **Social Proof Lead**: Opens with a credibility signal (percentage-based outperforms name-based on Meta). Rehook: social proof opens the door; second line reveals what peers are getting.
 - **Time-Bound Promise**: Concrete timeframe as a shortcut. First line = promise, second line = eliminates the objection.
 - **Direct Challenge**: Frames what competitors are doing as a missed opportunity. Never name competitors directly.
 - **Contrarian / Pattern Interrupt**: Challenges a widely-held belief. Highest-performing on Meta cold audiences. Must land within 125 characters.
@@ -305,14 +305,20 @@ Every hook needs at least one self-qualifying phrase before the truncation point
 Write the full voiceover script. For each shot:
 - Word count ≤ (shot_window_seconds × 2.5 wps)
 - If a line is too long for its window, trim the line — do not let chaining silently desync visuals
-- Mark emphasis beats: phrases where no major overlay motion should fire within 6 frames
-- Backup lines for edge cases (voice talent reads slower than expected)
+- Mark emphasis beats: phrases where no major overlay motion should fire within 6 frames of that beat
+- Provide a backup line for each VO window (voice talent often reads at 2.2–2.3 wps, not 2.5)
+
+Meta ad copy structure (output alongside the video script):
+- Primary text: pain → bridge to outcome → proof signal → CTA (2–4 sentences)
+- Headline: outcome-driven or curiosity-driven, 5–10 words max
+- URL description: reinforce offer or add urgency, 1 sentence
+- CTA button: "Learn More" is safest for B2B
 
 **Layer 5 — Veo Shot Prompts**
 Veo 3.1 is cinematic, not literate. Hard rules:
 - **Cannot render fine text or UI** — describe screens as "abstract glow only, no UI, no text, blurred soft glow." Render all actual UI as Remotion overlays on top.
 - **Cannot composite holographic UI** — always include: "Her/His face remains fully visible and lit. NO holographic interfaces, NO floating panels, NO screens, NO UI elements composited into the frame."
-- **Cannot split one shot into multiple vignettes** — split into N separate Veo shots; use WhipPanFlash transition in Remotion between them.
+- **Cannot split one shot into multiple vignettes** — split into N separate Veo shots; use WhipPanFlash (whipFrames: 3, flashFrames: 2) transition in Remotion between them.
 - **Duration: only 4s or 8s clips are valid** — snap UP (≤4s → 4s, >4s → 8s) and trim to script length in assembly.
 - **Brand color as lighting** — the client's primary accent color MUST appear as a deliberate visual element in every Veo prompt: light spill, key-light gel, neon edge, monitor glow, garment accent. A shot missing the brand color is a QA fail.
 
@@ -337,20 +343,54 @@ Mobile font minimums (9:16 Reels/Shorts):
 
 If anything looks "right-sized" on a desktop preview, it is wrong on a phone.
 
-Animation primitives:
-- **spring** for anything with mass/weight: cards, buttons, character entries (config: damping 12, mass 0.6, stiffness 100 for most arrivals)
-- **interpolate + clamp** for camera moves, parameter sweeps, exits (always extrapolate: "clamp" on both sides)
+**Animation primitives — pick by element type, not aesthetics:**
+- **spring** for anything with mass/weight (cards, buttons, character entries, toasts)
+- **interpolate + clamp** for camera moves, parameter sweeps, exits — always extrapolate: "clamp" on both sides
 
-Stagger siblings 3–6 frames apart. Simultaneous sibling animation is a QA fail.
+Spring config by feel:
+- Confident card arrival (DataCard, MockProductCard): { damping: 12, mass: 0.6, stiffness: 100 } — default for 80% of arrivals
+- Snappy UI (toasts, pills, micro-elements): { damping: 18, mass: 0.4, stiffness: 180 }
+- Heavy hero reveal (hero title, end-card brand mark): { damping: 8, mass: 1.0, stiffness: 80 }
+- Bouncy/playful: { damping: 6, mass: 0.5, stiffness: 120 } — reads childish on B2B; use sparingly
 
-Entry slower than exit: if entry is 18 frames, exit should be 8–10 frames.
+Named easing curves for interpolate (use these exact beziers, no generic Easing.inOut):
+- Arrivals/reveals: EASE_OUT_QUART = Easing.bezier(0.22, 1, 0.36, 1)
+- Camera moves / parameter sweeps: EASE_IN_OUT_CUB = Easing.bezier(0.65, 0, 0.35, 1)
+- Exits: EASE_IN_QUART = Easing.bezier(0.5, 0, 0.75, 0) — fast accelerating
+
+**Entry/exit grammar — motion type carries meaning, pick by message:**
+- scale + opacity (0.92 → 1, 0 → 1): "spawned/appeared" — use for toasts, callouts, status pills
+- slide + opacity (translateY 24 → 0): "arrived from offstage" — use for cards, lower-thirds, data
+- scale-from-larger (1.1 → 1, opacity 0 → 1): "settling into place" — use for hero titles, end-card brand mark
+- width/height reveal: "constructed in front of you" — use for progress bars, hairlines
+- opacity alone: weakest possible, feels lazy — never use alone, always pair with translate or scale
+
+**Entry always slower than exit:** if entry is 18 frames, exit is 8–10 frames. Slow exits feel reluctant.
+
+**Hold-time discipline — the destination is the content, not the animation:**
+- Stat / number: 1.2s minimum hold after arrival
+- Body copy sentence: 2.0s + 60ms per word over 8 words
+- Brand logo / mark: 1.0s
+- Quote / testimonial: 2.5s
+- Single word reveal: 0.6s
+If the viewer can't finish reading before the next motion fires, rewrite the timing.
+
+**Stagger siblings 3–6 frames apart.** Simultaneous sibling animation has no hierarchy — QA fail. For lists >5 items, group: 3-frame stagger within group, 8-frame gap between groups.
+
+**Follow-through:** secondary elements (shadows, glows, sub-text) lag the primary by 2–4 frames. Tie shadow blur to spring progress: blur(\${interpolate(spring, [0, 1], [0, 24])}px). A static shadow under a moving card looks pasted.
+
+**Audio-reactive timing:**
+- Major motion should land on VO emphasis beats or music transients, not between them
+- Type-on / word reveal cadence: ~3 syllables/sec average (~12 frames per word at 30fps for a 4-word callout over 1.6s)
+- Caption chunk boundaries drive major motion beats — don't fight the chunking
 
 **Layer 8 — End Card**
-Every ad ends with a 2–3s pure Remotion CTA frame (no Veo footage). Required elements: brand mark, single offer line, button copy, URL. Brand color anchors hardest here. Stagger: logo → headline → URL → button.
+Every ad ends with a 2–3s pure Remotion CTA frame (no Veo footage). Required elements: brand mark, single offer line, button copy, URL. Brand color anchors hardest here. Stagger: logo → headline → URL → button, with 4–6 frames between each. Hold final state ≥1.0s after button arrives.
 
 **Layer 9 — Multi-Aspect Reflow**
 For every overlay-heavy shot, specify how it reflows for 1:1 and 4:5 aspects:
-- Side-by-side panels → stack vertically in 1:1
+- Side-by-side panels → stack vertically in 1:1; center each panel
+- In 4:5: reduce panel max-width to ~42% and increase center gutter
 - Font sizes hold (no scaling down for non-primary aspects)
 - No cropped overlays in any aspect
 
@@ -376,13 +416,15 @@ If any fail: regenerate the offending layer, not the whole video. Do not ship a 
 ## ANTI-PATTERNS (never do these)
 
 - Animating opacity alone — weightless, lazy
-- Linear easing — robotic
+- Linear easing — robotic; use the named bezier curves
 - Simultaneous sibling animations — no hierarchy
-- Spring on a camera move — use interpolate
+- Spring on a camera move — use interpolate + EASE_IN_OUT_CUB
 - Interpolate without extrapolate: "clamp" — elements drift off-frame
+- Same easing curve for entry and exit — no asymmetry = no life
+- Continuous parallax/drift on every shot — screensaver aesthetic
 - Asking Veo to render readable text or UI — it cannot; use Remotion overlays
 - Asking Veo for multiple vignettes in one prompt — split into separate shots
-- Continuous parallax/drift on every shot — screensaver aesthetic
+- Animating to fill dead air — silence is a beat, not a problem
 - Shipping without running the QA rubric
 
 ## WHEN TO TRUST VS. OVERRIDE
