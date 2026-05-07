@@ -20,6 +20,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-07',
+    changes: [
+      'Improved: Video Production — Exact-Length Videos and Better Motion Craft',
+      '- Videos now render to the exact requested duration (e.g. 30s) instead of rounding up to the nearest clip boundary (e.g. 32s). For a 30s video, clips are assigned variable playback durations [8, 8, 8, 6s] so the total is always correct.',
+      '- Smooth cross-fade transitions between clips: each clip boundary now uses a 6-frame cross-dissolve with cinematic easing curves (EASE_IN_OUT_CUB at boundaries, EASE_OUT_QUART on arrivals, EASE_IN_QUART on exits) instead of raw hard cuts.',
+      '- Video Production skill system prompt updated with full motion craft guidelines: spring config cheat sheet, named easing bezier curves, entry/exit grammar by motion type, hold-time discipline, follow-through rules, and audio-reactive timing.',
+      '- New admin setting: Video API Default Model — choose the default Veo model for the generate_video tool from the Agent Mode tab of the admin page, matching the existing Image API Default Model pattern.',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Emma Voice Mode — Barge-In and Error Visibility',
