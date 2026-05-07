@@ -637,9 +637,10 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+
 /**
  * Get the email-verification provider API key from AWS Secrets Manager.
- * Secret format: plain string API key.
+ * Stored as a plain string at dev/AgentWeb/EnrichSo or prod/AgentWeb/EnrichSo.
  */
 export async function getEnrichSoApiKey(): Promise<string> {
   const environment = process.env.NODE_ENV || 'development';
@@ -651,6 +652,54 @@ export async function getEnrichSoApiKey(): Promise<string> {
     throw new Error(`Email verification API key is empty. Store it in Secrets Manager at ${secretName}.`);
   }
   return key.trim();
+}
+
+export interface ApolloCredentials {
+  apiKey: string;
+  webhookSecret?: string;
+}
+
+/**
+ * Get the Apollo people-enrichment API key from AWS Secrets Manager.
+ * Stored as JSON `{"apiKey":"…","webhookSecret":"…"}` at dev/AgentWeb/Apollo
+ * or prod/AgentWeb/Apollo.
+ */
+export async function getApolloApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Apollo'
+    : 'dev/AgentWeb/Apollo';
+  const secretString = await getSecret(secretName);
+  if (!secretString || secretString.trim() === '') {
+    throw new Error(`Apollo credentials secret is empty. Store JSON {"apiKey","webhookSecret"} in Secrets Manager at ${secretName}.`);
+  }
+  const parsed = JSON.parse(secretString) as ApolloCredentials;
+  if (!parsed.apiKey || parsed.apiKey.trim() === '') {
+    throw new Error(`Apollo credentials at ${secretName} missing apiKey.`);
+  }
+  return parsed.apiKey.trim();
+}
+
+/**
+ * Shared secret used to authenticate the Apollo waterfall webhook callback.
+ * Apollo doesn't HMAC-sign webhook bodies, so we send this value in a custom
+ * header (X-Apollo-Webhook-Secret) on the webhook URL we hand Apollo and
+ * verify it on the receiving route with a constant-time compare.
+ */
+export async function getApolloWebhookSecret(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Apollo'
+    : 'dev/AgentWeb/Apollo';
+  const secretString = await getSecret(secretName);
+  if (!secretString || secretString.trim() === '') {
+    throw new Error(`Apollo credentials secret is empty at ${secretName}.`);
+  }
+  const parsed = JSON.parse(secretString) as ApolloCredentials;
+  if (!parsed.webhookSecret || parsed.webhookSecret.trim() === '') {
+    throw new Error(`Apollo credentials at ${secretName} missing webhookSecret.`);
+  }
+  return parsed.webhookSecret.trim();
 }
 
 export interface AttioCredentials {
