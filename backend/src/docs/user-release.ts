@@ -1,4 +1,5 @@
 // Define the interface for release notes
+// Last updated: 2026-05-07
 
 export interface UserReleaseNote {
   date: string;
