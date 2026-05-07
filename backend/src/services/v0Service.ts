@@ -1482,6 +1482,18 @@ async function createGitHubRepoAndPush(
     });
   }
 
+  if (!hasFile("app/layout.tsx")) {
+    const lpConfig = await getLandingPagesConfig();
+    const measurementId = lpConfig?.ga4MeasurementId;
+    const gtagBlock = measurementId
+      ? `\n        <script async src="https://www.googletagmanager.com/gtag/js?id=${measurementId}"></script>\n        <script dangerouslySetInnerHTML={{ __html: \`window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', '${measurementId}');\` }} />`
+      : '';
+    scaffoldFiles.push({
+      path: "app/layout.tsx",
+      content: Buffer.from(`import type { Metadata } from "next";\nimport "./globals.css";\n\nexport const metadata: Metadata = {\n  title: "Landing Page",\n  description: "Generated landing page",\n};\n\nexport default function RootLayout({\n  children,\n}: {\n  children: React.ReactNode;\n}) {\n  return (\n    <html lang="en">\n      <head>${gtagBlock}\n      </head>\n      <body>{children}</body>\n    </html>\n  );\n}\n`),
+    });
+  }
+
   if (scaffoldFiles.length > 0) {
     console.log(`[V0 SERVICE] Adding ${scaffoldFiles.length} scaffold files: ${scaffoldFiles.map(f => f.path).join(", ")}`);
     files.push(...scaffoldFiles);
