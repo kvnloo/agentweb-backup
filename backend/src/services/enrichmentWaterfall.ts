@@ -198,6 +198,13 @@ async function resolveFieldWithWaterfall(
   ctx: WaterfallContext,
 ): Promise<SpecialistResult | null> {
   for (const provider of ordersForReverseLookup(lead)) {
+    // C10: pick the source label by the input signal that triggered the
+    // lookup, not by which provider answered. Apollo and enrich.so are
+    // web-aggregator services regardless; only mark `source: 'linkedin'`
+    // when the lead's LinkedIn URL was the lookup key. The `provider`
+    // field carries the granular label for UI/audit consumers.
+    const inputSignalSource: SpecialistResult['source'] = lead.linkedin ? 'linkedin' : 'web_search';
+
     if (provider === 'apollo') {
       const m = await getApolloMatchForLead(lead, ctx);
       if (m?.found && m.match) {
@@ -206,7 +213,7 @@ async function resolveFieldWithWaterfall(
           return {
             value: picked.value,
             confidence: picked.confidence,
-            source: 'linkedin',
+            source: inputSignalSource,
             provider: 'apollo',
           };
         }
@@ -219,7 +226,7 @@ async function resolveFieldWithWaterfall(
           return {
             value: picked.value,
             confidence: picked.confidence,
-            source: 'linkedin',
+            source: inputSignalSource,
             provider: 'enrich.so',
           };
         }
