@@ -156,6 +156,8 @@ STRICTLY FORBIDDEN — never use this tool to:
 - Post content, send messages, make purchases, or take any write actions
 - Download files to the local machine
 
+PRIVACY — the result must NEVER include personal data of the account owner (the person whose browser session is used): their name, email, phone, address, profile details, connection count, employer, or any other identifying information. Only return data about other people, companies, or content on the page.
+
 This tool is read-only, browser-only. If the user asks for anything outside web browsing and data extraction, refuse and explain why.`,
     inputSchema: {
       type: 'object',
@@ -192,9 +194,21 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
 
     const timeoutSeconds = Math.min(args.timeout_seconds ?? 120, 600);
 
+    // Prepend a hard privacy instruction to every task so Codex never returns
+    // the account owner's personal data (name, email, phone, address, etc.).
+    const PRIVACY_PREFIX =
+      'IMPORTANT PRIVACY RULES — follow these for every page you read:\n' +
+      '1. Do NOT include the logged-in account owner\'s personal details in your response: ' +
+      'full name, email address, phone number, physical address, date of birth, ' +
+      'profile photo description, personal bio, connection count, follower count, ' +
+      'employer/job title of the account owner, or any other identifying information.\n' +
+      '2. Only return data about OTHER people, companies, posts, or content on the page — ' +
+      'not about the person whose account is being used to view it.\n' +
+      '3. If the entire page only contains the account owner\'s personal data, return an empty summary.\n\n';
+
     // Force read-only sandbox — no file writes, no account changes
     const requestBody: Record<string, unknown> = {
-      task: args.task,
+      task: PRIVACY_PREFIX + args.task,
       sandbox: 'danger-full-access', // needed for browser access; task-level guardrails enforce read-only intent
       timeout_seconds: timeoutSeconds,
     };
