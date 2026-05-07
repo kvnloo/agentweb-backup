@@ -184,6 +184,37 @@ export interface DiagnosisContext {
   failedFunctions: Record<string, number> | null;
 }
 
+/**
+ * Build a short, human-readable audit string describing why a lead was
+ * discovered. Written to lead.system.findReason (NOT customFields, which
+ * leaks into CSV exports and email-template variables). Returns null when
+ * only free-text keywords were used — in that case there's no structured
+ * filter worth capturing.
+ *
+ * Capped at 200 chars; long over-flow strings are sliced with an ellipsis
+ * marker so DynamoDB items stay small.
+ */
+function buildFindReason(filters: {
+  keywords?: string;
+  title?: string;
+  company?: string;
+  location?: string;
+  industry?: string;
+  school?: string;
+  search_url?: string;
+}): string | null {
+  const parts: string[] = [];
+  if (filters.title) parts.push(`title=${filters.title}`);
+  if (filters.company) parts.push(`company=${filters.company}`);
+  if (filters.location) parts.push(`location=${filters.location}`);
+  if (filters.industry) parts.push(`industry=${filters.industry}`);
+  if (filters.school) parts.push(`school=${filters.school}`);
+  if (filters.search_url) parts.push('from-url');
+  if (parts.length === 0) return null;
+  const joined = parts.join('; ');
+  return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
+}
+
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -21298,6 +21329,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Slice to requested limit
     const itemsToImport = searchResult.items.slice(0, limit);
 
+    // Build the audit string ONCE — same for every lead in this batch since
+    // every lead in this slice came from the same set of filters.
+    const findReason = buildFindReason({
+      keywords, title, company, location, industry, school, search_url,
+    });
+
     // Map Unipile search result fields → CRM lead fields.
     // Search results use a different shape than full profiles:
     //   name (full), public_identifier (slug), profile_url (messy with miniProfileUrn),
@@ -21334,6 +21371,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       if (item.location) lead.notes = `Location: ${item.location}`;
 
+      // Tag the lead with why it was discovered — sidecar map (system field)
+      // distinct from customFields so it does NOT leak into CSV exports or
+      // email-template variables. See Phase 0b lead.system top-level field.
+      if (findReason) {
+        lead.system = { ...(lead.system ?? {}), findReason };
+      }
+
       return lead;
     });
 
@@ -21368,12 +21412,46 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       cursor: searchResult.cursor,
     };
 
+    // Surface the first 5 imported leads so callers can render a quick preview
+    // without making a follow-up read. Trimmed to keep the response small.
+    (response as any).importedLeads = leads.slice(0, 5);
+
     if (auto_enrich && result.newCount > 0) {
-      response.enrich_note = 'auto_enrich is not yet supported — run the Enrich with Web action on the list to enrich imported leads.';
+      const newLeadIds: string[] = (result as any).created?.map((c: any) => c.leadId) ?? [];
+      if (newLeadIds.length > 0) {
+        // Indirected through __testHooks so tests can spy and stub. The real
+        // implementation lands in a follow-up commit; until then the stub
+        // returns null (graceful no-op).
+        const job = await __testHooks.enqueueFindEmailJobForNewLeads(userId, listId, newLeadIds);
+        if (job) (response as any).autoEnrichJobId = job.jobId;
+      }
     }
 
     return response;
   }
 }
+
+/**
+ * Inline stub — replaced post-merge by an import from
+ * agentModeService.autoEnrich (Subagent B's slice). Keeps Subagent A
+ * independent: tests can spy on this stub today, and the import-swap is a
+ * trivial diff later.
+ */
+async function enqueueFindEmailJobForNewLeads_stub(
+  _userId: string,
+  _listId: string,
+  _leadIds: string[],
+): Promise<{ jobId: string; queued: number } | null> {
+  return null;
+}
+
+/**
+ * Test seam — exposes internal helpers so unit tests can spy/stub them
+ * without exporting them as production API. Mutating __testHooks in tests
+ * is safe because each test file imports a fresh module instance.
+ */
+export const __testHooks = {
+  enqueueFindEmailJobForNewLeads: enqueueFindEmailJobForNewLeads_stub,
+};
 
 export const agentModeService = new AgentModeService();
