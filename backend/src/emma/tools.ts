@@ -6091,35 +6091,45 @@ emmaToolRegistry.register({
           context: issueContext,
         });
 
-        // When an admin reports via delegate access, send only to the admin (not the customer).
-        // The admin initiated the report, not the customer.
-        const emailRecipients = isDelegatedAdmin && adminEmail
+        // Never email the customer — internal team + admin (if known) only.
+        const emailRecipients = adminEmail
           ? [...productIssueEmails, adminEmail]
-          : [...productIssueEmails, user.email];
-        const emailGreeting = isDelegatedAdmin && adminEmail
-          ? `Hi ${adminEmail}, you've submitted an issue report on behalf of ${user.displayName || user.email}.`
-          : `Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.`;
+          : [...productIssueEmails];
 
+        const priorityColor = (issue.priority || 'Medium') === 'High' ? '#dc2626' : (issue.priority || 'Medium') === 'Low' ? '#6b7280' : '#d97706';
         await resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: emailRecipients,
-          subject: `We received your issue: ${issue.title}`,
+          subject: `[Issue] ${issue.title} — reported by ${user.email}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-              <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
-                <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
+              <div style="background-color: #f8f9fa; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
+                <h2 style="margin: 0; color: #111; font-size: 18px;">Customer Issue Report</h2>
+                <span style="background-color: ${priorityColor}; color: #fff; font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 12px;">${issue.priority || 'Medium'}</span>
               </div>
-              <p style="color: #444;">${emailGreeting} The AgentWeb engineering team has been notified.</p>
-              ${result.pageId ? `<div style="margin: 8px 0;"><strong>Issue ID:</strong> AGW-${result.pageId}</div>` : ''}
-              <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
-              <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
-              <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
-                <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
-                <div>${issue.description.replace(/\n/g, '<br>')}</div>
+
+              <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr>
+                  <td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td>
+                  <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
+                </tr>
+                ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
+                ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
+                ${result.notionUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Notion</strong></td><td style="padding: 6px 0;"><a href="${result.notionUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in Notion</a></td></tr>` : ''}
+                ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
+              </table>
+
+              <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; border-radius: 0 4px 4px 0;">
+                <div style="font-weight: 600; margin-bottom: 8px; color: #333;">Description</div>
+                <div style="color: #444; line-height: 1.6;">${issue.description.replace(/\n/g, '<br>')}</div>
+              </div>
+
+              <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #9ca3af;">
+                Reply to this email to respond directly to the customer.
               </div>
             </div>
           `,
-          replyTo: isDelegatedAdmin && adminEmail ? adminEmail : user.email,
+          replyTo: user.email,
         });
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });

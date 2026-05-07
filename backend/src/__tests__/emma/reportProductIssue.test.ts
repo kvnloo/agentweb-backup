@@ -176,7 +176,7 @@ describe('report_product_issues tool', () => {
     expect(result.message).toContain('1 of 2');
   });
 
-  it('should send resend email to founders with Notion URL and user details', async () => {
+  it('should send resend email to founders only (never customer) with issue details', async () => {
     await toolExecute(
       { issues: [{ title: 'Bug', description: 'Desc', pageUrl: 'https://app.example.com/page' }] },
       { userId: 'user-123' }
@@ -184,12 +184,14 @@ describe('report_product_issues tool', () => {
 
     expect(mockResendSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: ['founders@agentweb.pro', 'customer@example.com'],
-        subject: 'We received your issue: Bug',
+        to: ['founders@agentweb.pro'],
+        subject: '[Issue] Bug — reported by customer@example.com',
         replyTo: 'customer@example.com',
         html: expect.stringContaining('AGW-notion-page-id'),
       })
     );
+    const callArgs = mockResendSendEmail.mock.calls[0][0];
+    expect(callArgs.to).not.toContain('customer@example.com');
   });
 
   it('should send only one email per issue (no oncall alert duplicate)', async () => {
@@ -226,7 +228,7 @@ describe('report_product_issues tool', () => {
       adminEmail: 'admin@agentweb.pro',
     };
 
-    it('should send email only to admin (not customer) when isDelegatedAdmin', async () => {
+    it('should send email to founders + admin (never customer) when isDelegatedAdmin', async () => {
       await toolExecute(
         { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
         delegateContext
@@ -235,15 +237,14 @@ describe('report_product_issues tool', () => {
       expect(mockResendSendEmail).toHaveBeenCalledWith(
         expect.objectContaining({
           to: ['founders@agentweb.pro', 'admin@agentweb.pro'],
-          replyTo: 'admin@agentweb.pro',
+          replyTo: 'customer@example.com',
         })
       );
-      // Customer email must NOT be in recipients
       const callArgs = mockResendSendEmail.mock.calls[0][0];
       expect(callArgs.to).not.toContain('customer@example.com');
     });
 
-    it('should include admin greeting in email body when isDelegatedAdmin', async () => {
+    it('should show delegation info in email body when isDelegatedAdmin', async () => {
       await toolExecute(
         { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
         delegateContext
@@ -251,8 +252,8 @@ describe('report_product_issues tool', () => {
 
       const callArgs = mockResendSendEmail.mock.calls[0][0];
       expect(callArgs.html).toContain('admin@agentweb.pro');
-      expect(callArgs.html).toContain('on behalf of');
-      expect(callArgs.html).toContain('Test Customer');
+      expect(callArgs.html).toContain('Via delegation');
+      expect(callArgs.html).toContain('customer@example.com');
     });
 
     it('should add Reported By (Admin) field to Notion context when isDelegatedAdmin', async () => {
@@ -270,15 +271,17 @@ describe('report_product_issues tool', () => {
       );
     });
 
-    it('should fall back to normal (customer) recipients when isDelegatedAdmin but no adminEmail', async () => {
+    it('should suppress customer email even when isDelegatedAdmin but adminEmail is unknown', async () => {
       await toolExecute(
         { issues: [{ title: 'Bug', description: 'Desc' }] },
         { userId: 'user-123', isDelegatedAdmin: true }
       );
 
       const callArgs = mockResendSendEmail.mock.calls[0][0];
-      expect(callArgs.to).toContain('customer@example.com');
-      expect(callArgs.replyTo).toBe('customer@example.com');
+      // Customer must never receive email under any delegate scenario
+      expect(callArgs.to).not.toContain('customer@example.com');
+      // Only internal recipients (productIssueEmails) when adminEmail not resolved
+      expect(callArgs.to).toEqual(['founders@agentweb.pro']);
     });
   });
 });
