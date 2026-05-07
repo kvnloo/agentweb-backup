@@ -285,6 +285,39 @@ describe('POST /api/crm/leads/find-email', () => {
       expect(payload.email).toBe('a@acme.com');
     });
 
+    it('skips recordLookupByEmailUsage when result is a cache hit (C8)', async () => {
+      const tracker: any = {
+        checkLookupByEmailQuota: jest.fn(),
+        recordLookupByEmailUsage: jest.fn(),
+      };
+      setQuotaTrackerForLookupRoute(tracker);
+      mockEnrichSo.findEmail.mockResolvedValue({
+        found: true, email: 'a@acme.com', confidence: 'high', fromCache: true, checkedAt: 'x',
+      });
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+      });
+      expect(res.status).toBe(200);
+      expect(tracker.checkLookupByEmailQuota).toHaveBeenCalled();
+      expect(tracker.recordLookupByEmailUsage).not.toHaveBeenCalled();
+    });
+
+    it('records lookup usage when the call hit a provider (cache miss)', async () => {
+      const tracker: any = {
+        checkLookupByEmailQuota: jest.fn(),
+        recordLookupByEmailUsage: jest.fn(),
+      };
+      setQuotaTrackerForLookupRoute(tracker);
+      mockEnrichSo.findEmail.mockResolvedValue({
+        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+      });
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+      });
+      expect(res.status).toBe(200);
+      expect(tracker.recordLookupByEmailUsage).toHaveBeenCalledTimes(1);
+    });
+
     it('does not call getLeadListById / updateLead when persistTo* is omitted', async () => {
       mockEnrichSo.findEmail.mockResolvedValue({
         found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',

@@ -238,7 +238,12 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
       },
       { userId },
     );
-    if (tracker) {
+    // C8: Only debit the user's lookup quota when the call actually went to a
+    // provider. Cache hits don't consume credits, so charging the user against
+    // their daily lookup cap for them is wrong (and especially noticeable now
+    // that the layered Apollo+enrich.so waterfall produces many more cache hits
+    // than the previous single-provider path).
+    if (tracker && !result.fromCache) {
       try { await tracker.recordLookupByEmailUsage(userId); } catch (e) {
         console.error('[CRM enrich.so] recordLookupByEmail failed (find-email):', (e as Error).message);
       }
