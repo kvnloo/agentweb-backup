@@ -118,6 +118,21 @@ interface ProjectedFromApollo {
   confidence: EnrichSoConfidence;
 }
 
+/**
+ * Field projector for Apollo /people/match results.
+ *
+ * Apollo's match payload is rich on identity (name, email, title, linkedin,
+ * employment history) but sparse or absent on:
+ *   - `summary` (long bio)            — not returned reliably
+ *   - `connectionCount`               — not in the response at all
+ *   - `skills`                        — not in the response at all
+ *   - `education`                     — present but sparse / unstructured
+ *
+ * For email-keyed leads these still resolve via enrich.so's reverse-lookup
+ * (which carries them). For LinkedIn-only leads — where enrich.so can't help
+ * because reverse-lookup keys on email — these four fields stay empty until
+ * the lead acquires an email. Documented limitation, not a bug.
+ */
 function pickFromApolloMatch(
   field: EnrichmentFieldName,
   match: { person: MappedPerson; organization?: { name?: string } },
