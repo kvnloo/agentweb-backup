@@ -23,6 +23,7 @@ import type { MappedPerson, MappedMatch } from './apolloFieldMapper';
 import { getEnrichSoService, type ReverseResult, type EnrichSoConfidence } from './enrichSoService';
 import { findEmailViaPatterns } from './emailPatternFinder';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
+import { normalizeLinkedInUrl } from './enrichmentGroups';
 import { crmDb } from './db';
 
 type ProviderSource = 'apollo' | 'enrich.so';
@@ -44,7 +45,12 @@ export function __resetWaterfallDedupForTesting(): void {
 }
 
 function apolloDedupToken(lead: any): string | null {
-  if (lead.linkedin) return `li:${String(lead.linkedin).trim().toLowerCase()}`;
+  // S1: reuse the canonical LinkedIn URL normalizer so /in/x and /in/x/?utm_*
+  // dedup to the same token (same as apolloCacheKeys' canonical form).
+  if (lead.linkedin) {
+    const norm = normalizeLinkedInUrl(lead.linkedin);
+    if (norm) return `li:${norm}`;
+  }
   if (lead.email) return `em:${String(lead.email).trim().toLowerCase()}`;
   return null;
 }
