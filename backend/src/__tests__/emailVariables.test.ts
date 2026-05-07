@@ -1,4 +1,4 @@
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 jest.mock('../utils/llmService');
@@ -219,6 +219,68 @@ describe('hasUnsafeEmailStyles', () => {
   it('should return true for HTML with multiple <style> blocks where one has classes', () => {
     const html = '<head><style>body{}</style><style>.btn { color: white; }</style></head>';
     expect(hasUnsafeEmailStyles(html)).toBe(true);
+  });
+});
+
+describe('rewriteS3ImageUrls', () => {
+  const S3_URL = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/abc/files/123/logo.png';
+  const BACKEND = 'https://api.agentweb.pro';
+
+  it('should return empty string unchanged', () => {
+    expect(rewriteS3ImageUrls('', BACKEND)).toBe('');
+  });
+
+  it('should not modify HTML with no img tags', () => {
+    const html = '<p>Hello world</p>';
+    expect(rewriteS3ImageUrls(html, BACKEND)).toBe(html);
+  });
+
+  it('should not modify img src pointing to non-S3 domain', () => {
+    const html = '<img src="https://cdn.example.com/logo.png" alt="Logo">';
+    expect(rewriteS3ImageUrls(html, BACKEND)).toBe(html);
+  });
+
+  it('should rewrite S3 img src to backend /asset/ proxy URL', () => {
+    const html = `<img src="${S3_URL}" alt="Logo">`;
+    const result = rewriteS3ImageUrls(html, BACKEND);
+    expect(result).toMatch(/src="https:\/\/api\.agentweb\.pro\/asset\/[A-Za-z0-9_-]+"/);
+    expect(result).not.toContain('s3.us-west-2.amazonaws.com');
+  });
+
+  it('should produce a proxy URL that round-trips back to the original S3 URL', () => {
+    const html = `<img src="${S3_URL}" alt="Logo">`;
+    const result = rewriteS3ImageUrls(html, BACKEND);
+    const match = result.match(/src="https:\/\/api\.agentweb\.pro\/asset\/([A-Za-z0-9_-]+)"/);
+    expect(match).toBeTruthy();
+    const hash = match![1];
+    const base64 = hash.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = Buffer.from(base64, 'base64').toString('utf-8');
+    expect(decoded).toBe(S3_URL);
+  });
+
+  it('should rewrite multiple S3 img tags independently', () => {
+    const url2 = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/abc/files/456/icon.png';
+    const html = `<img src="${S3_URL}"><img src="${url2}">`;
+    const result = rewriteS3ImageUrls(html, BACKEND);
+    const matches = result.match(/\/asset\/[A-Za-z0-9_-]+/g);
+    expect(matches).toHaveLength(2);
+    expect(matches![0]).not.toBe(matches![1]);
+  });
+
+  it('should preserve all other img attributes', () => {
+    const html = `<img class="logo" alt="AgentWeb" width="200" src="${S3_URL}" height="50">`;
+    const result = rewriteS3ImageUrls(html, BACKEND);
+    expect(result).toContain('class="logo"');
+    expect(result).toContain('alt="AgentWeb"');
+    expect(result).toContain('width="200"');
+    expect(result).toContain('height="50"');
+  });
+
+  it('should strip trailing slash from baseUrl', () => {
+    const html = `<img src="${S3_URL}">`;
+    const result = rewriteS3ImageUrls(html, 'https://api.agentweb.pro/');
+    expect(result).toMatch(/src="https:\/\/api\.agentweb\.pro\/asset\//);
+    expect(result).not.toMatch(/\/\/asset\//);
   });
 });
 
