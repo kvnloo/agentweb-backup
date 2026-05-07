@@ -18,6 +18,14 @@ import { crmDb, userDb } from '../services/db';
 import { getEnrichSoService } from '../services/enrichSoService';
 import { QuotaExceededError, LookupByEmailQuotaExceededError, type QuotaTracker } from '../services/enrichSoQuota';
 import { validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+import { waterfallFindEmail } from '../services/enrichmentWaterfall';
+import {
+  startEmailJob,
+  recordResult,
+  completeJob,
+  getJob,
+} from '../services/emailJobTracker';
+import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
 import {
   ALL_ENRICHMENT_FIELDS,
   EnrichmentFieldConfig,
@@ -157,11 +165,15 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
 
 /**
  * POST /leads/find-email
- * Body: { firstName, lastName, domain?, company? }
+ * Body: { firstName?, lastName?, domain?, company?, linkedin? }
  * Returns: { found, email?, confidence?, fromCache, checkedAt }
  *
  * Same auth + format gates as lookup-by-email; shares the same daily lookup
  * quota counter so the user can't burn extra credits via this route.
+ *
+ * Precondition: ONE of (linkedin URL) OR (name + domain/company) must be
+ * present. Linkedin alone is enough — Apollo's /people/match accepts it as
+ * a primary match key, so a lead with only a LinkedIn URL still resolves.
  */
 router.post('/leads/find-email', async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).user?.userId;
@@ -171,12 +183,16 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
   const lastName = (req.body?.lastName ?? '').toString().trim();
   const domainRaw = (req.body?.domain ?? '').toString().trim().toLowerCase();
   const company = (req.body?.company ?? '').toString().trim();
+  const linkedin = (req.body?.linkedin ?? '').toString().trim();
 
-  if (!firstName && !lastName) {
-    return res.status(400).json({ message: 'firstName or lastName is required' });
-  }
-  if (!domainRaw && !company) {
-    return res.status(400).json({ message: 'domain or company is required' });
+  const haveName = !!(firstName || lastName);
+  const haveOrg = !!(domainRaw || company);
+  const haveLinkedin = !!linkedin && /linkedin\.com\/in\//i.test(linkedin);
+
+  if (!haveLinkedin && !(haveName && haveOrg)) {
+    return res.status(400).json({
+      message: 'Provide either a LinkedIn URL, OR a name plus a domain or company.',
+    });
   }
   // If domain is supplied, sanity-check the format. Bare hostnames pass; URLs are stripped.
   let domain = domainRaw;
@@ -200,9 +216,26 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
     }
   }
 
+  // Optional: caller can pass persistToListId+persistToLeadId to have the
+  // route apply applyApolloMatchToLead and persist directly. Lets the
+  // LeadDetailPanel button reuse the same single-source-of-truth projection
+  // helper instead of duplicating it in React. Quick-Add (no lead yet) calls
+  // omit these and just consume the JSON response.
+  const persistToListId = (req.body?.persistToListId ?? '').toString().trim();
+  const persistToLeadId = (req.body?.persistToLeadId ?? '').toString().trim();
+
   try {
-    const result = await getEnrichSoService().findEmail(
-      { firstName, lastName, domain: domain || undefined, company: domain ? undefined : company },
+    // Waterfall: enrich.so first (cheap, doesn't need email as input), then
+    // Apollo basic /people/match if enrich.so misses. Apollo finds many
+    // emails enrich.so misses (verified, ~1 credit per call).
+    const result = await waterfallFindEmail(
+      {
+        firstName,
+        lastName,
+        domain: domain || undefined,
+        company: domain ? undefined : company,
+        linkedin: linkedin || undefined,
+      },
       { userId },
     );
     if (tracker) {
@@ -210,19 +243,81 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
         console.error('[CRM enrich.so] recordLookupByEmail failed (find-email):', (e as Error).message);
       }
     }
+
+    // If caller asked us to persist and we got a hit, project + write directly.
+    let filledFields: string[] = [];
+    if (result.found && result.email && persistToListId && persistToLeadId) {
+      // Authorization: persistTo* lets the caller specify any (listId, leadId)
+      // pair, so we MUST verify the auth'd user owns/can-access the target list
+      // before writing — otherwise this is an IDOR.
+      const persistList = await crmDb.getLeadListById(persistToListId);
+      if (!persistList) {
+        return res.status(404).json({ message: 'persistTo lead list not found' });
+      }
+      if (!(await canAccessCrmList(userId, persistList as any))) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+      const lead: any = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null);
+      if (lead) {
+        if (result.apolloMatch) {
+          // Apollo win: full projection (single source of truth lives here).
+          const proj = applyApolloMatchToLead(lead, result.apolloMatch, { fillEmail: true });
+          // Stamp Apollo email_status into sourceQuote when available.
+          if (result.emailStatus && proj.enrichmentMetadata.email) {
+            proj.enrichmentMetadata.email.sourceQuote = `Apollo (${result.emailStatus})`;
+          }
+          if (proj.changed.size > 0) {
+            const payload: any = { ...proj.updates, enrichmentMetadata: proj.enrichmentMetadata };
+            if (Object.keys(proj.customFields).length > 0) {
+              payload.customFields = { ...((lead.customFields ?? {}) as Record<string, any>), ...proj.customFields };
+            }
+            if (!payload.email) payload.email = result.email;   // belt + suspenders
+            await crmDb.updateLead(persistToListId, persistToLeadId, payload);
+            filledFields = Array.from(proj.changed);
+          }
+        } else if (!lead.email) {
+          // Non-Apollo hit (enrich.so / pattern). Only the email is meaningful.
+          const newMeta: Record<string, any> = {
+            ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
+            email: {
+              source: 'web_search',
+              provider: result.provider ?? 'enrich.so',
+              confidence: result.confidence ?? 'medium',
+              enrichedAt: new Date().toISOString(),
+              sourceQuote: result.pattern
+                ? `Pattern: ${result.pattern}`
+                : (result.emailStatus ? `${result.provider} (${result.emailStatus})` : undefined),
+            },
+          };
+          await crmDb.updateLead(persistToListId, persistToLeadId, { email: result.email, enrichmentMetadata: newMeta });
+          filledFields = ['email'];
+        }
+      }
+    }
+
     return res.json({
       found: result.found,
       email: result.email,
       confidence: result.confidence,
-      isCatchAll: result.isCatchAll,
+      provider: result.provider,
+      emailStatus: result.emailStatus,
+      pattern: result.pattern,
+      tier: result.tier,
       fromCache: result.fromCache,
-      checkedAt: result.checkedAt,
+      checkedAt: new Date().toISOString(),
+      // When Apollo provided the match, expose the rich profile so the UI
+      // can show / persist title, linkedin, employment history, tech stack,
+      // funding, etc. — without making a second API call.
+      apolloMatch: result.apolloMatch,
+      // When persistTo was set, list of field names actually written to the
+      // lead (so the UI can show "Filled X fields" without re-deriving).
+      filledFields,
     });
   } catch (error: any) {
     if (error instanceof QuotaExceededError) {
       return res.status(429).json({ message: error.message, endpoint: error.endpoint, limit: error.limit });
     }
-    console.error('[CRM enrich.so] find-email error:', error);
+    console.error('[CRM find-email] error:', error);
     return res.status(500).json({ message: error.message || 'Failed to find email' });
   }
 });
@@ -249,51 +344,93 @@ async function fetchAllLeads(listId: string): Promise<any[]> {
 }
 
 /**
- * Background bulk find-email — for leads with name + (company or website) but
- * no email, look up the email and write it back to the lead record. Does not
- * block the response. Failures per-lead are swallowed (logged).
+ * Background bulk find-email — for leads with name + (company or website) OR
+ * a LinkedIn URL but no email, look up the email and write it back to the lead
+ * record. Does not block the response. Failures per-lead are swallowed (logged).
  */
 async function findEmailsForLeadsInBackground(
   listId: string,
   leads: any[],
   userId: string,
+  jobId?: string,
 ): Promise<void> {
-  let svc;
-  try { svc = getEnrichSoService(); } catch { return; }
-  await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
-    const firstName = (lead.firstName ?? '').trim();
-    const lastName = (lead.lastName ?? '').trim();
-    const company = (lead.company ?? '').trim();
-    const website = (lead.website ?? '').trim();
-    const domain = website
-      ? website.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '')
-      : '';
-    if ((!firstName && !lastName) || (!domain && !company)) return;
-    try {
-      const r = await svc.findEmail(
-        { firstName, lastName, domain: domain || undefined, company: domain ? undefined : company },
-        { userId },
-      );
-      if (r.found && r.email) {
-        // Record provenance alongside the value so the UI badge shows where
-        // the email came from (admin/delegated only — gated in EnrichedValue).
-        const now = new Date().toISOString();
-        const enrichmentMetadata = {
-          ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
-          email: {
-            source: 'web_search' as const,
-            provider: 'enrich.so',
-            confidence: r.confidence,
-            enrichedAt: now,
-            sourceQuote: r.message,
-          },
-        };
-        await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
+  try {
+    await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
+      const firstName = (lead.firstName ?? '').trim();
+      const lastName = (lead.lastName ?? '').trim();
+      const company = (lead.company ?? '').trim();
+      const website = (lead.website ?? '').trim();
+      const linkedin = (lead.linkedin ?? '').trim();
+      const haveName = !!(firstName || lastName);
+      const haveOrg = !!(company || website);
+      if (!linkedin && !(haveName && haveOrg)) {
+        if (jobId) recordResult(jobId, { found: false });
+        return;
       }
-    } catch (err) {
-      console.error('[CRM enrich.so] bulk find-email failed for', lead.leadId, ':', (err as Error).message);
-    }
-  });
+      try {
+        const r = await waterfallFindEmail(
+          {
+            firstName,
+            lastName,
+            company: company || undefined,
+            website: website || undefined,
+            linkedin: lead.linkedin || undefined,
+            leadHint: { listId, leadId: lead.leadId },
+          },
+          { userId },
+        );
+        if (r.found && r.email) {
+          // When Apollo's matchPerson was the source (Tier 2 first leg, has
+          // r.apolloMatch), project the full payload onto missing fields too —
+          // title, linkedin, company, employment history, tech stack, funding,
+          // headcount growth. Never overwrites existing values.
+          //
+          // For non-Apollo hits (enrich.so finder, pattern, Apollo findEmail
+          // basic) we only have the email itself, so just write that.
+          if (r.apolloMatch) {
+            const proj = applyApolloMatchToLead(lead, r.apolloMatch, { fillEmail: true });
+            // The waterfall already returned r.email which equals proj.updates.email
+            // (or the existing lead email if user filled). Ensure the email
+            // metadata sourceQuote includes Apollo's emailStatus where available.
+            if (r.emailStatus && proj.enrichmentMetadata.email) {
+              proj.enrichmentMetadata.email.sourceQuote = `Apollo (${r.emailStatus})`;
+            }
+            const payload: any = { ...proj.updates, enrichmentMetadata: proj.enrichmentMetadata };
+            if (Object.keys(proj.customFields).length > 0) {
+              payload.customFields = { ...((lead.customFields ?? {}) as Record<string, any>), ...proj.customFields };
+            }
+            // Ensure email always lands even if applyApolloMatchToLead's
+            // never-overwrite rule skipped it for some edge case.
+            if (!payload.email) payload.email = r.email;
+            await crmDb.updateLead(listId, lead.leadId, payload);
+          } else {
+            const now = new Date().toISOString();
+            const enrichmentMetadata = {
+              ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
+              email: {
+                source: 'web_search' as const,
+                provider: r.provider ?? 'enrich.so',
+                confidence: r.confidence ?? 'medium',
+                enrichedAt: now,
+                sourceQuote: r.message ?? (r.emailStatus ? `Apollo (${r.emailStatus})` : undefined),
+              },
+            };
+            await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
+          }
+          if (jobId) recordResult(jobId, { found: true, tier: r.tier });
+        } else {
+          if (jobId) recordResult(jobId, { found: false });
+        }
+      } catch (err) {
+        console.error('[CRM bulk find-email] failed for', lead.leadId, ':', (err as Error).message);
+        if (jobId) recordResult(jobId, { found: false, error: true });
+      }
+    });
+    if (jobId) completeJob(jobId);
+  } catch (err) {
+    if (jobId) completeJob(jobId, (err as Error).message);
+    throw err;
+  }
 }
 
 /**
@@ -324,15 +461,26 @@ async function lookupProfilesForLeadsInBackground(
   leads: any[],
   userId: string,
   config: import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
+  jobId?: string,
 ): Promise<void> {
   let svc;
-  try { svc = getEnrichSoService(); } catch { return; }
-  await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
-    const email = (lead.email ?? '').trim();
-    if (!email) return;
-    try {
-      const r = await svc.reverseLookup(email, { userId });
-      if (!r.found) return;
+  try { svc = getEnrichSoService(); } catch {
+    if (jobId) completeJob(jobId, 'enrich.so service not initialized');
+    return;
+  }
+  try {
+    await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
+      const email = (lead.email ?? '').trim();
+      if (!email) {
+        if (jobId) recordResult(jobId, { found: false });
+        return;
+      }
+      try {
+        const r = await svc.reverseLookup(email, { userId });
+        if (!r.found) {
+          if (jobId) recordResult(jobId, { found: false });
+          return;
+        }
 
       // Standard fields → top-level lead columns. Each one is gated on the
       // per-list config and only written when the lead's column is empty
@@ -357,10 +505,11 @@ async function lookupProfilesForLeadsInBackground(
       }
 
       const wroteAny = Object.keys(updates).length > 0 || Object.keys(customUpdates).length > 0;
-      if (!wroteAny) return;
+      if (!wroteAny) {
+        if (jobId) recordResult(jobId, { found: false });
+        return;
+      }
 
-      // Tag every newly-filled field with provenance so the UI badge can
-      // attribute it to enrich.so (admin/delegated only).
       const now = new Date().toISOString();
       const fieldMetaForProvider = {
         source: 'linkedin' as const,
@@ -377,16 +526,25 @@ async function lookupProfilesForLeadsInBackground(
       if (Object.keys(customUpdates).length > 0) updatePayload.customFields = mergedCustom;
 
       await crmDb.updateLead(listId, lead.leadId, updatePayload);
-    } catch (err) {
-      console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
-    }
-  });
+        if (jobId) recordResult(jobId, { found: true });
+      } catch (err) {
+        console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
+        if (jobId) recordResult(jobId, { found: false, error: true });
+      }
+    });
+    if (jobId) completeJob(jobId);
+  } catch (err) {
+    if (jobId) completeJob(jobId, (err as Error).message);
+    throw err;
+  }
 }
 
 function isApplicableForFindEmail(lead: any): boolean {
-  return !lead.email
-    && (!!lead.firstName || !!lead.lastName)
-    && (!!lead.company || !!lead.website);
+  if (lead.email) return false;
+  // Apollo's /people/match accepts linkedin_url as a primary match key, so
+  // a lead with ONLY a LinkedIn URL is still applicable.
+  if (lead.linkedin) return true;
+  return (!!lead.firstName || !!lead.lastName) && (!!lead.company || !!lead.website);
 }
 
 function isApplicableForLookup(
@@ -466,13 +624,17 @@ router.get('/lists/:listId/leads/enrichment-counts', async (req: Request, res: R
 
 /**
  * POST /lists/:listId/leads/find-emails
- * Body: (none — operates on the whole list)
+ * Body: { leadIds?: string[] }   (omit → all leads in list; non-empty array → restrict to those)
  * Returns: 202 { queued, skipped, alreadyDone }
  */
 router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Response) => {
   const { listId } = req.params;
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const { leadIds } = req.body ?? {};
+  if (leadIds !== undefined && !Array.isArray(leadIds)) {
+    return res.status(400).json({ message: 'leadIds must be an array when provided' });
+  }
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -480,12 +642,24 @@ router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Respon
     if (!(await canAccessCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
-    const leads = await fetchAllLeads(listId);
+    let leads: any[];
+    if (Array.isArray(leadIds)) {
+      if (leadIds.length === 0) {
+        return res.status(202).json({ queued: 0, skipped: 0, alreadyDone: 0 });
+      }
+      const fetched = await Promise.all(
+        leadIds.map((id: string) => crmDb.getLeadById(listId, id).catch(() => null)),
+      );
+      leads = fetched.filter((l): l is any => !!l);
+    } else {
+      leads = await fetchAllLeads(listId);
+    }
     const applicable = leads.filter(isApplicableForFindEmail);
     const alreadyDone = leads.filter((l: any) => !!l.email).length;
     const skipped = leads.length - applicable.length - alreadyDone;
-    void findEmailsForLeadsInBackground(listId, applicable, userId);
-    return res.status(202).json({ queued: applicable.length, skipped, alreadyDone });
+    const job = startEmailJob({ kind: 'find', listId, userId, total: applicable.length });
+    void findEmailsForLeadsInBackground(listId, applicable, userId, job.jobId);
+    return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk find-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue email finder' });
@@ -494,13 +668,17 @@ router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Respon
 
 /**
  * POST /lists/:listId/leads/lookup-emails
- * Body: (none — operates on the whole list)
+ * Body: { leadIds?: string[] }   (omit → all leads in list; non-empty array → restrict)
  * Returns: 202 { queued, skipped, alreadyDone }
  */
 router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Response) => {
   const { listId } = req.params;
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const { leadIds } = req.body ?? {};
+  if (leadIds !== undefined && !Array.isArray(leadIds)) {
+    return res.status(400).json({ message: 'leadIds must be an array when provided' });
+  }
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -513,12 +691,24 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
     const config = normalizeEnrichmentFieldConfig(
       (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
     );
-    const leads = await fetchAllLeads(listId);
+    let leads: any[];
+    if (Array.isArray(leadIds)) {
+      if (leadIds.length === 0) {
+        return res.status(202).json({ queued: 0, skipped: 0, alreadyDone: 0 });
+      }
+      const fetched = await Promise.all(
+        leadIds.map((id: string) => crmDb.getLeadById(listId, id).catch(() => null)),
+      );
+      leads = fetched.filter((l): l is any => !!l);
+    } else {
+      leads = await fetchAllLeads(listId);
+    }
     const applicable = leads.filter((l) => isApplicableForLookup(l, config));
     const alreadyDone = leads.length - applicable.length - leads.filter((l: any) => !l.email).length;
     const skipped = leads.length - applicable.length - alreadyDone;
-    void lookupProfilesForLeadsInBackground(listId, applicable, userId, config);
-    return res.status(202).json({ queued: applicable.length, skipped, alreadyDone });
+    const job = startEmailJob({ kind: 'lookup', listId, userId, total: applicable.length });
+    void lookupProfilesForLeadsInBackground(listId, applicable, userId, config, job.jobId);
+    return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk lookup-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue profile lookup' });
@@ -593,10 +783,12 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
     const skipped = targetLeads.length - validatable.length;
     const alreadyDone = validatable.filter((l) => l.alreadyValidated).length;
 
-    // Fire and forget — pills update as each completes.
-    void validateLeadsInBackground(listId, validatable, userId);
+    // Fire and forget — pills update as each completes. Track progress so the
+    // UI can show a live counter + final breakdown via /email-jobs/:jobId.
+    const job = startEmailJob({ kind: 'validate', listId, userId, total: validatable.length });
+    void validateLeadsInBackground(listId, validatable, userId, job.jobId);
 
-    return res.status(202).json({ queued: validatable.length, skipped, alreadyDone });
+    return res.status(202).json({ jobId: job.jobId, queued: validatable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] validate-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue email validation' });
@@ -734,6 +926,31 @@ router.patch('/lists/:listId/enrichment-field-config', async (req: Request, res:
     console.error('[CRM enrich.so] patch enrichment-field-config error:', error);
     return res.status(500).json({ message: error.message || 'Failed to update enrichment field config' });
   }
+});
+
+/**
+ * GET /lists/:listId/email-jobs/:jobId
+ *
+ * Polled by the frontend after a bulk find/validate/lookup is kicked off.
+ * Returns the job's running counts (processed / found / notFound / errors)
+ * plus the final status. Once `status === 'completed'` or `'error'`, the UI
+ * can refetch the lead list to show the new pills/values.
+ *
+ * Returns 404 if the job doesn't exist (e.g., backend restart wiped the
+ * in-memory tracker — the UI should surface "progress unknown" rather than
+ * spin forever).
+ */
+router.get('/lists/:listId/email-jobs/:jobId', async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const { listId, jobId } = req.params;
+  const job = getJob(jobId);
+  if (!job) return res.status(404).json({ message: 'Job not found or expired' });
+  if (job.userId !== userId || job.listId !== listId) {
+    // Don't leak job state across users or lists.
+    return res.status(404).json({ message: 'Job not found or expired' });
+  }
+  return res.json(job);
 });
 
 export default router;

@@ -229,6 +229,76 @@ describe('POST /api/crm/leads/find-email', () => {
     expect(res.body.scope).toBe('lookup');
     expect(mockEnrichSo.findEmail).not.toHaveBeenCalled();
   });
+
+  // ─── persistToListId/persistToLeadId authorization ─────────────────────────
+  describe('persistTo* authorization', () => {
+    it('returns 403 when persistToListId references a list owned by another user', async () => {
+      mockEnrichSo.findEmail.mockResolvedValue({
+        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+      });
+      // List belongs to a different user, no shared org.
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'someone-else' } as any);
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+        persistToListId: 'L1', persistToLeadId: 'LD1',
+      });
+
+      expect(res.status).toBe(403);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when persistToListId references a list that does not exist', async () => {
+      mockEnrichSo.findEmail.mockResolvedValue({
+        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+      });
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+        persistToListId: 'missing-list', persistToLeadId: 'LD1',
+      });
+
+      expect(res.status).toBe(404);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('persists when caller owns the list', async () => {
+      mockEnrichSo.findEmail.mockResolvedValue({
+        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+      });
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+      mockCrmDb.getLeadById.mockResolvedValue({
+        leadId: 'LD1', email: '', customFields: {}, enrichmentMetadata: {},
+      } as any);
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+        persistToListId: 'L1', persistToLeadId: 'LD1',
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+      const [listId, leadId, payload] = mockCrmDb.updateLead.mock.calls[0] as any;
+      expect(listId).toBe('L1');
+      expect(leadId).toBe('LD1');
+      expect(payload.email).toBe('a@acme.com');
+    });
+
+    it('does not call getLeadListById / updateLead when persistTo* is omitted', async () => {
+      mockEnrichSo.findEmail.mockResolvedValue({
+        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+      });
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // ─── validate-emails (bulk) ──────────────────────────────────────────────────
