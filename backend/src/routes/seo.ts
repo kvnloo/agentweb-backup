@@ -1,7 +1,7 @@
 import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { userDb } from "../services/db";
-import { getSecret } from "../utils/secretsManager";
+import { getSecret, getLandingPagesConfig } from "../utils/secretsManager";
 import { calculateFunnelMetrics, DEFAULT_FUNNEL_STAGES, validateFunnelStages } from "../services/funnelService";
 import {
   getGoogleSearchConsoleAccessToken,
@@ -332,9 +332,21 @@ router.get("/metrics", async (req, res) => {
 
     const metrics = await Promise.all(metricsPromises);
 
-    // Fetch Google Analytics metrics for all configured properties
+    // Fetch Google Analytics metrics for all configured properties.
+    // For *.agentwebforms.com subdomains, also inject the platform-owned GA4 property from Secrets Manager
+    // so traffic shows up without requiring per-user config.
     let gaMetricsArray: any[] = [];
-    const gaProperties = getGoogleAnalyticsProperties(user);
+    let gaProperties = getGoogleAnalyticsProperties(user);
+
+    if (domainFilter) {
+      const lpConfig = await getLandingPagesConfig();
+      if (lpConfig && bareHost(domainFilter).endsWith(`.${lpConfig.gscDomain}`)) {
+        const alreadyHas = gaProperties.some((p: any) => p.propertyId === lpConfig.ga4PropertyId);
+        if (!alreadyHas) {
+          gaProperties = [...gaProperties, { propertyId: lpConfig.ga4PropertyId, label: lpConfig.gscDomain }];
+        }
+      }
+    }
 
     if (gaProperties.length > 0) {
       const gaClient = await getGoogleAnalyticsDataClient();
