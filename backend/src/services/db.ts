@@ -4556,6 +4556,11 @@ export const crmDb = {
     syncMetadata?: Record<string, any>;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
+    /** CRM-internal bookkeeping (findReason, freshUntil, scheduledRunAt,
+     *  icpSource). Sidecar map distinct from customFields so it does NOT
+     *  leak into CSV exports, email-template variables, or the
+     *  lead-filter UI as a user-authored column. Pass `null` to clear. */
+    system?: Record<string, any> | null;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4633,6 +4638,17 @@ export const crmDb = {
       if (updates.enrichmentMetadata !== undefined) {
         setExpressions.push('enrichmentMetadata = :enrichmentMetadata');
         expressionAttributeValues[':enrichmentMetadata'] = updates.enrichmentMetadata;
+      }
+
+      if (updates.system !== undefined) {
+        if (updates.system === null) {
+          removeExpressions.push('#system');
+          expressionAttributeNames['#system'] = 'system';
+        } else {
+          setExpressions.push('#system = :system');
+          expressionAttributeNames['#system'] = 'system';
+          expressionAttributeValues[':system'] = updates.system;
+        }
       }
 
       if (updates.selectedSenderId !== undefined) {
@@ -4807,7 +4823,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -4876,6 +4892,12 @@ export const crmDb = {
     dealValue?: number | null;
     dealCurrency?: string;
     syncMetadata?: Record<string, any>;
+    /** CRM-internal bookkeeping for the find-leads / scheduled-search /
+     *  ICP-sourcing flows (findReason, freshUntil, scheduledRunAt,
+     *  icpSource). Sidecar map distinct from customFields so it does NOT
+     *  leak into CSV exports, email-template variables, or the
+     *  lead-filter UI. */
+    system?: Record<string, any>;
   }>) {
     try {
       const results = {
@@ -5013,6 +5035,9 @@ export const crmDb = {
           if (lead.dealCurrency) {
             item.dealCurrency = lead.dealCurrency;
           }
+          if (lead.system && Object.keys(lead.system).length > 0) {
+            item.system = lead.system;
+          }
 
           return {
             PutRequest: {
@@ -5046,7 +5071,7 @@ export const crmDb = {
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
 
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
 
       // Extract from new leads
       newLeads.forEach(lead => {

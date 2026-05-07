@@ -97,6 +97,9 @@ export interface LeadRecord {
   phone?: string;
   notes?: string;
   customFields?: Record<string, string>;
+  /** CRM-internal sidecar — findReason, freshUntil, scheduledRunAt,
+   *  icpSource. Not user-authored; not exported in CSVs. */
+  system?: Record<string, any>;
   [key: string]: any; // Allow other dynamic fields
 }
 
