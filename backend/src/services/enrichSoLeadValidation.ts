@@ -51,14 +51,14 @@ export async function validateLeadEmailInBackground(
   leadId: string,
   email: string,
   userId?: string,
-): Promise<void> {
-  if (!email || !email.trim()) return;
+): Promise<{ status: string } | null> {
+  if (!email || !email.trim()) return null;
 
   let svc;
   try {
     svc = getEnrichSoService();
   } catch {
-    return;  // service not initialized — skip silently
+    return null;  // service not initialized — skip silently
   }
 
   let result;
@@ -66,7 +66,7 @@ export async function validateLeadEmailInBackground(
     result = await svc.validateEmail(email, userId ? { userId } : {});
   } catch (err) {
     console.error('[enrichSo] background validation failed:', (err as Error).message);
-    return;
+    return null;
   }
 
   // Use the targeted setLeadEmailValidation path so we update only the two
@@ -88,17 +88,34 @@ export async function validateLeadEmailInBackground(
   };
   try {
     await crmDb.setLeadEmailValidation(listId, leadId, validation, metadata);
+    return { status: result.status };
   } catch (err) {
     console.error('[enrichSo] setLeadEmailValidation failed during background validation:', (err as Error).message);
+    return null;
   }
 }
+
+import { recordResult, completeJob } from './emailJobTracker';
 
 export async function validateLeadsInBackground(
   listId: string,
   leads: ValidatableLead[],
   userId?: string,
+  jobId?: string,
 ): Promise<void> {
-  await runWithConcurrency(leads, VALIDATION_CONCURRENCY, (l) =>
-    validateLeadEmailInBackground(listId, l.leadId, l.email ?? '', userId),
-  );
+  try {
+    await runWithConcurrency(leads, VALIDATION_CONCURRENCY, async (l) => {
+      const r = await validateLeadEmailInBackground(listId, l.leadId, l.email ?? '', userId);
+      if (jobId) {
+        // For validate jobs, "found" === deliverable. Risky/undeliverable/unknown
+        // count as not-found so the UI breakdown is meaningful.
+        if (!r) recordResult(jobId, { found: false, error: true });
+        else recordResult(jobId, { found: r.status === 'deliverable' });
+      }
+    });
+    if (jobId) completeJob(jobId);
+  } catch (err) {
+    if (jobId) completeJob(jobId, (err as Error).message);
+    throw err;
+  }
 }
