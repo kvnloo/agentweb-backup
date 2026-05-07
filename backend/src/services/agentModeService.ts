@@ -571,9 +571,10 @@ export class AgentModeService {
       },
       execute: async (args: any, context: any) => {
         const { emailService } = await import('./emailService');
-        const toList: string[] = Array.isArray(args.to) ? args.to : [args.to];
+        const raw: any[] = Array.isArray(args.to) ? args.to : [args.to];
+        const toList: string[] = raw.filter((e): e is string => typeof e === 'string' && e.length > 0);
         if (toList.length === 0) {
-          throw new Error('At least one email address is required in the "to" field.');
+          throw new Error('At least one valid email address is required in the "to" field.');
         }
         await emailService.sendSessionNotificationEmail(
           toList,

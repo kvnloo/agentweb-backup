@@ -5792,6 +5792,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-07',
+    changes: [
+      'Fixed: Session Notification Emails Now Reliably Delivered',
+      '- The notify_session tool previously reported success but delivered no email in certain edge cases (e.g. null recipients passed by the agent)',
+      '- Email delivery errors are now surfaced to the agent instead of being silently swallowed',
+      '- Invalid or null entries in the recipient list are filtered out before sending',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Organization Members Now See Their Owner\'s Subscription Plan',
