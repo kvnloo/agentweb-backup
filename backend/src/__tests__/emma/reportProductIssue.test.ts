@@ -185,7 +185,7 @@ describe('report_product_issues tool', () => {
     expect(mockResendSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         to: ['founders@agentweb.pro'],
-        subject: 'Product issue reported: Bug',
+        subject: '[Issue] Bug — reported by customer@example.com',
         replyTo: 'customer@example.com',
         html: expect.stringContaining('AGW-notion-page-id'),
       })
@@ -252,7 +252,7 @@ describe('report_product_issues tool', () => {
 
       const callArgs = mockResendSendEmail.mock.calls[0][0];
       expect(callArgs.html).toContain('admin@agentweb.pro');
-      expect(callArgs.html).toContain('admin delegation');
+      expect(callArgs.html).toContain('Via delegation');
       expect(callArgs.html).toContain('customer@example.com');
     });
 
