@@ -196,7 +196,13 @@ export function mapApolloOrganization(apolloOrg: any): MappedOrganization {
   const departmentHeadcount: Record<string, number> | undefined = (() => {
     const src = o.departmental_head_count ?? o.departmentHeadcount;
     if (!src || typeof src !== 'object') return undefined;
-    const entries = Object.entries(src).filter(([, v]) => typeof v === 'number');
+    // S15: only keep keys matching a safe identifier shape — Apollo's response
+    // is trusted but downstream UI/log consumers shouldn't see arbitrary
+    // strings (DDB tolerates but rendering doesn't).
+    const SAFE_KEY = /^[a-z][a-z0-9_]*$/i;
+    const entries = Object.entries(src).filter(
+      ([k, v]) => typeof v === 'number' && k.length <= 64 && SAFE_KEY.test(k),
+    );
     if (!entries.length) return undefined;
     return Object.fromEntries(entries) as Record<string, number>;
   })();
