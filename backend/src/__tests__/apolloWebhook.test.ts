@@ -25,6 +25,7 @@ jest.mock('../services/db', () => ({
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
     getLeadListById: jest.fn(),
+    setLeadEmailIfMissing: jest.fn(),
   },
 }));
 
@@ -150,7 +151,7 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
   });
 
-  it('writes the email and confidence metadata on the happy path', async () => {
+  it('writes the email via the conditional setLeadEmailIfMissing path', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
       cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
     } as any);
@@ -158,16 +159,38 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'LD1', email: '', enrichmentMetadata: {},
     } as any);
+    (mockCrmDb as any).setLeadEmailIfMissing.mockResolvedValue({ written: true });
 
     const res = await send({ request_id: 'r1', person: { email: 'apollo@b.com', email_status: 'verified' } });
     expect(res.status).toBe(200);
-    expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
-    const [listId, leadId, payload] = mockCrmDb.updateLead.mock.calls[0] as any;
+    expect(res.body.written).toBe(true);
+    // Must NOT call the unconditional updateLead path.
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect((mockCrmDb as any).setLeadEmailIfMissing).toHaveBeenCalledTimes(1);
+    const [listId, leadId, email, meta] = (mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0];
     expect(listId).toBe('L1');
     expect(leadId).toBe('LD1');
-    expect(payload.email).toBe('apollo@b.com');
-    expect(payload.enrichmentMetadata.email.confidence).toBe('high');
-    expect(payload.enrichmentMetadata.email.apolloRequestId).toBe('r1');
+    expect(email).toBe('apollo@b.com');
+    expect(meta.confidence).toBe('high');
+    expect(meta.apolloRequestId).toBe('r1');
+  });
+
+  it('reports written:false when the conditional update silently lost the race', async () => {
+    mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+    } as any);
+    (mockCrmDb as any).getLeadListById = jest.fn().mockResolvedValue({ listId: 'L1', userId: 'u1' });
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'LD1', email: '', enrichmentMetadata: {},
+    } as any);
+    // Simulate Tier 1/2/4 filling the email between our read and DDB conditional.
+    (mockCrmDb as any).setLeadEmailIfMissing.mockResolvedValue({ written: false });
+
+    const res = await send({ request_id: 'r1', person: { email: 'apollo@b.com' } });
+    expect(res.status).toBe(200);
+    expect(res.body.written).toBe(false);
+    // Still 200 — the lead has an email, the request was attributed, the
+    // result just didn't apply (which is fine).
   });
 });
 

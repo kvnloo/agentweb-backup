@@ -116,8 +116,7 @@ router.post('/', async (req: Request, res: Response) => {
       status === 'verified' ? 'high' :
       status === 'guessed' ? 'low' :
       'medium';
-    const newMeta: Record<string, any> = { ...((lead.enrichmentMetadata ?? {}) as Record<string, any>) };
-    newMeta.email = {
+    const emailMeta = {
       source: 'web_search',
       provider: 'apollo',
       confidence,
@@ -125,8 +124,14 @@ router.post('/', async (req: Request, res: Response) => {
       sourceQuote: `Apollo waterfall (${status || 'unknown'})`,
       apolloRequestId: requestId,
     };
-    await crmDb.updateLead(listId, leadId, { email, enrichmentMetadata: newMeta });
-    return res.status(200).json({ accepted: true, matched: true, hadEmail: true, listId, leadId });
+    // Conditional write — DDB rejects (silently here) if Tier 1/2/4 filled the
+    // email between our in-memory check above and this update. Belt-and-
+    // suspenders TOCTOU guard.
+    const writeResult = await crmDb.setLeadEmailIfMissing(listId, leadId, email, emailMeta);
+    return res.status(200).json({
+      accepted: true, matched: true, hadEmail: true, listId, leadId,
+      written: writeResult.written,
+    });
   } catch (err: any) {
     console.error('[apollo webhook] error:', err);
     return res.status(500).json({ message: err.message || 'webhook processing failed' });

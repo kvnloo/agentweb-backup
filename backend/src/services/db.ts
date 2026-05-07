@@ -3542,7 +3542,7 @@ export const crmDb = {
           updatedAt: new Date().toISOString(),
           leadCount: 0,
           fieldNames: [], // Initialize with empty array
-          displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
+          displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'companyLinkedin', 'notes'], // Default visible fields
           sortConfig: null,
           alertEvents: normalizedAlertEvents,
           listSenderId: listSenderId ?? null,
@@ -3710,6 +3710,11 @@ export const crmDb = {
       /** Per-list enrich.so field config — gates which fields the reverse-lookup
        * specialists write to a lead. See enrichmentFieldConfig.ts. */
       enrichmentFieldConfig?: Record<string, boolean>;
+      /** Last successful CSV-import column-mapping for this list. Restored as
+       * the default mapping in the import wizard so repeat imports of the same
+       * template are one-click. Shape: csvHeader → standard field, "skip", or
+       * { customField } / { splitFullName }. */
+      lastImportMapping?: Record<string, any>;
     }
   ) {
     try {
@@ -3799,6 +3804,12 @@ export const crmDb = {
         expressionAttributeNames['#csvExportHistory'] = 'csvExportHistory';
         updateExpressions.push('#csvExportHistory = :csvExportHistory');
         expressionAttributeValues[':csvExportHistory'] = updates.csvExportHistory;
+      }
+
+      if (updates.lastImportMapping !== undefined) {
+        expressionAttributeNames['#lastImportMapping'] = 'lastImportMapping';
+        updateExpressions.push('#lastImportMapping = :lastImportMapping');
+        expressionAttributeValues[':lastImportMapping'] = updates.lastImportMapping;
       }
 
       if (updates.statusConfig !== undefined) {
@@ -4113,6 +4124,7 @@ export const crmDb = {
     title?: string;
     notes?: string;
     linkedin?: string;
+    companyLinkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
     status?: string | null;
@@ -4164,6 +4176,7 @@ export const crmDb = {
         title: leadData.title || '',
         notes: leadData.notes || '',
         linkedin: leadData.linkedin?.trim() || '',
+        companyLinkedin: leadData.companyLinkedin?.trim() || '',
         customFields: leadData.customFields || {},
         engagements: [], // Initialize with empty array
         isICP: 0,
@@ -4246,7 +4259,7 @@ export const crmDb = {
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
       standardFields.forEach(field => {
         if (leadData[field as keyof typeof leadData] && String(leadData[field as keyof typeof leadData]).trim()) {
           fieldNames.push(field);
@@ -4504,6 +4517,7 @@ export const crmDb = {
     title?: string;
     notes?: string;
     linkedin?: string;
+    companyLinkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
     emailDraftFormat?: 'text' | 'html';
@@ -4604,6 +4618,11 @@ export const crmDb = {
       if (updates.linkedin !== undefined) {
         setExpressions.push('linkedin = :linkedin');
         expressionAttributeValues[':linkedin'] = updates.linkedin.trim();
+      }
+
+      if (updates.companyLinkedin !== undefined) {
+        setExpressions.push('companyLinkedin = :companyLinkedin');
+        expressionAttributeValues[':companyLinkedin'] = updates.companyLinkedin.trim();
       }
 
       if (updates.customFields !== undefined) {
@@ -4851,6 +4870,7 @@ export const crmDb = {
     title?: string;
     notes?: string;
     linkedin?: string;
+    companyLinkedin?: string;
     customFields?: Record<string, any>;
     status?: string | null;
     dealValue?: number | null;
@@ -4970,6 +4990,7 @@ export const crmDb = {
             // Store LinkedIn URL in canonical form so future dedup reads match
             // regardless of the source's formatting (Unipile, CSV upload, manual entry).
             linkedin: normalizeLinkedInUrl(lead.linkedin),
+            companyLinkedin: lead.companyLinkedin?.trim() || '',
             customFields: lead.customFields || {},
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
@@ -5023,7 +5044,7 @@ export const crmDb = {
 
       // Extract all field names from imported leads (both new and updated)
       const allFieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
 
       const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
 
@@ -5086,7 +5107,7 @@ export const crmDb = {
 
           // Define standard string fields that should be trimmed and compared
           const standardStringFields: (keyof typeof newData)[] = [
-            'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'dealCurrency'
+            'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'dealCurrency'
           ];
 
           for (const field of standardStringFields) {
@@ -5836,7 +5857,7 @@ export const crmDb = {
     // owns this row, so a future caller cannot silently mislabel an enrich.so
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
-    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param';
+    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
   }): Promise<void> {
     try {
       await dynamodb.put({
@@ -5922,6 +5943,78 @@ export const crmDb = {
     } catch (err: any) {
       if (err.code === 'ConditionalCheckFailedException') return;
       handleDynamoDbError(err, 'setLeadEmailValidation:retry');
+      throw err;
+    }
+  },
+
+  /**
+   * Conditional email-fill used by the Apollo waterfall webhook (and any other
+   * path where a parallel writer might have filled the email between the read
+   * and the write). The condition `attribute_not_exists(email)` ensures we
+   * never overwrite an email that landed via Tier 1/2/4 in the meantime.
+   *
+   * Returns:
+   *   { written: true }  — the conditional update applied
+   *   { written: false } — the lead already has an email (no overwrite)
+   */
+  async setLeadEmailIfMissing(
+    listId: string,
+    leadId: string,
+    email: string,
+    enrichmentEmailMeta: Record<string, any>,
+  ): Promise<{ written: boolean }> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) return { written: false };
+
+    const params: any = {
+      TableName: tableName,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET email = :email, ' +
+        'enrichmentMetadata.email = :meta, ' +
+        'updatedAt = :ts',
+      ExpressionAttributeValues: {
+        ':email': normalizedEmail,
+        ':meta': enrichmentEmailMeta,
+        ':ts': new Date().toISOString(),
+      },
+      // Two guards:
+      //   1. attribute_exists(leadId) — don't auto-create a deleted lead
+      //   2. attribute_not_exists(email) — TOCTOU protection against parallel fills
+      ConditionExpression: 'attribute_exists(leadId) AND attribute_not_exists(email)',
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return { written: true };
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return { written: false };
+      // ValidationException → enrichmentMetadata map doesn't exist yet.
+      if (err.code !== 'ValidationException') {
+        handleDynamoDbError(err, 'setLeadEmailIfMissing');
+        throw err;
+      }
+    }
+    // Bootstrap missing parent map, then retry.
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return { written: false };
+      handleDynamoDbError(err, 'setLeadEmailIfMissing:bootstrap');
+      throw err;
+    }
+    try {
+      await dynamodb.update(params).promise();
+      return { written: true };
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return { written: false };
+      handleDynamoDbError(err, 'setLeadEmailIfMissing:retry');
       throw err;
     }
   },
