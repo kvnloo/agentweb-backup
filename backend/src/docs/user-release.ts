@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-07',
+    changes: [
+      'New: Landing Page Metrics — View GSC & GA4 Traffic Per Landing Page',
+      '- Each deployed landing page now has a "View Metrics" button that opens a dedicated metrics view filtered to that page\'s domain',
+      '- Google Search Console data is scoped to just that subdomain (e.g. mysite.agentwebforms.com) using GSC page filters',
+      '- Google Analytics 4 traffic is automatically shown for all agentwebforms.com landing pages — no manual configuration needed',
+      '- A "Back to Landing Pages" breadcrumb makes it easy to return from metrics to the landing pages list',
+      '- Domains are automatically registered in your SEO config when a landing page is deployed',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Emma Voice Mode — Barge-In and Error Visibility',
