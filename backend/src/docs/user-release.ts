@@ -5798,6 +5798,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The notify_session tool previously reported success but delivered no email in certain edge cases (e.g. null recipients passed by the agent)',
       '- Email delivery errors are now surfaced to the agent instead of being silently swallowed',
       '- Invalid or null entries in the recipient list are filtered out before sending',
+      'Fixed: Issue Reports No Longer Notify the Customer',
+      '- When Emma reports a product issue on behalf of a customer, the notification now goes only to the internal team',
+      '- Previously, a confirmation email was incorrectly sent to the customer — this no longer happens',
+      '- The internal email now includes a direct Notion link so engineers can jump straight to the ticket',
     ],
   },
   {
