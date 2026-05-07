@@ -1852,6 +1852,67 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/find/from-icp
+ * @desc Find leads using filters extracted from one of the user's ICP
+ *       personas (icpResult[]). Phase 2 entry-point — uses regex
+ *       extraction; the full LLM-based parser is a follow-up.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/find/from-icp', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const { icpIndex, limit, auto_enrich } = req.body ?? {};
+
+    if (typeof icpIndex !== 'number' || icpIndex < 0 || !Number.isFinite(icpIndex)) {
+      return res.status(400).json({ message: 'icpIndex (non-negative number) is required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+
+    const { userDb } = await import('../services/db');
+    const user: any = await userDb.getUserById(userId);
+    const personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+    if (personas.length === 0) {
+      return res.status(404).json({ message: 'No ICP personas found. Generate them on the GTM Plan page first.' });
+    }
+    if (icpIndex >= personas.length) {
+      return res.status(404).json({ message: `icpIndex ${icpIndex} out of range (have ${personas.length} personas)` });
+    }
+
+    const persona = personas[icpIndex];
+    const { extractIcpFilters } = await import('../services/icpPersonaFilterExtractor');
+    const filters = extractIcpFilters(persona);
+
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.importLeadsFromSearch(userId, {
+      listId,
+      keywords: filters.keywords,
+      title: filters.title,
+      industry: filters.industry,
+      location: filters.location,
+      limit: limit ? Math.min(Number(limit), 500) : 20,
+      auto_enrich: auto_enrich === true,
+      icpSource: persona.name,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ message: result.error });
+    }
+
+    res.status(201).json({ ...result, persona: { name: persona.name, index: icpIndex } });
+  } catch (error: any) {
+    console.error('Error finding leads from ICP:', error);
+    res.status(500).json({ message: error.message || 'Failed to find leads from ICP' });
+  }
+});
+
+/**
  * @route GET /api/crm/lists/:listId/leads/:leadId
  * @desc Get a specific lead
  * @access Private

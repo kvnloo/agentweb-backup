@@ -21279,11 +21279,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     cursor?: string;
     limit?: number;
     auto_enrich?: boolean;
+    /** When set, every imported lead in this batch gets
+     *  `lead.system.icpSource = icpSource` so the UI can attribute the
+     *  lead back to the persona that sourced it. Distinct from the
+     *  `lead.icpMatch` scoring field (post-import scoring). */
+    icpSource?: string;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
-      cursor, limit = 20, auto_enrich = false,
+      cursor, limit = 20, auto_enrich = false, icpSource,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -21375,8 +21380,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // Tag the lead with why it was discovered — sidecar map (system field)
       // distinct from customFields so it does NOT leak into CSV exports or
       // email-template variables. See Phase 0b lead.system top-level field.
-      if (findReason) {
-        lead.system = { ...(lead.system ?? {}), findReason };
+      const sys: Record<string, any> = {};
+      if (findReason) sys.findReason = findReason;
+      if (icpSource) sys.icpSource = icpSource;
+      if (Object.keys(sys).length > 0) {
+        lead.system = { ...(lead.system ?? {}), ...sys };
       }
 
       return lead;
