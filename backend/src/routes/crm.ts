@@ -185,6 +185,13 @@ import enrichSoSubRouter from './crmEnrichSo';
 import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
 router.use(enrichSoSubRouter);
 
+// Apollo people-enrichment routes (lookup-by-linkedin, reveal-phone, bulk
+// enrich, and the /webhooks/apollo callback). The webhook handler attaches
+// its own express.raw body parser before HMAC verification — keep this
+// mounted before any global JSON body parser if we add one in the future.
+import apolloSubRouter from './crmApollo';
+router.use(apolloSubRouter);
+
 const normalizeAlertEvents = (alertEvents: any) => {
   if (alertEvents === undefined) {
     return undefined;
@@ -2085,8 +2092,211 @@ router.delete('/lists/:listId/leads/:leadId', async (req: Request, res: Response
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/import/preview
+ * @desc Parse a CSV file and return its headers, the first few sample rows,
+ *   and a suggested column→field mapping the wizard renders for the user
+ *   to review/override.
+ * @access Private
+ */
+router.post(
+  '/lists/:listId/leads/import/preview',
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    try {
+      const authReq = req as AuthenticatedRequest;
+      const userId = authReq.user?.userId;
+      const { listId } = req.params;
+
+      if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) return res.status(404).json({ message: 'Lead list not found' });
+      if (!(await canAccessCrmList(userId, list))) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ message: 'CSV file is required' });
+      }
+
+      const fileContent = req.file.buffer.toString('utf-8');
+      let records: any[];
+      try {
+        records = parse(fileContent, {
+          columns: true,
+          skip_empty_lines: true,
+          trim: true,
+          relax_column_count: true,
+        });
+      } catch (parseError: any) {
+        return res.status(400).json({ message: `Failed to parse CSV: ${parseError.message}` });
+      }
+
+      if (records.length === 0) {
+        return res.status(400).json({ message: 'CSV file is empty or has no valid rows' });
+      }
+
+      const headers = Object.keys(records[0]);
+      const { suggestColumnMapping } = await import('../services/csvColumnMatcher');
+      const suggestedMapping = suggestColumnMapping(headers);
+
+      // A required field is satisfied if any column maps to email or linkedin
+      // (we'll re-validate at import time with the user's final choices).
+      const mappedFields = new Set(
+        Object.values(suggestedMapping).map((s) => s.field),
+      );
+      const requiredFieldsSatisfied = mappedFields.has('email') || mappedFields.has('linkedin');
+
+      return res.json({
+        headers,
+        sampleRows: records.slice(0, 5),
+        totalRows: records.length,
+        suggestedMapping,
+        requiredFieldsSatisfied,
+        savedMapping: (list as any).lastImportMapping,
+      });
+    } catch (error: any) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ message: 'File too large. Maximum CSV size is 50 MB.' });
+      }
+      console.error('Error previewing CSV:', error);
+      return res.status(500).json({ message: error.message || 'Failed to preview CSV' });
+    }
+  },
+);
+
+type ColumnMappingTarget =
+  | 'email'
+  | 'firstName'
+  | 'lastName'
+  | 'phone'
+  | 'company'
+  | 'title'
+  | 'linkedin'
+  | 'companyLinkedin'
+  | 'notes'
+  | 'skip'
+  | { customField: string }
+  | { splitFullName: true | 'first' | 'last' };
+
+const STANDARD_LEAD_FIELDS: ReadonlyArray<string> = [
+  'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'companyLinkedin', 'notes',
+];
+
+/**
+ * Cap on the user-supplied column mapping before persisting it on the list.
+ * The list row already carries csvExportHistory/lastImportMapping/etc., so
+ * we leave plenty of headroom under the 400KB DDB item limit. Returns an
+ * error message string when the mapping is too large, null when it's fine.
+ */
+const MAX_MAPPING_KEYS = 500;
+const MAX_MAPPING_JSON_BYTES = 64 * 1024;
+function validateColumnMappingSize(mapping: Record<string, any>): string | null {
+  const keyCount = Object.keys(mapping).length;
+  if (keyCount > MAX_MAPPING_KEYS) {
+    return `columnMapping has too many entries (${keyCount}); maximum is ${MAX_MAPPING_KEYS}.`;
+  }
+  const serializedBytes = Buffer.byteLength(JSON.stringify(mapping), 'utf8');
+  if (serializedBytes > MAX_MAPPING_JSON_BYTES) {
+    return `columnMapping exceeds ${MAX_MAPPING_JSON_BYTES} bytes (got ${serializedBytes}).`;
+  }
+  return null;
+}
+
+/**
+ * Project a CSV record through a user-supplied column mapping into a lead
+ * shape ready for batchCreateLeads. Falls back to header-name auto-detect
+ * when no mapping is provided (legacy behavior, preserved so old clients keep
+ * working).
+ */
+function projectRecordWithMapping(
+  record: Record<string, any>,
+  mapping: Record<string, ColumnMappingTarget> | null,
+): Record<string, any> {
+  const lead: Record<string, any> = {
+    email: '',
+    firstName: '',
+    lastName: '',
+    phone: '',
+    company: '',
+    title: '',
+    notes: '',
+    linkedin: '',
+    companyLinkedin: '',
+  };
+  const customFields: Record<string, any> = {};
+
+  if (mapping) {
+    for (const [csvHeader, target] of Object.entries(mapping)) {
+      const raw = record[csvHeader];
+      const value = typeof raw === 'string' ? raw.trim() : raw == null ? '' : String(raw);
+      if (!value) continue;
+
+      if (target === 'skip') continue;
+
+      if (typeof target === 'string' && STANDARD_LEAD_FIELDS.includes(target)) {
+        lead[target] = target === 'email' ? value.toLowerCase() : value;
+        continue;
+      }
+
+      if (typeof target === 'object' && target !== null) {
+        if ('customField' in target && target.customField) {
+          customFields[target.customField] = value;
+          continue;
+        }
+        if ('splitFullName' in target) {
+          // "Jane Marie Doe" → first="Jane", last="Marie Doe". For the
+          // "first" / "last" sub-directives we only emit one half, used when
+          // the wizard maps two columns ("Full Name" + something else) — but
+          // typically both halves come from one column with the boolean form.
+          const parts = value.split(/\s+/);
+          const first = parts[0] || '';
+          const rest = parts.slice(1).join(' ');
+          if (target.splitFullName === 'last') {
+            lead.lastName = lead.lastName || rest;
+          } else if (target.splitFullName === 'first') {
+            lead.firstName = lead.firstName || first;
+          } else {
+            lead.firstName = lead.firstName || first;
+            lead.lastName = lead.lastName || rest;
+          }
+          continue;
+        }
+      }
+    }
+  } else {
+    // Legacy auto-detect — match column name case-insensitively to standard field.
+    Object.keys(record).forEach((key) => {
+      const lower = key.toLowerCase().trim();
+      const raw = record[key];
+      const value = typeof raw === 'string' ? raw.trim() : raw == null ? '' : String(raw);
+      if (!value) return;
+
+      if (['email', 'e-mail', 'e_mail'].includes(lower)) {
+        lead.email = value.toLowerCase();
+        return;
+      }
+      const matching = STANDARD_LEAD_FIELDS.find((sf) => sf.toLowerCase() === lower);
+      if (matching) {
+        lead[matching] = value;
+      } else {
+        customFields[key] = value;
+      }
+    });
+  }
+
+  if (Object.keys(customFields).length > 0) {
+    lead.customFields = customFields;
+  }
+  return lead;
+}
+
+/**
  * @route POST /api/crm/lists/:listId/leads/import
- * @desc Import leads from CSV file
+ * @desc Import leads from CSV file. Optionally accepts a `columnMapping`
+ *   field (multipart string, JSON-encoded) that controls how each CSV
+ *   column maps to a Lead field. When omitted, falls back to header-name
+ *   auto-detect for backwards compatibility.
  * @access Private
  */
 router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Request, res: Response) => {
@@ -2113,10 +2323,50 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       return res.status(400).json({ message: 'CSV file is required' });
     }
 
+    // Parse columnMapping if provided. Multipart bodies arrive as strings.
+    let columnMapping: Record<string, ColumnMappingTarget> | null = null;
+    if (req.body?.columnMapping) {
+      try {
+        columnMapping =
+          typeof req.body.columnMapping === 'string'
+            ? JSON.parse(req.body.columnMapping)
+            : req.body.columnMapping;
+      } catch (err: any) {
+        return res
+          .status(400)
+          .json({ message: `Invalid columnMapping JSON: ${err.message}` });
+      }
+    }
+
+    if (columnMapping) {
+      // C7: cap mapping size before doing anything with it. The mapping is
+      // persisted on the list row via lastImportMapping; without bounds, a
+      // pathological CSV (5000 columns) could push the lead-list DDB item
+      // past the 400KB limit and cause silent updateLeadList failures.
+      const mappingValidationError = validateColumnMappingSize(columnMapping);
+      if (mappingValidationError) {
+        return res.status(400).json({ message: mappingValidationError });
+      }
+
+      // Required fields: at least one of email or linkedin must be mapped, or
+      // we have no way to dedup or message the lead.
+      const mappedFields = Object.values(columnMapping)
+        .map((t) => (typeof t === 'string' ? t : ''))
+        .filter(Boolean);
+      const hasEmailOrLinkedIn =
+        mappedFields.includes('email') || mappedFields.includes('linkedin');
+      if (!hasEmailOrLinkedIn) {
+        return res.status(400).json({
+          message:
+            'At least one column must be mapped to Email or LinkedIn — these are required for deduplication.',
+        });
+      }
+    }
+
     // Parse CSV file
     const fileContent = req.file.buffer.toString('utf-8');
     let records: any[];
-    
+
     try {
       records = parse(fileContent, {
         columns: true,
@@ -2132,64 +2382,24 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       return res.status(400).json({ message: 'CSV file is empty or has no valid rows' });
     }
 
-    // Map CSV records to lead data
-    const leads = records.map((record, index) => {
-      // Only normalize email field for deduplication, all other fields pass through as-is
-      const standardFields = ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
-      
-      // Find and normalize email field (for deduplication)
-      let email = '';
-      Object.keys(record).forEach(key => {
-        const lower = key.toLowerCase().trim();
-        if (['email', 'e-mail', 'e_mail'].includes(lower)) {
-          email = record[key]?.trim() || '';
-        }
-      });
-
-      // Extract standard fields if they match exactly (case-insensitive)
-      const leadData: Record<string, any> = {};
-      const customFields: Record<string, any> = {};
-      
-      Object.keys(record).forEach(key => {
-        const lower = key.toLowerCase().trim();
-        const value = record[key]?.trim() || '';
-        
-        // Skip email (already extracted)
-        if (['email', 'e-mail', 'e_mail'].includes(lower)) {
-          return;
-        }
-        
-        // Check if it matches a standard field name (case-insensitive)
-        const matchingStandardField = standardFields.find(sf => 
-          sf.toLowerCase() === lower
-        );
-        
-        if (matchingStandardField && value) {
-          leadData[matchingStandardField] = value;
-        } else if (value) {
-          // All other fields go to customFields with original column name
-          customFields[key] = value;
-        }
-      });
-
-      return {
-        email: email,
-        firstName: leadData.firstName || '',
-        lastName: leadData.lastName || '',
-        phone: leadData.phone || '',
-        company: leadData.company || '',
-        title: leadData.title || '',
-        notes: leadData.notes || '',
-        linkedin: leadData.linkedin || '',
-        customFields: Object.keys(customFields).length > 0 ? customFields : undefined,
-      };
-    });
+    const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads);
 
     if (results.newCount > 0) {
       void autoEnrollListIntoSequences(userId, listId);
+    }
+
+    // Persist the successful mapping so the next import of the same template
+    // is one-click. Best-effort — failing to save the mapping shouldn't fail
+    // the import the user already paid for.
+    if (columnMapping) {
+      try {
+        await crmDb.updateLeadList(listId, { lastImportMapping: columnMapping });
+      } catch (err) {
+        console.warn('Failed to persist lastImportMapping for list', listId, err);
+      }
     }
 
     res.json({
@@ -2245,7 +2455,7 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
     }
 
     // Build columns: standard fields + custom fields from fieldNames and lead data
-    const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'notes'];
+    const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'companyLinkedin', 'notes'];
     const customFieldSet = new Set<string>();
 
     if (list.fieldNames && Array.isArray(list.fieldNames)) {
