@@ -36,7 +36,16 @@ async function runWithConcurrency<T>(
     while (true) {
       const idx = i++;
       if (idx >= items.length) return;
-      try { await worker(items[idx]); } catch { /* swallowed; per-item handler logs */ }
+      try {
+        await worker(items[idx]);
+      } catch (err) {
+        // Belt-and-suspenders. The worker (enrichLeadsWithApolloInBackground)
+        // wraps its own try/catch and logs per-item errors at the call site —
+        // this outer catch is here so a synchronous throw in the worker fn
+        // (or in any future change to it) doesn't kill the runner. Log here
+        // too so a future bug doesn't go entirely silent.
+        console.error('[CRM apollo] runWithConcurrency outer worker error:', (err as Error).message);
+      }
     }
   });
   await Promise.all(runners);
