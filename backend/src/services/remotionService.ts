@@ -28,16 +28,21 @@ export interface RemotionComposeParams {
   /** User ID for S3 path scoping */
   userId: string;
   /**
-   * Duration of each source clip in seconds.
-   * Used as a fallback when targetDurationSeconds is not provided.
+   * Uniform duration of each source clip in seconds.
+   * Used when all clips share the same length.
    * If not provided, defaults to 8 seconds (Veo default clip length).
    */
   clipDurationSeconds?: number;
   /**
+   * Per-clip durations in seconds (variable-length support).
+   * When provided, overrides clipDurationSeconds for each individual clip.
+   * E.g. [8, 8, 8, 6] for a 30s video with 3 × 8s clips and one 6s clip.
+   */
+  clipDurationsSeconds?: number[];
+  /**
    * Exact total duration to render in seconds.
-   * When provided, overrides clipDurationSeconds × clipCount so the
-   * composition matches the requested duration (e.g. 30s) rather than
-   * the raw clip total (e.g. 4 clips × 8s = 32s).
+   * When provided, overrides the sum of clip durations. Use as a final
+   * trim guard (e.g. exactly 30s when clips sum to 30s anyway).
    */
   targetDurationSeconds?: number;
 }
@@ -200,14 +205,21 @@ export class RemotionService {
       const allClipUrls = [params.clipUrl, ...(params.extraClipUrls ?? [])];
       const clipCount = allClipUrls.length;
 
-      // Each Veo clip is at most 8 seconds; use the per-clip duration for total calculation
+      // Resolve per-clip durations (seconds). Variable lengths take priority over uniform.
       const MAX_VEO_CLIP_SECONDS = 8;
-      const perClipSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
-      // If the caller specifies an exact target duration (e.g. 30s from 4×8s clips), use it
-      // directly so the composition doesn't run over (e.g. 32s instead of 30s).
-      const totalDurationSeconds = params.targetDurationSeconds ?? perClipSeconds * clipCount;
+      const uniformSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
+      const perClipSeconds: number[] = allClipUrls.map((_, i) =>
+        params.clipDurationsSeconds?.[i] != null
+          ? Math.min(params.clipDurationsSeconds[i], MAX_VEO_CLIP_SECONDS)
+          : uniformSeconds
+      );
+
+      // Total = sum of per-clip durations, optionally overridden by targetDurationSeconds
+      const sumSeconds = perClipSeconds.reduce((a, b) => a + b, 0);
+      const totalDurationSeconds = params.targetDurationSeconds ?? sumSeconds;
       const durationInFrames = Math.round(totalDurationSeconds * FPS);
-      console.log(`RemotionService: ${clipCount} clip(s) × ${perClipSeconds}s = ${totalDurationSeconds}s (target=${params.targetDurationSeconds ?? 'none'}) → durationInFrames=${durationInFrames}`);
+      const clipDurationInFrames = perClipSeconds.map(s => Math.round(s * FPS));
+      console.log(`RemotionService: ${clipCount} clip(s) [${perClipSeconds.join(',')}]s = ${totalDurationSeconds}s → durationInFrames=${durationInFrames}`);
 
       // Ensure filename ends with .mp4
       let filename = params.filename;
@@ -223,7 +235,7 @@ export class RemotionService {
       const inputPropsWithDuration = {
         clipUrl: allClipUrls[0],
         extraClipUrls: allClipUrls.slice(1),
-        perClipDurationInFrames: Math.round(perClipSeconds * FPS),
+        clipDurationInFrames,
         brandName: params.brandName,
         tagline: params.tagline,
         primaryColor: params.primaryColor,

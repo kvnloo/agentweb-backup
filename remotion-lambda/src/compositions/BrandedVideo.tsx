@@ -16,6 +16,9 @@ export interface BrandedVideoProps {
   extraClipUrls?: string[];
   /** Duration of each individual clip in frames (all clips have the same duration) */
   perClipDurationInFrames?: number;
+  /** Per-clip durations in frames. When provided, overrides perClipDurationInFrames
+   *  and allows variable-length clips (e.g. [240, 240, 240, 180] for 8,8,8,6s at 30fps). */
+  clipDurationInFrames?: number[];
   /** Brand display name shown as headline */
   brandName: string;
   /** Optional tagline or subtitle */
@@ -263,6 +266,7 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   clipUrl,
   extraClipUrls = [],
   perClipDurationInFrames,
+  clipDurationInFrames,
   brandName,
   tagline,
   primaryColor,
@@ -285,10 +289,28 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   const allClips = [clipUrl, ...extraClipUrls];
   const clipCount = allClips.length;
 
-  // Duration for each clip segment: either from props or evenly divide total
-  const perClipFrames = perClipDurationInFrames
-    ? Math.max(1, perClipDurationInFrames)
-    : Math.floor(durationInFrames / clipCount);
+  // Resolve per-clip frame durations:
+  // 1. clipDurationInFrames array (variable lengths, e.g. [240, 240, 240, 180])
+  // 2. perClipDurationInFrames scalar (uniform)
+  // 3. fallback: divide total composition duration equally
+  const fallbackPerClip = Math.max(1, Math.floor(durationInFrames / clipCount));
+  const clipFrames: number[] = allClips.map((_, i) => {
+    if (clipDurationInFrames && clipDurationInFrames[i] != null) {
+      return Math.max(1, clipDurationInFrames[i]);
+    }
+    if (perClipDurationInFrames) {
+      return Math.max(1, perClipDurationInFrames);
+    }
+    return fallbackPerClip;
+  });
+
+  // Build cumulative start offsets from the per-clip durations
+  const clipStarts: number[] = [];
+  let cursor = 0;
+  for (let i = 0; i < clipCount; i++) {
+    clipStarts.push(cursor);
+    cursor += clipFrames[i];
+  }
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
@@ -301,12 +323,12 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
         const fadeIn = isFirst ? 0 : CLIP_FADE_FRAMES;
         const fadeOut = isLast ? 0 : CLIP_FADE_FRAMES;
         // Extend non-last clips by CLIP_FADE_FRAMES so they overlap the start of the next clip
-        const seqDuration = isLast ? perClipFrames : perClipFrames + CLIP_FADE_FRAMES;
+        const seqDuration = isLast ? clipFrames[i] : clipFrames[i] + CLIP_FADE_FRAMES;
 
         return (
           <Sequence
             key={`clip-${i}`}
-            from={i * perClipFrames}
+            from={clipStarts[i]}
             durationInFrames={seqDuration}
           >
             <ClipWithFade

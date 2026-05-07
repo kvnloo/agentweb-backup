@@ -4043,6 +4043,11 @@ emmaToolRegistry.register({
           type: 'number',
           description: 'Optional: Exact total duration for the composed video in seconds. Use this to trim the output to the desired length (e.g. 30) when clips total more (e.g. 4 clips × 8s = 32s). If omitted, defaults to clip_duration_seconds × number of clips.'
         },
+        clip_durations_seconds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional: Per-clip playback durations in seconds (variable-length support). E.g. [8, 8, 8, 6] for a 30s video with 3 full clips and one 6s clip. Overrides clip_duration_seconds for each individual clip. Use when clips have different lengths.'
+        },
         brand_name: {
           type: 'string',
           description: 'Brand display name shown as the headline overlay'
@@ -4091,7 +4096,8 @@ emmaToolRegistry.register({
         ctaUrl: args.cta_url,
       },
       args.clip_duration_seconds,
-      args.target_duration_seconds
+      args.target_duration_seconds,
+      args.clip_durations_seconds
     );
   }
 });
