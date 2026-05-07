@@ -101,11 +101,18 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
         //
         // linkedinUrl is an optional bonus signal — when the caller has it,
         // Apollo's /people/match prioritizes it over name+domain matching.
+        //
+        // Identifier handling: prefer `domain` (strict canonical match). Fall
+        // back to `organization_name` (looser name match) only when no domain
+        // is available. The service layer enforces mutual exclusion so we
+        // never send both — sending a company-name string as `domain` would
+        // corrupt match heuristics and pollute the cache for 60-90 days.
         const body: any = {
           first_name: input.firstName,
           last_name: input.lastName,
-          domain: input.domain,
         };
+        if (input.domain) body.domain = input.domain;
+        else if (input.organizationName) body.organization_name = input.organizationName;
         if (input.linkedinUrl) body.linkedin_url = input.linkedinUrl;
         if (input.runWaterfall) {
           const webhook = input.webhookUrl ?? buildWebhookUrl();
@@ -233,11 +240,11 @@ function buildCacheStore(): ApolloCacheStore {
       if (item.cacheType !== 'apollo') return null;
       return item as any;
     },
-    async put(row) {
+    async put(row, opts) {
       await crmDb.putEnrichmentCacheItem({
         ...row,
         cacheType: 'apollo',
-      });
+      }, opts);
     },
   };
 }

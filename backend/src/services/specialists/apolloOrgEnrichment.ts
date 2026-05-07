@@ -23,6 +23,7 @@
 import type { FieldSpecialist, SpecialistResult } from '../enrichmentSpecialists';
 import { waterfallApolloMatch } from '../enrichmentWaterfall';
 import type { MappedOrganization } from '../apolloFieldMapper';
+import { getFieldConfidence } from '../fieldConfidenceRegistry';
 
 type OrgFieldName =
   | 'companyTechStack'
@@ -63,24 +64,12 @@ function pickOrgValue(field: OrgFieldName, org: MappedOrganization): string | nu
 }
 
 /**
- * Per-field confidence for Apollo org data. Apollo doesn't return field-level
- * confidence on /organizations/enrich, so we infer:
+ * Per-field confidence is sourced from the central registry
+ * (`fieldConfidenceRegistry.ts`), which infers Apollo-org fidelity as:
  *   - 'high'   for factual public-record fields (funding rounds, dates)
  *   - 'medium' for current-state fields refreshed weekly (tech stack, growth)
  *   - 'low'    for estimates Apollo synthesizes (annual revenue, dept headcount)
  */
-const ORG_FIELD_CONFIDENCE: Record<OrgFieldName, SpecialistResult['confidence']> = {
-  companyTechStack: 'medium',
-  companyHeadcountGrowth6mo: 'medium',
-  companyHeadcountGrowth12mo: 'medium',
-  companyHeadcountGrowth24mo: 'medium',
-  companyFundingTotal: 'high',
-  companyFundingStage: 'high',
-  companyFundingLastRoundDate: 'high',
-  companyAnnualRevenue: 'low',           // estimate
-  companyDepartmentHeadcount: 'low',     // estimate
-};
-
 function buildSpec(field: OrgFieldName): FieldSpecialist {
   return {
     fieldName: field,
@@ -92,7 +81,7 @@ function buildSpec(field: OrgFieldName): FieldSpecialist {
       if (!value) return null;
       return {
         value,
-        confidence: ORG_FIELD_CONFIDENCE[field],
+        confidence: getFieldConfidence('apollo', field),
         source: 'web_search',
         provider: 'apollo',
       };

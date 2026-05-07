@@ -25,6 +25,7 @@ import { findEmailViaPatterns } from './emailPatternFinder';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { normalizeLinkedInUrl } from './enrichmentGroups';
 import { crmDb } from './db';
+import { getFieldConfidence } from './fieldConfidenceRegistry';
 
 type ProviderSource = 'apollo' | 'enrich.so';
 
@@ -168,19 +169,26 @@ function pickFromEnrichSoReverse(
   field: EnrichmentFieldName,
   r: ReverseResult,
 ): { value: string; confidence: EnrichSoConfidence } | null {
+  // Confidence is sourced from the central registry (provider × field) so a
+  // single edit in fieldConfidenceRegistry.ts updates every code path that
+  // consumes enrich.so reverse-lookup results. The 'email' signal reflects
+  // that reverse lookup is keyed on email — registry can later upgrade
+  // confidence for stronger signals (e.g. linkedin) if needed.
+  const conf = (f: string): EnrichSoConfidence =>
+    getFieldConfidence('enrich.so', f, 'email') as EnrichSoConfidence;
   switch (field) {
-    case 'firstName':       return r.firstName        ? { value: r.firstName,        confidence: 'high' } : null;
-    case 'lastName':        return r.lastName         ? { value: r.lastName,         confidence: 'high' } : null;
-    case 'company':         return r.companyName      ? { value: r.companyName,      confidence: 'high' } : null;
-    case 'title':           return r.jobTitle         ? { value: r.jobTitle,         confidence: 'high' } : null;
-    case 'linkedin':        return r.profileUrl       ? { value: r.profileUrl,       confidence: 'high' } : null;
-    case 'summary':         return r.summary          ? { value: r.summary,          confidence: 'high' } : null;
-    case 'location':        return r.location         ? { value: r.location,         confidence: 'high' } : null;
-    case 'headline':        return r.headline         ? { value: r.headline,         confidence: 'high' } : null;
-    case 'connectionCount': return typeof r.connectionCount === 'number' ? { value: String(r.connectionCount), confidence: 'high' } : null;
-    case 'skills':          return r.skills && r.skills.length ? { value: r.skills.slice(0, 5).join(', '), confidence: 'high' } : null;
-    case 'pastCompanies':   return r.pastCompanies && r.pastCompanies.length ? { value: r.pastCompanies.join('; '), confidence: 'high' } : null;
-    case 'education':       return r.education && r.education.length ? { value: r.education.join('; '), confidence: 'high' } : null;
+    case 'firstName':       return r.firstName        ? { value: r.firstName,        confidence: conf('firstName') } : null;
+    case 'lastName':        return r.lastName         ? { value: r.lastName,         confidence: conf('lastName') } : null;
+    case 'company':         return r.companyName      ? { value: r.companyName,      confidence: conf('company') } : null;
+    case 'title':           return r.jobTitle         ? { value: r.jobTitle,         confidence: conf('title') } : null;
+    case 'linkedin':        return r.profileUrl       ? { value: r.profileUrl,       confidence: conf('linkedin') } : null;
+    case 'summary':         return r.summary          ? { value: r.summary,          confidence: conf('summary') } : null;
+    case 'location':        return r.location         ? { value: r.location,         confidence: conf('location') } : null;
+    case 'headline':        return r.headline         ? { value: r.headline,         confidence: conf('headline') } : null;
+    case 'connectionCount': return typeof r.connectionCount === 'number' ? { value: String(r.connectionCount), confidence: conf('connectionCount') } : null;
+    case 'skills':          return r.skills && r.skills.length ? { value: r.skills.slice(0, 5).join(', '), confidence: conf('skills') } : null;
+    case 'pastCompanies':   return r.pastCompanies && r.pastCompanies.length ? { value: r.pastCompanies.join('; '), confidence: conf('pastCompanies') } : null;
+    case 'education':       return r.education && r.education.length ? { value: r.education.join('; '), confidence: conf('education') } : null;
   }
 }
 

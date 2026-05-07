@@ -5883,16 +5883,23 @@ export const crmDb = {
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
     cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
-  }): Promise<void> {
+  }, opts?: { force?: boolean }): Promise<void> {
     try {
-      await dynamodb.put({
+      // `force: true` is set by callers that explicitly asked for a fresh API
+      // hit (forceRefresh=true). Without dropping the ConditionExpression,
+      // those callers would burn API credits but the existing non-expired
+      // row would silently win and stay stale.
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
         Item: item,
+      };
+      if (!opts?.force) {
         // Only insert if item doesn't exist OR is already expired.
         // Prevents race when multiple clients simultaneously miss the same cache entry.
-        ConditionExpression: 'attribute_not_exists(canonicalId) OR expiresAt < :now',
-        ExpressionAttributeValues: { ':now': Math.floor(Date.now() / 1000) },
-      }).promise();
+        params.ConditionExpression = 'attribute_not_exists(canonicalId) OR expiresAt < :now';
+        params.ExpressionAttributeValues = { ':now': Math.floor(Date.now() / 1000) };
+      }
+      await dynamodb.put(params).promise();
     } catch (error: any) {
       if (error.code === 'ConditionalCheckFailedException') return;  // another worker won the race
       handleDynamoDbError(error, 'putEnrichmentCacheItem');

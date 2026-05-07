@@ -102,6 +102,12 @@ export interface CacheRow {
 
 export interface EnrichSoCacheStore {
   get(canonicalId: string, sk: string): Promise<CacheRow | null>;
+  /**
+   * `opts.force === true` tells the underlying DDB writer to drop the
+   * race-protection ConditionExpression. Used by forceRefresh callers so a
+   * fresh API hit actually overwrites the stale row (instead of silently
+   * no-op'ing on the conditional check).
+   */
   put(row: CacheRow & {
     canonicalKey: string;
     entityKey: string;
@@ -110,7 +116,7 @@ export interface EnrichSoCacheStore {
     sourcesUsed: string[];
     resultCount: number;
     schemaVersion: number;
-  }): Promise<void>;
+  }, opts?: { force?: boolean }): Promise<void>;
 }
 
 export interface EnrichSoServiceDeps {
@@ -129,6 +135,31 @@ const TTL_SECONDS: Record<EnrichSoEndpoint, number> = {
 };
 const NEGATIVE_TTL_SECONDS = 7 * 86400;
 const ERROR_TTL_SECONDS = 3600;
+
+/**
+ * Decide whether an upstream error is "transient" — a blip we want to surface
+ * to observability and retry on, NOT a stable failure to memoize.
+ *
+ * Transient = 5xx upstream, rate-limit (429), or any node-level network error
+ * (ECONNRESET / ETIMEDOUT / ENOTFOUND). Caching these would mask outages and
+ * pin a "null" answer for the error TTL window (1h here + 5m process LRU).
+ *
+ * Stable / non-transient = 4xx other than 429 (e.g. 400 bad request, 403
+ * auth), and unknown errors with no status/code (often parser failures —
+ * keep the existing cache behavior so a malformed-response loop doesn't
+ * hammer the upstream).
+ */
+function isTransientError(err: any): boolean {
+  const status: number | undefined = err?.response?.status;
+  if (typeof status === 'number') {
+    if (status === 429) return true;
+    if (status >= 500 && status < 600) return true;
+    return false;
+  }
+  const code: string | undefined = err?.code;
+  if (code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') return true;
+  return false;
+}
 
 // ─── Process-local LRU (size 500, TTL 5min) ─────────────────────────────────
 
@@ -376,6 +407,10 @@ export class EnrichSoService {
     try {
       apiData = await apiCall();
     } catch (err: any) {
+      // Transient = 5xx / 429 / network errors. We want these to surface to
+      // observability and let the next call retry against a healthy upstream.
+      // Caching them would pin a null answer for 1h and mask ongoing outages.
+      if (isTransientError(err)) throw err;
       const errorRow: CacheRow = {
         canonicalId: key.canonicalId,
         fieldGroup: key.sk,
@@ -386,7 +421,9 @@ export class EnrichSoService {
         expiresAt: Math.floor(Date.now() / 1000) + ERROR_TTL_SECONDS,
         fetchedAt: new Date().toISOString(),
       };
-      await this.writeRow(errorRow, key);
+      // forceRefresh callers want their fresh result to land — same applies
+      // to the error row that replaces the prior (now-stale) row.
+      await this.writeRow(errorRow, key, !!opts.forceRefresh);
       memSet(memKey, errorRow);
       throw err;
     }
@@ -403,7 +440,7 @@ export class EnrichSoService {
         (negative ? NEGATIVE_TTL_SECONDS : TTL_SECONDS[endpoint]),
       fetchedAt: new Date().toISOString(),
     };
-    await this.writeRow(row, key);
+    await this.writeRow(row, key, !!opts.forceRefresh);
     memSet(memKey, row);
 
     // Record quota usage only on successful API calls (cache misses, not hits).
@@ -428,7 +465,7 @@ export class EnrichSoService {
     return { row, fromCache: true };
   }
 
-  private async writeRow(row: CacheRow, key: ReturnType<typeof enrichSoCacheKey> & {}): Promise<void> {
+  private async writeRow(row: CacheRow, key: ReturnType<typeof enrichSoCacheKey> & {}, force = false): Promise<void> {
     await this.deps.store.put({
       ...row,
       canonicalKey: key.canonicalKey,
@@ -438,7 +475,7 @@ export class EnrichSoService {
       sourcesUsed: ['enrichso'],
       resultCount: row.status === 'hit' ? 1 : 0,
       schemaVersion: 1,
-    });
+    }, force ? { force: true } : undefined);
   }
 }
 

@@ -115,7 +115,10 @@ describe('ApolloService', () => {
   });
 
   describe('matchPerson — error caching', () => {
-    it('caches transient errors briefly (≤60s) so an outage does not lock the row for an hour', async () => {
+    it('caches non-transient errors (generic Error with no status — treated as stable parse failure)', async () => {
+      // A generic Error with no response.status and no err.code is classified
+      // as non-transient — likely a malformed-response / parse failure that
+      // would loop on retry. Caching it briefly avoids hammering the upstream.
       const http = makeHttp({
         match: jest.fn().mockRejectedValue(new Error('upstream 500')),
       });
@@ -125,13 +128,12 @@ describe('ApolloService', () => {
       await expect(svc.matchPerson({ email: 'x@y.com' })).rejects.toThrow('upstream 500');
       const cachedRow = Array.from(store.rows.values()).find((r: any) => r.status === 'error');
       expect(cachedRow).toBeDefined();
-      // Old behavior cached for 3600s. New behavior is 60s by default.
       const ttlSeconds = (cachedRow as any).expiresAt - Math.floor(Date.now() / 1000);
       expect(ttlSeconds).toBeLessThanOrEqual(60);
       expect(ttlSeconds).toBeGreaterThan(0);
     });
 
-    it('honors Retry-After header (capped at 300s) for 429 responses', async () => {
+    it('does NOT cache transient 429 errors (we want them to surface to observability)', async () => {
       const err: any = new Error('rate limited');
       err.response = { status: 429, headers: { 'retry-after': '120' } };
       const http = makeHttp({ match: jest.fn().mockRejectedValue(err) });
@@ -139,23 +141,20 @@ describe('ApolloService', () => {
       const svc = new ApolloService({ http, store });
 
       await expect(svc.matchPerson({ email: 'x@y.com' })).rejects.toThrow();
+      // No cache row written — the next call will hit the upstream again.
       const cachedRow = Array.from(store.rows.values()).find((r: any) => r.status === 'error');
-      const ttlSeconds = (cachedRow as any).expiresAt - Math.floor(Date.now() / 1000);
-      expect(ttlSeconds).toBeGreaterThan(60);
-      expect(ttlSeconds).toBeLessThanOrEqual(120);
+      expect(cachedRow).toBeUndefined();
     });
 
-    it('caps Retry-After at 300s', async () => {
-      const err: any = new Error('rate limited');
-      err.response = { status: 429, headers: { 'retry-after': '99999' } };
+    it('does NOT cache transient 5xx errors', async () => {
+      const err: any = new Error('upstream 500');
+      err.response = { status: 500, headers: {} };
       const http = makeHttp({ match: jest.fn().mockRejectedValue(err) });
       const store = makeStore();
       const svc = new ApolloService({ http, store });
 
       await expect(svc.matchPerson({ email: 'x@y.com' })).rejects.toThrow();
-      const cachedRow = Array.from(store.rows.values()).find((r: any) => r.status === 'error');
-      const ttlSeconds = (cachedRow as any).expiresAt - Math.floor(Date.now() / 1000);
-      expect(ttlSeconds).toBeLessThanOrEqual(300);
+      expect(store.rows.size).toBe(0);
     });
   });
 

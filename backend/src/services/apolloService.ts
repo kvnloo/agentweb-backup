@@ -106,11 +106,17 @@ export interface ApolloHttpClient {
    *  as a stronger identifier — Apollo prioritizes linkedin_url over name+
    *  domain matches. Doesn't affect our cache key (still keyed on name+domain
    *  for find-style lookups), but routes a stronger signal to Apollo.
+   *
+   *  `domain` and `organizationName` are mutually exclusive identifiers —
+   *  prefer `domain` (canonical) when both are available. Sending a company
+   *  name in `domain` would corrupt Apollo's match heuristics; the caller
+   *  must pass company names via `organizationName` instead.
    */
   findEmail(input: {
     firstName: string;
     lastName: string;
-    domain: string;
+    domain?: string;
+    organizationName?: string;
     linkedinUrl?: string;
     runWaterfall?: boolean;
     webhookUrl?: string;
@@ -132,6 +138,12 @@ export interface CacheRow {
 
 export interface ApolloCacheStore {
   get(canonicalId: string, sk: string): Promise<CacheRow | null>;
+  /**
+   * `opts.force === true` tells the underlying DDB writer to drop the
+   * race-protection ConditionExpression. Used by forceRefresh callers so a
+   * fresh API hit actually overwrites the stale row (instead of silently
+   * no-op'ing on the conditional check).
+   */
   put(row: CacheRow & {
     canonicalKey: string;
     entityKey: string;
@@ -140,7 +152,7 @@ export interface ApolloCacheStore {
     sourcesUsed: string[];
     resultCount: number;
     schemaVersion: number;
-  }): Promise<void>;
+  }, opts?: { force?: boolean }): Promise<void>;
 }
 
 export interface ApolloServiceDeps {
@@ -178,6 +190,56 @@ function errorTtlSecondsFor(err: any): number {
     }
   }
   return ERROR_TTL_DEFAULT_SECONDS;
+}
+
+/**
+ * Decide whether an upstream error is "transient" — a blip we want to surface
+ * to observability and retry on, NOT a stable failure to memoize.
+ *
+ * Transient = 5xx upstream, rate-limit (429), or any node-level network error
+ * (ECONNRESET / ETIMEDOUT / ENOTFOUND). Caching these would mask outages and
+ * pin a "null" answer for the error TTL window.
+ *
+ * Stable / non-transient = 4xx other than 429 (e.g. 400 bad request, 403
+ * auth), and unknown errors with no status/code (often parser failures —
+ * keep the existing cache behavior so a malformed-response loop doesn't
+ * hammer the upstream).
+ */
+function isTransientError(err: any): boolean {
+  const status: number | undefined = err?.response?.status;
+  if (typeof status === 'number') {
+    if (status === 429) return true;
+    if (status >= 500 && status < 600) return true;
+    return false;
+  }
+  const code: string | undefined = err?.code;
+  if (code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') return true;
+  return false;
+}
+
+/**
+ * Build the org-identifier portion of a findEmail HTTP body.
+ *
+ * Apollo's /people/match endpoint accepts either `domain` (preferred — strict
+ * canonical match) or `organization_name` (looser name match). Sending a
+ * company name in the `domain` slot corrupts Apollo's match heuristics and
+ * poisons the cache for the row's TTL (60-90 days). Pre-fix code did exactly
+ * that via `domain: input.domain ?? input.company`.
+ *
+ * Rules:
+ *   - domain present (after trim) → send `domain`, drop organizationName.
+ *   - domain absent + company present → send `organizationName`, drop domain.
+ *   - both absent → send neither (caller-side validation rejects this).
+ */
+function buildOrgIdentifierForFindEmail(
+  domain: string | undefined,
+  company: string | undefined,
+): { domain?: string; organizationName?: string } {
+  const d = (domain ?? '').trim();
+  if (d) return { domain: d };
+  const c = (company ?? '').trim();
+  if (c) return { organizationName: c };
+  return {};
 }
 
 // ─── Process-local LRU ───────────────────────────────────────────────────────
@@ -292,7 +354,10 @@ export class ApolloService {
       const apiResp = await this.deps.http.findEmail({
         firstName: (input.firstName ?? '').trim(),
         lastName: (input.lastName ?? '').trim(),
-        domain: (input.domain ?? input.company ?? '').trim(),
+        // Prefer canonical `domain` when present. Fall back to `organizationName`
+        // only when no domain is available — sending a company name in `domain`
+        // would corrupt Apollo's match heuristics and pollute the cache.
+        ...buildOrgIdentifierForFindEmail(input.domain, input.company),
         linkedinUrl: input.linkedinUrl,
         runWaterfall: true,
         // The factory's HTTP client supplies the webhook URL from env config.
@@ -323,7 +388,10 @@ export class ApolloService {
         const apiResp = await this.deps.http.findEmail({
           firstName: (input.firstName ?? '').trim(),
           lastName: (input.lastName ?? '').trim(),
-          domain: (input.domain ?? input.company ?? '').trim(),
+          // Prefer canonical `domain` when present. Fall back to `organizationName`
+          // only when no domain is available — sending a company name in `domain`
+          // would corrupt Apollo's match heuristics and pollute the cache.
+          ...buildOrgIdentifierForFindEmail(input.domain, input.company),
           // Pass linkedin URL as a stronger Apollo match signal when available.
           // Doesn't affect our cache key (intentional — see apolloCacheKeys.ts
           // FindInput.linkedinUrl).
@@ -413,6 +481,11 @@ export class ApolloService {
     try {
       apiData = await apiCall();
     } catch (err: any) {
+      // Transient = 5xx / 429 / network errors. We want these to surface to
+      // observability and let the next call retry against a healthy upstream.
+      // Caching them would pin a null answer for 60-300s + 1h LRU and mask
+      // ongoing outages.
+      if (isTransientError(err)) throw err;
       const errorRow: CacheRow = {
         canonicalId: key.canonicalId,
         fieldGroup: key.sk,
@@ -423,7 +496,9 @@ export class ApolloService {
         expiresAt: Math.floor(Date.now() / 1000) + errorTtlSecondsFor(err),
         fetchedAt: new Date().toISOString(),
       };
-      await this.writeRow(errorRow, key);
+      // forceRefresh callers want their fresh result to land — same applies
+      // to the error row that replaces the prior (now-stale) row.
+      await this.writeRow(errorRow, key, !!opts.forceRefresh);
       memSet(memKey, errorRow);
       throw err;
     }
@@ -440,7 +515,7 @@ export class ApolloService {
         (negative ? NEGATIVE_TTL_SECONDS : TTL_SECONDS[endpoint]),
       fetchedAt: new Date().toISOString(),
     };
-    await this.writeRow(row, key);
+    await this.writeRow(row, key, !!opts.forceRefresh);
     memSet(memKey, row);
 
     if (this.deps.quota && opts.userId) {
@@ -457,7 +532,7 @@ export class ApolloService {
     return { row, fromCache: true };
   }
 
-  private async writeRow(row: CacheRow, key: ApolloCacheKey): Promise<void> {
+  private async writeRow(row: CacheRow, key: ApolloCacheKey, force = false): Promise<void> {
     await this.deps.store.put({
       ...row,
       canonicalKey: key.canonicalKey,
@@ -467,7 +542,7 @@ export class ApolloService {
       sourcesUsed: ['apollo'],
       resultCount: row.status === 'hit' ? 1 : 0,
       schemaVersion: APOLLO_SCHEMA_VERSION,
-    });
+    }, force ? { force: true } : undefined);
   }
 
   /** Fan-out write — a linkedin-keyed match that returns an email also writes

@@ -19,6 +19,7 @@
  */
 
 import type { MappedMatch } from './apolloFieldMapper';
+import { getFieldConfidence } from './fieldConfidenceRegistry';
 
 interface ApplyResult {
   updates: Record<string, any>;
@@ -117,7 +118,9 @@ export function applyApolloMatchToLead(
     }
     if (p.employmentHistory && p.employmentHistory.length && !existingCustom.employmentHistory) {
       customFields.employmentHistory = JSON.stringify(p.employmentHistory);
-      newMeta.employmentHistory = tag('medium');
+      // Source-of-truth for confidence is the central registry — no behavior
+      // change for this field today, but new fields land here automatically.
+      newMeta.employmentHistory = tag(getFieldConfidence('apollo', 'employmentHistory'));
       changed.add('employmentHistory');
     }
   }
@@ -131,7 +134,7 @@ export function applyApolloMatchToLead(
     }
     if (o.techStack && o.techStack.length && !existingCustom.companyTechStack) {
       customFields.companyTechStack = o.techStack.join('; ');
-      newMeta.companyTechStack = tag('medium', 'web_search');
+      newMeta.companyTechStack = tag(getFieldConfidence('apollo', 'companyTechStack'), 'web_search');
       changed.add('companyTechStack');
     }
     const orgFields: Array<[string, string | number | undefined]> = [
