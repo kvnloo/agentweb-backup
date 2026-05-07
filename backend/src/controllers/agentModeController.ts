@@ -576,6 +576,8 @@ export async function runVerifiedChat(
   console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
+  let transientRetryCount = 0;
+  const MAX_TRANSIENT_RETRIES = 2;
   let allContent = '';
   const allToolCalls: any[] = [];
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
@@ -850,7 +852,11 @@ export async function runVerifiedChat(
       if (!isTransientLLMError(error) || isContextLimitError(error)) {
         throw error;
       }
-      if (attempt === maxAttempts) {
+      // Transient LLM errors (503, 500, timeout): callLLM already retried 3× internally.
+      // Cap outer transient retries at MAX_TRANSIENT_RETRIES to prevent multi-minute hangs
+      // when the LLM provider is having an extended outage (e.g. 8 attempts × 90s = 760s).
+      transientRetryCount++;
+      if (transientRetryCount > MAX_TRANSIENT_RETRIES || attempt === maxAttempts) {
         throw error;
       }
     }
@@ -1215,6 +1221,7 @@ export async function runScheduledChat(
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
     console.error('Full error details:', {
       message: error instanceof Error ? error.message : String(error),
+      originalMessage: (error as any)?.originalMessage || 'N/A',
       stack: error instanceof Error ? error.stack : undefined,
       name: error instanceof Error ? error.name : 'Unknown'
     });
@@ -1232,9 +1239,14 @@ export async function runScheduledChat(
       }
 
       try {
+        const originalMsg = (error as any)?.originalMessage;
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const fullMessage = originalMsg && originalMsg !== errorMessage
+          ? `${errorMessage} (cause: ${originalMsg})`
+          : errorMessage;
         await chatbotDb.updateSessionError(
           sessionId,
-          error instanceof Error ? error.message : String(error),
+          fullMessage,
           error instanceof Error ? error.stack : undefined
         );
       } catch (saveError) {
