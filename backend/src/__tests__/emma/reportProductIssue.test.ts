@@ -270,15 +270,17 @@ describe('report_product_issues tool', () => {
       );
     });
 
-    it('should fall back to normal (customer) recipients when isDelegatedAdmin but no adminEmail', async () => {
+    it('should suppress customer email even when isDelegatedAdmin but adminEmail is unknown', async () => {
       await toolExecute(
         { issues: [{ title: 'Bug', description: 'Desc' }] },
         { userId: 'user-123', isDelegatedAdmin: true }
       );
 
       const callArgs = mockResendSendEmail.mock.calls[0][0];
-      expect(callArgs.to).toContain('customer@example.com');
-      expect(callArgs.replyTo).toBe('customer@example.com');
+      // Customer must never receive email under any delegate scenario
+      expect(callArgs.to).not.toContain('customer@example.com');
+      // Only internal recipients (productIssueEmails) when adminEmail not resolved
+      expect(callArgs.to).toEqual(['founders@agentweb.pro']);
     });
   });
 });

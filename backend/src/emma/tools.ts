@@ -6091,12 +6091,13 @@ emmaToolRegistry.register({
           context: issueContext,
         });
 
-        // When an admin reports via delegate access, send only to the admin (not the customer).
-        // The admin initiated the report, not the customer.
-        const emailRecipients = isDelegatedAdmin && adminEmail
-          ? [...productIssueEmails, adminEmail]
+        // Delegate access: never email the customer — it's the admin acting on their behalf.
+        // Send to productIssueEmails + adminEmail (if known). If adminEmail lookup failed,
+        // still a delegate session — just send to productIssueEmails only.
+        const emailRecipients = isDelegate
+          ? adminEmail ? [...productIssueEmails, adminEmail] : [...productIssueEmails]
           : [...productIssueEmails, user.email];
-        const emailGreeting = isDelegatedAdmin && adminEmail
+        const emailGreeting = isDelegate && adminEmail
           ? `Hi ${adminEmail}, you've submitted an issue report on behalf of ${user.displayName || user.email}.`
           : `Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.`;
 
@@ -6119,7 +6120,7 @@ emmaToolRegistry.register({
               </div>
             </div>
           `,
-          replyTo: isDelegatedAdmin && adminEmail ? adminEmail : user.email,
+          replyTo: isDelegate && adminEmail ? adminEmail : user.email,
         });
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
