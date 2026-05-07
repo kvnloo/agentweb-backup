@@ -131,6 +131,29 @@ export function injectUnsubscribeUrl(html: string, unsubscribeUrl: string, fallb
   return html.replace(/<\/body>/i, `${footer}</body>`) + (/<\/body>/i.test(html) ? '' : footer);
 }
 
+const S3_BUCKET_HOST = 'agentweb-user-files.s3.us-west-2.amazonaws.com';
+
+/**
+ * Rewrite S3 image src URLs in email HTML to go through the /asset/ proxy on the
+ * backend (e.g. https://api.agentweb.pro/asset/<base64url>). This makes image
+ * hostnames match the sending domain, satisfying Resend/Gmail deliverability checks.
+ *
+ * Only rewrites src attributes pointing to the agentweb-user-files S3 bucket.
+ * baseUrl should be the backend URL, e.g. process.env.BACKEND_URL or 'https://api.agentweb.pro'.
+ */
+export function rewriteS3ImageUrls(html: string, baseUrl: string): string {
+  if (!html) return html;
+  const base = baseUrl.replace(/\/$/, '');
+  return html.replace(
+    /(<img\b[^>]*?\bsrc=["'])([^"']+)(["'][^>]*>)/gi,
+    (_match, prefix, srcUrl, suffix) => {
+      if (!srcUrl.includes(S3_BUCKET_HOST)) return _match;
+      const hash = Buffer.from(srcUrl).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+      return `${prefix}${base}/asset/${hash}${suffix}`;
+    },
+  );
+}
+
 export function substituteVariables(template: string, lead: Record<string, any>): string {
   if (!template) return template;
 

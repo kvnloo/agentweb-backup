@@ -380,7 +380,7 @@ Severity rules:
 
 IMPORTANT — template variables: This is a drip sequence template. Placeholders like {{unsubscribeUrl}}, {{firstName}}, {{email}}, {{companyName}} are intentional template variables that will be replaced with real values at send time. Do NOT flag these as broken links or missing content.
 
-IMPORTANT — image hosting: Images hosted on AWS S3 or CDNs are normal for transactional email systems. Do NOT flag S3-hosted images as suspicious.
+IMPORTANT — image hosting: Images hosted on api.agentweb.pro/asset/ are served through our own domain proxy and are fine. Flag images whose src domain does not match the sending domain AND is not api.agentweb.pro (e.g. raw S3 URLs, external CDNs).
 
 Be precise. Only report genuine issues. If the email looks clean, return an empty issues array.`;
 
