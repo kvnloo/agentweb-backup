@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-07',
     changes: [
+      'Fixed: Sequence Emails Now Use Full YouTube Links',
+      '- Email sequences previously sent youtu.be short links, which Gmail flags as potential phishing',
+      '- All youtu.be short URLs are now automatically expanded to full youtube.com/watch?v=... URLs before sending',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
       'New: Landing Page Metrics — View GSC & GA4 Traffic Per Landing Page',
       '- Each deployed landing page now has a "View Metrics" button that opens a dedicated metrics view filtered to that page\'s domain',
       '- Google Search Console data is scoped to just that subdomain (e.g. mysite.agentwebforms.com) using GSC page filters',
