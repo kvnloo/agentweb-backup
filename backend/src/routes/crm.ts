@@ -2170,6 +2170,10 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'attio', 'updated'),
     ]);
 
+    if (updates.email) {
+      void validateLeadEmailInBackground(listId, leadId, updates.email, userId);
+    }
+
     res.json(updatedLead);
   } catch (error: any) {
     console.error('Error updating lead:', error);

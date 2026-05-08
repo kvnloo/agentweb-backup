@@ -17,6 +17,7 @@ import {
   runWithConcurrency,
   BULK_ENRICH_CONCURRENCY,
 } from './crmEnrichmentConcurrency';
+import { validateLeadEmailInBackground } from './enrichSoLeadValidation';
 
 export async function findEmailsForLeadsInBackground(
   listId: string,
@@ -94,6 +95,7 @@ export async function findEmailsForLeadsInBackground(
             });
             populatedFieldNames.add('email');
           }
+          void validateLeadEmailInBackground(listId, lead.leadId, r.email, userId);
           if (jobId) recordResult(jobId, { found: true, tier: r.tier });
         } else {
           if (jobId) recordResult(jobId, { found: false });
