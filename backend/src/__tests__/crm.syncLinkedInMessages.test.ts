@@ -230,11 +230,12 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     const res = makeRes();
     await handler!(req, res);
 
+    // eventId must use stable provider_id, NOT the ephemeral msg.id
     expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ eventId: 'linkedin_msg_msg-1', eventType: 'linkedin.message.sent' }),
+      expect.objectContaining({ eventId: 'linkedin_msg_p1', eventType: 'linkedin.message.sent' }),
     );
     expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ eventId: 'linkedin_msg_msg-2', eventType: 'linkedin.message.received' }),
+      expect.objectContaining({ eventId: 'linkedin_msg_p2', eventType: 'linkedin.message.received' }),
     );
   });
 
@@ -270,6 +271,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
       true,
       'unipile-acct-1',
     );
-    expect(mockGetMessagesWithContact).toHaveBeenCalledWith('provider-id-1');
+    // account_id must be passed so Unipile can identify which side is is_sender=1
+    expect(mockGetMessagesWithContact).toHaveBeenCalledWith('provider-id-1', 'unipile-acct-1');
   });
 });

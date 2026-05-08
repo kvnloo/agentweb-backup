@@ -54,6 +54,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Fixed: LinkedIn Conversation Sync — Outbound Messages Now Visible and No More Duplicates',
+      '- Manually sent LinkedIn messages (replies you type directly in LinkedIn) now appear in the CRM engagement history after syncing via Emma',
+      '- Previously, sent messages were invisible because Unipile could not identify the sender side without the account context — this is now passed correctly',
+      '- Duplicate inbound messages (e.g. the same "Sounds great" appearing 3 times) no longer occur — messages are now keyed on their stable LinkedIn provider ID instead of an ephemeral internal ID that changed each sync',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Fixed: Auto Engagement — Disabling Comments Now Takes Effect Immediately',
       '- When you remove "Comment" from your engagement preferred actions, any already-queued comment jobs are now cancelled at execution time instead of posting anyway',
       '- Previously, comment actions scheduled before you changed the setting would still post to LinkedIn even after you disabled them',

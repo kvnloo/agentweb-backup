@@ -259,16 +259,17 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(true);
       expect(result.data.synced).toBe(2);
       expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(2);
+      // eventId must be keyed on stable provider_id, not ephemeral msg.id
       expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
         expect.objectContaining({
-          eventId: 'linkedin_msg_msg-1',
+          eventId: 'linkedin_msg_prov-1',
           eventType: 'linkedin.message.sent',
           text: 'Hi there!',
         })
       );
       expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
         expect.objectContaining({
-          eventId: 'linkedin_msg_msg-2',
+          eventId: 'linkedin_msg_prov-2',
           eventType: 'linkedin.message.received',
           text: 'Hello back!',
         })
@@ -286,8 +287,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.data.synced).toBe(1);
       expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(1);
+      // eventId must use stable provider_id (prov-1), not ephemeral msg.id (msg-1)
       expect(mockAddLinkedInMessageEvent).toHaveBeenCalledWith(
-        expect.objectContaining({ eventId: 'linkedin_msg_msg-1' })
+        expect.objectContaining({ eventId: 'linkedin_msg_prov-1' })
       );
     });
 
@@ -298,6 +300,19 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('LinkedIn URL');
+    });
+
+    it('passes account_id to getMessagesWithContact so Unipile can identify the sender side', async () => {
+      mockGetLeadById.mockResolvedValue(lead);
+      mockGetMessagesWithContact.mockResolvedValue([]);
+
+      await service.linkedinOutreach('user-1', updateArgs);
+
+      // account_id must be passed so Unipile knows which account is "us" and sets is_sender correctly
+      expect(mockGetMessagesWithContact).toHaveBeenCalledWith(
+        expect.any(String), // providerId
+        'test-account-id',  // account_id from args
+      );
     });
   });
 
