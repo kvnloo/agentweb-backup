@@ -218,14 +218,20 @@ async function enrichLeadsWithApolloInBackground(
       });
       if (proj.changed.size === 0) return;
 
-      const updatePayload: any = { ...proj.updates, enrichmentMetadata: proj.enrichmentMetadata };
-      if (Object.keys(proj.customFields).length > 0) {
-        updatePayload.customFields = {
-          ...((lead.customFields ?? {}) as Record<string, any>),
-          ...proj.customFields,
-        };
+      // Use targeted document-path SETs via setLeadFields — never spread
+      // lead.customFields (a stale snapshot) back into an updateLead call.
+      // Two concurrent workers on the same list would otherwise clobber each
+      // other's customFields/enrichmentMetadata maps. Matches the converted
+      // enrich.so + crmEnrichmentService write paths.
+      const topLevel: Record<string, string> = {};
+      for (const [k, v] of Object.entries(proj.updates)) {
+        if (v !== undefined && v !== null && v !== '') topLevel[k] = String(v);
       }
-      await crmDb.updateLead(listId, lead.leadId, updatePayload);
+      await crmDb.setLeadFields(listId, lead.leadId, {
+        topLevel,
+        enrichmentMetadata: proj.enrichmentMetadata,
+        customFields: proj.customFields,
+      });
     } catch (err) {
       console.error('[CRM apollo] bulk enrich failed for', lead.leadId, ':', (err as Error).message);
     }
