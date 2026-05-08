@@ -113,7 +113,9 @@ function isPrivateIPv6(ip: string): boolean {
 function isPrivateIP(ip: string): boolean {
   if (isIPv4(ip)) return isPrivateIPv4(ip);
   if (isIPv6(ip)) return isPrivateIPv6(ip);
-  // Unknown family — be conservative and reject
+  // Unknown family — be conservative and reject. Both call sites already
+  // gate with isIP(), so this is unreachable through the public API.
+  /* istanbul ignore next */
   return true;
 }
 

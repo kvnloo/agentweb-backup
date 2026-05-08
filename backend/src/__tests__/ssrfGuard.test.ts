@@ -173,4 +173,47 @@ describe('assertPublicHostname', () => {
     const { assertPublicHostname } = require('../utils/ssrfGuard');
     await expect(assertPublicHostname('https://example-v6.com')).resolves.toBeUndefined();
   });
+
+  // ─── Coverage: branches missed by the cases above ────────────────────────
+
+  it('rejects ::ffff:0a00:0001 (hex-form IPv4-mapped → 10.0.0.1)', async () => {
+    mockResolvesTo('::ffff:0a00:0001', 6);
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://hex-mapped.example')).rejects.toThrow(/private|internal/i);
+  });
+
+  it('accepts ::ffff:0808:0808 (hex-form IPv4-mapped → 8.8.8.8 public)', async () => {
+    mockResolvesTo('::ffff:0808:0808', 6);
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://hex-mapped-public.example')).resolves.toBeUndefined();
+  });
+
+  it('accepts a literal public IPv4 hostname (no DNS lookup)', async () => {
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    // 1.1.1.1 is parsed as an IP literal, so the IP-literal short-circuit
+    // returns success without ever calling dnsLookup.
+    await expect(assertPublicHostname('http://1.1.1.1/')).resolves.toBeUndefined();
+    expect(mockLookup).not.toHaveBeenCalled();
+  });
+
+  it('rejects when DNS lookup itself throws', async () => {
+    mockLookup.mockRejectedValueOnce(new Error('ENOTFOUND'));
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://no-such-host.example'))
+      .rejects.toThrow(/DNS lookup failed/);
+  });
+
+  it('rejects when DNS returns no addresses', async () => {
+    mockLookup.mockResolvedValueOnce([]);
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://empty-resolve.example'))
+      .rejects.toThrow(/did not resolve/);
+  });
+
+  it('rejects URLs that parse but have an empty hostname (javascript:, file:, data:)', async () => {
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('javascript:alert(1)')).rejects.toThrow(/Invalid URL/);
+    await expect(assertPublicHostname('file:///etc/passwd')).rejects.toThrow(/Invalid URL/);
+    await expect(assertPublicHostname('data:text/plain,hi')).rejects.toThrow(/Invalid URL/);
+  });
 });

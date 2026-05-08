@@ -206,5 +206,34 @@ describe('unsubscribeUrl utility', () => {
         })
       ).toThrow();
     });
+
+    it('returns false when timingSafeEqual throws (defensive catch)', () => {
+      jest.resetModules();
+      const crypto = require('crypto');
+      const spy = jest.spyOn(crypto, 'timingSafeEqual').mockImplementation(() => {
+        throw new Error('forced crypto failure');
+      });
+      try {
+        const { signUnsubscribeUrl, verifyUnsubscribeSignature } = require('../utils/unsubscribeUrl');
+        const url = signUnsubscribeUrl({
+          baseUrl: 'https://app.agentweb.pro',
+          listId: 'list-1',
+          leadId: 'lead-1',
+          email: 'foo@example.com',
+        });
+        const sig = new URL(url).searchParams.get('sig')!;
+        const ok = verifyUnsubscribeSignature({
+          listId: 'list-1',
+          leadId: 'lead-1',
+          email: 'foo@example.com',
+          sig,
+        });
+        // Defensive catch must convert any unexpected throw into a quiet false,
+        // never let the exception bubble out of verify.
+        expect(ok).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });
