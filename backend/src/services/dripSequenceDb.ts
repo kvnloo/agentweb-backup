@@ -537,7 +537,8 @@ async function exitEnrollment(
   enrollmentId: string,
   exitReason: ExitReason,
 ): Promise<void> {
-  await completeEnrollment(enrollmentId, exitReason, 'exited');
+  const finalStatus: EnrollmentStatus = exitReason === 'unsubscribed' ? 'unsubscribed' : 'exited';
+  await completeEnrollment(enrollmentId, exitReason, finalStatus);
 }
 
 async function getEnrollmentStats(sequenceId: string): Promise<{

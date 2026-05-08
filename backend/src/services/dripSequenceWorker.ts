@@ -15,6 +15,7 @@ import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition } from 
 import { resendService } from './resendService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
+import { isDoNotContact } from '../utils/leadContactStatus';
 import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { settingsService } from './settingsService';
 
@@ -171,9 +172,20 @@ async function checkExitConditions(
 ): Promise<'converted' | 'engagement' | 'unsubscribed' | null> {
   const { exitConditions } = sequence;
 
+  // Fetch lead once — needed for lifecycle and unsubscribe checks
+  let lead: any = null;
+  if (exitConditions.onLifecycleChange?.length || exitConditions.onUnsubscribe) {
+    lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+  }
+
+  // Check if lead has unsubscribed — always enforced (onUnsubscribe is always true)
+  if (exitConditions.onUnsubscribe && lead && isDoNotContact(lead)) {
+    console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} has unsubscribed`);
+    return 'unsubscribed';
+  }
+
   // Check lifecycle-based exit (e.g. lead became "paying")
   if (exitConditions.onLifecycleChange?.length) {
-    const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
     if (lead?.lifecycle && exitConditions.onLifecycleChange.includes(lead.lifecycle as any)) {
       return 'converted';
     }
