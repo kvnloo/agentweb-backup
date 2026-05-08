@@ -14163,7 +14163,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Read doc content (all pages concatenated)
       const content = await readClickUpDocContent(clickUpToken, workspaceId, doc.id);
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
         ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : content;
@@ -14215,7 +14215,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Read task content (formatted as markdown)
       const content = await readClickUpTaskContent(clickUpToken, task.id);
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
         ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : content;
