@@ -695,6 +695,29 @@ describe('CRM Database Service', () => {
       expect(second.UpdateExpression).toContain('enrichmentMetadata.#rmem0');
       expect(second.UpdateExpression).toContain('customFields.#rmcf0');
     });
+
+    it('uses if_not_exists in all SET clauses when ifNotExists=true', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { email: 'a@b.com' },
+        enrichmentMetadata: { email: { source: 'web_search' } },
+        customFields: { skills: 'TS, Node' },
+        ifNotExists: true,
+      });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const second = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(second.UpdateExpression).toContain('email = if_not_exists(email, :tl_email)');
+      expect(second.UpdateExpression).toContain(
+        'enrichmentMetadata.#em0 = if_not_exists(enrichmentMetadata.#em0, :em0)',
+      );
+      expect(second.UpdateExpression).toContain(
+        'customFields.#cf0 = if_not_exists(customFields.#cf0, :cf0)',
+      );
+    });
   });
 
   describe('mergeFieldNames', () => {

@@ -6,7 +6,8 @@
 
 jest.mock('../services/db', () => ({
   crmDb: {
-    updateLead: jest.fn(),
+    setLeadFields: jest.fn(),
+    mergeFieldNames: jest.fn(),
   },
 }));
 
@@ -24,18 +25,23 @@ jest.mock('../services/emailJobTracker', () => ({
   completeJob: jest.fn(),
   getJob: jest.fn(),
 }));
+jest.mock('../services/enrichSoLeadValidation', () => ({
+  validateLeadEmailInBackground: jest.fn(),
+}));
 
 import { findEmailsForLeadsInBackground } from '../services/crmFindEmailRunner';
 import { crmDb } from '../services/db';
 import { waterfallFindEmail } from '../services/enrichmentWaterfall';
 import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
 import { recordResult, completeJob } from '../services/emailJobTracker';
+import { validateLeadEmailInBackground } from '../services/enrichSoLeadValidation';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockWaterfall = waterfallFindEmail as jest.Mock;
 const mockApply = applyApolloMatchToLead as jest.Mock;
 const mockRecord = recordResult as jest.Mock;
 const mockComplete = completeJob as jest.Mock;
+const mockValidate = validateLeadEmailInBackground as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -49,7 +55,8 @@ describe('findEmailsForLeadsInBackground', () => {
   it('completes the job with no work when leads array is empty', async () => {
     await findEmailsForLeadsInBackground('list1', [], 'u1', 'job_a');
     expect(mockWaterfall).not.toHaveBeenCalled();
-    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockCrmDb.setLeadFields).not.toHaveBeenCalled();
+    expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('list1', new Set());
     expect(mockComplete).toHaveBeenCalledWith('job_a');
   });
 
@@ -77,11 +84,22 @@ describe('findEmailsForLeadsInBackground', () => {
     await findEmailsForLeadsInBackground('list1', leads, 'u1', 'job_c');
     expect(mockWaterfall).toHaveBeenCalledTimes(1);
     expect(mockApply).not.toHaveBeenCalled();
-    expect(mockCrmDb.updateLead).toHaveBeenCalledWith(
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledWith(
       'list1',
       'l1',
-      expect.objectContaining({ email: 'jane@acme.com' }),
+      expect.objectContaining({
+        topLevel: { email: 'jane@acme.com' },
+        enrichmentMetadata: expect.objectContaining({
+          email: expect.objectContaining({
+            source: 'web_search',
+            provider: 'enrich.so',
+            confidence: 'high',
+          }),
+        }),
+      }),
     );
+    expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('list1', new Set(['email']));
+    expect(mockValidate).toHaveBeenCalledWith('list1', 'l1', 'jane@acme.com', 'u1');
     expect(mockRecord).toHaveBeenCalledWith('job_c', { found: true, tier: 1 });
     expect(mockComplete).toHaveBeenCalledWith('job_c');
   });
@@ -98,17 +116,24 @@ describe('findEmailsForLeadsInBackground', () => {
       updates: { email: 'jane@acme.com', title: 'CTO' },
       enrichmentMetadata: { email: { source: 'web_search', sourceQuote: 'Apollo' } },
       customFields: {},
+      changed: ['email', 'title'],
     });
     const leads = [
       { leadId: 'l2', firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
     ];
     await findEmailsForLeadsInBackground('list1', leads, 'u1', 'job_d');
     expect(mockApply).toHaveBeenCalledTimes(1);
-    expect(mockCrmDb.updateLead).toHaveBeenCalledWith(
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledWith(
       'list1',
       'l2',
-      expect.objectContaining({ email: 'jane@acme.com', title: 'CTO' }),
+      {
+        topLevel: { email: 'jane@acme.com', title: 'CTO' },
+        enrichmentMetadata: { email: { source: 'web_search', sourceQuote: 'Apollo (verified)' } },
+        customFields: {},
+      },
     );
+    expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('list1', new Set(['email', 'title']));
+    expect(mockValidate).toHaveBeenCalledWith('list1', 'l2', 'jane@acme.com', 'u1');
   });
 
   it('continues when an individual lead errors and completes the job', async () => {
@@ -132,5 +157,30 @@ describe('findEmailsForLeadsInBackground', () => {
     await findEmailsForLeadsInBackground('list1', leads, 'u1');
     expect(mockRecord).not.toHaveBeenCalled();
     expect(mockComplete).not.toHaveBeenCalled();
+  });
+
+  it('falls back to waterfall email if Apollo projection misses email', async () => {
+    mockWaterfall.mockResolvedValueOnce({
+      found: true,
+      email: 'fallback@acme.com',
+      apolloMatch: { person: { name: 'Jane Doe' } },
+      tier: 2,
+    });
+    mockApply.mockReturnValueOnce({
+      updates: { title: 'CTO' },
+      enrichmentMetadata: {},
+      customFields: {},
+      changed: ['title'],
+    });
+    const leads = [{ leadId: 'l3', firstName: 'Jane', lastName: 'Doe', company: 'Acme' }];
+
+    await findEmailsForLeadsInBackground('list1', leads, 'u1', 'job_f');
+
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledWith(
+      'list1',
+      'l3',
+      expect.objectContaining({ topLevel: { title: 'CTO', email: 'fallback@acme.com' } }),
+    );
+    expect(mockValidate).toHaveBeenCalledWith('list1', 'l3', 'fallback@acme.com', 'u1');
   });
 });
