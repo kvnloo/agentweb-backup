@@ -4045,6 +4045,14 @@ export const crmDb = {
     }
   },
 
+  async mergeFieldNames(listId: string, newFields: Set<string> | string[]): Promise<void> {
+    const incoming = newFields instanceof Set ? newFields : new Set(newFields);
+    if (incoming.size === 0) return;
+    const list = await this.getLeadListById(listId);
+    const existing = (list?.fieldNames as string[]) || [];
+    await this.updateFieldNames(listId, [...new Set([...existing, ...incoming])]);
+  },
+
   async updateSearchQueryTemplates(
     listId: string,
     templates: Record<string, string>,
@@ -4561,6 +4569,10 @@ export const crmDb = {
      *  leak into CSV exports, email-template variables, or the
      *  lead-filter UI as a user-authored column. Pass `null` to clear. */
     system?: Record<string, any> | null;
+    /** Skip the per-call fieldNames update on AW-LeadLists. Use when the caller
+     *  will do a single consolidated updateFieldNames after bulk writes (avoids
+     *  read-modify-write races under parallel workers). */
+    skipFieldNamesUpdate?: boolean;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -4840,8 +4852,8 @@ export const crmDb = {
         });
       }
 
-      // Update field names in list
-      if (fieldNames.length > 0) {
+      // Update field names in list (skip when caller handles consolidated write)
+      if (fieldNames.length > 0 && !updates.skipFieldNamesUpdate) {
         const list = await this.getLeadListById(listId);
         const existingFieldNames = (list?.fieldNames as string[]) || [];
         const allFieldNames = [...existingFieldNames, ...fieldNames];
@@ -6056,6 +6068,119 @@ export const crmDb = {
     } catch (err: any) {
       if (err.code === 'ConditionalCheckFailedException') return { written: false };
       handleDynamoDbError(err, 'setLeadEmailIfMissing:retry');
+      throw err;
+    }
+  },
+
+  /**
+   * Atomic targeted write for bulk enrichment background jobs.
+   *
+   * Writes top-level scalar fields, enrichmentMetadata sub-keys, and
+   * customFields sub-keys in a single DDB UpdateExpression so concurrent
+   * jobs writing different keys never clobber each other (unlike the full-map
+   * SET that updateLead uses for enrichmentMetadata/customFields).
+   *
+   * Step 1 bootstraps missing parent maps with if_not_exists so document-path
+   * SETs in step 2 never hit ValidationException on cold leads.
+   */
+  async setLeadFields(
+    listId: string,
+    leadId: string,
+    options: {
+      topLevel?: Record<string, string>;
+      enrichmentMetadata?: Record<string, any>;
+      customFields?: Record<string, string>;
+      removeEnrichmentMetadataKeys?: string[];
+      removeCustomFieldKeys?: string[];
+    },
+  ): Promise<void> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const key = { listId, leadId };
+    const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
+    const hasCustomKeys = Object.keys(options.customFields ?? {}).length > 0;
+    const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
+    const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
+    const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
+    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
+
+    // Step 1: ensure parent maps exist so document-path SETs don't throw.
+    if (hasMetaKeys || hasCustomKeys) {
+      try {
+        await dynamodb.update({
+          TableName: tableName,
+          Key: key,
+          UpdateExpression:
+            'SET customFields = if_not_exists(customFields, :emptyMap), ' +
+            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+          ExpressionAttributeValues: { ':emptyMap': {} },
+          ConditionExpression: 'attribute_exists(leadId)',
+        }).promise();
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') return;
+        handleDynamoDbError(err, 'setLeadFields:bootstrap');
+        throw err;
+      }
+    }
+
+    // Step 2: build one combined expression — top-level, enrichmentMetadata
+    // sub-keys, and customFields sub-keys all in a single DDB round-trip.
+    const setClauses: string[] = ['updatedAt = :ts'];
+    const removeClauses: string[] = [];
+    const attrNames: Record<string, string> = {};
+    const attrValues: Record<string, any> = { ':ts': new Date().toISOString() };
+
+    for (const [k, v] of Object.entries(options.topLevel ?? {})) {
+      attrValues[`:tl_${k}`] = v;
+      setClauses.push(`${k} = :tl_${k}`);
+    }
+
+    let idx = 0;
+    for (const [k, v] of Object.entries(options.enrichmentMetadata ?? {})) {
+      attrNames[`#em${idx}`] = k;
+      attrValues[`:em${idx}`] = v;
+      setClauses.push(`enrichmentMetadata.#em${idx} = :em${idx}`);
+      idx++;
+    }
+
+    idx = 0;
+    for (const [k, v] of Object.entries(options.customFields ?? {})) {
+      attrNames[`#cf${idx}`] = k;
+      attrValues[`:cf${idx}`] = v;
+      setClauses.push(`customFields.#cf${idx} = :cf${idx}`);
+      idx++;
+    }
+
+    let rmIdx = 0;
+    for (const k of options.removeEnrichmentMetadataKeys ?? []) {
+      attrNames[`#rmem${rmIdx}`] = k;
+      removeClauses.push(`enrichmentMetadata.#rmem${rmIdx}`);
+      rmIdx++;
+    }
+
+    rmIdx = 0;
+    for (const k of options.removeCustomFieldKeys ?? []) {
+      attrNames[`#rmcf${rmIdx}`] = k;
+      removeClauses.push(`customFields.#rmcf${rmIdx}`);
+      rmIdx++;
+    }
+
+    let updateExpr = 'SET ' + setClauses.join(', ');
+    if (removeClauses.length > 0) updateExpr += ' REMOVE ' + removeClauses.join(', ');
+
+    const params: any = {
+      TableName: tableName,
+      Key: key,
+      UpdateExpression: updateExpr,
+      ExpressionAttributeValues: attrValues,
+      ConditionExpression: 'attribute_exists(leadId)',
+    };
+    if (Object.keys(attrNames).length > 0) params.ExpressionAttributeNames = attrNames;
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;
+      handleDynamoDbError(err, 'setLeadFields');
       throw err;
     }
   },

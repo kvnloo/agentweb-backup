@@ -231,6 +231,10 @@ describe('AgentModeService - LLM Timing Metadata', () => {
   describe('parallel tool execution', () => {
     it('should execute multiple tools concurrently (not sequentially)', async () => {
       const TOOL_DELAY_MS = 50;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const starts: number[] = [];
+      const ends: number[] = [];
 
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
@@ -257,20 +261,27 @@ describe('AgentModeService - LLM Timing Metadata', () => {
       // Each tool takes TOOL_DELAY_MS — if sequential, total >= 3 * TOOL_DELAY_MS
       // If parallel, total should be close to TOOL_DELAY_MS
       jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        starts.push(Date.now());
         await new Promise(resolve => setTimeout(resolve, TOOL_DELAY_MS));
+        ends.push(Date.now());
+        inFlight--;
         return { success: true };
       });
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
 
-      const start = Date.now();
       await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
-      const elapsed = Date.now() - start;
 
-      // If tools run in parallel, total should be well under 3 * TOOL_DELAY_MS
-      // Allow generous margin for test overhead but reject clearly sequential execution
-      expect(elapsed).toBeLessThan(3 * TOOL_DELAY_MS);
+      // Verify at least 2 tools were in-flight simultaneously.
+      expect(maxInFlight).toBeGreaterThan(1);
+
+      // Compute tool execution window only (exclude full-response overhead).
+      const toolsWindowMs = Math.max(...ends) - Math.min(...starts);
+      // Parallel window should be close to one delay, not N * delay.
+      expect(toolsWindowMs).toBeLessThan(2 * TOOL_DELAY_MS);
     });
 
     it('should preserve tool result order matching original tool_calls order', async () => {

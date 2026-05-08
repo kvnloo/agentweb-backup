@@ -650,6 +650,72 @@ describe('CRM Database Service', () => {
       const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(updateCall.UpdateExpression).toContain('REMOVE');
     });
+
+    it('should skip list fieldNames update when skipFieldNamesUpdate=true', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId, listId } }),
+      });
+
+      await crmDb.updateLead(listId, leadId, {
+        customFields: { industry: 'SaaS' },
+        skipFieldNamesUpdate: true,
+      } as any);
+
+      expect(mockDocumentClientMethods.get).not.toHaveBeenCalled();
+      const listUpdates = mockDocumentClientMethods.update.mock.calls.filter(
+        (call: any) => call[0].TableName === `${process.env.TABLE_PREFIX || ''}AW-LeadLists`
+      );
+      expect(listUpdates.length).toBe(0);
+    });
+  });
+
+  describe('setLeadFields', () => {
+    it('writes top-level + metadata + custom field keys with targeted expressions', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { email: 'a@b.com' },
+        enrichmentMetadata: { email: { source: 'web_search' } },
+        customFields: { skills: 'TS, Node' },
+        removeEnrichmentMetadataKeys: ['old_meta'],
+        removeCustomFieldKeys: ['old_custom'],
+      });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const second = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(second.UpdateExpression).toContain('SET');
+      expect(second.UpdateExpression).toContain('REMOVE');
+      expect(second.UpdateExpression).toContain('enrichmentMetadata.#em0 = :em0');
+      expect(second.UpdateExpression).toContain('customFields.#cf0 = :cf0');
+      expect(second.UpdateExpression).toContain('enrichmentMetadata.#rmem0');
+      expect(second.UpdateExpression).toContain('customFields.#rmcf0');
+    });
+  });
+
+  describe('mergeFieldNames', () => {
+    it('merges existing + incoming field names and writes deduped union', async () => {
+      const getSpy = jest.spyOn(crmDb, 'getLeadListById').mockResolvedValue({
+        listId: 'list_123',
+        fieldNames: ['email', 'company_size'],
+      } as any);
+      const updateSpy = jest.spyOn(crmDb, 'updateFieldNames').mockResolvedValue(undefined);
+
+      await crmDb.mergeFieldNames('list_123', new Set(['industry', 'email']));
+
+      expect(getSpy).toHaveBeenCalledWith('list_123');
+      expect(updateSpy).toHaveBeenCalledWith(
+        'list_123',
+        expect.arrayContaining(['email', 'company_size', 'industry']),
+      );
+
+      getSpy.mockRestore();
+      updateSpy.mockRestore();
+    });
   });
 
   describe('batchCreateLeads', () => {
@@ -1472,4 +1538,3 @@ describe('CRM Database Service', () => {
     });
   });
 });
-

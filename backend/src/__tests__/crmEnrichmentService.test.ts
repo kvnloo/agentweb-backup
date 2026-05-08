@@ -17,6 +17,8 @@ jest.mock('../services/db', () => ({
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
     updateFieldNames: jest.fn(),
+    setLeadFields: jest.fn(),
+    mergeFieldNames: jest.fn(),
     updateSearchQueryTemplates: jest.fn(),
     createEnrichmentSnapshotItem: jest.fn(),
     createEnrichmentJobMeta: jest.fn(),
@@ -124,6 +126,20 @@ describe('CrmEnrichmentService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new CrmEnrichmentService();
+    // Bridge new targeted-write API to existing assertions that inspect updateLead payloads.
+    mockCrmDb.setLeadFields.mockImplementation(async (listId: string, leadId: string, options: any) => {
+      const payload: Record<string, any> = { ...(options?.topLevel || {}) };
+      if (options?.customFields && Object.keys(options.customFields).length > 0) {
+        payload.customFields = options.customFields;
+      }
+      if (options?.enrichmentMetadata && Object.keys(options.enrichmentMetadata).length > 0) {
+        payload.enrichmentMetadata = options.enrichmentMetadata;
+      }
+      await mockCrmDb.updateLead(listId, leadId, payload as any);
+    });
+    mockCrmDb.mergeFieldNames.mockImplementation(async (listId: string, newFields: Set<string> | string[]) => {
+      await mockCrmDb.updateFieldNames(listId, Array.from(newFields as any));
+    });
     mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
     mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
     mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
@@ -2060,7 +2076,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     expect(lastUpdateCustomFields().funding_stage).toBe('Series B');
   });
 
-  it('rejects (sets to null) a value when sourceQuote is not found in any source', async () => {
+  it('rejects (removes) a value when sourceQuote is not found in any source', async () => {
     setupSingleLeadJob('Acme is an early-stage startup');
     mockGeminiCreate.mockResolvedValue(
       geminiResponse({
@@ -2082,7 +2098,7 @@ describe('CrmEnrichmentService - citation verification', () => {
 
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
-    expect(lastUpdateCustomFields().funding_stage).toBeNull();
+    expect(lastUpdateCustomFields().funding_stage).toBeUndefined();
   });
 
   it('rejects a value when rich-format response omits sourceQuote', async () => {
@@ -2102,7 +2118,7 @@ describe('CrmEnrichmentService - citation verification', () => {
 
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
-    expect(lastUpdateCustomFields().funding_stage).toBeNull();
+    expect(lastUpdateCustomFields().funding_stage).toBeUndefined();
   });
 
   it('keeps a value from a legacy flat-string LLM response (backwards compat)', async () => {
@@ -2198,7 +2214,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
     // Even though the quote is in source, the slug-check should still reject the URL
-    expect(lastUpdateCustomFields().company_linkedin_url).toBeNull();
+    expect(lastUpdateCustomFields().company_linkedin_url).toBeUndefined();
   });
 
   it('persists enrichmentMetadata sidecar with source, sourceUrl, sourceQuote, confidence, jobId, enrichedAt', async () => {
@@ -2279,13 +2295,11 @@ describe('CrmEnrichmentService - citation verification', () => {
     };
 
     await service.execute(spec);
-    const updateCall = mockCrmDb.updateLead.mock.calls[0];
-    const meta = (updateCall[2] as any).enrichmentMetadata;
-    // Cleared field's metadata is dropped...
-    expect(meta.industry).toBeUndefined();
-    // ...but unrelated metadata is preserved
-    expect(meta.other_field).toBeDefined();
-    expect(meta.other_field.source).toBe('web_search');
+    const setCall = mockCrmDb.setLeadFields.mock.calls[0];
+    const options = setCall[2] as any;
+    // Cleared field should be removed from both maps via targeted REMOVE lists.
+    expect(options.removeCustomFieldKeys).toContain('industry');
+    expect(options.removeEnrichmentMetadataKeys).toContain('industry');
   });
 
   it('omits enrichmentMetadata for null/rejected fields', async () => {
@@ -2405,7 +2419,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     const cf = lastUpdateCustomFields();
     expect(cf.industry).toBe('SaaS');                                  // supported → kept high
     expect(cf.market_size).toBe('$10B');                               // unsupported → kept but low confidence
-    expect(cf.funding_stage).toBeNull();                               // contradicted → dropped
+    expect(cf.funding_stage).toBeUndefined();                          // contradicted → removed
 
     const meta = (mockCrmDb.updateLead.mock.calls[0][2] as any).enrichmentMetadata;
     expect(meta.industry.criticVerdict).toBe('supported');
@@ -2443,7 +2457,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     expect(result.processedCount).toBe(1);
     const cf = lastUpdateCustomFields();
     expect(cf.industry).toBe('SaaS');           // supported → kept
-    expect(cf.funding_stage).toBeNull();        // unsupported → rejected
+    expect(cf.funding_stage).toBeUndefined();   // unsupported → removed
   });
 });
 
