@@ -13,6 +13,9 @@ function match(p: any = {}, o: any = {}): MappedMatch {
       linkedin: p.linkedin,
       apolloPersonId: p.apolloPersonId ?? 'apollo_p1',
       employmentHistory: p.employmentHistory,
+      city: p.city,
+      state: p.state,
+      country: p.country,
       fieldConfidence: p.fieldConfidence ?? {},
     } as any,
     organization: o ? ({
@@ -23,6 +26,7 @@ function match(p: any = {}, o: any = {}): MappedMatch {
       latestFundingStage: o.latestFundingStage,
       latestFundingRoundDate: o.latestFundingRoundDate,
       annualRevenue: o.annualRevenue,
+      linkedinUrl: o.linkedinUrl,
     } as any) : undefined,
   };
 }
@@ -124,5 +128,104 @@ describe('applyApolloMatchToLead', () => {
     expect(r.updates.company).toBeUndefined();
     expect(r.customFields.companyTechStack).toBeUndefined();
     expect(r.updates.firstName).toBe('A');
+  });
+
+  describe('minimalFields option', () => {
+    it('writes only email, firstName, lastName, title, company, linkedin, companyLinkedin, location', () => {
+      const lead = {};
+      const m = match(
+        {
+          firstName: 'Jane',
+          lastName: 'Doe',
+          email: 'jane@acme.com',
+          emailStatus: 'verified',
+          title: 'VP Eng',
+          seniority: 'vp',
+          linkedin: 'https://linkedin.com/in/janedoe',
+          employmentHistory: [{ organizationName: 'Acme', title: 'VP' }],
+          city: 'San Francisco',
+          state: 'CA',
+          country: 'United States',
+        },
+        {
+          name: 'Acme',
+          techStack: ['React', 'AWS'],
+          headcountGrowth12mo: 0.32,
+          totalFunding: 30_000_000,
+          latestFundingStage: 'Series B',
+          latestFundingRoundDate: '2025-06-01',
+          annualRevenue: 5_000_000,
+          linkedinUrl: 'https://linkedin.com/company/acme',
+        },
+      );
+      const r = applyApolloMatchToLead(lead, m, { fillEmail: true, minimalFields: true });
+
+      // Kept fields
+      expect(r.updates.email).toBe('jane@acme.com');
+      expect(r.updates.firstName).toBe('Jane');
+      expect(r.updates.lastName).toBe('Doe');
+      expect(r.updates.company).toBe('Acme');
+      expect(r.updates.linkedin).toBe('https://linkedin.com/in/janedoe');
+      expect(r.updates.companyLinkedin).toBe('https://linkedin.com/company/acme');
+      expect(r.updates.title).toBe('VP Eng');
+      expect(r.customFields.location).toBe('San Francisco, CA, United States');
+
+      // Dropped fields
+      expect(r.customFields.apolloPersonId).toBeUndefined();
+      expect(r.customFields.apolloTitle).toBeUndefined();
+      expect(r.customFields.apolloSeniority).toBeUndefined();
+      expect(r.customFields.employmentHistory).toBeUndefined();
+      expect(r.customFields.companyTechStack).toBeUndefined();
+      expect(r.customFields.companyHeadcountGrowth6mo).toBeUndefined();
+      expect(r.customFields.companyHeadcountGrowth12mo).toBeUndefined();
+      expect(r.customFields.companyHeadcountGrowth24mo).toBeUndefined();
+      expect(r.customFields.companyFundingTotal).toBeUndefined();
+      expect(r.customFields.companyFundingStage).toBeUndefined();
+      expect(r.customFields.companyFundingLastRoundDate).toBeUndefined();
+      expect(r.customFields.companyAnnualRevenue).toBeUndefined();
+
+      // Changed set is exactly the kept fields
+      expect(Array.from(r.changed).sort()).toEqual(
+        ['company', 'companyLinkedin', 'email', 'firstName', 'lastName', 'linkedin', 'location', 'title'],
+      );
+    });
+
+    it('joins location from whichever of city/state/country are present', () => {
+      const r1 = applyApolloMatchToLead({}, match({ city: 'NYC' }), { minimalFields: true });
+      expect(r1.customFields.location).toBe('NYC');
+
+      const r2 = applyApolloMatchToLead({}, match({ state: 'CA', country: 'US' }), { minimalFields: true });
+      expect(r2.customFields.location).toBe('CA, US');
+
+      const r3 = applyApolloMatchToLead({}, match({}), { minimalFields: true });
+      expect(r3.customFields.location).toBeUndefined();
+      expect(r3.changed.has('location')).toBe(false);
+    });
+
+    it('never overwrites existing companyLinkedin or location', () => {
+      const lead = {
+        companyLinkedin: 'https://linkedin.com/company/keep-me',
+        customFields: { location: 'KeepMyLocation' },
+      };
+      const m = match(
+        { city: 'SF', state: 'CA' },
+        { linkedinUrl: 'https://linkedin.com/company/new-co' },
+      );
+      const r = applyApolloMatchToLead(lead, m, { minimalFields: true });
+      expect(r.updates.companyLinkedin).toBeUndefined();
+      expect(r.customFields.location).toBeUndefined();
+      expect(r.changed.has('companyLinkedin')).toBe(false);
+      expect(r.changed.has('location')).toBe(false);
+    });
+
+    it('still respects fillEmail:false in minimal mode', () => {
+      const r = applyApolloMatchToLead(
+        {},
+        match({ email: 'a@b.com', emailStatus: 'verified', firstName: 'A' }),
+        { minimalFields: true, fillEmail: false },
+      );
+      expect(r.updates.email).toBeUndefined();
+      expect(r.updates.firstName).toBe('A');
+    });
   });
 });
