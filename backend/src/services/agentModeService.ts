@@ -14025,7 +14025,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       contentStr = content.toString('utf-8');
     }
 
-    const maxContentLength = 50000;
+    const maxContentLength = 1_000_000;
     if (contentStr.length > maxContentLength) {
       contentStr = contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
       console.log(`AgentMode: Knowledge base content truncated to ${maxContentLength} characters`);
@@ -14074,7 +14074,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const file = files[0];
       const contentStr = await this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || '');
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = contentStr.length > maxContentLength
         ? contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : contentStr;
