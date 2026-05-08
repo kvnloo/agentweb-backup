@@ -1,6 +1,7 @@
 import * as https from 'https';
 import * as http from 'http';
 import { emmaToolRegistry } from './registry';
+import { uploadFileToS3 } from '../utils/s3Utils';
 
 interface RelayConfig {
   endpoint: string;
@@ -17,6 +18,33 @@ async function getRelayConfig(): Promise<RelayConfig | null> {
   const parsed = JSON.parse(raw) as RelayConfig;
   if (!parsed.endpoint || !parsed.apiKey) return null;
   return parsed;
+}
+
+function httpRequestBinary(
+  url: string,
+  secret: string,
+  timeoutMs: number,
+): Promise<{ status: number; data: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === 'https:';
+    const options: http.RequestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + (parsed.search || ''),
+      method: 'GET',
+      headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+    };
+    const lib = isHttps ? https : http;
+    const req = lib.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); });
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, data: Buffer.concat(chunks) }));
+    });
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('File download timed out')); });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 function httpRequest(
@@ -236,11 +264,36 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
       return { success: false, error: 'Invalid JSON from local agent relay.' };
     }
 
+    const screenshotUrls: string[] = [];
+    if (parsed.ok && Array.isArray(parsed.screenshots) && parsed.screenshots.length > 0) {
+      const baseEndpoint = config.endpoint.replace(/\/$/, '');
+      for (const screenshot of parsed.screenshots as Array<{ name: string; url: string }>) {
+        try {
+          const fileUrl = baseEndpoint + screenshot.url;
+          const fileResp = await httpRequestBinary(fileUrl, config.apiKey, 30_000);
+          if (fileResp.status === 200) {
+            const ext = screenshot.name.split('.').pop()?.toLowerCase() ?? 'png';
+            const contentType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+              : ext === 'webp' ? 'image/webp'
+              : ext === 'gif' ? 'image/gif'
+              : 'image/png';
+            const uploadResult = await uploadFileToS3(fileResp.data, screenshot.name, userId, contentType);
+            if (uploadResult.success && uploadResult.url) {
+              screenshotUrls.push(uploadResult.url);
+            }
+          }
+        } catch (err: any) {
+          console.error('localAgentTools: failed to upload screenshot', screenshot.name, err.message);
+        }
+      }
+    }
+
     return {
       success: parsed.ok === true,
       result: parsed.result ?? '',
       session_id: parsed.session_id ?? '',
       returncode: parsed.returncode ?? -1,
+      ...(screenshotUrls.length > 0 ? { screenshot_urls: screenshotUrls } : {}),
       ...(parsed.error ? { error: parsed.error } : {}),
     };
   },

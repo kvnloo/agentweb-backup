@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import asyncio
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,10 @@ from .sessions import SessionStore, extract_session_id
 MACOS_CODEX_APP_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
 
 
+SCREENSHOTS_BASE_DIR = Path("~/.codex-relay/screenshots").expanduser()
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
 @dataclass(frozen=True)
 class CodexResult:
     ok: bool
@@ -29,6 +34,8 @@ class CodexResult:
     stderr: str
     command: tuple[str, ...]
     session_id: str = ""
+    screenshot_dir: str = ""
+    screenshots: tuple[str, ...] = ()
 
 
 class CodexRunner:
@@ -37,6 +44,11 @@ class CodexRunner:
 
     def run(self, task: str, *, dry_run: bool = False) -> CodexResult:
         task = _augment_task_with_browser_context(task, self.config)
+        # Allocate a per-run screenshots directory so Codex knows where to save images
+        run_id = str(uuid.uuid4())
+        screenshot_dir = SCREENSHOTS_BASE_DIR / run_id
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        task = _augment_task_with_screenshot_dir(task, screenshot_dir)
         command = self._build_command()
         if dry_run:
             return CodexResult(
@@ -46,10 +58,13 @@ class CodexRunner:
                 stdout="",
                 stderr="",
                 command=tuple(command),
+                screenshot_dir=str(screenshot_dir),
             )
 
         with tempfile.TemporaryDirectory(prefix="codex-relay-") as tmp:
             output_path = Path(tmp) / "last-message.md"
+            # Snapshot files present before the run so we can diff afterwards
+            pre_run_files = _image_files_in(screenshot_dir)
             command.extend(["-o", str(output_path), task])
             proc = subprocess.Popen(
                 command,
@@ -74,6 +89,9 @@ class CodexRunner:
             if not final_message.strip():
                 final_message = _last_json_message(stdout) or stdout[-4000:]
             session_id = self._save_session_id(stdout, "")
+            new_screenshots = tuple(
+                f.name for f in _image_files_in(screenshot_dir) if f not in pre_run_files
+            )
             return CodexResult(
                 ok=proc.returncode == 0,
                 final_message=final_message.strip(),
@@ -82,6 +100,8 @@ class CodexRunner:
                 stderr="",
                 command=tuple(command),
                 session_id=session_id,
+                screenshot_dir=str(screenshot_dir),
+                screenshots=new_screenshots,
             )
 
     def _build_command(self) -> list[str]:
@@ -243,3 +263,18 @@ def _quote(value: str) -> str:
 
 def _format_dry_run(command: list[str], task: str) -> str:
     return f"Dry run. Would execute:\n\n{_shell_join(command)}\n\nTask:\n{task}"
+
+
+def _image_files_in(directory: Path) -> set[Path]:
+    if not directory.exists():
+        return set()
+    return {f for f in directory.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS}
+
+
+def _augment_task_with_screenshot_dir(task: str, screenshot_dir: Path) -> str:
+    instruction = (
+        f"<screenshot_dir>\n"
+        f"If you take any screenshots during this task, save them to this directory: {screenshot_dir}\n"
+        f"</screenshot_dir>"
+    )
+    return task + "\n\n" + instruction

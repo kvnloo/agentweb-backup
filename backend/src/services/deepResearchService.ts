@@ -229,22 +229,18 @@ export class DeepResearchService {
 
       console.log('Deep research completed successfully');
 
-      // Extract the research report from the interaction steps (v2 SDK replaced outputs with steps)
-      const steps = interaction.steps || [];
-      const modelOutputSteps = steps.filter((s: any) => s.type === 'model_output');
-      if (modelOutputSteps.length === 0) {
+      // Extract the research report from the interaction outputs
+      const outputs = (interaction as any).outputs || [];
+      if (outputs.length === 0) {
         return {
           success: false,
           error: 'Deep research completed but no output was returned.'
         };
       }
 
-      // Concatenate all text parts from the last model_output step
-      const finalStep = modelOutputSteps[modelOutputSteps.length - 1] as any;
-      const researchText = (finalStep.content || [])
-        .filter((c: any) => c.type === 'text')
-        .map((c: any) => c.text as string)
-        .join('');
+      // Get the final text output (usually the last one)
+      const finalOutput = outputs[outputs.length - 1];
+      const researchText = 'text' in finalOutput ? (finalOutput.text as string) || '' : '';
 
       if (!researchText) {
         return {

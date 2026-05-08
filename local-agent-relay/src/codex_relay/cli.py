@@ -48,6 +48,7 @@ def main() -> None:
     serve_parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds.")
     serve_parser.add_argument("--model", default="", help="Optional Codex model override.")
     serve_parser.add_argument("--reasoning-effort", default="", help="Optional reasoning effort config value.")
+    serve_parser.add_argument("--extra-arg", action="append", default=[], help="Extra argument passed to codex exec. Repeatable.")
     serve_parser.add_argument("--no-browser", action="store_true", help="Disable browser pre-loading.")
     serve_parser.add_argument("--browser-backend", choices=("chrome", "playwright"), default="chrome")
     serve_parser.add_argument("--browser-headless", action="store_true")
@@ -114,6 +115,7 @@ def _run_serve(args: argparse.Namespace) -> None:
         timeout_seconds=args.timeout,
         model=args.model,
         reasoning_effort=args.reasoning_effort,
+        extra_args=tuple(getattr(args, 'extra_arg', [])),
         browser_enabled=not args.no_browser,
         browser_backend=args.browser_backend,
         browser_headless=args.browser_headless,

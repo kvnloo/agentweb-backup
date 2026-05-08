@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'New: Emma Can Take Screenshots via Local Agent',
+      '- When you have the local Codex agent connected, Emma can now take screenshots of any webpage and share them directly in the chat',
+      '- Screenshots are automatically uploaded to secure cloud storage and displayed inline in the conversation',
+      '- Just ask Emma to "take a screenshot of [URL]" or "grab a screenshot of that post" and the local agent handles the rest',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Fixed: Agent Chat — Switching Chats No Longer Shows Tasks from a Previous Chat',
       '- When you have multiple active agent chats and switch between them, tool execution spinners and AI suggestions from the previous chat no longer bleed into the newly selected chat',
       '- Each chat now shows only its own progress state when you switch to it',
