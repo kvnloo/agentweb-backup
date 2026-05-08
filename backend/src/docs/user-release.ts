@@ -5880,6 +5880,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-08',
+    changes: [
+      'Improved: CRM Email Draft Now Defaults to GPT-5.5 and Shows the Sender',
+      '- The AI Model dropdown in the Draft Email dialog now defaults to GPT-5.5 instead of Gemini 3 Flash',
+      '- The dialog now shows a "Sending From" field so you can confirm which sender the email will come from before drafting',
+      '- The sender is resolved automatically using the same hierarchy: lead-specific PoC → list default → account default',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Organization Members Now See Their Owner\'s Subscription Plan',
