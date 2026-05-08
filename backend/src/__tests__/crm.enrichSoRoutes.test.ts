@@ -19,6 +19,8 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
+    setLeadFields: jest.fn(),
+    mergeFieldNames: jest.fn(),
     updateLeadList: jest.fn(),
     setLeadEmailValidation: jest.fn(),
     getLeadsByListId: jest.fn(),
@@ -54,6 +56,16 @@ app.use('/api/crm', authenticateToken, enrichSoRouter);
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockCrmDb.setLeadFields.mockImplementation(async (listId: string, leadId: string, options: any) => {
+    const payload: Record<string, any> = { ...(options?.topLevel || {}) };
+    if (options?.customFields && Object.keys(options.customFields).length > 0) {
+      payload.customFields = options.customFields;
+    }
+    if (options?.enrichmentMetadata && Object.keys(options.enrichmentMetadata).length > 0) {
+      payload.enrichmentMetadata = options.enrichmentMetadata;
+    }
+    await mockCrmDb.updateLead(listId, leadId, payload as any);
+  });
   setQuotaTrackerForLookupRoute(null);
 });
 
@@ -453,6 +465,8 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
     expect(payload.linkedin).toContain('linkedin.com/in/alice');
     // Extended fields disabled by default → not written.
     expect(payload.customFields).toBeUndefined();
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledTimes(1);
+    expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('L1', expect.any(Set));
   });
 
   it('writes extended fields to customFields when enabled in config', async () => {
@@ -485,6 +499,7 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
     // Provenance metadata also tagged for each new field.
     expect(payload.enrichmentMetadata.skills.provider).toBe('enrich.so');
     expect(payload.enrichmentMetadata.summary.provider).toBe('enrich.so');
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledTimes(1);
   });
 
   it('does not overwrite existing customFields entries', async () => {
