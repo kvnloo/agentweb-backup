@@ -84,6 +84,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Fixed: Emma Now Reads Full Transcripts and Large Documents Without Missing Details',
+      '- When Emma reads a large document (e.g. a meeting transcript) that exceeds 20KB, she can now retrieve the full content — including the end of the document',
+      '- Previously, large responses were stored in S3 and Emma was told to use retrieval tools to read them, but those tools were gated behind skill installation and returned "not available"',
+      '- Emma now always has access to the retrieval tools, so she no longer summarizes from a truncated preview',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Maintenance: Google Gemini SDK Upgrade',
       '- Upgraded the Google Gemini JS SDK from v1 to v2 ahead of Google\'s June 8, 2026 deadline',
       '- No user-facing changes — voice mode and deep research continue to work as before',
