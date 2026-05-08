@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-07
+// Last updated: 2026-05-08
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-08',
+    changes: [
+      'New: Emma Can Take Screenshots via Local Agent',
+      '- When you have the local Codex agent connected, Emma can now take screenshots of any webpage and share them directly in the chat',
+      '- Screenshots are automatically uploaded to secure cloud storage and displayed inline in the conversation',
+      '- Just ask Emma to "take a screenshot of [URL]" or "grab a screenshot of that post" and the local agent handles the rest',
+    ],
+  },
   {
     date: '2026-05-08',
     changes: [
