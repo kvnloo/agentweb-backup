@@ -1699,6 +1699,10 @@ export class CrmEnrichmentService {
       updateFailed: 0,
     };
     const failureRecords: Array<{ leadId: string; email?: string; step: string; message: string }> = [];
+    // Tracks field names that received at least one non-null value across all
+    // parallel workers. Written to list.fieldNames in a single post-job call
+    // instead of per-lead to avoid read-modify-write races under parallel writes.
+    const populatedFieldNames = new Set<string>();
 
     emitProgress('Starting enrichment...', 0, 0, 0);
 
@@ -1723,22 +1727,35 @@ export class CrmEnrichmentService {
             console.error('[CrmEnrichment] Failed to write snapshot:', err);
           }
 
-          // Build merged enrichmentMetadata. When a field is cleared (customUpdates[k] is
-          // null/empty after a forced re-enrichment that found nothing), drop the prior
-          // metadata entry too — otherwise UI shows "—" with stale source/quote attached.
-          const mergedMeta: Record<string, EnrichedFieldMeta> = { ...((lead as any).enrichmentMetadata || {}) };
+          // Split customUpdates: non-empty → SET per key, null/empty → REMOVE per key.
+          // Both cleared-field metadata entries and the field values themselves are
+          // removed atomically — prevents stale "—" badge in UI for cleared fields.
+          const customSet: Record<string, string> = {};
+          const clearKeys: string[] = [];
           for (const [k, v] of Object.entries(customUpdates)) {
-            if (v === null || v === undefined || v === '') delete mergedMeta[k];
+            if (v === null || v === undefined || v === '') clearKeys.push(k);
+            else customSet[k] = v as string;
           }
-          Object.assign(mergedMeta, fieldMeta);
 
-          await crmDb.updateLead(spec.listId, lead.leadId, {
-            ...standardUpdates,
-            customFields: {
-              ...(lead.customFields || {}),
-              ...customUpdates,
-            },
-            enrichmentMetadata: mergedMeta,
+          // Normalize known top-level fields before writing.
+          const topLevel: Record<string, string> = {};
+          for (const [k, v] of Object.entries(standardUpdates)) {
+            if (v !== null && v !== undefined && v !== '') topLevel[k] = String(v);
+          }
+          if (topLevel.email) topLevel.email = topLevel.email.trim().toLowerCase();
+          if (topLevel.linkedin) topLevel.linkedin = topLevel.linkedin.trim();
+
+          // Track which fields got real values for the consolidated fieldNames write
+          for (const [k, v] of Object.entries(fields)) {
+            if (v !== null && v !== undefined && v !== '') populatedFieldNames.add(k);
+          }
+
+          await crmDb.setLeadFields(spec.listId, lead.leadId, {
+            topLevel,
+            enrichmentMetadata: fieldMeta,
+            customFields: customSet,
+            removeEnrichmentMetadataKeys: clearKeys,
+            removeCustomFieldKeys: clearKeys,
           });
 
           counters.processed++;
@@ -1800,9 +1817,10 @@ export class CrmEnrichmentService {
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
     }
 
-    // Register new field names on the list
+    // Single consolidated fieldNames write after all workers finish — avoids
+    // per-lead read-modify-write race where parallel workers clobber each other.
     try {
-      await crmDb.updateFieldNames(spec.listId, spec.outputFields);
+      await crmDb.mergeFieldNames(spec.listId, populatedFieldNames);
     } catch (err) {
       console.error('[CrmEnrichment] Failed to update field names:', err);
     }

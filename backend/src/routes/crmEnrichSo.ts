@@ -260,6 +260,7 @@ async function findEmailsForLeadsInBackground(
 ): Promise<void> {
   let svc;
   try { svc = getEnrichSoService(); } catch { return; }
+  const populatedFieldNames = new Set<string>();
   await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
     const firstName = (lead.firstName ?? '').trim();
     const lastName = (lead.lastName ?? '').trim();
@@ -275,25 +276,30 @@ async function findEmailsForLeadsInBackground(
         { userId },
       );
       if (r.found && r.email) {
-        // Record provenance alongside the value so the UI badge shows where
-        // the email came from (admin/delegated only — gated in EnrichedValue).
         const now = new Date().toISOString();
-        const enrichmentMetadata = {
-          ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
-          email: {
-            source: 'web_search' as const,
-            provider: 'enrich.so',
-            confidence: r.confidence,
-            enrichedAt: now,
-            sourceQuote: r.message,
+        await crmDb.setLeadFields(listId, lead.leadId, {
+          topLevel: { email: r.email },
+          enrichmentMetadata: {
+            email: {
+              source: 'web_search',
+              provider: 'enrich.so',
+              confidence: r.confidence,
+              enrichedAt: now,
+              sourceQuote: r.message,
+            },
           },
-        };
-        await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
+        });
+        populatedFieldNames.add('email');
       }
     } catch (err) {
       console.error('[CRM enrich.so] bulk find-email failed for', lead.leadId, ':', (err as Error).message);
     }
   });
+  try {
+    await crmDb.mergeFieldNames(listId, populatedFieldNames);
+  } catch (err) {
+    console.error('[CRM enrich.so] bulk find-email: failed to update fieldNames:', (err as Error).message);
+  }
 }
 
 /**
@@ -327,6 +333,7 @@ async function lookupProfilesForLeadsInBackground(
 ): Promise<void> {
   let svc;
   try { svc = getEnrichSoService(); } catch { return; }
+  const populatedFieldNames = new Set<string>();
   await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
     const email = (lead.email ?? '').trim();
     if (!email) return;
@@ -337,26 +344,26 @@ async function lookupProfilesForLeadsInBackground(
       // Standard fields → top-level lead columns. Each one is gated on the
       // per-list config and only written when the lead's column is empty
       // (never overwrites existing data).
-      const updates: Record<string, string> = {};
-      if (config.firstName && !lead.firstName && r.firstName) updates.firstName = r.firstName;
-      if (config.lastName  && !lead.lastName  && r.lastName)  updates.lastName  = r.lastName;
-      if (config.company   && !lead.company   && r.companyName) updates.company  = r.companyName;
-      if (config.title     && !lead.title     && r.jobTitle)  updates.title     = r.jobTitle;
-      if (config.linkedin  && !lead.linkedin  && r.profileUrl) updates.linkedin  = r.profileUrl;
+      const topLevel: Record<string, string> = {};
+      if (config.firstName && !lead.firstName && r.firstName) topLevel.firstName = r.firstName;
+      if (config.lastName  && !lead.lastName  && r.lastName)  topLevel.lastName  = r.lastName;
+      if (config.company   && !lead.company   && r.companyName) topLevel.company  = r.companyName;
+      if (config.title     && !lead.title     && r.jobTitle)  topLevel.title     = r.jobTitle;
+      if (config.linkedin  && !lead.linkedin  && r.profileUrl) topLevel.linkedin  = r.profileUrl;
 
       // Extended fields → customFields[<field>]. Same never-overwrite rule:
       // skip when the lead already has a value at that key.
       const existingCustom = (lead.customFields ?? {}) as Record<string, any>;
-      const customUpdates: Record<string, string> = {};
+      const customFields: Record<string, string> = {};
       const EXTENDED = ['summary', 'skills', 'connectionCount', 'location', 'headline', 'pastCompanies', 'education'] as const;
       for (const f of EXTENDED) {
         if (!config[f]) continue;
-        if (existingCustom[f]) continue;   // already present → don't overwrite
+        if (existingCustom[f]) continue;
         const v = pickExtendedFieldValue(f, r);
-        if (v) customUpdates[f] = v;
+        if (v) customFields[f] = v;
       }
 
-      const wroteAny = Object.keys(updates).length > 0 || Object.keys(customUpdates).length > 0;
+      const wroteAny = Object.keys(topLevel).length > 0 || Object.keys(customFields).length > 0;
       if (!wroteAny) return;
 
       // Tag every newly-filled field with provenance so the UI badge can
@@ -368,19 +375,23 @@ async function lookupProfilesForLeadsInBackground(
         confidence: 'high' as const,
         enrichedAt: now,
       };
-      const newMeta: Record<string, any> = { ...((lead.enrichmentMetadata ?? {}) as Record<string, any>) };
-      for (const k of Object.keys(updates)) newMeta[k] = fieldMetaForProvider;
-      for (const k of Object.keys(customUpdates)) newMeta[k] = fieldMetaForProvider;
+      const enrichmentMetadata: Record<string, any> = {};
+      for (const k of Object.keys(topLevel)) enrichmentMetadata[k] = fieldMetaForProvider;
+      for (const k of Object.keys(customFields)) enrichmentMetadata[k] = fieldMetaForProvider;
 
-      const mergedCustom = { ...existingCustom, ...customUpdates };
-      const updatePayload: any = { ...updates, enrichmentMetadata: newMeta };
-      if (Object.keys(customUpdates).length > 0) updatePayload.customFields = mergedCustom;
+      await crmDb.setLeadFields(listId, lead.leadId, { topLevel, enrichmentMetadata, customFields });
 
-      await crmDb.updateLead(listId, lead.leadId, updatePayload);
+      for (const k of Object.keys(topLevel)) populatedFieldNames.add(k);
+      for (const k of Object.keys(customFields)) populatedFieldNames.add(k);
     } catch (err) {
       console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
     }
   });
+  try {
+    await crmDb.mergeFieldNames(listId, populatedFieldNames);
+  } catch (err) {
+    console.error('[CRM enrich.so] bulk lookup: failed to update fieldNames:', (err as Error).message);
+  }
 }
 
 function isApplicableForFindEmail(lead: any): boolean {
