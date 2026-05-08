@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-07
+// Last updated: 2026-05-08
 
 export interface UserReleaseNote {
   date: string;
@@ -27,6 +27,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- "Draft Email" and "Draft Message" buttons inside the panel let you generate AI drafts with one click; "Update Draft" refines an existing draft',
       '- A new AI Model dropdown on the draft dialog lets you choose which model generates the draft, defaulting to Gemini 3 Flash',
       '- Email validation status (Deliverable / Risky / Undeliverable) now shows correctly in the panel header',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Maintenance: Google Gemini SDK Upgrade',
+      '- Upgraded the Google Gemini JS SDK from v1 to v2 ahead of Google\'s June 8, 2026 deadline',
+      '- No user-facing changes — voice mode and deep research continue to work as before',
     ],
   },
   {
