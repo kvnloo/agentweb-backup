@@ -132,7 +132,12 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/validate-email', () => {
       status: 'risky', confidence: 'medium', isCatchAll: true, fromCache: false, checkedAt: '2026-05-04T00:00:00Z',
     });
 
-    await request(app).post('/api/crm/lists/L1/leads/LD1/validate-email');
+    // autoDncOnFailure=false so the new auto-DNC path doesn't call updateLead;
+    // this test is specifically checking the customFields read-modify-write
+    // regression (M4), not the contactStatus flip.
+    await request(app)
+      .post('/api/crm/lists/L1/leads/LD1/validate-email')
+      .send({ autoDncOnFailure: false });
 
     // The whole point of the M4 fix: the route does NOT call updateLead({customFields: ...})
     // because that would clobber concurrent edits. Instead it calls the targeted DB method.
@@ -148,6 +153,151 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/validate-email', () => {
     const res = await request(app).post('/api/crm/lists/L1/leads/LD1/validate-email');
     expect(res.status).toBe(500);
     expect(res.body.message).toMatch(/quota/);
+  });
+
+  // ─── auto-DNC on undeliverable/risky ──────────────────────────────────────
+  // The Validate Email checkbox in the UI sends `autoDncOnFailure` (default
+  // true). When validation comes back undeliverable/risky AND the lead isn't
+  // already DNC, the route flips the lead to contactStatus='do-not-contact'
+  // so it's automatically excluded from group-email sending.
+
+  describe('auto-DNC behavior', () => {
+    function setupLead(lead: Partial<Record<string, any>> = {}) {
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+      mockCrmDb.getLeadById.mockResolvedValue({
+        leadId: 'LD1',
+        email: 'a@b.com',
+        customFields: {},
+        enrichmentMetadata: {},
+        ...lead,
+      } as any);
+    }
+    function mockValidate(status: 'deliverable' | 'risky' | 'undeliverable' | 'unknown') {
+      mockEnrichSo.validateEmail.mockResolvedValue({
+        status, confidence: 'high', isCatchAll: false,
+        provider: 'GOOGLE', message: status, fromCache: false,
+        checkedAt: '2026-05-08T00:00:00Z',
+      });
+    }
+
+    it('undeliverable + autoDncOnFailure=true → marks lead as do-not-contact', async () => {
+      setupLead();
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(true);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+      const [listId, leadId, updates] = mockCrmDb.updateLead.mock.calls[0] as any;
+      expect(listId).toBe('L1');
+      expect(leadId).toBe('LD1');
+      expect(updates).toMatchObject({
+        contactStatus: 'do-not-contact',
+        contactStatusReason: 'bounced',
+        contactStatusUpdatedBy: 'u1',
+      });
+      expect(typeof updates.contactStatusNote).toBe('string');
+      expect(updates.contactStatusNote).toMatch(/undeliverable/i);
+    });
+
+    it('risky + autoDncOnFailure=true → does NOT mark DNC (risky is intentionally excluded)', async () => {
+      setupLead();
+      mockValidate('risky');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('deliverable + autoDncOnFailure=true → does NOT touch contactStatus', async () => {
+      setupLead();
+      mockValidate('deliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('unknown + autoDncOnFailure=true → does NOT mark DNC (only undeliverable/risky)', async () => {
+      setupLead();
+      mockValidate('unknown');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('undeliverable + autoDncOnFailure=false → leaves contactStatus alone', async () => {
+      setupLead();
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: false });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('autoDncOnFailure omitted → defaults to true (auto-DNC applied)', async () => {
+      setupLead();
+      mockValidate('undeliverable');
+
+      const res = await request(app).post('/api/crm/lists/L1/leads/LD1/validate-email');
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(true);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+    });
+
+    it('lead already do-not-contact → preserves existing reason/note (no overwrite)', async () => {
+      setupLead({
+        contactStatus: 'do-not-contact',
+        contactStatusReason: 'requested-removal',
+        contactStatusNote: 'User asked to be removed via email reply',
+      });
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('lead already unsubscribed → preserves existing status (no overwrite)', async () => {
+      setupLead({
+        contactStatus: 'unsubscribed',
+        contactStatusReason: 'opted-out',
+      });
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
   });
 });
 

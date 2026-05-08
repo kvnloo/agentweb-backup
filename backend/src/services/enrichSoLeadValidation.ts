@@ -46,11 +46,21 @@ async function runWithConcurrency<T>(
   await Promise.all(runners);
 }
 
+export interface ValidateLeadEmailOpts {
+  /** When true and the result is undeliverable/risky, the lead is also flipped
+   *  to contactStatus='do-not-contact' (best-effort; failures are logged, not
+   *  thrown). Already-DNC/unsubscribed leads are preserved. Default: false —
+   *  legacy single-create + CSV-import callers don't want this surprise. The
+   *  bulk validate route passes true when the user ticks the UI checkbox. */
+  autoDncOnFailure?: boolean;
+}
+
 export async function validateLeadEmailInBackground(
   listId: string,
   leadId: string,
   email: string,
   userId?: string,
+  opts: ValidateLeadEmailOpts = {},
 ): Promise<{ status: string } | null> {
   if (!email || !email.trim()) return null;
 
@@ -80,19 +90,46 @@ export async function validateLeadEmailInBackground(
     message: result.message,
     checkedAt: result.checkedAt,
   };
+  const now = new Date().toISOString();
   const metadata = {
     source: 'web_search' as const,
     confidence: result.confidence,
-    enrichedAt: new Date().toISOString(),
+    enrichedAt: now,
     sourceQuote: `Email verification: ${result.message ?? result.status}`,
   };
   try {
     await crmDb.setLeadEmailValidation(listId, leadId, validation, metadata);
-    return { status: result.status };
   } catch (err) {
     console.error('[enrichSo] setLeadEmailValidation failed during background validation:', (err as Error).message);
     return null;
   }
+
+  // Auto-DNC (opt-in via opts). Only `undeliverable` triggers the flip — risky
+  // is intentionally excluded since many risky results are catch-all domains
+  // that still deliver. One extra getLeadById per undeliverable hit so we don't
+  // clobber a user-set DNC reason. Failures here are logged but don't fail the
+  // whole call — the validation pill already updated.
+  const isBadResult = result.status === 'undeliverable';
+  if (opts.autoDncOnFailure && isBadResult) {
+    try {
+      const lead: any = await crmDb.getLeadById(listId, leadId);
+      const alreadySuppressed =
+        lead?.contactStatus === 'do-not-contact' || lead?.contactStatus === 'unsubscribed';
+      if (lead && !alreadySuppressed) {
+        await crmDb.updateLead(listId, leadId, {
+          contactStatus: 'do-not-contact',
+          contactStatusReason: 'bounced',
+          contactStatusNote: `Email ${result.status}`,
+          contactStatusUpdatedAt: now,
+          contactStatusUpdatedBy: userId ?? 'system',
+        } as any);
+      }
+    } catch (err) {
+      console.error('[enrichSo] auto-DNC failed (best-effort):', (err as Error).message);
+    }
+  }
+
+  return { status: result.status };
 }
 
 import { recordResult, completeJob } from './emailJobTracker';
@@ -102,10 +139,11 @@ export async function validateLeadsInBackground(
   leads: ValidatableLead[],
   userId?: string,
   jobId?: string,
+  opts: ValidateLeadEmailOpts = {},
 ): Promise<void> {
   try {
     await runWithConcurrency(leads, VALIDATION_CONCURRENCY, async (l) => {
-      const r = await validateLeadEmailInBackground(listId, l.leadId, l.email ?? '', userId);
+      const r = await validateLeadEmailInBackground(listId, l.leadId, l.email ?? '', userId, opts);
       if (jobId) {
         // For validate jobs, "found" === deliverable. Risky/undeliverable/unknown
         // count as not-found so the UI breakdown is meaningful.

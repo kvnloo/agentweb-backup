@@ -76,13 +76,21 @@ async function canAccessCrmList(
 
 /**
  * POST /lists/:listId/leads/:leadId/validate-email
- * Body: (none)
- * Returns: { status, confidence, isCatchAll, fromCache, checkedAt }
+ * Body: { autoDncOnFailure?: boolean }   — default true
+ *   When true and the result is undeliverable/risky, the lead is also flipped
+ *   to contactStatus='do-not-contact' (unless it was already DNC/unsubscribed,
+ *   in which case the existing reason/note is preserved).
+ * Returns: { status, confidence, isCatchAll, fromCache, checkedAt, dncApplied }
  */
 router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, res: Response) => {
   const { listId, leadId } = req.params;
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  // Default true — UI checkbox is checked by default and the user must opt
+  // out to disable it. Explicit `false` opts out; everything else (including
+  // omitted / null / undefined) means "yes, auto-DNC".
+  const autoDncOnFailure = req.body?.autoDncOnFailure !== false;
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -118,6 +126,31 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
     };
     await crmDb.setLeadEmailValidation(listId, leadId, validation, metadata);
 
+    // Auto-DNC: only when the user opted in AND the result is undeliverable AND
+    // the lead isn't already DNC/unsubscribed (don't clobber a user-set reason).
+    // Risky is intentionally excluded — many risky results are catch-all domains
+    // that still deliver, so flipping them to DNC is too aggressive.
+    let dncApplied = false;
+    const isBadResult = result.status === 'undeliverable';
+    const alreadySuppressed =
+      lead.contactStatus === 'do-not-contact' || lead.contactStatus === 'unsubscribed';
+    if (autoDncOnFailure && isBadResult && !alreadySuppressed) {
+      try {
+        await crmDb.updateLead(listId, leadId, {
+          contactStatus: 'do-not-contact',
+          contactStatusReason: 'bounced',
+          contactStatusNote: `Email ${result.status}`,
+          contactStatusUpdatedAt: now,
+          contactStatusUpdatedBy: userId,
+        } as any);
+        dncApplied = true;
+      } catch (err) {
+        // Best-effort — validation result already persisted; surfacing a 500 here
+        // would mislead the caller about whether validation succeeded.
+        console.error('[CRM enrich.so] auto-DNC updateLead failed:', (err as Error).message);
+      }
+    }
+
     return res.json({
       success: true,
       status: result.status,
@@ -125,6 +158,7 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
       isCatchAll: result.isCatchAll,
       fromCache: result.fromCache,
       checkedAt: result.checkedAt,
+      dncApplied,
     });
   } catch (error: any) {
     if (error instanceof QuotaExceededError) {
@@ -631,6 +665,10 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
   if (leadIds !== undefined && !Array.isArray(leadIds)) {
     return res.status(400).json({ message: 'leadIds must be an array when provided' });
   }
+  // Mirrors the single-lead validate route: default true unless the client
+  // explicitly opts out. The bulk dialog sends this from a checkbox the user
+  // can untick before confirming.
+  const autoDncOnFailure = req.body?.autoDncOnFailure !== false;
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -680,7 +718,7 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
     // Fire and forget — pills update as each completes. Track progress so the
     // UI can show a live counter + final breakdown via /email-jobs/:jobId.
     const job = startEmailJob({ kind: 'validate', listId, userId, total: validatable.length });
-    void validateLeadsInBackground(listId, validatable, userId, job.jobId);
+    void validateLeadsInBackground(listId, validatable, userId, job.jobId, { autoDncOnFailure });
 
     return res.status(202).json({ jobId: job.jobId, queued: validatable.length, skipped, alreadyDone });
   } catch (error: any) {
