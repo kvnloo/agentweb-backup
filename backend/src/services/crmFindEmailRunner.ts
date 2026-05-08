@@ -24,6 +24,7 @@ export async function findEmailsForLeadsInBackground(
   userId: string,
   jobId?: string,
 ): Promise<void> {
+  const populatedFieldNames = new Set<string>();
   try {
     await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
       const firstName = (lead.firstName ?? '').trim();
@@ -50,42 +51,48 @@ export async function findEmailsForLeadsInBackground(
           { userId },
         );
         if (r.found && r.email) {
-          // When Apollo's matchPerson was the source (Tier 2 first leg, has
-          // r.apolloMatch), project the full payload onto missing fields too —
-          // title, linkedin, company, employment history, tech stack, funding,
-          // headcount growth. Never overwrites existing values.
-          //
-          // For non-Apollo hits (enrich.so finder, pattern, Apollo findEmail
-          // basic) we only have the email itself, so just write that.
           if (r.apolloMatch) {
             const proj = applyApolloMatchToLead(lead, r.apolloMatch, { fillEmail: true });
-            // The waterfall already returned r.email which equals proj.updates.email
-            // (or the existing lead email if user filled). Ensure the email
-            // metadata sourceQuote includes Apollo's emailStatus where available.
             if (r.emailStatus && proj.enrichmentMetadata.email) {
               proj.enrichmentMetadata.email.sourceQuote = `Apollo (${r.emailStatus})`;
             }
-            const payload: any = { ...proj.updates, enrichmentMetadata: proj.enrichmentMetadata };
-            if (Object.keys(proj.customFields).length > 0) {
-              payload.customFields = { ...((lead.customFields ?? {}) as Record<string, any>), ...proj.customFields };
+            // Belt-and-suspenders: all leads here have no email (guaranteed by
+            // isApplicableForFindEmail), but guard in case applyApolloMatchToLead
+            // skipped it for an unexpected edge case.
+            if (!proj.updates.email) proj.updates.email = r.email;
+
+            // Extract only the delta — proj.enrichmentMetadata is a full map
+            // (snapshot + new keys). We only want to write keys for fields we
+            // actually changed so we don't touch unrelated metadata.
+            const enrichmentMetadataDelta: Record<string, any> = {};
+            for (const k of proj.changed) {
+              if (proj.enrichmentMetadata[k] !== undefined) {
+                enrichmentMetadataDelta[k] = proj.enrichmentMetadata[k];
+              }
             }
-            // Ensure email always lands even if applyApolloMatchToLead's
-            // never-overwrite rule skipped it for some edge case.
-            if (!payload.email) payload.email = r.email;
-            await crmDb.updateLead(listId, lead.leadId, payload);
+
+            await crmDb.setLeadFields(listId, lead.leadId, {
+              topLevel: proj.updates,
+              enrichmentMetadata: enrichmentMetadataDelta,
+              customFields: proj.customFields,
+            });
+
+            for (const k of proj.changed) populatedFieldNames.add(k);
           } else {
             const now = new Date().toISOString();
-            const enrichmentMetadata = {
-              ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
-              email: {
-                source: 'web_search' as const,
-                provider: r.provider ?? 'enrich.so',
-                confidence: r.confidence ?? 'medium',
-                enrichedAt: now,
-                sourceQuote: r.message ?? (r.emailStatus ? `Apollo (${r.emailStatus})` : undefined),
+            await crmDb.setLeadFields(listId, lead.leadId, {
+              topLevel: { email: r.email },
+              enrichmentMetadata: {
+                email: {
+                  source: 'web_search' as const,
+                  provider: r.provider ?? 'enrich.so',
+                  confidence: r.confidence ?? 'medium',
+                  enrichedAt: now,
+                  sourceQuote: r.message ?? (r.emailStatus ? `Apollo (${r.emailStatus})` : undefined),
+                },
               },
-            };
-            await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
+            });
+            populatedFieldNames.add('email');
           }
           if (jobId) recordResult(jobId, { found: true, tier: r.tier });
         } else {
@@ -96,6 +103,11 @@ export async function findEmailsForLeadsInBackground(
         if (jobId) recordResult(jobId, { found: false, error: true });
       }
     });
+    try {
+      await crmDb.mergeFieldNames(listId, populatedFieldNames);
+    } catch (err) {
+      console.error('[CRM bulk find-email] failed to update fieldNames:', (err as Error).message);
+    }
     if (jobId) completeJob(jobId);
   } catch (err) {
     if (jobId) completeJob(jobId, (err as Error).message);

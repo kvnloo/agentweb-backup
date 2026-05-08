@@ -450,7 +450,7 @@ async function lookupProfilesForLeadsInBackground(
       for (const k of Object.keys(topLevel)) enrichmentMetadata[k] = fieldMetaForProvider;
       for (const k of Object.keys(customFields)) enrichmentMetadata[k] = fieldMetaForProvider;
 
-      await crmDb.setLeadFields(listId, lead.leadId, { topLevel, enrichmentMetadata, customFields });
+      await crmDb.setLeadFields(listId, lead.leadId, { topLevel, enrichmentMetadata, customFields, ifNotExists: true });
 
         for (const k of Object.keys(topLevel)) populatedFieldNames.add(k);
         for (const k of Object.keys(customFields)) populatedFieldNames.add(k);

@@ -6092,6 +6092,10 @@ export const crmDb = {
       customFields?: Record<string, string>;
       removeEnrichmentMetadataKeys?: string[];
       removeCustomFieldKeys?: string[];
+      /** When true, all SET clauses use if_not_exists() — atomically skips any
+       *  field already present in the DB. Use for bulk enrichment paths that
+       *  must never overwrite user-entered or concurrently-written data. */
+      ifNotExists?: boolean;
     },
   ): Promise<void> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
@@ -6129,16 +6133,19 @@ export const crmDb = {
     const attrNames: Record<string, string> = {};
     const attrValues: Record<string, any> = { ':ts': new Date().toISOString() };
 
+    const ine = options.ifNotExists ?? false;
     for (const [k, v] of Object.entries(options.topLevel ?? {})) {
       attrValues[`:tl_${k}`] = v;
-      setClauses.push(`${k} = :tl_${k}`);
+      setClauses.push(ine ? `${k} = if_not_exists(${k}, :tl_${k})` : `${k} = :tl_${k}`);
     }
 
     let idx = 0;
     for (const [k, v] of Object.entries(options.enrichmentMetadata ?? {})) {
       attrNames[`#em${idx}`] = k;
       attrValues[`:em${idx}`] = v;
-      setClauses.push(`enrichmentMetadata.#em${idx} = :em${idx}`);
+      setClauses.push(ine
+        ? `enrichmentMetadata.#em${idx} = if_not_exists(enrichmentMetadata.#em${idx}, :em${idx})`
+        : `enrichmentMetadata.#em${idx} = :em${idx}`);
       idx++;
     }
 
@@ -6146,7 +6153,9 @@ export const crmDb = {
     for (const [k, v] of Object.entries(options.customFields ?? {})) {
       attrNames[`#cf${idx}`] = k;
       attrValues[`:cf${idx}`] = v;
-      setClauses.push(`customFields.#cf${idx} = :cf${idx}`);
+      setClauses.push(ine
+        ? `customFields.#cf${idx} = if_not_exists(customFields.#cf${idx}, :cf${idx})`
+        : `customFields.#cf${idx} = :cf${idx}`);
       idx++;
     }
 
