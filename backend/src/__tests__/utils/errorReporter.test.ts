@@ -1,8 +1,12 @@
 /**
- * Tests for errorReporter utility — UI error dedup + Notion/email reporting.
+ * Tests for errorReporter utility.
+ *
+ * As of 2026-05-07 the Notion + oncall-email side-effects were removed —
+ * reportUIError now only emits a structured `console.error` log line.
+ * These tests pin the new log-only contract: no Notion task creation,
+ * no oncall email, dedup intact, enrichment + title prefix preserved.
  */
 
-// Mock notionService and emailService before importing errorReporter
 jest.mock('../../services/notionService', () => ({
   createOncallItem: jest.fn(),
 }));
@@ -25,75 +29,59 @@ const { userDb } = require('../../services/db');
 const mockCreateOncallItem = createOncallItem as jest.MockedFunction<typeof createOncallItem>;
 const mockSendOncallAlert = emailService.sendOncallAlert as jest.MockedFunction<typeof emailService.sendOncallAlert>;
 
+function lastLogPayload(spy: jest.SpyInstance): { subject: string; errorMessage: string; context: Record<string, any> } {
+  const calls = spy.mock.calls;
+  expect(calls.length).toBeGreaterThan(0);
+  const [tag, json] = calls[calls.length - 1];
+  expect(tag).toBe('[uiError]');
+  return JSON.parse(json as string);
+}
+
 describe('reportUIError', () => {
+  let logSpy: jest.SpyInstance;
+
   beforeEach(() => {
     jest.clearAllMocks();
     __clearDedupCacheForTests();
-    mockCreateOncallItem.mockResolvedValue({ pageId: 'page-abc', notionUrl: 'https://notion.so/page-abc' });
-    mockSendOncallAlert.mockResolvedValue(undefined);
+    logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
   });
 
-  describe('Notion item creation', () => {
-    it('creates Notion item with Oncall + UI Error tags', async () => {
-      await reportUIError({
-        operation: 'test-op',
-        errorMessage: 'Something broke',
-        userId: 'user-1',
-      });
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
 
-      expect(mockCreateOncallItem).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: 'UI Error: test-op',
-          description: 'Something broke',
-          additionalTags: ['UI Error'],
-        })
-      );
+  describe('no external side-effects', () => {
+    it('never calls notionService.createOncallItem', async () => {
+      await reportUIError({ operation: 'op', errorMessage: 'err', userId: 'u' });
+      expect(mockCreateOncallItem).not.toHaveBeenCalled();
     });
 
-    it('includes userId and context in Notion item', async () => {
+    it('never calls emailService.sendOncallAlert', async () => {
+      await reportUIError({ operation: 'op', errorMessage: 'err', userId: 'u' });
+      expect(mockSendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('emits one structured log line per non-deduped report', async () => {
+      await reportUIError({ operation: 'op', errorMessage: 'err' });
+      const payload = lastLogPayload(logSpy);
+      expect(payload.subject).toBe('UI Error: op');
+      expect(payload.errorMessage).toBe('err');
+      expect(payload.context).toMatchObject({ Operation: 'op', Error: 'err' });
+    });
+
+    it('includes userId and caller context in the log payload', async () => {
       await reportUIError({
         operation: 'schedule-manual-run',
         errorMessage: 'Run failed',
         userId: 'user-42',
         context: { 'Schedule ID': 'sched-123', 'Schedule Name': 'My Schedule' },
       });
-
-      expect(mockCreateOncallItem).toHaveBeenCalledWith(
-        expect.objectContaining({
-          context: expect.objectContaining({
-            'User ID': 'user-42',
-            'Schedule ID': 'sched-123',
-            'Schedule Name': 'My Schedule',
-          }),
-        })
-      );
-    });
-
-    it('passes notionUrl to sendOncallAlert so it sends slim email', async () => {
-      await reportUIError({ operation: 'op', errorMessage: 'err' });
-
-      expect(mockSendOncallAlert).toHaveBeenCalledWith(
-        'UI Error: op',
-        'err',
-        expect.any(Object),
-        'https://notion.so/page-abc'
-      );
-    });
-
-    it('falls back to email-only when Notion creation fails', async () => {
-      mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion API down'));
-
-      await reportUIError({ operation: 'failing-op', errorMessage: 'oops' });
-
-      // Falls back: sendOncallAlert called without notionUrl
-      expect(mockSendOncallAlert).toHaveBeenCalledWith(
-        'UI Error: failing-op',
-        'oops',
-        expect.any(Object)
-      );
-      // notionUrl argument not passed (only 3 args)
-      const call = mockSendOncallAlert.mock.calls[0];
-      expect(call).toHaveLength(3);
+      const payload = lastLogPayload(logSpy);
+      expect(payload.context).toMatchObject({
+        'User ID': 'user-42',
+        'Schedule ID': 'sched-123',
+        'Schedule Name': 'My Schedule',
+      });
     });
   });
 
@@ -101,49 +89,64 @@ describe('reportUIError', () => {
     it('deduplicates the same error within the window (second call skipped)', async () => {
       await reportUIError({ operation: 'dedup-op', errorMessage: 'same error' });
       await reportUIError({ operation: 'dedup-op', errorMessage: 'same error' });
-      expect(mockCreateOncallItem).toHaveBeenCalledTimes(1);
+      const uiErrorCalls = logSpy.mock.calls.filter((c) => c[0] === '[uiError]');
+      expect(uiErrorCalls).toHaveLength(1);
     });
 
     it('normalizes UUID in error message for fingerprinting', async () => {
-      // Same error structure but different UUIDs — should dedup to same fingerprint
       await reportUIError({ operation: 'uuid-op', errorMessage: 'Session 550e8400-e29b-41d4-a716-446655440000 failed' });
       await reportUIError({ operation: 'uuid-op', errorMessage: 'Session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee failed' });
-      expect(mockCreateOncallItem).toHaveBeenCalledTimes(1);
+      const uiErrorCalls = logSpy.mock.calls.filter((c) => c[0] === '[uiError]');
+      expect(uiErrorCalls).toHaveLength(1);
     });
 
     it('does NOT dedup errors with different operations', async () => {
       await reportUIError({ operation: 'op-a', errorMessage: 'same error' });
       await reportUIError({ operation: 'op-b', errorMessage: 'same error' });
-      expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
+      const uiErrorCalls = logSpy.mock.calls.filter((c) => c[0] === '[uiError]');
+      expect(uiErrorCalls).toHaveLength(2);
     });
 
     it('does NOT dedup structurally different error messages', async () => {
       await reportUIError({ operation: 'op', errorMessage: 'TypeError: cannot read x' });
       await reportUIError({ operation: 'op', errorMessage: 'ReferenceError: y is not defined' });
-      expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
+      const uiErrorCalls = logSpy.mock.calls.filter((c) => c[0] === '[uiError]');
+      expect(uiErrorCalls).toHaveLength(2);
     });
   });
 
   describe('Error boundaries', () => {
-    it('does not throw when Notion fails and email also fails', async () => {
-      mockCreateOncallItem.mockRejectedValue(new Error('Notion down'));
-      mockSendOncallAlert.mockRejectedValue(new Error('Email down'));
-
-      await expect(
-        reportUIError({ operation: 'double-fail-op', errorMessage: 'both systems down' })
-      ).resolves.not.toThrow();
-    });
-
-    it('works without optional userId or context', async () => {
+    it('does not throw when called', async () => {
       await expect(
         reportUIError({ operation: 'minimal-op', errorMessage: 'just an error' })
       ).resolves.not.toThrow();
-      expect(mockCreateOncallItem).toHaveBeenCalled();
     });
   });
 
-  describe('onboarding-tagged enrichment', () => {
-    it('enriches the context with user identity, stage, step status, and recent events', async () => {
+  describe('Title prefix', () => {
+    it('uses "Onboarding Error:" subject for onboarding-prefixed operations', async () => {
+      userDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'u@example.com' });
+      await reportUIError({
+        operation: 'onboarding:brand:submit',
+        errorMessage: 'Submit failed',
+        userId: 'user-1',
+      });
+      const payload = lastLogPayload(logSpy);
+      expect(payload.subject).toBe('Onboarding Error: onboarding:brand:submit');
+    });
+
+    it('uses "UI Error:" subject for non-onboarding operations', async () => {
+      await reportUIError({
+        operation: 'react-error-boundary',
+        errorMessage: 'Crash',
+      });
+      const payload = lastLogPayload(logSpy);
+      expect(payload.subject).toBe('UI Error: react-error-boundary');
+    });
+  });
+
+  describe('Onboarding enrichment', () => {
+    it('enriches the log context with user identity, stage, step status, and recent events', async () => {
       userDb.getUserById.mockResolvedValue({
         userId: 'user-1',
         email: 'maya@example.com',
@@ -166,18 +169,18 @@ describe('reportUIError', () => {
         context: { Source: 'backend', Step: 'icp' },
       });
 
-      const call = mockCreateOncallItem.mock.calls[0][0];
-      expect(call.context).toMatchObject({
+      const ctx = lastLogPayload(logSpy).context;
+      expect(ctx).toMatchObject({
         Operation: 'onboarding:icp:llm-generation',
         'User ID': 'user-1',
         'User Email': 'maya@example.com',
         'Onboarding Stage': 'brand_submitted',
       });
-      expect(call.context!['Investigate as User']).toContain('targetUserId=user-1');
-      expect(call.context!['Step Status']).toContain('icp=failed');
-      expect(call.context!['Step Status']).toContain('error=LLM timeout');
-      expect(call.context!['Recent Events (last 20)']).toContain('goal_selected');
-      expect(call.context!['Recent Events (last 20)']).toContain('brand_submitted');
+      expect(ctx['Investigate as User']).toContain('targetUserId=user-1');
+      expect(ctx['Step Status']).toContain('icp=failed');
+      expect(ctx['Step Status']).toContain('error=LLM timeout');
+      expect(ctx['Recent Events (last 20)']).toContain('goal_selected');
+      expect(ctx['Recent Events (last 20)']).toContain('brand_submitted');
     });
 
     it('does NOT enrich for non-onboarding operations', async () => {
@@ -194,9 +197,9 @@ describe('reportUIError', () => {
       });
 
       expect(userDb.getUserById).not.toHaveBeenCalled();
-      const call = mockCreateOncallItem.mock.calls[0][0];
-      expect(call.context).not.toHaveProperty('Onboarding Stage');
-      expect(call.context).not.toHaveProperty('Step Status');
+      const ctx = lastLogPayload(logSpy).context;
+      expect(ctx).not.toHaveProperty('Onboarding Stage');
+      expect(ctx).not.toHaveProperty('Step Status');
     });
 
     it('falls back gracefully when getUserById throws', async () => {
@@ -210,40 +213,16 @@ describe('reportUIError', () => {
         })
       ).resolves.not.toThrow();
 
-      // Notion task still fires with the base context (no enrichment).
-      const call = mockCreateOncallItem.mock.calls[0][0];
-      expect(call.context).toMatchObject({
+      const ctx = lastLogPayload(logSpy).context;
+      expect(ctx).toMatchObject({
         Operation: 'onboarding:icp:status-fetch',
         'User ID': 'user-1',
       });
-      expect(call.context).not.toHaveProperty('Onboarding Stage');
-    });
-
-    it('uses "Onboarding Error:" title prefix for onboarding operations so Notion routes to Harsha', async () => {
-      userDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'u@example.com' });
-
-      await reportUIError({
-        operation: 'onboarding:brand:submit',
-        errorMessage: 'Submit failed',
-        userId: 'user-1',
-      });
-
-      const call = mockCreateOncallItem.mock.calls[0][0];
-      expect(call.title).toBe('Onboarding Error: onboarding:brand:submit');
-    });
-
-    it('uses "UI Error:" title prefix for non-onboarding operations', async () => {
-      await reportUIError({
-        operation: 'react-error-boundary',
-        errorMessage: 'Crash',
-      });
-
-      const call = mockCreateOncallItem.mock.calls[0][0];
-      expect(call.title).toBe('UI Error: react-error-boundary');
+      expect(ctx).not.toHaveProperty('Onboarding Stage');
     });
   });
 
-  describe('attribution enrichment', () => {
+  describe('Attribution enrichment', () => {
     it('surfaces full firstTouch UTM (source/medium/campaign/content/term) as a pipe-delimited line', async () => {
       userDb.getUserById.mockResolvedValue({
         userId: 'user-1',
@@ -264,7 +243,7 @@ describe('reportUIError', () => {
         userId: 'user-1',
       });
 
-      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      const ctx = lastLogPayload(logSpy).context;
       expect(ctx['Attribution (first touch UTM)']).toBe(
         'source=linkedin | medium=cpc | campaign=b2b-demo | content=creative-A | term=agentic-marketing',
       );
@@ -286,7 +265,7 @@ describe('reportUIError', () => {
         userId: 'user-1',
       });
 
-      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      const ctx = lastLogPayload(logSpy).context;
       expect(ctx['Attribution (first touch referrer)']).toBe('https://t.co/abc');
       expect(ctx['Attribution (first touch landing URL)']).toHaveLength(300);
       expect(ctx).not.toHaveProperty('Attribution (first touch UTM)');
@@ -305,7 +284,7 @@ describe('reportUIError', () => {
         userId: 'user-1',
       });
 
-      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      const ctx = lastLogPayload(logSpy).context;
       expect(ctx['Attribution (last touch source)']).toBe('direct');
     });
 
@@ -322,7 +301,7 @@ describe('reportUIError', () => {
         userId: 'user-1',
       });
 
-      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      const ctx = lastLogPayload(logSpy).context;
       expect(ctx).not.toHaveProperty('Attribution (last touch source)');
     });
 
@@ -335,7 +314,7 @@ describe('reportUIError', () => {
         userId: 'user-1',
       });
 
-      const ctx = mockCreateOncallItem.mock.calls[0][0].context!;
+      const ctx = lastLogPayload(logSpy).context;
       expect(ctx).not.toHaveProperty('Attribution (first touch UTM)');
       expect(ctx).not.toHaveProperty('Attribution (first touch referrer)');
       expect(ctx).not.toHaveProperty('Attribution (first touch landing URL)');
