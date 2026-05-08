@@ -21496,7 +21496,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         if (current?.position && !lead.title) lead.title = current.position;
       }
 
-      if (item.location) lead.notes = `Location: ${item.location}`;
+      if (item.location) {
+        lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
+      }
 
       // Tag the lead with why it was discovered — sidecar map (system field)
       // distinct from customFields so it does NOT leak into CSV exports or
