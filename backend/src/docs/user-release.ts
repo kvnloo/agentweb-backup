@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Improved: Knowledge Base — Large Documents Now Read in Full',
+      '- The Read Knowledge Base File tool previously cut off documents at ~50,000 characters, silently dropping the rest',
+      '- Documents up to 1 MB are now returned in full; content beyond that is flagged as truncated',
+      '- Large files are automatically stored in S3 and searchable, so the agent can query specific sections without bloating the context window',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Improved: Scheduled Session Quality Scores Now Reflect Automation Accurately',
       '- The AI judge that scores scheduled runs was incorrectly penalising sessions for "the user repeating instructions" — in a scheduled run there is no user; those messages are auto-injected by the scheduler to advance each step of the task',
       '- Scores for scheduled sessions now correctly evaluate whether the task was completed, not whether a (non-existent) user had to repeat themselves',
