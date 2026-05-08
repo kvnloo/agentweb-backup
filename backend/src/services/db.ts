@@ -3945,6 +3945,66 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Persists the Unipile search cursor for a given (listId, criteriaHash) so
+   * the next find-leads top-up loop with the same filters resumes where the
+   * previous one stopped instead of re-paginating from page 1.
+   *
+   * Stored as: searchCursors: { [criteriaHash]: { cursor, lastUsedAt } }.
+   * Pass cursor=null to clear an entry (e.g. after exhausting results).
+   * LRU-evicts to MAX_SEARCH_CURSORS entries by lastUsedAt to keep the list
+   * item from growing unbounded across many distinct search-criteria sets.
+   */
+  async setLeadListSearchCursor(
+    listId: string,
+    criteriaHash: string,
+    cursor: string | null
+  ): Promise<void> {
+    const MAX_SEARCH_CURSORS = 10;
+    try {
+      const current = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        ProjectionExpression: '#sc',
+        ExpressionAttributeNames: { '#sc': 'searchCursors' },
+      }).promise();
+      const existingMap = (current.Item?.searchCursors as Record<string, { cursor: string; lastUsedAt: string }>) ?? {};
+
+      const nextMap: Record<string, { cursor: string; lastUsedAt: string }> = { ...existingMap };
+      if (cursor === null) {
+        delete nextMap[criteriaHash];
+      } else {
+        nextMap[criteriaHash] = { cursor, lastUsedAt: new Date().toISOString() };
+      }
+
+      const entries = Object.entries(nextMap);
+      if (entries.length > MAX_SEARCH_CURSORS) {
+        // LRU eviction: drop oldest by lastUsedAt until at cap.
+        entries.sort((a, b) => (a[1].lastUsedAt || '').localeCompare(b[1].lastUsedAt || ''));
+        const trimmed = entries.slice(entries.length - MAX_SEARCH_CURSORS);
+        for (const key of Object.keys(nextMap)) delete nextMap[key];
+        for (const [k, v] of trimmed) nextMap[k] = v;
+      }
+
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: 'SET #sc = :map, #updatedAt = :now',
+        ExpressionAttributeNames: {
+          '#sc': 'searchCursors',
+          '#updatedAt': 'updatedAt',
+        },
+        ExpressionAttributeValues: {
+          ':map': nextMap,
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setLeadListSearchCursor');
+      throw error;
+    }
+  },
+
   async deleteLeadList(listId: string) {
     try {
       // First, delete all leads in this list

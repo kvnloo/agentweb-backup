@@ -21430,101 +21430,183 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       };
     }
 
-    // Search for people. The structured filters (location/industry/school) are
-    // auto-resolved to LinkedIn entity IDs by linkedInOutreachService when only
-    // free text is supplied; pre-resolved *_id always wins. cursor enables
-    // pagination through a single query.
-    const searchResult = await linkedInOutreachService.searchPeople(accountId, {
-      keywords,
-      url: search_url,
-      title,
-      company,
-      company_id,
-      location,
-      location_id,
-      industry,
-      industry_id,
-      school,
-      school_id,
-      cursor,
-    });
-
-    if (!searchResult?.items?.length) {
-      return { success: true, imported: 0, skipped: 0, message: 'No results found for the given search criteria.' };
-    }
-
-    // Slice to requested limit
-    const itemsToImport = searchResult.items.slice(0, limit);
-
     // Build the audit string ONCE — same for every lead in this batch since
-    // every lead in this slice came from the same set of filters.
+    // every lead in this loop came from the same set of filters.
     const findReason = buildFindReason({
       keywords, title, company, location, industry, school, search_url,
     });
 
-    // Map Unipile search result fields → CRM lead fields.
-    // Search results use a different shape than full profiles:
-    //   name (full), public_identifier (slug), profile_url (messy with miniProfileUrn),
-    //   headline, location — NO first_name/last_name, NO clean public_profile_url.
-    const leads = itemsToImport.map((item: any) => {
-      const lead: any = {};
-
-      // Split full name into first/last
-      if (item.name) {
-        const parts = (item.name as string).trim().split(/\s+/);
-        lead.firstName = parts[0] || '';
-        lead.lastName = parts.slice(1).join(' ') || '';
-      } else {
-        if (item.first_name) lead.firstName = item.first_name;
-        if (item.last_name) lead.lastName = item.last_name;
-      }
-
-      // Build clean LinkedIn URL from slug — avoids the messy miniProfileUrn query string
-      if (item.public_identifier) {
-        lead.linkedin = `https://www.linkedin.com/in/${item.public_identifier}`;
-      } else if (item.profile_url) {
-        // Strip the miniProfileUrn garbage if present
-        const baseUrl = (item.profile_url as string).split('?')[0];
-        lead.linkedin = baseUrl;
-      }
-
-      // Title from headline or current_role
-      if (item.headline) lead.title = item.headline;
-      if (item.work_experience?.length) {
-        const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
-        if (current?.company && !lead.company) lead.company = current.company;
-        if (current?.position && !lead.title) lead.title = current.position;
-      }
-
-      if (item.location) {
-        lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
-      }
-
-      // Tag the lead with why it was discovered — sidecar map (system field)
-      // distinct from customFields so it does NOT leak into CSV exports or
-      // email-template variables. See Phase 0b lead.system top-level field.
-      const sys: Record<string, any> = {};
-      if (findReason) sys.findReason = findReason;
-      if (icpSource) sys.icpSource = icpSource;
-      if (Object.keys(sys).length > 0) {
-        lead.system = { ...(lead.system ?? {}), ...sys };
-      }
-
-      return lead;
+    // Hash criteria so we can persist a per-(list, criteria) cursor and pick
+    // up where the previous top-up loop stopped on a future call.
+    const criteriaHash = computeFindLeadsCriteriaHash({
+      keywords, search_url, title, company, company_id,
+      location, location_id, industry, industry_id, school, school_id,
     });
 
-    // Bulk-import into CRM list
     const { crmDb } = await import('./db');
-    const { default: crmRouter } = await import('../routes/crm').catch(() => ({ default: null }));
 
-    // Call batchCreateLeads directly (same path as the bulk-import endpoint)
-    const result = await crmDb.batchCreateLeads(listId, leads);
+    // Initial cursor: caller-provided wins; otherwise resume from any cursor
+    // we previously persisted for this exact criteria set on this list.
+    let activeCursor: string | undefined = cursor;
+    let preLoopList: any = null;
+    try {
+      preLoopList = await crmDb.getLeadListById(listId);
+      if (!activeCursor) {
+        const stored = (preLoopList as any)?.searchCursors?.[criteriaHash];
+        if (stored?.cursor) activeCursor = stored.cursor as string;
+      }
+    } catch {
+      // List read failure here is recoverable — fall through with no stored cursor.
+    }
 
-    // Surface the post-import list count so callers (especially Emma running
-    // multiple paginated searches) can trust ground truth instead of summing
-    // per-call `imported` values — the same lead can match multiple search
-    // queries and is correctly dedup'd by batchCreateLeads, but the per-call
-    // count alone doesn't reflect that overlap across calls.
+    // Top-up loop. Keep paginating until we've added `limit` *new* leads
+    // (post-dedup), the search exhausts, or we hit the safety cap.
+    const MAX_ITERATIONS = 20;
+    let cumulativeNew = 0;
+    let cumulativeMerged = 0;
+    let totalFetched = 0;
+    let iterationCount = 0;
+    // `nextCursor` is the cursor we'll pass to the *next* searchPeople call.
+    // `lastFetchCursor` is the cursor we passed to the *most recent* call —
+    // tracked separately so that, if we end up trimming on the final page,
+    // we can resume *that* page on the next call (the deleted-from-CRM leads
+    // re-appear as "new" through dedup, so no candidate is permanently lost).
+    let nextCursor: string | null | undefined = activeCursor ?? null;
+    let lastFetchCursor: string | null | undefined = nextCursor;
+    let safetyCapHit = false;
+    let searchError: string | null = null;
+    const allErrors: string[] = [];
+    const allCreated: Array<{ leadId: string; email?: string }> = [];
+    const allMappedLeadsPreview: any[] = []; // first-5 preview only
+
+    while (iterationCount < MAX_ITERATIONS) {
+      iterationCount++;
+      lastFetchCursor = nextCursor;
+      let searchResult: any;
+      try {
+        // Structured filters (location/industry/school) are auto-resolved to
+        // LinkedIn entity IDs by linkedInOutreachService when only free text
+        // is supplied; pre-resolved *_id always wins.
+        searchResult = await linkedInOutreachService.searchPeople(accountId, {
+          keywords,
+          url: search_url,
+          title,
+          company,
+          company_id,
+          location,
+          location_id,
+          industry,
+          industry_id,
+          school,
+          school_id,
+          cursor: lastFetchCursor ?? undefined,
+        });
+      } catch (e: any) {
+        searchError = e?.message ? String(e.message) : String(e);
+        break;
+      }
+
+      const items = Array.isArray(searchResult?.items) ? searchResult.items : [];
+      nextCursor = searchResult?.cursor ?? null;
+
+      if (items.length === 0) break;
+      totalFetched += items.length;
+
+      // Map Unipile search result fields → CRM lead fields.
+      const leads = items.map((item: any) => {
+        const lead: any = {};
+        if (item.name) {
+          const parts = (item.name as string).trim().split(/\s+/);
+          lead.firstName = parts[0] || '';
+          lead.lastName = parts.slice(1).join(' ') || '';
+        } else {
+          if (item.first_name) lead.firstName = item.first_name;
+          if (item.last_name) lead.lastName = item.last_name;
+        }
+        if (item.public_identifier) {
+          lead.linkedin = `https://www.linkedin.com/in/${item.public_identifier}`;
+        } else if (item.profile_url) {
+          const baseUrl = (item.profile_url as string).split('?')[0];
+          lead.linkedin = baseUrl;
+        }
+        if (item.headline) lead.title = item.headline;
+        if (item.work_experience?.length) {
+          const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+          if (current?.company && !lead.company) lead.company = current.company;
+          if (current?.position && !lead.title) lead.title = current.position;
+        }
+        if (item.location) {
+          lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
+        }
+        // sys is sidecar — see Phase 0b lead.system top-level field.
+        const sys: Record<string, any> = {};
+        if (findReason) sys.findReason = findReason;
+        if (icpSource) sys.icpSource = icpSource;
+        if (Object.keys(sys).length > 0) {
+          lead.system = { ...(lead.system ?? {}), ...sys };
+        }
+        return lead;
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+      cumulativeNew += result.newCount ?? 0;
+      cumulativeMerged += result.mergedCount ?? 0;
+      if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
+      const created = Array.isArray((result as any).created) ? (result as any).created : [];
+      if (created.length) allCreated.push(...created);
+
+      if (allMappedLeadsPreview.length < 5) {
+        for (const lead of leads) {
+          if (allMappedLeadsPreview.length >= 5) break;
+          allMappedLeadsPreview.push(lead);
+        }
+      }
+
+      if (cumulativeNew >= limit) break;
+      if (!nextCursor) break;
+    }
+
+    // Did we exit because we hit the safety cap with more pages still
+    // available? (Surfaces when iteration ran the full count without hitting
+    // limit and a cursor remains.)
+    if (iterationCount >= MAX_ITERATIONS && cumulativeNew < limit && nextCursor) {
+      safetyCapHit = true;
+    }
+
+    // Trim post-hoc to exactly `limit` new leads. Trailing IDs in
+    // `allCreated` come from the last batch insert in iteration order, so
+    // dropping `excess` from the end gives a stable, predictable trim.
+    let trimmedCount = 0;
+    if (cumulativeNew > limit) {
+      const excess = cumulativeNew - limit;
+      const toTrim = allCreated.slice(allCreated.length - excess);
+      for (const entry of toTrim) {
+        try {
+          await crmDb.deleteLead(listId, entry.leadId);
+        } catch (e: any) {
+          allErrors.push(`Failed to trim lead ${entry.leadId}: ${e?.message || e}`);
+        }
+      }
+      allCreated.splice(allCreated.length - excess, excess);
+      cumulativeNew -= excess;
+      trimmedCount = excess;
+    }
+
+    // Resume cursor — the value we both surface to callers and persist:
+    //  - If we trimmed on the final page, resume from THAT page's fetch
+    //    cursor (lastFetchCursor) so the next call re-fetches it. The
+    //    just-deleted leads come back through dedup as "new", so no candidate
+    //    is permanently lost across calls.
+    //  - Otherwise we advanced cleanly through every page we processed, so
+    //    resume from `nextCursor` (the cursor returned by the last fetch).
+    const resumeCursor: string | null = (trimmedCount > 0 ? lastFetchCursor : nextCursor) ?? null;
+    try {
+      await crmDb.setLeadListSearchCursor(listId, criteriaHash, resumeCursor);
+    } catch {
+      // Persistence failure is non-fatal — the loop already imported the leads.
+    }
+
+    // Surface the post-import list count.
     let listTotalAfterImport = 0;
     try {
       const list = await crmDb.getLeadListById(listId);
@@ -21536,32 +21618,68 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
     const response: any = {
       success: true,
-      imported: result.newCount,
-      skipped: result.mergedCount,
+      imported: cumulativeNew,
+      skipped: cumulativeMerged,
       list_total_after_import: listTotalAfterImport,
-      errors: result.errors,
-      total: itemsToImport.length,
-      cursor: searchResult.cursor,
+      errors: allErrors,
+      total: totalFetched,
+      cursor: resumeCursor,
+      iterations: iterationCount,
+      trimmed: trimmedCount,
+      safetyCapHit,
     };
+    if (searchError) response.searchError = searchError;
+    if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
+      response.message = 'No results found for the given search criteria.';
+    }
+    response.importedLeads = allMappedLeadsPreview;
 
-    // Surface the first 5 imported leads so callers can render a quick preview
-    // without making a follow-up read. Trimmed to keep the response small.
-    (response as any).importedLeads = leads.slice(0, 5);
-
-    if (auto_enrich && result.newCount > 0) {
-      const newLeadIds: string[] = (result as any).created?.map((c: any) => c.leadId) ?? [];
+    if (auto_enrich && cumulativeNew > 0) {
+      const newLeadIds: string[] = allCreated.map((c) => c.leadId);
       if (newLeadIds.length > 0) {
         // Indirected through __testHooks so tests can spy and stub.
         const job = await __testHooks.enqueueFindEmailJobForNewLeads(userId, listId, newLeadIds);
         // Guard on jobId rather than truthiness — autoEnrich returns a
         // sentinel { jobId: '', queued: 0, reason: 'quota-exhausted' } in
         // the no-budget path that we must not surface as a job id.
-        if (job?.jobId) (response as any).autoEnrichJobId = job.jobId;
+        if (job?.jobId) response.autoEnrichJobId = job.jobId;
       }
     }
 
     return response;
   }
+}
+
+/**
+ * Stable hash of the find-leads filter set, used as the key in the per-list
+ * `searchCursors` map so the next top-up loop with the same criteria resumes
+ * from the cursor we persisted last time.
+ */
+function computeFindLeadsCriteriaHash(filters: {
+  keywords?: string;
+  search_url?: string;
+  title?: string;
+  company?: string;
+  company_id?: string;
+  location?: string;
+  location_id?: string;
+  industry?: string;
+  industry_id?: string;
+  school?: string;
+  school_id?: string;
+}): string {
+  const orderedKeys = [
+    'keywords', 'search_url', 'title', 'company', 'company_id',
+    'location', 'location_id', 'industry', 'industry_id', 'school', 'school_id',
+  ] as const;
+  const obj: Record<string, string> = {};
+  for (const k of orderedKeys) {
+    const v = (filters as any)[k];
+    if (v !== undefined && v !== null && v !== '') obj[k] = String(v);
+  }
+  // SHA-1 of canonical JSON, truncated to 16 hex chars — collision risk is
+  // negligible for the per-list cardinality we expect here.
+  return require('crypto').createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
 }
 
 /**
