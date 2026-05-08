@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Improved: Scheduled Session Quality Scores Now Reflect Automation Accurately',
+      '- The AI judge that scores scheduled runs was incorrectly penalising sessions for "the user repeating instructions" — in a scheduled run there is no user; those messages are auto-injected by the scheduler to advance each step of the task',
+      '- Scores for scheduled sessions now correctly evaluate whether the task was completed, not whether a (non-existent) user had to repeat themselves',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Fixed: Auto Engagement — Disabling Comments Now Takes Effect Immediately',
       '- When you remove "Comment" from your engagement preferred actions, any already-queued comment jobs are now cancelled at execution time instead of posting anyway',
       '- Previously, comment actions scheduled before you changed the setting would still post to LinkedIn even after you disabled them',
