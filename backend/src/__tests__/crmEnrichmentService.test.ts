@@ -2732,3 +2732,61 @@ describe('CrmEnrichmentService - LinkedIn confidence scoring (Stage 3)', () => {
     expect(allUserMsgs).not.toContain('LinkedIn profile data');
   });
 });
+
+describe('CrmEnrichmentService.getEnrichmentConfig', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('falls back to gpt-5-chat-2 defaults when no setting is stored', async () => {
+    mockSettingsService.getSetting.mockResolvedValue(null as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config).toEqual({
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    });
+  });
+
+  it('falls back to gpt-5-chat-2 defaults when stored JSON is malformed', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'crm-enrichment-config',
+      settingValue: 'not-json',
+      updatedBy: 'system',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config).toEqual({
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    });
+  });
+
+  it('returns stored values when present, overriding the default', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'crm-enrichment-config',
+      settingValue: JSON.stringify({
+        enrichmentModel: 'gemini-3-pro-preview',
+        dataExtractionModel: 'anthropic.claude-sonnet-4-6',
+      }),
+      updatedBy: 'admin@example.com',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config).toEqual({
+      enrichmentModel: 'gemini-3-pro-preview',
+      dataExtractionModel: 'anthropic.claude-sonnet-4-6',
+    });
+  });
+
+  it('falls back per-field when stored JSON omits one model', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'crm-enrichment-config',
+      settingValue: JSON.stringify({ enrichmentModel: 'gemini-3-pro-preview' }),
+      updatedBy: 'admin@example.com',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config.enrichmentModel).toBe('gemini-3-pro-preview');
+    expect(config.dataExtractionModel).toBe('gpt-5-chat-2');
+  });
+});

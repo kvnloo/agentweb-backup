@@ -41,8 +41,8 @@ app.use('/api/settings', settingsRoutes);
 
 const CRM_ENRICHMENT_KEY = 'crm-enrichment-config';
 const DEFAULTS = {
-  enrichmentModel: 'gemini-3-flash-preview',
-  dataExtractionModel: 'gemini-3-flash-preview',
+  enrichmentModel: 'gpt-5-chat-2',
+  dataExtractionModel: 'gpt-5-chat-2',
 };
 
 describe('GET /api/settings/crm-enrichment-config', () => {

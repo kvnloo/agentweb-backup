@@ -248,14 +248,19 @@ export class CrmEnrichmentService {
     return linkedInOutreachService.resolveAccountId(userId);
   }
 
-  // Default to the better-quality preview model; on timeout we fall back to
-  // the GA model on retry so a stalled Gemini shard doesn't hang the pipeline.
-  private static readonly DEFAULT_ENRICH_MODEL = 'gemini-3-flash-preview';
-  private static readonly DEFAULT_SUGGEST_MODEL = 'gemini-3-flash-preview';
+  // Default to Azure-hosted gpt-5-chat-2: GA, capacity-stable, ~10s on the
+  // CRM enrichment workload. We previously defaulted to gemini-3-flash-preview,
+  // but Gemini's *-preview shards intermittently queue requests for 200+ s
+  // (the per-call 60s timeout fires, then the fallback eats another minute),
+  // producing 3+ minute previews that often returned all-null fields.
+  // On timeout we fall back to a Gemini GA model so we have cross-vendor
+  // redundancy when one provider is degraded.
+  private static readonly DEFAULT_ENRICH_MODEL = 'gpt-5-chat-2';
+  private static readonly DEFAULT_SUGGEST_MODEL = 'gpt-5-chat-2';
 
   // Fallback used by llmCallWithTimeout when the primary model times out.
-  // GA models are capacity-stable (sub-10-s) where preview models can queue
-  // 200+ seconds intermittently. Trading a small quality dip for liveness.
+  // Cross-vendor on purpose — if Azure throttles, Gemini absorbs; if Gemini
+  // queues, Azure absorbs.
   private static readonly LLM_FALLBACK_MODEL = 'gemini-2.5-flash';
 
   // Per-call ceiling. The OpenAI SDK aborts the underlying fetch when this
