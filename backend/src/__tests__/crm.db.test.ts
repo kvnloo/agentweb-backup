@@ -721,23 +721,73 @@ describe('CRM Database Service', () => {
   });
 
   describe('mergeFieldNames', () => {
-    it('merges existing + incoming field names and writes deduped union', async () => {
-      const getSpy = jest.spyOn(crmDb, 'getLeadListById').mockResolvedValue({
-        listId: 'list_123',
-        fieldNames: ['email', 'company_size'],
-      } as any);
-      const updateSpy = jest.spyOn(crmDb, 'updateFieldNames').mockResolvedValue(undefined);
+    it('atomically appends via list_append without a read-modify-write', async () => {
+      // The previous implementation read-then-set, which loses concurrent writes.
+      // The atomic version must NOT call getLeadListById and must use list_append.
+      const getSpy = jest.spyOn(crmDb, 'getLeadListById');
+      const updateFieldNamesSpy = jest.spyOn(crmDb, 'updateFieldNames');
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
 
       await crmDb.mergeFieldNames('list_123', new Set(['industry', 'email']));
 
-      expect(getSpy).toHaveBeenCalledWith('list_123');
-      expect(updateSpy).toHaveBeenCalledWith(
-        'list_123',
-        expect.arrayContaining(['email', 'company_size', 'industry']),
-      );
+      // No RMW: the read step is gone.
+      expect(getSpy).not.toHaveBeenCalled();
+      expect(updateFieldNamesSpy).not.toHaveBeenCalled();
+
+      // Single atomic UpdateItem with list_append.
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).toMatch(/list_append\(if_not_exists\(fieldNames,\s*:empty\),\s*:incoming\)/);
+      // Incoming must be a normalised array (deduped, deterministic order is fine).
+      const incoming = call.ExpressionAttributeValues[':incoming'];
+      expect(Array.isArray(incoming)).toBe(true);
+      expect(new Set(incoming)).toEqual(new Set(['industry', 'email']));
+      expect(call.ExpressionAttributeValues[':empty']).toEqual([]);
 
       getSpy.mockRestore();
-      updateSpy.mockRestore();
+      updateFieldNamesSpy.mockRestore();
+    });
+
+    it('is a no-op when incoming is empty', async () => {
+      mockDocumentClientMethods.update.mockClear();
+      await crmDb.mergeFieldNames('list_123', new Set());
+      await crmDb.mergeFieldNames('list_123', []);
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getLeadListById — fieldNames dedup on read', () => {
+    it('dedupes and sorts fieldNames so transient list_append duplicates are hidden', async () => {
+      // mergeFieldNames uses list_append, which can leave duplicates in storage
+      // under concurrent writes. getLeadListById must clean them on read so all
+      // consumers (UI, validators, schema generators) see a clean unique list.
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: {
+            listId: 'list_123',
+            fieldNames: ['industry', 'email', 'industry', 'company_size', 'email'],
+          },
+        }),
+      });
+
+      const result = await crmDb.getLeadListById('list_123');
+
+      expect(result).not.toBeNull();
+      expect(result!.fieldNames).toEqual(['company_size', 'email', 'industry']);
+    });
+
+    it('leaves an absent fieldNames untouched (does not inject an empty array)', async () => {
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { listId: 'list_456', name: 'No fieldNames yet' },
+        }),
+      });
+
+      const result = await crmDb.getLeadListById('list_456');
+      expect(result).not.toBeNull();
+      expect(result).not.toHaveProperty('fieldNames');
     });
   });
 

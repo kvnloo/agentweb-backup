@@ -3662,7 +3662,14 @@ export const crmDb = {
       };
 
       const result = await dynamodb.get(params).promise();
-      return result.Item || null;
+      const item = result.Item || null;
+      // mergeFieldNames now writes via atomic list_append, which can leave
+      // duplicates in storage when concurrent appenders race. Dedupe + sort
+      // on read so all consumers see a clean unique set.
+      if (item && Array.isArray(item.fieldNames)) {
+        item.fieldNames = Array.from(new Set(item.fieldNames as string[])).sort();
+      }
+      return item;
     } catch (error) {
       handleDynamoDbError(error, "getLeadListById");
       throw error;
@@ -4106,11 +4113,28 @@ export const crmDb = {
   },
 
   async mergeFieldNames(listId: string, newFields: Set<string> | string[]): Promise<void> {
-    const incoming = newFields instanceof Set ? newFields : new Set(newFields);
-    if (incoming.size === 0) return;
-    const list = await this.getLeadListById(listId);
-    const existing = (list?.fieldNames as string[]) || [];
-    await this.updateFieldNames(listId, [...new Set([...existing, ...incoming])]);
+    // Atomic append via DDB list_append — no read-modify-write. Two concurrent
+    // post-job calls on the same list can no longer lose updates. Storage may
+    // contain transient duplicates under high concurrency; getLeadListById
+    // dedupes + sorts on read so consumers see a clean unique set.
+    const incoming = Array.from(newFields instanceof Set ? newFields : new Set(newFields));
+    if (incoming.length === 0) return;
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression:
+          'SET fieldNames = list_append(if_not_exists(fieldNames, :empty), :incoming), updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':incoming': incoming,
+          ':updatedAt': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'mergeFieldNames');
+      throw error;
+    }
   },
 
   async updateSearchQueryTemplates(
