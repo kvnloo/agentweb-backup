@@ -120,16 +120,30 @@ function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
 
 const SESSION_TYPE_HEADERS: Record<string, string> = {
   "slack-triggered": "[Session context: Emma is drafting a suggested response to an inbound Slack message on behalf of the team. She is NOT directly serving an end user. Evaluate goalCompletion based on whether she produced an appropriate draft — not whether the Slack contact's underlying request was fulfilled.]",
+  "scheduled": "[Session context: This is a fully automated scheduled run — NO human user was present. Every message labeled 'user' in the transcript was automatically injected by the scheduling system to trigger the next step of the task, NOT typed by a real person. Therefore: (1) DO NOT interpret repeated 'user' messages as user frustration or the user having to repeat themselves — they are automated prompts driving a multi-step workflow. (2) DO NOT penalize the score for high message volume or for the user 'repeating instructions'. (3) Evaluate ONLY whether the assistant ultimately completed the scheduled task successfully. Signs of a good run: task goals were achieved, relevant tools were called, outputs were produced. Signs of a bad run: the assistant failed to call required tools, produced no output, or errored out without completing the task.]",
 };
+
+function getSessionTypeHeader(pageIdentifier?: string, sessionType?: string): string {
+  // Check exact pageIdentifier match first (e.g. "slack-triggered")
+  if (pageIdentifier && SESSION_TYPE_HEADERS[pageIdentifier]) {
+    return SESSION_TYPE_HEADERS[pageIdentifier];
+  }
+  // Fall back to sessionType (e.g. "scheduled" sessions have dynamic pageIdentifiers)
+  if (sessionType && SESSION_TYPE_HEADERS[sessionType]) {
+    return SESSION_TYPE_HEADERS[sessionType];
+  }
+  return "";
+}
 
 export async function scoreSession(
   messages: ChatMessage[],
   currentMessageCount: number,
-  pageIdentifier?: string
+  pageIdentifier?: string,
+  sessionType?: string
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
-  const header = pageIdentifier ? (SESSION_TYPE_HEADERS[pageIdentifier] ?? "") : "";
+  const header = getSessionTypeHeader(pageIdentifier, sessionType);
   const conversationText = header
     ? `${header}\n\n${baseConversationText}`
     : baseConversationText;
@@ -180,10 +194,15 @@ export interface ScoringJudge {
 export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
-  judge: ScoringJudge
+  judge: ScoringJudge,
+  sessionType?: string
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const conversationText = serializeMessagesForScoring(recentMessages);
+  const baseConversationText = serializeMessagesForScoring(recentMessages);
+  const header = getSessionTypeHeader(undefined, sessionType);
+  const conversationText = header
+    ? `${header}\n\n${baseConversationText}`
+    : baseConversationText;
 
   const { agentModeService } = await import("./agentModeService");
 
@@ -235,7 +254,7 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  const result = await scoreSessionWithJudge(session.messages || [], messageCount, judge);
+  const result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType);
 
   const judgeScore = {
     score: result.score,
@@ -278,7 +297,7 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
-  const result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier);
+  const result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType);
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {
     score: result.score,
