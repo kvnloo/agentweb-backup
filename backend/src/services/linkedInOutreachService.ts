@@ -760,9 +760,12 @@ export class LinkedInOutreachService {
   /**
    * Fetch all messages exchanged with a specific LinkedIn contact (by their Unipile attendee/provider ID).
    * Paginates up to 10 pages (1000 messages). Filters out system events.
+   * account_id is required: without it Unipile cannot determine which side is is_sender=1,
+   * so outbound messages appear as received and is_sender is always 0.
    */
   async getMessagesWithContact(
     attendeeId: string,
+    account_id: string,
     opts?: { after?: string }
   ): Promise<Array<{ id: string; provider_id: string; text: string | null; is_sender: 0 | 1; is_event: 0 | 1; sender_id: string; timestamp: string }>> {
     const MAX_PAGES = 10;
@@ -772,7 +775,7 @@ export class LinkedInOutreachService {
     const client = await this.getClient();
 
     do {
-      const params: any = { attendee_id: attendeeId, limit: 100 };
+      const params: any = { attendee_id: attendeeId, account_id, limit: 100 };
       if (cursor) params.cursor = cursor;
       else if (opts?.after) params.after = opts.after;
 

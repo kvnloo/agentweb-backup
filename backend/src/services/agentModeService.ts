@@ -20817,17 +20817,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const leadLinkedIn = ((lead as any).linkedin as string | undefined)?.toLowerCase();
           if (!leadLinkedIn) throw new Error('Lead has no LinkedIn URL — add a LinkedIn profile URL to this lead first');
 
-          // Fetch all messages with this contact from Unipile
-          const messages = await linkedInOutreachService.getMessagesWithContact(providerId);
+          // Fetch all messages with this contact from Unipile.
+          // account_id is required so Unipile can identify which side is is_sender=1.
+          const messages = await linkedInOutreachService.getMessagesWithContact(providerId, account_id);
 
-          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp
+          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp.
+          // Key on provider_id (stable) not msg.id (ephemeral internal Unipile UUID that
+          // changes each call), so repeated syncs don't create duplicate rows.
           const { emailEventsDb } = await import('./emailEventsDb');
           const emailDomain = `linkedin-${list_id}`;
 
           const syncAt = new Date().toISOString();
           await Promise.all([
             ...messages.map(msg => emailEventsDb.addLinkedInMessageEvent({
-              eventId: `linkedin_msg_${msg.id}`,
+              eventId: `linkedin_msg_${msg.provider_id}`,
               emailDomain,
               leadEmail: leadLinkedIn,
               eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',

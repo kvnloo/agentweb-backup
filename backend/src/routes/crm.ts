@@ -3376,7 +3376,9 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
     }
 
     const providerId = await linkedInOutreachService.resolveProviderId(leadLinkedIn, true, accountId);
-    const messages = await linkedInOutreachService.getMessagesWithContact(providerId);
+    // Pass accountId so Unipile can identify which side is is_sender=1 (outbound vs inbound).
+    // Key eventId on msg.provider_id (stable) not msg.id (ephemeral) to prevent duplicate rows on re-sync.
+    const messages = await linkedInOutreachService.getMessagesWithContact(providerId, accountId);
 
     const { emailEventsDb } = await import('../services/emailEventsDb');
     const emailDomain = `linkedin-${listId}`;
@@ -3384,7 +3386,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
 
     await Promise.all([
       ...messages.map((msg: any) => emailEventsDb.addLinkedInMessageEvent({
-        eventId: `linkedin_msg_${msg.id}`,
+        eventId: `linkedin_msg_${msg.provider_id}`,
         emailDomain,
         leadEmail: leadLinkedIn,
         eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',
