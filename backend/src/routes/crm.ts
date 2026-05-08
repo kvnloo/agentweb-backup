@@ -1902,10 +1902,17 @@ router.post('/lists/:listId/leads/find/from-icp', async (req: Request, res: Resp
     const { extractIcpFilters } = await import('../services/icpPersonaFilterExtractor');
     const filters = extractIcpFilters(persona);
 
+    // Phase 2 entry-point caveat: the regex extractor's `keywords` field is
+    // the full first sentence of `meta_targeting_brief` — useful as a modal
+    // pre-fill, but harmful as a real LinkedIn search input (LinkedIn ANDs
+    // every word in keywords, so prose kills recall to 0). When the
+    // extractor produced a title we suppress keywords here so title +
+    // industry + location carry the search. Only fall back to keywords when
+    // no title was extractable.
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.importLeadsFromSearch(userId, {
       listId,
-      keywords: filters.keywords,
+      keywords: filters.title ? undefined : filters.keywords,
       title: filters.title,
       industry: filters.industry,
       location: filters.location,

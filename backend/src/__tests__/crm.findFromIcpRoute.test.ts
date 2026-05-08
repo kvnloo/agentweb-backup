@@ -209,4 +209,32 @@ describe('POST /api/crm/lists/:listId/leads/find/from-icp', () => {
     await handler!(mockReq, mockRes);
     expect(mockRes.status).toHaveBeenCalledWith(400);
   });
+
+  // Phase 2 follow-up: keywords field from the regex extractor is the full
+  // first sentence of meta_targeting_brief, which behaves as an AND-of-words
+  // search in LinkedIn and kills recall. When a title was extractable, the
+  // route should suppress keywords so title + industry + location carry the
+  // search.
+  it('does NOT forward keywords when title was extracted', async () => {
+    mockReq.body = { icpIndex: 0 };
+    await handler!(mockReq, mockRes);
+    const args = mockImportLeadsFromSearch.mock.calls[0][1];
+    expect(args.title).toBe('RevOps Leaders');
+    expect(args.keywords).toBeUndefined();
+  });
+
+  it('forwards keywords as fallback when title could NOT be extracted', async () => {
+    // Persona with empty name → extractor returns no title, keywords falls
+    // back to first sentence of brief. In that case the route should still
+    // pass keywords through (it is the only signal).
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona({ name: '' })],
+    });
+    mockReq.body = { icpIndex: 0 };
+    await handler!(mockReq, mockRes);
+    const args = mockImportLeadsFromSearch.mock.calls[0][1];
+    expect(args.title).toBeUndefined();
+    expect(args.keywords).toContain('RevOps managers at SaaS');
+  });
 });
