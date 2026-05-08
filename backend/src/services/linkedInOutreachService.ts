@@ -758,28 +758,46 @@ export class LinkedInOutreachService {
   }
 
   /**
-   * Fetch all messages exchanged with a specific LinkedIn contact (by their Unipile attendee/provider ID).
-   * Paginates up to 10 pages (1000 messages). Filters out system events.
-   * account_id is required: without it Unipile cannot determine which side is is_sender=1,
-   * so outbound messages appear as received and is_sender is always 0.
+   * Fetch all messages exchanged with a specific LinkedIn contact.
+   * Uses getAllChatsFromAttendee (which accepts account_id) to find the chat, then
+   * getAllMessagesFromChat to retrieve messages — this is the only path where Unipile
+   * sets is_sender=1 correctly for outbound messages.
+   * getAllMessagesFromAttendee does NOT accept account_id so is_sender is always 0 there.
    */
   async getMessagesWithContact(
     attendeeId: string,
     account_id: string,
     opts?: { after?: string }
   ): Promise<Array<{ id: string; provider_id: string; text: string | null; is_sender: 0 | 1; is_event: 0 | 1; sender_id: string; timestamp: string }>> {
+    const client = await this.getClient();
+
+    // Step 1: find the chat between our account and this attendee
+    const chatsResult = await client.messaging.getAllChatsFromAttendee({
+      attendee_id: attendeeId,
+      account_id,
+      limit: 1,
+    });
+
+    if (!chatsResult?.items?.length) {
+      this.log('getMessagesWithContact: no chat found for attendee', { attendeeId, account_id });
+      return [];
+    }
+
+    const chatId = chatsResult.items[0].id;
+    this.log('getMessagesWithContact: found chat', { chatId, attendeeId });
+
+    // Step 2: fetch messages from the chat — is_sender is correctly set by Unipile
     const MAX_PAGES = 10;
     const messages: any[] = [];
     let cursor: string | undefined;
     let pages = 0;
-    const client = await this.getClient();
 
     do {
-      const params: any = { attendee_id: attendeeId, account_id, limit: 100 };
+      const params: any = { chat_id: chatId, limit: 100 };
       if (cursor) params.cursor = cursor;
       else if (opts?.after) params.after = opts.after;
 
-      const result = await client.messaging.getAllMessagesFromAttendee(params);
+      const result = await client.messaging.getAllMessagesFromChat(params);
 
       if (result?.items) {
         for (const msg of result.items) {
