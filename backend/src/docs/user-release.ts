@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Fixed: Data Analysis — S3 Tool-Response Files Now Resolve Automatically',
+      '- When the agent reads large data via read_tool_response and passes the S3 key to perform_data_analysis, the backend now fetches the file content automatically and embeds it for Gemini',
+      '- Previously this would fail silently and the agent would retry up to 10 times without producing results',
+      '- Daily scheduled data reports (e.g. token usage reports) are no longer affected by this retry loop',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Improved: Knowledge Base — Large Documents Now Read in Full',
       '- The Read Knowledge Base File tool previously cut off documents at ~50,000 characters, silently dropping the rest',
       '- Documents up to 1 MB are now returned in full; content beyond that is flagged as truncated',
