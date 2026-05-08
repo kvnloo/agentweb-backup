@@ -32,10 +32,12 @@ const FORBIDDEN_HOSTNAMES = new Set([
 
 function ipv4ToInt(ip: string): number | null {
   const parts = ip.split('.');
+  /* istanbul ignore next — callers gate on isIPv4(ip), so malformed inputs never reach here */
   if (parts.length !== 4) return null;
   let n = 0;
   for (const p of parts) {
     const octet = Number(p);
+    /* istanbul ignore next — callers gate on isIPv4(ip) */
     if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
     n = (n << 8) + octet;
   }
@@ -45,6 +47,7 @@ function ipv4ToInt(ip: string): number | null {
 
 function isPrivateIPv4(ip: string): boolean {
   const raw = ipv4ToInt(ip);
+  /* istanbul ignore next — ipv4ToInt only returns null on malformed IPs, which the callers' isIPv4 guard rejects upstream */
   if (raw === null) return false;
   // JS bitwise ops produce 32-bit signed values; force unsigned with `>>> 0`
   // before comparing against unsigned literal network addresses.
@@ -165,6 +168,7 @@ export async function assertPublicHostname(rawUrl: string): Promise<void> {
     throw new SsrfBlockedError(`DNS lookup failed: ${err?.message || 'unknown'}`);
   }
 
+  /* istanbul ignore next — dns.promises.lookup either resolves with an array or rejects; the !addresses branch is defensive */
   if (!addresses || addresses.length === 0) {
     throw new SsrfBlockedError('Hostname did not resolve');
   }

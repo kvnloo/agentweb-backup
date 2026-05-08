@@ -85,6 +85,36 @@ describe('unsubscribeUrl utility', () => {
       });
       expect(url).toContain('email=a%2Bb%40example.com');
     });
+
+    it('strips a trailing slash from baseUrl so the path is not doubled', () => {
+      const { signUnsubscribeUrl } = require('../utils/unsubscribeUrl');
+      const url = signUnsubscribeUrl({
+        baseUrl: 'https://app.agentweb.pro/',
+        listId: 'list-1',
+        leadId: 'lead-1',
+        email: 'foo@example.com',
+      });
+      expect(url).not.toMatch(/\/\/crm-unsubscribe/);
+      expect(url).toMatch(/^https:\/\/app\.agentweb\.pro\/crm-unsubscribe\?/);
+    });
+
+    it('round-trips a falsy email (empty string normalises to empty)', () => {
+      const { signUnsubscribeUrl, verifyUnsubscribeSignature } = require('../utils/unsubscribeUrl');
+      const url = signUnsubscribeUrl({
+        baseUrl: 'https://app.agentweb.pro',
+        listId: 'list-1',
+        leadId: 'lead-1',
+        email: '',
+      });
+      const sig = new URL(url).searchParams.get('sig')!;
+      const ok = verifyUnsubscribeSignature({
+        listId: 'list-1',
+        leadId: 'lead-1',
+        email: '',
+        sig,
+      });
+      expect(ok).toBe(true);
+    });
   });
 
   describe('verifyUnsubscribeSignature', () => {

@@ -203,6 +203,15 @@ describe('assertPublicHostname', () => {
       .rejects.toThrow(/DNS lookup failed/);
   });
 
+  it('rejects with "unknown" message when DNS error has no message', async () => {
+    // Mock rejecting with an object lacking `.message` so the `|| "unknown"`
+    // fallback branch is exercised.
+    mockLookup.mockRejectedValueOnce({});
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://no-message-err.example'))
+      .rejects.toThrow(/DNS lookup failed: unknown/);
+  });
+
   it('rejects when DNS returns no addresses', async () => {
     mockLookup.mockResolvedValueOnce([]);
     const { assertPublicHostname } = require('../utils/ssrfGuard');
@@ -215,5 +224,23 @@ describe('assertPublicHostname', () => {
     await expect(assertPublicHostname('javascript:alert(1)')).rejects.toThrow(/Invalid URL/);
     await expect(assertPublicHostname('file:///etc/passwd')).rejects.toThrow(/Invalid URL/);
     await expect(assertPublicHostname('data:text/plain,hi')).rejects.toThrow(/Invalid URL/);
+  });
+
+  it('rejects 0.0.0.0/8 (this-network range)', async () => {
+    mockResolvesTo('0.0.0.0');
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://zero.example')).rejects.toThrow(/private|internal/i);
+  });
+
+  it('rejects 0.1.2.3 (also in this-network /8)', async () => {
+    mockResolvesTo('0.1.2.3');
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://zero2.example')).rejects.toThrow(/private|internal/i);
+  });
+
+  it('rejects :: (IPv6 unspecified)', async () => {
+    mockResolvesTo('::', 6);
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('http://unspec.example')).rejects.toThrow(/private|internal/i);
   });
 });

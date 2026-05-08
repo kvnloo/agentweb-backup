@@ -84,6 +84,7 @@ export function verifyUnsubscribeSignature({ listId, leadId, email, sig }: Verif
   try {
     const expectedBuf = Buffer.from(expected, 'hex');
     const sigBuf = Buffer.from(sig, 'hex');
+    /* istanbul ignore next — sig.length === expected.length and both are pre-validated hex, so byte lengths always match here */
     if (expectedBuf.length !== sigBuf.length) return false;
     return timingSafeEqual(expectedBuf, sigBuf);
   } catch {
