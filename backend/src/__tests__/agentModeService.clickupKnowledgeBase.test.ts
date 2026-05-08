@@ -113,18 +113,18 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.type).toBe('clickup');
     });
 
-    it('should truncate content exceeding 50000 characters', async () => {
+    it('should truncate content exceeding 1MB', async () => {
       mockGetAccessToken.mockResolvedValue('ck_token');
       mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'WS' }]);
       mockListDocs.mockResolvedValue([
         { id: 'doc-1', name: 'Large Doc', dateCreated: '1000', dateUpdated: '2000' },
       ]);
-      mockReadDocContent.mockResolvedValue('x'.repeat(60000));
+      mockReadDocContent.mockResolvedValue('x'.repeat(1100000));
 
       const result = await (agentModeService as any).readClickUpSharedDoc('clickup:ws-1', 'Large Doc', 'user-123');
       expect(result.success).toBe(true);
       expect(result.content).toContain('[Content truncated due to size limit]');
-      expect(result.content.length).toBeLessThan(60000);
+      expect(result.content.length).toBeLessThan(1100000);
     });
 
     it('should handle API errors gracefully', async () => {
@@ -335,18 +335,18 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.type).toBe('clickup-tasks');
     });
 
-    it('should truncate content exceeding 50000 characters', async () => {
+    it('should truncate content exceeding 1MB', async () => {
       mockGetAccessToken.mockResolvedValue('ck_token');
       mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'WS' }]);
       mockListTasks.mockResolvedValue([
         { id: 'task-1', name: 'Large Task', description: '', status: 'open', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '1000', dateUpdated: '2000' },
       ]);
-      mockReadTaskContent.mockResolvedValue('x'.repeat(60000));
+      mockReadTaskContent.mockResolvedValue('x'.repeat(1100000));
 
       const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'Large Task', 'user-123');
       expect(result.success).toBe(true);
       expect(result.content).toContain('[Content truncated due to size limit]');
-      expect(result.content.length).toBeLessThan(60000);
+      expect(result.content.length).toBeLessThan(1100000);
     });
 
     it('should handle API errors gracefully', async () => {

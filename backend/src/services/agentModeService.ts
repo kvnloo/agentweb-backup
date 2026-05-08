@@ -4951,14 +4951,51 @@ export class AgentModeService {
       }
 
       // Gemini code execution runs in a remote isolated sandbox — it cannot access local file paths
-      // or S3-offloaded tool response paths from previous tool calls. Detect this pattern early so
-      // the LLM knows all data must arrive via file_urls or embedded in analysis_instruction.
+      // or S3-offloaded tool response paths from previous tool calls. When the LLM embeds S3 tool-
+      // response keys in the instruction (a common pattern after read_tool_response), auto-resolve
+      // them by fetching the content from S3 and embedding it inline, rather than failing and
+      // forcing the LLM into a retry loop.
       const localPathPattern = /(?:open|read|load)\s*\(\s*['"`]\/|with open\(['"`]\//i;
       const s3KeyPathPattern = /tool-responses\/[a-z0-9-]{36}\//i;
-      if (localPathPattern.test(analysisInstruction) || s3KeyPathPattern.test(analysisInstruction)) {
+      if (s3KeyPathPattern.test(analysisInstruction)) {
+        // Extract all unique tool-response S3 keys from the instruction
+        const keyMatches = analysisInstruction.match(/tool-responses\/[a-z0-9-]{36}\/[^\s'"`)]+/gi) || [];
+        const uniqueKeys = [...new Set(keyMatches)];
+        let resolved = analysisInstruction;
+        const resolvedKeys: string[] = [];
+        const failedKeys: string[] = [];
+        for (const key of uniqueKeys) {
+          try {
+            const content = await getS3ObjectAsString(key);
+            if (content) {
+              // Replace all occurrences of the key with the actual content inline
+              resolved = resolved.split(key).join(`\n[Content of ${key}]:\n${content}\n`);
+              resolvedKeys.push(key);
+            } else {
+              failedKeys.push(key);
+            }
+          } catch {
+            failedKeys.push(key);
+          }
+        }
+        if (failedKeys.length > 0 && resolvedKeys.length === 0) {
+          return {
+            success: false,
+            message: `The analysis_instruction references tool-response S3 keys that could not be read: ${failedKeys.join(', ')}. Use read_tool_response to load the data first, then embed it directly in analysis_instruction or save it via save_file and pass the URL in file_urls.`
+          };
+        }
+        analysisInstruction = resolved;
+        // Re-check size after resolution
+        if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
+          return {
+            success: false,
+            message: `After resolving tool-response references, the analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). Use save_file to upload the dataset as a .csv or .txt file, then call perform_data_analysis with the returned file URL in file_urls and a concise analysis_instruction.`
+          };
+        }
+      } else if (localPathPattern.test(analysisInstruction)) {
         return {
           success: false,
-          message: `The analysis_instruction references local file paths or tool-response paths (e.g. open('/home/bard/...') or tool-responses/...). The code execution sandbox is remote and isolated — it has no access to any local files or previous tool responses. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
+          message: `The analysis_instruction references local file paths (e.g. open('/home/bard/...')). The code execution sandbox is remote and isolated — it has no access to any local files. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
         };
       }
 
@@ -14025,7 +14062,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       contentStr = content.toString('utf-8');
     }
 
-    const maxContentLength = 50000;
+    const maxContentLength = 1_000_000;
     if (contentStr.length > maxContentLength) {
       contentStr = contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
       console.log(`AgentMode: Knowledge base content truncated to ${maxContentLength} characters`);
@@ -14074,7 +14111,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const file = files[0];
       const contentStr = await this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || '');
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = contentStr.length > maxContentLength
         ? contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : contentStr;
@@ -14126,7 +14163,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Read doc content (all pages concatenated)
       const content = await readClickUpDocContent(clickUpToken, workspaceId, doc.id);
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
         ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : content;
@@ -14178,7 +14215,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Read task content (formatted as markdown)
       const content = await readClickUpTaskContent(clickUpToken, task.id);
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
         ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : content;
