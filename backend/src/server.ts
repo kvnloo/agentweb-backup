@@ -494,27 +494,13 @@ createTestAccount().then(async () => {
         console.error('[dripWorker] Failed to initialize:', error);
       }
 
-      // Onboarding stuck-user detector — runs once per day. Scans every user
-      // with a non-terminal onboardingStage, groups by stage, and posts ONE
-      // Notion oncall task summarizing "how many users are stuck at which
-      // stage" with sample emails per stage. Replaces the previous per-user
-      // hourly fire-pattern that flooded the oncall view.
-      // See backend/src/cron/onboardingStuckDetector.ts.
-      try {
-        const STUCK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
-        const { runOnboardingStuckDetector } = await import('./cron/onboardingStuckDetector');
-        const tick = () => runOnboardingStuckDetector()
-          .then((r) => console.log('[onboardingStuckDetector]', r))
-          .catch((e) => console.error('[onboardingStuckDetector] Error:', e));
-        // First run after 5min to let the server settle and other crons land.
-        setTimeout(() => {
-          tick();
-          setInterval(tick, STUCK_INTERVAL_MS);
-        }, 5 * 60 * 1000);
-        console.log('[onboardingStuckDetector] Initialized — first run in 5 min, then every 24 h');
-      } catch (error) {
-        console.error('[onboardingStuckDetector] Failed to initialize:', error);
-      }
+      // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one
+      // Notion oncall task per day grouped by stage. The cron itself is well-
+      // designed but the broader telemetry pipeline (incl. per-event UI Error
+      // tasks from errorReporter) was flooding the sprint board, so we cut
+      // the whole pipeline. The implementation in
+      // backend/src/cron/onboardingStuckDetector.ts is preserved and unit-
+      // tested; re-enable here if we want the daily summary back.
 
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
