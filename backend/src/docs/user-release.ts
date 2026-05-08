@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Fixed: Fathom Connected Account Now Shows Correct Status',
+      '- The Connected Accounts page now does a live check with Fathom to confirm your token is valid, rather than relying on the stored expiry date',
+      '- If Fathom has revoked your token (e.g. after re-authorization), the account will correctly show as "Disconnected" with a prompt to reconnect',
+      '- When a Fathom tool call fails due to an invalid token, Emma now tells you exactly what to do: go to Settings → Connected Accounts and reconnect Fathom',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'New: Emma Can Take Screenshots via Local Agent',
       '- When you have the local Codex agent connected, Emma can now take screenshots of any webpage and share them directly in the chat',
       '- Screenshots are automatically uploaded to secure cloud storage and displayed inline in the conversation',
