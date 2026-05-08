@@ -469,6 +469,24 @@ export class CrmEnrichmentService {
       .replace(/\s+/g, ' ');
   }
 
+  /**
+   * True when applying `template` to this lead produces the same string as
+   * applying it to an empty lead — i.e. every {{placeholder}} resolved to
+   * empty. In that case the search query contains nothing lead-specific,
+   * just the constant suffix (e.g. "company overview"), and Google would
+   * return generic top-ranking pages identical for every empty-signal lead
+   * — most famously the FedEx investor page for "company overview".
+   *
+   * Callers should skip web search entirely when this returns true; the LLM
+   * then returns null for those fields rather than confidently extracting
+   * the wrong company.
+   */
+  static templateHasNoLeadSignal(template: string, lead: LeadRecord): boolean {
+    const rendered = CrmEnrichmentService.applySearchTemplate(template, lead);
+    const renderedEmpty = CrmEnrichmentService.applySearchTemplate(template, {} as LeadRecord);
+    return rendered === renderedEmpty;
+  }
+
   private static buildSearchQuery(lead: LeadRecord, outputFields: string[]): string {
     const companyName = String(lead.company || '').trim();
     const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
@@ -585,7 +603,16 @@ export class CrmEnrichmentService {
       ? CrmEnrichmentService.applySearchTemplate(template, lead)
       : CrmEnrichmentService.buildSearchQuery(lead, webSearchFields);
 
-    if (query) {
+    // Skip the main web search when a template-driven query would produce
+    // generic top-ranked results for every empty-signal lead (e.g. emailDomain
+    // empty → query collapses to "company overview" → Google returns the same
+    // FedEx page for every lead in the list).
+    const skipMainSearch = !!template && CrmEnrichmentService.templateHasNoLeadSignal(template, lead);
+    if (skipMainSearch) {
+      console.log(`[CrmEnrichment][gatherWebContext] skipping web search lead=${lead.leadId}: template "${template}" has no lead-specific signal`);
+    }
+
+    if (query && !skipMainSearch) {
       console.log(`[CrmEnrichment][gatherWebContext] searchWeb query="${query}"`);
       let result = await agentModeService.searchWeb(query, 5);
       console.log(`[CrmEnrichment][gatherWebContext] searchWeb done success=${result?.success} resultCount=${Array.isArray(result?.results) ? result.results.length : 0}`);

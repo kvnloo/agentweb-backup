@@ -276,6 +276,40 @@ describe('CrmEnrichmentService', () => {
 
   // ─── SUCCESS CASES ────────────────────────────────────────────────────────
 
+  describe('preview - empty-signal leads', () => {
+    it('skips searchWeb when leads have no email/company (avoids identical-bogus-results bug)', async () => {
+      // Leads have only LinkedIn URLs — no email, no company. The canonical
+      // group templates use {{emailDomain}}, which collapses to "" for these,
+      // making the query "company overview" / "funding investors" — generic
+      // searches that historically returned the same FedEx page for every lead.
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const emptyLeads = [
+        { leadId: 'lead1', linkedin: 'https://www.linkedin.com/in/scott-t', customFields: {} },
+        { leadId: 'lead2', linkedin: 'https://www.linkedin.com/in/mike-h', customFields: {} },
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: emptyLeads, lastEvaluatedKey: null, hasMore: false });
+
+      // No mock searchWeb setup — if it gets called, the mock returns undefined
+      // and the test would throw. We assert it is NOT called.
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_name: null, industry: null }));
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Research {{emailDomain}} {{company}}',
+        outputFields: ['company_name', 'industry'],
+        sources: ['web_search'],
+        // Caller-provided template using emailDomain — common case from the UI
+        webSearchTemplate: '{{emailDomain}} company overview',
+      };
+
+      await service.preview(spec);
+
+      // The whole point of this fix: the broken generic search must NOT fire.
+      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
+    });
+  });
+
   describe('preview - success cases', () => {
     it('should return correct stats and 2 sample results with enriched fields', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
@@ -1433,6 +1467,52 @@ describe('CrmEnrichmentService.applySearchTemplate', () => {
   it('handles missing customFields key gracefully', () => {
     const template = '{{company}} {{customFields.missing_field}}';
     expect(CrmEnrichmentService.applySearchTemplate(template, lead)).toBe('Acme Corp');
+  });
+});
+
+// ─── templateHasNoLeadSignal ─────────────────────────────────────────────────
+
+describe('CrmEnrichmentService.templateHasNoLeadSignal', () => {
+  it('returns true when emailDomain placeholder resolves to empty (no email on lead)', () => {
+    const template = '{{emailDomain}} company overview';
+    const lead = { leadId: 'l1', linkedin: 'https://www.linkedin.com/in/foo' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns false when emailDomain resolves to a real domain', () => {
+    const template = '{{emailDomain}} company overview';
+    const lead = { leadId: 'l1', email: 'jane@acme.com' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(false);
+  });
+
+  it('returns true when template references {{company}} but lead has only email (placeholder unfilled)', () => {
+    const template = '{{company}} funding investors';
+    const lead = { leadId: 'l1', email: 'jane@acme.com' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns false when {{firstName}} {{lastName}} both populated', () => {
+    const template = '{{firstName}} {{lastName}} linkedin';
+    const lead = { leadId: 'l1', firstName: 'Jane', lastName: 'Doe' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(false);
+  });
+
+  it('returns true for a literal template with no placeholders (constant query)', () => {
+    const template = 'company overview';
+    const lead = { leadId: 'l1', email: 'jane@acme.com', company: 'Acme' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns true when {{customFields.foo}} is the only placeholder and not present', () => {
+    const template = '{{customFields.industry}} sector';
+    const lead = { leadId: 'l1', customFields: {} };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns false when at least one placeholder is filled even if others are empty', () => {
+    const template = '{{firstName}} {{lastName}} {{emailDomain}}';
+    const lead = { leadId: 'l1', firstName: 'Jane' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(false);
   });
 });
 
