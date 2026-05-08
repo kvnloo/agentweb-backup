@@ -201,4 +201,72 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
       expect(result.list_total_after_import).toBe(0);
     });
   });
+
+  // Bug fix: LinkedIn search results carry a `location` string per hit. The
+  // old code wrote `notes = "Location: ${item.location}"`, which pollutes the
+  // free-text notes field that users edit by hand. Location is a structured
+  // enrichment field (see enrichmentFieldConfig.ts EXTENDED_FIELDS); it
+  // belongs in customFields.location alongside the enrich.so reverse-lookup
+  // writes (crmEnrichSo.ts:427).
+  describe('location storage', () => {
+    it('writes item.location to customFields.location, not notes', async () => {
+      mockSearchPeople.mockResolvedValueOnce({
+        items: [{ name: 'Alice Smith', location: 'San Francisco Bay Area' }],
+        cursor: null,
+      });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+
+      await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      expect(mockBatchCreateLeads).toHaveBeenCalledTimes(1);
+      const [, leads] = mockBatchCreateLeads.mock.calls[0];
+      expect(leads).toHaveLength(1);
+      expect(leads[0].customFields).toEqual(expect.objectContaining({
+        location: 'San Francisco Bay Area',
+      }));
+      expect(leads[0].notes).toBeUndefined();
+    });
+
+    it('omits customFields.location when item has no location', async () => {
+      mockSearchPeople.mockResolvedValueOnce({
+        items: [{ name: 'Bob Jones' }],
+        cursor: null,
+      });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+
+      await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      const [, leads] = mockBatchCreateLeads.mock.calls[0];
+      expect(leads[0].notes).toBeUndefined();
+      // No customFields object created when there's nothing to put in it.
+      expect(leads[0].customFields?.location).toBeUndefined();
+    });
+
+    it('does not clobber an existing customFields object on the lead', async () => {
+      // Future-proofing: if upstream code ever pre-populates customFields on
+      // the search-result item (it doesn't today), the location merge must
+      // preserve those keys rather than replace the whole object.
+      mockSearchPeople.mockResolvedValueOnce({
+        items: [{ name: 'Cara Lee', location: 'NYC', customFields: { tier: 'A' } }],
+        cursor: null,
+      });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+
+      await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      const [, leads] = mockBatchCreateLeads.mock.calls[0];
+      expect(leads[0].customFields).toEqual(expect.objectContaining({
+        location: 'NYC',
+      }));
+    });
+  });
 });
