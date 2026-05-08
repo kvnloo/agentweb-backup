@@ -3,7 +3,8 @@ import AWS from "aws-sdk";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
-import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
+import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
+import { userDb } from "./db";
 import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
@@ -1171,6 +1172,44 @@ export async function deployLandingPage(
       console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
     }
 
+    // Auto-configure GSC domain + GA4 property when deployed to a managed subdomain
+    if (customDomain) {
+      try {
+        const lpConfig = await getLandingPagesConfig();
+        if (lpConfig && customDomain.endsWith(`.${lpConfig.gscDomain}`)) {
+          const user = await userDb.getUserById(userId);
+          if (user) {
+            const updates: Record<string, any> = {};
+
+            // Ensure root GSC domain property is configured (covers all subdomains)
+            const seoDomains: string[] = user.seoDomains ?? [];
+            if (!seoDomains.includes(lpConfig.gscDomain)) {
+              updates.seoDomains = [...seoDomains, lpConfig.gscDomain];
+            }
+
+            // Ensure our GA4 property is in the user's configured properties
+            const gaProps: Array<{ propertyId: string; label: string }> = user.googleAnalyticsProperties ?? [];
+            if (!gaProps.some(p => p.propertyId === lpConfig.ga4PropertyId)) {
+              updates.googleAnalyticsProperties = [
+                ...gaProps,
+                { propertyId: lpConfig.ga4PropertyId, label: lpConfig.gscDomain },
+              ];
+            }
+
+            if (Object.keys(updates).length > 0) {
+              await userDb.updateUser(userId, updates as any);
+              console.log(`[V0 SERVICE] Auto-configured analytics for user ${userId}: ${JSON.stringify(Object.keys(updates))}`);
+            } else {
+              console.log(`[V0 SERVICE] Analytics already configured for user ${userId} — no update needed`);
+            }
+          }
+        }
+      } catch (configErr: any) {
+        // Non-fatal — deploy succeeded, analytics config can be set up manually
+        console.warn(`[V0 SERVICE] Could not auto-configure analytics: ${configErr.message}`);
+      }
+    }
+
     return {
       ...record,
       status: "deployed",
@@ -1440,6 +1479,18 @@ async function createGitHubRepoAndPush(
     scaffoldFiles.push({
       path: "lib/utils.ts",
       content: Buffer.from('import { type ClassValue, clsx } from "clsx"\nimport { twMerge } from "tailwind-merge"\n\nexport function cn(...inputs: ClassValue[]) {\n  return twMerge(clsx(inputs))\n}\n'),
+    });
+  }
+
+  if (!hasFile("app/layout.tsx")) {
+    const lpConfig = await getLandingPagesConfig();
+    const measurementId = lpConfig?.ga4MeasurementId;
+    const gtagBlock = measurementId
+      ? `\n        <script async src="https://www.googletagmanager.com/gtag/js?id=${measurementId}"></script>\n        <script dangerouslySetInnerHTML={{ __html: \`window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', '${measurementId}');\` }} />`
+      : '';
+    scaffoldFiles.push({
+      path: "app/layout.tsx",
+      content: Buffer.from(`import type { Metadata } from "next";\nimport "./globals.css";\n\nexport const metadata: Metadata = {\n  title: "Landing Page",\n  description: "Generated landing page",\n};\n\nexport default function RootLayout({\n  children,\n}: {\n  children: React.ReactNode;\n}) {\n  return (\n    <html lang="en">\n      <head>${gtagBlock}\n      </head>\n      <body>{children}</body>\n    </html>\n  );\n}\n`),
     });
   }
 

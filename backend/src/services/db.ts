@@ -5383,8 +5383,17 @@ export const crmDb = {
             source: 'email' as const, // Mark as email event
           };
 
+          // For all email events, pass through pre-stored emailContent (e.g. sent emails)
+          if (event.emailContent && event.eventType !== 'email.received' && event.eventType !== 'email.delivered') {
+            return { ...baseEngagement, emailContent: event.emailContent };
+          }
+
           // For email.received and email.delivered events, fetch the email content
-          if ((event.eventType === 'email.received' || event.eventType === 'email.delivered') && event.data?.email_id) {
+          if ((event.eventType === 'email.received' || event.eventType === 'email.delivered') && (event.emailContent || event.data?.email_id)) {
+            // If already stored, return immediately
+            if (event.emailContent && !event.data?.email_id) {
+              return { ...baseEngagement, emailContent: event.emailContent };
+            }
             try {
               let emailContent: { html?: string; text?: string; headers?: Record<string, string> } | null = null;
 

@@ -235,6 +235,79 @@ describe('SocialEngagementExecutor', () => {
     });
   });
 
+  // ─── config re-validation (skip if settings changed after scheduling) ────────
+
+  describe('config re-validation', () => {
+    it('should skip comment action when engager preferredActions no longer includes comment', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment', targetType: 'post' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockUserDb.getUserById.mockResolvedValue({
+        ...mockUser,
+        connected_accounts: [{
+          ...mockConnectedAccount,
+          engagementSettings: { preferredActions: ['like'] },
+        }],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should allow comment action when engager preferredActions includes comment', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment', targetType: 'post' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('Great insight!') as any
+      );
+      mockUserDb.getUserById.mockResolvedValue({
+        ...mockUser,
+        connected_accounts: [{
+          ...mockConnectedAccount,
+          engagementSettings: { preferredActions: ['like', 'comment'] },
+        }],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalled();
+    });
+
+    it('should skip reply_comment action when commentPreferredActions no longer includes reply', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'reply_comment', targetType: 'comment', commentId: 'urn:li:comment:999', commentText: 'Hello' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockUserDb.getUserById.mockResolvedValue({
+        ...mockUser,
+        connected_accounts: [{
+          ...mockConnectedAccount,
+          engagementSettings: { commentPreferredActions: ['like'] },
+        }],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should allow comment action when no engagementSettings exist (legacy accounts)', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment', targetType: 'post' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('Interesting take!') as any
+      );
+      mockUserDb.getUserById.mockResolvedValue({
+        ...mockUser,
+        connected_accounts: [mockConnectedAccount],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalled();
+    });
+  });
+
   // ─── executePostAction – like ───────────────────────────────────────────────
 
   describe('executePostAction – like', () => {

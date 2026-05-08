@@ -1,5 +1,5 @@
 // Define the interface for release notes
-
+// Last updated: 2026-05-07
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,149 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Auto Engagement — Disabling Comments Now Takes Effect Immediately',
+      '- When you remove "Comment" from your engagement preferred actions, any already-queued comment jobs are now cancelled at execution time instead of posting anyway',
+      '- Previously, comment actions scheduled before you changed the setting would still post to LinkedIn even after you disabled them',
+      '- The fix applies to both post comments and comment auto-replies',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Improved: CRM — Engagements and Messaging Unified in the Lead Panel',
+      '- Clicking any lead now opens a right-side panel showing the full engagement history (emails, LinkedIn messages) alongside contact details — no more separate Engagements dialog',
+      '- The selected lead row is now highlighted so it\'s always clear which record is open',
+      '- Email and LinkedIn compose are built into the panel: draft, edit, and send without leaving the record',
+      '- "Draft Email" and "Draft Message" buttons inside the panel let you generate AI drafts with one click; "Update Draft" refines an existing draft',
+      '- A new AI Model dropdown on the draft dialog lets you choose which model generates the draft, defaulting to Gemini 3 Flash',
+      '- Email validation status (Deliverable / Risky / Undeliverable) now shows correctly in the panel header',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'Fixed: Sequence Emails Now Use Full YouTube Links',
+      '- Email sequences previously sent youtu.be short links, which Gmail flags as potential phishing',
+      '- All youtu.be short URLs are now automatically expanded to full youtube.com/watch?v=... URLs before sending',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'New: Local Agent — Emma Can Now Browse Your Browser',
+      '- Emma can now use a local Codex agent running on your machine to extract data from websites you\'re already logged into (LinkedIn, HubSpot, Reddit, GitHub, and more)',
+      '- Set up takes 3 steps: run codex-relay serve locally, expose it via ngrok, and store the endpoint + secret in AWS Secrets Manager',
+      '- All tasks are strictly browser read-only — shell commands, file access, and account modifications are blocked',
+      '- The account owner\'s personal data is automatically stripped from all results to protect privacy',
+      '- Multiple requests are handled concurrently — parallel users don\'t block each other',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'New: Landing Page Metrics — View GSC & GA4 Traffic Per Landing Page',
+      '- Each deployed landing page now has a "View Metrics" button that opens a dedicated metrics view filtered to that page\'s domain',
+      '- Google Search Console data is scoped to just that subdomain (e.g. mysite.agentwebforms.com) using GSC page filters',
+      '- Google Analytics 4 traffic is automatically shown for all agentwebforms.com landing pages — no manual configuration needed',
+      '- GA4 tracking script is automatically injected into newly generated landing pages so visitor events are collected from day one',
+      '- A "Back to Landing Pages" breadcrumb makes it easy to return from metrics to the landing pages list',
+      '- Domains are automatically registered in your SEO config when a landing page is deployed',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'Improved: Video Production — Exact-Length Videos and Better Motion Craft',
+      '- Videos now render to the exact requested duration (e.g. 30s) instead of rounding up to the nearest clip boundary (e.g. 32s). For a 30s video, clips are assigned variable playback durations [8, 8, 8, 6s] so the total is always correct.',
+      '- Smooth cross-fade transitions between clips: each clip boundary now uses a 6-frame cross-dissolve with cinematic easing curves (EASE_IN_OUT_CUB at boundaries, EASE_OUT_QUART on arrivals, EASE_IN_QUART on exits) instead of raw hard cuts.',
+      '- Video Production skill system prompt updated with full motion craft guidelines: spring config cheat sheet, named easing bezier curves, entry/exit grammar by motion type, hold-time discipline, follow-through rules, and audio-reactive timing.',
+      '- New admin setting: Video API Default Model — choose the default Veo model for the generate_video tool from the Agent Mode tab of the admin page, matching the existing Image API Default Model pattern.',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'Improved: CRM Sequences — Better Email Deliverability',
+      '- Images in sequence emails are now served through a consistent domain (api.agentweb.pro) instead of raw S3 URLs, reducing the chance of emails landing in spam',
+      '- Unsubscribe links are now properly injected into every sequence email at send time, ensuring compliance and improving deliverability',
+      '- Both fixes apply automatically to all users — no action required',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Improved: Emma Voice Mode — Barge-In and Error Visibility',
+      '- Emma now stops speaking immediately when you start talking, instead of talking over you',
+      '- When the voice session ends due to a quota limit or unexpected error, a clear message is shown so you know what happened and can try again',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'New: Admins Can Now Hide Pages from the Customer Portal Sidebar',
+      '- In the Subscriptions tab, each page now has three access levels: Allowed (user can access), Locked (shown with an upgrade prompt), or Hidden (not shown in the sidebar at all)',
+      '- Previously only Allowed/Locked were supported — Hidden is new and lets you remove pages entirely for certain subscription tiers rather than showing a lock icon',
+      '- Configure per-tier page visibility in Admin → Subscriptions → Edit a subscription type',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Fixed: LinkedIn Outbound Messages Now Visible in CRM Engagement History',
+      '- Manual replies sent directly on LinkedIn (outside the app) were previously invisible in the CRM — only the lead\'s inbound messages were shown',
+      '- A new "Sync LinkedIn" button in the engagement history section pulls all messages (sent and received) from LinkedIn via Unipile and refreshes the timeline immediately',
+      '- The button appears automatically on any lead that has a LinkedIn profile URL',
+      '- Also fixed: LinkedIn InMail events now display correctly as "LinkedIn InMail sent" instead of a raw event type string',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Improved: Slack Suggest Sessions Now Show Sender Names Instead of User IDs',
+      '- When an inbound Slack message mentions another person (e.g. "let me know if @Jane is available"), the mention now shows the person\'s display name instead of a raw Slack user ID like <@U0B0XGBEDT>',
+      '- This applies to both the email notification and the session content Emma uses to draft a response',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'New: Characters for Video Creation',
+      '- Save reusable characters (name, visual description, reference portrait image) in the new Characters tab on the Videos page',
+      '- When creating a video task, select a saved character to include them as a visual reference — their appearance is used to anchor the character consistently across generated clips',
+      '- In Agent Mode with the Video Production skill, Emma now automatically lists your saved characters and incorporates the chosen character\'s portrait as a visual reference when generating videos',
+      '- Characters can be created, previewed, and deleted directly from the Characters tab',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Fixed: Satisfaction Score Reports Now Include All Active Sessions',
+      '- Sessions that started before the report window but had messages within it are now correctly included in satisfaction score counts',
+      '- Previously, a session that began late at night and continued past midnight would be silently excluded from the 24-hour report, potentially hiding unsatisfied sessions',
+      '- Also fixed: when satisfaction scores are generated during a sync call, they are now returned in the same response — previously the response would show null even after the score was successfully computed',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Improved: Emma now clarifies Slack channel access limits for non-admin accounts',
+      '- When a non-admin user asks Emma to search across all Slack channels, Emma explains that only an admin account can do a broad channel search',
+      '- Emma suggests asking an admin to run the search instead of silently returning limited results',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Fix: Data Analysis Tool Now Fails Gracefully on Large or Misrouted Datasets',
+      '- The perform_data_analysis tool now detects when Python code references local file paths or tool-response paths and immediately returns a clear error explaining that the sandbox is remote and isolated',
+      '- Previously, the tool would silently fail or return simulated results when given paths it could not access, causing the agent to retry the same broken call repeatedly',
+      '- The tool description and parameter docs have been updated to make clear that all data must arrive via file_urls (S3 URLs) or inline in analysis_instruction — not via local paths',
+      '- For large datasets, the correct workflow is: use save_file to upload the data and get an S3 URL, then pass that URL in file_urls',
+    ],
+  },
   {
     date: '2026-05-07',
     changes: [
@@ -59,6 +202,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When a scheduled LinkedIn outreach run fails because the Unipile-connected account is disconnected, the agent now explains the common reasons (LinkedIn revoked the session due to automation detection, you logged in from another browser/device, the session cookie expired, or Unipile lost the session internally)',
       '- The agent now also provides step-by-step next steps: try Reconnect first in Settings > Connected Accounts, and if that does not work, remove the connection and add it again as a new connection',
       '- Previously the session just silently ended with "Outreach failed" with no actionable guidance',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Tips from Emma: contextual tips appear while AI generates your content',
+      '- After 5 seconds of active generation, a "Tips from Emma" card appears in the chat area with 3 tips specific to your request',
+      '- Tips are generated by the AI based on your exact prompt — a landing page request gets landing page best practices, a founder outreach request gets LinkedIn outreach tips, etc.',
+      '- Navigate between tips with prev/next buttons and a 1/3 counter; dismiss with the X button',
+      '- The card auto-dismisses when your content finishes generating',
+      '- Artifact panel now opens with a loading shimmer as soon as an HTML or image tool starts running, giving immediate visual feedback',
     ],
   },
   {
@@ -5686,6 +5840,28 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When Emma drafts a suggested response to an inbound Slack message, the session scorer now understands her role is response drafting — not directly fulfilling the Slack contact\'s request',
       '- Previously, if a Slack contact sent garbled or misdirected messages, the scorer penalized goalCompletion even when Emma responded perfectly',
       '- The fix injects session context into the conversation transcript so the scorer evaluates draft quality, not end-user goal fulfillment',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'Fixed: Session Notification Emails Now Reliably Delivered',
+      '- The notify_session tool previously reported success but delivered no email in certain edge cases (e.g. null recipients passed by the agent)',
+      '- Email delivery errors are now surfaced to the agent instead of being silently swallowed',
+      '- Invalid or null entries in the recipient list are filtered out before sending',
+      'Fixed: Issue Reports No Longer Notify the Customer',
+      '- When Emma reports a product issue on behalf of a customer, the notification now goes only to the internal team',
+      '- Previously, a confirmation email was incorrectly sent to the customer — this no longer happens',
+      '- The internal email now includes a direct Notion link so engineers can jump straight to the ticket',
+    ],
+  },
+  {
+    date: '2026-05-06',
+    changes: [
+      'Improved: Organization Members Now See Their Owner\'s Subscription Plan',
+      '- Members of an organization now see the correct subscription plan and status (e.g. Super Premium / Active) on their Subscription settings page, instead of Free',
+      '- Billing controls (Manage Billing, View Plans) are replaced with a message explaining the subscription is managed by the org owner',
+      '- Admin Users tab now shows org role and org name under each user\'s email, and in the expanded detail panel',
     ],
   },
 ];

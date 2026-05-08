@@ -4000,12 +4000,14 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
+    // If the LLM didn't specify a model, fall back to the admin-configured video API default
+    const videoModel = args.videoModel || await agentModeService.getVideoApiDefaultModel();
     return await agentModeService.generateVideo(
       args.prompt,
       args.filename,
       context?.userId,
       context?.sessionId,
-      args.videoModel,
+      videoModel,
       args.startFrame,
       args.endFrame,
       args.compose,
@@ -4036,6 +4038,15 @@ emmaToolRegistry.register({
         clip_duration_seconds: {
           type: 'number',
           description: 'Duration of each individual clip in seconds (all clips must have the same duration). Defaults to 8.'
+        },
+        target_duration_seconds: {
+          type: 'number',
+          description: 'Optional: Exact total duration for the composed video in seconds. Use this to trim the output to the desired length (e.g. 30) when clips total more (e.g. 4 clips × 8s = 32s). If omitted, defaults to clip_duration_seconds × number of clips.'
+        },
+        clip_durations_seconds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional: Per-clip playback durations in seconds (variable-length support). E.g. [8, 8, 8, 6] for a 30s video with 3 full clips and one 6s clip. Overrides clip_duration_seconds for each individual clip. Use when clips have different lengths.'
         },
         brand_name: {
           type: 'string',
@@ -4084,8 +4095,108 @@ emmaToolRegistry.register({
         ctaText: args.cta_text,
         ctaUrl: args.cta_url,
       },
-      args.clip_duration_seconds
+      args.clip_duration_seconds,
+      args.target_duration_seconds,
+      args.clip_durations_seconds
     );
+  }
+});
+
+// --- Character management tools for Video Production ---
+emmaToolRegistry.register({
+  name: 'list_characters',
+  definition: {
+    name: 'list_characters',
+    description: 'List all saved video characters for the user. Each character has a name, visual description, and a reference image URL. Call this at the start of video production to offer character selection. Pass the referenceImageUrl as startFrame in generate_video to anchor the character visually.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    return await agentModeService.listVideoCharacters(context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_character',
+  definition: {
+    name: 'get_character',
+    description: 'Get full details of a saved video character by ID, including their referenceImageUrl. Use the referenceImageUrl as startFrame in generate_video to anchor the character appearance in the video.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        character_id: {
+          type: 'string',
+          description: 'The characterId from list_characters'
+        }
+      },
+      required: ['character_id']
+    }
+  },
+  execute: async (args: any, _context?: any) => {
+    return await agentModeService.getVideoCharacter(args.character_id);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'create_character',
+  definition: {
+    name: 'create_character',
+    description: 'Save a new video character. First call generate_image with the character description to create a reference portrait, then pass the returned S3 URL here along with the name and description. The character will be saved and available for future video productions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Display name for the character (e.g. "Maya")'
+        },
+        description: {
+          type: 'string',
+          description: 'Visual description of the character (e.g. "confident woman in her 30s, blue blazer, professional studio background")'
+        },
+        reference_image_url: {
+          type: 'string',
+          description: 'S3 URL of the character portrait image, returned by generate_image'
+        },
+        prompt: {
+          type: 'string',
+          description: 'The exact prompt passed to generate_image to create the reference image'
+        }
+      },
+      required: ['name', 'description', 'reference_image_url']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createVideoCharacter(context?.userId, {
+      name: args.name,
+      description: args.description,
+      referenceImageUrl: args.reference_image_url,
+      referenceImageKey: '',
+      prompt: args.prompt || args.description,
+    });
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'delete_character',
+  definition: {
+    name: 'delete_character',
+    description: 'Delete a saved video character by ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        character_id: {
+          type: 'string',
+          description: 'The characterId to delete'
+        }
+      },
+      required: ['character_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.deleteVideoCharacter(context?.userId, args.character_id);
   }
 });
 
@@ -4552,18 +4663,18 @@ emmaToolRegistry.register({
   name: "perform_data_analysis",
   definition: {
     name: "perform_data_analysis",
-    description: 'Perform data analysis with code execution on files from URLs. If no files are attached, treat the information in the instruction as the complete dataset.',
+    description: 'Perform data analysis with code execution on files from URLs. IMPORTANT: The code execution runs in a remote isolated sandbox with no access to local files, tool response paths, or any previous context. All data must be provided either via file_urls (S3 URLs) or embedded directly in analysis_instruction. If data from a previous tool call is too large to embed inline, first save it using the save_file tool to get an S3 URL, then pass that URL in file_urls.',
     inputSchema: {
       type: "object",
       properties: {
         file_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'List of file URLs to analyze (URLs from uploaded files or previous task results)'
+          description: 'List of S3 or HTTPS file URLs to fetch and analyze. Use this for large datasets — save data via save_file first to get a URL if needed.'
         },
         analysis_instruction: {
           type: 'string',
-          description: 'Description of the analysis task to perform on the provided files'
+          description: 'The analysis task and any small inline datasets. Do NOT reference local file paths or tool-response paths — the sandbox cannot access them. For large datasets use file_urls instead.'
         }
       },
       required: ['file_urls', 'analysis_instruction']
@@ -5980,35 +6091,45 @@ emmaToolRegistry.register({
           context: issueContext,
         });
 
-        // When an admin reports via delegate access, send only to the admin (not the customer).
-        // The admin initiated the report, not the customer.
-        const emailRecipients = isDelegatedAdmin && adminEmail
+        // Never email the customer — internal team + admin (if known) only.
+        const emailRecipients = adminEmail
           ? [...productIssueEmails, adminEmail]
-          : [...productIssueEmails, user.email];
-        const emailGreeting = isDelegatedAdmin && adminEmail
-          ? `Hi ${adminEmail}, you've submitted an issue report on behalf of ${user.displayName || user.email}.`
-          : `Hi ${user.displayName || user.email}, we've received your issue report and the AgentWeb engineering team has been notified. We'll follow up if we need more details.`;
+          : [...productIssueEmails];
 
+        const priorityColor = (issue.priority || 'Medium') === 'High' ? '#dc2626' : (issue.priority || 'Medium') === 'Low' ? '#6b7280' : '#d97706';
         await resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: emailRecipients,
-          subject: `We received your issue: ${issue.title}`,
+          subject: `[Issue] ${issue.title} — reported by ${user.email}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-              <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
-                <h2 style="margin: 0; color: #111;">Product Issue Report</h2>
+              <div style="background-color: #f8f9fa; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
+                <h2 style="margin: 0; color: #111; font-size: 18px;">Customer Issue Report</h2>
+                <span style="background-color: ${priorityColor}; color: #fff; font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 12px;">${issue.priority || 'Medium'}</span>
               </div>
-              <p style="color: #444;">${emailGreeting} The AgentWeb engineering team has been notified.</p>
-              ${result.pageId ? `<div style="margin: 8px 0;"><strong>Issue ID:</strong> AGW-${result.pageId}</div>` : ''}
-              <div style="margin: 8px 0;"><strong>Priority:</strong> ${issue.priority || 'Medium'}</div>
-              <div style="margin: 8px 0;"><strong>Page URL:</strong> ${issue.pageUrl || 'N/A'}</div>
-              <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; margin: 20px 0;">
-                <div style="font-weight: 600; margin-bottom: 10px;">Description:</div>
-                <div>${issue.description.replace(/\n/g, '<br>')}</div>
+
+              <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr>
+                  <td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td>
+                  <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
+                </tr>
+                ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
+                ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
+                ${result.notionUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Notion</strong></td><td style="padding: 6px 0;"><a href="${result.notionUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in Notion</a></td></tr>` : ''}
+                ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
+              </table>
+
+              <div style="background-color: #fff; border-left: 4px solid #4F46E5; padding: 15px; border-radius: 0 4px 4px 0;">
+                <div style="font-weight: 600; margin-bottom: 8px; color: #333;">Description</div>
+                <div style="color: #444; line-height: 1.6;">${issue.description.replace(/\n/g, '<br>')}</div>
+              </div>
+
+              <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #9ca3af;">
+                Reply to this email to respond directly to the customer.
               </div>
             </div>
           `,
-          replyTo: isDelegatedAdmin && adminEmail ? adminEmail : user.email,
+          replyTo: user.email,
         });
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });

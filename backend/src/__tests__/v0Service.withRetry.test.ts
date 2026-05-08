@@ -6,6 +6,7 @@
 // Minimal mocks to allow v0Service module to load
 jest.mock("aws-sdk", () => {
   const mockFn = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
+  const mockS3 = { putObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }) };
   return {
     __esModule: true,
     default: {
@@ -19,6 +20,7 @@ jest.mock("aws-sdk", () => {
           promise: () => Promise.resolve({ SecretString: '{"apiKey":"test-key"}' }),
         }),
       })),
+      S3: jest.fn().mockImplementation(() => mockS3),
       config: { update: jest.fn() },
     },
     DynamoDB: {
@@ -26,6 +28,7 @@ jest.mock("aws-sdk", () => {
         put: mockFn, update: mockFn, get: mockFn, query: mockFn, delete: mockFn,
       })),
     },
+    S3: jest.fn().mockImplementation(() => mockS3),
     config: { update: jest.fn() },
   };
 });

@@ -131,6 +131,47 @@ export function injectUnsubscribeUrl(html: string, unsubscribeUrl: string, fallb
   return html.replace(/<\/body>/i, `${footer}</body>`) + (/<\/body>/i.test(html) ? '' : footer);
 }
 
+/**
+ * Converts youtu.be short URLs to full youtube.com/watch?v=... URLs.
+ * Gmail's spam filters flag youtu.be links as potential phishing attempts.
+ */
+export function normalizeYoutubeUrls(html: string): string {
+  if (!html) return html;
+  return html.replace(
+    /https?:\/\/youtu\.be\/([a-zA-Z0-9_-]+)(\?[^\s"'<>]*)?/g,
+    (_match, videoId, query) => {
+      const base = `https://www.youtube.com/watch?v=${videoId}`;
+      if (!query) return base;
+      // Append existing query params (e.g. si=...) after v=
+      const extraParams = query.slice(1); // strip leading '?'
+      return `${base}&${extraParams}`;
+    },
+  );
+}
+
+const S3_BUCKET_HOST = 'agentweb-user-files.s3.us-west-2.amazonaws.com';
+
+/**
+ * Rewrite S3 image src URLs in email HTML to go through the /asset/ proxy on the
+ * backend (e.g. https://api.agentweb.pro/asset/<base64url>). This makes image
+ * hostnames match the sending domain, satisfying Resend/Gmail deliverability checks.
+ *
+ * Only rewrites src attributes pointing to the agentweb-user-files S3 bucket.
+ * baseUrl should be the backend URL, e.g. process.env.BACKEND_URL or 'https://api.agentweb.pro'.
+ */
+export function rewriteS3ImageUrls(html: string, baseUrl: string): string {
+  if (!html) return html;
+  const base = baseUrl.replace(/\/$/, '');
+  return html.replace(
+    /(<img\b[^>]*?\bsrc=["'])([^"']+)(["'][^>]*>)/gi,
+    (_match, prefix, srcUrl, suffix) => {
+      if (!srcUrl.includes(S3_BUCKET_HOST)) return _match;
+      const hash = Buffer.from(srcUrl).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+      return `${prefix}${base}/asset/${hash}${suffix}`;
+    },
+  );
+}
+
 export function substituteVariables(template: string, lead: Record<string, any>): string {
   if (!template) return template;
 

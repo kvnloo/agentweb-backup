@@ -232,6 +232,7 @@ export class AgentModeService {
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private imageApiDefaultModelSettingName = 'agent_mode_image_api_default_model';
+  private videoApiDefaultModelSettingName = 'agent_mode_video_api_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
@@ -310,6 +311,7 @@ export class AgentModeService {
     description: string;
     toolNames: string[];
     category?: string;
+    systemPrompt?: string;
   }> = [
       {
         name: 'Meeting Intelligence',
@@ -347,7 +349,7 @@ export class AgentModeService {
           builtin.name,
           builtin.description,
           builtin.toolNames,
-          undefined, // systemPrompt
+          builtin.systemPrompt,
           true       // isPublished — available immediately
         );
 
@@ -506,6 +508,7 @@ export class AgentModeService {
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/calendarTools');
+        await import('../emma/localAgentTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -645,9 +648,10 @@ export class AgentModeService {
       },
       execute: async (args: any, context: any) => {
         const { emailService } = await import('./emailService');
-        const toList: string[] = Array.isArray(args.to) ? args.to : [args.to];
+        const raw: any[] = Array.isArray(args.to) ? args.to : [args.to];
+        const toList: string[] = raw.filter((e): e is string => typeof e === 'string' && e.length > 0);
         if (toList.length === 0) {
-          throw new Error('At least one email address is required in the "to" field.');
+          throw new Error('At least one valid email address is required in the "to" field.');
         }
         await emailService.sendSessionNotificationEmail(
           toList,
@@ -796,6 +800,26 @@ export class AgentModeService {
       console.error('AgentMode: Error getting image API default model setting:', error);
     }
     // Return undefined to let imageGeneration.ts use its own hardcoded default
+    return undefined;
+  }
+
+  // Supported video API models
+  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+
+  async getVideoApiDefaultModel(): Promise<string | undefined> {
+    try {
+      const setting = await settingsService.getSetting(this.videoApiDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (AgentModeService.VIDEO_API_MODELS.includes(configuredModel)) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported video API default model "${configuredModel}" in settings; using hardcoded default.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting video API default model setting:', error);
+    }
+    // Return undefined to let the video generation service use its own hardcoded default
     return undefined;
   }
 
@@ -2919,6 +2943,10 @@ export class AgentModeService {
 
     // Session Notifications (no email integration required)
     'notify_session',
+
+    // Local Agent Relay (Codex agent running on user's machine)
+    'run_local_agent_task',
+    'check_local_agent_status',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -4988,6 +5016,28 @@ export class AgentModeService {
         };
       }
 
+      // Reject oversized instructions early so the LLM can self-correct rather than sending a
+      // payload that will be rejected and cause it to simulate results.
+      const MAX_INLINE_INSTRUCTION_CHARS = 200_000; // ~50K tokens — well within Gemini's 1M context
+      if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
+        return {
+          success: false,
+          message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). The dataset embedded in the instruction is too large to send inline. Please use the save_file tool first to upload the dataset as a .csv or .txt file, then call perform_data_analysis again with the returned file URL in the file_urls parameter and a concise analysis_instruction describing what to analyze.`
+        };
+      }
+
+      // Gemini code execution runs in a remote isolated sandbox — it cannot access local file paths
+      // or S3-offloaded tool response paths from previous tool calls. Detect this pattern early so
+      // the LLM knows all data must arrive via file_urls or embedded in analysis_instruction.
+      const localPathPattern = /(?:open|read|load)\s*\(\s*['"`]\/|with open\(['"`]\//i;
+      const s3KeyPathPattern = /tool-responses\/[a-z0-9-]{36}\//i;
+      if (localPathPattern.test(analysisInstruction) || s3KeyPathPattern.test(analysisInstruction)) {
+        return {
+          success: false,
+          message: `The analysis_instruction references local file paths or tool-response paths (e.g. open('/home/bard/...') or tool-responses/...). The code execution sandbox is remote and isolated — it has no access to any local files or previous tool responses. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
+        };
+      }
+
       // Get Gemini API key from Secrets Manager
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
       const geminiSecretName = environment === 'prod'
@@ -5228,10 +5278,21 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error performing data analysis:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const statusCode = (error as any)?.response?.status;
+      const isPayloadTooLarge = statusCode === 413 ||
+        /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
+      if (isPayloadTooLarge) {
+        return {
+          success: false,
+          message: `The data payload sent to Gemini was too large. Please use the save_file tool to upload the dataset as a .csv or .txt file first, then call perform_data_analysis with the returned file URL in the file_urls parameter instead of embedding the data inline.`,
+          error: errorMessage
+        };
+      }
       return {
         success: false,
         message: 'Failed to perform data analysis. Please check that the file URLs are accessible.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: errorMessage
       };
     }
   }
@@ -15429,7 +15490,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     composeParams: Record<string, any>,
-    clipDurationSeconds?: number
+    clipDurationSeconds?: number,
+    targetDurationSeconds?: number,
+    clipDurationsSeconds?: number[]
   ): Promise<any> {
     try {
       if (!clipUrls || clipUrls.length === 0) {
@@ -15450,6 +15513,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
+        targetDurationSeconds,
+        clipDurationsSeconds,
         filename,
         userId,
       });
@@ -15471,6 +15536,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       console.error('AgentMode: Error composing video:', error);
       return { success: false, message: 'Failed to compose video', error: error.message };
+    }
+  }
+
+  // ---- Video character management ----
+
+  public async listVideoCharacters(userId: string): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const characters = await characterDb.listCharacters(userId);
+      return { success: true, characters };
+    } catch (error: any) {
+      console.error('AgentMode: Error listing characters:', error);
+      return { success: false, message: 'Failed to list characters', error: error.message };
+    }
+  }
+
+  public async getVideoCharacter(characterId: string): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const character = await characterDb.getCharacterById(characterId);
+      if (!character) return { success: false, message: 'Character not found' };
+      return { success: true, character };
+    } catch (error: any) {
+      console.error('AgentMode: Error getting character:', error);
+      return { success: false, message: 'Failed to get character', error: error.message };
+    }
+  }
+
+  public async createVideoCharacter(userId: string, input: {
+    name: string;
+    description: string;
+    referenceImageUrl: string;
+    referenceImageKey: string;
+    prompt: string;
+  }): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const character = await characterDb.createCharacter(userId, input);
+      return { success: true, character };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating character:', error);
+      return { success: false, message: 'Failed to create character', error: error.message };
+    }
+  }
+
+  public async deleteVideoCharacter(userId: string, characterId: string): Promise<any> {
+    try {
+      const { characterDb } = await import('./characterDb');
+      const character = await characterDb.getCharacterById(characterId);
+      if (!character) return { success: false, message: 'Character not found' };
+      if (character.userId !== userId) return { success: false, message: 'Not authorized' };
+      await characterDb.deleteCharacter(userId, characterId);
+      return { success: true, message: 'Character deleted' };
+    } catch (error: any) {
+      console.error('AgentMode: Error deleting character:', error);
+      return { success: false, message: 'Failed to delete character', error: error.message };
     }
   }
 

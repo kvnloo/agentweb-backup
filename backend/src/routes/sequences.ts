@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 const router = express.Router();
@@ -304,8 +304,14 @@ router.post(
     const withBanner = /<body\b/i.test(htmlContent)
       ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
       : testBanner + htmlContent;
+    // Rewrite S3 image URLs through the asset proxy (same as production send path).
+    // Use EMAIL_ASSET_BASE_URL so URLs in emails are publicly accessible even when
+    // the test send originates from a dev environment with a private BACKEND_URL.
+    const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
+    const withRewrittenImages = rewriteS3ImageUrls(withBanner, assetBaseUrl);
+    const withNormalizedUrls = normalizeYoutubeUrls(withRewrittenImages);
     // Wire up unsubscribe URL with the real portal domain
-    const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl);
+    const testHtml = injectUnsubscribeUrl(withNormalizedUrls, testUnsubscribeUrl);
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
@@ -380,7 +386,7 @@ Severity rules:
 
 IMPORTANT — template variables: This is a drip sequence template. Placeholders like {{unsubscribeUrl}}, {{firstName}}, {{email}}, {{companyName}} are intentional template variables that will be replaced with real values at send time. Do NOT flag these as broken links or missing content.
 
-IMPORTANT — image hosting: Images hosted on AWS S3 or CDNs are normal for transactional email systems. Do NOT flag S3-hosted images as suspicious.
+IMPORTANT — image hosting: Images hosted on api.agentweb.pro/asset/ are served through our own domain proxy and are fine. Flag images whose src domain does not match the sending domain AND is not api.agentweb.pro (e.g. raw S3 URLs, external CDNs).
 
 Be precise. Only report genuine issues. If the email looks clean, return an empty issues array.`;
 

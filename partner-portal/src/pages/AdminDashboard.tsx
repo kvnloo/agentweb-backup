@@ -278,6 +278,9 @@ interface User {
   utmCampaign?: string;
   utmContent?: string;
   utmTerm?: string;
+  orgId?: string;
+  orgRole?: "owner" | "member";
+  orgName?: string;
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -4008,9 +4011,15 @@ export default function AdminDashboard() {
                             <Typography variant="body2" sx={{ fontWeight: 500 }}>
                               {user.email}
                             </Typography>
-                            <Typography variant="caption" color="text.secondary">
-                              {user.supportNote || (user.roles?.includes("partner") ? "Partner" : "")}
-                            </Typography>
+                            {user.orgId ? (
+                              <Typography variant="caption" color="text.secondary">
+                                {user.orgRole === "owner" ? "Org Owner" : "Org Member"}{user.orgName ? ` · ${user.orgName}` : ""}
+                              </Typography>
+                            ) : (
+                              <Typography variant="caption" color="text.secondary">
+                                {user.supportNote || (user.roles?.includes("partner") ? "Partner" : "")}
+                              </Typography>
+                            )}
                           </Box>
                         </TableCell>
                         <TableCell>
@@ -4107,6 +4116,25 @@ export default function AdminDashboard() {
                                     {(!user.roles || user.roles.length === 0) && <Typography variant="body2" color="text.disabled">—</Typography>}
                                   </Box>
                                 </Grid>
+                                {user.orgId && (
+                                  <Grid item xs={3}>
+                                    <Typography variant="caption" color="text.secondary">Organization</Typography>
+                                    <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "wrap", mt: 0.5 }}>
+                                      <Chip
+                                        label={user.orgRole === "owner" ? "Owner" : "Member"}
+                                        size="small"
+                                        color={user.orgRole === "owner" ? "primary" : "default"}
+                                        variant="outlined"
+                                      />
+                                      {user.orgName && (
+                                        <Typography variant="body2">{user.orgName}</Typography>
+                                      )}
+                                      <Typography variant="caption" color="text.disabled" sx={{ fontFamily: "monospace", fontSize: "0.7rem" }}>
+                                        {user.orgId}
+                                      </Typography>
+                                    </Box>
+                                  </Grid>
+                                )}
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Tasks / Workflows</Typography>
                                   <Box sx={{ display: "flex", gap: 1, mt: 0.5 }}>
@@ -7590,6 +7618,8 @@ const AgentModeSettings = () => {
   const [savingImageGenerationDefaultModel, setSavingImageGenerationDefaultModel] = useState(false);
   const [imageApiDefaultModel, setImageApiDefaultModel] = useState('');
   const [savingImageApiDefaultModel, setSavingImageApiDefaultModel] = useState(false);
+  const [videoApiDefaultModel, setVideoApiDefaultModel] = useState('');
+  const [savingVideoApiDefaultModel, setSavingVideoApiDefaultModel] = useState(false);
   const [videoGenerationDefaultModel, setVideoGenerationDefaultModel] = useState('');
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
   const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
@@ -7639,6 +7669,9 @@ const AgentModeSettings = () => {
 
       // Load image API default model
       await loadImageApiDefaultModel();
+
+      // Load video API default model
+      await loadVideoApiDefaultModel();
 
       // Load video generation default model
       await loadVideoGenerationDefaultModel(models);
@@ -8047,6 +8080,56 @@ const AgentModeSettings = () => {
     }
   };
 
+  const VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+
+  const loadVideoApiDefaultModel = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && VIDEO_API_MODELS.includes(configuredModel)) {
+          setVideoApiDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading video API default model:', settingsError);
+      }
+    }
+    setVideoApiDefaultModel('');
+  };
+
+  const saveVideoApiDefaultModel = async () => {
+    try {
+      setSavingVideoApiDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (videoApiDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
+          settingValue: videoApiDefaultModel,
+          description: 'Default video API model for generate_video tool (e.g. veo-3.1-generate-preview)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Video API default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving video API default model:', error);
+      setError('Failed to save video API default model');
+    } finally {
+      setSavingVideoApiDefaultModel(false);
+    }
+  };
+
   const loadVideoGenerationDefaultModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
@@ -8343,7 +8426,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'imageApiDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'imageApiDefaultModel' | 'videoApiDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -8439,6 +8522,14 @@ const AgentModeSettings = () => {
 
         setImageApiDefaultModel('');
         setSuccess('Reset image API default model successfully!');
+      } else if (type === 'videoApiDefaultModel') {
+        setSavingVideoApiDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setVideoApiDefaultModel('');
+        setSuccess('Reset video API default model successfully!');
       } else if (type === 'videoGenerationDefaultModel') {
         setSavingVideoGenerationDefaultModel(true);
         await axios.delete(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
@@ -8486,6 +8577,8 @@ const AgentModeSettings = () => {
         setSavingImageGenerationDefaultModel(false);
       } else if (type === 'imageApiDefaultModel') {
         setSavingImageApiDefaultModel(false);
+      } else if (type === 'videoApiDefaultModel') {
+        setSavingVideoApiDefaultModel(false);
       } else if (type === 'videoGenerationDefaultModel') {
         setSavingVideoGenerationDefaultModel(false);
       } else if (type === 'customerSupportDefaultModel') {
@@ -8828,6 +8921,55 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             The image generation API model used by the <code>generate_image</code> tool when the agent doesn't specify one explicitly. Overrides the hardcoded default.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Video API Default Model (controls which video generation API/model is called) */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Video API Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('videoApiDefaultModel')}
+                disabled={savingVideoApiDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveVideoApiDefaultModel}
+                disabled={savingVideoApiDefaultModel}
+              >
+                {savingVideoApiDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-video-api-model-label">Video API Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-video-api-model-label"
+              value={videoApiDefaultModel}
+              label="Video API Default Model"
+              onChange={(e) => setVideoApiDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use hardcoded default (veo-3.1-generate-preview)</em>
+              </MenuItem>
+              {VIDEO_API_MODELS.map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            The video generation API model used by the <code>generate_video</code> tool when the agent doesn't specify one explicitly. Overrides the hardcoded default.
           </Typography>
         </CardContent>
       </Card>

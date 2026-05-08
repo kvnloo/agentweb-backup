@@ -4,7 +4,7 @@ import bcrypt from "bcryptjs";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
-import { userDb, taskDb, subscriberDb, crmDb } from "../services/db";
+import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -400,6 +400,21 @@ router.get("/users", async (req, res) => {
         secretNames: secrets ? Object.keys(secrets) : [],
       };
     });
+
+    // Batch-fetch org names for users who belong to an org
+    const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
+    const orgMap: Record<string, string> = {};
+    await Promise.all(
+      orgIds.map(async (orgId) => {
+        const org = await orgDb.getOrgById(orgId).catch(() => null);
+        if (org) orgMap[orgId] = org.name;
+      })
+    );
+    for (const user of sanitized) {
+      if (user.orgId && orgMap[user.orgId]) {
+        user.orgName = orgMap[user.orgId];
+      }
+    }
 
     // Batch-fetch Clarity replay session URLs for all users
     const replayResults = await Promise.all(
@@ -2887,15 +2902,13 @@ router.get("/chat-sessions", async (req, res) => {
         }
       }
 
-      // Re-fetch sessions so response includes newly generated scores
-      if (judges.length > 0) {
-        for (let i = 0; i < sessionsWithMessages.length; i++) {
-          try {
-            const refreshed = await chatbotDb.getChatSession((sessionsWithMessages[i] as any).sessionId);
-            if (refreshed) sessionsWithMessages[i] = refreshed;
-          } catch (error) {
-            // Keep original session data on refresh failure
-          }
+      // Re-fetch sessions so response includes newly generated scores (both default and judge)
+      for (let i = 0; i < sessionsWithMessages.length; i++) {
+        try {
+          const refreshed = await chatbotDb.getChatSession((sessionsWithMessages[i] as any).sessionId);
+          if (refreshed) sessionsWithMessages[i] = refreshed;
+        } catch (error) {
+          // Keep original session data on refresh failure
         }
       }
     }
@@ -4365,9 +4378,13 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      // Pass through hiddenPages as-is (these are never wildcarded)
+      const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
+        ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
@@ -4440,9 +4457,15 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyTokenAllowance)
         : null;
 
+      // Pass through hiddenPages as-is; validate it's an array of strings
+      const hiddenPages: string[] = Array.isArray(type.hiddenPages)
+        ? type.hiddenPages.filter((p: any) => typeof p === 'string')
+        : [];
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
+        ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),

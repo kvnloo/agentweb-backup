@@ -551,13 +551,24 @@ export class VideoService {
       const modelToUse = params.videoModel;
       
       // Determine how many clips to generate
-      // Veo supports max 8s per clip; for longer videos generate multiple clips in parallel
+      // Veo supports max 8s per clip; for longer videos generate multiple clips in parallel.
+      // Per-clip playback durations can be variable (e.g. [8,8,8,6] for a 30s video).
       const VEO_MAX_SECONDS = 8;
+      const VEO_MIN_SECONDS = 4;
       const requestedDuration = params.durationSeconds ?? VEO_MAX_SECONDS;
-      const perClipDuration = Math.min(VEO_MAX_SECONDS, Math.max(5, requestedDuration > VEO_MAX_SECONDS ? VEO_MAX_SECONDS : requestedDuration));
-      const clipCount = requestedDuration > VEO_MAX_SECONDS ? Math.ceil(requestedDuration / VEO_MAX_SECONDS) : 1;
 
-      console.log(`VideoService: Generating ${clipCount} clip(s) × ${perClipDuration}s for requested ${requestedDuration}s`);
+      // Each Veo clip is generated at VEO_MAX_SECONDS (snapped up per spec).
+      // The playback duration per clip may be shorter for the last clip to hit the exact target.
+      const clipCount = requestedDuration > VEO_MAX_SECONDS ? Math.ceil(requestedDuration / VEO_MAX_SECONDS) : 1;
+      const veoGenerateDuration = VEO_MAX_SECONDS; // always ask Veo for 8s per clip
+      // Playback durations: all full-length except possibly the last
+      const remainder = requestedDuration - (clipCount - 1) * VEO_MAX_SECONDS;
+      const lastClipPlayback = Math.max(VEO_MIN_SECONDS, Math.min(VEO_MAX_SECONDS, remainder));
+      const clipPlaybackDurations: number[] = Array.from({ length: clipCount }, (_, i) =>
+        i === clipCount - 1 ? lastClipPlayback : VEO_MAX_SECONDS
+      );
+
+      console.log(`VideoService: Generating ${clipCount} clip(s) for requested ${requestedDuration}s, playback=[${clipPlaybackDurations.join(',')}]s`);
 
       // Generate video
       let result: VideoGenerationResult;
@@ -566,7 +577,7 @@ export class VideoService {
 
         if (modelToUse === "veo-3.1-generate-preview") {
           if (clipCount === 1) {
-            result = await this.generateWithVeo31({ ...params, durationSeconds: perClipDuration });
+            result = await this.generateWithVeo31({ ...params, durationSeconds: veoGenerateDuration });
             if (result.success && result.videoUrl) {
               clipUrls = [result.videoUrl];
             }
@@ -578,12 +589,12 @@ export class VideoService {
               keyframes = await this.generateKeyframes(params.prompt, clipCount, filenameBase, params.userId);
             }
 
-            // Generate all clips concurrently; each clip gets its keyframe pair when available
+            // Generate all clips concurrently at full Veo duration; playback trimming happens in Remotion
             const clipResults = await Promise.all(
               Array.from({ length: clipCount }, (_, i) =>
                 this.generateWithVeo31({
                   ...params,
-                  durationSeconds: perClipDuration,
+                  durationSeconds: veoGenerateDuration,
                   filename: `${filenameBase}_clip${i + 1}.mp4`,
                   // Keyframe steering: clip[i] goes from frame[i] to frame[i+1]
                   startFrame: keyframes ? keyframes[i] : params.startFrame,
@@ -615,7 +626,9 @@ export class VideoService {
             ...params.composeParams,
             clipUrl: clipUrls[0],
             extraClipUrls: clipUrls.slice(1),
-            clipDurationSeconds: perClipDuration,
+            // Pass per-clip playback durations so Remotion places each clip exactly
+            // (e.g. [8,8,8,6] for a 30s video — last clip plays only 6s of its 8s footage)
+            clipDurationsSeconds: clipPlaybackDurations,
             filename: params.filename,
             userId: params.userId,
           });
