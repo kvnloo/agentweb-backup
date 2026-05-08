@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-08',
     changes: [
+      'Fixed: Auto Engagement — Disabling Comments Now Takes Effect Immediately',
+      '- When you remove "Comment" from your engagement preferred actions, any already-queued comment jobs are now cancelled at execution time instead of posting anyway',
+      '- Previously, comment actions scheduled before you changed the setting would still post to LinkedIn even after you disabled them',
+      '- The fix applies to both post comments and comment auto-replies',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
       'Improved: CRM — Engagements and Messaging Unified in the Lead Panel',
       '- Clicking any lead now opens a right-side panel showing the full engagement history (emails, LinkedIn messages) alongside contact details — no more separate Engagements dialog',
       '- The selected lead row is now highlighted so it\'s always clear which record is open',
