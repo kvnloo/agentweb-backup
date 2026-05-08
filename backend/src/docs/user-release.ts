@@ -9,6 +9,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-08',
+    changes: [
+      'Improved: CRM — Engagements and Messaging Unified in the Lead Panel',
+      '- Clicking any lead now opens a right-side panel showing the full engagement history (emails, LinkedIn messages) alongside contact details — no more separate Engagements dialog',
+      '- The selected lead row is now highlighted so it\'s always clear which record is open',
+      '- Email and LinkedIn compose are built into the panel: draft, edit, and send without leaving the record',
+      '- "Draft Email" and "Draft Message" buttons inside the panel let you generate AI drafts with one click; "Update Draft" refines an existing draft',
+      '- A new AI Model dropdown on the draft dialog lets you choose which model generates the draft, defaulting to Gemini 3 Flash',
+      '- Email validation status (Deliverable / Risky / Undeliverable) now shows correctly in the panel header',
+    ],
+  },
+  {
     date: '2026-05-07',
     changes: [
       'Fixed: Sequence Emails Now Use Full YouTube Links',
