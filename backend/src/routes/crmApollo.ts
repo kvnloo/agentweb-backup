@@ -214,6 +214,7 @@ async function enrichLeadsWithApolloInBackground(
         fillEmail: true,
         includePerson: opts.enrichPerson !== false,
         includeOrg: opts.enrichOrg !== false,
+        minimalFields: true,
       });
       if (proj.changed.size === 0) return;
 

@@ -53,7 +53,7 @@ export async function findEmailsForLeadsInBackground(
         );
         if (r.found && r.email) {
           if (r.apolloMatch) {
-            const proj = applyApolloMatchToLead(lead, r.apolloMatch, { fillEmail: true });
+            const proj = applyApolloMatchToLead(lead, r.apolloMatch, { fillEmail: true, minimalFields: true });
             if (r.emailStatus && proj.enrichmentMetadata.email) {
               proj.enrichmentMetadata.email.sourceQuote = `Apollo (${r.emailStatus})`;
             }

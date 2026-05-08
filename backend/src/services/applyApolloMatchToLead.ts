@@ -36,6 +36,7 @@ interface InputLead {
   title?: string;
   linkedin?: string;
   company?: string;
+  companyLinkedin?: string;
   customFields?: Record<string, any>;
   enrichmentMetadata?: Record<string, any>;
 }
@@ -52,6 +53,12 @@ interface Options {
   /** Toggle for the BulkEnrichmentDialog "Apollo" mode — defaults true. When
    *  false, skips company name, tech stack, headcount growth, funding, etc. */
   includeOrg?: boolean;
+  /** When true, restrict the projection to a small "identity" set:
+   *  email, firstName, lastName, title, company, linkedin, companyLinkedin,
+   *  location. Skips seniority, apolloPersonId, employment history, tech
+   *  stack, headcount growth, funding, revenue. Used by find-email +
+   *  bulk-enrich flows where users only want core profile fields auto-filled. */
+  minimalFields?: boolean;
 }
 
 export function applyApolloMatchToLead(
@@ -74,6 +81,7 @@ export function applyApolloMatchToLead(
   const o = match.organization;
   const includePerson = opts.includePerson !== false;
   const includeOrg = opts.includeOrg !== false;
+  const minimal = opts.minimalFields === true;
   const existingCustom = (lead.customFields ?? {}) as Record<string, any>;
 
   // Person fields — only written when missing AND person-projection enabled.
@@ -103,25 +111,36 @@ export function applyApolloMatchToLead(
       newMeta.linkedin = tag(p.fieldConfidence.linkedin);
       changed.add('linkedin');
     }
-    // apolloPersonId is always recorded for follow-up actions (phone reveals etc.).
-    if (p.apolloPersonId && existingCustom.apolloPersonId !== p.apolloPersonId) {
-      customFields.apolloPersonId = p.apolloPersonId;
-      changed.add('apolloPersonId');
-    }
-    if (p.title && !existingCustom.apolloTitle) {
-      customFields.apolloTitle = p.title;
-      changed.add('apolloTitle');
-    }
-    if (p.seniority && !existingCustom.apolloSeniority) {
-      customFields.apolloSeniority = p.seniority;
-      changed.add('apolloSeniority');
-    }
-    if (p.employmentHistory && p.employmentHistory.length && !existingCustom.employmentHistory) {
-      customFields.employmentHistory = JSON.stringify(p.employmentHistory);
-      // Source-of-truth for confidence is the central registry — no behavior
-      // change for this field today, but new fields land here automatically.
-      newMeta.employmentHistory = tag(getFieldConfidence('apollo', 'employmentHistory'));
-      changed.add('employmentHistory');
+    if (minimal) {
+      // Join whichever of city/state/country are present into a single
+      // `location` custom-field string — same key the enrich.so reverse
+      // lookup writes, so downstream UI/views render it consistently.
+      const loc = [p.city, p.state, p.country].filter(Boolean).join(', ');
+      if (loc && !existingCustom.location) {
+        customFields.location = loc;
+        changed.add('location');
+      }
+    } else {
+      // apolloPersonId is always recorded for follow-up actions (phone reveals etc.).
+      if (p.apolloPersonId && existingCustom.apolloPersonId !== p.apolloPersonId) {
+        customFields.apolloPersonId = p.apolloPersonId;
+        changed.add('apolloPersonId');
+      }
+      if (p.title && !existingCustom.apolloTitle) {
+        customFields.apolloTitle = p.title;
+        changed.add('apolloTitle');
+      }
+      if (p.seniority && !existingCustom.apolloSeniority) {
+        customFields.apolloSeniority = p.seniority;
+        changed.add('apolloSeniority');
+      }
+      if (p.employmentHistory && p.employmentHistory.length && !existingCustom.employmentHistory) {
+        customFields.employmentHistory = JSON.stringify(p.employmentHistory);
+        // Source-of-truth for confidence is the central registry — no behavior
+        // change for this field today, but new fields land here automatically.
+        newMeta.employmentHistory = tag(getFieldConfidence('apollo', 'employmentHistory'));
+        changed.add('employmentHistory');
+      }
     }
   }
 
@@ -132,24 +151,31 @@ export function applyApolloMatchToLead(
       newMeta.company = tag('medium');
       changed.add('company');
     }
-    if (o.techStack && o.techStack.length && !existingCustom.companyTechStack) {
-      customFields.companyTechStack = o.techStack.join('; ');
-      newMeta.companyTechStack = tag(getFieldConfidence('apollo', 'companyTechStack'), 'web_search');
-      changed.add('companyTechStack');
+    if (!lead.companyLinkedin && o.linkedinUrl) {
+      updates.companyLinkedin = o.linkedinUrl;
+      newMeta.companyLinkedin = tag('medium');
+      changed.add('companyLinkedin');
     }
-    const orgFields: Array<[string, string | number | undefined]> = [
-      ['companyHeadcountGrowth6mo',  o.headcountGrowth6mo],
-      ['companyHeadcountGrowth12mo', o.headcountGrowth12mo],
-      ['companyHeadcountGrowth24mo', o.headcountGrowth24mo],
-      ['companyFundingTotal',        o.totalFunding],
-      ['companyFundingStage',        o.latestFundingStage],
-      ['companyFundingLastRoundDate', o.latestFundingRoundDate],
-      ['companyAnnualRevenue',        o.annualRevenue ?? o.annualRevenuePrinted],
-    ];
-    for (const [k, v] of orgFields) {
-      if (v != null && v !== '' && !existingCustom[k]) {
-        customFields[k] = typeof v === 'number' ? String(v) : v;
-        changed.add(k);
+    if (!minimal) {
+      if (o.techStack && o.techStack.length && !existingCustom.companyTechStack) {
+        customFields.companyTechStack = o.techStack.join('; ');
+        newMeta.companyTechStack = tag(getFieldConfidence('apollo', 'companyTechStack'), 'web_search');
+        changed.add('companyTechStack');
+      }
+      const orgFields: Array<[string, string | number | undefined]> = [
+        ['companyHeadcountGrowth6mo',  o.headcountGrowth6mo],
+        ['companyHeadcountGrowth12mo', o.headcountGrowth12mo],
+        ['companyHeadcountGrowth24mo', o.headcountGrowth24mo],
+        ['companyFundingTotal',        o.totalFunding],
+        ['companyFundingStage',        o.latestFundingStage],
+        ['companyFundingLastRoundDate', o.latestFundingRoundDate],
+        ['companyAnnualRevenue',        o.annualRevenue ?? o.annualRevenuePrinted],
+      ];
+      for (const [k, v] of orgFields) {
+        if (v != null && v !== '' && !existingCustom[k]) {
+          customFields[k] = typeof v === 'number' ? String(v) : v;
+          changed.add(k);
+        }
       }
     }
   }
