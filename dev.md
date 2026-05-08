@@ -1,3 +1,42 @@
+## Scaling to 100 PRs/Day — Investigation & Conclusion (2026-05-08)
+
+### Context
+
+Explored how to scale development throughput from ~20 PRs/day to 100+ PRs/day, inspired by reports that the Claude Code founder achieves this scale using parallel Claude Code sessions and the `/loop` feature.
+
+### Options Investigated
+
+**Option 1: Slot-based parallelism on a single EC2**
+Multiple git worktrees on one instance, each running on offset ports (3001/5173/5174 for slot 0, 3011/5183/5184 for slot 1, etc.). Each slot gets its own DynamoDB table prefix (`Dev1-`, `Dev2-`, etc.) for data isolation. Rejected: complex to manage, slots contend for RAM, and the existing architecture already solves this more cleanly.
+
+**Option 2: One EC2 per Claude session (current architecture extended)**
+The current system already does the right thing — one EC2 instance per task, each fully isolated by default (separate filesystem, ports, tmux sessions, logs). The only missing piece is auto-dispatch: today a human manually launches each EC2 and terminates it when done. Auto-dispatch (claim task from Notion queue on boot, self-terminate on completion) would be ~100 lines of shell and is straightforward to implement when needed.
+
+**Option 3: Approved task queue gate**
+Add an `approved` status in Notion so auto-dispatch only pulls from curated tasks. Eliminates compute waste from low-priority backlog items. Makes sense as a companion to auto-dispatch.
+
+### Root Cause of 20 PR/day Ceiling
+
+The bottleneck is **not** infrastructure — it is task volume. There are genuinely only ~20 worthwhile tasks per day given the current product stage and team size. The EC2/Claude infrastructure is already capable of 50–80 PRs/day if the task supply existed.
+
+Running 100 simultaneous instances against an empty or low-quality queue would produce:
+- Noise features nobody needs
+- Token burn with no product value
+- PRs that slow review rather than accelerate delivery
+
+### Conclusion
+
+**Do not over-engineer for a throughput target we don't need yet.** 20 PRs/day on focused, high-value work is the correct operating mode now.
+
+Throughput will improve organically by:
+1. **Epic decomposition** — when a large feature is scoped, break it into 15–30 atomic tasks upfront rather than treating it as one PR
+2. **Better task inflow** — user feedback, error monitoring, SEO signals, and competitor analysis will grow the natural task supply as the product matures
+3. **Auto-dispatch when the queue is full** — implement the Notion claim/release + EC2 self-terminate pattern only when there are consistently more approved tasks than active instances
+
+Revisit this when the backlog problem is real, not hypothetical.
+
+---
+
 ## "Bounced" Users Investigation — info@pmps.ai, admin@btstravel.be (2026-05-04)
 
 ### Context
