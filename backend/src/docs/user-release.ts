@@ -88,6 +88,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Unsubscribed Leads No Longer Receive Emails from Sequences',
+      '- Leads who clicked unsubscribe are now detected before each sequence step and their enrollment is exited immediately',
+      '- The Sequences UI now shows these leads with an "Unsubscribed" badge (red) instead of "Exited"',
+      '- The unsubscribed count in sequence enrollment stats now reflects these leads correctly',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Emma Voice Mode — Barge-In and Error Visibility',
