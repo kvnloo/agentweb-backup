@@ -4099,3 +4099,52 @@ The quality agent tool approach was set aside for the following reasons:
 ### Future Consideration
 
 Revisit if prompt-level instruction proves insufficient — i.e., Emma continues producing generic content despite the quality standard directive. At that point, Option 1 (standalone `assess_quality` tool with content-type-specific rubrics) is the recommended starting point.
+
+## Emma in Internal Slack Channels — Investigation (2026-05-08)
+
+### Context
+
+Investigated how to enable Emma to respond meaningfully when team members @mention her in AgentWeb's internal Slack workspace. The goal: a platform-wide Emma that can answer engineering and product questions in internal channels, not just serve customer accounts.
+
+### The Core Tension
+
+Emma's context pipeline is account-scoped. Every response call flows through:
+1. `generateChatResponse()` (`chatbotService.ts:3610`) — requires a `userId` to anchor context
+2. `searchPlatformKnowledgeBase(userId)` — queries Vertex AI Discovery Engine indexed per user
+3. Per-session tool sets injected based on the current page URL and user account configs
+
+In internal Slack channels there is no customer `userId` to anchor on. Calling Emma without this identity produces a context-starved response with no product knowledge, no KB results, and the wrong (customer-facing) system prompt tone.
+
+### Existing Slack Infrastructure (Reusable)
+
+The current `app_mention` event handler (`slack.ts:566`) already:
+- Detects `@Emma` mentions and creates Agent Mode sessions
+- Posts threaded replies via `handleSlackSessionResponse()`
+- Maps threads to sessions (settings key: `slack_thread_{channel}_{ts}`)
+- Has a Slack client instance and `postThinkingMessage()` / `postThreadResponse()` utilities
+
+This plumbing is ~100% reusable. The work is in defining a new identity and context model for the internal context.
+
+### Options Explored
+
+**Option 1: Platform Admin Identity (Low effort)**
+Designate a special internal identity (e.g. `emma-internal@agentweb.pro`). Route `app_mention` events from the internal workspace (`teamId` check) to this identity. Pre-populate its KB in Vertex AI with product docs, release notes, and runbooks. Emma's existing KB search pipeline works unchanged — just a different `userId`.
+
+**Option 2: Dynamic Context Aggregation (Medium effort)**
+Detect internal workspace via `teamId`, then compose context chunks before calling `generateChatResponse()`: recent PRs (`gh` API), deployment status, sprint tasks (Notion MCP), recent backend errors. Inject as structured context — same pattern Emma uses for page-aware tools.
+
+**Option 3: Separate Internal System Prompt + Tool Set (Medium effort)**
+Add `getInternalEmmaSystemContext()` alongside the existing `getEmmaSystemContext()`. Internal variant uses engineering-appropriate tone and exposes internal tools: `get_recent_prs`, `get_deployment_status`, `get_sprint_tasks`, `search_codebase_docs`. Add a parallel `handleInternalSlackSession()` path in the Slack event handler. Session storage and threading reused as-is.
+
+**Option 4: Clarifying-Question Meta-Tool (High effort)**
+Internal Emma gets a `clarify_context` tool. When context is insufficient, she asks a follow-up in the thread before answering. Combined with Option 3's tool set, she can answer "why is the LinkedIn connector failing?" by querying deployment logs, or ask "which user?" if she needs more info.
+
+### Recommended Phased Approach
+
+- **Phase 1 (Options 1 + 3):** Platform admin identity + internal system prompt. Gets Emma functional in internal channels with correct tone. ~1 day of work.
+- **Phase 2 (Option 2):** Layer dynamic context: auto-inject release notes, recent PRs, sprint tasks. ~2 days.
+- **Phase 3 (Option 4):** Clarifying questions + deeper tool integrations once pattern is proven. ~3 days.
+
+### Decision
+
+**Stick with the current account-scoped Emma implementation for now.** Internal Slack coverage is not a near-term priority. No changes planned in the immediate roadmap. Revisit when the team actively needs Emma to answer platform-level questions in Slack — at that point Phase 1 (admin identity + internal system prompt) is the recommended starting point given it reuses the most existing infrastructure.
