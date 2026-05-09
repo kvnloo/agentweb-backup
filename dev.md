@@ -1,3 +1,33 @@
+## SeaDance 2.0 Video Generation — Investigation & Blocked (2026-05-09)
+
+### Context
+
+Investigated adding SeaDance 2.0 (ByteDance's advanced video model) as an alternative to Google Veo for video generation. SeaDance 2.0 offers flexible durations (4–15s native), multiple resolutions, aspect ratio control, and native audio — advantages over Veo's fixed 8s/clip limit.
+
+### Approach Attempted
+
+Initial plan was to integrate via **Runway AI** (Gen-4 Turbo) as a well-supported third-party provider with an existing API. However, Runway Pro subscription requires a **debit card** — credit cards and other payment methods are not accepted — making sign-up impossible at this time.
+
+SeaDance 2.0 itself (`bytedance/seedance-2.0`) is currently available on **fal.ai**, but fal.ai's pricing for this model is not yet stable/published, making it a less reliable integration target.
+
+### Status: Parked
+
+Will revisit when one of the following becomes available:
+- ByteDance offers a direct API and subscription for SeaDance (no third-party intermediary)
+- A reliable third-party API (fal.ai pricing stabilizes, or another provider) is confirmed
+
+### Proposed Design (for when we revisit)
+
+See investigation notes from 2026-05-09 conversation. Summary:
+- Add `@fal-ai/client` npm package to backend
+- Add secrets: `dev/AgentWeb/Fal/VideoApi` and `prod/AgentWeb/Fal/VideoApi`
+- Add `generateWithSeadance2()` in `backend/src/services/videoGeneration.ts` using `fal.subscribe("bytedance/seedance-2.0/text-to-video")` or `image-to-video` endpoint
+- fal.ai accepts image URLs directly (no base64 conversion needed, simpler than Veo)
+- Multi-clip threshold: 15s native (vs. Veo's 8s), so fewer splits needed
+- Files to update: `videoGeneration.ts`, `agentModeService.ts`, `emma/tools.ts`, `AdminDashboard.tsx`, `TaskDetails.tsx`
+
+---
+
 ## Scaling to 100 PRs/Day — Investigation & Conclusion (2026-05-08)
 
 ### Context
