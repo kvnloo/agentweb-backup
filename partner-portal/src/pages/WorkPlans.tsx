@@ -45,10 +45,18 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
 
+/** Backend-enforced cap. Keep in sync with USER_INSTRUCTIONS_MAX_LENGTH in
+ *  backend/src/services/workPlanService.ts. */
+const USER_INSTRUCTIONS_MAX_LENGTH = 500;
+
 interface WorkPlanStep {
   stepCount: number;
   title: string;
   description?: string;
+  /** User-facing guidance shown when a customer expands this step in the
+   *  Agent Mode plan view. The legacy `description` field is the LLM's
+   *  raw system prompt and must NEVER be rendered to end users. */
+  userInstructions?: string;
   requiredFunctionCalls?: string[];
 }
 
@@ -709,9 +717,35 @@ export default function WorkPlans() {
                     <TextField
                       value={step.description || ""}
                       onChange={(e) => updateStep(i, "description", e.target.value)}
-                      placeholder="Description (optional)"
+                      placeholder="LLM prompt for this step (not shown to users)"
                       size="small"
                       fullWidth
+                      sx={{ mb: 0.5 }}
+                    />
+                    <TextField
+                      value={step.userInstructions || ""}
+                      onChange={(e) => {
+                        const next = e.target.value.slice(0, USER_INSTRUCTIONS_MAX_LENGTH);
+                        updateStep(i, "userInstructions", next);
+                      }}
+                      placeholder="User Instructions: what should the user do at this step? What should they expect? (Shown to users when they expand this step.)"
+                      size="small"
+                      fullWidth
+                      multiline
+                      minRows={2}
+                      maxRows={4}
+                      inputProps={{ maxLength: USER_INSTRUCTIONS_MAX_LENGTH }}
+                      helperText={`${step.userInstructions?.length ?? 0} / ${USER_INSTRUCTIONS_MAX_LENGTH}`}
+                      FormHelperTextProps={{
+                        sx: {
+                          textAlign: "right",
+                          m: 0,
+                          color:
+                            (step.userInstructions?.length ?? 0) >= USER_INSTRUCTIONS_MAX_LENGTH
+                              ? "error.main"
+                              : "text.secondary",
+                        },
+                      }}
                       sx={{ mb: 0.5 }}
                     />
                     <Autocomplete
