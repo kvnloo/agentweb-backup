@@ -1,0 +1,44 @@
+[relay]
+poll_seconds = 60
+command_prefix = "codex:"
+dry_run = true
+mark_seen = true
+
+# Only these addresses can issue jobs.
+allowed_senders = [
+  "you@example.com",
+]
+
+[imap]
+host = "imap.example.com"
+port = 993
+username = "${CODEX_RELAY_IMAP_USER}"
+password = "${CODEX_RELAY_IMAP_PASSWORD}"
+mailbox = "INBOX"
+
+[smtp]
+host = "smtp.example.com"
+port = 587
+username = "${CODEX_RELAY_SMTP_USER}"
+password = "${CODEX_RELAY_SMTP_PASSWORD}"
+from_addr = "codex-relay@example.com"
+use_tls = true
+
+[codex]
+binary = "codex"
+# Point this at the repo Codex should work inside.
+cwd = "/Users/ruiwang/Documents/GitHub/your-repo"
+sandbox = "workspace-write"
+timeout_seconds = 1800
+model = ""
+reasoning_effort = ""
+extra_args = []
+browser_enabled = true
+browser_backend = "chrome"
+browser_headless = false
+browser_profile_dir = "~/.codex-relay/chrome-profile"
+browser_max_chars = 12000
+session_ref = ""
+session_alias = ""
+new_session = false
+session_store_path = "~/.codex-relay/sessions.json"

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-agent-relay"
+version = "0.1.0"
+description = "HTTP relay server that bridges AgentWeb/Emma to a local Codex agent"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.45",
+]
+
+[project.scripts]
+codex-relay = "codex_relay.cli:main"
+codex-relay-browser = "codex_relay.browser:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

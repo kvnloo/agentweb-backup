@@ -3336,6 +3336,144 @@ router.get('/lists/:listId/leads/:leadId/engagements', async (req: Request, res:
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages
+ * @desc Sync LinkedIn messages from Unipile for a lead into CRM engagement history
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if ((list as any).userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    const leadLinkedIn = (lead.linkedin as string | undefined)?.toLowerCase();
+    if (!leadLinkedIn) {
+      return res.status(400).json({ message: 'Lead has no LinkedIn URL — add a LinkedIn profile URL to this lead first' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const providerId = await linkedInOutreachService.resolveProviderId(leadLinkedIn, true, accountId);
+    // Pass accountId so Unipile can identify which side is is_sender=1 (outbound vs inbound).
+    // Key eventId on msg.provider_id (stable) not msg.id (ephemeral) to prevent duplicate rows on re-sync.
+    const messages = await linkedInOutreachService.getMessagesWithContact(providerId, accountId);
+
+    const { emailEventsDb } = await import('../services/emailEventsDb');
+    const emailDomain = `linkedin-${listId}`;
+    const syncAt = new Date().toISOString();
+
+    await Promise.all([
+      ...messages.map((msg: any) => emailEventsDb.addLinkedInMessageEvent({
+        eventId: `linkedin_msg_${msg.provider_id}`,
+        emailDomain,
+        leadEmail: leadLinkedIn,
+        eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',
+        text: msg.text ?? null,
+        timestamp: msg.timestamp,
+        senderId: msg.sender_id,
+        messageProviderId: msg.provider_id,
+      })),
+      crmDb.updateLeadLinkedInSyncAt(listId, leadId, syncAt),
+    ]);
+
+    return res.json({ synced: messages.length, syncedAt: syncAt });
+  } catch (error: any) {
+    console.error('Error syncing LinkedIn messages:', error);
+    return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn messages' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message
+ * @desc Send a LinkedIn direct message to a lead via Unipile
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+    const { message } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ message: 'message is required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    const leadLinkedIn = (lead.linkedin as string | undefined)?.trim();
+    if (!leadLinkedIn) {
+      return res.status(400).json({ message: 'Lead has no LinkedIn URL — add a LinkedIn profile URL first' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+
+    await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
+
+    // Record the engagement
+    const { emailEventsDb } = await import('../services/emailEventsDb');
+    const emailDomain = `linkedin-${listId}`;
+    const leadLinkedInKey = leadLinkedIn.toLowerCase();
+    await emailEventsDb.addLinkedInMessageEvent({
+      eventId: `linkedin_sent_${Date.now()}_${leadId}`,
+      emailDomain,
+      leadEmail: leadLinkedInKey,
+      eventType: 'linkedin.message.sent',
+      text: message.trim(),
+      timestamp: new Date().toISOString(),
+      senderId: accountId,
+      messageProviderId: '',
+    });
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    console.error('Error sending LinkedIn message:', error);
+    if (error.message?.startsWith('Cannot send message:')) {
+      return res.status(400).json({ message: error.message });
+    }
+    return res.status(500).json({ message: error.message || 'Failed to send LinkedIn message' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/:leadId/engagements
  * @desc Add a custom engagement event to a lead
  * @access Private

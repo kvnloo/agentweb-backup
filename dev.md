@@ -1,3 +1,72 @@
+## SeaDance 2.0 Video Generation — Investigation & Blocked (2026-05-09)
+
+### Context
+
+Investigated adding SeaDance 2.0 (ByteDance's advanced video model) as an alternative to Google Veo for video generation. SeaDance 2.0 offers flexible durations (4–15s native), multiple resolutions, aspect ratio control, and native audio — advantages over Veo's fixed 8s/clip limit.
+
+### Approach Attempted
+
+Initial plan was to integrate via **Runway AI** (Gen-4 Turbo) as a well-supported third-party provider with an existing API. However, Runway Pro subscription requires a **debit card** — credit cards and other payment methods are not accepted — making sign-up impossible at this time.
+
+SeaDance 2.0 itself (`bytedance/seedance-2.0`) is currently available on **fal.ai**, but fal.ai's pricing for this model is not yet stable/published, making it a less reliable integration target.
+
+### Status: Parked
+
+Will revisit when one of the following becomes available:
+- ByteDance offers a direct API and subscription for SeaDance (no third-party intermediary)
+- A reliable third-party API (fal.ai pricing stabilizes, or another provider) is confirmed
+
+### Proposed Design (for when we revisit)
+
+See investigation notes from 2026-05-09 conversation. Summary:
+- Add `@fal-ai/client` npm package to backend
+- Add secrets: `dev/AgentWeb/Fal/VideoApi` and `prod/AgentWeb/Fal/VideoApi`
+- Add `generateWithSeadance2()` in `backend/src/services/videoGeneration.ts` using `fal.subscribe("bytedance/seedance-2.0/text-to-video")` or `image-to-video` endpoint
+- fal.ai accepts image URLs directly (no base64 conversion needed, simpler than Veo)
+- Multi-clip threshold: 15s native (vs. Veo's 8s), so fewer splits needed
+- Files to update: `videoGeneration.ts`, `agentModeService.ts`, `emma/tools.ts`, `AdminDashboard.tsx`, `TaskDetails.tsx`
+
+---
+
+## Scaling to 100 PRs/Day — Investigation & Conclusion (2026-05-08)
+
+### Context
+
+Explored how to scale development throughput from ~20 PRs/day to 100+ PRs/day, inspired by reports that the Claude Code founder achieves this scale using parallel Claude Code sessions and the `/loop` feature.
+
+### Options Investigated
+
+**Option 1: Slot-based parallelism on a single EC2**
+Multiple git worktrees on one instance, each running on offset ports (3001/5173/5174 for slot 0, 3011/5183/5184 for slot 1, etc.). Each slot gets its own DynamoDB table prefix (`Dev1-`, `Dev2-`, etc.) for data isolation. Rejected: complex to manage, slots contend for RAM, and the existing architecture already solves this more cleanly.
+
+**Option 2: One EC2 per Claude session (current architecture extended)**
+The current system already does the right thing — one EC2 instance per task, each fully isolated by default (separate filesystem, ports, tmux sessions, logs). The only missing piece is auto-dispatch: today a human manually launches each EC2 and terminates it when done. Auto-dispatch (claim task from Notion queue on boot, self-terminate on completion) would be ~100 lines of shell and is straightforward to implement when needed.
+
+**Option 3: Approved task queue gate**
+Add an `approved` status in Notion so auto-dispatch only pulls from curated tasks. Eliminates compute waste from low-priority backlog items. Makes sense as a companion to auto-dispatch.
+
+### Root Cause of 20 PR/day Ceiling
+
+The bottleneck is **not** infrastructure — it is task volume. There are genuinely only ~20 worthwhile tasks per day given the current product stage and team size. The EC2/Claude infrastructure is already capable of 50–80 PRs/day if the task supply existed.
+
+Running 100 simultaneous instances against an empty or low-quality queue would produce:
+- Noise features nobody needs
+- Token burn with no product value
+- PRs that slow review rather than accelerate delivery
+
+### Conclusion
+
+**Do not over-engineer for a throughput target we don't need yet.** 20 PRs/day on focused, high-value work is the correct operating mode now.
+
+Throughput will improve organically by:
+1. **Epic decomposition** — when a large feature is scoped, break it into 15–30 atomic tasks upfront rather than treating it as one PR
+2. **Better task inflow** — user feedback, error monitoring, SEO signals, and competitor analysis will grow the natural task supply as the product matures
+3. **Auto-dispatch when the queue is full** — implement the Notion claim/release + EC2 self-terminate pattern only when there are consistently more approved tasks than active instances
+
+Revisit this when the backlog problem is real, not hypothetical.
+
+---
+
 ## "Bounced" Users Investigation — info@pmps.ai, admin@btstravel.be (2026-05-04)
 
 ### Context
@@ -4060,3 +4129,52 @@ The quality agent tool approach was set aside for the following reasons:
 ### Future Consideration
 
 Revisit if prompt-level instruction proves insufficient — i.e., Emma continues producing generic content despite the quality standard directive. At that point, Option 1 (standalone `assess_quality` tool with content-type-specific rubrics) is the recommended starting point.
+
+## Emma in Internal Slack Channels — Investigation (2026-05-08)
+
+### Context
+
+Investigated how to enable Emma to respond meaningfully when team members @mention her in AgentWeb's internal Slack workspace. The goal: a platform-wide Emma that can answer engineering and product questions in internal channels, not just serve customer accounts.
+
+### The Core Tension
+
+Emma's context pipeline is account-scoped. Every response call flows through:
+1. `generateChatResponse()` (`chatbotService.ts:3610`) — requires a `userId` to anchor context
+2. `searchPlatformKnowledgeBase(userId)` — queries Vertex AI Discovery Engine indexed per user
+3. Per-session tool sets injected based on the current page URL and user account configs
+
+In internal Slack channels there is no customer `userId` to anchor on. Calling Emma without this identity produces a context-starved response with no product knowledge, no KB results, and the wrong (customer-facing) system prompt tone.
+
+### Existing Slack Infrastructure (Reusable)
+
+The current `app_mention` event handler (`slack.ts:566`) already:
+- Detects `@Emma` mentions and creates Agent Mode sessions
+- Posts threaded replies via `handleSlackSessionResponse()`
+- Maps threads to sessions (settings key: `slack_thread_{channel}_{ts}`)
+- Has a Slack client instance and `postThinkingMessage()` / `postThreadResponse()` utilities
+
+This plumbing is ~100% reusable. The work is in defining a new identity and context model for the internal context.
+
+### Options Explored
+
+**Option 1: Platform Admin Identity (Low effort)**
+Designate a special internal identity (e.g. `emma-internal@agentweb.pro`). Route `app_mention` events from the internal workspace (`teamId` check) to this identity. Pre-populate its KB in Vertex AI with product docs, release notes, and runbooks. Emma's existing KB search pipeline works unchanged — just a different `userId`.
+
+**Option 2: Dynamic Context Aggregation (Medium effort)**
+Detect internal workspace via `teamId`, then compose context chunks before calling `generateChatResponse()`: recent PRs (`gh` API), deployment status, sprint tasks (Notion MCP), recent backend errors. Inject as structured context — same pattern Emma uses for page-aware tools.
+
+**Option 3: Separate Internal System Prompt + Tool Set (Medium effort)**
+Add `getInternalEmmaSystemContext()` alongside the existing `getEmmaSystemContext()`. Internal variant uses engineering-appropriate tone and exposes internal tools: `get_recent_prs`, `get_deployment_status`, `get_sprint_tasks`, `search_codebase_docs`. Add a parallel `handleInternalSlackSession()` path in the Slack event handler. Session storage and threading reused as-is.
+
+**Option 4: Clarifying-Question Meta-Tool (High effort)**
+Internal Emma gets a `clarify_context` tool. When context is insufficient, she asks a follow-up in the thread before answering. Combined with Option 3's tool set, she can answer "why is the LinkedIn connector failing?" by querying deployment logs, or ask "which user?" if she needs more info.
+
+### Recommended Phased Approach
+
+- **Phase 1 (Options 1 + 3):** Platform admin identity + internal system prompt. Gets Emma functional in internal channels with correct tone. ~1 day of work.
+- **Phase 2 (Option 2):** Layer dynamic context: auto-inject release notes, recent PRs, sprint tasks. ~2 days.
+- **Phase 3 (Option 4):** Clarifying questions + deeper tool integrations once pattern is proven. ~3 days.
+
+### Decision
+
+**Stick with the current account-scoped Emma implementation for now.** Internal Slack coverage is not a near-term priority. No changes planned in the immediate roadmap. Revisit when the team actively needs Emma to answer platform-level questions in Slack — at that point Phase 1 (admin identity + internal system prompt) is the recommended starting point given it reuses the most existing infrastructure.

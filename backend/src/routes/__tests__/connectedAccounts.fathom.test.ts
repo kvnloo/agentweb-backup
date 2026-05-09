@@ -156,7 +156,7 @@ describe('Connected Accounts - Fathom', () => {
   });
 
   describe('GET /api/oauth/connected-accounts - Fathom account in list', () => {
-    it('should show Fathom OAuth account with refresh token as permanently connected', async () => {
+    it('should show Fathom account as active when live API check passes', async () => {
       const mockAccounts = [
         {
           platform: 'fathom',
@@ -168,21 +168,46 @@ describe('Connected Accounts - Fathom', () => {
             account_type: 'oauth',
             token_expires_at: Date.now() + 3600 * 1000,
             access_token: 'oauth-token',
-            refresh_token: 'refresh-token',
           },
         },
       ];
 
       (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+      mockValidateApiKey.mockResolvedValue(true);
 
       const response = await request(app).get('/api/oauth/connected-accounts');
 
       expect(response.status).toBe(200);
       expect(response.body.accounts).toHaveLength(1);
       expect(response.body.accounts[0].platform).toBe('fathom');
-      // Accounts with refresh_token show as permanently connected
       expect(response.body.accounts[0].status).toBe('active');
       expect(response.body.accounts[0].expiry_message).toBe('Connected');
+    });
+
+    it('should show Fathom account as disconnected when live API check returns 401', async () => {
+      const mockAccounts = [
+        {
+          platform: 'fathom',
+          account_id: 'fathom-user-123',
+          account_name: 'Fathom',
+          created_at: '2026-03-16T00:00:00.000Z',
+          updated_at: '2026-03-16T00:00:00.000Z',
+          config: {
+            account_type: 'oauth',
+            token_expires_at: Date.now() + 3600 * 24 * 365 * 4 * 1000, // far future
+            access_token: 'revoked-token',
+          },
+        },
+      ];
+
+      (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+      mockValidateApiKey.mockResolvedValue(false);
+
+      const response = await request(app).get('/api/oauth/connected-accounts');
+
+      expect(response.status).toBe(200);
+      expect(response.body.accounts[0].status).toBe('disconnected');
+      expect(response.body.accounts[0].expiry_message).toContain('reconnect');
     });
   });
 });

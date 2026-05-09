@@ -15,7 +15,8 @@ import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition } from 
 import { resendService } from './resendService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
-import { substituteVariables } from '../utils/emailVariables';
+import { isDoNotContact } from '../utils/leadContactStatus';
+import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { settingsService } from './settingsService';
 
 export async function processDueEnrollments(): Promise<{
@@ -109,7 +110,23 @@ async function processEnrollment(
   };
 
   const subject = substituteVariables(step.subject, emailVars);
-  const bodyHtml = substituteVariables(step.bodyHtml, emailVars);
+  let bodyHtml = substituteVariables(step.bodyHtml, emailVars);
+
+  // Rewrite S3 image URLs through the /asset/ proxy so image hostnames match the
+  // sending domain — reduces spam filtering by Gmail and other providers.
+  // Use EMAIL_ASSET_BASE_URL so emails always contain publicly accessible URLs,
+  // even when sent from a dev environment where BACKEND_URL is a private IP.
+  const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
+  bodyHtml = rewriteS3ImageUrls(bodyHtml, assetBaseUrl);
+
+  // Convert youtu.be short URLs to full youtube.com URLs to avoid Gmail spam filters.
+  bodyHtml = normalizeYoutubeUrls(bodyHtml);
+
+  // Inject unsubscribe URL — replaces {{unsubscribeUrl}} variable, updates an existing
+  // unsubscribe anchor href, or appends a footer if no unsubscribe link is present.
+  const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+  const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
+  bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
   // Resolve sender config — use step's senderId if set, else account default
   const senderEmail = resolveSenderEmail(user, senderConfig, step.senderId);
@@ -155,9 +172,20 @@ async function checkExitConditions(
 ): Promise<'converted' | 'engagement' | 'unsubscribed' | null> {
   const { exitConditions } = sequence;
 
+  // Fetch lead once — needed for lifecycle and unsubscribe checks
+  let lead: any = null;
+  if (exitConditions.onLifecycleChange?.length || exitConditions.onUnsubscribe) {
+    lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+  }
+
+  // Check if lead has unsubscribed — always enforced (onUnsubscribe is always true)
+  if (exitConditions.onUnsubscribe && lead && isDoNotContact(lead)) {
+    console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} has unsubscribed`);
+    return 'unsubscribed';
+  }
+
   // Check lifecycle-based exit (e.g. lead became "paying")
   if (exitConditions.onLifecycleChange?.length) {
-    const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
     if (lead?.lifecycle && exitConditions.onLifecycleChange.includes(lead.lifecycle as any)) {
       return 'converted';
     }

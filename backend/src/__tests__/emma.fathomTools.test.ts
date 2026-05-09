@@ -148,12 +148,25 @@ describe('fathom_get_meetings', () => {
 
   it('handles Fathom API errors gracefully', async () => {
     mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
-    mockedAxios.get = jest.fn().mockRejectedValue(new Error('Request failed with status code 401'));
+    mockedAxios.get = jest.fn().mockRejectedValue(new Error('Network Error'));
 
     const result = await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('Failed to fetch meetings');
+  });
+
+  it('returns reconnect message when token is invalid (401)', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn().mockRejectedValue({
+      response: { status: 401 },
+      message: 'Request failed with status code 401',
+    });
+
+    const result = await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('reconnect');
   });
 });
 
@@ -232,5 +245,18 @@ describe('fathom_get_transcript', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('Failed to fetch transcript');
+  });
+
+  it('returns reconnect message when token is invalid (401)', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn().mockRejectedValue({
+      response: { status: 401 },
+      message: 'Request failed with status code 401',
+    });
+
+    const result = await executeTool('fathom_get_transcript', { recording_id: 101 }, { userId: 'user-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('reconnect');
   });
 });

@@ -28,6 +28,7 @@ jest.mock("aws-sdk", () => ({
           Promise.resolve({ SecretString: '{"apiKey":"test-key"}' }),
       }),
     })),
+    S3: jest.fn().mockImplementation(() => ({ putObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }) })),
     config: { update: jest.fn() },
   },
   DynamoDB: {
@@ -49,6 +50,7 @@ jest.mock("aws-sdk", () => ({
         Promise.resolve({ SecretString: '{"apiKey":"test-key"}' }),
     }),
   })),
+  S3: jest.fn().mockImplementation(() => ({ putObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }) })),
   config: { update: jest.fn() },
 }));
 

@@ -132,6 +132,31 @@ export class SocialEngagementExecutor {
 
         console.log(`[Executor] Engaging as: "${engagingConnection.account_name}" (${engagingAccountId})`);
 
+        // Re-validate the action against the current config — the user may have changed
+        // settings after this action was scheduled.
+        const engagerSettings = engagingConnection.engagementSettings || {};
+        if (targetType === 'comment' && engagerSettings.commentPreferredActions) {
+            // comment auto-reply: engager IS the post owner, check commentPreferredActions
+            const commentPrefs: string[] = engagerSettings.commentPreferredActions;
+            const requiresReply = actionType === 'reply_comment' || actionType === 'like_and_reply_comment';
+            const requiresLike = actionType === 'like_comment' || actionType === 'like_and_reply_comment';
+            const replyRevoked = requiresReply && !commentPrefs.includes('reply');
+            const likeRevoked = requiresLike && !requiresReply && !commentPrefs.includes('like');
+            if (replyRevoked || likeRevoked) {
+                console.log(`[Executor] Skipping ${actionType} on ${scheduleId}: action no longer permitted by current commentPreferredActions=${JSON.stringify(commentPrefs)}`);
+                await this.markActionDone(scheduleId);
+                return;
+            }
+        } else if (targetType !== 'comment' && engagerSettings.preferredActions) {
+            // post engagement: check engager's preferredActions
+            const postPrefs: string[] = engagerSettings.preferredActions;
+            if (actionType === 'comment' && !postPrefs.includes('comment')) {
+                console.log(`[Executor] Skipping ${actionType} on ${scheduleId}: action no longer permitted by current preferredActions=${JSON.stringify(postPrefs)}`);
+                await this.markActionDone(scheduleId);
+                return;
+            }
+        }
+
         // Load engagement memory and personality for personalized comments
         const engagerMemory = engagingConnection.engagementMemory?.content || '';
         const engagerPersonality = engagingConnection.engagementSettings?.personality;

@@ -230,7 +230,7 @@ export class DeepResearchService {
       console.log('Deep research completed successfully');
 
       // Extract the research report from the interaction outputs
-      const outputs = interaction.outputs || [];
+      const outputs = (interaction as any).outputs || [];
       if (outputs.length === 0) {
         return {
           success: false,

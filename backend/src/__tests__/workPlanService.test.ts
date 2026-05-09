@@ -67,6 +67,80 @@ describe('WorkPlanService', () => {
     });
   });
 
+  describe('createWorkPlan — userInstructions validation', () => {
+    it('rejects when a step.userInstructions exceeds 500 characters', async () => {
+      const tooLong = 'a'.repeat(501);
+      await expect(workPlanService.createWorkPlan({
+        title: 'Test Plan',
+        steps: [{ stepCount: 1, title: 'Step 1', userInstructions: tooLong }],
+        visibility: 'private',
+        isBuiltIn: false,
+        ownerId: 'user1',
+      })).rejects.toThrow(/userInstructions.*500/i);
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('rejects when step.userInstructions is not a string', async () => {
+      await expect(workPlanService.createWorkPlan({
+        title: 'Test Plan',
+        steps: [{ stepCount: 1, title: 'Step 1', userInstructions: 42 as any }],
+        visibility: 'private',
+        isBuiltIn: false,
+        ownerId: 'user1',
+      })).rejects.toThrow(/userInstructions.*string/i);
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('rejects when ANY one of multiple steps has invalid userInstructions', async () => {
+      await expect(workPlanService.createWorkPlan({
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', userInstructions: 'short and fine' },
+          { stepCount: 2, title: 'Step 2', userInstructions: 'b'.repeat(600) },
+          { stepCount: 3, title: 'Step 3' },
+        ],
+        visibility: 'private',
+        isBuiltIn: false,
+        ownerId: 'user1',
+      })).rejects.toThrow(/step 2.*userInstructions.*500/i);
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('persists step.userInstructions when valid (≤500 chars)', async () => {
+      const text = 'Click "Generate" then upload the result. Expect a CSV.';
+      const result = await workPlanService.createWorkPlan({
+        title: 'Test Plan',
+        steps: [{ stepCount: 1, title: 'Step 1', userInstructions: text }],
+        visibility: 'private',
+        isBuiltIn: false,
+        ownerId: 'user1',
+      });
+      expect(result.steps[0].userInstructions).toBe(text);
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        Item: expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({ userInstructions: text }),
+          ]),
+        }),
+      }));
+    });
+  });
+
+  describe('updateWorkPlan — userInstructions validation', () => {
+    it('rejects update when a step.userInstructions exceeds 500 characters', async () => {
+      await expect(workPlanService.updateWorkPlan({
+        planId: 'p1',
+        title: 'Test Plan',
+        steps: [{ stepCount: 1, title: 'Step 1', userInstructions: 'x'.repeat(501) }],
+        visibility: 'private',
+        isBuiltIn: false,
+        createdAt: mockTimestamp,
+        updatedAt: mockTimestamp,
+      })).rejects.toThrow(/userInstructions.*500/i);
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+  });
+
   describe('getWorkPlan', () => {
     it('should return plan by planId', async () => {
       const plan = { planId: 'p1', title: 'Plan', steps: [] };

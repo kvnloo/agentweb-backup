@@ -1411,7 +1411,7 @@ Sent via AgentWeb: ${customerFrontendUrl}
       `;
 
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
-      await this.sendEmail(emailList, emailSubject, text, html);
+      await this.sendEmailStrict(emailList, emailSubject, text, html);
       console.log(`Session notification email sent to: ${emailList.join(', ')}`);
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];

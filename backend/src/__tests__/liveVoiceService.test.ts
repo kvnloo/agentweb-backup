@@ -448,7 +448,7 @@ describe('turnComplete handling', () => {
 // ---------------------------------------------------------------------------
 
 describe('emotion tag stripping', () => {
-  it('strips [warm] and other emotion tags from inline text before emitting live:transcript', async () => {
+  it('passes inline text through unchanged to live:transcript', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
     await startLiveSession('session-emotion-inline', 'socket-1', emitFn, 'test-user-id');
@@ -456,19 +456,17 @@ describe('emotion tag stripping', () => {
     callbacks['onmessage']?.({
       serverContent: {
         modelTurn: {
-          parts: [{ text: '[warm] Great news! [excited] Your CTR is up 12%.' }],
+          parts: [{ text: 'Great news! Your CTR is up 12%.' }],
         },
       },
     });
 
     const transcriptCall = emitFn.mock.calls.find(([event]) => event === 'live:transcript');
     expect(transcriptCall).toBeDefined();
-    expect(transcriptCall![1].text).not.toMatch(/\[warm\]/i);
-    expect(transcriptCall![1].text).not.toMatch(/\[excited\]/i);
     expect(transcriptCall![1].text).toContain('Great news!');
   });
 
-  it('strips emotion tags that include punctuation like [warm,] or [pause.]', async () => {
+  it('passes inline text with punctuation through unchanged to live:transcript', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
     await startLiveSession('session-emotion-punctuation', 'socket-1', emitFn, 'test-user-id');
@@ -476,20 +474,18 @@ describe('emotion tag stripping', () => {
     callbacks['onmessage']?.({
       serverContent: {
         modelTurn: {
-          parts: [{ text: '[warm,] Hello there! [pause.] Your results are in.' }],
+          parts: [{ text: 'Hello there! Your results are in.' }],
         },
       },
     });
 
     const transcriptCall = emitFn.mock.calls.find(([event]) => event === 'live:transcript');
     expect(transcriptCall).toBeDefined();
-    expect(transcriptCall![1].text).not.toMatch(/\[warm/i);
-    expect(transcriptCall![1].text).not.toMatch(/\[pause/i);
     expect(transcriptCall![1].text).toContain('Hello there!');
     expect(transcriptCall![1].text).toContain('Your results are in.');
   });
 
-  it('strips emotion tags from outputTranscription before emitting and saving', async () => {
+  it('passes outputTranscription text through unchanged for emitting and saving', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
     await startLiveSession('session-emotion-output', 'socket-1', emitFn, 'test-user-id');
@@ -497,7 +493,7 @@ describe('emotion tag stripping', () => {
 
     callbacks['onmessage']?.({
       serverContent: {
-        outputTranscription: { text: '[thoughtful] Your campaigns are doing well. [pause] Let me check the numbers.' },
+        outputTranscription: { text: 'Your campaigns are doing well. Let me check the numbers.' },
       },
     });
     callbacks['onmessage']?.({
@@ -508,12 +504,11 @@ describe('emotion tag stripping', () => {
     await Promise.resolve();
 
     const transcriptCall = emitFn.mock.calls.find(([event]) => event === 'live:transcript');
-    expect(transcriptCall![1].text).not.toMatch(/\[(thoughtful|pause)\]/i);
     expect(transcriptCall![1].text).toContain('Your campaigns are doing well.');
 
     const saveCall = mockAddMessagesToSession.mock.calls[0];
     const savedContent: string = saveCall[1].find((m: any) => m.role === 'assistant')?.content ?? '';
-    expect(savedContent).not.toMatch(/\[(thoughtful|pause)\]/i);
+    expect(savedContent).toContain('Your campaigns are doing well.');
   });
 
   it('preserves inter-chunk spacing when Gemini streams words in separate chunks', async () => {
@@ -543,20 +538,19 @@ describe('emotion tag stripping', () => {
     expect(turnCompleteCall![1].assistantText).not.toContain("I've gotthem!");
   });
 
-  it('strips emotion tags from inputTranscription (user speech transcript)', async () => {
+  it('passes inputTranscription (user speech transcript) through unchanged', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
     await startLiveSession('session-emotion-input', 'socket-1', emitFn, 'test-user-id');
 
     callbacks['onmessage']?.({
       serverContent: {
-        inputTranscription: { text: '[warm] How is my ad spend?' },
+        inputTranscription: { text: 'How is my ad spend?' },
       },
     });
 
     const userTranscriptCall = emitFn.mock.calls.find(([event]) => event === 'live:user-transcript');
     expect(userTranscriptCall).toBeDefined();
-    expect(userTranscriptCall![1].text).not.toMatch(/\[warm\]/i);
     expect(userTranscriptCall![1].text).toContain('How is my ad spend?');
   });
 });
@@ -815,11 +809,13 @@ describe('error handling', () => {
     const callbacks = makeCallbacks();
     await startLiveSession('session-drop', 'socket-1', emitFn, 'test-user-id');
 
-    callbacks['onclose']?.({ reason: 'server closed' });
+    callbacks['onclose']?.({ code: 1006, reason: 'server closed' });
 
     expect(hasLiveSession('session-drop')).toBe(false);
     expect(emitFn).toHaveBeenCalledWith('live:closed', {
       sessionId: 'session-drop',
+      code: 1006,
+      reason: 'server closed',
     });
   });
 });

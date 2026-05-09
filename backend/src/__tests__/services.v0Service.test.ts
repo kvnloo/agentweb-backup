@@ -13,6 +13,8 @@ const mockDelete = jest
   .fn()
   .mockReturnValue({ promise: () => Promise.resolve() });
 
+const mockS3 = { putObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }) };
+
 jest.mock("aws-sdk", () => ({
   __esModule: true,
   default: {
@@ -31,6 +33,7 @@ jest.mock("aws-sdk", () => ({
           Promise.resolve({ SecretString: '{"apiKey":"test-key"}' }),
       }),
     })),
+    S3: jest.fn().mockImplementation(() => mockS3),
     config: { update: jest.fn() },
   },
   DynamoDB: {
@@ -48,6 +51,7 @@ jest.mock("aws-sdk", () => ({
         Promise.resolve({ SecretString: '{"apiKey":"test-key"}' }),
     }),
   })),
+  S3: jest.fn().mockImplementation(() => mockS3),
   config: { update: jest.fn() },
 }));
 

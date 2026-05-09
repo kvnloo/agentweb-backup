@@ -200,6 +200,7 @@ export class AgentModeService {
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private imageApiDefaultModelSettingName = 'agent_mode_image_api_default_model';
+  private videoApiDefaultModelSettingName = 'agent_mode_video_api_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
@@ -234,6 +235,7 @@ export class AgentModeService {
     description: string;
     toolNames: string[];
     category?: string;
+    systemPrompt?: string;
   }> = [
       {
         name: 'Meeting Intelligence',
@@ -271,7 +273,7 @@ export class AgentModeService {
           builtin.name,
           builtin.description,
           builtin.toolNames,
-          undefined, // systemPrompt
+          builtin.systemPrompt,
           true       // isPublished — available immediately
         );
 
@@ -430,6 +432,7 @@ export class AgentModeService {
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/calendarTools');
+        await import('../emma/localAgentTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -569,9 +572,10 @@ export class AgentModeService {
       },
       execute: async (args: any, context: any) => {
         const { emailService } = await import('./emailService');
-        const toList: string[] = Array.isArray(args.to) ? args.to : [args.to];
+        const raw: any[] = Array.isArray(args.to) ? args.to : [args.to];
+        const toList: string[] = raw.filter((e): e is string => typeof e === 'string' && e.length > 0);
         if (toList.length === 0) {
-          throw new Error('At least one email address is required in the "to" field.');
+          throw new Error('At least one valid email address is required in the "to" field.');
         }
         await emailService.sendSessionNotificationEmail(
           toList,
@@ -720,6 +724,26 @@ export class AgentModeService {
       console.error('AgentMode: Error getting image API default model setting:', error);
     }
     // Return undefined to let imageGeneration.ts use its own hardcoded default
+    return undefined;
+  }
+
+  // Supported video API models
+  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+
+  async getVideoApiDefaultModel(): Promise<string | undefined> {
+    try {
+      const setting = await settingsService.getSetting(this.videoApiDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (AgentModeService.VIDEO_API_MODELS.includes(configuredModel)) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported video API default model "${configuredModel}" in settings; using hardcoded default.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting video API default model setting:', error);
+    }
+    // Return undefined to let the video generation service use its own hardcoded default
     return undefined;
   }
 
@@ -2843,6 +2867,17 @@ export class AgentModeService {
 
     // Session Notifications (no email integration required)
     'notify_session',
+
+    // Local Agent Relay (Codex agent running on user's machine)
+    'run_local_agent_task',
+    'check_local_agent_status',
+
+    // S3 overflow retrieval — always available so the LLM can read large tool
+    // responses that were offloaded to S3 by the 10KB overflow mechanism.
+    // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
+    // header but has no tool to retrieve the full content.
+    'search_tool_response',
+    'read_tool_response',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -4923,14 +4958,51 @@ export class AgentModeService {
       }
 
       // Gemini code execution runs in a remote isolated sandbox — it cannot access local file paths
-      // or S3-offloaded tool response paths from previous tool calls. Detect this pattern early so
-      // the LLM knows all data must arrive via file_urls or embedded in analysis_instruction.
+      // or S3-offloaded tool response paths from previous tool calls. When the LLM embeds S3 tool-
+      // response keys in the instruction (a common pattern after read_tool_response), auto-resolve
+      // them by fetching the content from S3 and embedding it inline, rather than failing and
+      // forcing the LLM into a retry loop.
       const localPathPattern = /(?:open|read|load)\s*\(\s*['"`]\/|with open\(['"`]\//i;
       const s3KeyPathPattern = /tool-responses\/[a-z0-9-]{36}\//i;
-      if (localPathPattern.test(analysisInstruction) || s3KeyPathPattern.test(analysisInstruction)) {
+      if (s3KeyPathPattern.test(analysisInstruction)) {
+        // Extract all unique tool-response S3 keys from the instruction
+        const keyMatches = analysisInstruction.match(/tool-responses\/[a-z0-9-]{36}\/[^\s'"`)]+/gi) || [];
+        const uniqueKeys = [...new Set(keyMatches)];
+        let resolved = analysisInstruction;
+        const resolvedKeys: string[] = [];
+        const failedKeys: string[] = [];
+        for (const key of uniqueKeys) {
+          try {
+            const content = await getS3ObjectAsString(key);
+            if (content) {
+              // Replace all occurrences of the key with the actual content inline
+              resolved = resolved.split(key).join(`\n[Content of ${key}]:\n${content}\n`);
+              resolvedKeys.push(key);
+            } else {
+              failedKeys.push(key);
+            }
+          } catch {
+            failedKeys.push(key);
+          }
+        }
+        if (failedKeys.length > 0 && resolvedKeys.length === 0) {
+          return {
+            success: false,
+            message: `The analysis_instruction references tool-response S3 keys that could not be read: ${failedKeys.join(', ')}. Use read_tool_response to load the data first, then embed it directly in analysis_instruction or save it via save_file and pass the URL in file_urls.`
+          };
+        }
+        analysisInstruction = resolved;
+        // Re-check size after resolution
+        if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
+          return {
+            success: false,
+            message: `After resolving tool-response references, the analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). Use save_file to upload the dataset as a .csv or .txt file, then call perform_data_analysis with the returned file URL in file_urls and a concise analysis_instruction.`
+          };
+        }
+      } else if (localPathPattern.test(analysisInstruction)) {
         return {
           success: false,
-          message: `The analysis_instruction references local file paths or tool-response paths (e.g. open('/home/bard/...') or tool-responses/...). The code execution sandbox is remote and isolated — it has no access to any local files or previous tool responses. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
+          message: `The analysis_instruction references local file paths (e.g. open('/home/bard/...')). The code execution sandbox is remote and isolated — it has no access to any local files. All data must be provided via: (1) file_urls — pass S3 URLs of files (use save_file to upload data and get a URL first), or (2) analysis_instruction — embed the data directly as text if it is small enough.`
         };
       }
 
@@ -13997,7 +14069,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       contentStr = content.toString('utf-8');
     }
 
-    const maxContentLength = 50000;
+    const maxContentLength = 1_000_000;
     if (contentStr.length > maxContentLength) {
       contentStr = contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
       console.log(`AgentMode: Knowledge base content truncated to ${maxContentLength} characters`);
@@ -14046,7 +14118,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const file = files[0];
       const contentStr = await this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || '');
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = contentStr.length > maxContentLength
         ? contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : contentStr;
@@ -14098,7 +14170,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Read doc content (all pages concatenated)
       const content = await readClickUpDocContent(clickUpToken, workspaceId, doc.id);
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
         ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : content;
@@ -14150,7 +14222,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Read task content (formatted as markdown)
       const content = await readClickUpTaskContent(clickUpToken, task.id);
 
-      const maxContentLength = 50000;
+      const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
         ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
         : content;
@@ -15386,7 +15458,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     composeParams: Record<string, any>,
-    clipDurationSeconds?: number
+    clipDurationSeconds?: number,
+    targetDurationSeconds?: number,
+    clipDurationsSeconds?: number[]
   ): Promise<any> {
     try {
       if (!clipUrls || clipUrls.length === 0) {
@@ -15407,6 +15481,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
+        targetDurationSeconds,
+        clipDurationsSeconds,
         filename,
         userId,
       });
@@ -18689,7 +18765,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -18707,6 +18783,8 @@ Please:
           stepCount: index + 1, // Must be sequential: index+1
           title: step.title,
           description: step.description,
+          // Preserve user-facing instructions through to the session.
+          ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
@@ -18737,7 +18815,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -18768,6 +18846,7 @@ Please:
             ...workPlan.steps[existingIndex],
             title: newStep.title,
             description: newStep.description,
+            ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
             requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds
           };
@@ -18777,6 +18856,7 @@ Please:
             stepCount: newStep.stepCount,
             title: newStep.title,
             description: newStep.description,
+            ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
@@ -20748,17 +20828,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const leadLinkedIn = ((lead as any).linkedin as string | undefined)?.toLowerCase();
           if (!leadLinkedIn) throw new Error('Lead has no LinkedIn URL — add a LinkedIn profile URL to this lead first');
 
-          // Fetch all messages with this contact from Unipile
-          const messages = await linkedInOutreachService.getMessagesWithContact(providerId);
+          // Fetch all messages with this contact from Unipile.
+          // account_id is required so Unipile can identify which side is is_sender=1.
+          const messages = await linkedInOutreachService.getMessagesWithContact(providerId, account_id);
 
-          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp
+          // Upsert all messages into AW-EmailEvents in parallel, then stamp sync timestamp.
+          // Key on provider_id (stable) not msg.id (ephemeral internal Unipile UUID that
+          // changes each call), so repeated syncs don't create duplicate rows.
           const { emailEventsDb } = await import('./emailEventsDb');
           const emailDomain = `linkedin-${list_id}`;
 
           const syncAt = new Date().toISOString();
           await Promise.all([
             ...messages.map(msg => emailEventsDb.addLinkedInMessageEvent({
-              eventId: `linkedin_msg_${msg.id}`,
+              eventId: `linkedin_msg_${msg.provider_id}`,
               emailDomain,
               leadEmail: leadLinkedIn,
               eventType: msg.is_sender === 1 ? 'linkedin.message.sent' : 'linkedin.message.received',

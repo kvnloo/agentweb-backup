@@ -147,6 +147,15 @@ emmaToolRegistry.register({
         meetings,
       };
     } catch (error: any) {
+      const status = error?.response?.status;
+      if (status === 401 || status === 403) {
+        return {
+          success: false,
+          message:
+            'Your Fathom access token is invalid or has been revoked. ' +
+            'Please reconnect your Fathom account in Settings → Connected Accounts.',
+        };
+      }
       console.error('[fathom_get_meetings] API error:', error?.message);
       return {
         success: false,
@@ -216,6 +225,14 @@ emmaToolRegistry.register({
       };
     } catch (error: any) {
       const status = error?.response?.status;
+      if (status === 401 || status === 403) {
+        return {
+          success: false,
+          message:
+            'Your Fathom access token is invalid or has been revoked. ' +
+            'Please reconnect your Fathom account in Settings → Connected Accounts.',
+        };
+      }
       if (status === 404) {
         return {
           success: false,

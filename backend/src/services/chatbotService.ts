@@ -2495,6 +2495,10 @@ export class ChatbotDB {
         stepCount: number;
         title: string;
         description?: string;
+        /** User-facing guidance shown when the customer expands this
+         *  step in the customer-portal plan view. Surfaced through to
+         *  DynamoDB so <HorizontalPlanProgress> can render it. */
+        userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
         notes?: string;
@@ -3793,15 +3797,16 @@ export async function generateChatResponse(
     let agentModeService: AgentModeService | null = null;
     let toolDefinitions: any[] = [];
 
-    if (portalType === 'customer' || isDelegatedAdmin) {
+    if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin) {
       try {
         // Initialize AgentModeService to access tool registry and executeTool
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
         // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
-        // Only include customer-specific tools when on the customer portal
-        const toolsToInclude = new Set<string>(portalType === 'customer' ? [
+        // Only include customer-specific tools when on the customer portal or emma-sidebar
+        const isCustomerContext = (portalType as string) === 'customer' || (portalType as string) === 'emma-sidebar';
+        const toolsToInclude = new Set<string>(isCustomerContext ? [
           ...AgentModeService.FOUNDATION_TOOLS,
           'read_page_source',
           'enrich_leads_preview', 'enrich_leads_execute',
@@ -3810,9 +3815,10 @@ export async function generateChatResponse(
           'report_product_issues',
           'get_temp_email', 'check_temp_inbox',
           'get_test_account', 'save_test_account', 'list_test_accounts',
+          'run_local_agent_task', 'check_local_agent_status',
         ] : []);
 
-        if (portalType === 'customer') {
+        if (isCustomerContext) {
           // Page-aware tool injection based on the current page URL
           const urlPath = (currentUrl || '').replace(/^\//, '');
           const page = urlPath.split('/')[0].split('?')[0];
@@ -3853,6 +3859,7 @@ export async function generateChatResponse(
           await import('../emma/tools');
           await import('../emma/tempEmailTools');
           await import('../emma/testAccountTools');
+          await import('../emma/localAgentTools');
           emmaToolsLoaded = true;
         }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
