@@ -18765,7 +18765,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -18783,6 +18783,8 @@ Please:
           stepCount: index + 1, // Must be sequential: index+1
           title: step.title,
           description: step.description,
+          // Preserve user-facing instructions through to the session.
+          ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
@@ -18813,7 +18815,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -18844,6 +18846,7 @@ Please:
             ...workPlan.steps[existingIndex],
             title: newStep.title,
             description: newStep.description,
+            ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
             requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds
           };
@@ -18853,6 +18856,7 @@ Please:
             stepCount: newStep.stepCount,
             title: newStep.title,
             description: newStep.description,
+            ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
