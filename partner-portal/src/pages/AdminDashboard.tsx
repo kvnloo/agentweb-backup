@@ -3944,11 +3944,9 @@ export default function AdminDashboard() {
               renderTags={(selected, getTagProps) =>
                 selected.map((ch, index) => (
                   <Chip
-                    key={ch.id}
                     label={`#${ch.name}`}
                     size="small"
                     {...getTagProps({ index })}
-                    onDelete={getTagProps({ index }).onDelete}
                   />
                 ))
               }
