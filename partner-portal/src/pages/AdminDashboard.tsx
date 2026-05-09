@@ -41,6 +41,7 @@ import {
   Popover,
   ButtonGroup,
   InputAdornment,
+  Autocomplete,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -816,10 +817,12 @@ export default function AdminDashboard() {
   const [slackChannelNames, setSlackChannelNames] = useState<Record<string, string>>({});
   const [slackChannelInputText, setSlackChannelInputText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
-  const [adminSlackChannel, setAdminSlackChannel] = useState("");
-  const [adminSlackChannelInput, setAdminSlackChannelInput] = useState("");
+  const [adminSlackChannels, setAdminSlackChannels] = useState<string[]>([]);
+  const [adminSlackChannelsInput, setAdminSlackChannelsInput] = useState<string[]>([]);
   const [adminSlackChannelLoading, setAdminSlackChannelLoading] = useState(false);
   const [adminSlackChannelSaved, setAdminSlackChannelSaved] = useState(false);
+  const [availableSlackChannels, setAvailableSlackChannels] = useState<{ id: string; name: string }[]>([]);
+  const [availableSlackChannelsLoading, setAvailableSlackChannelsLoading] = useState(false);
   const [secretsDialogOpen, setSecretsDialogOpen] = useState(false);
   const [editingSecretsUserId, setEditingSecretsUserId] = useState<string | null>(null);
   const [secretEntries, setSecretEntries] = useState<Array<{ name: string; value: string }>>([]);
@@ -944,15 +947,31 @@ export default function AdminDashboard() {
     if (tabValue === 2) {
       loadUsers(userFilterHideBotLike);
       loadSubscriptionTypes();
-      // Load admin Slack channel setting
-      axios.get(buildApiUrl('/api/settings/slack_admin_channel'), {
+      // Load admin Slack channels setting (multi-channel)
+      axios.get(buildApiUrl('/api/settings/slack_admin_channels'), {
         headers: { Authorization: `Bearer ${token}` },
       }).then((res) => {
-        const val = res.data?.settingValue || '';
-        setAdminSlackChannel(val);
-        setAdminSlackChannelInput(val);
+        try {
+          const ids: string[] = JSON.parse(res.data?.settingValue || '[]');
+          setAdminSlackChannels(ids);
+          setAdminSlackChannelsInput(ids);
+        } catch {
+          setAdminSlackChannels([]);
+          setAdminSlackChannelsInput([]);
+        }
       }).catch(() => {
         // Setting not found — leave empty
+      });
+      // Fetch available Slack channels for dropdown
+      setAvailableSlackChannelsLoading(true);
+      axios.get(buildApiUrl('/api/slack/channels'), {
+        headers: { Authorization: `Bearer ${token}` },
+      }).then((res) => {
+        setAvailableSlackChannels((res.data || []).map((ch: any) => ({ id: ch.id, name: ch.name })));
+      }).catch(() => {
+        setAvailableSlackChannels([]);
+      }).finally(() => {
+        setAvailableSlackChannelsLoading(false);
       });
     }
   }, [tabValue]);
@@ -2400,18 +2419,18 @@ export default function AdminDashboard() {
       await axios.post(
         buildApiUrl('/api/settings'),
         {
-          settingName: 'slack_admin_channel',
-          settingValue: adminSlackChannelInput.trim(),
-          description: 'Admin Slack channel ID for delegated Emma access'
+          settingName: 'slack_admin_channels',
+          settingValue: JSON.stringify(adminSlackChannelsInput),
+          description: 'Admin Slack channel IDs for delegated Emma access'
         },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      setAdminSlackChannel(adminSlackChannelInput.trim());
+      setAdminSlackChannels(adminSlackChannelsInput);
       setAdminSlackChannelSaved(true);
       setTimeout(() => setAdminSlackChannelSaved(false), 3000);
     } catch (error: any) {
-      console.error("Error saving admin Slack channel:", error);
-      setError(error.response?.data?.message || "Failed to save admin Slack channel");
+      console.error("Error saving admin Slack channels:", error);
+      setError(error.response?.data?.message || "Failed to save admin Slack channels");
     } finally {
       setAdminSlackChannelLoading(false);
     }
@@ -3889,35 +3908,70 @@ export default function AdminDashboard() {
               Sync to CRM
             </Button>
           </Box>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
-            <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channel:</Typography>
-            <TextField
-              size="small"
-              placeholder="Channel ID (e.g., C07XXXXXXXX)"
-              value={adminSlackChannelInput}
-              onChange={(e) => { setAdminSlackChannelInput(e.target.value); setAdminSlackChannelSaved(false); }}
-              sx={{ width: 280 }}
-            />
-            <Button
-              variant="contained"
-              size="small"
-              onClick={handleSaveAdminSlackChannel}
-              disabled={adminSlackChannelLoading || !adminSlackChannelInput.trim()}
-            >
-              {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
-            </Button>
-            {adminSlackChannel && (
-              <Link
-                href={`https://slack.com/app_redirect?channel=${adminSlackChannel}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                sx={{ display: 'flex', alignItems: 'center', gap: 0.5, whiteSpace: 'nowrap' }}
+          <Box sx={{ mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+              <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channels:</Typography>
+              <Button
+                variant="contained"
+                size="small"
+                onClick={handleSaveAdminSlackChannel}
+                disabled={adminSlackChannelLoading}
               >
-                Open in Slack <OpenInNewIcon fontSize="small" />
-              </Link>
-            )}
-            {adminSlackChannelSaved && (
-              <Typography variant="caption" color="success.main">Saved!</Typography>
+                {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
+              </Button>
+              {adminSlackChannelSaved && (
+                <Typography variant="caption" color="success.main">Saved!</Typography>
+              )}
+            </Box>
+            <Autocomplete
+              multiple
+              options={availableSlackChannels}
+              getOptionLabel={(opt) => `#${opt.name}`}
+              value={availableSlackChannels.filter((ch) => adminSlackChannelsInput.includes(ch.id))}
+              onChange={(_e, selected) => {
+                setAdminSlackChannelsInput(selected.map((ch) => ch.id));
+                setAdminSlackChannelSaved(false);
+              }}
+              loading={availableSlackChannelsLoading}
+              isOptionEqualToValue={(opt, val) => opt.id === val.id}
+              renderInput={(params) => (
+                <TextField
+                  {...params}
+                  size="small"
+                  placeholder={availableSlackChannels.length > 0 ? "Select channels…" : "No channels available (bot not in any channel)"}
+                />
+              )}
+              renderTags={(selected, getTagProps) =>
+                selected.map((ch, index) => (
+                  <Chip
+                    key={ch.id}
+                    label={`#${ch.name}`}
+                    size="small"
+                    {...getTagProps({ index })}
+                    onDelete={getTagProps({ index }).onDelete}
+                  />
+                ))
+              }
+              sx={{ maxWidth: 560 }}
+              noOptionsText={availableSlackChannelsLoading ? "Loading channels…" : "No channels found — make sure the bot is added to the channels"}
+            />
+            {adminSlackChannels.length > 0 && (
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
+                {adminSlackChannels.map((id) => {
+                  const ch = availableSlackChannels.find((c) => c.id === id);
+                  return (
+                    <Link
+                      key={id}
+                      href={`https://slack.com/app_redirect?channel=${id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      sx={{ display: 'flex', alignItems: 'center', gap: 0.5, fontSize: '0.75rem' }}
+                    >
+                      {ch ? `#${ch.name}` : id} <OpenInNewIcon sx={{ fontSize: '0.875rem' }} />
+                    </Link>
+                  );
+                })}
+              </Box>
             )}
           </Box>
           <TableContainer component={Paper} variant="outlined">
