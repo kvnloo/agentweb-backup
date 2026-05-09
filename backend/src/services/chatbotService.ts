@@ -2495,6 +2495,10 @@ export class ChatbotDB {
         stepCount: number;
         title: string;
         description?: string;
+        /** User-facing guidance shown when the customer expands this
+         *  step in the customer-portal plan view. Surfaced through to
+         *  DynamoDB so <HorizontalPlanProgress> can render it. */
+        userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
         notes?: string;
