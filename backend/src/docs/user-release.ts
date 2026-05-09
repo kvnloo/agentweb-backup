@@ -5933,6 +5933,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-09',
+    changes: [
+      'Improved: Admin Slack Channels Now Support Multiple Channels',
+      '- The Admin Slack Channels setting on the Users tab now allows configuring multiple channels instead of just one',
+      '- Channels are selected from a dropdown showing all channels the Emma bot is a member of, so you can identify them by name instead of pasting raw IDs',
+      '- All configured channels are treated as admin channels — messages in any of them trigger delegated Emma sessions on behalf of the specified user',
+    ],
+  },
+  {
     date: '2026-05-08',
     changes: [
       'Improved: CRM Email Draft Now Defaults to GPT-5.5 and Shows the Sender',
