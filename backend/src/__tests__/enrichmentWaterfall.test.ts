@@ -416,11 +416,11 @@ describe('waterfall — email finder', () => {
         domain: 'acme.com',
         leadHint: { listId: 'L1', leadId: 'lead-1' },
       },
-      { userId: 'u1' },
+      { userId: 'u1', apolloWaitMs: 50 },   // short budget: poller times out fast, falls through to Tier 4
     );
 
-    // Tier 4 should have fired after Tier 3 returned async-pending (no patterns
-    // deliverable in this mock so result is found:false).
+    // Tier 4 should have fired after Tier 3 timed out waiting for the webhook
+    // (no patterns deliverable in this mock so result is found:false).
     expect(r.found).toBe(false);
 
     // Tier 3 should have written a placeholder cache row to map request_id → lead.
@@ -436,7 +436,7 @@ describe('waterfall — email finder', () => {
     apolloFindWaterfallAware.mockClear();
     const r2 = await wf.waterfallFindEmail(
       { firstName: 'A', lastName: 'B', domain: 'acme.com' },     // no leadHint
-      { userId: 'u1' },
+      { userId: 'u1', apolloWaitMs: 50 },
     );
     expect(r2.found).toBe(false);
     // Apollo findEmail may still be called for tier 2 (without runWaterfall),
@@ -449,6 +449,184 @@ describe('waterfall — email finder', () => {
 
     jest.dontMock('../services/db');
   });
+
+  it('Tier 3 returns the polled webhook result and SKIPS Tier 4 when result lands in budget', async () => {
+    const mockPut = jest.fn().mockResolvedValue(undefined);
+    // Simulate the webhook depositing a completed result on the 2nd poll.
+    let getCount = 0;
+    const mockGet = jest.fn().mockImplementation(async () => {
+      getCount++;
+      if (getCount < 2) return { rawData: { status: 'pending' } };
+      return {
+        rawData: {
+          status: 'completed',
+          result: { email: 'polled@hit.com', emailStatus: 'verified', status: 'completed' },
+        },
+      };
+    });
+    jest.doMock('../services/db', () => ({
+      crmDb: {
+        putEnrichmentCacheItem: mockPut,
+        getEnrichmentCacheItem: mockGet,
+        getLeadById: jest.fn(),
+      },
+    }));
+    jest.resetModules();
+    const wf = await import('../services/enrichmentWaterfall');
+    wf.__resetWaterfallDedupForTesting();
+
+    const apolloFind = jest.fn().mockImplementation(async (input: any) => {
+      if (!input.runWaterfall) return { person: { id: 'p1' } };
+      return { person: null, request_id: 'wf_req_hit' };
+    });
+    const apollo = await import('../services/apolloService');
+    apollo.setApolloServiceForTesting(new apollo.ApolloService({
+      http: {
+        match: jest.fn().mockResolvedValue({ person: { id: 'p1' } }),
+        findEmail: apolloFind,
+        enrichOrg: jest.fn().mockResolvedValue({ organization: null }),
+      },
+      store: apolloStore(),
+    }));
+    const enrichSo = await import('../services/enrichSoService');
+    enrichSo.setEnrichSoServiceForTesting(new enrichSo.EnrichSoService({
+      http: {
+        validateEmail: jest.fn().mockResolvedValue({ data: { result: 'undeliverable' } }),
+        findEmail: jest.fn().mockResolvedValue({ data: { found: false } }),
+        reverseLookup: jest.fn().mockResolvedValue({ success: false }),
+      },
+      store: enrichSoStore(),
+    }));
+    const patterns = await import('../services/emailPatternFinder');
+    const tier4Spy = jest.spyOn(patterns, 'findEmailViaPatterns');
+
+    const r = await wf.waterfallFindEmail(
+      { firstName: 'A', lastName: 'B', domain: 'acme.com', leadHint: { listId: 'L1', leadId: 'LD1' } },
+      { userId: 'u1', apolloWaitMs: 8000 },   // generous: 2s poll + 5s poll fits in 8s
+    );
+
+    expect(r.found).toBe(true);
+    expect(r.email).toBe('polled@hit.com');
+    expect((r as any).provider).toBe('apollo');
+    expect((r as any).tier).toBe(3);
+    expect((r as any).confidence).toBe('high');     // verified → high
+    expect(tier4Spy).not.toHaveBeenCalled();        // skipped Tier 4
+
+    tier4Spy.mockRestore();
+    jest.dontMock('../services/db');
+  }, 15000);
+
+  it('Tier 3 falls through to Tier 4 when the placeholder poll TIMES OUT (no webhook deposit lands)', async () => {
+    // Distinct from the no_email case: here the webhook never arrives, so the
+    // poller burns its full budget and returns null. We must still fall
+    // through to Tier 4 — verify Tier 4 actually fires (not just that the
+    // result is found:false, which the no-Apollo path would also produce).
+    const mockPut = jest.fn().mockResolvedValue(undefined);
+    // Always returns pending → poller never finds a terminal state.
+    const mockGet = jest.fn().mockResolvedValue({ rawData: { status: 'pending' } });
+    jest.doMock('../services/db', () => ({
+      crmDb: {
+        putEnrichmentCacheItem: mockPut,
+        getEnrichmentCacheItem: mockGet,
+        getLeadById: jest.fn(),
+      },
+    }));
+    jest.resetModules();
+    const wf = await import('../services/enrichmentWaterfall');
+    wf.__resetWaterfallDedupForTesting();
+
+    const apolloFind = jest.fn().mockImplementation(async (input: any) => {
+      if (!input.runWaterfall) return { person: { id: 'p1' } };
+      return { person: null, request_id: 'wf_req_timeout' };
+    });
+    const apollo = await import('../services/apolloService');
+    apollo.setApolloServiceForTesting(new apollo.ApolloService({
+      http: {
+        match: jest.fn().mockResolvedValue({ person: { id: 'p1' } }),
+        findEmail: apolloFind,
+        enrichOrg: jest.fn().mockResolvedValue({ organization: null }),
+      },
+      store: apolloStore(),
+    }));
+    const enrichSo = await import('../services/enrichSoService');
+    enrichSo.setEnrichSoServiceForTesting(new enrichSo.EnrichSoService({
+      http: {
+        validateEmail: jest.fn().mockResolvedValue({ data: { result: 'undeliverable' } }),
+        findEmail: jest.fn().mockResolvedValue({ data: { found: false } }),
+        reverseLookup: jest.fn().mockResolvedValue({ success: false }),
+      },
+      store: enrichSoStore(),
+    }));
+    const patterns = await import('../services/emailPatternFinder');
+    const tier4Spy = jest.spyOn(patterns, 'findEmailViaPatterns')
+      .mockResolvedValue({ found: false } as any);
+
+    const r = await wf.waterfallFindEmail(
+      { firstName: 'A', lastName: 'B', domain: 'acme.com', leadHint: { listId: 'L1', leadId: 'LD1' } },
+      { userId: 'u-timeout', apolloWaitMs: 50 },     // tiny budget so the test runs in ms, not 90s
+    );
+
+    expect(r.found).toBe(false);
+    expect(tier4Spy).toHaveBeenCalled();             // Tier 4 fired AFTER poll exhausted budget
+    expect(mockGet.mock.calls.length).toBeGreaterThan(0);   // poller did at least one DDB read
+
+    tier4Spy.mockRestore();
+    jest.dontMock('../services/db');
+  }, 5000);
+
+  it('Tier 3 falls through to Tier 4 when the placeholder reports no_email', async () => {
+    const mockPut = jest.fn().mockResolvedValue(undefined);
+    // Webhook signals "Apollo broker chain returned no email" — we should
+    // skip the rest of Tier 3's poll and try Tier 4 immediately.
+    const mockGet = jest.fn().mockResolvedValue({ rawData: { status: 'no_email' } });
+    jest.doMock('../services/db', () => ({
+      crmDb: {
+        putEnrichmentCacheItem: mockPut,
+        getEnrichmentCacheItem: mockGet,
+        getLeadById: jest.fn(),
+      },
+    }));
+    jest.resetModules();
+    const wf = await import('../services/enrichmentWaterfall');
+    wf.__resetWaterfallDedupForTesting();
+
+    const apolloFind = jest.fn().mockImplementation(async (input: any) => {
+      if (!input.runWaterfall) return { person: { id: 'p1' } };
+      return { person: null, request_id: 'wf_req_no' };
+    });
+    const apollo = await import('../services/apolloService');
+    apollo.setApolloServiceForTesting(new apollo.ApolloService({
+      http: {
+        match: jest.fn().mockResolvedValue({ person: { id: 'p1' } }),
+        findEmail: apolloFind,
+        enrichOrg: jest.fn().mockResolvedValue({ organization: null }),
+      },
+      store: apolloStore(),
+    }));
+    const enrichSo = await import('../services/enrichSoService');
+    enrichSo.setEnrichSoServiceForTesting(new enrichSo.EnrichSoService({
+      http: {
+        validateEmail: jest.fn().mockResolvedValue({ data: { result: 'undeliverable' } }),
+        findEmail: jest.fn().mockResolvedValue({ data: { found: false } }),
+        reverseLookup: jest.fn().mockResolvedValue({ success: false }),
+      },
+      store: enrichSoStore(),
+    }));
+    const patterns = await import('../services/emailPatternFinder');
+    const tier4Spy = jest.spyOn(patterns, 'findEmailViaPatterns')
+      .mockResolvedValue({ found: false } as any);
+
+    const r = await wf.waterfallFindEmail(
+      { firstName: 'A', lastName: 'B', domain: 'acme.com', leadHint: { listId: 'L1', leadId: 'LD1' } },
+      { userId: 'u-noemail', apolloWaitMs: 8000 },
+    );
+
+    expect(r.found).toBe(false);
+    expect(tier4Spy).toHaveBeenCalled();   // Tier 4 fired even with non-zero budget remaining
+
+    tier4Spy.mockRestore();
+    jest.dontMock('../services/db');
+  }, 15000);
 
   it('Apollo waterfall confidence respects email_status enum', async () => {
     setEnrichSoServiceForTesting(buildEnrichSo({}));

@@ -1,7 +1,13 @@
 /**
  * Tests for getApolloApiKey + getApolloWebhookSecret in secretsManager.ts.
- * Both read from a single JSON secret {"apiKey","webhookSecret"} stored at
- * dev/AgentWeb/Apollo or prod/AgentWeb/Apollo.
+ *
+ *   getApolloApiKey       — JSON {"apiKey",...} at dev/AgentWeb/Apollo or
+ *                           prod/AgentWeb/Apollo (AWS Secrets Manager).
+ *   getApolloWebhookSecret — env-var-or-default; never hits Secrets Manager.
+ *                           The secret must round-trip through Apollo's URL
+ *                           path (path-based webhook auth), so an in-code
+ *                           default is shipped intentionally; production
+ *                           rotates via APOLLO_WEBHOOK_SECRET env.
  */
 export {};
 
@@ -104,54 +110,56 @@ describe('secretsManager — getApolloApiKey', () => {
 });
 
 describe('secretsManager — getApolloWebhookSecret', () => {
+  const ORIGINAL_ENV = process.env.APOLLO_WEBHOOK_SECRET;
+
   beforeEach(() => {
     jest.clearAllMocks();
     jest.resetModules();
-    delete process.env.NODE_ENV;
+    delete process.env.APOLLO_WEBHOOK_SECRET;
+  });
+  afterAll(() => {
+    if (ORIGINAL_ENV === undefined) delete process.env.APOLLO_WEBHOOK_SECRET;
+    else process.env.APOLLO_WEBHOOK_SECRET = ORIGINAL_ENV;
   });
 
-  it('returns webhookSecret from the same Apollo JSON secret', async () => {
-    process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({
-      SecretString: JSON.stringify({ apiKey: 'apl', webhookSecret: 'wh_secret_value' }),
-    });
-
+  it('falls back to the hardcoded default when env is unset', async () => {
     const { getApolloWebhookSecret } = require('../utils/secretsManager');
     const wh = await getApolloWebhookSecret();
-
-    expect(wh).toBe('wh_secret_value');
-    expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/Apollo' });
+    expect(typeof wh).toBe('string');
+    expect(wh.length).toBeGreaterThan(0);
+    expect(mockGetSecretValue).not.toHaveBeenCalled();
   });
 
-  it('uses prod secret name in production', async () => {
-    process.env.NODE_ENV = 'production';
-    mockGetSecretValue.mockResolvedValue({
-      SecretString: JSON.stringify({ apiKey: 'apl', webhookSecret: 'wh_prod' }),
-    });
-
+  it('uses APOLLO_WEBHOOK_SECRET env var when set', async () => {
+    process.env.APOLLO_WEBHOOK_SECRET = 'env_override_value';
     const { getApolloWebhookSecret } = require('../utils/secretsManager');
-    await getApolloWebhookSecret();
-
-    expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/Apollo' });
+    expect(await getApolloWebhookSecret()).toBe('env_override_value');
+    expect(mockGetSecretValue).not.toHaveBeenCalled();
   });
 
-  it('throws when JSON is missing webhookSecret', async () => {
-    process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({
-      SecretString: JSON.stringify({ apiKey: 'apl_only' }),
-    });
-
+  it('trims whitespace around env value', async () => {
+    process.env.APOLLO_WEBHOOK_SECRET = '   trimmed_value   ';
     const { getApolloWebhookSecret } = require('../utils/secretsManager');
-    await expect(getApolloWebhookSecret()).rejects.toThrow(/missing webhookSecret/);
+    expect(await getApolloWebhookSecret()).toBe('trimmed_value');
   });
 
-  it('throws when webhookSecret is whitespace', async () => {
-    process.env.NODE_ENV = 'development';
-    mockGetSecretValue.mockResolvedValue({
-      SecretString: JSON.stringify({ apiKey: 'apl', webhookSecret: '   ' }),
-    });
+  it('falls back to default when env var is empty string', async () => {
+    process.env.APOLLO_WEBHOOK_SECRET = '';
+    const { getApolloWebhookSecret: a } = require('../utils/secretsManager');
+    const fallback = await a();
+    jest.resetModules();
+    delete process.env.APOLLO_WEBHOOK_SECRET;
+    const { getApolloWebhookSecret: b } = require('../utils/secretsManager');
+    expect(await b()).toBe(fallback);
+  });
 
-    const { getApolloWebhookSecret } = require('../utils/secretsManager');
-    await expect(getApolloWebhookSecret()).rejects.toThrow(/missing webhookSecret/);
+  it('falls back to default when env var is whitespace-only', async () => {
+    process.env.APOLLO_WEBHOOK_SECRET = '   ';
+    const { getApolloWebhookSecret: a } = require('../utils/secretsManager');
+    const fallback = await a();
+    jest.resetModules();
+    delete process.env.APOLLO_WEBHOOK_SECRET;
+    const { getApolloWebhookSecret: b } = require('../utils/secretsManager');
+    expect(await b()).toBe(fallback);
   });
 });
