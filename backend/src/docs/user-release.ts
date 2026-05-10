@@ -11,15 +11,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-10',
     changes: [
-      'Fixed: Website Scans No Longer Report 429 Asset Errors as Site Failures',
-      '- When Emma scans a website, Cloudflare and similar bot-protection systems may rate-limit the automated browser\'s requests for CSS, JavaScript, and images with 429 responses',
-      '- Previously, Emma could incorrectly report a healthy website as "broken" or "returning errors" based on these blocked asset requests',
-      '- Emma now correctly distinguishes between bot-protection 429s on static assets (normal for automated browsers) and genuine site failures — if the main page HTML loaded successfully and content is present, the site is reported as functional',
-    ],
-  },
-  {
-    date: '2026-05-10',
-    changes: [
       'New: Video Ads Now Support AI-Generated Voiceovers',
       '- The Video Production skill can now generate a professional voiceover for your ad using ElevenLabs TTS and mix it directly into the final video',
       '- Choose from 6 voices: George (warm, confident male), Rachel (clear, professional female), Adam (deep, authoritative), Bella (soft, friendly), Josh (young, energetic), or Dorothy (pleasant, conversational)',
