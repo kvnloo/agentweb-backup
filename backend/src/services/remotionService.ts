@@ -45,6 +45,10 @@ export interface RemotionComposeParams {
    * trim guard (e.g. exactly 30s when clips sum to 30s anyway).
    */
   targetDurationSeconds?: number;
+  /** Optional S3 URL of an MP3 voiceover to overlay on the composed video */
+  audioUrl?: string;
+  /** Voiceover volume (0.0–1.0, default 1.0) */
+  audioVolume?: number;
 }
 
 export interface RemotionComposeResult {
@@ -232,7 +236,7 @@ export class RemotionService {
         ? Math.max(1, Math.min(90, Math.round(durationInFrames * 0.15)))
         : 90; // default to 90 even if no CTA; BrandedVideo guards against rendering it
 
-      const inputPropsWithDuration = {
+      const inputPropsWithDuration: Record<string, any> = {
         clipUrl: allClipUrls[0],
         extraClipUrls: allClipUrls.slice(1),
         clipDurationInFrames,
@@ -246,6 +250,8 @@ export class RemotionService {
         introDurationFrames,
         outroDurationFrames,
         durationInFrames,
+        ...(params.audioUrl && { audioUrl: params.audioUrl }),
+        ...(params.audioUrl && params.audioVolume != null && { audioVolume: params.audioVolume }),
       };
 
       console.log(

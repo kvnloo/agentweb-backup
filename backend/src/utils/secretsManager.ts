@@ -701,6 +701,18 @@ export interface LandingPagesConfig {
  * Returns null (non-throwing) if the secret does not exist or is inaccessible —
  * the deploy succeeds regardless, just without auto-configuration.
  */
+/**
+ * Get ElevenLabs API key from AWS Secrets Manager.
+ * Secret location: dev/AgentWeb/ElevenLabs (or prod/AgentWeb/ElevenLabs)
+ * Secret format: plain string API key (xi_...)
+ */
+export async function getElevenLabsApiKey(): Promise<string> {
+  const secretName = process.env.NODE_ENV === 'production'
+    ? 'prod/AgentWeb/ElevenLabs'
+    : 'dev/AgentWeb/ElevenLabs';
+  return (await getSecret(secretName)).trim();
+}
+
 export async function getLandingPagesConfig(): Promise<LandingPagesConfig | null> {
   try {
     const environment = process.env.NODE_ENV || 'development';
