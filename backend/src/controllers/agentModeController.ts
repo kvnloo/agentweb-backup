@@ -3877,7 +3877,7 @@ export const agentModeController = {
         keywords: keywords !== undefined ? keywords : (existingSchedule.keywords || []),
         requiredFunctionCalls: requiredFunctionCalls !== undefined ? requiredFunctionCalls : (existingSchedule.requiredFunctionCalls || []),
         functionCallMinCalls: functionCallMinCalls !== undefined ? functionCallMinCalls : (existingSchedule.functionCallMinCalls || {}),
-        emailNotifications: emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || []),
+        emailNotifications: normalizeEmailList(emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])),
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
@@ -3889,9 +3889,9 @@ export const agentModeController = {
       if (variableError) {
         return res.status(400).json({ error: variableError });
       }
-      const effectiveEmailNotifications = Array.isArray(emailNotifications)
-        ? emailNotifications
-        : (Array.isArray(existingSchedule.emailNotifications) ? existingSchedule.emailNotifications : []);
+      const effectiveEmailNotifications = normalizeEmailList(
+        emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])
+      );
       updates.variables = normalizedVariables;
 
       // Preserve existing values for unchanged variables unless explicitly overwritten
