@@ -21,6 +21,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-10',
     changes: [
+      'Fixed: Website Scans No Longer Report 429 Asset Errors as Site Failures',
+      '- When the Browser Automation skill scans a website, Cloudflare and similar bot-protection systems may rate-limit asset requests (CSS, JS, images) with 429 responses',
+      '- Previously, Emma could incorrectly report a healthy website as broken based on these blocked asset requests',
+      '- Emma now checks whether the main HTML loaded successfully and page content is present before concluding a site is down, and reports 429 asset errors as bot-protection rate limiting rather than site failures',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
       'Fixed: Scheduled Chat — Email Notifications Now Parsed Correctly',
       '- When creating or updating a scheduled chat, email addresses passed as a stringified JSON array (a common pattern from AI tools) are now automatically parsed into a proper list',
       '- For example, ["[\\"will@example.com\\", \\"other@example.com\\"]"] is now correctly stored as two separate addresses',
