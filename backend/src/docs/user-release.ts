@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-07
+// Last updated: 2026-05-08
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,67 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Fathom Connected Account Now Shows Correct Status',
+      '- The Connected Accounts page now does a live check with Fathom to confirm your token is valid, rather than relying on the stored expiry date',
+      '- If Fathom has revoked your token (e.g. after re-authorization), the account will correctly show as "Disconnected" with a prompt to reconnect',
+      '- When a Fathom tool call fails due to an invalid token, Emma now tells you exactly what to do: go to Settings → Connected Accounts and reconnect Fathom',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'New: Emma Can Take Screenshots via Local Agent',
+      '- When you have the local Codex agent connected, Emma can now take screenshots of any webpage and share them directly in the chat',
+      '- Screenshots are automatically uploaded to secure cloud storage and displayed inline in the conversation',
+      '- Just ask Emma to "take a screenshot of [URL]" or "grab a screenshot of that post" and the local agent handles the rest',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Agent Chat — Switching Chats No Longer Shows Tasks from a Previous Chat',
+      '- When you have multiple active agent chats and switch between them, tool execution spinners and AI suggestions from the previous chat no longer bleed into the newly selected chat',
+      '- Each chat now shows only its own progress state when you switch to it',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Data Analysis — S3 Tool-Response Files Now Resolve Automatically',
+      '- When the agent reads large data via read_tool_response and passes the S3 key to perform_data_analysis, the backend now fetches the file content automatically and embeds it for Gemini',
+      '- Previously this would fail silently and the agent would retry up to 10 times without producing results',
+      '- Daily scheduled data reports (e.g. token usage reports) are no longer affected by this retry loop',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Improved: Knowledge Base — Large Documents Now Read in Full',
+      '- The Read Knowledge Base File tool previously cut off documents at ~50,000 characters, silently dropping the rest',
+      '- Documents up to 1 MB are now returned in full; content beyond that is flagged as truncated',
+      '- Large files are automatically stored in S3 and searchable, so the agent can query specific sections without bloating the context window',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Improved: Scheduled Session Quality Scores Now Reflect Automation Accurately',
+      '- The AI judge that scores scheduled runs was incorrectly penalising sessions for "the user repeating instructions" — in a scheduled run there is no user; those messages are auto-injected by the scheduler to advance each step of the task',
+      '- Scores for scheduled sessions now correctly evaluate whether the task was completed, not whether a (non-existent) user had to repeat themselves',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: LinkedIn Conversation Sync — Outbound Messages Now Visible and No More Duplicates',
+      '- Manually sent LinkedIn messages (replies you type directly in LinkedIn) now appear in the CRM engagement history after syncing via Emma',
+      '- Previously, sent messages were invisible because Unipile could not identify the sender side without the account context — this is now passed correctly',
+      '- Duplicate inbound messages (e.g. the same "Sounds great" appearing 3 times) no longer occur — messages are now keyed on their stable LinkedIn provider ID instead of an ephemeral internal ID that changed each sync',
+    ],
+  },
   {
     date: '2026-05-08',
     changes: [
@@ -27,6 +88,23 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- "Draft Email" and "Draft Message" buttons inside the panel let you generate AI drafts with one click; "Update Draft" refines an existing draft',
       '- A new AI Model dropdown on the draft dialog lets you choose which model generates the draft, defaulting to Gemini 3 Flash',
       '- Email validation status (Deliverable / Risky / Undeliverable) now shows correctly in the panel header',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Emma Now Reads Full Transcripts and Large Documents Without Missing Details',
+      '- When Emma reads a large document (e.g. a meeting transcript) that exceeds 20KB, she can now retrieve the full content — including the end of the document',
+      '- Previously, large responses were stored in S3 and Emma was told to use retrieval tools to read them, but those tools were gated behind skill installation and returned "not available"',
+      '- Emma now always has access to the retrieval tools, so she no longer summarizes from a truncated preview',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Maintenance: Google Gemini SDK Upgrade',
+      '- Upgraded the Google Gemini JS SDK from v1 to v2 ahead of Google\'s June 8, 2026 deadline',
+      '- No user-facing changes — voice mode and deep research continue to work as before',
     ],
   },
   {
@@ -77,6 +155,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Images in sequence emails are now served through a consistent domain (api.agentweb.pro) instead of raw S3 URLs, reducing the chance of emails landing in spam',
       '- Unsubscribe links are now properly injected into every sequence email at send time, ensuring compliance and improving deliverability',
       '- Both fixes apply automatically to all users — no action required',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Fixed: Unsubscribed Leads No Longer Receive Emails from Sequences',
+      '- Leads who clicked unsubscribe are now detected before each sequence step and their enrollment is exited immediately',
+      '- The Sequences UI now shows these leads with an "Unsubscribed" badge (red) instead of "Exited"',
+      '- The unsubscribed count in sequence enrollment stats now reflects these leads correctly',
     ],
   },
   {
@@ -5853,6 +5940,24 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When Emma reports a product issue on behalf of a customer, the notification now goes only to the internal team',
       '- Previously, a confirmation email was incorrectly sent to the customer — this no longer happens',
       '- The internal email now includes a direct Notion link so engineers can jump straight to the ticket',
+    ],
+  },
+  {
+    date: '2026-05-09',
+    changes: [
+      'Improved: Admin Slack Channels Now Support Multiple Channels',
+      '- The Admin Slack Channels setting on the Users tab now allows configuring multiple channels instead of just one',
+      '- Channels are selected from a dropdown showing all channels the Emma bot is a member of, so you can identify them by name instead of pasting raw IDs',
+      '- All configured channels are treated as admin channels — messages in any of them trigger delegated Emma sessions on behalf of the specified user',
+    ],
+  },
+  {
+    date: '2026-05-08',
+    changes: [
+      'Improved: CRM Email Draft Now Defaults to GPT-5.5 and Shows the Sender',
+      '- The AI Model dropdown in the Draft Email dialog now defaults to GPT-5.5 instead of Gemini 3 Flash',
+      '- The dialog now shows a "Sending From" field so you can confirm which sender the email will come from before drafting',
+      '- The sender is resolved automatically using the same hierarchy: lead-specific PoC → list default → account default',
     ],
   },
   {

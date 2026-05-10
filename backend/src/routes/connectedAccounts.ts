@@ -25,6 +25,19 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       .map(acc => acc.account_id);
     const unipileStatusMap = await linkedInOutreachService.getStatusesForAccounts(unipileAccountIds);
 
+    // Pre-validate Fathom tokens with a live API call (token_expires_at is unreliable
+    // because Fathom may revoke tokens server-side without updating the stored expiry).
+    const fathomAccounts = accounts.filter(acc => acc.platform === 'fathom');
+    const fathomLiveStatusMap = new Map<string, boolean>();
+    await Promise.all(fathomAccounts.map(async acc => {
+      try {
+        const fathomApi = new FathomApiService((acc.config as any).access_token);
+        fathomLiveStatusMap.set(acc.account_id, await fathomApi.validateApiKey());
+      } catch {
+        fathomLiveStatusMap.set(acc.account_id, false);
+      }
+    }));
+
     const accountsWithStatus = accounts.map(acc => {
       let status: string;
       let expiryMessage: string;
@@ -34,6 +47,11 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         const unipileStatus = unipileStatusMap.get(acc.account_id) || 'OK';
         status = unipileStatus === 'OK' ? 'active' : 'disconnected';
         expiryMessage = unipileStatus === 'OK' ? 'Connected' : `Disconnected (${unipileStatus})`;
+      } else if (acc.platform === 'fathom') {
+        // Fathom: use live API check — token_expires_at is unreliable (server-side revocation)
+        const isLive = fathomLiveStatusMap.get(acc.account_id) ?? false;
+        status = isLive ? 'active' : 'disconnected';
+        expiryMessage = isLive ? 'Connected' : 'Disconnected — please reconnect';
       } else {
         // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
         // short-lived access token expiry; just show them as permanently connected.

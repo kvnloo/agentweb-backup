@@ -616,9 +616,22 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             return;
           }
 
-          // Check if this is the admin Slack channel
-          const adminChannelSetting = await settingsService.getSetting('slack_admin_channel');
-          const isAdminChannel = !!(adminChannelSetting?.settingValue && adminChannelSetting.settingValue === channel);
+          // Check if this is an admin Slack channel (supports multiple channels via slack_admin_channels JSON array)
+          const adminChannelsSetting = await settingsService.getSetting('slack_admin_channels');
+          let adminChannelIds: string[] = [];
+          if (adminChannelsSetting?.settingValue) {
+            try {
+              adminChannelIds = JSON.parse(adminChannelsSetting.settingValue);
+            } catch {
+              adminChannelIds = [];
+            }
+          }
+          // Legacy fallback: single-channel setting
+          if (adminChannelIds.length === 0) {
+            const legacySetting = await settingsService.getSetting('slack_admin_channel');
+            if (legacySetting?.settingValue) adminChannelIds = [legacySetting.settingValue];
+          }
+          const isAdminChannel = adminChannelIds.includes(channel);
 
           let user = null;
           let delegateInfo: { adminUserId: string; adminEmail: string; isDelegated: boolean } | undefined;

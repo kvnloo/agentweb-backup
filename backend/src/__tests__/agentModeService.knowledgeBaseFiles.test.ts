@@ -365,9 +365,9 @@ describe('AgentModeService - Knowledge Base Files', () => {
         expect(storageInstance.bucket).toHaveBeenCalledWith('test-bucket');
       });
 
-      it('should truncate content when it exceeds 50KB limit', async () => {
-        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 60000, knowledgeBaseType: 'private' };
-        const largeContent = 'x'.repeat(60000);
+      it('should truncate content when it exceeds 1MB limit', async () => {
+        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 1100000, knowledgeBaseType: 'private' };
+        const largeContent = 'x'.repeat(1100000);
         const mockContent = Buffer.from(largeContent);
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
         mockFile.exists.mockResolvedValue([true]);
@@ -380,7 +380,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
         );
 
         expect(result.success).toBe(true);
-        expect(result.files[0].content.length).toBe(50000 + '\n\n[Content truncated due to size limit]'.length);
+        expect(result.files[0].content.length).toBe(1_000_000 + '\n\n[Content truncated due to size limit]'.length);
         expect(result.files[0].content).toContain('[Content truncated due to size limit]');
       });
 

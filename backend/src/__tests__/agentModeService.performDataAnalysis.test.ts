@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { getSecret } from '../utils/secretsManager';
 
 jest.mock('axios', () => ({
@@ -16,7 +16,8 @@ jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({
     success: true,
     url: 'https://example.com/upload.png'
-  })
+  }),
+  getS3ObjectAsString: jest.fn()
 }));
 
 jest.mock('../utils/secretsManager', () => ({
@@ -27,6 +28,7 @@ const mockedAxiosGet = axios.get as jest.Mock;
 const mockedAxiosPost = axios.post as jest.Mock;
 const mockedUploadFileToS3 = uploadFileToS3 as jest.Mock;
 const mockedGetSecret = getSecret as jest.Mock;
+const mockedGetS3ObjectAsString = getS3ObjectAsString as jest.Mock;
 
 describe('AgentModeService.performDataAnalysis', () => {
   let service: AgentModeService;
@@ -248,6 +250,57 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(mockedUploadFileToS3).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
     expect(result.analysis).not.toContain('![Analysis Result]');
+  });
+
+  // ─── tool-response S3 key auto-resolution ───────────────────────────────────
+
+  test('auto-resolves tool-response S3 keys in analysis_instruction and proceeds', async () => {
+    const sessionId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+    const s3Key = `tool-responses/${sessionId}/call123.txt`;
+    const s3Content = 'sessionId,userId,totalTokens\nsess1,user1,1000\nsess2,user2,2000';
+
+    mockedGetS3ObjectAsString.mockResolvedValueOnce(s3Content);
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [{ content: { parts: [{ text: 'Analysis complete.' }] } }]
+      }
+    });
+
+    const instruction = `Read from ${s3Key} and compute total tokens per user.`;
+    const result = await (service as any).performDataAnalysis([], instruction, 'user-1');
+
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith(s3Key);
+    expect(mockedAxiosPost).toHaveBeenCalledTimes(1);
+    const postBody = mockedAxiosPost.mock.calls[0][1];
+    const sentInstruction = postBody.contents[0].parts[postBody.contents[0].parts.length - 1].text as string;
+    // S3 content should be embedded inline; the raw key reference (as a bare path) is gone
+    expect(sentInstruction).toContain(s3Content);
+    // The original bare reference "Read from <key>" is replaced — key appears only in the [Content of ...] header
+    expect(sentInstruction).not.toContain(`Read from ${s3Key}`);
+    expect(result.success).toBe(true);
+  });
+
+  test('returns error when tool-response S3 key cannot be read and no keys resolved', async () => {
+    const sessionId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+    const s3Key = `tool-responses/${sessionId}/missing.txt`;
+
+    mockedGetS3ObjectAsString.mockRejectedValueOnce(new Error('NoSuchKey'));
+
+    const instruction = `Analyze the data in ${s3Key}.`;
+    const result = await (service as any).performDataAnalysis([], instruction, 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('could not be read');
+    expect(mockedAxiosPost).not.toHaveBeenCalled();
+  });
+
+  test('rejects local file path references (open, with open) without S3 keys', async () => {
+    const instruction = `with open('/home/bard/data.csv') as f: data = f.read()`;
+    const result = await (service as any).performDataAnalysis([], instruction, 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('local file paths');
+    expect(mockedAxiosPost).not.toHaveBeenCalled();
   });
 
   test('prompt instructs Gemini to use matplotlib, not altair', async () => {

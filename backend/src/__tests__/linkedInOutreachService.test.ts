@@ -61,7 +61,9 @@ describe('LinkedInOutreachService', () => {
         })
       },
       messaging: {
-        startNewChat: jest.fn().mockResolvedValue({ id: 'chat-id' })
+        startNewChat: jest.fn().mockResolvedValue({ id: 'chat-id' }),
+        getAllChatsFromAttendee: jest.fn().mockResolvedValue({ items: [{ id: 'chat-id-123' }] }),
+        getAllMessagesFromChat: jest.fn().mockResolvedValue({ items: [] }),
       },
       request: {
         send: jest.fn().mockResolvedValue({ provider_id: 'provider-123' })
@@ -989,6 +991,64 @@ describe('LinkedInOutreachService', () => {
       const result = await linkedInOutreachService.resolveAccountId('user-5');
 
       expect(result).toBeNull();
+    });
+  });
+
+  describe('getMessagesWithContact', () => {
+    it('uses getAllChatsFromAttendee to find chat then getAllMessagesFromChat for messages', async () => {
+      const mockMessages = [
+        { id: 'm1', provider_id: 'prov-1', text: 'Hello', is_sender: 1, is_event: 0, sender_id: 'acct-1', timestamp: '2026-01-01T10:00:00.000Z' },
+        { id: 'm2', provider_id: 'prov-2', text: 'Hi back!', is_sender: 0, is_event: 0, sender_id: 'lead-1', timestamp: '2026-01-01T10:01:00.000Z' },
+      ];
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockResolvedValueOnce({
+        items: [{ id: 'chat-456' }],
+      });
+      (mockUnipileClient.messaging.getAllMessagesFromChat as jest.Mock).mockResolvedValueOnce({
+        items: mockMessages,
+      });
+
+      const result = await linkedInOutreachService.getMessagesWithContact('attendee-id', 'acct-1');
+
+      expect(mockUnipileClient.messaging.getAllChatsFromAttendee).toHaveBeenCalledWith({
+        attendee_id: 'attendee-id',
+        account_id: 'acct-1',
+        limit: 1,
+      });
+      expect(mockUnipileClient.messaging.getAllMessagesFromChat).toHaveBeenCalledWith(
+        expect.objectContaining({ chat_id: 'chat-456', limit: 100 }),
+      );
+      expect(result).toHaveLength(2);
+      expect(result[0].provider_id).toBe('prov-1');
+      expect(result[0].is_sender).toBe(1);
+      expect(result[1].is_sender).toBe(0);
+    });
+
+    it('returns empty array when no chat found for attendee', async () => {
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockResolvedValueOnce({
+        items: [],
+      });
+
+      const result = await linkedInOutreachService.getMessagesWithContact('unknown-attendee', 'acct-1');
+
+      expect(result).toEqual([]);
+      expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
+    });
+
+    it('filters out is_event=1 system messages', async () => {
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockResolvedValueOnce({
+        items: [{ id: 'chat-789' }],
+      });
+      (mockUnipileClient.messaging.getAllMessagesFromChat as jest.Mock).mockResolvedValueOnce({
+        items: [
+          { id: 'm1', provider_id: 'prov-1', text: 'Real message', is_sender: 1, is_event: 0, sender_id: 'acct', timestamp: '2026-01-01T10:00:00.000Z' },
+          { id: 'm2', provider_id: 'prov-sys', text: null, is_sender: 0, is_event: 1, sender_id: 'system', timestamp: '2026-01-01T10:00:00.000Z' },
+        ],
+      });
+
+      const result = await linkedInOutreachService.getMessagesWithContact('attendee-id', 'acct-1');
+
+      expect(result).toHaveLength(1);
+      expect(result[0].provider_id).toBe('prov-1');
     });
   });
 });

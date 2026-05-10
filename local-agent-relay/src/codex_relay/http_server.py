@@ -14,15 +14,16 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import threading
-from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 from .config import CodexConfig
-from .runner import CodexRunner
+from .runner import CodexRunner, SCREENSHOTS_BASE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,32 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self._send_json(200, {"status": "ok", "version": "1.0"})
+        elif path.startswith("/files/"):
+            self._serve_file(path)
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _serve_file(self, path: str) -> None:
+        if not self._check_auth():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        # path is /files/{run_id}/{filename} — strip leading /files/
+        rel = path[len("/files/"):]
+        # Reject any path traversal attempts
+        if ".." in rel or rel.startswith("/"):
+            self._send_json(400, {"error": "invalid path"})
+            return
+        file_path = SCREENSHOTS_BASE_DIR / rel
+        if not file_path.is_file():
+            self._send_json(404, {"error": "file not found"})
+            return
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        data = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -120,11 +145,17 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": str(exc)})
             return
 
+        # Derive the run_id from the screenshot_dir path (last path component)
+        run_id = Path(result.screenshot_dir).name if result.screenshot_dir else ""
         self._send_json(200, {
             "ok": result.ok,
             "result": result.final_message,
             "session_id": result.session_id,
             "returncode": result.returncode,
+            "screenshots": [
+                {"name": name, "url": f"/files/{run_id}/{name}"}
+                for name in result.screenshots
+            ],
         })
 
 

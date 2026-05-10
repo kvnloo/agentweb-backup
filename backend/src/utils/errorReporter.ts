@@ -1,5 +1,3 @@
-import { emailService } from '../services/emailService';
-
 export interface UIErrorReport {
   operation: string;
   errorMessage: string;
@@ -8,9 +6,8 @@ export interface UIErrorReport {
 }
 
 /**
- * Enrich the oncall context for onboarding-tagged errors. The Notion task IS
- * the investigation surface (no separate admin portal page) — so we pack
- * everything Rui needs to investigate directly into the task body:
+ * Enrich the log context for onboarding-tagged errors so the structured log
+ * line carries enough state to investigate without leaving the logs:
  *   - User identity
  *   - Current onboardingStage
  *   - Per-step status table (icp / competitor / creativeDir / adImage / adCopy)
@@ -18,8 +15,7 @@ export interface UIErrorReport {
  *   - A delegate-as-user URL for one-click manual UI inspection
  *
  * Best-effort and silent on failure — the base reportUIError flow must never
- * be blocked by an enrichment-fetch hiccup. If userDb is unreachable the
- * Notion task still fires with the original context.
+ * be blocked by an enrichment-fetch hiccup.
  */
 async function enrichOnboardingContext(
   userId: string,
@@ -116,9 +112,16 @@ function normalizeError(message: string): string {
 }
 
 /**
- * Report a UI-facing error to Notion as an oncall issue.
- * Deduplicates by (operation + normalized error message) within a 30-minute window
- * to avoid flooding oncall when users repeatedly trigger the same failure.
+ * Report a UI-facing error as a structured log line.
+ *
+ * Previously this function also created a Notion oncall task and emailed
+ * oncall — both were removed 2026-05-07 because the Notion side was flooding
+ * the sprint board and the email side was burning bandwidth on signal we
+ * rarely acted on. Logs are sufficient for post-hoc investigation; if we
+ * need a louder alert in the future, wire it in selectively at the call site.
+ *
+ * Deduplicates by (operation + normalized error message) within a 30-minute
+ * window so a single failing user can't spam the log either.
  */
 export async function reportUIError(params: UIErrorReport): Promise<void> {
   const { operation, errorMessage, userId, context } = params;
@@ -143,30 +146,9 @@ export async function reportUIError(params: UIErrorReport): Promise<void> {
     ...context,
   };
 
-  // Enrich onboarding-tagged errors with full investigation context — see
-  // enrichOnboardingContext doc above. The Notion task becomes the
-  // investigation surface; the responder rarely needs to leave it.
-  if (userId && operation.startsWith('onboarding:')) {
+  if (userId && isOnboarding) {
     fullContext = await enrichOnboardingContext(userId, fullContext);
   }
 
-  try {
-    const { createOncallItem } = await import('../services/notionService');
-    const { notionUrl } = await createOncallItem({
-      title: subject,
-      description: errorMessage,
-      additionalTags: ['UI Error'],
-      context: fullContext,
-    });
-    // Pass notionUrl so sendOncallAlert sends the slim email (skips re-creating Notion item)
-    await emailService.sendOncallAlert(subject, errorMessage, fullContext, notionUrl);
-  } catch (err) {
-    // Notion creation failed — fall back to full email; catch any email failure too
-    console.error('[errorReporter] Notion creation failed, falling back to email:', err);
-    try {
-      await emailService.sendOncallAlert(subject, errorMessage, fullContext);
-    } catch (emailErr) {
-      console.error('[errorReporter] Email fallback also failed:', emailErr);
-    }
-  }
+  console.error('[uiError]', JSON.stringify({ subject, errorMessage, context: fullContext }));
 }

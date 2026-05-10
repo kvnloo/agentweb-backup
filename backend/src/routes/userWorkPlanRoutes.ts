@@ -51,6 +51,7 @@ router.post("/", async (req, res) => {
       stepCount: s.stepCount || i + 1,
       title: s.title || `Step ${i + 1}`,
       description: s.description,
+      ...(s.userInstructions !== undefined && { userInstructions: s.userInstructions }),
       requiredFunctionCalls: s.requiredFunctionCalls || [],
       skillIds: s.skillIds || [],
     }));

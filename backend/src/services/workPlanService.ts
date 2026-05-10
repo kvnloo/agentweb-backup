@@ -18,10 +18,23 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 
 export type WorkPlanVisibility = 'system' | 'private' | 'public' | 'pending_review';
 
+/**
+ * Maximum length of a step's userInstructions field. Capped so the
+ * customer-facing panel renders without scrolling at text-sm + leading-
+ * relaxed (~5 short lines). The legacy `description` field still holds
+ * the LLM's raw system prompt and is not bound by this limit.
+ */
+export const USER_INSTRUCTIONS_MAX_LENGTH = 500;
+
 export interface WorkPlanStep {
   stepCount: number;
   title: string;
   description?: string;
+  /** User-facing guidance: what the customer should do at this step
+   *  and what to expect. Capped at USER_INSTRUCTIONS_MAX_LENGTH chars
+   *  via validateSteps(). The legacy `description` field is the LLM's
+   *  raw system prompt and is NEVER rendered to end users. */
+  userInstructions?: string;
   requiredFunctionCalls?: string[];
   skillIds?: string[];
 }
@@ -56,7 +69,28 @@ export class WorkPlanService {
     this.tableName = `${TABLE_PREFIX}AW-WorkPlans`;
   }
 
+  /**
+   * Validate per-step fields that have a user-facing constraint.
+   * Throws an error with a 1-indexed step pointer so the message
+   * surfaces clearly in API responses + logs.
+   */
+  private validateSteps(steps: WorkPlanStep[] | undefined): void {
+    if (!steps) return;
+    steps.forEach((step, idx) => {
+      if (step.userInstructions === undefined || step.userInstructions === null) return;
+      if (typeof step.userInstructions !== 'string') {
+        throw new Error(`step ${idx + 1}: userInstructions must be a string`);
+      }
+      if (step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
+        throw new Error(
+          `step ${idx + 1}: userInstructions exceeds ${USER_INSTRUCTIONS_MAX_LENGTH} characters (got ${step.userInstructions.length})`,
+        );
+      }
+    });
+  }
+
   async createWorkPlan(plan: Omit<WorkPlan, 'planId' | 'createdAt' | 'updatedAt'>): Promise<WorkPlan> {
+    this.validateSteps(plan.steps);
     const timestamp = new Date().toISOString();
     const workPlan: WorkPlan = {
       ...plan,
@@ -82,6 +116,7 @@ export class WorkPlanService {
   }
 
   async updateWorkPlan(plan: WorkPlan): Promise<void> {
+    this.validateSteps(plan.steps);
     await dynamodb.put({
       TableName: this.tableName,
       Item: { ...plan, updatedAt: new Date().toISOString() },

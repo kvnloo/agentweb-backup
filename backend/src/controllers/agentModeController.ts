@@ -5173,6 +5173,11 @@ export const agentModeController = {
           stepCount: step.stepCount,
           title: step.title,
           description: step.description,
+          // Carry the user-facing instructions through to the session so
+          // <HorizontalPlanProgress> can render them in the expanded-step
+          // panel. Without this, the field set in the partner-portal
+          // editor never reaches the customer portal.
+          ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,

@@ -240,3 +240,57 @@ Environment variables can be used in config values with `${NAME}` syntax. This i
 ```bash
 python -m unittest
 ```
+
+## Running a Dev Instance Alongside Prod
+
+The prod relay runs from its own standalone repo (e.g. `~/local-agent-relay`). To run a dev instance with unreleased changes from the `agentweb` repo on the same machine:
+
+**1. Copy the relay to a separate directory on the target machine:**
+
+```bash
+scp -r /path/to/agentweb/local-agent-relay user@host:~/agentweb-dev-relay
+```
+
+**2. On the target machine, create a venv using Python 3.11+:**
+
+```bash
+cd ~/agentweb-dev-relay
+/opt/homebrew/bin/python3.11 -m venv .venv-dev
+.venv-dev/bin/pip install --upgrade pip
+.venv-dev/bin/pip install .
+```
+
+**3. Start on a different port (prod uses 8080, dev uses 8081):**
+
+```bash
+screen -dmS codex-relay-dev bash -c \
+  '~/agentweb-dev-relay/.venv-dev/bin/codex-relay serve --port 8081 --secret YOUR_DEV_SECRET --cwd ~/agent-work --sandbox danger-full-access --binary /Applications/Codex.app/Contents/Resources/codex --extra-arg=--skip-git-repo-check 2>&1 | tee /tmp/codex-relay-dev.log'
+```
+
+> **Note:** `--extra-arg=--skip-git-repo-check` is required when the `--cwd` directory has no git commits yet. Use `=` to pass flags as extra args (not a space) so argparse doesn't misinterpret them.
+
+**4. Expose via a second ngrok tunnel:**
+
+```bash
+ngrok http 8081
+```
+
+**5. Save the dev relay config in AWS Secrets Manager:**
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id dev/AgentWeb/LocalAgentRelay \
+  --secret-string '{"endpoint":"https://<dev-ngrok-url>.ngrok-free.app","apiKey":"YOUR_DEV_SECRET"}'
+```
+
+The backend routes to `dev/AgentWeb/LocalAgentRelay` when `NODE_ENV != production` and to `prod/AgentWeb/LocalAgentRelay` in production, so the two instances are fully independent.
+
+**To update the dev relay with new changes**, re-copy the changed files and restart the screen session:
+
+```bash
+scp /path/to/agentweb/local-agent-relay/src/codex_relay/*.py \
+    user@host:~/agentweb-dev-relay/src/codex_relay/
+ssh user@host "screen -S codex-relay-dev -X quit; \
+  screen -dmS codex-relay-dev bash -c \
+  '~/agentweb-dev-relay/.venv-dev/bin/codex-relay serve --port 8081 --secret YOUR_DEV_SECRET 2>&1 | tee /tmp/codex-relay-dev.log'"
+```
