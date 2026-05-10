@@ -32,6 +32,74 @@ type ProviderSource = 'apollo' | 'enrich.so';
 export interface WaterfallContext {
   userId: string;
   enrichmentFieldConfig?: any;
+  /**
+   * Max wall-clock time (ms) Tier 3 waits for Apollo's async waterfall webhook
+   * to deposit a result before falling through to Tier 4. Defaults to
+   * `process.env.APOLLO_WATERFALL_WAIT_MS` if set, else 90 000ms. Tests pass
+   * a small value to keep the suite fast.
+   */
+  apolloWaitMs?: number;
+}
+
+/**
+ * Default wall-clock budget for waiting on Apollo's async waterfall result.
+ * 90s comfortably covers the typical broker-chain latency (tens of seconds);
+ * tunable via `APOLLO_WATERFALL_WAIT_MS` for ops without a redeploy.
+ */
+const DEFAULT_APOLLO_WAIT_MS = 90_000;
+function resolveApolloWaitMs(ctx: WaterfallContext): number {
+  if (typeof ctx.apolloWaitMs === 'number') return Math.max(0, ctx.apolloWaitMs);
+  const fromEnv = Number(process.env.APOLLO_WATERFALL_WAIT_MS);
+  return Number.isFinite(fromEnv) && fromEnv >= 0 ? fromEnv : DEFAULT_APOLLO_WAIT_MS;
+}
+
+/**
+ * Poll the placeholder cache row for an Apollo async-waterfall result.
+ *
+ * Backoff schedule: 2s → 5s → 10s → 15s × N, capped to remaining budget.
+ * The webhook handler stamps `rawData.status` to `completed` (with email),
+ * `no_email`, or `rejected` — anything else (incl. `pending` or row absent)
+ * means keep waiting.
+ *
+ * Returns `{email, emailStatus}` only when status='completed' AND an email
+ * is present. All other terminal states (no_email, rejected, timeout)
+ * resolve to null so the caller falls through to Tier 4.
+ */
+async function waitForApolloAsyncResult(
+  requestId: string,
+  budgetMs: number,
+): Promise<{ email: string; emailStatus?: string } | null> {
+  if (budgetMs <= 0) return null;
+  const key = apolloAsyncRequestCacheKey({ requestId });
+  if (!key) return null;
+  const start = Date.now();
+  const intervals = [2000, 5000, 10000, 15000];
+  let attempt = 0;
+  // Read-then-sleep: do the DDB read at the top of each iteration, so an
+  // already-deposited placeholder (e.g. extremely fast broker hit, or a
+  // cache row that survived a retry) returns on the first tick instead of
+  // after the initial 2s backoff.
+  while (true) {
+    const row: any = await crmDb.getEnrichmentCacheItem(key.canonicalId, key.sk).catch(() => null);
+    const status = row?.rawData?.status;
+    if (status === 'completed') {
+      const result = row.rawData.result || {};
+      if (typeof result.email === 'string' && result.email.length > 0) {
+        return { email: result.email, emailStatus: result.emailStatus };
+      }
+      return null;
+    }
+    if (status === 'no_email' || status === 'rejected') {
+      return null;
+    }
+    // pending / undefined → keep waiting (if budget allows)
+    const remaining = budgetMs - (Date.now() - start);
+    if (remaining <= 0) return null;
+    const baseDelay = intervals[Math.min(attempt, intervals.length - 1)];
+    const delay = Math.min(baseDelay, remaining);
+    await new Promise((r) => setTimeout(r, delay));
+    attempt++;
+  }
 }
 
 /** In-flight dedup for Apollo match calls. Key: `${userId}:${cacheToken}`. */
@@ -561,7 +629,30 @@ export async function waterfallFindEmail(
             );
           });
         }
-        // Don't return — fall through to Tier 4 so we still have a sync answer.
+        // Wait for the webhook to deposit the result onto the placeholder.
+        // Apollo's broker chain typically lands within tens of seconds; budget
+        // is configurable via ctx.apolloWaitMs (test override) or env. On
+        // hit → return Tier 3 result and skip Tier 4. On timeout / no_email
+        // / rejected → fall through to Tier 4. The webhook keeps a separate
+        // direct-lead-write safety net for results that arrive after we give up.
+        const polled = await waitForApolloAsyncResult(f.asyncRequestId, resolveApolloWaitMs(ctx));
+        if (polled?.email) {
+          const status = (polled.emailStatus ?? '').toLowerCase();
+          const confidence: EnrichSoConfidence =
+            status === 'verified' ? 'high' :
+            status === 'guessed' ? 'low' :
+            'medium';
+          return {
+            found: true,
+            email: polled.email,
+            confidence,
+            emailStatus: polled.emailStatus,
+            provider: 'apollo',
+            fromCache: false,
+            tier: 3,
+          };
+        }
+        // Falls through to Tier 4.
       }
     } catch { /* fall through */ }
   }
