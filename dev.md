@@ -4209,3 +4209,37 @@ A customer portal PR had serious test-suite issues that exhausted GitHub Actions
 ### Principle
 
 Tests will occasionally fail or hang. CI must make that failure cheap, bounded, and easy to diagnose instead of letting a single regression consume the entire Actions budget.
+
+## Emma "Forgot Brand" — Root Cause & Fix (2026-05-10)
+
+### User Report
+
+User `phoenixtech@agentweb.pro` (Phoenix Technologies) reported that Emma "forgot their brand" during a session (`a93853a9-923a-44bb-a176-6c6eaefbe587`). The user was asking Emma to generate Meta Image Ad Prompts. Emma replied asking *"What's the product or company these Meta image ads are for?"* — even though the user had a rich, fully-populated brand profile (Phoenix Technologies, Kevin Zhang, detailed tone of voice, key messages, etc.).
+
+### Root Cause
+
+Emma violated the system prompt rule at `agentModeSystemPrompt.ts:306`:
+
+> "Before asking the user for business details... ALWAYS call `read_brand_guidelines` and `read_market_strategy` first."
+
+The LLM skipped this rule and asked the user for context it already had access to via tools. This is a prompt-instruction compliance failure — the system prompt said what to do, but the model chose a clarifying-question flow instead.
+
+Session transcript summary:
+1. User: "Generate Meta Image Ad Prompts for ChatGPT Images 2.0"
+2. Emma: "What's the product or company?" ← violated rule
+3. User: "My brand!" (frustrated)
+4. Emma: "Who is the target customer?" ← asked again
+5. User: "Look at Market Strategy"
+6. Emma: called `read_market_strategy`, then proceeded correctly
+
+The brand data was present in DynamoDB (`AW-Users.brandGuidelines`) and would have been returned had Emma called `read_brand_guidelines` upfront.
+
+### Fix Applied
+
+Added `read_brand_guidelines` and `read_market_strategy` to the foundation tools list in the admin Agent Mode settings page. These tools were already in `DEFAULT_FOUNDATION_TOOLS` in `agentModeService.ts` (line 2817–2819) as the code-level fallback, but were not present in the DB-stored foundation tools config, which takes precedence over the default when set.
+
+By ensuring these tools are present in the DB-configured foundation tools list, they are always available to Emma in every session — not just when the DB config falls back to defaults.
+
+### Why This Helps (and Its Limits)
+
+Guaranteeing tool availability prevents the "tool not available" failure mode, but does not prevent the LLM from choosing not to call the tool. The prompt instruction at line 306 remains the primary enforcement mechanism. If the "forgot brand" pattern recurs, the next step is **Option C** from the investigation: programmatic pre-flight injection of brand context into the context window at session start (same pattern as account memory injection at `agentModeService.ts:1635`), making brand context available without requiring any LLM tool call decision.
