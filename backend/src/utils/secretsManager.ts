@@ -682,24 +682,22 @@ export async function getApolloApiKey(): Promise<string> {
 
 /**
  * Shared secret used to authenticate the Apollo waterfall webhook callback.
- * Apollo doesn't HMAC-sign webhook bodies, so we send this value in a custom
- * header (X-Apollo-Webhook-Secret) on the webhook URL we hand Apollo and
- * verify it on the receiving route with a constant-time compare.
+ * Apollo doesn't HMAC-sign webhook bodies and silently drops `webhook_headers`,
+ * so we embed this value in the **URL path** of the webhook we hand Apollo
+ * (/api/crm/webhooks/apollo/<secret>) and verify it on the receiving route
+ * with a constant-time compare. Must be URL-safe (no characters needing
+ * percent-encoding to round-trip cleanly).
+ *
+ * Resolution order: `APOLLO_WEBHOOK_SECRET` env var if set and non-empty,
+ * otherwise the built-in default. The default ships intentionally so the
+ * webhook works in dev without extra setup; production deploys should set
+ * the env var to a rotated value.
  */
+const DEFAULT_APOLLO_WEBHOOK_SECRET = 'dev_apl_wh_8k3p2x9qm7n4r5z6_v1';
+
 export async function getApolloWebhookSecret(): Promise<string> {
-  const environment = process.env.NODE_ENV || 'development';
-  const secretName = environment === 'production'
-    ? 'prod/AgentWeb/Apollo'
-    : 'dev/AgentWeb/Apollo';
-  const secretString = await getSecret(secretName);
-  if (!secretString || secretString.trim() === '') {
-    throw new Error(`Apollo credentials secret is empty at ${secretName}.`);
-  }
-  const parsed = JSON.parse(secretString) as ApolloCredentials;
-  if (!parsed.webhookSecret || parsed.webhookSecret.trim() === '') {
-    throw new Error(`Apollo credentials at ${secretName} missing webhookSecret.`);
-  }
-  return parsed.webhookSecret.trim();
+  const fromEnv = process.env.APOLLO_WEBHOOK_SECRET?.trim();
+  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_APOLLO_WEBHOOK_SECRET;
 }
 
 export interface AttioCredentials {

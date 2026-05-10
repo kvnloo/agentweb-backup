@@ -34,26 +34,22 @@ const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
 
 /**
  * Build the public webhook URL Apollo will POST async waterfall results to.
- * Auth is sent in a custom header (X-Apollo-Webhook-Secret) supplied to
- * Apollo via webhook_headers, not as a URL query param — query strings land
- * in nginx access logs and LB traces.
+ * The shared secret is embedded in the URL **path** (not header, not query
+ * string). Apollo's `webhook_headers` parameter is silently dropped on the
+ * callback POST — verified empirically 2026-05-08 — so we can't rely on it.
+ * Apollo treats the path as opaque and posts back to the exact URL we hand
+ * them, which lets us verify the secret on arrival.
+ *
+ * The secret resolves via getApolloWebhookSecret() so sender and receiver
+ * use the same source (env override or built-in default). Returns null only
+ * when no public base URL is configured — caller must skip Tier 3 in that
+ * case rather than send an un-routable webhook URL.
  */
-function buildWebhookUrl(): string | null {
+async function buildWebhookUrl(): Promise<string | null> {
   const base = process.env.BACKEND_URL || process.env.PUBLIC_BASE_URL;
   if (!base) return null;
-  return `${base.replace(/\/$/, '')}/api/crm/webhooks/apollo`;
-}
-
-/**
- * Header bag delivered to Apollo alongside webhook_url so they include it on
- * the callback POST. Keyed under APOLLO_WEBHOOK_SECRET (set during init).
- * Returns null when the secret isn't loaded — caller must skip Tier 3 in
- * that case rather than send an unauthenticated webhook URL.
- */
-function buildWebhookHeaders(): Record<string, string> | null {
-  const secret = process.env.APOLLO_WEBHOOK_SECRET;
-  if (!secret) return null;
-  return { 'X-Apollo-Webhook-Secret': secret };
+  const secret = await getApolloWebhookSecret();
+  return `${base.replace(/\/$/, '')}/api/crm/webhooks/apollo/${encodeURIComponent(secret)}`;
 }
 
 function buildHttpClient(apiKey: string): ApolloHttpClient {
@@ -115,9 +111,8 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
         else if (input.organizationName) body.organization_name = input.organizationName;
         if (input.linkedinUrl) body.linkedin_url = input.linkedinUrl;
         if (input.runWaterfall) {
-          const webhook = input.webhookUrl ?? buildWebhookUrl();
-          const headers = buildWebhookHeaders();
-          if (!webhook || !headers) {
+          const webhook = input.webhookUrl ?? (await buildWebhookUrl());
+          if (!webhook) {
             // No webhook URL or no secret loaded → can't safely enable
             // run_waterfall_email (callback would be unauthenticated).
             // Fall back to basic match so the waterfall still works.
@@ -125,8 +120,6 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
           } else {
             body.run_waterfall_email = true;
             body.webhook_url = webhook;
-            // Apollo posts these on the callback request alongside the body.
-            body.webhook_headers = headers;
           }
         }
         const r = await client.post('/people/match', body);

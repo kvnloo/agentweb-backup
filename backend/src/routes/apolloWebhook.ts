@@ -3,16 +3,33 @@
  *
  * Mounted on a PUBLIC path (before crmRoutes' auth middleware) because Apollo
  * doesn't send a JWT — they just POST to the webhook URL we hand them. Auth is
- * the shared `X-Apollo-Webhook-Secret` request header, compared in constant
- * time against getApolloWebhookSecret(). Headers (not query strings) so the
- * secret never lands in nginx access logs or load-balancer traces.
+ * a shared secret embedded in the URL **path**, compared in constant time
+ * against getApolloWebhookSecret().
  *
- *   POST /api/crm/webhooks/apollo
- *   X-Apollo-Webhook-Secret: <webhookSecret>
+ *   POST /api/crm/webhooks/apollo/<webhookSecret>
  *
- * The placeholder cache row written by Tier 3 (apollo:async_request:<request_id>)
- * maps the request_id back to a specific lead. We never overwrite an existing
- * email — the lead may have been filled by Tier 1/2/4 in the meantime.
+ * Why path-based, not header-based: Apollo's `webhook_headers` parameter is
+ * accepted at submit time but NOT echoed back on the callback POST (verified
+ * empirically 2026-05-08). Header auth therefore never passes in production.
+ *
+ * Why path, not query string: by Apollo convention the path round-trips
+ * cleanly on retries; query strings can be reordered or dropped by some
+ * proxies. The trade-off: paths DO appear in default nginx `combined` access
+ * logs and ALB request URIs, so the secret can leak via log retention. To
+ * mitigate, treat the secret as bearer-grade — rotate via APOLLO_WEBHOOK_SECRET
+ * env on a cadence, and keep nginx/ALB configured to suppress (or scrub)
+ * access logs for `/api/crm/webhooks/apollo/*` if practical.
+ *
+ * On every authenticated callback we perform two writes:
+ *   1. Stamp `rawData.status` and `rawData.result` onto the Tier 3 placeholder
+ *      row (apollo:async_request:<request_id>) so the in-process Tier 3 poller
+ *      can pick up the result and skip Tier 4. Uses `force: true` because the
+ *      placeholder is fresh (TTL 7d) and the default ConditionExpression
+ *      otherwise no-ops the overwrite.
+ *   2. As a late-arrival safety net (in case the poller already gave up),
+ *      `setLeadEmailIfMissing` writes the email onto the lead — conditional,
+ *      so it never overwrites a value Tier 1/2/4 may have filled in the
+ *      meantime.
  */
 
 import express, { Request, Response, Router } from 'express';
@@ -22,7 +39,7 @@ import { apolloAsyncRequestCacheKey } from '../services/apolloCacheKeys';
 import { getApolloWebhookSecret } from '../utils/secretsManager';
 
 /**
- * Constant-time header secret check. Returns false for length mismatches
+ * Constant-time secret check. Returns false for length mismatches
  * without ever leaking that information through compare timing — Buffer
  * lengths are equalised by padding before timingSafeEqual.
  */
@@ -42,26 +59,74 @@ const router: Router = express.Router();
 
 interface ApolloWebhookPayload {
   request_id?: string;
-  person?: {
+  // Async waterfall shape — Apollo's actual run_waterfall_email callback body.
+  // Each `vendors` entry is either a finder (has `emails[]` populated) or a
+  // verifier (`usedForVerification: true`, `status: 'validated'` on success).
+  people?: Array<{
     id?: string;
-    email?: string;
-    email_status?: string;
-  };
+    waterfall?: {
+      emails?: Array<{
+        vendors?: Array<{
+          name?: string;
+          status?: string;
+          emails?: string[];
+          usedForVerification?: boolean;
+        }>;
+      }>;
+    };
+  }>;
+  // Legacy/sync shapes left for fallback — not what run_waterfall_email sends.
+  person?: { id?: string; email?: string; email_status?: string };
   email?: string;
   email_status?: string;
 }
 
-router.post('/', async (req: Request, res: Response) => {
+/**
+ * Pull the first finder-vendor email out of Apollo's nested waterfall payload.
+ * Falls back to the flat `person.email` / `email` shape if `people[]` is absent
+ * (sync match or older payload format). When a downstream verifier vendor
+ * (ZeroBounce et al.) reports `validated`, the resulting status is upgraded
+ * to `verified` regardless of the finder's self-claim.
+ */
+function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string } {
+  const person = Array.isArray(payload.people) ? payload.people[0] : null;
+  const groups = person?.waterfall?.emails;
+  if (Array.isArray(groups)) {
+    for (const grp of groups) {
+      const vendors = Array.isArray(grp?.vendors) ? grp.vendors : [];
+      const finder = vendors.find((v) => Array.isArray(v?.emails) && v.emails.length > 0);
+      if (!finder || !finder.emails || finder.emails.length === 0) continue;
+      const verified = vendors.some(
+        (v) => v?.usedForVerification && String(v?.status ?? '').toLowerCase() === 'validated',
+      );
+      const finderStatus = String(finder.status ?? '').toLowerCase();
+      const emailStatus =
+        verified || finderStatus === 'verified' ? 'verified' :
+        finderStatus === 'guessed' ? 'guessed' :
+        finderStatus || undefined;
+      return { email: String(finder.emails[0]), emailStatus };
+    }
+  }
+  // Flat-shape fallback. Lowercase the status so downstream confidence
+  // mapping (`status === 'verified' ? 'high' : ...`) doesn't miss when
+  // Apollo returns mixed case (e.g. "VERIFIED").
+  const flatEmail = payload.person?.email ?? payload.email;
+  const flatStatus = payload.person?.email_status ?? payload.email_status;
+  return {
+    email: flatEmail,
+    emailStatus: typeof flatStatus === 'string' ? flatStatus.toLowerCase() : flatStatus,
+  };
+}
+
+router.post('/:secret', async (req: Request, res: Response) => {
   try {
     const expectedSecret = await getApolloWebhookSecret().catch(() => null);
     if (!expectedSecret) {
       console.warn('[apollo webhook] webhook secret not configured — refusing');
       return res.status(503).json({ message: 'webhook not configured' });
     }
-    // Header-based auth. Express lower-cases header names; supertest preserves
-    // case. Read both forms defensively.
-    const headerVal = req.header('X-Apollo-Webhook-Secret') ?? req.header('x-apollo-webhook-secret') ?? '';
-    if (!headerVal || !safeSecretEquals(headerVal, expectedSecret)) {
+    const provided = req.params.secret ?? '';
+    if (!provided || !safeSecretEquals(provided, expectedSecret)) {
       return res.status(401).json({ message: 'invalid webhook secret' });
     }
 
@@ -98,12 +163,40 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(202).json({ accepted: true, matched: false, leadDeleted: true });
     }
 
+    // Idempotency: if this exact request_id already wrote the lead, we know
+    // the FIRST webhook arrival also stamped the placeholder result (deposit
+    // sits below this guard, so any path that wrote the lead with this
+    // requestId also ran the deposit). A retry can therefore early-out
+    // without re-depositing — the placeholder is already correct.
     if (lead.email && lead.enrichmentMetadata?.email?.apolloRequestId === requestId) {
       return res.status(200).json({ accepted: true, matched: true, alreadyProcessed: true });
     }
 
-    const email = payload.person?.email ?? payload.email;
-    const emailStatus = payload.person?.email_status ?? payload.email_status;
+    const { email, emailStatus } = extractApolloEmail(payload);
+
+    // Stamp the result onto the placeholder so the waterfall poller (running
+    // in the original Tier 3 caller) can pick it up and skip Tier 4. Best-
+    // effort — failures don't block the direct lead-write below, which is
+    // the safety net for late arrivals after the poller has already given up.
+    //
+    // `force: true` is required: the placeholder was written by Tier 3 and is
+    // still fresh (TTL ~7d), so the default ConditionExpression on
+    // putEnrichmentCacheItem ("insert only when absent or expired") would
+    // silently no-op the overwrite via ConditionalCheckFailedException — the
+    // poller would then see status=pending forever and always time out.
+    const placeholderResult = email
+      ? { email, emailStatus, status: 'completed' as const, completedAt: new Date().toISOString() }
+      : { status: 'no_email' as const, completedAt: new Date().toISOString() };
+    try {
+      await crmDb.putEnrichmentCacheItem({
+        ...(placeholder as any),
+        rawData: { ...(placeholder.rawData || {}), status: placeholderResult.status, result: placeholderResult },
+        cacheType: 'apollo',
+      } as any, { force: true });
+    } catch (err: any) {
+      console.error('[apollo webhook] placeholder result-stamp failed for', requestId, ':', err?.message);
+    }
+
     if (!email) {
       return res.status(200).json({ accepted: true, matched: true, hadEmail: false });
     }
