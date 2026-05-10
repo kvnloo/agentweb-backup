@@ -20,6 +20,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-10',
     changes: [
+      'New: Video Ads Now Support AI-Generated Voiceovers',
+      '- The Video Production skill can now generate a professional voiceover for your ad using ElevenLabs TTS and mix it directly into the final video',
+      '- Choose from 6 voices: George (warm, confident male), Rachel (clear, professional female), Adam (deep, authoritative), Bella (soft, friendly), Josh (young, energetic), or Dorothy (pleasant, conversational)',
+      '- To use: ask Emma to generate a voiceover for your script first, then pass the audio URL into your video composition — or just ask for "a video ad with voiceover" and the agent handles the full workflow automatically',
+      '- Voiceovers are baked directly into the Remotion render, so the final MP4 is a single self-contained file with audio included',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
       'Fixed: Scheduled Chat — Email Notifications Now Parsed Correctly',
       '- When creating or updating a scheduled chat, email addresses passed as a stringified JSON array (a common pattern from AI tools) are now automatically parsed into a proper list',
       '- For example, ["[\\"will@example.com\\", \\"other@example.com\\"]"] is now correctly stored as two separate addresses',
