@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-10',
+    changes: [
+      'Fixed: Scheduled Chat — Email Notifications Now Parsed Correctly',
+      '- When creating or updating a scheduled chat, email addresses passed as a stringified JSON array (a common pattern from AI tools) are now automatically parsed into a proper list',
+      '- For example, ["[\\"will@example.com\\", \\"other@example.com\\"]"] is now correctly stored as two separate addresses',
+      '- Invalid email addresses are filtered out rather than silently saved',
+    ],
+  },
+  {
     date: '2026-05-08',
     changes: [
       'Fixed: Fathom Connected Account Now Shows Correct Status',
