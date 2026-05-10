@@ -4178,3 +4178,34 @@ Internal Emma gets a `clarify_context` tool. When context is insufficient, she a
 ### Decision
 
 **Stick with the current account-scoped Emma implementation for now.** Internal Slack coverage is not a near-term priority. No changes planned in the immediate roadmap. Revisit when the team actively needs Emma to answer platform-level questions in Slack — at that point Phase 1 (admin identity + internal system prompt) is the recommended starting point given it reuses the most existing infrastructure.
+
+---
+
+## May 10, 2026: Lesson - CI Must Fail Cheaply When Tests Regress
+
+### Incident
+
+A customer portal PR had serious test-suite issues that exhausted GitHub Actions credits before the test job could finish. The suite had real failures, stale assertions, timer leakage, and a same-tab state synchronization loop, but the workflow allowed every run to consume the full job budget.
+
+### Root Causes
+
+- PR test workflow did not cancel older runs when newer commits were pushed.
+- The test command did not fail fast, so one known failing area could leave the rest of the suite running.
+- Vitest workers were too aggressive for a memory-heavy suite in CI.
+- Fake timers leaked across files and caused unrelated tests to hang or time out later.
+- A hook wrote localStorage, dispatched a same-tab event, re-read a fresh array, set state again, and repeated.
+- Several tests were asserting obsolete UI output after the product had moved from raw JSON/debug text to humanized summaries.
+
+### Guardrails To Apply
+
+- Add PR workflow `concurrency` with `cancel-in-progress: true`.
+- Run expensive suites with fail-fast behavior, for example `--bail=1`.
+- Add a shell-level timeout shorter than the GitHub job timeout, so CI exits with useful logs before the platform kills the job.
+- Keep CI worker counts conservative for large jsdom suites.
+- Use fake timers only in tests that need them, and restore real timers in setup/cleanup.
+- Treat stale tests as production risk when they hide real failures or force full-suite retries.
+- Keep passing-test logs quiet enough that the first failure is obvious.
+
+### Principle
+
+Tests will occasionally fail or hang. CI must make that failure cheap, bounded, and easy to diagnose instead of letting a single regression consume the entire Actions budget.
