@@ -1,6 +1,7 @@
 import React from "react";
 import {
   AbsoluteFill,
+  Audio,
   OffthreadVideo,
   Sequence,
   useCurrentFrame,
@@ -37,6 +38,10 @@ export interface BrandedVideoProps {
   introDurationFrames?: number;
   /** Duration in frames for the outro CTA overlay (default: 90 = 3s at 30fps) */
   outroDurationFrames?: number;
+  /** Optional S3 URL of an MP3 voiceover audio file to overlay on the video */
+  audioUrl?: string;
+  /** Volume for the voiceover track (0.0–1.0, default: 1.0) */
+  audioVolume?: number;
 }
 
 /** Animated lower-third headline shown at the start */
@@ -276,6 +281,8 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
   ctaUrl,
   introDurationFrames = 90,
   outroDurationFrames = 90,
+  audioUrl,
+  audioVolume = 1.0,
 }) => {
   const { durationInFrames, fps } = useVideoConfig();
   const hasOutro = Boolean(ctaText);
@@ -364,6 +371,11 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
             durationFrames={safeOutroDuration}
           />
         </Sequence>
+      )}
+
+      {/* Voiceover audio track */}
+      {audioUrl && (
+        <Audio src={audioUrl} volume={audioVolume} />
       )}
     </AbsoluteFill>
   );
