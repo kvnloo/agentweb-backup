@@ -2309,7 +2309,11 @@ router.post(
 
       const headers = Object.keys(records[0]);
       const { suggestColumnMapping } = await import('../services/csvColumnMatcher');
-      const suggestedMapping = suggestColumnMapping(headers);
+      const standardLeadFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'companyLinkedin', 'notes'];
+      const existingCustomFields = ((list as any).fieldNames as string[] || []).filter(
+        (f: string) => !standardLeadFields.includes(f),
+      );
+      const suggestedMapping = suggestColumnMapping(headers, existingCustomFields);
 
       // A required field is satisfied if any column maps to email or linkedin
       // (we'll re-validate at import time with the user's final choices).
@@ -2595,6 +2599,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     res.json({
       success: true,
       successCount: results.successCount,
+      mergedCount: results.mergedCount,
       errorCount: results.errorCount,
       errors: results.errors,
       message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`,
