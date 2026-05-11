@@ -39,6 +39,11 @@ jest.mock('aws-sdk', () => {
         })),
       }
     ),
+    SecretsManager: jest.fn().mockImplementation(() => ({
+      getSecretValue: jest.fn().mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '{}' }),
+      }),
+    })),
   };
 });
 
