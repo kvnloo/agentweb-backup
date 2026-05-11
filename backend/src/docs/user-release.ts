@@ -11,7 +11,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
-<<<<<<< HEAD
       'Admin: Connected Accounts Tab Added to Admin Dashboard',
       '- A new Connected Accounts tab is available in the Admin Dashboard showing all Unipile (LinkedIn Outreach) accounts across all users',
       '- Each row shows the user email, account name, account ID, and live Unipile connection status (OK / ERROR / UNKNOWN)',
