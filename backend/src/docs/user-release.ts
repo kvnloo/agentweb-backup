@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
+      'New: Inject Your Own Google Tag Manager Container into Landing Pages',
+      '- Each deployed landing page card now shows an "Add GTM" button if no container is configured, or a green "GTM: GTM-XXXXXX" badge if one is already set',
+      '- Clicking either button opens a dialog where you can enter your GTM container ID (format: GTM-XXXXXXX)',
+      '- Once saved, the GTM snippet is injected into the page\'s layout and the site redeploys automatically in ~30 seconds',
+      '- This enables custom GA4 events (button clicks, PDF downloads, form submissions) to flow into your own Google Analytics property and LookerStudio dashboards',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
       'New: CRM Senders Now Support a Default LinkedIn Outreach Account',
       '- The Senders dialog in the CRM now includes a LinkedIn Sender section',
       '- If you have a LinkedIn outreach account connected, you can designate one as the default sender for LinkedIn messages',
