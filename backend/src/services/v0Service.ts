@@ -1941,6 +1941,98 @@ export async function triggerVercelDeployment(
   console.log(`[V0 SERVICE] Triggered deployment for ${repoFullName} on ${ref}`);
 }
 
+// ---------------------------------------------------------------------------
+// Integrations — maps friendly field names to Vercel env var keys
+// ---------------------------------------------------------------------------
+export const INTEGRATIONS = {
+  recaptcha: {
+    siteKey: {
+      envKey: "NEXT_PUBLIC_RECAPTCHA_SITE_KEY",
+      type: "plain" as const,
+      target: ["production", "preview", "development"] as string[],
+    },
+    secretKey: {
+      envKey: "RECAPTCHA_SECRET_KEY",
+      type: "encrypted" as const,
+      target: ["production", "preview", "development"] as string[],
+    },
+  },
+} as const;
+
+export async function getProjectEnvVars(
+  vercelProjectId: string
+): Promise<Record<string, { ids: string[]; id: string; value: string; type: string }>> {
+  const vercelToken = await getVercelToken();
+  const headers = {
+    Authorization: `Bearer ${vercelToken}`,
+    "Content-Type": "application/json",
+  };
+  const res = await axios.get<any>(
+    `https://api.vercel.com/v10/projects/${vercelProjectId}/env`,
+    { headers, timeout: VERCEL_API_TIMEOUT_MS }
+  );
+  const envs: any[] = res.data?.envs ?? [];
+  // Vercel can have multiple records per key (one per environment target).
+  // Collect all IDs so we can delete them all before re-creating.
+  const result: Record<string, { ids: string[]; id: string; value: string; type: string }> = {};
+  for (const env of envs) {
+    if (!env.key) continue;
+    if (result[env.key]) {
+      result[env.key].ids.push(env.id);
+    } else {
+      result[env.key] = { ids: [env.id], id: env.id, value: env.value ?? "", type: env.type ?? "plain" };
+    }
+  }
+  return result;
+}
+
+export async function upsertEnvVar(
+  vercelProjectId: string,
+  key: string,
+  value: string,
+  target: string[],
+  existingIds?: string[],
+  type: "plain" | "encrypted" = "encrypted"
+): Promise<string> {
+  const vercelToken = await getVercelToken();
+  const headers = {
+    Authorization: `Bearer ${vercelToken}`,
+    "Content-Type": "application/json",
+  };
+  // Delete all existing records for this key first (avoids per-environment split records).
+  const idsToDelete = Array.isArray(existingIds) ? existingIds : existingIds ? [existingIds as string] : [];
+  if (idsToDelete.length) {
+    await Promise.all(
+      idsToDelete.map((id) =>
+        axios.delete(`https://api.vercel.com/v10/projects/${vercelProjectId}/env/${id}`, {
+          headers,
+          timeout: VERCEL_API_TIMEOUT_MS,
+        }).catch(() => {})
+      )
+    );
+  }
+  const res = await axios.post<any>(
+    `https://api.vercel.com/v10/projects/${vercelProjectId}/env`,
+    { key, value, type, target },
+    { headers, timeout: VERCEL_API_TIMEOUT_MS }
+  );
+  return res.data.id;
+}
+
+export async function deleteEnvVar(
+  vercelProjectId: string,
+  envId: string
+): Promise<void> {
+  const vercelToken = await getVercelToken();
+  await axios.delete(
+    `https://api.vercel.com/v10/projects/${vercelProjectId}/env/${envId}`,
+    {
+      headers: { Authorization: `Bearer ${vercelToken}` },
+      timeout: VERCEL_API_TIMEOUT_MS,
+    }
+  );
+}
+
 /**
  * Refine a landing page with follow-up instructions via v0 chat.
  */

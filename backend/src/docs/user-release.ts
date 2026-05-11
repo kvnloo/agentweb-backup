@@ -69,6 +69,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-11',
+    changes: [
+      'New: Manage Environment Variables for Landing Pages',
+      '- Each deployed landing page card now has an "Env Vars" button that opens a configuration panel',
+      '- Set reCAPTCHA v2 Site Key and Secret Key directly from the portal — no Vercel access needed',
+      '- Add custom environment variables with optional secret/encrypted storage for sensitive values',
+      '- Saving automatically triggers a redeployment so all changes take effect immediately',
+      '- Variables are scoped to the Vercel project, so landing pages sharing a project share the same environment',
+    ],
+  },
+  {
     date: '2026-05-10',
     changes: [
       'New: Video Ads Now Support AI-Generated Voiceovers',
