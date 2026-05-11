@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
+      'Fixed: Scheduled Chat Results Now Always Appear in the Chat View',
+      '- Previously, if a scheduled chat generated a very large response (e.g. a detailed HTML report), the final message could silently fail to save — the email arrived correctly but the chat page showed no response',
+      '- The root cause was an oversized DynamoDB item exceeding the 400KB limit; the fix now correctly detects and truncates oversized messages regardless of content format',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
       'Improved: Foreplay Ad Library Now Available Platform-Wide',
       '- The Foreplay Ad Library in the Knowledge Base is now active for all users without any setup required',
       '- Previously, each user had to connect their own Foreplay API key to use swipefile and board search in agent mode',
