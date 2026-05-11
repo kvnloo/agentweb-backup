@@ -221,7 +221,7 @@ export interface ChatSession {
   assetCache?: {
     images: Array<{ url: string; filename: string; generatedAt: string }>;
     videos: Array<{ url: string; filename: string; generatedAt: string }>;
-    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>;
+    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string; reportType?: 'creative' | 'research' | 'performance' }>;
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
@@ -1983,6 +1983,52 @@ export class ChatbotDB {
       }).promise();
     } catch (error) {
       console.error(`Error persisting searchableTexts for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Persist reportType values for specific htmlReport entries in a session's assetCache.
+   */
+  async persistReportTypes(
+    sessionId: string,
+    updates: Array<{ url: string; reportType: 'creative' | 'research' | 'performance' }>,
+    force = false
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    try {
+      const result = await dynamodb.get({
+        TableName: this.tableName,
+        Key: { sessionId },
+        ProjectionExpression: 'assetCache',
+      }).promise();
+
+      const item = result.Item as any;
+      if (!item?.assetCache) return;
+
+      const cache = item.assetCache as ChatSession['assetCache'];
+      if (!cache) return;
+
+      const updateMap = new Map(updates.map(u => [u.url, u.reportType]));
+      let changed = false;
+
+      for (const report of cache.htmlReports || []) {
+        const type = updateMap.get(report.url);
+        if (type && (force || !report.reportType)) {
+          report.reportType = type;
+          changed = true;
+        }
+      }
+
+      if (!changed) return;
+
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET assetCache = :cache',
+        ExpressionAttributeValues: { ':cache': cache },
+      }).promise();
+    } catch (error) {
+      console.error(`Error persisting reportTypes for session ${sessionId}:`, error);
     }
   }
 
