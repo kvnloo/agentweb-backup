@@ -6867,7 +6867,14 @@ For more than ~30 results from a single query, use the cursor returned in the re
 
 When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
 
-After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
+Setting auto_enrich=true queues a background email-finder job for the newly imported leads — the response then includes "autoEnrichJobId" so the caller can poll job status. When auto_enrich is false (default), no background work is started and you should recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.
+
+Response keys:
+- imported / skipped / errors / total — per-call counts (do not sum across calls)
+- list_total_after_import — actual post-import list size (trust this for cumulative counts)
+- cursor — pagination cursor for the next page of the same query (null when no more results)
+- importedLeads — array of the first 5 imported lead summaries (firstName, lastName, linkedin, title, company), useful for rendering a quick preview without a follow-up read
+- autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -6925,7 +6932,11 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of leads to import. Defaults to 20, max 100.'
+          description: 'Maximum number of leads to import. Defaults to 20, max 500.'
+        },
+        auto_enrich: {
+          type: 'boolean',
+          description: 'When true, after import, queue a background email-finder job for the new leads. Returns autoEnrichJobId in the response. Default: false.'
         }
       },
       required: ['list_id']
@@ -6933,7 +6944,7 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) throw new Error('Authentication required');
-    const limit = Math.min(args.limit ?? 20, 100);
+    const limit = Math.min(args.limit ?? 20, 500);
     return agentModeService.importLeadsFromSearch(context.userId, {
       listId: args.list_id,
       keywords: args.keywords,
@@ -6949,6 +6960,7 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
       school_id: args.school_id,
       cursor: args.cursor,
       limit,
+      auto_enrich: args.auto_enrich,
     });
   }
 });

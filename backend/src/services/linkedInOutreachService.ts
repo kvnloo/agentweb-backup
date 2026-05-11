@@ -437,12 +437,15 @@ export class LinkedInOutreachService {
 
       let body: any;
 
-      if (url) {
-        // URL-based search: the URL overrides all other params
-        body = { url };
-      } else if (cursor) {
-        // Pagination: just pass the cursor
+      if (cursor) {
+        // Pagination: cursor wins over url because the cursor payload already
+        // encodes the original URL/filter set. Sending `{ url }` here would
+        // make Unipile re-run the search from page 1 on every iteration of
+        // a top-up loop — see find-leads "200 found / 1 imported" regression.
         body = { cursor };
+      } else if (url) {
+        // URL-based search (first page): the URL overrides all other params.
+        body = { url };
       } else {
         // Structured classic search
         body = {

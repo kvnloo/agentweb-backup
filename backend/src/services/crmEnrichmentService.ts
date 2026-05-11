@@ -91,12 +91,17 @@ export interface LeadRecord {
   firstName?: string;
   lastName?: string;
   email?: string;
+  emailDomain?: string;
   company?: string;
+  website?: string;
   title?: string;
   linkedin?: string;
   phone?: string;
   notes?: string;
   customFields?: Record<string, string>;
+  /** CRM-internal sidecar — findReason, freshUntil, scheduledRunAt,
+   *  icpSource. Not user-authored; not exported in CSVs. */
+  system?: Record<string, any>;
   [key: string]: any; // Allow other dynamic fields
 }
 
@@ -245,14 +250,19 @@ export class CrmEnrichmentService {
     return linkedInOutreachService.resolveAccountId(userId);
   }
 
-  // Default to the better-quality preview model; on timeout we fall back to
-  // the GA model on retry so a stalled Gemini shard doesn't hang the pipeline.
-  private static readonly DEFAULT_ENRICH_MODEL = 'gemini-3-flash-preview';
-  private static readonly DEFAULT_SUGGEST_MODEL = 'gemini-3-flash-preview';
+  // Default to Azure-hosted gpt-5-chat-2: GA, capacity-stable, ~10s on the
+  // CRM enrichment workload. We previously defaulted to gemini-3-flash-preview,
+  // but Gemini's *-preview shards intermittently queue requests for 200+ s
+  // (the per-call 60s timeout fires, then the fallback eats another minute),
+  // producing 3+ minute previews that often returned all-null fields.
+  // On timeout we fall back to a Gemini GA model so we have cross-vendor
+  // redundancy when one provider is degraded.
+  private static readonly DEFAULT_ENRICH_MODEL = 'gpt-5-chat-2';
+  private static readonly DEFAULT_SUGGEST_MODEL = 'gpt-5-chat-2';
 
   // Fallback used by llmCallWithTimeout when the primary model times out.
-  // GA models are capacity-stable (sub-10-s) where preview models can queue
-  // 200+ seconds intermittently. Trading a small quality dip for liveness.
+  // Cross-vendor on purpose — if Azure throttles, Gemini absorbs; if Gemini
+  // queues, Azure absorbs.
   private static readonly LLM_FALLBACK_MODEL = 'gemini-2.5-flash';
 
   // Per-call ceiling. The OpenAI SDK aborts the underlying fetch when this
@@ -461,6 +471,24 @@ export class CrmEnrichmentService {
       .replace(/\s+/g, ' ');
   }
 
+  /**
+   * True when applying `template` to this lead produces the same string as
+   * applying it to an empty lead — i.e. every {{placeholder}} resolved to
+   * empty. In that case the search query contains nothing lead-specific,
+   * just the constant suffix (e.g. "company overview"), and Google would
+   * return generic top-ranking pages identical for every empty-signal lead
+   * — most famously the FedEx investor page for "company overview".
+   *
+   * Callers should skip web search entirely when this returns true; the LLM
+   * then returns null for those fields rather than confidently extracting
+   * the wrong company.
+   */
+  static templateHasNoLeadSignal(template: string, lead: LeadRecord): boolean {
+    const rendered = CrmEnrichmentService.applySearchTemplate(template, lead);
+    const renderedEmpty = CrmEnrichmentService.applySearchTemplate(template, {} as LeadRecord);
+    return rendered === renderedEmpty;
+  }
+
   private static buildSearchQuery(lead: LeadRecord, outputFields: string[]): string {
     const companyName = String(lead.company || '').trim();
     const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
@@ -577,7 +605,16 @@ export class CrmEnrichmentService {
       ? CrmEnrichmentService.applySearchTemplate(template, lead)
       : CrmEnrichmentService.buildSearchQuery(lead, webSearchFields);
 
-    if (query) {
+    // Skip the main web search when a template-driven query would produce
+    // generic top-ranked results for every empty-signal lead (e.g. emailDomain
+    // empty → query collapses to "company overview" → Google returns the same
+    // FedEx page for every lead in the list).
+    const skipMainSearch = !!template && CrmEnrichmentService.templateHasNoLeadSignal(template, lead);
+    if (skipMainSearch) {
+      console.log(`[CrmEnrichment][gatherWebContext] skipping web search lead=${lead.leadId}: template "${template}" has no lead-specific signal`);
+    }
+
+    if (query && !skipMainSearch) {
       console.log(`[CrmEnrichment][gatherWebContext] searchWeb query="${query}"`);
       let result = await agentModeService.searchWeb(query, 5);
       console.log(`[CrmEnrichment][gatherWebContext] searchWeb done success=${result?.success} resultCount=${Array.isArray(result?.results) ? result.results.length : 0}`);
@@ -1699,6 +1736,10 @@ export class CrmEnrichmentService {
       updateFailed: 0,
     };
     const failureRecords: Array<{ leadId: string; email?: string; step: string; message: string }> = [];
+    // Tracks field names that received at least one non-null value across all
+    // parallel workers. Written to list.fieldNames in a single post-job call
+    // instead of per-lead to avoid read-modify-write races under parallel writes.
+    const populatedFieldNames = new Set<string>();
 
     emitProgress('Starting enrichment...', 0, 0, 0);
 
@@ -1723,22 +1764,35 @@ export class CrmEnrichmentService {
             console.error('[CrmEnrichment] Failed to write snapshot:', err);
           }
 
-          // Build merged enrichmentMetadata. When a field is cleared (customUpdates[k] is
-          // null/empty after a forced re-enrichment that found nothing), drop the prior
-          // metadata entry too — otherwise UI shows "—" with stale source/quote attached.
-          const mergedMeta: Record<string, EnrichedFieldMeta> = { ...((lead as any).enrichmentMetadata || {}) };
+          // Split customUpdates: non-empty → SET per key, null/empty → REMOVE per key.
+          // Both cleared-field metadata entries and the field values themselves are
+          // removed atomically — prevents stale "—" badge in UI for cleared fields.
+          const customSet: Record<string, string> = {};
+          const clearKeys: string[] = [];
           for (const [k, v] of Object.entries(customUpdates)) {
-            if (v === null || v === undefined || v === '') delete mergedMeta[k];
+            if (v === null || v === undefined || v === '') clearKeys.push(k);
+            else customSet[k] = v as string;
           }
-          Object.assign(mergedMeta, fieldMeta);
 
-          await crmDb.updateLead(spec.listId, lead.leadId, {
-            ...standardUpdates,
-            customFields: {
-              ...(lead.customFields || {}),
-              ...customUpdates,
-            },
-            enrichmentMetadata: mergedMeta,
+          // Normalize known top-level fields before writing.
+          const topLevel: Record<string, string> = {};
+          for (const [k, v] of Object.entries(standardUpdates)) {
+            if (v !== null && v !== undefined && v !== '') topLevel[k] = String(v);
+          }
+          if (topLevel.email) topLevel.email = topLevel.email.trim().toLowerCase();
+          if (topLevel.linkedin) topLevel.linkedin = topLevel.linkedin.trim();
+
+          // Track which fields got real values for the consolidated fieldNames write
+          for (const [k, v] of Object.entries(fields)) {
+            if (v !== null && v !== undefined && v !== '') populatedFieldNames.add(k);
+          }
+
+          await crmDb.setLeadFields(spec.listId, lead.leadId, {
+            topLevel,
+            enrichmentMetadata: fieldMeta,
+            customFields: customSet,
+            removeEnrichmentMetadataKeys: clearKeys,
+            removeCustomFieldKeys: clearKeys,
           });
 
           counters.processed++;
@@ -1800,9 +1854,10 @@ export class CrmEnrichmentService {
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
     }
 
-    // Register new field names on the list
+    // Single consolidated fieldNames write after all workers finish — avoids
+    // per-lead read-modify-write race where parallel workers clobber each other.
     try {
-      await crmDb.updateFieldNames(spec.listId, spec.outputFields);
+      await crmDb.mergeFieldNames(spec.listId, populatedFieldNames);
     } catch (err) {
       console.error('[CrmEnrichment] Failed to update field names:', err);
     }

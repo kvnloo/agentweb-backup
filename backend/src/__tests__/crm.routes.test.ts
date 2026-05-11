@@ -39,6 +39,7 @@ import { resendService } from '../services/resendService';
 import { agentModeService } from '../services/agentModeService';
 import { createLLMService } from '../utils/llmService';
 import { emailEventsDb } from '../services/emailEventsDb';
+import { validateLeadEmailInBackground } from '../services/enrichSoLeadValidation';
 import router from '../routes/crm';
 
 // Mock dependencies
@@ -104,6 +105,10 @@ jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),
   }
+}));
+jest.mock('../services/enrichSoLeadValidation', () => ({
+  validateLeadEmailInBackground: jest.fn(),
+  validateLeadsInBackground: jest.fn(),
 }));
 
 const mockUploadFileToS3 = jest.fn();
@@ -746,6 +751,35 @@ describe('CRM Routes', () => {
       expect(mockResponse.status).toHaveBeenCalledWith(400);
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'selectedSenderId must reference a configured sender' });
     });
+
+    it('triggers background email validation when email is updated', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+      const updatedLead = {
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'new@example.com',
+      };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(updatedLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = { email: 'new@example.com' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({ email: 'new@example.com' }));
+      expect(validateLeadEmailInBackground).toHaveBeenCalledWith('list1', 'lead1', 'new@example.com', 'test-user-id');
+      expect(mockResponse.json).toHaveBeenCalledWith(updatedLead);
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/match-icps', () => {
@@ -1212,6 +1246,7 @@ describe('CRM Routes', () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
       (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({
         successCount: 1,
+        mergedCount: 0,
         errorCount: 0,
         errors: [],
       });
@@ -1245,6 +1280,7 @@ describe('CRM Routes', () => {
         expect.objectContaining({
           success: true,
           successCount: 1,
+          mergedCount: 0,
         })
       );
     });

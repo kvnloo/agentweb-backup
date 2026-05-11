@@ -114,14 +114,24 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
     }));
   });
 
-  it('returns the search cursor in the response so callers can paginate', async () => {
-    mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: 'page-2-cursor' });
+  it('returns the cursor at which the top-up loop stopped (so callers can resume manually)', async () => {
+    // Top-up note: with the loop in place, the response cursor is the
+    // last cursor *seen by the loop* — useful as a manual resume point.
+    // Here the first page yields 10 new leads (= default limit of 20 not
+    // hit, but the loop continues), then the second page is empty and
+    // returns cursor=null, so the loop exits with lastCursor=null.
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: Array.from({ length: 20 }, (_, i) => ({ name: `Lead ${i}` })), cursor: 'page-2-cursor' })
+      .mockResolvedValueOnce({ items: [], cursor: null });
+    mockBatchCreateLeads.mockResolvedValueOnce({ successCount: 20, newCount: 20, mergedCount: 0, errorCount: 0, errors: [], created: Array.from({ length: 20 }, (_, i) => ({ leadId: `l-${i}` })) });
 
     const result = await service.importLeadsFromSearch('user-1', {
       listId: 'list-1',
       title: 'CTO',
     });
 
+    // newCount(20) === default limit(20), loop exits *after* page 1 and
+    // never consumes the cursor — so we surface page-2-cursor for resumption.
     expect(result.cursor).toBe('page-2-cursor');
   });
 
@@ -162,8 +172,10 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
   describe('list_total_after_import field', () => {
     it('includes list_total_after_import populated from getLeadListById', async () => {
       mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
-      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
-      mockGetLeadListById.mockResolvedValueOnce({ listId: 'list-1', leadCount: 42 });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }] });
+      // mockResolvedValue (not Once) — top-up loop reads the list both
+      // pre-loop (for stored-cursor lookup) and post-loop (for count).
+      mockGetLeadListById.mockResolvedValue({ listId: 'list-1', leadCount: 42 });
 
       const result = await service.importLeadsFromSearch('user-1', {
         listId: 'list-1',
@@ -175,8 +187,8 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
 
     it('falls back to 0 when getLeadListById returns null', async () => {
       mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
-      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
-      mockGetLeadListById.mockResolvedValueOnce(null);
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }] });
+      mockGetLeadListById.mockResolvedValue(null);
 
       const result = await service.importLeadsFromSearch('user-1', {
         listId: 'list-1',
@@ -188,8 +200,9 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
 
     it('does not fail the import when getLeadListById throws', async () => {
       mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
-      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
-      mockGetLeadListById.mockRejectedValueOnce(new Error('boom'));
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }] });
+      // Both pre- and post-loop reads throw; both are caught. list_total_after_import → 0.
+      mockGetLeadListById.mockRejectedValue(new Error('boom'));
 
       const result = await service.importLeadsFromSearch('user-1', {
         listId: 'list-1',
@@ -199,6 +212,74 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
       expect(result.success).toBe(true);
       expect(result.imported).toBe(1);
       expect(result.list_total_after_import).toBe(0);
+    });
+  });
+
+  // Bug fix: LinkedIn search results carry a `location` string per hit. The
+  // old code wrote `notes = "Location: ${item.location}"`, which pollutes the
+  // free-text notes field that users edit by hand. Location is a structured
+  // enrichment field (see enrichmentFieldConfig.ts EXTENDED_FIELDS); it
+  // belongs in customFields.location alongside the enrich.so reverse-lookup
+  // writes (crmEnrichSo.ts:427).
+  describe('location storage', () => {
+    it('writes item.location to customFields.location, not notes', async () => {
+      mockSearchPeople.mockResolvedValueOnce({
+        items: [{ name: 'Alice Smith', location: 'San Francisco Bay Area' }],
+        cursor: null,
+      });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+
+      await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      expect(mockBatchCreateLeads).toHaveBeenCalledTimes(1);
+      const [, leads] = mockBatchCreateLeads.mock.calls[0];
+      expect(leads).toHaveLength(1);
+      expect(leads[0].customFields).toEqual(expect.objectContaining({
+        location: 'San Francisco Bay Area',
+      }));
+      expect(leads[0].notes).toBeUndefined();
+    });
+
+    it('omits customFields.location when item has no location', async () => {
+      mockSearchPeople.mockResolvedValueOnce({
+        items: [{ name: 'Bob Jones' }],
+        cursor: null,
+      });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+
+      await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      const [, leads] = mockBatchCreateLeads.mock.calls[0];
+      expect(leads[0].notes).toBeUndefined();
+      // No customFields object created when there's nothing to put in it.
+      expect(leads[0].customFields?.location).toBeUndefined();
+    });
+
+    it('does not clobber an existing customFields object on the lead', async () => {
+      // Future-proofing: if upstream code ever pre-populates customFields on
+      // the search-result item (it doesn't today), the location merge must
+      // preserve those keys rather than replace the whole object.
+      mockSearchPeople.mockResolvedValueOnce({
+        items: [{ name: 'Cara Lee', location: 'NYC', customFields: { tier: 'A' } }],
+        cursor: null,
+      });
+      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [] });
+
+      await service.importLeadsFromSearch('user-1', {
+        listId: 'list-1',
+        title: 'CTO',
+      });
+
+      const [, leads] = mockBatchCreateLeads.mock.calls[0];
+      expect(leads[0].customFields).toEqual(expect.objectContaining({
+        location: 'NYC',
+      }));
     });
   });
 });

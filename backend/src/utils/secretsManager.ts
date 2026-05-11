@@ -637,9 +637,10 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+
 /**
  * Get the email-verification provider API key from AWS Secrets Manager.
- * Secret format: plain string API key.
+ * Stored as a plain string at dev/AgentWeb/EnrichSo or prod/AgentWeb/EnrichSo.
  */
 export async function getEnrichSoApiKey(): Promise<string> {
   const environment = process.env.NODE_ENV || 'development';
@@ -651,6 +652,52 @@ export async function getEnrichSoApiKey(): Promise<string> {
     throw new Error(`Email verification API key is empty. Store it in Secrets Manager at ${secretName}.`);
   }
   return key.trim();
+}
+
+export interface ApolloCredentials {
+  apiKey: string;
+  webhookSecret?: string;
+}
+
+/**
+ * Get the Apollo people-enrichment API key from AWS Secrets Manager.
+ * Stored as JSON `{"apiKey":"…","webhookSecret":"…"}` at dev/AgentWeb/Apollo
+ * or prod/AgentWeb/Apollo.
+ */
+export async function getApolloApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Apollo'
+    : 'dev/AgentWeb/Apollo';
+  const secretString = await getSecret(secretName);
+  if (!secretString || secretString.trim() === '') {
+    throw new Error(`Apollo credentials secret is empty. Store JSON {"apiKey","webhookSecret"} in Secrets Manager at ${secretName}.`);
+  }
+  const parsed = JSON.parse(secretString) as ApolloCredentials;
+  if (!parsed.apiKey || parsed.apiKey.trim() === '') {
+    throw new Error(`Apollo credentials at ${secretName} missing apiKey.`);
+  }
+  return parsed.apiKey.trim();
+}
+
+/**
+ * Shared secret used to authenticate the Apollo waterfall webhook callback.
+ * Apollo doesn't HMAC-sign webhook bodies and silently drops `webhook_headers`,
+ * so we embed this value in the **URL path** of the webhook we hand Apollo
+ * (/api/crm/webhooks/apollo/<secret>) and verify it on the receiving route
+ * with a constant-time compare. Must be URL-safe (no characters needing
+ * percent-encoding to round-trip cleanly).
+ *
+ * Resolution order: `APOLLO_WEBHOOK_SECRET` env var if set and non-empty,
+ * otherwise the built-in default. The default ships intentionally so the
+ * webhook works in dev without extra setup; production deploys should set
+ * the env var to a rotated value.
+ */
+const DEFAULT_APOLLO_WEBHOOK_SECRET = 'dev_apl_wh_8k3p2x9qm7n4r5z6_v1';
+
+export async function getApolloWebhookSecret(): Promise<string> {
+  const fromEnv = process.env.APOLLO_WEBHOOK_SECRET?.trim();
+  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_APOLLO_WEBHOOK_SECRET;
 }
 
 export interface AttioCredentials {

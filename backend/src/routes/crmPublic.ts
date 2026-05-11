@@ -160,7 +160,7 @@ router.get('/lists/:listId/leads/:leadId/group-email-status', async (req: Reques
 router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: Request, res: Response) => {
   try {
     const { listId, leadId } = req.params;
-    const { email, feedback } = req.body;
+    const { email, feedback, sig } = req.body;
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
@@ -171,7 +171,21 @@ router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: 
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    if ((lead.email || '').toLowerCase() !== email.trim().toLowerCase()) {
+    // Authorisation check: prefer HMAC signature when present (signed URLs
+    // produced by group-email send). Fall back to email-match for legacy
+    // URLs in old emails.
+    if (typeof sig === 'string' && sig.length > 0) {
+      const { verifyUnsubscribeSignature } = await import('../utils/unsubscribeUrl');
+      const ok = verifyUnsubscribeSignature({
+        listId,
+        leadId,
+        email: typeof email === 'string' ? email.trim().toLowerCase() : '',
+        sig,
+      });
+      if (!ok) {
+        return res.status(403).json({ message: 'Invalid unsubscribe signature' });
+      }
+    } else if ((lead.email || '').toLowerCase() !== email.trim().toLowerCase()) {
       return res.status(403).json({ message: 'Email does not match lead record' });
     }
 
@@ -197,7 +211,7 @@ router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: 
 router.post('/lists/:listId/leads/:leadId/group-email-resubscribe', async (req: Request, res: Response) => {
   try {
     const { listId, leadId } = req.params;
-    const { email } = req.body;
+    const { email, sig } = req.body;
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
@@ -208,7 +222,21 @@ router.post('/lists/:listId/leads/:leadId/group-email-resubscribe', async (req: 
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    if ((lead.email || '').toLowerCase() !== email.trim().toLowerCase()) {
+    // Authorisation: same shape as unsubscribe — re-enabling sends after a
+    // lead opted out is a privilege-escalation surface, so prefer HMAC. Fall
+    // back to email-match for legacy URLs.
+    if (typeof sig === 'string' && sig.length > 0) {
+      const { verifyUnsubscribeSignature } = await import('../utils/unsubscribeUrl');
+      const ok = verifyUnsubscribeSignature({
+        listId,
+        leadId,
+        email: typeof email === 'string' ? email.trim().toLowerCase() : '',
+        sig,
+      });
+      if (!ok) {
+        return res.status(403).json({ message: 'Invalid resubscribe signature' });
+      }
+    } else if ((lead.email || '').toLowerCase() !== email.trim().toLowerCase()) {
       return res.status(403).json({ message: 'Email does not match lead record' });
     }
 
