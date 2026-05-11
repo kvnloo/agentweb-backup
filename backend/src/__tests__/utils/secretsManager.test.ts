@@ -26,6 +26,7 @@ import {
   getHubSpotCredentials,
   getAttioCredentials,
   get2CaptchaApiKey,
+  getForeplayApiKey,
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -1556,6 +1557,56 @@ describe('secretsManager utils', () => {
 
       await get2CaptchaApiKey();
       expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/2Captcha' });
+    });
+  });
+
+  describe('getForeplayApiKey', () => {
+    it('should return the API key from dev secret in development', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'fp_platform_key' })
+      });
+
+      const key = await getForeplayApiKey();
+      expect(key).toBe('fp_platform_key');
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/Foreplay' });
+    });
+
+    it('should return the API key from prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'fp_prod_key' })
+      });
+
+      const key = await getForeplayApiKey();
+      expect(key).toBe('fp_prod_key');
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/Foreplay' });
+    });
+
+    it('should return null when secret does not exist', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('ResourceNotFoundException'))
+      });
+
+      const key = await getForeplayApiKey();
+      expect(key).toBeNull();
+    });
+
+    it('should return null when secret value is empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      const key = await getForeplayApiKey();
+      expect(key).toBeNull();
+    });
+
+    it('should trim whitespace from the key', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '  fp_key_with_spaces  ' })
+      });
+
+      const key = await getForeplayApiKey();
+      expect(key).toBe('fp_key_with_spaces');
     });
   });
 });
