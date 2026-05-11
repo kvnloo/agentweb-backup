@@ -166,3 +166,126 @@ When ready to fix, the change is small and isolated.
 | Brand guidelines | Auto-injected by backend from user account | Same |
 
 The `lead_list_id` gap means landing pages created via the UI button have no contact form lead capture configured. This is also deferred — addressable when the UI dialog is upgraded to include a lead list selector step.
+
+---
+
+# WIP: Churn Offer — Intercept Cancellation with a Retention Offer
+
+**Date:** 2026-05-11  
+**Branch:** `rui/churn-offer`  
+**Status:** Design complete. Implementation not started.
+
+---
+
+## Problem Statement
+
+When a user clicks "Downgrade to Free" on the Pricing page, the app immediately fires
+`POST /api/stripe/cancel-subscription` with no retention attempt. There is no pause,
+no discount offer, and no exit survey — every cancellation is a hard loss.
+
+Goal: intercept the cancel click, present a compelling offer, and recover a meaningful
+percentage of users who would otherwise churn.
+
+---
+
+## Current Cancellation Flow
+
+1. User clicks "Downgrade to Free" on `customer-portal/src/pages/Pricing.tsx`
+2. `handleUpgrade()` (line ~151) POSTs directly to `POST /api/stripe/cancel-subscription`
+3. Backend sets `cancel_at_period_end: true` on the Stripe subscription
+4. User sees "Canceling" badge in `SubscriptionCard`; access continues until period end
+5. On `customer.subscription.deleted` webhook, user is downgraded to Free in DynamoDB
+
+There is also a **Stripe Customer Portal path** (`POST /api/stripe/create-customer-portal-session`)
+that lets users cancel natively in Stripe's UI — this path is not intercepted by our frontend.
+
+---
+
+## Chosen Approach: Option B — Tiered Offers with Pause
+
+Show a modal before the cancel fires with 2–3 options depending on the user's plan:
+
+| Option | Starter ($199) | Pro ($499) |
+|--------|---------------|------------|
+| Pause | Pause for 1 month (no charge) | Pause for 1 month |
+| Discount | 30% off for 3 months (~$139/mo) | 30% off for 3 months (~$349/mo) |
+| Downgrade | — | Downgrade to Starter + 50% off first month ($99) |
+
+All options are reversible. If the user declines all offers, cancellation proceeds normally.
+
+**Why not Option A (single fixed discount):** wastes discount budget on users who might stay
+anyway; no pause option misses users who are temporarily inactive.
+
+**Why not Option C (exit survey first):** more friction upfront; can be added as iteration.
+
+---
+
+## Architecture
+
+### Frontend
+
+**New component:** `customer-portal/src/components/settings/ChurnOfferModal.tsx`
+- Modeled after `WelcomeOfferModal.tsx` (same pattern, different offers)
+- Opens when user selects Free plan in `Pricing.tsx` instead of firing cancel immediately
+- Three-step state machine: `presenting → offer_accepted | offer_rejected → canceling`
+- Offer buttons call their respective backend endpoints; "No thanks, cancel anyway" proceeds
+  with the original `POST /api/stripe/cancel-subscription`
+
+**Modify:** `customer-portal/src/pages/Pricing.tsx` — `handleUpgrade()` (lines ~151–161)
+- Check if current plan is paid and new plan is Free; if so, open `ChurnOfferModal` instead
+  of calling the cancel endpoint directly
+
+### Backend
+
+**New endpoints** in `backend/src/routes/stripe.ts`:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/stripe/churn-offer` | Returns eligible offers for the current user based on their tier |
+| `POST /api/stripe/churn-offer/accept-discount` | Applies a coupon to the running subscription |
+| `POST /api/stripe/churn-offer/accept-pause` | Calls `stripe.subscriptions.update({ pause_collection: { behavior: "void" } })` |
+| `POST /api/stripe/churn-offer/accept-downgrade` | Creates a `subscription_schedule` for end-of-period downgrade + applies coupon |
+
+**New service:** `backend/src/services/churnOfferService.ts`
+- Determine eligible offers from user's tier and tenure
+- Create single-use Stripe coupons per user (or reuse pre-created env-var coupons)
+- Log offer events to DynamoDB for analytics
+
+**Env vars needed:**
+- `STRIPE_CHURN_DISCOUNT_COUPON_ID` — 30% off, 3-month repeating coupon
+- `STRIPE_CHURN_DOWNGRADE_COUPON_ID` — 50% off, 1-month coupon for downgrade path
+
+### Data Model
+
+Store churn offer events in DynamoDB (append-only, same pattern as `paymentHistoryDb.ts`):
+
+```
+AW-ChurnOffers
+  userId (PK) + createdAt (SK)
+  offerId
+  tier          ("starter" | "pro")
+  offerType     ("discount" | "pause" | "downgrade")
+  status        ("presented" | "accepted" | "rejected" | "expired")
+  expiresAt
+```
+
+---
+
+## What Is NOT in Scope
+
+- Exit survey / reason collection (future iteration)
+- Admin dashboard for offer analytics (future iteration)
+- Intercepting cancellations via the Stripe Customer Portal path (Stripe-native, not interceptable)
+
+---
+
+## Files to Create/Modify
+
+| File | Change |
+|------|--------|
+| `customer-portal/src/components/settings/ChurnOfferModal.tsx` | New component |
+| `customer-portal/src/pages/Pricing.tsx` | Intercept cancel in `handleUpgrade()` |
+| `backend/src/routes/stripe.ts` | 4 new endpoints |
+| `backend/src/services/churnOfferService.ts` | New service |
+| `backend/src/__tests__/churnOfferService.test.ts` | New tests |
+| `backend/src/services/db.ts` | New DynamoDB helpers for `AW-ChurnOffers` |
