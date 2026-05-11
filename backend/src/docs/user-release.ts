@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-08
+// Last updated: 2026-05-11
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: CRM Senders Now Support a Default LinkedIn Outreach Account',
+      '- The Senders dialog in the CRM now includes a LinkedIn Sender section',
+      '- If you have a LinkedIn outreach account connected, you can designate one as the default sender for LinkedIn messages',
+      '- When sending a LinkedIn message from a lead, the configured default account is used automatically — no more relying on auto-resolution',
+      '- If no default is set, the existing fallback behavior (your connected account, then a shared account) still applies',
+    ],
+  },
   {
     date: '2026-05-10',
     changes: [
