@@ -11,6 +11,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
+      'New: Report Type Classification on the Reports Page',
+      '- All HTML reports are now automatically classified into one of three types: Creative, Research, or Performance',
+      '- Classification is powered by Gemini 3.1 Flash Lite and uses the report filename and content to determine the type',
+      '- A type badge (purple for Creative, blue for Research, orange for Performance) now appears on every report card',
+      '- Click the badge to manually override the type if the auto-classification is incorrect — the change is saved immediately',
+      '- Use the new All / Creative / Research / Performance tabs at the top of the Reports page to filter by type',
+      '- Existing reports are classified lazily on first page load and the result is cached, so you only pay the classification cost once per report',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
       'New: Inject Your Own Google Tag Manager Container into Landing Pages',
       '- Each deployed landing page card now shows an "Add GTM" button if no container is configured, or a green "GTM: GTM-XXXXXX" badge if one is already set',
       '- Clicking either button opens a dialog where you can enter your GTM container ID (format: GTM-XXXXXXX)',
