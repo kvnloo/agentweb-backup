@@ -97,6 +97,42 @@ describe('csvColumnMatcher', () => {
     });
   });
 
+  describe('custom field matching', () => {
+    it('matches custom fields exactly', () => {
+      const result = suggestColumnMapping(['industry type', 'favorite color'], ['industry type', 'favorite color']);
+      expect(result['industry type'].field).toBe('skip');
+      expect(result['industry type'].customField).toBe('industry type');
+      expect(result['industry type'].confidence).toBe('high');
+      
+      expect(result['favorite color'].field).toBe('skip');
+      expect(result['favorite color'].customField).toBe('favorite color');
+      expect(result['favorite color'].confidence).toBe('high');
+    });
+
+    it('matches custom fields with case insensitivity and camel/snake normalization', () => {
+      const result = suggestColumnMapping(['teamSize', 'annual_revenue'], ['team_size', 'annualRevenue']);
+      expect(result['teamSize'].field).toBe('skip');
+      expect(result['teamSize'].customField).toBe('team_size');
+      expect(result['teamSize'].confidence).toBe('high');
+
+      expect(result['annual_revenue'].field).toBe('skip');
+      expect(result['annual_revenue'].customField).toBe('annualRevenue');
+      expect(result['annual_revenue'].confidence).toBe('high');
+    });
+
+    it('matches custom fields using substring containment (min length 4)', () => {
+      const result = suggestColumnMapping(['User Employee Count', 'identity'], ['Employee Count', 'id']);
+      expect(result['User Employee Count'].field).toBe('skip');
+      expect(result['User Employee Count'].customField).toBe('Employee Count');
+      expect(result['User Employee Count'].confidence).toBe('medium');
+
+      // Custom field "id" has length 2 < 4, so it should not match header "identity" via substring
+      expect(result['identity'].field).toBe('skip');
+      expect(result['identity'].customField).toBeUndefined();
+      expect(result['identity'].confidence).toBe('low');
+    });
+  });
+
   describe('return type shape', () => {
     it('returns MappingSuggestion per header', () => {
       const result = suggestColumnMapping(['Email']);

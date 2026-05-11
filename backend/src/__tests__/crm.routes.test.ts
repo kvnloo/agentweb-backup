@@ -1246,6 +1246,7 @@ describe('CRM Routes', () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
       (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({
         successCount: 1,
+        mergedCount: 0,
         errorCount: 0,
         errors: [],
       });
@@ -1279,6 +1280,7 @@ describe('CRM Routes', () => {
         expect.objectContaining({
           success: true,
           successCount: 1,
+          mergedCount: 0,
         })
       );
     });

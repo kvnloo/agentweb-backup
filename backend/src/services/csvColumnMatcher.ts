@@ -21,6 +21,7 @@ export interface MappingSuggestion {
   field: MappingTarget;
   confidence: 'high' | 'medium' | 'low';
   splitFullName?: boolean;
+  customField?: string;
 }
 
 const FIELD_SYNONYMS: Record<LeadField, string[]> = {
@@ -72,6 +73,13 @@ function normalize(s: string): string {
     .replace(/[^\w\s]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+// Splits camelCase/PascalCase before normalizing, so "companySize" and
+// "company_size" both become "company size" and match each other.
+function normalizeCustomField(s: string): string {
+  const split = s.replace(/([a-z])([A-Z])/g, '$1 $2');
+  return normalize(split);
 }
 
 function levenshtein(a: string, b: string): number {
@@ -155,7 +163,10 @@ function matchHeader(header: string): MatchResult {
  * - "Full Name"/"Name" is mapped to firstName + splitFullName=true *only* if
  *   no explicit first/last name column was found.
  */
-export function suggestColumnMapping(headers: string[]): Record<string, MappingSuggestion> {
+export function suggestColumnMapping(
+  headers: string[],
+  existingCustomFields: string[] = [],
+): Record<string, MappingSuggestion> {
   const result: Record<string, MappingSuggestion> = {};
   const claimedFields = new Set<MappingTarget>();
   const fullNameHeaders: string[] = [];
@@ -195,6 +206,49 @@ export function suggestColumnMapping(headers: string[]): Record<string, MappingS
       claimedFields.add('lastName');
     } else {
       result[header] = { field: 'skip', confidence: 'low' };
+    }
+  }
+
+  // Pass 4: match still-unresolved headers against existing custom field names.
+  // Uses exact + substring only (no Levenshtein) to avoid false positives on
+  // arbitrary user-defined strings. camelCase is split before comparing so
+  // "companySize" and "company_size" both normalize to "company size".
+  if (existingCustomFields.length > 0) {
+    const normalizedCustomFields = existingCustomFields.map((cf) => ({
+      original: cf,
+      normalized: normalizeCustomField(cf),
+    }));
+    const claimedCustomFields = new Set<string>();
+
+    for (const header of headers) {
+      if (result[header]?.field !== 'skip' && result[header]?.field !== undefined) continue;
+      // Skip headers already resolved to a standard field or split.
+      if (result[header] && result[header].field !== 'skip') continue;
+
+      const norm = normalizeCustomField(header);
+
+      // Tier 1: exact match.
+      const exactMatch = normalizedCustomFields.find(
+        (cf) => cf.normalized === norm && !claimedCustomFields.has(cf.original),
+      );
+      if (exactMatch) {
+        result[header] = { field: 'skip', confidence: 'high', customField: exactMatch.original };
+        claimedCustomFields.add(exactMatch.original);
+        continue;
+      }
+
+      // Tier 2: substring containment (min length 4 to avoid trivial matches).
+      const substringMatch = normalizedCustomFields.find(
+        (cf) =>
+          !claimedCustomFields.has(cf.original) &&
+          cf.normalized.length >= 4 &&
+          (norm.includes(cf.normalized) || cf.normalized.includes(norm)),
+      );
+      if (substringMatch) {
+        result[header] = { field: 'skip', confidence: 'medium', customField: substringMatch.original };
+        claimedCustomFields.add(substringMatch.original);
+        continue;
+      }
     }
   }
 
