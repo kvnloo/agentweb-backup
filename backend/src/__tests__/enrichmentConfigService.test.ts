@@ -35,6 +35,7 @@ function makeDeps(overrides: Partial<ConfigServiceDeps> = {}): ConfigServiceDeps
     writeListConfig: jest.fn().mockResolvedValue(undefined),
     loadListFieldNames: jest.fn().mockResolvedValue([]),
     llmSuggestTypes: jest.fn().mockResolvedValue([]),
+    llmInferAliases: jest.fn().mockResolvedValue({}),
     ...overrides,
   };
 }
@@ -386,6 +387,80 @@ describe('setEnrichmentConfig — validation', () => {
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
     expect(saved.fields[0].aliasFor).toBe('tech_stack');
+  });
+
+  it('falls back to LLM for opaque names where the heuristic returned undefined', async () => {
+    // Heuristic doesn't know 'stag' = funding_stage. LLM gets the question
+    // (with instruction context) and maps it. Only the opaque field hits LLM.
+    const llmMock = jest.fn().mockResolvedValue({ stag: 'funding_stage' });
+    const deps = makeDeps({ llmInferAliases: llmMock });
+    const config = validConfig({
+      fields: [
+        { name: 'firstName', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+        { name: 'stag', type: 'string', instruction: 'company funding stage',
+          include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    // LLM only called for fields the heuristic couldn't resolve
+    expect(llmMock).toHaveBeenCalledTimes(1);
+    expect(llmMock.mock.calls[0][0]).toEqual([
+      { name: 'stag', instruction: 'company funding stage' },
+    ]);
+
+    const byName = Object.fromEntries(saved.fields.map(f => [f.name, f]));
+    expect(byName.firstName.aliasFor).toBe('first_name');   // heuristic
+    expect(byName.stag.aliasFor).toBe('funding_stage');      // LLM
+  });
+
+  it('ignores LLM suggestions that point to unknown canonical names', async () => {
+    // Defense against hallucinated canonical names from the LLM.
+    const deps = makeDeps({
+      llmInferAliases: jest.fn().mockResolvedValue({
+        stag: 'not_a_real_canonical_field',
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'stag', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBeUndefined();
+  });
+
+  it('saves successfully if the LLM throws (heuristic results stand)', async () => {
+    const deps = makeDeps({
+      llmInferAliases: jest.fn().mockRejectedValue(new Error('LLM 503')),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'firstName', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+        { name: 'stag', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    const byName = Object.fromEntries(saved.fields.map(f => [f.name, f]));
+    expect(byName.firstName.aliasFor).toBe('first_name');   // heuristic still applied
+    expect(byName.stag.aliasFor).toBeUndefined();            // LLM failed, no inference
+  });
+
+  it('skips LLM call entirely when heuristic resolved every field', async () => {
+    const llmMock = jest.fn().mockResolvedValue({});
+    const deps = makeDeps({ llmInferAliases: llmMock });
+    const config = validConfig({
+      fields: [
+        { name: 'firstName', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'companyLinkedinUrl', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(llmMock).not.toHaveBeenCalled();
   });
 
   it('leaves opaque custom names without aliasFor (heuristic cannot guess)', async () => {

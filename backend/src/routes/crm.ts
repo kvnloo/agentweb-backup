@@ -93,6 +93,54 @@ const enrichmentConfigDeps: ConfigServiceDeps = {
     return Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : [];
   },
   llmSuggestTypes: async (fields) => heuristicTypeSuggestion(fields),
+  llmInferAliases: async (fields) => {
+    if (fields.length === 0) return {};
+    // Lazy import — avoids circular deps + keeps the LLM service out of the
+    // hot path for callers that never hit alias inference.
+    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
+    const { createLLMService } = await import('../utils/llmService');
+
+    // Build the canonical-field cheat sheet for the system prompt. Grouping
+    // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
+    // → funding_stage instead of guessing across groups).
+    const canonicalCheatsheet = Object.entries(FIELD_GROUPS)
+      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
+      .join('\n');
+
+    const systemPrompt =
+      `You map user-named CRM enrichment fields to canonical field names ` +
+      `based on semantic intent (not just name similarity). ` +
+      `Return strict JSON keyed by user field name.\n\n` +
+      `Available canonical fields, grouped:\n${canonicalCheatsheet}\n\n` +
+      `Rules:\n` +
+      `- Match by MEANING, not string similarity. "stag" with instruction ` +
+      `"funding stage" → "funding_stage".\n` +
+      `- Return null when the user's field is a unique custom concept (no ` +
+      `confident canonical match).\n` +
+      `- Use the field's instruction text to disambiguate. If instruction is ` +
+      `empty, fall back to name alone.\n` +
+      `- Pick at most ONE canonical name per user field.`;
+
+    const userPrompt =
+      `Map each user field to a canonical name (or null):\n` +
+      fields.map(f => `- ${f.name}${f.instruction ? ` — "${f.instruction}"` : ''}`).join('\n') +
+      `\n\nReturn JSON: {"<userFieldName>": "<canonical_name>" | null} for each input.`;
+
+    try {
+      const llm = createLLMService(
+        process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
+        0.0,
+      );
+      const result = await llm.generateJSONContent<Record<string, string | null>>(
+        systemPrompt,
+        userPrompt,
+      );
+      return result ?? {};
+    } catch (err) {
+      console.warn('[crm] llmInferAliases failed:', (err as Error).message);
+      return {};
+    }
+  },
 };
 const d1StripeClient = d1StripeSecretKey
   ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })

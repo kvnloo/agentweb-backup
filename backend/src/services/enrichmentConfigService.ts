@@ -153,6 +153,14 @@ export interface ConfigServiceDeps {
   llmSuggestTypes(
     input: Array<{ name: string; instruction: string }>,
   ): Promise<FieldTypeSuggestion[]>;
+  /** Called once per save to map opaque user-named fields (where heuristics
+   *  returned undefined) to canonical FIELD_GROUPS names via an LLM.
+   *  Returns { fieldName: canonicalName | null } — null means no confident
+   *  match (field stays ungrouped). Implementations should fail soft
+   *  (return {} on error) so heuristic results still apply. */
+  llmInferAliases(
+    input: Array<{ name: string; instruction: string }>,
+  ): Promise<Record<string, string | null>>;
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -334,16 +342,43 @@ export async function setEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
   deps: ConfigServiceDeps,
 ): Promise<EnrichmentConfig> {
-  // Auto-infer aliasFor BEFORE validation — so heuristic matches don't get
-  // rejected as "no aliasFor", and so the user never has to set it manually.
-  // Explicit aliasFor (e.g. from API callers) is left untouched.
-  const enriched = {
+  // Step 1: heuristic alias inference (camelCase, synonym map, standard
+  // columns). Cheap, no API call. Catches the easy 80% of cases.
+  // Explicit client-supplied aliasFor is preserved.
+  let enriched: EnrichmentConfig = {
     ...input.config,
     fields: input.config.fields.map(f => ({
       ...f,
       aliasFor: f.aliasFor ?? inferAliasFor(f.name),
     })),
   };
+
+  // Step 2: LLM fallback for fields the heuristic couldn't resolve. One LLM
+  // call total per save (not per enrichment run) — cheap. LLM matches opaque
+  // names like `stag` → `funding_stage` based on the user's instruction text.
+  const llmCandidates = enriched.fields.filter(f => !f.aliasFor);
+  if (llmCandidates.length > 0) {
+    try {
+      const llmAliases = await deps.llmInferAliases(
+        llmCandidates.map(f => ({ name: f.name, instruction: f.instruction || '' })),
+      );
+      enriched = {
+        ...enriched,
+        fields: enriched.fields.map(f => {
+          if (f.aliasFor) return f;   // heuristic already won
+          const llmGuess = llmAliases[f.name];
+          if (llmGuess && CANONICAL_FIELD_NAMES.has(llmGuess)) {
+            return { ...f, aliasFor: llmGuess };
+          }
+          return f;
+        }),
+      };
+    } catch (err) {
+      // Fail soft — heuristic results stand. Don't block save on LLM failure.
+      // eslint-disable-next-line no-console
+      console.warn('[enrichmentConfigService] LLM alias inference failed:', err);
+    }
+  }
 
   validateConfig(enriched);
 
