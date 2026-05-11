@@ -1865,28 +1865,32 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
 });
 
 /**
- * @route POST /api/crm/lists/:listId/leads/find/from-icp
- * @desc Find leads using filters extracted from one of the user's ICP
- *       personas (icpResult[]). Phase 2 entry-point — uses regex
- *       extraction; the full LLM-based parser is a follow-up.
+ * @route GET /api/crm/icp/filters
+ * @desc Preview LLM-extracted LinkedIn search filter VARIANTS for one of
+ *       the user's ICP personas (icpResult[]). Returns 1–3 candidate
+ *       filter sets — does NOT run a search or import. The frontend uses
+ *       this to pre-fill the Find Leads modal; when multiple variants
+ *       come back, the modal renders a chip picker so the user chooses
+ *       an angle (broad vs. region-focused, etc.) before clicking Find
+ *       & Import.
+ *
+ *       Results are cached per persona on `user.icpResult[i].extractedFilters`
+ *       keyed by a hash of the persona content + a code-bumped version.
+ *       Cache hits skip the LLM entirely; cache misses regenerate and
+ *       persist via userDb.updateUser.
  * @access Private
  */
-router.post('/lists/:listId/leads/find/from-icp', async (req: Request, res: Response) => {
+router.get('/icp/filters', async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const { listId } = req.params;
-    const { icpIndex, limit, auto_enrich } = req.body ?? {};
-
-    if (typeof icpIndex !== 'number' || icpIndex < 0 || !Number.isFinite(icpIndex)) {
-      return res.status(400).json({ message: 'icpIndex (non-negative number) is required' });
+    const raw = req.query?.icpIndex;
+    const icpIndex = typeof raw === 'string' ? Number(raw) : NaN;
+    if (!Number.isFinite(icpIndex) || !Number.isInteger(icpIndex) || icpIndex < 0) {
+      return res.status(400).json({ message: 'icpIndex (non-negative integer) is required' });
     }
-
-    const list = await crmDb.getLeadListById(listId);
-    if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
 
     const { userDb } = await import('../services/db');
     const user: any = await userDb.getUserById(userId);
@@ -1899,36 +1903,80 @@ router.post('/lists/:listId/leads/find/from-icp', async (req: Request, res: Resp
     }
 
     const persona = personas[icpIndex];
-    const { extractIcpFilters } = await import('../services/icpPersonaFilterExtractor');
-    const filters = extractIcpFilters(persona);
+    const {
+      extractIcpFiltersWithLlm,
+      personaCacheKey,
+      ICP_FILTER_CACHE_VERSION,
+    } = await import('../services/icpFilterLlmExtractor');
 
-    // Phase 2 entry-point caveat: the regex extractor's `keywords` field is
-    // the full first sentence of `meta_targeting_brief` — useful as a modal
-    // pre-fill, but harmful as a real LinkedIn search input (LinkedIn ANDs
-    // every word in keywords, so prose kills recall to 0). When the
-    // extractor produced a title we suppress keywords here so title +
-    // industry + location carry the search. Only fall back to keywords when
-    // no title was extractable.
-    const { agentModeService } = await import('../services/agentModeService');
-    const result = await agentModeService.importLeadsFromSearch(userId, {
-      listId,
-      keywords: filters.title ? undefined : filters.keywords,
-      title: filters.title,
-      industry: filters.industry,
-      location: filters.location,
-      limit: normalizeFindLeadsLimit(limit),
-      auto_enrich: auto_enrich === true,
-      icpSource: persona.name,
-    });
+    const currentKey = personaCacheKey(persona);
+    const cached = persona.extractedFilters;
+    const cacheHit =
+      cached &&
+      cached.cacheKey === currentKey &&
+      cached.cacheVersion === ICP_FILTER_CACHE_VERSION &&
+      Array.isArray(cached.variants) &&
+      cached.variants.length > 0;
 
-    if (!result.success) {
-      return res.status(400).json({ message: result.error });
+    if (cacheHit) {
+      return res.status(200).json({
+        persona: { name: persona.name, index: icpIndex },
+        variants: cached.variants,
+        cached: true,
+      });
     }
 
-    res.status(201).json({ ...result, persona: { name: persona.name, index: icpIndex } });
+    let variants;
+    try {
+      variants = await extractIcpFiltersWithLlm(persona);
+    } catch (llmError: any) {
+      console.error('Error extracting ICP filters via LLM:', llmError);
+      return res.status(503).json({
+        message: 'Failed to extract filters with the LLM, please try again.',
+      });
+    }
+
+    // Re-read user before persisting so we don't clobber concurrent edits
+    // made during the ~3s LLM window (e.g., GTM page regenerating
+    // personas). Mirrors the pattern in onboardingIcpService.ts: read →
+    // long-running work → re-read → write.
+    //
+    // If the persona at icpIndex is gone, or its content changed (hash
+    // mismatch), the LLM result we just produced no longer matches what
+    // the user has now — skip the write so the next click can regenerate
+    // against the current content. We still return the variants to the
+    // caller for the current request.
+    const freshUser: any = await userDb.getUserById(userId);
+    const freshPersonas: any[] = Array.isArray(freshUser?.icpResult) ? freshUser.icpResult : [];
+    const freshPersona = freshPersonas[icpIndex];
+    const cacheStillApplies =
+      freshPersona && personaCacheKey(freshPersona) === currentKey;
+
+    if (cacheStillApplies) {
+      const nextIcpResult = freshPersonas.map((p: any, i: number) =>
+        i === icpIndex
+          ? {
+              ...p,
+              extractedFilters: {
+                cacheKey: currentKey,
+                cacheVersion: ICP_FILTER_CACHE_VERSION,
+                variants,
+                generatedAt: new Date().toISOString(),
+              },
+            }
+          : p,
+      );
+      await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+    }
+
+    return res.status(200).json({
+      persona: { name: persona.name, index: icpIndex },
+      variants,
+      cached: false,
+    });
   } catch (error: any) {
-    console.error('Error finding leads from ICP:', error);
-    res.status(500).json({ message: error.message || 'Failed to find leads from ICP' });
+    console.error('Error previewing ICP filters:', error);
+    res.status(500).json({ message: error.message || 'Failed to preview ICP filters' });
   }
 });
 
