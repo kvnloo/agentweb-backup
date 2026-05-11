@@ -652,3 +652,106 @@ describe('runEnrichment — per-lead error isolation', () => {
     expect(result.processed).toBe(1);                  // lead-2 written successfully
   });
 });
+
+// ─── Socket.IO progress + complete emission ───────────────────────────────────
+
+describe('runEnrichment — socket progress events', () => {
+  it('emits crm-enrichment-progress at start with totalToProcess and progress=0', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'lead-1' }),
+        makeLead({ leadId: 'lead-2' }),
+      ]),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const initial = socketEmit.mock.calls.find(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 0,
+    );
+    expect(initial).toBeDefined();
+    expect(initial![2]).toMatchObject({
+      message: expect.stringMatching(/starting/i),
+      progress: 0,
+      processedCount: 0,
+      failedCount: 0,
+      totalToProcess: 2,
+    });
+  });
+
+  it('emits to both socketId room and user:{userId} room when socketId provided', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+
+    await runEnrichment(makeInput(), deps, {
+      userId: USER_ID,
+      socketId: 'socket-abc',
+      socketEmit,
+    });
+
+    const rooms = new Set(socketEmit.mock.calls.map(([room]) => room));
+    expect(rooms.has('socket-abc')).toBe(true);
+    expect(rooms.has(`user:${USER_ID}`)).toBe(true);
+  });
+
+  it('emits crm-enrichment-complete with listId, processedCount, failedCount once at end', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'lead-1' }),
+        makeLead({ leadId: 'lead-2' }),
+      ]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } as any },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const completes = socketEmit.mock.calls.filter(
+      ([room, event]) => event === 'crm-enrichment-complete' && room === `user:${USER_ID}`,
+    );
+    expect(completes).toHaveLength(1);
+    expect(completes[0][2]).toMatchObject({
+      listId: LIST_ID,
+      processedCount: 2,
+      failedCount: 0,
+    });
+    expect(Array.isArray(completes[0][2].outputFields)).toBe(true);
+  });
+
+  it('does not throw when no options are provided (back-compat)', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+    await expect(runEnrichment(makeInput(), deps)).resolves.toBeDefined();
+  });
+
+  it('emits progress updates with non-zero processed count as leads complete', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'lead-1' }),
+        makeLead({ leadId: 'lead-2' }),
+      ]),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const progressCalls = socketEmit.mock.calls.filter(
+      ([, event]) => event === 'crm-enrichment-progress',
+    );
+    // At least the initial 0% emit plus a post-processing emit.
+    expect(progressCalls.length).toBeGreaterThanOrEqual(2);
+    const finalProgress = progressCalls[progressCalls.length - 1][2];
+    expect(finalProgress.processedCount).toBe(2);
+    expect(finalProgress.progress).toBe(100);
+  });
+});
