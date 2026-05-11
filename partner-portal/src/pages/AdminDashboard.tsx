@@ -60,6 +60,7 @@ import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
+import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -717,6 +718,7 @@ export default function AdminDashboard() {
     'funnel': 18,
     'alert-emails': 19,
     'onboarding': 20,
+    'connected-accounts': 21,
   };
   
   // Get initial tab value from URL or default to Users
@@ -3015,6 +3017,7 @@ export default function AdminDashboard() {
             <Tab label="Funnel" {...a11yProps(19)} />
             <Tab label="Alert Emails" {...a11yProps(18)} />
             <Tab label="Onboarding" {...a11yProps(20)} />
+            <Tab label="Connected Accounts" {...a11yProps(21)} />
           </Tabs>
         </Box>
 
@@ -6097,6 +6100,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={20}>
           <OnboardingTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={21}>
+          <ConnectedAccountsTab />
         </TabPanel>
       </Paper>
 

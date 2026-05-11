@@ -5,6 +5,8 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
+import { linkedInOutreachService } from "../services/linkedInOutreachService";
+import { deleteAccountById } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -105,16 +107,17 @@ const isAfterLastSync = (recordTime: string | undefined, lastSyncAt: string | un
 router.use(authenticateToken);
 router.use(isAdmin);
 
-// Get all Unipile (LinkedIn outreach) accounts across all users
+// Get all Unipile (LinkedIn outreach) accounts across all users (with live status + orphan detection)
 router.get("/unipile-accounts", async (req, res) => {
   try {
+    // 1. Build the DB-side list
     const users = await userDb.getAllUsers();
-    const accounts: any[] = [];
+    const dbAccounts: any[] = [];
     for (const user of users) {
       const userAccounts = (user as any).connected_accounts || [];
       for (const acc of userAccounts) {
         if (acc.platform === 'unipile') {
-          accounts.push({
+          dbAccounts.push({
             account_id: acc.account_id,
             account_name: acc.account_name,
             user_email: (user as any).email,
@@ -125,10 +128,72 @@ router.get("/unipile-accounts", async (req, res) => {
         }
       }
     }
-    res.json({ accounts });
+
+    // 2. Fetch ALL accounts currently registered in Unipile
+    let allUnipileAccounts: Array<{ id: string; name: string; type: string; created_at?: string }> = [];
+    try {
+      allUnipileAccounts = await linkedInOutreachService.getAllUnipileAccounts();
+    } catch (unipileErr) {
+      console.warn("[Admin] Failed to fetch all Unipile accounts:", unipileErr);
+    }
+
+    // 3. Fetch live status for DB accounts
+    const dbAccountIds = dbAccounts.map((a) => a.account_id);
+    let statusMap = new Map<string, string>();
+    if (dbAccountIds.length > 0) {
+      try {
+        statusMap = await linkedInOutreachService.getStatusesForAccounts(dbAccountIds);
+      } catch (statusErr) {
+        console.warn("[Admin] Failed to fetch Unipile statuses:", statusErr);
+      }
+    }
+
+    const accountsWithStatus = dbAccounts.map((a) => ({
+      ...a,
+      unipile_status: statusMap.get(a.account_id) ?? 'UNKNOWN',
+      is_orphan: false,
+    }));
+
+    // 4. Detect orphans: in Unipile but NOT in our DB
+    const dbAccountIdSet = new Set(dbAccountIds);
+    const orphans = allUnipileAccounts
+      .filter((u) => !dbAccountIdSet.has(u.id))
+      .map((u) => ({
+        account_id: u.id,
+        account_name: u.name,
+        user_email: null,
+        user_id: null,
+        created_at: u.created_at ?? null,
+        updated_at: null,
+        unipile_status: 'ORPHAN',
+        is_orphan: true,
+      }));
+
+    res.json({ accounts: [...accountsWithStatus, ...orphans] });
   } catch (error) {
     console.error("Error fetching Unipile accounts:", error);
     res.status(500).json({ message: "Failed to fetch Unipile accounts" });
+  }
+});
+
+// Force-delete a Unipile account (removes from Unipile API and, if present, from DB)
+router.delete("/unipile-accounts/:accountId", async (req, res) => {
+  const { accountId } = req.params;
+  const { userId } = req.query as { userId?: string };
+  try {
+    try {
+      await linkedInOutreachService.deleteAccount(accountId);
+    } catch (unipileErr: any) {
+      console.warn(`[Admin] Unipile API delete failed for ${accountId}:`, unipileErr?.message);
+    }
+    // Only touch the DB record if we have a userId (orphans don't have one)
+    if (userId) {
+      await deleteAccountById(userId, 'unipile', accountId);
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error force-deleting Unipile account:", error);
+    res.status(500).json({ message: "Failed to delete Unipile account" });
   }
 });
 

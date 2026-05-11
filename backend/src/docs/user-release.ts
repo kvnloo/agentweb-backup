@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
+      'Admin: Connected Accounts Tab Added to Admin Dashboard',
+      '- A new Connected Accounts tab is available in the Admin Dashboard showing all Unipile (LinkedIn Outreach) accounts across all users',
+      '- Each row shows the user email, account name, account ID, and live Unipile connection status (OK / ERROR / UNKNOWN)',
+      '- Orphaned accounts — those that exist in Unipile but have no matching AgentWeb user (e.g. after a user was deleted or a disconnect failed) — are now surfaced with an ORPHAN status and highlighted in red',
+      '- Admins can force-delete any account directly from the tab, removing it from both the Unipile API and the AgentWeb database',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
       'Fixed: Scheduled Chat Results Now Always Appear in the Chat View',
       '- Previously, if a scheduled chat generated a very large response (e.g. a detailed HTML report), the final message could silently fail to save — the email arrived correctly but the chat page showed no response',
       '- The root cause was an oversized DynamoDB item exceeding the 400KB limit; the fix now correctly detects and truncates oversized messages regardless of content format',

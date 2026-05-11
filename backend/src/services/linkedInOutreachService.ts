@@ -247,6 +247,28 @@ export class LinkedInOutreachService {
     }
   }
 
+  /**
+   * Fetch every account registered in Unipile (all pages), regardless of whether
+   * it exists in our DB. Used by the admin view to detect orphaned accounts that
+   * were not cleaned up when the AgentWeb user was deleted or disconnected.
+   */
+  async getAllUnipileAccounts(): Promise<Array<{ id: string; name: string; type: string; created_at?: string }>> {
+    const client = await this.getClient();
+    const items: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const res: any = await client.account.getAll(cursor ? { cursor } : undefined);
+      if (res?.items) items.push(...res.items);
+      cursor = res?.cursor || undefined;
+    } while (cursor);
+    return items.map((item: any) => ({
+      id: item.id,
+      name: item.name ?? item.connection_params?.im?.publicIdentifier ?? item.id,
+      type: item.type,
+      created_at: item.created_at,
+    }));
+  }
+
   // ─── Profile & outreach ──────────────────────────────────────────────────────
 
   /**
