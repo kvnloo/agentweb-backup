@@ -204,6 +204,96 @@ describe('getEnrichmentConfig', () => {
     expect(names).toContain('industry');
   });
 
+  it('excludes contactStatus* lifecycle columns from candidates (CRM pipeline state, not enrichable)', async () => {
+    // contactStatus tracks pipeline lifecycle (inbox/working/paying) and audit
+    // sidecars (note/reason/updatedAt/updatedBy). Showing these in the
+    // enrichment dialog is noise — the user can't usefully enrich them.
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue([
+        'contactStatus', 'contactStatusNote', 'contactStatusReason',
+        'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
+        'industry',     // normal custom field — must still surface
+      ]),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const names = result.config.fields.map(f => f.name);
+
+    expect(names).not.toContain('contactStatus');
+    expect(names).not.toContain('contactStatusNote');
+    expect(names).not.toContain('contactStatusReason');
+    expect(names).not.toContain('contactStatusUpdatedAt');
+    expect(names).not.toContain('contactStatusUpdatedBy');
+    expect(names).toContain('industry');
+  });
+
+  it('drops previously-saved contactStatus* fields from a re-read merge (cleanup of stale defaults)', async () => {
+    // Older default-config generator pre-selected lifecycle columns. Now that
+    // we exclude them from candidates, they must also be pruned from saved
+    // entries on read — otherwise they'd resurface as "manually added" and
+    // jump to the top of the dialog.
+    const saved: any = {
+      fields: [
+        { name: 'firstName',              type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'first_name' },
+        { name: 'contactStatus',          type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' },
+        { name: 'contactStatusNote',      type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' },
+        { name: 'contactStatusUpdatedAt', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' },
+        { name: 'Description',            type: 'string', instruction: 'Company description', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'company_description' },
+      ],
+      globalOverwriteDefault: 'fill_if_empty',
+      schemaVersion: 1,
+      updatedAt: '2026-05-11T00:00:00Z',
+      updatedBy: USER_ID,
+    };
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(saved),
+      loadListFieldNames: jest.fn().mockResolvedValue(['contactStatus', 'contactStatusNote', 'contactStatusUpdatedAt']),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const names = result.config.fields.map(f => f.name);
+
+    expect(names).not.toContain('contactStatus');
+    expect(names).not.toContain('contactStatusNote');
+    expect(names).not.toContain('contactStatusUpdatedAt');
+    // Description (genuine manual add) still surfaces, at the top
+    expect(names[0]).toBe('Description');
+  });
+
+  it('surfaces user-added saved-only fields at the TOP of the merged list (visibility for recent adds)', async () => {
+    // When a user adds a custom field via the dialog (not in list.fieldNames),
+    // it should appear at the top — most recently added, most likely to be
+    // looked at. Otherwise it gets buried after 8 standard + N list-custom
+    // fields and users think it vanished.
+    const saved: any = {
+      fields: [
+        // saved order matches what the user last saved — standard fields
+        // (default-built first), then their manual add at the end
+        { name: 'firstName', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'first_name' },
+        { name: 'email',     type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+        { name: 'Description', type: 'string', instruction: 'Company description', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'company_description' },
+      ],
+      globalOverwriteDefault: 'fill_if_empty',
+      schemaVersion: 1,
+      updatedAt: '2026-05-11T00:00:00Z',
+      updatedBy: USER_ID,
+    };
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(saved),
+      loadListFieldNames: jest.fn().mockResolvedValue([]),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const names = result.config.fields.map(f => f.name);
+
+    // Description is saved-only (not in candidates) — must be first
+    expect(names[0]).toBe('Description');
+    // Standard candidates follow
+    expect(names).toContain('firstName');
+    expect(names).toContain('email');
+  });
+
   it('returns the standard 8 fields when the list has no custom field schema', async () => {
     // Previously this test expected an empty fields array. After the merge
     // change, standard enrichable lead columns are always surfaced.

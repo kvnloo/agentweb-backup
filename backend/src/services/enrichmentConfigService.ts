@@ -131,6 +131,10 @@ const EXCLUDED_LIST_FIELD_NAMES = new Set<string>([
   'enrichmentMetadata', 'enrichmentData', 'syncMetadata', 'engagements', 'email_validation',
   // Lifecycle controls (managed elsewhere)
   'status', 'dealValue', 'dealCurrency',
+  // CRM pipeline state + audit sidecars (set by the inbox/working/paying
+  // workflow, not enrichable from external sources)
+  'contactStatus', 'contactStatusNote', 'contactStatusReason',
+  'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
   // System timestamps
   'createdAt', 'updatedAt',
 ]);
@@ -282,36 +286,50 @@ function buildDefaultConfig(
   };
 }
 
-/** Merge a saved config with the current candidate set. Saved fields keep
- *  their user-customized settings; new candidates are appended as defaults.
- *  Saved fields the user added manually (e.g. `stag`) are preserved even
- *  if not in the current candidate set. */
+/** Merge a saved config with the current candidate set.
+ *
+ *  Order is intentional, optimized for "I just added a field, where did it go?":
+ *    1. User-added saved-only fields FIRST (manual adds like Description,
+ *       stag — not present in list.fieldNames or the standard set). These
+ *       are the most-recently-added and most-looked-at, so they go on top.
+ *    2. Standard + list-custom candidates (with saved settings if present,
+ *       otherwise defaults).
+ *
+ *  Saved entries always keep their user-customized settings; brand-new
+ *  candidates surface with `include:true` defaults. */
 function mergeSavedWithCandidates(
   saved: EnrichmentConfig,
   listFieldNames: string[],
 ): EnrichmentConfig {
-  const savedByName = new Map(saved.fields.map(f => [f.name, f]));
+  // Drop saved entries that are now excluded (e.g. older configs that
+  // pre-selected contactStatus* lifecycle columns). Treats the exclusion
+  // list as authoritative — these can't usefully enrich, so they shouldn't
+  // resurface even if a prior save persisted them.
+  const visibleSaved = saved.fields.filter(
+    f => !EXCLUDED_LIST_FIELD_NAMES.has(f.name) && !TRULY_RESERVED_SET.has(f.name),
+  );
+  const savedByName = new Map(visibleSaved.map(f => [f.name, f]));
   const candidates = candidateFieldNames(listFieldNames);
+  const candidateSet = new Set(candidates);
   const merged: EnrichmentFieldConfig[] = [];
   const usedNames = new Set<string>();
 
-  // Pass 1: every candidate from the standard/custom set
-  //   - If saved has a matching entry, use it (preserves user choices)
-  //   - Else create a default-include:false entry
-  for (const name of candidates) {
-    const savedEntry = savedByName.get(name);
-    if (savedEntry) {
-      merged.push(savedEntry);
-    } else {
-      merged.push(buildDefaultField(name));
+  // Pass 1: user-added saved-only fields first (not in current candidates).
+  // Preserves saved order among themselves.
+  for (const field of visibleSaved) {
+    if (!candidateSet.has(field.name) && !usedNames.has(field.name)) {
+      merged.push(field);
+      usedNames.add(field.name);
     }
-    usedNames.add(name);
   }
 
-  // Pass 2: preserve any saved fields the user added manually that aren't
-  // in the candidate set (e.g. `stag`, `industry`)
-  for (const field of saved.fields) {
-    if (!usedNames.has(field.name)) merged.push(field);
+  // Pass 2: standard + list-custom candidates. Saved entries keep their
+  // settings; otherwise default.
+  for (const name of candidates) {
+    if (usedNames.has(name)) continue;
+    const savedEntry = savedByName.get(name);
+    merged.push(savedEntry ?? buildDefaultField(name));
+    usedNames.add(name);
   }
 
   return { ...saved, fields: merged };
