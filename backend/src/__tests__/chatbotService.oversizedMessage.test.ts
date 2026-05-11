@@ -71,8 +71,8 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
     expect(writeRequests[1].PutRequest.Item.message.content).toBe('tool result');
   });
 
-  it('oversized tool message content gets truncated', async () => {
-    // Create a string that exceeds 350,000 chars
+  it('oversized string content gets truncated', async () => {
+    // Create a string that exceeds 350,000 chars when serialized
     const oversizedContent = 'x'.repeat(400_000);
     const messages = [
       { role: 'tool', content: oversizedContent, tool_call_id: 'tc1' },
@@ -91,25 +91,20 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
 
     const storedContent = writeRequests[0].PutRequest.Item.message.content as string;
 
-    // Content should start with the truncated portion
-    expect(storedContent.startsWith('x'.repeat(100))).toBe(true);
-    // Content should end with truncation notice
-    expect(storedContent).toContain('[Truncated — original size: 400000 chars]');
-    // The truncated portion itself should be 350,000 chars (before the notice)
+    // Content should be truncated to 350,000 chars + notice
     expect(storedContent.startsWith('x'.repeat(350_000))).toBe(true);
-    // Total length should be 350,000 + the notice suffix
-    const expectedSuffix = `\n\n[Truncated — original size: 400000 chars]`;
-    expect(storedContent).toBe('x'.repeat(350_000) + expectedSuffix);
+    expect(storedContent).toContain('[Truncated — original size:');
 
     // Should have logged a warning
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('oversized content'),
+      expect.stringContaining('oversized serialized size'),
     );
 
     warnSpy.mockRestore();
   });
 
-  it('non-string content passes through without truncation or warning', async () => {
+  it('oversized non-string content (array) gets serialized and truncated', async () => {
+    // Large array whose JSON serialization exceeds 350,000 chars
     const largeArray = Array.from({ length: 50_000 }, (_, i) => `item-${i}-${'y'.repeat(10)}`);
     const messages = [
       { role: 'tool', content: largeArray, tool_call_id: 'tc1' },
@@ -126,12 +121,15 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
     const writeRequests = lastBatchWriteParams.RequestItems[tableName];
     expect(writeRequests).toHaveLength(1);
 
+    // Content should be converted to a truncated string (not the original array)
     const storedContent = writeRequests[0].PutRequest.Item.message.content;
-    expect(Array.isArray(storedContent)).toBe(true);
-    expect(storedContent).toEqual(largeArray);
+    expect(typeof storedContent).toBe('string');
+    expect(storedContent).toContain('[Truncated — original size:');
 
-    // Non-string content skips the fast-path check entirely — no warning
-    expect(warnSpy).not.toHaveBeenCalled();
+    // Should have logged a warning
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('oversized serialized size'),
+    );
 
     warnSpy.mockRestore();
   });
