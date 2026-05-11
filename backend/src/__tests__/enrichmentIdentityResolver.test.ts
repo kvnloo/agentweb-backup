@@ -36,6 +36,51 @@ function makeInput(overrides: Partial<ResolveIdentityInput> = {}): ResolveIdenti
   };
 }
 
+// ─── Name-based identity (Unipile tier 3.5 path) ─────────────────────────────
+
+describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
+  it('allows lead with firstName+lastName through when needsPersonFields=true and email/linkedin are missing', async () => {
+    // Repro of the FitSimple Waitlist bug: lead has name + company but no
+    // email and no linkedin (user deleted it). User enriches linkedin_url
+    // only; downstream Unipile tier 3.5 should be reachable. Identity
+    // resolution must not gate the lead out.
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Ayush',
+          lastName: 'Jha',
+          company: 'Agoda',
+        },
+        needsPersonFields: true,
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    // No email → no Apollo/enrich.so calls are even possible. The waterfall
+    // downstream handles LinkedIn lookup via Unipile by name+company.
+    expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
+    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
+    expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
+  });
+
+  it("still rejects lead with only firstName (no lastName) when needsPersonFields=true and no email/linkedin", async () => {
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false);
+  });
+});
+
 // ─── Failure paths (TDD: cover the unhappy branches first) ────────────────────
 
 describe('resolveIdentity — failure paths', () => {

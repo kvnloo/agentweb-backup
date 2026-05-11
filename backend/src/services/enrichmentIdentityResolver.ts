@@ -73,11 +73,16 @@ export async function resolveIdentity(
 ): Promise<ResolveIdentityResult> {
   const { lead, needsPersonFields, needsCompanyFields, mode, listId } = input;
 
-  // 1. Need at least an email OR a LinkedIn URL to do anything. Apollo can
-  // match on either; if both are missing we can't resolve the lead's identity.
+  // 1. Need at least one of: email, LinkedIn URL, or (firstName + lastName).
+  // Apollo matches on email/linkedin; the waterfall's web tier (Unipile
+  // tier 3.5) can resolve LinkedIn from name+company. If none of these
+  // are present we can't resolve the lead's identity.
   let email = typeof lead.email === 'string' ? lead.email.trim() : '';
   const linkedinUrl = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
-  if (!email && !linkedinUrl) return { ok: false, reason: 'no_email' };
+  const hasName =
+    typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
+    typeof lead.lastName === 'string' && lead.lastName.trim() !== '';
+  if (!email && !linkedinUrl && !hasName) return { ok: false, reason: 'no_email' };
 
   const resolved: Partial<LeadRecord> & { emailDomain?: string } = {};
   const meta: Record<string, EnrichedFieldMeta> = {};
@@ -112,22 +117,25 @@ export async function resolveIdentity(
   }
 
   // After LinkedIn fallback, we still might not have an email. Without it,
-  // company-side resolution (Apollo org-match by domain) can't run.
-  if (!email) return { ok: false, reason: 'no_email' };
+  // Apollo person/org match by email can't run — but the waterfall's web
+  // tier can still resolve fields from name+company, so don't fail-early.
+  // Skip the email-dependent steps and let the completeness check below
+  // decide whether we resolved enough.
 
-  // 3. Derive emailDomain from email if not present. Pure local op, no API call.
-  if (!lead.emailDomain) {
+  // 3. Derive emailDomain from email if present. Pure local op, no API call.
+  if (email && !lead.emailDomain) {
     const derived = extractDomainFromEmail(email);
     if (derived) resolved.emailDomain = derived;
   }
   const emailDomain = lead.emailDomain || resolved.emailDomain;
 
-  // 4. Person resolution — only when needed AND still missing after step 2.
+  // 4. Person resolution — only when needed AND still missing AND we have
+  // email for Apollo. Without email, the downstream web tier handles it.
   const personStillMissing =
     needsPersonFields &&
     (!lead.firstName || !lead.lastName) &&
     (!resolved.firstName || !resolved.lastName);
-  if (personStillMissing) {
+  if (personStillMissing && email) {
     const apolloPerson = await deps.apolloPeopleMatch({ email });
     if (apolloPerson) {
       const apolloMeta = makeApiMeta('apollo');
@@ -171,9 +179,9 @@ export async function resolveIdentity(
       }
     }
 
-    // Fallback to enrich.so if company is still missing.
+    // Fallback to enrich.so if company is still missing — requires email.
     const companyStillMissing = !lead.company && !resolved.company;
-    if (companyStillMissing) {
+    if (companyStillMissing && email) {
       const enrichSo = await deps.enrichSoReverseLookup({ email });
       if (enrichSo) {
         const enrichSoMeta = makeApiMeta('enrich.so');
