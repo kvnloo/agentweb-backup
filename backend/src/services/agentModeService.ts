@@ -2166,7 +2166,7 @@ export class AgentModeService {
         // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
         const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
         const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
-          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video'
+          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
         );
 
         let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
@@ -3414,6 +3414,43 @@ export class AgentModeService {
         success: actualResult.success,
         description: actualResult.description,
         videoUrl: actualResult.videoUrl
+      };
+    }
+
+    if (toolName === 'generate_voiceover') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse generate_voiceover result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        audioUrl: actualResult.audioUrl,
+        filename: actualResult.filename,
+        durationSeconds: actualResult.durationSeconds,
+        ...(actualResult.error && { error: actualResult.error })
+      };
+    }
+
+    if (toolName === 'mux_video_with_audio') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse mux_video_with_audio result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        videoUrl: actualResult.videoUrl,
+        filename: actualResult.filename,
+        ...(actualResult.error && { error: actualResult.error })
       };
     }
 
@@ -15536,6 +15573,71 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: 'Failed to generate video',
         error: error.message
       };
+    }
+  }
+
+  /**
+   * Mux a video file with a voiceover audio track using ffmpeg.
+   */
+  public async muxVideoWithAudio(
+    videoUrl: string,
+    audioUrl: string,
+    outputFilename: string,
+    userId: string,
+    _sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`AgentMode: Muxing video+audio for user ${userId}`);
+      const { muxVideoWithAudio } = await import('./voiceoverService');
+      const result = await muxVideoWithAudio(videoUrl, audioUrl, outputFilename, userId);
+      if (result.success && result.videoUrl) {
+        return {
+          success: true,
+          message: `✅ Video with voiceover "${result.filename}" ready!`,
+          videoUrl: result.videoUrl,
+          filename: result.filename,
+        };
+      }
+      return { success: false, message: result.error || 'Mux failed', error: result.error };
+    } catch (error: any) {
+      console.error('AgentMode: Error muxing video+audio:', error);
+      return { success: false, message: 'Failed to combine video and audio', error: error.message };
+    }
+  }
+
+  /**
+   * Generate voiceover audio from a script using ElevenLabs TTS.
+   */
+  public async generateVoiceover(
+    script: string,
+    filename: string,
+    userId: string,
+    sessionId: string,
+    voice?: string,
+    stability?: number,
+    similarityBoost?: number
+  ): Promise<any> {
+    try {
+      console.log(`AgentMode: Generating voiceover, script length=${script?.length}, voice=${voice ?? 'george'}, userId=${userId}`);
+      const { generateVoiceover, isAvailable } = await import('./voiceoverService');
+      if (!await isAvailable()) {
+        return { success: false, message: 'Voiceover service is not available. ElevenLabs API key may not be configured.', error: 'Service unavailable' };
+      }
+      const result = await generateVoiceover(script, filename, userId, voice, stability, similarityBoost);
+      if (result.success && result.audioUrl) {
+        return {
+          success: true,
+          message: `✅ Voiceover "${result.filename}" generated successfully!`,
+          audioUrl: result.audioUrl,
+          filename: result.filename,
+          durationSeconds: result.durationSeconds,
+          voiceId: result.voiceId,
+        };
+      }
+      return { success: false, message: result.error || 'Failed to generate voiceover', error: result.error };
+    } catch (error: any) {
+      console.error('AgentMode: Error generating voiceover:', error);
+      return { success: false, message: 'Failed to generate voiceover', error: error.message };
     }
   }
 

@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-08
+// Last updated: 2026-05-11
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,54 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Inject Your Own Google Tag Manager Container into Landing Pages',
+      '- Each deployed landing page card now shows an "Add GTM" button if no container is configured, or a green "GTM: GTM-XXXXXX" badge if one is already set',
+      '- Clicking either button opens a dialog where you can enter your GTM container ID (format: GTM-XXXXXXX)',
+      '- Once saved, the GTM snippet is injected into the page\'s layout and the site redeploys automatically in ~30 seconds',
+      '- This enables custom GA4 events (button clicks, PDF downloads, form submissions) to flow into your own Google Analytics property and LookerStudio dashboards',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: CRM Senders Now Support a Default LinkedIn Outreach Account',
+      '- The Senders dialog in the CRM now includes a LinkedIn Sender section',
+      '- If you have a LinkedIn outreach account connected, you can designate one as the default sender for LinkedIn messages',
+      '- When sending a LinkedIn message from a lead, the configured default account is used automatically — no more relying on auto-resolution',
+      '- If no default is set, the existing fallback behavior (your connected account, then a shared account) still applies',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
+      'New: Video Ads Now Support AI-Generated Voiceovers',
+      '- The Video Production skill can now generate a professional voiceover for your ad using ElevenLabs TTS and mix it directly into the final video',
+      '- Choose from 6 voices: George (warm, confident male), Rachel (clear, professional female), Adam (deep, authoritative), Bella (soft, friendly), Josh (young, energetic), or Dorothy (pleasant, conversational)',
+      '- To use: ask Emma to generate a voiceover for your script first, then pass the audio URL into your video composition — or just ask for "a video ad with voiceover" and the agent handles the full workflow automatically',
+      '- Voiceovers are baked directly into the Remotion render, so the final MP4 is a single self-contained file with audio included',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
+      'Fixed: Website Scans No Longer Report 429 Asset Errors as Site Failures',
+      '- When the Browser Automation skill scans a website, Cloudflare and similar bot-protection systems may rate-limit asset requests (CSS, JS, images) with 429 responses',
+      '- Previously, Emma could incorrectly report a healthy website as broken based on these blocked asset requests',
+      '- Emma now checks whether the main HTML loaded successfully and page content is present before concluding a site is down, and reports 429 asset errors as bot-protection rate limiting rather than site failures',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
+      'Fixed: Scheduled Chat — Email Notifications Now Parsed Correctly',
+      '- When creating or updating a scheduled chat, email addresses passed as a stringified JSON array (a common pattern from AI tools) are now automatically parsed into a proper list',
+      '- For example, ["[\\"will@example.com\\", \\"other@example.com\\"]"] is now correctly stored as two separate addresses',
+      '- Invalid email addresses are filtered out rather than silently saved',
+    ],
+  },
   {
     date: '2026-05-08',
     changes: [

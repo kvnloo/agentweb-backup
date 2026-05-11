@@ -114,6 +114,7 @@ export interface GeneratedLandingPage {
   slug?: string;
   archived?: boolean;
   archivedAt?: string;
+  gtmContainerId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -2192,6 +2193,27 @@ export async function deleteLandingPage(
         ":archived": true,
         ":archivedAt": new Date().toISOString(),
         ":updatedAt": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+export async function updateLandingPageGtm(
+  id: string,
+  userId: string,
+  gtmContainerId: string
+): Promise<void> {
+  const record = await getLandingPage(id, userId);
+  if (!record) throw new Error("Landing page not found");
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET gtmContainerId = :gtm, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":gtm": gtmContainerId,
+        ":now": new Date().toISOString(),
       },
     })
     .promise();

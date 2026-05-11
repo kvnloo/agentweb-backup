@@ -3991,6 +3991,14 @@ emmaToolRegistry.register({
             clipDurationSeconds: {
               type: 'number',
               description: 'Optional: Duration of the source clip in seconds. Defaults to 8 (Veo default). Used to set correct composition duration.'
+            },
+            audioUrl: {
+              type: 'string',
+              description: 'Optional S3 URL of an MP3 voiceover audio file to overlay on the composed video. Generate first with generate_voiceover, then pass the returned audioUrl here.'
+            },
+            audioVolume: {
+              type: 'number',
+              description: 'Optional voiceover volume (0.0–1.0). Defaults to 1.0.'
             }
           },
           required: ['brandName', 'primaryColor', 'secondaryColor']
@@ -4075,6 +4083,14 @@ emmaToolRegistry.register({
         cta_url: {
           type: 'string',
           description: 'Optional website URL shown alongside the CTA text'
+        },
+        audio_url: {
+          type: 'string',
+          description: 'Optional S3 URL of an MP3 voiceover audio file to overlay on the composed video. Generate first with generate_voiceover, then pass the returned audioUrl here.'
+        },
+        audio_volume: {
+          type: 'number',
+          description: 'Optional voiceover volume (0.0–1.0). Defaults to 1.0.'
         }
       },
       required: ['clip_urls', 'filename', 'brand_name', 'primary_color', 'secondary_color']
@@ -4094,10 +4110,93 @@ emmaToolRegistry.register({
         logoUrl: args.logo_url,
         ctaText: args.cta_text,
         ctaUrl: args.cta_url,
+        audioUrl: args.audio_url,
+        audioVolume: args.audio_volume,
       },
       args.clip_duration_seconds,
       args.target_duration_seconds,
       args.clip_durations_seconds
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'mux_video_with_audio',
+  definition: {
+    name: 'mux_video_with_audio',
+    description: 'Combine a silent or muted video (MP4) with a voiceover audio track (MP3) into a single video file with audio. Use this after generate_video and generate_voiceover to produce a final video+audio file. The audio is trimmed to the video length automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        video_url: {
+          type: 'string',
+          description: 'S3 URL of the video file (MP4) — e.g. the videoUrl returned by generate_video or compose_video'
+        },
+        audio_url: {
+          type: 'string',
+          description: 'S3 URL of the voiceover MP3 — the audioUrl returned by generate_voiceover'
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename for the final video (e.g. "agentweb_ad_final.mp4"). .mp4 extension added automatically.'
+        }
+      },
+      required: ['video_url', 'audio_url', 'filename']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.muxVideoWithAudio(
+      args.video_url,
+      args.audio_url,
+      args.filename,
+      context?.userId,
+      context?.sessionId
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'generate_voiceover',
+  definition: {
+    name: 'generate_voiceover',
+    description: 'Generate professional voiceover audio from a script using ElevenLabs TTS. Returns an S3 URL to an MP3 file. Use this to create narration for video ads, presentations, or any audio content. After generating, you can reference the audioUrl in your response so the user can download or play it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        script: {
+          type: 'string',
+          description: 'The voiceover script text to convert to speech'
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename for the audio file (e.g. "product_ad_voiceover.mp3"). .mp3 extension is added automatically if missing.'
+        },
+        voice: {
+          type: 'string',
+          description: 'Voice to use. Available presets: "george" (warm confident male, default), "rachel" (clear professional female), "adam" (deep authoritative male), "bella" (soft friendly female), "josh" (energetic young male), "dorothy" (conversational female). Or pass a raw ElevenLabs voice ID.',
+          enum: ['george', 'rachel', 'adam', 'bella', 'josh', 'dorothy']
+        },
+        stability: {
+          type: 'number',
+          description: 'Voice stability (0.0–1.0). Higher = more consistent but less expressive. Default: 0.5'
+        },
+        similarity_boost: {
+          type: 'number',
+          description: 'Voice similarity boost (0.0–1.0). Higher = closer to original voice. Default: 0.75'
+        }
+      },
+      required: ['script', 'filename']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.generateVoiceover(
+      args.script,
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      args.voice,
+      args.stability,
+      args.similarity_boost
     );
   }
 });

@@ -10,6 +10,7 @@ import {
   getLandingPage,
   listLandingPages,
   deleteLandingPage,
+  updateLandingPageGtm,
   BrandContext,
   getDeploymentStatus,
   getPreviewDeploymentUrl,
@@ -1063,6 +1064,137 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     } else {
       res.status(500).json({ error: `Failed to publish: ${ghMessage}` });
     }
+  }
+});
+
+/**
+ * POST /api/landing-pages/v0/generated/:id/gtm
+ * Inject a Google Tag Manager container into the root layout.tsx of the
+ * page's GitHub repo and persist the container ID in DynamoDB.
+ *
+ * Body: { gtmContainerId: string }  — e.g. "GTM-XXXXXX"
+ *
+ * The handler:
+ *  1. Reads the current app/layout.tsx from GitHub
+ *  2. Inserts the GTM <head> snippet + <noscript> body snippet (idempotent —
+ *     removes any existing GTM block first)
+ *  3. Commits the updated file to the main branch (triggers Vercel re-deploy)
+ *  4. Saves gtmContainerId on the DynamoDB record
+ */
+router.post("/generated/:id/gtm", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "Landing page has no GitHub repository" });
+
+    const { gtmContainerId } = req.body as { gtmContainerId?: string };
+    if (!gtmContainerId || typeof gtmContainerId !== "string") {
+      return res.status(400).json({ error: "gtmContainerId is required" });
+    }
+    // Validate GTM container ID format
+    if (!/^GTM-[A-Z0-9]{4,10}$/.test(gtmContainerId.trim())) {
+      return res.status(400).json({ error: "Invalid GTM container ID. Expected format: GTM-XXXXXXX" });
+    }
+    const containerId = gtmContainerId.trim();
+
+    const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+    const [, owner, repoRaw] = repoMatch;
+    const repo = repoRaw.replace(".git", "");
+
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+    const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+    const GITHUB_TIMEOUT_MS = 30_000;
+    const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+    // 1. Fetch current layout.tsx
+    const layoutPath = "app/layout.tsx";
+    let currentContent = "";
+    let fileSha: string | undefined;
+    try {
+      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+      fileSha = fileRes.data.sha;
+    } catch (err: any) {
+      if (err.response?.status === 404) {
+        return res.status(400).json({ error: "app/layout.tsx not found in the repository" });
+      }
+      throw err;
+    }
+
+    // 2. Build GTM snippets
+    const gtmHeadSnippet =
+      `        {/* Google Tag Manager */}\n` +
+      `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
+      `        {/* End Google Tag Manager */}`;
+
+    const gtmBodySnippet =
+      `        {/* Google Tag Manager (noscript) */}\n` +
+      `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
+      `        {/* End Google Tag Manager (noscript) */}`;
+
+    // 3. Idempotent injection — strip any existing GTM block first
+    let updatedContent = currentContent
+      .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
+      .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
+
+    // Insert head snippet inside <head> (before </head> or before first child after <head>)
+    if (/<head[^>]*>/.test(updatedContent)) {
+      updatedContent = updatedContent.replace(
+        /(<head[^>]*>)/,
+        `$1\n${gtmHeadSnippet}`
+      );
+    } else {
+      // Fallback: insert before <body
+      updatedContent = updatedContent.replace(
+        /(<body[^>]*>)/,
+        `${gtmHeadSnippet}\n      $1`
+      );
+    }
+
+    // Insert noscript snippet immediately after <body ...>
+    if (/<body[^>]*>/.test(updatedContent)) {
+      updatedContent = updatedContent.replace(
+        /(<body[^>]*>)/,
+        `$1\n${gtmBodySnippet}`
+      );
+    }
+
+    // 4. Commit updated layout.tsx to GitHub
+    const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
+    await axios.put<any>(
+      `${repoBase}/contents/${layoutPath}`,
+      {
+        message: `chore: inject GTM container ${containerId}`,
+        content: base64New,
+        sha: fileSha,
+      },
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+
+    // 5. Persist gtmContainerId in DynamoDB
+    await updateLandingPageGtm(page.id, userId, containerId);
+
+    // Trigger Vercel re-deploy if we have a project ID
+    const vercelProjectId = await resolveVercelProjectId(page);
+    if (vercelProjectId) {
+      try {
+        await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
+      } catch (deployErr: any) {
+        console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after GTM inject: ${deployErr.message}`);
+      }
+    }
+
+    res.json({ success: true, gtmContainerId: containerId, message: `GTM container ${containerId} injected. Your site will redeploy shortly.` });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error injecting GTM:", error);
+    res.status(500).json({ error: error.response?.data?.message || error.message || "Failed to inject GTM" });
   }
 });
 
