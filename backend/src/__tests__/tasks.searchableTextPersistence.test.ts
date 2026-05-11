@@ -53,6 +53,11 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// Prevent classification LLM calls from interfering with searchableText persistence tests
+jest.mock('../services/reportClassificationService', () => ({
+  classifyReport: jest.fn().mockRejectedValue(new Error('mocked')),
+}));
+
 const router = require('../routes/tasks').default;
 
 const HTML_CONTENT = '<html><body><h1>Sales Report Q1</h1><p>Revenue increased by 20%.</p></body></html>';
