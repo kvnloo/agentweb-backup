@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { userDb } from './db';
 import { decryptPassword } from '../utils/crypto';
+import { getForeplayApiKey } from '../utils/secretsManager';
 
 const FOREPLAY_API = 'https://public.api.foreplay.co';
 
@@ -82,19 +83,22 @@ export function clearForeplayCacheForToken(token: string): void {
 }
 
 /**
- * Get the decrypted Foreplay API token for a user.
- * Returns null if no token is stored or decryption fails.
+ * Get the Foreplay API token for a user.
+ * Returns the user's own token if configured, otherwise falls back to the
+ * platform-wide key stored in Secrets Manager. Returns null only if neither exists.
  */
 export async function getAccessToken(userId: string): Promise<string | null> {
   const user = await userDb.getUserById(userId);
   const secrets = (user?.secrets as Record<string, string>) || {};
-  if (!secrets.foreplay_api_token) return null;
-  try {
-    const decrypted = decryptPassword(secrets.foreplay_api_token);
-    return decrypted.password;
-  } catch {
-    return null;
+  if (secrets.foreplay_api_token) {
+    try {
+      const decrypted = decryptPassword(secrets.foreplay_api_token);
+      return decrypted.password;
+    } catch {
+      // fall through to platform key
+    }
   }
+  return getForeplayApiKey();
 }
 
 function authHeaders(token: string) {
