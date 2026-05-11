@@ -2000,9 +2000,10 @@ export async function upsertEnvVar(
     "Content-Type": "application/json",
   };
   // Delete all existing records for this key first (avoids per-environment split records).
-  if (existingIds?.length) {
+  const idsToDelete = Array.isArray(existingIds) ? existingIds : existingIds ? [existingIds as string] : [];
+  if (idsToDelete.length) {
     await Promise.all(
-      existingIds.map((id) =>
+      idsToDelete.map((id) =>
         axios.delete(`https://api.vercel.com/v10/projects/${vercelProjectId}/env/${id}`, {
           headers,
           timeout: VERCEL_API_TIMEOUT_MS,
