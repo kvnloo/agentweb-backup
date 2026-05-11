@@ -3415,7 +3415,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { message } = req.body;
+    const { message, accountId: requestedAccountId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -3441,7 +3441,10 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    // Use the caller-specified account (user's configured default) if provided, otherwise auto-resolve
+    const accountId = (requestedAccountId && typeof requestedAccountId === 'string')
+      ? requestedAccountId
+      : await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
@@ -3640,11 +3643,12 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
       const config = JSON.parse(setting.settingValue);
       res.json({
         senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null
+        defaultSenderId: config.defaultSenderId || null,
+        defaultLinkedInAccountId: config.defaultLinkedInAccountId || null
       });
     } catch (parseError) {
       console.error('Error parsing CRM sender emails:', parseError);
-      res.json({ senders: [], defaultSenderId: null });
+      res.json({ senders: [], defaultSenderId: null, defaultLinkedInAccountId: null });
     }
   } catch (error: any) {
     console.error('Error fetching CRM sender emails:', error);
@@ -3666,7 +3670,7 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { senders, defaultSenderId } = req.body;
+    const { senders, defaultSenderId, defaultLinkedInAccountId } = req.body;
 
     // Validate senders array
     if (!Array.isArray(senders)) {
@@ -3691,7 +3695,7 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
 
     // Validate defaultSenderId if provided
     if (defaultSenderId !== null && defaultSenderId !== undefined) {
-      const defaultSenderExists = senders.some((s: any, index: number) => 
+      const defaultSenderExists = senders.some((s: any, index: number) =>
         s.id === defaultSenderId || index.toString() === defaultSenderId
       );
       if (!defaultSenderExists && senders.length > 0) {
@@ -3699,15 +3703,23 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       }
     }
 
+    // Validate defaultLinkedInAccountId if provided
+    if (defaultLinkedInAccountId !== null && defaultLinkedInAccountId !== undefined) {
+      if (typeof defaultLinkedInAccountId !== 'string') {
+        return res.status(400).json({ message: 'defaultLinkedInAccountId must be a string' });
+      }
+    }
+
     const settingName = `crm_sender_emails_${userId}`;
-    const config = {
+    const config: any = {
       senders: senders.map((s: any, index: number) => ({
         id: s.id || index.toString(),
         email: s.email.trim(),
         fromName: s.fromName.trim(),
         notes: s.notes ? s.notes.trim() : undefined
       })),
-      defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null)
+      defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
+      defaultLinkedInAccountId: defaultLinkedInAccountId || null
     };
 
     await settingsService.setSetting(
