@@ -1662,11 +1662,14 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     }
 
     const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
+    const leadIds = Array.isArray(req.body?.leadIds)
+      ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
+      : undefined;
     const deps = buildV3OrchestratorDeps(userId);
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
-    console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'}`);
+    console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'} leadIds=${leadIds?.length ?? 'all'}`);
     const result = await svcRunEnrichmentV3(
-      { listId, userId, config, mode, refreshFields },
+      { listId, userId, config, mode, refreshFields, leadIds },
       deps,
       {
         userId,

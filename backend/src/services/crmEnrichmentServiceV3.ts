@@ -73,6 +73,10 @@ export interface RunEnrichmentInput {
   config: EnrichmentConfig;
   mode: 'preview' | 'enrich';
   refreshFields?: Array<{ leadId: string; fieldName: string }>;
+  /** Optional filter — when provided and non-empty, only leads whose
+   *  `leadId` is in this set get enriched. Used by the bulk-action bar
+   *  "Enrichment" button to scope a run to the user's selection. */
+  leadIds?: string[];
 }
 
 interface TierCount {
@@ -514,8 +518,11 @@ export async function runEnrichment(
 
   console.log(`[v3] runEnrichment START listId=${input.listId} userId=${input.userId} mode=${input.mode} runId=${runId}`);
   const loadStart = Date.now();
-  const leads = await deps.loadLeads({ listId: input.listId, userId: input.userId });
-  console.log(`[v3] loadLeads → ${leads.length} lead(s) in ${Date.now() - loadStart}ms`);
+  const allLeads = await deps.loadLeads({ listId: input.listId, userId: input.userId });
+  const leads = (input.leadIds && input.leadIds.length > 0)
+    ? allLeads.filter(l => input.leadIds!.includes(l.leadId))
+    : allLeads;
+  console.log(`[v3] loadLeads → ${allLeads.length} lead(s) in ${Date.now() - loadStart}ms (after leadIds filter: ${leads.length})`);
 
   const { routing, needsPerson, needsCompany } = routeFields(input.config);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
