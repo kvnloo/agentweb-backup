@@ -626,15 +626,26 @@ export class ChatbotDB {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
           let safeMessage = message;
-          // Fast path: only check serialized size when content is large enough to matter
-          const contentLen = typeof message.content === 'string' ? message.content.length : 0;
-          if (contentLen > MAX_MESSAGE_CONTENT_SIZE) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized content (${contentLen} chars), truncating`);
-            safeMessage = {
-              ...message,
-              content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                + `\n\n[Truncated — original size: ${contentLen} chars]`,
-            };
+          // Check serialized item size — covers both string content and content-block arrays.
+          // DynamoDB hard limit is 400KB per item; we use 350KB as a safety margin.
+          const serializedLen = JSON.stringify(message).length;
+          if (serializedLen > MAX_MESSAGE_CONTENT_SIZE) {
+            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} chars), truncating`);
+            if (typeof message.content === 'string') {
+              safeMessage = {
+                ...message,
+                content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
+              };
+            } else {
+              // Content is an array of blocks — stringify it, truncate, store as plain string
+              const contentStr = JSON.stringify(message.content);
+              safeMessage = {
+                ...message,
+                content: contentStr.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
+              };
+            }
           }
           return {
             PutRequest: {
