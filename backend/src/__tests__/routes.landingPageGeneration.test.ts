@@ -71,6 +71,10 @@ const mockIterateLandingPage = jest.fn();
 const mockGetLandingPage = jest.fn();
 const mockListLandingPages = jest.fn();
 const mockDeleteLandingPage = jest.fn();
+const mockGetProjectEnvVars = jest.fn();
+const mockUpsertEnvVar = jest.fn();
+const mockDeleteEnvVar = jest.fn();
+const mockResolveVercelProjectId = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
   generateLandingPage: (...args: any[]) => mockGenerateLandingPage(...args),
@@ -79,9 +83,19 @@ jest.mock("../services/v0Service", () => ({
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
+  getProjectEnvVars: (...args: any[]) => mockGetProjectEnvVars(...args),
+  upsertEnvVar: (...args: any[]) => mockUpsertEnvVar(...args),
+  deleteEnvVar: (...args: any[]) => mockDeleteEnvVar(...args),
+  resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   buildBrandEnrichedPrompt: jest.fn(),
   extractTemplateOutline: jest.fn(),
   BrandContext: {},
+  INTEGRATIONS: {
+    recaptcha: {
+      siteKey: { envKey: "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", type: "plain", target: ["production", "preview", "development"] },
+      secretKey: { envKey: "RECAPTCHA_SECRET_KEY", type: "encrypted", target: ["production", "preview", "development"] },
+    },
+  },
 }));
 
 const mockedExtractOutline = extractTemplateOutline as jest.MockedFunction<typeof extractTemplateOutline>;
@@ -105,6 +119,10 @@ beforeEach(() => {
   mockListLandingPages.mockResolvedValue([]);
   mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
+  mockResolveVercelProjectId.mockResolvedValue("vercel-proj-123");
+  mockGetProjectEnvVars.mockResolvedValue({});
+  mockUpsertEnvVar.mockResolvedValue("env-id-1");
+  mockDeleteEnvVar.mockResolvedValue(undefined);
   _resetRateLimitState();
 });
 
@@ -670,5 +688,215 @@ describe("Rate limiting on expensive endpoints", () => {
       .post("/api/landing-pages/v0/generate")
       .send({ prompt: "Valid prompt" });
     expect(res.status).toBe(429);
+  });
+});
+
+// =============================================================================
+// GET /generated/:id/integrations
+// =============================================================================
+describe("GET /api/landing-pages/v0/generated/:id/integrations", () => {
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/nonexistent/integrations"
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: no vercelProjectId → returns empty fields without calling getProjectEnvVars", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", status: "draft",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce(null);
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.recaptcha.siteKey).toBe("");
+    expect(res.body.recaptcha.secretKeyIsSet).toBe(false);
+    expect(mockGetProjectEnvVars).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: getProjectEnvVars throws → 500", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockRejectedValueOnce(new Error("Vercel API error"));
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it("SUCCESS: no env vars set → returns empty siteKey and secretKeyIsSet=false", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.recaptcha.siteKey).toBe("");
+    expect(res.body.recaptcha.secretKeyIsSet).toBe(false);
+  });
+
+  it("SUCCESS: both recaptcha keys set → returns siteKey value and secretKeyIsSet=true", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({
+      "NEXT_PUBLIC_RECAPTCHA_SITE_KEY": { id: "env-abc", value: "6LcSITEKEY" },
+      "RECAPTCHA_SECRET_KEY": { id: "env-xyz", value: "*****" },
+    });
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.recaptcha.siteKey).toBe("6LcSITEKEY");
+    expect(res.body.recaptcha.secretKeyIsSet).toBe(true);
+  });
+});
+
+// =============================================================================
+// PUT /generated/:id/integrations
+// =============================================================================
+describe("PUT /api/landing-pages/v0/generated/:id/integrations", () => {
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/nonexistent/integrations")
+      .send({ recaptcha: { siteKey: "key", secretKey: "secret" } });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page belongs to different user (getLandingPage returns null) → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/other-user-page/integrations")
+      .send({ recaptcha: { siteKey: "key" } });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: no vercelProjectId → 400 with 'deploy it first' message", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", status: "draft",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "key" } });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/deploy it first/);
+  });
+
+  it("SUCCESS: upserts both recaptcha keys (create path, no existing env vars)", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "6LcSITE", secretKey: "6LcSECRET" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(mockUpsertEnvVar).toHaveBeenCalledTimes(2);
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", "6LcSITE",
+      ["production", "preview", "development"], undefined, "plain"
+    );
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "RECAPTCHA_SECRET_KEY", "6LcSECRET",
+      ["production", "preview", "development"], undefined, "encrypted"
+    );
+  });
+
+  it("SUCCESS: updates existing keys (PATCH path, existing IDs passed)", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({
+      "NEXT_PUBLIC_RECAPTCHA_SITE_KEY": { id: "env-site-123", value: "old-key" },
+      "RECAPTCHA_SECRET_KEY": { id: "env-secret-456", value: "*****" },
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "new-site-key", secretKey: "new-secret" } });
+
+    expect(res.status).toBe(200);
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", "new-site-key",
+      ["production", "preview", "development"], "env-site-123", "plain"
+    );
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "RECAPTCHA_SECRET_KEY", "new-secret",
+      ["production", "preview", "development"], "env-secret-456", "encrypted"
+    );
+  });
+
+  it("SUCCESS: empty string for siteKey → deletes existing env var", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({
+      "NEXT_PUBLIC_RECAPTCHA_SITE_KEY": { id: "env-site-123", value: "old-key" },
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "" } });
+
+    expect(res.status).toBe(200);
+    expect(mockDeleteEnvVar).toHaveBeenCalledWith("proj-1", "env-site-123");
+    expect(mockUpsertEnvVar).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: omitting secretKey from body → only siteKey is touched", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "6LcNEW" } });
+
+    expect(res.status).toBe(200);
+    expect(mockUpsertEnvVar).toHaveBeenCalledTimes(1);
+    expect(mockUpsertEnvVar.mock.calls[0][1]).toBe("NEXT_PUBLIC_RECAPTCHA_SITE_KEY");
+  });
+
+  it("SUCCESS: custom variable → stored as plain type so it can be read back", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ custom: [{ key: "MY_API_URL", value: "https://api.example.com" }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.updated).toContain("MY_API_URL");
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "MY_API_URL", "https://api.example.com",
+      ["production", "preview", "development"], undefined, "plain"
+    );
   });
 });

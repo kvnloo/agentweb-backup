@@ -1941,6 +1941,91 @@ export async function triggerVercelDeployment(
   console.log(`[V0 SERVICE] Triggered deployment for ${repoFullName} on ${ref}`);
 }
 
+// ---------------------------------------------------------------------------
+// Integrations — maps friendly field names to Vercel env var keys
+// ---------------------------------------------------------------------------
+export const INTEGRATIONS = {
+  recaptcha: {
+    siteKey: {
+      envKey: "NEXT_PUBLIC_RECAPTCHA_SITE_KEY",
+      type: "plain" as const,
+      target: ["production", "preview", "development"] as string[],
+    },
+    secretKey: {
+      envKey: "RECAPTCHA_SECRET_KEY",
+      type: "encrypted" as const,
+      target: ["production", "preview", "development"] as string[],
+    },
+  },
+} as const;
+
+export async function getProjectEnvVars(
+  vercelProjectId: string
+): Promise<Record<string, { id: string; value: string }>> {
+  const vercelToken = await getVercelToken();
+  const headers = {
+    Authorization: `Bearer ${vercelToken}`,
+    "Content-Type": "application/json",
+  };
+  const res = await axios.get<any>(
+    `https://api.vercel.com/v10/projects/${vercelProjectId}/env`,
+    { headers, timeout: VERCEL_API_TIMEOUT_MS }
+  );
+  const envs: any[] = res.data?.envs ?? [];
+  const result: Record<string, { id: string; value: string }> = {};
+  for (const env of envs) {
+    if (env.key) {
+      result[env.key] = { id: env.id, value: env.value ?? "" };
+    }
+  }
+  return result;
+}
+
+export async function upsertEnvVar(
+  vercelProjectId: string,
+  key: string,
+  value: string,
+  target: string[],
+  envId?: string,
+  type: "plain" | "encrypted" = "encrypted"
+): Promise<string> {
+  const vercelToken = await getVercelToken();
+  const headers = {
+    Authorization: `Bearer ${vercelToken}`,
+    "Content-Type": "application/json",
+  };
+  const body = { key, value, type, target };
+  if (envId) {
+    const res = await axios.patch<any>(
+      `https://api.vercel.com/v10/projects/${vercelProjectId}/env/${envId}`,
+      body,
+      { headers, timeout: VERCEL_API_TIMEOUT_MS }
+    );
+    return res.data.id ?? envId;
+  } else {
+    const res = await axios.post<any>(
+      `https://api.vercel.com/v10/projects/${vercelProjectId}/env`,
+      body,
+      { headers, timeout: VERCEL_API_TIMEOUT_MS }
+    );
+    return res.data.id;
+  }
+}
+
+export async function deleteEnvVar(
+  vercelProjectId: string,
+  envId: string
+): Promise<void> {
+  const vercelToken = await getVercelToken();
+  await axios.delete(
+    `https://api.vercel.com/v10/projects/${vercelProjectId}/env/${envId}`,
+    {
+      headers: { Authorization: `Bearer ${vercelToken}` },
+      timeout: VERCEL_API_TIMEOUT_MS,
+    }
+  );
+}
+
 /**
  * Refine a landing page with follow-up instructions via v0 chat.
  */

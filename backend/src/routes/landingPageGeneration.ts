@@ -17,6 +17,10 @@ import {
   triggerVercelDeployment,
   resolveVercelProjectId,
   extractTemplateOutline,
+  getProjectEnvVars,
+  upsertEnvVar,
+  deleteEnvVar,
+  INTEGRATIONS,
 } from "../services/v0Service";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
@@ -1226,6 +1230,122 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
   } catch (error: any) {
     console.error("[LP GENERATION] Error getting preview URL:", error);
     res.status(500).json({ error: error.message || "Failed to get preview URL" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /generated/:id/integrations
+// Returns current integration values for the page's Vercel project.
+// Secret key values are never returned — only a boolean "isSet" flag.
+// ---------------------------------------------------------------------------
+router.get("/generated/:id/integrations", editRateLimiter, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+
+    const vercelProjectId = await resolveVercelProjectId(page);
+    if (!vercelProjectId) {
+      return res.json({ recaptcha: { siteKey: "", secretKeyIsSet: false } });
+    }
+
+    const envMap = await getProjectEnvVars(vercelProjectId);
+    const cfg = INTEGRATIONS.recaptcha;
+    const siteKeyEntry = envMap[cfg.siteKey.envKey];
+    const secretKeyEntry = envMap[cfg.secretKey.envKey];
+
+    // All known integration env var keys
+    const knownKeys = new Set([cfg.siteKey.envKey, cfg.secretKey.envKey]);
+
+    // Custom env vars: anything not in a known integration
+    const custom = Object.entries(envMap)
+      .filter(([key]) => !knownKeys.has(key))
+      .map(([key, entry]) => ({ key, value: entry.value, id: entry.id }));
+
+    res.json({
+      recaptcha: {
+        siteKey: siteKeyEntry?.value ?? "",
+        secretKeyIsSet: !!secretKeyEntry?.id,
+      },
+      custom,
+    });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error getting integrations:", error);
+    res.status(500).json({ error: error.message || "Failed to get integrations" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /generated/:id/integrations
+// Upserts integration env vars on the page's Vercel project.
+// Pass empty string for a field to delete that env var; omit to leave untouched.
+// ---------------------------------------------------------------------------
+router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+
+    const vercelProjectId = await resolveVercelProjectId(page);
+    if (!vercelProjectId) {
+      return res.status(400).json({ error: "Landing page has no Vercel project — deploy it first" });
+    }
+
+    const { recaptcha, custom } = req.body as {
+      recaptcha?: { siteKey?: string; secretKey?: string };
+      custom?: { key: string; value: string; id?: string; _delete?: boolean }[];
+    };
+
+    const envMap = await getProjectEnvVars(vercelProjectId);
+    const updated: string[] = [];
+    const allTargets = ["production", "preview", "development"];
+
+    if (recaptcha) {
+      const cfg = INTEGRATIONS.recaptcha;
+
+      if (recaptcha.siteKey !== undefined) {
+        const existing = envMap[cfg.siteKey.envKey];
+        if (recaptcha.siteKey === "") {
+          if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
+        } else {
+          await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.id, cfg.siteKey.type);
+        }
+        updated.push(cfg.siteKey.envKey);
+      }
+
+      if (recaptcha.secretKey !== undefined) {
+        const existing = envMap[cfg.secretKey.envKey];
+        if (recaptcha.secretKey === "") {
+          if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
+        } else {
+          await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.id, cfg.secretKey.type);
+        }
+        updated.push(cfg.secretKey.envKey);
+      }
+    }
+
+    if (Array.isArray(custom)) {
+      for (const entry of custom) {
+        if (!entry.key) continue;
+        if (entry._delete) {
+          const existing = entry.id ? { id: entry.id } : envMap[entry.key];
+          if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
+        } else {
+          const existing = envMap[entry.key];
+          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.id, "plain");
+        }
+        updated.push(entry.key);
+      }
+    }
+
+    res.json({ success: true, updated });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error updating integrations:", error);
+    res.status(500).json({ error: error.message || "Failed to update integrations" });
   }
 });
 
