@@ -47,6 +47,7 @@ function makeDeps(overrides: Partial<WaterfallDeps> = {}): WaterfallDeps {
     fetchApolloPerson: jest.fn().mockResolvedValue(null),
     extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
     fetchWebForGroup: jest.fn().mockResolvedValue(null),
+    findLinkedInUrl: jest.fn().mockResolvedValue(null),
     ...overrides,
   };
 }

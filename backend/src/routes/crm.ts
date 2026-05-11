@@ -1662,7 +1662,7 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     }
 
     const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
-    const deps = buildV3OrchestratorDeps();
+    const deps = buildV3OrchestratorDeps(userId);
     const result = await svcRunEnrichmentV3(
       { listId, userId, config, mode, refreshFields },
       deps,

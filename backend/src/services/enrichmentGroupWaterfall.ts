@@ -105,6 +105,7 @@ export interface WaterfallDeps {
     lead: LeadRecord,
     groupName: string,
   ): Promise<{ webContext: string } | null>;
+  findLinkedInUrl(lead: LeadRecord): Promise<string | null>;
 }
 
 export interface RunWaterfallInput {
@@ -173,6 +174,14 @@ function metaApollo(): EnrichedFieldMeta {
 function metaWeb(): EnrichedFieldMeta {
   return {
     source: 'web_search',
+    enrichedAt: new Date().toISOString(),
+  };
+}
+
+function metaUnipile(): EnrichedFieldMeta {
+  return {
+    source: 'api',
+    provider: 'unipile',
     enrichedAt: new Date().toISOString(),
   };
 }
@@ -278,6 +287,32 @@ export async function runWaterfall(
     };
   }
 
+  // ─ Tier 3.5: Unipile LinkedIn search ───────────────────────────────────────
+  // Only for person_identity group when linkedin_url still missing after Apollo tiers.
+  // Searches by firstName + lastName + company to find the LinkedIn public_identifier.
+  let unipileFills = 0;
+  if (groupName === 'person_identity' && remaining.includes('linkedin_url')) {
+    const linkedInUrl = await deps.findLinkedInUrl(lead);
+    if (linkedInUrl) {
+      filled.push({ field: 'linkedin_url', value: linkedInUrl, meta: metaUnipile() });
+      remaining = remaining.filter(f => f !== 'linkedin_url');
+      unipileFills = 1;
+    }
+  }
+
+  if (remaining.length === 0) {
+    return {
+      fields: filled,
+      missing: [],
+      tierFills: {
+        crm: crmHits.length,
+        apollo: apolloHits.length + tier3Fills + unipileFills,
+        web: 0,
+        missing: 0,
+      },
+    };
+  }
+
   // ─ Tier 4: Web ─────────────────────────────────────────────────────────────
   const webCache = await deps.fetchWebForGroup(lead, groupName);
   let webFills = 0;
@@ -305,7 +340,7 @@ export async function runWaterfall(
     missing: remaining,
     tierFills: {
       crm: crmHits.length,
-      apollo: apolloHits.length + tier3Fills,
+      apollo: apolloHits.length + tier3Fills + unipileFills,
       web: webFills,
       missing: remaining.length,
     },
