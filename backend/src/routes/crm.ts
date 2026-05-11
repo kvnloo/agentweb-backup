@@ -1663,13 +1663,21 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
 
     const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
     const deps = buildV3OrchestratorDeps(userId);
+    const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
+    console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'}`);
     const result = await svcRunEnrichmentV3(
       { listId, userId, config, mode, refreshFields },
       deps,
+      {
+        userId,
+        socketId,
+        socketEmit: (room, event, payload) => io.to(room).emit(event, payload),
+      },
     );
+    console.log(`[v3][route] enrich-v3 response listId=${listId} processed=${result.processed} durationMs=${result.durationMs}`);
     return res.json(result);
   } catch (error) {
-    console.error('[crm] POST enrich-v3 failed:', error);
+    console.error('[v3][route] enrich-v3 failed:', error);
     return res.status(500).json({ message: 'Enrichment run failed' });
   }
 });

@@ -16,9 +16,28 @@ import {
   type ApolloFetchContext,
 } from './enrichmentGroupWaterfall';
 import { FIELD_GROUPS } from './enrichmentGroups';
-import type { LeadRecord } from './crmEnrichmentService';
+import type { LeadRecord, SocketEmitFn } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import type { ResolveIdentityResult } from './enrichmentIdentityResolver';
+
+// ─── Socket progress options ─────────────────────────────────────────────────
+//
+// Phase 1b — emit live progress + completion events so the customer-portal
+// CRM page can show a progress banner and a final toast (mirrors the v2
+// `crm-enrichment-progress` / `crm-enrichment-complete` contract).
+export interface RunEnrichmentOptions {
+  /** User-scoped — events are always emitted to `user:${userId}` for the CRM
+   *  page's persistent socket listener. Required when socketEmit is given. */
+  userId?: string;
+  /** Optional explicit socket id. When present, events also go to that room
+   *  (matches v2 behavior for the dialog that initiated the run). */
+  socketId?: string;
+  /** Injected by callers (route handler or tests). When omitted the service
+   *  emits no events — keeps unit tests silent and unblocks back-compat. */
+  socketEmit?: SocketEmitFn;
+  progressEvent?: string;
+  completeEvent?: string;
+}
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -282,9 +301,12 @@ async function processLead(
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
+  const leadStart = Date.now();
+  console.log(`[v3][lead ${lead.leadId}] start (email=${lead.email ?? '∅'}, company=${lead.company ?? '∅'})`);
 
   // Step 0: identity resolution
   let identity: ResolveIdentityResult;
+  const idStart = Date.now();
   try {
     identity = await deps.resolveIdentity({
       listId: input.listId,
@@ -293,7 +315,9 @@ async function processLead(
       needsCompanyFields: needsCompany,
       mode: input.mode,
     });
+    console.log(`[v3][lead ${lead.leadId}] identity resolved in ${Date.now() - idStart}ms (ok=${identity.ok})`);
   } catch (err) {
+    console.log(`[v3][lead ${lead.leadId}] identity threw after ${Date.now() - idStart}ms: ${(err as Error).message}`);
     // Resolver makes external API calls (Apollo / enrich.so) — classify as
     // llm-or-parse since these are LLM-adjacent providers.
     return {
@@ -305,6 +329,7 @@ async function processLead(
     };
   }
   if (!identity.ok) {
+    console.log(`[v3][lead ${lead.leadId}] identity unresolved → skipping`);
     return {
       fills: [],
       perGroupTierFills,
@@ -324,6 +349,8 @@ async function processLead(
     // Step 1: canonical groups (SEQUENTIAL — preserves Apollo ctx memoization
     // without promise-caching; design §6)
     for (const [groupName, fields] of routing.groupedByGroup.entries()) {
+      const gStart = Date.now();
+      console.log(`[v3][lead ${lead.leadId}] waterfall group=${groupName} fields=${fields.join(',')} START`);
       const groupResult = await deps.runWaterfall({
         listId: input.listId,
         lead: enrichedLead,
@@ -345,11 +372,14 @@ async function processLead(
         groupName,
         addTierCounts(perGroupTierFills.get(groupName) ?? emptyTierCount(), groupResult.tierFills),
       );
+      console.log(`[v3][lead ${lead.leadId}] waterfall group=${groupName} done in ${Date.now() - gStart}ms (fills=${groupResult.fields.length}, tier=${JSON.stringify(groupResult.tierFills)})`);
     }
 
     // Step 2: ungrouped fields (web only — no canonical group means no Apollo
     // direct-map; LLM extracts using the field's instruction)
     if (routing.ungrouped.length > 0) {
+      const ugStart = Date.now();
+      console.log(`[v3][lead ${lead.leadId}] ungrouped-web START fields=${routing.ungrouped.join(',')}`);
       const ungroupedResult = await deps.extractUngroupedFieldsViaWeb({
         listId: input.listId,
         lead: enrichedLead,
@@ -361,6 +391,7 @@ async function processLead(
         '__ungrouped__',
         addTierCounts(perGroupTierFills.get('__ungrouped__') ?? emptyTierCount(), ungroupedResult.tierFills),
       );
+      console.log(`[v3][lead ${lead.leadId}] ungrouped-web done in ${Date.now() - ugStart}ms (fills=${ungroupedResult.fields.length})`);
     }
 
     // Step 3: critic pass — only over web-tier fills.
@@ -369,6 +400,8 @@ async function processLead(
     // consumers filter by criticVerdict.
     const webFills = allFills.filter(f => f.meta.source === 'web_search');
     if (webFills.length > 0) {
+      const cStart = Date.now();
+      console.log(`[v3][lead ${lead.leadId}] critic START over ${webFills.length} web-fill(s)`);
       const criticResult = await deps.runCriticOverWebFills({ lead: enrichedLead, fills: webFills });
       for (const fill of webFills) {
         const verdict = criticResult.verdicts[fill.field];
@@ -376,8 +409,10 @@ async function processLead(
           fill.meta = { ...fill.meta, criticVerdict: verdict };
         }
       }
+      console.log(`[v3][lead ${lead.leadId}] critic done in ${Date.now() - cStart}ms`);
     }
   } catch (err) {
+    console.log(`[v3][lead ${lead.leadId}] processing threw after ${Date.now() - leadStart}ms: ${(err as Error).message}`);
     return {
       fills: [],
       perGroupTierFills,
@@ -387,6 +422,7 @@ async function processLead(
     };
   }
 
+  console.log(`[v3][lead ${lead.leadId}] done in ${Date.now() - leadStart}ms (fills=${allFills.length})`);
   return {
     fills: allFills,
     perGroupTierFills,
@@ -462,16 +498,33 @@ async function writeLeadOutcome(
 export async function runEnrichment(
   input: RunEnrichmentInput,
   deps: OrchestratorDeps,
+  options?: RunEnrichmentOptions,
 ): Promise<RunEnrichmentResult> {
   const runId = randomUUID();
   const startedAt = Date.now();
 
+  const progressEvent = options?.progressEvent || 'crm-enrichment-progress';
+  const completeEvent = options?.completeEvent || 'crm-enrichment-complete';
+  const userRoom = options?.userId ? `user:${options.userId}` : null;
+  const emitToRooms = (event: string, payload: any) => {
+    if (!options?.socketEmit) return;
+    if (options.socketId) options.socketEmit(options.socketId, event, payload);
+    if (userRoom) options.socketEmit(userRoom, event, payload);
+  };
+
+  console.log(`[v3] runEnrichment START listId=${input.listId} userId=${input.userId} mode=${input.mode} runId=${runId}`);
+  const loadStart = Date.now();
   const leads = await deps.loadLeads({ listId: input.listId, userId: input.userId });
+  console.log(`[v3] loadLeads → ${leads.length} lead(s) in ${Date.now() - loadStart}ms`);
 
   const { routing, needsPerson, needsCompany } = routeFields(input.config);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   for (const f of input.config.fields) configFieldsByName[f.name] = f;
+
+  const includedFieldNames = input.config.fields
+    .filter(f => f.include)
+    .map(f => f.name);
 
   const tierBreakdown: Record<string, TierCount> = {};
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
@@ -482,8 +535,35 @@ export async function runEnrichment(
   let searchWebFailed = 0;
   let updateFailed = 0;
 
+  emitToRooms(progressEvent, {
+    runId,
+    listId: input.listId,
+    message: 'Starting enrichment...',
+    progress: 0,
+    processedCount: 0,
+    failedCount: 0,
+    totalToProcess: leads.length,
+  });
+
   // Process up to 20 leads in parallel (matches v2 web-mode setting).
   const CONCURRENCY = 20;
+  // Per-lead progress counter so the UI bar moves while a chunk is in flight,
+  // not only between chunks. (For small lists with 1 chunk, this is the
+  // difference between a frozen 0% banner and visible progress.)
+  let completedLeads = 0;
+  const emitPerLeadProgress = () => {
+    completedLeads += 1;
+    emitToRooms(progressEvent, {
+      runId,
+      listId: input.listId,
+      message: `Processed ${completedLeads}/${leads.length} lead${leads.length === 1 ? '' : 's'}`,
+      progress: leads.length === 0 ? 100 : Math.round((completedLeads / leads.length) * 100),
+      processedCount: completedLeads,
+      failedCount: 0,
+      totalToProcess: leads.length,
+    });
+  };
+
   // Phase 1 keeps the loop simple — slice by chunks to bound concurrency.
   // (A semaphore-based approach is the obvious upgrade if needed.)
   for (let i = 0; i < leads.length; i += CONCURRENCY) {
@@ -492,7 +572,10 @@ export async function runEnrichment(
       chunk.map(lead =>
         processLead(
           lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName,
-        ).then(outcome => ({ lead, outcome })),
+        ).then(outcome => {
+          emitPerLeadProgress();
+          return { lead, outcome };
+        }),
       ),
     );
 
@@ -536,7 +619,9 @@ export async function runEnrichment(
         previewSamples.push({ leadId: lead.leadId, extractedFields, meta });
         processed += 1;
       } else {
+        const wStart = Date.now();
         const writeResult = await writeLeadOutcome(lead, outcome, input, deps);
+        console.log(`[v3][lead ${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
         if (writeResult.ok) {
           processed += 1;
         } else {
@@ -544,6 +629,19 @@ export async function runEnrichment(
         }
       }
     }
+
+    const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
+    const failedSoFar =
+      identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+    emitToRooms(progressEvent, {
+      runId,
+      listId: input.listId,
+      message: `Enriching ${completedSoFar}/${leads.length} (${processed} enriched, ${failedSoFar} failed)`,
+      progress: leads.length === 0 ? 100 : Math.round((completedSoFar / leads.length) * 100),
+      processedCount: processed,
+      failedCount: failedSoFar,
+      totalToProcess: leads.length,
+    });
   }
 
   // Compute total rollup
@@ -569,6 +667,20 @@ export async function runEnrichment(
   if (input.mode === 'preview') {
     result.preview = previewSamples;
   }
+
+  const totalFailed =
+    identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+  console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} durationMs=${result.durationMs}`);
+  emitToRooms(completeEvent, {
+    runId,
+    listId: input.listId,
+    processedCount: processed,
+    failedCount: totalFailed,
+    outputFields: includedFieldNames,
+    failureBreakdown: result.failed,
+    tierFillBreakdown: result.tierFillBreakdown,
+    durationMs: result.durationMs,
+  });
 
   return result;
 }
