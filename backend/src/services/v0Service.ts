@@ -1961,7 +1961,7 @@ export const INTEGRATIONS = {
 
 export async function getProjectEnvVars(
   vercelProjectId: string
-): Promise<Record<string, { id: string; value: string; type: string }>> {
+): Promise<Record<string, { ids: string[]; id: string; value: string; type: string }>> {
   const vercelToken = await getVercelToken();
   const headers = {
     Authorization: `Bearer ${vercelToken}`,
@@ -1972,10 +1972,15 @@ export async function getProjectEnvVars(
     { headers, timeout: VERCEL_API_TIMEOUT_MS }
   );
   const envs: any[] = res.data?.envs ?? [];
-  const result: Record<string, { id: string; value: string; type: string }> = {};
+  // Vercel can have multiple records per key (one per environment target).
+  // Collect all IDs so we can delete them all before re-creating.
+  const result: Record<string, { ids: string[]; id: string; value: string; type: string }> = {};
   for (const env of envs) {
-    if (env.key) {
-      result[env.key] = { id: env.id, value: env.value ?? "", type: env.type ?? "plain" };
+    if (!env.key) continue;
+    if (result[env.key]) {
+      result[env.key].ids.push(env.id);
+    } else {
+      result[env.key] = { ids: [env.id], id: env.id, value: env.value ?? "", type: env.type ?? "plain" };
     }
   }
   return result;
@@ -1986,7 +1991,7 @@ export async function upsertEnvVar(
   key: string,
   value: string,
   target: string[],
-  envId?: string,
+  existingIds?: string[],
   type: "plain" | "encrypted" = "encrypted"
 ): Promise<string> {
   const vercelToken = await getVercelToken();
@@ -1994,22 +1999,23 @@ export async function upsertEnvVar(
     Authorization: `Bearer ${vercelToken}`,
     "Content-Type": "application/json",
   };
-  const body = { key, value, type, target };
-  if (envId) {
-    const res = await axios.patch<any>(
-      `https://api.vercel.com/v10/projects/${vercelProjectId}/env/${envId}`,
-      body,
-      { headers, timeout: VERCEL_API_TIMEOUT_MS }
+  // Delete all existing records for this key first (avoids per-environment split records).
+  if (existingIds?.length) {
+    await Promise.all(
+      existingIds.map((id) =>
+        axios.delete(`https://api.vercel.com/v10/projects/${vercelProjectId}/env/${id}`, {
+          headers,
+          timeout: VERCEL_API_TIMEOUT_MS,
+        }).catch(() => {})
+      )
     );
-    return res.data.id ?? envId;
-  } else {
-    const res = await axios.post<any>(
-      `https://api.vercel.com/v10/projects/${vercelProjectId}/env`,
-      body,
-      { headers, timeout: VERCEL_API_TIMEOUT_MS }
-    );
-    return res.data.id;
   }
+  const res = await axios.post<any>(
+    `https://api.vercel.com/v10/projects/${vercelProjectId}/env`,
+    { key, value, type, target },
+    { headers, timeout: VERCEL_API_TIMEOUT_MS }
+  );
+  return res.data.id;
 }
 
 export async function deleteEnvVar(

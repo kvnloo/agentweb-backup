@@ -1310,9 +1310,9 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
       if (recaptcha.siteKey !== undefined) {
         const existing = envMap[cfg.siteKey.envKey];
         if (recaptcha.siteKey === "") {
-          if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
+          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
         } else {
-          await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.id, cfg.siteKey.type);
+          await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.ids, cfg.siteKey.type);
         }
         updated.push(cfg.siteKey.envKey);
       }
@@ -1320,9 +1320,9 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
       if (recaptcha.secretKey !== undefined) {
         const existing = envMap[cfg.secretKey.envKey];
         if (recaptcha.secretKey === "") {
-          if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
+          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
         } else {
-          await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.id, cfg.secretKey.type);
+          await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.ids, cfg.secretKey.type);
         }
         updated.push(cfg.secretKey.envKey);
       }
@@ -1332,11 +1332,11 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
       for (const entry of custom) {
         if (!entry.key) continue;
         if (entry._delete) {
-          const existing = entry.id ? { id: entry.id } : envMap[entry.key];
-          if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
+          const existing = entry.id ? { ids: [entry.id] } : envMap[entry.key];
+          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
         } else {
           const existing = envMap[entry.key];
-          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.id, entry.secret ? "encrypted" : "plain");
+          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.ids, entry.secret ? "encrypted" : "plain");
         }
         updated.push(entry.key);
       }
