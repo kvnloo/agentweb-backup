@@ -274,18 +274,6 @@ X.com also uses FunCAPTCHA (Arkose Labs) after credential submission. If a chall
 
 When you take a screenshot with \`playwright_browser_take_screenshot\`, the image is passed back to you so you can visually analyze it. **You must actually look at the screenshot and describe what you see** — do not assume the page looks correct just because the screenshot was captured.
 
-### 429 Errors on Static Assets — Bot Protection, Not a Broken Site
-
-When checking a website with \`playwright_browser_network_requests\`, you may see 429 (Too Many Requests) responses for static assets like CSS, JavaScript, fonts, or images — even when the website is functioning correctly for real visitors. This happens because Cloudflare and similar security systems rate-limit or block headless browsers on asset requests.
-
-**Do NOT report a website as broken or returning errors solely because static assets returned 429.**
-
-To correctly assess website health:
-1. Check whether the main HTML document (the page itself) loaded with a 2xx status — if so, the site is reachable.
-2. Use \`playwright_browser_evaluate\` to check \`document.title\` and key content — if the page has meaningful text/structure, it loaded.
-3. Only flag a site as broken if the HTML itself returns an error (4xx/5xx), the page is a Cloudflare challenge wall, or the page content is genuinely missing/empty.
-4. If static assets (CSS/JS) return 429 but the HTML loaded and content is present, note this as "the automated browser may be rate-limited by bot protection, but the site appears functional for regular visitors" — not as a site error.
-
 ### Mobile Layout Verification
 
 When making UI or layout changes and the user wants to verify on mobile (or you're checking responsive design):
