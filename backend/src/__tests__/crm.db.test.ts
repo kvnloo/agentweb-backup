@@ -678,6 +678,7 @@ describe('CRM Database Service', () => {
         promise: jest.fn().mockResolvedValue({}),
       });
 
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
       await crmDb.setLeadFields('list_123', 'lead_123', {
         topLevel: { email: 'a@b.com' },
         enrichmentMetadata: { email: { source: 'web_search' } },
@@ -686,6 +687,8 @@ describe('CRM Database Service', () => {
         removeCustomFieldKeys: ['old_custom'],
       });
 
+      // 1: bootstrap parent maps, 2: combined SET/REMOVE expression. The
+      // fieldNames sync is spied out — it's covered by its own test.
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
       const second = mockDocumentClientMethods.update.mock.calls[1][0];
       expect(second.UpdateExpression).toContain('SET');
@@ -694,6 +697,7 @@ describe('CRM Database Service', () => {
       expect(second.UpdateExpression).toContain('customFields.#cf0 = :cf0');
       expect(second.UpdateExpression).toContain('enrichmentMetadata.#rmem0');
       expect(second.UpdateExpression).toContain('customFields.#rmcf0');
+      mergeSpy.mockRestore();
     });
 
     it('uses if_not_exists in all SET clauses when ifNotExists=true', async () => {
@@ -701,6 +705,7 @@ describe('CRM Database Service', () => {
         promise: jest.fn().mockResolvedValue({}),
       });
 
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
       await crmDb.setLeadFields('list_123', 'lead_123', {
         topLevel: { email: 'a@b.com' },
         enrichmentMetadata: { email: { source: 'web_search' } },
@@ -717,6 +722,45 @@ describe('CRM Database Service', () => {
       expect(second.UpdateExpression).toContain(
         'customFields.#cf0 = if_not_exists(customFields.#cf0, :cf0)',
       );
+      mergeSpy.mockRestore();
+    });
+
+    it('registers newly-written customFields keys on the parent list via mergeFieldNames', async () => {
+      // The bug this guards against: enrichment writes lead.customFields.Description
+      // but the lead-list's fieldNames stays stale, so Configure Display Fields
+      // doesn't list "Description" as an available column. Any setLeadFields
+      // call that introduces custom keys must keep list.fieldNames in sync.
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        customFields: { Description: 'Company blurb', funding_round: 'Series C' },
+      });
+
+      expect(mergeSpy).toHaveBeenCalledTimes(1);
+      expect(mergeSpy.mock.calls[0][0]).toBe('list_123');
+      const incoming = mergeSpy.mock.calls[0][1] as Set<string> | string[];
+      const keys = incoming instanceof Set ? Array.from(incoming) : incoming;
+      expect(new Set(keys)).toEqual(new Set(['Description', 'funding_round']));
+
+      mergeSpy.mockRestore();
+    });
+
+    it('does NOT call mergeFieldNames when only top-level or removal-only fields are written', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { email: 'a@b.com' },
+        removeCustomFieldKeys: ['stale_one'],
+      });
+
+      expect(mergeSpy).not.toHaveBeenCalled();
+      mergeSpy.mockRestore();
     });
   });
 

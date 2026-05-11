@@ -6314,6 +6314,22 @@ export const crmDb = {
       handleDynamoDbError(err, 'setLeadFields');
       throw err;
     }
+
+    // Keep the parent list's fieldNames in sync. Without this, enrichment
+    // writes customFields.X on the lead, the Configure Display Fields dialog
+    // (which reads list.fieldNames) doesn't see X, and the user thinks the
+    // enriched field "disappeared." mergeFieldNames is atomic + idempotent,
+    // so concurrent enrichment writes can't race or duplicate.
+    if (hasCustomKeys) {
+      try {
+        await this.mergeFieldNames(listId, Object.keys(options.customFields!));
+      } catch (err) {
+        // Field-name sync is best-effort — the lead write already succeeded.
+        // Logging keeps the failure visible without failing the caller.
+        // eslint-disable-next-line no-console
+        console.warn('[setLeadFields] mergeFieldNames failed:', (err as Error).message);
+      }
+    }
   },
 
   async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
