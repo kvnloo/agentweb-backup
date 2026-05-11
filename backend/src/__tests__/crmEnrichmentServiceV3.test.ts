@@ -93,6 +93,70 @@ describe('runEnrichment — empty list', () => {
   });
 });
 
+// ─── leadIds filter ──────────────────────────────────────────────────────────
+
+describe('runEnrichment — leadIds filter', () => {
+  it('processes only the leads whose ids are in input.leadIds', async () => {
+    const leads = [
+      makeLead({ leadId: 'lead-1' }),
+      makeLead({ leadId: 'lead-2' }),
+      makeLead({ leadId: 'lead-3' }),
+    ];
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+
+    const result = await runEnrichment(
+      makeInput({ leadIds: ['lead-2', 'lead-3'] }),
+      deps,
+    );
+
+    expect(result.processed).toBe(2);
+    expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
+    const processedIds = (deps.resolveIdentity as jest.Mock).mock.calls
+      .map(c => c[0].lead.leadId)
+      .sort();
+    expect(processedIds).toEqual(['lead-2', 'lead-3']);
+  });
+
+  it('processes 0 leads when leadIds is provided but matches nothing', async () => {
+    const leads = [makeLead({ leadId: 'lead-1' })];
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+
+    const result = await runEnrichment(
+      makeInput({ leadIds: ['nonexistent'] }),
+      deps,
+    );
+
+    expect(result.processed).toBe(0);
+    expect(deps.resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it('processes all loaded leads when leadIds is undefined (no filter)', async () => {
+    const leads = [
+      makeLead({ leadId: 'lead-1' }),
+      makeLead({ leadId: 'lead-2' }),
+    ];
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+
+    const result = await runEnrichment(makeInput(), deps);
+
+    expect(result.processed).toBe(2);
+    expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
+  });
+
+  it('processes all loaded leads when leadIds is an empty array (treated as no filter)', async () => {
+    const leads = [
+      makeLead({ leadId: 'lead-1' }),
+      makeLead({ leadId: 'lead-2' }),
+    ];
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+
+    const result = await runEnrichment(makeInput({ leadIds: [] }), deps);
+
+    expect(result.processed).toBe(2);
+    expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
+  });
+});
+
 // ─── Identity resolution failure ──────────────────────────────────────────────
 
 describe('runEnrichment — identity resolution', () => {
