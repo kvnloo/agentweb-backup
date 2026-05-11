@@ -760,6 +760,24 @@ export async function getElevenLabsApiKey(): Promise<string> {
   return (await getSecret(secretName)).trim();
 }
 
+/**
+ * Get the platform-wide Foreplay API key from AWS Secrets Manager.
+ * Stored as a plain string at dev/AgentWeb/Foreplay or prod/AgentWeb/Foreplay.
+ * Returns null (non-throwing) if the secret does not exist — callers treat this as
+ * "no platform key configured" and degrade gracefully.
+ */
+export async function getForeplayApiKey(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === 'production'
+      ? 'prod/AgentWeb/Foreplay'
+      : 'dev/AgentWeb/Foreplay';
+    const key = await getSecret(secretName);
+    return key && key.trim() ? key.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getLandingPagesConfig(): Promise<LandingPagesConfig | null> {
   try {
     const environment = process.env.NODE_ENV || 'development';
