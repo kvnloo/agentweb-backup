@@ -11,6 +11,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
+<<<<<<< HEAD
       'Admin: Connected Accounts Tab Added to Admin Dashboard',
       '- A new Connected Accounts tab is available in the Admin Dashboard showing all Unipile (LinkedIn Outreach) accounts across all users',
       '- Each row shows the user email, account name, account ID, and live Unipile connection status (OK / ERROR / UNKNOWN)',
@@ -66,6 +67,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- If you have a LinkedIn outreach account connected, you can designate one as the default sender for LinkedIn messages',
       '- When sending a LinkedIn message from a lead, the configured default account is used automatically — no more relying on auto-resolution',
       '- If no default is set, the existing fallback behavior (your connected account, then a shared account) still applies',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Manage Environment Variables for Landing Pages',
+      '- Each deployed landing page card now has an "Env Vars" button that opens a configuration panel',
+      '- Set reCAPTCHA v2 Site Key and Secret Key directly from the portal — no Vercel access needed',
+      '- Add custom environment variables with optional secret/encrypted storage for sensitive values',
+      '- Saving automatically triggers a redeployment so all changes take effect immediately',
+      '- Variables are scoped to the Vercel project, so landing pages sharing a project share the same environment',
     ],
   },
   {

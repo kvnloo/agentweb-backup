@@ -1257,7 +1257,7 @@ router.get("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     const secretKeyEntry = envMap[cfg.secretKey.envKey];
 
     // All known integration env var keys
-    const knownKeys = new Set([cfg.siteKey.envKey, cfg.secretKey.envKey]);
+    const knownKeys = new Set<string>([cfg.siteKey.envKey, cfg.secretKey.envKey]);
 
     // Custom env vars: anything not in a known integration
     const custom = Object.entries(envMap)
