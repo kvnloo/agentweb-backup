@@ -357,15 +357,29 @@ async function runCriticReal(input: {
  * Verify a Unipile search result item's name matches the lead's name before
  * accepting it as the correct LinkedIn profile. Case-insensitive prefix match
  * on both first and last name — rejects if the result carries name fields that
- * don't match, or if it carries no name fields at all (can't verify → reject).
+ * don't match, or if no name info can be parsed (can't verify → reject).
+ *
+ * Unipile's people-search response typically carries the combined `name`
+ * field ("Ayush Jha") rather than separate `first_name` / `last_name`, so we
+ * fall back to splitting `name` on whitespace when those split fields are
+ * absent.
  */
-function unipileNameMatches(
+export function unipileNameMatches(
   item: any,
   leadFirst: string | undefined,
   leadLast: string | undefined,
 ): boolean {
-  const itemFirst = typeof item.first_name === 'string' ? item.first_name.trim().toLowerCase() : null;
-  const itemLast  = typeof item.last_name  === 'string' ? item.last_name.trim().toLowerCase()  : null;
+  let itemFirst = typeof item.first_name === 'string' ? item.first_name.trim().toLowerCase() : null;
+  let itemLast  = typeof item.last_name  === 'string' ? item.last_name.trim().toLowerCase()  : null;
+
+  // Fallback: derive first/last from the combined `name` field. Split on
+  // whitespace — first token → first name, last token → last name. Handles
+  // middle names by ignoring everything between.
+  if (itemFirst === null && itemLast === null && typeof item.name === 'string') {
+    const tokens = item.name.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length >= 1) itemFirst = tokens[0];
+    if (tokens.length >= 2) itemLast = tokens[tokens.length - 1];
+  }
 
   // Can't verify without at least one name field — reject for correctness.
   if (itemFirst === null && itemLast === null) return false;
