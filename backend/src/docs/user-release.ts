@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-11',
     changes: [
+      'Improved: Foreplay Ad Library Now Available Platform-Wide',
+      '- The Foreplay Ad Library in the Knowledge Base is now active for all users without any setup required',
+      '- Previously, each user had to connect their own Foreplay API key to use swipefile and board search in agent mode',
+      '- A platform-wide Foreplay account is now used as a fallback, so AI agents can search and read Foreplay ads out of the box',
+      '- Users who connect their own Foreplay API key (via the Knowledge Base page) will continue to use their personal account — the platform key only applies when no personal key is configured',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
       'New: Report Type Classification on the Reports Page',
       '- All HTML reports are now automatically classified into one of three types: Creative, Research, or Performance',
       '- Classification is powered by Gemini 3.1 Flash Lite and uses the report filename and content to determine the type',
