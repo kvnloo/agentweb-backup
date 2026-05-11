@@ -28,11 +28,6 @@ import {
 import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 import {
-  ALL_ENRICHMENT_FIELDS,
-  EnrichmentFieldConfig,
-  normalizeEnrichmentFieldConfig,
-} from '../services/enrichmentFieldConfig';
-import {
   runWithConcurrency,
   BULK_ENRICH_CONCURRENCY,
 } from '../services/crmEnrichmentConcurrency';
@@ -363,32 +358,14 @@ async function fetchAllLeads(listId: string): Promise<any[]> {
 
 /**
  * Background bulk reverse-lookup — for leads with email but missing one or
- * more profile fields (firstName/lastName/company/title/linkedin), fetch the
- * profile and fill ONLY the empty fields. Never overwrites user data.
+ * more standard profile fields (firstName/lastName/company/title/linkedin),
+ * fetch the profile via enrich.so and fill ONLY the empty fields.
+ * Never overwrites existing data.
  */
-/** Format an extended-field value for storage in `customFields` (string only).
- * Returns null when the field has no usable value. */
-function pickExtendedFieldValue(
-  field: Exclude<keyof import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
-    'firstName' | 'lastName' | 'company' | 'title' | 'linkedin'>,
-  r: any,
-): string | null {
-  switch (field) {
-    case 'summary':         return typeof r.summary === 'string' && r.summary.trim() ? r.summary : null;
-    case 'location':        return typeof r.location === 'string' && r.location.trim() ? r.location : null;
-    case 'headline':        return typeof r.headline === 'string' && r.headline.trim() ? r.headline : null;
-    case 'connectionCount': return typeof r.connectionCount === 'number' ? String(r.connectionCount) : null;
-    case 'skills':          return Array.isArray(r.skills) && r.skills.length ? r.skills.slice(0, 5).join(', ') : null;
-    case 'pastCompanies':   return Array.isArray(r.pastCompanies) && r.pastCompanies.length ? r.pastCompanies.join('; ') : null;
-    case 'education':       return Array.isArray(r.education) && r.education.length ? r.education.join('; ') : null;
-  }
-}
-
 async function lookupProfilesForLeadsInBackground(
   listId: string,
   leads: any[],
   userId: string,
-  config: import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
   jobId?: string,
 ): Promise<void> {
   let svc;
@@ -411,49 +388,33 @@ async function lookupProfilesForLeadsInBackground(
           return;
         }
 
-      // Standard fields → top-level lead columns. Each one is gated on the
-      // per-list config and only written when the lead's column is empty
-      // (never overwrites existing data).
-      const topLevel: Record<string, string> = {};
-      if (config.firstName && !lead.firstName && r.firstName) topLevel.firstName = r.firstName;
-      if (config.lastName  && !lead.lastName  && r.lastName)  topLevel.lastName  = r.lastName;
-      if (config.company   && !lead.company   && r.companyName) topLevel.company  = r.companyName;
-      if (config.title     && !lead.title     && r.jobTitle)  topLevel.title     = r.jobTitle;
-      if (config.linkedin  && !lead.linkedin  && r.profileUrl) topLevel.linkedin  = r.profileUrl;
+        // Standard fields → top-level lead columns. Only written when the
+        // lead's column is empty (never overwrites existing data).
+        const topLevel: Record<string, string> = {};
+        if (!lead.firstName && r.firstName)  topLevel.firstName = r.firstName;
+        if (!lead.lastName  && r.lastName)   topLevel.lastName  = r.lastName;
+        if (!lead.company   && r.companyName) topLevel.company  = r.companyName;
+        if (!lead.title     && r.jobTitle)   topLevel.title     = r.jobTitle;
+        if (!lead.linkedin  && r.profileUrl) topLevel.linkedin  = r.profileUrl;
 
-      // Extended fields → customFields[<field>]. Same never-overwrite rule:
-      // skip when the lead already has a value at that key.
-      const existingCustom = (lead.customFields ?? {}) as Record<string, any>;
-      const customFields: Record<string, string> = {};
-      const EXTENDED = ['summary', 'skills', 'connectionCount', 'location', 'headline', 'pastCompanies', 'education'] as const;
-      for (const f of EXTENDED) {
-        if (!config[f]) continue;
-        if (existingCustom[f]) continue;
-        const v = pickExtendedFieldValue(f, r);
-        if (v) customFields[f] = v;
-      }
+        if (Object.keys(topLevel).length === 0) {
+          if (jobId) recordResult(jobId, { found: false });
+          return;
+        }
 
-      const wroteAny = Object.keys(topLevel).length > 0 || Object.keys(customFields).length > 0;
-      if (!wroteAny) {
-        if (jobId) recordResult(jobId, { found: false });
-        return;
-      }
+        const now = new Date().toISOString();
+        const fieldMetaForProvider = {
+          source: 'linkedin' as const,
+          provider: 'enrich.so',
+          confidence: 'high' as const,
+          enrichedAt: now,
+        };
+        const enrichmentMetadata: Record<string, any> = {};
+        for (const k of Object.keys(topLevel)) enrichmentMetadata[k] = fieldMetaForProvider;
 
-      const now = new Date().toISOString();
-      const fieldMetaForProvider = {
-        source: 'linkedin' as const,
-        provider: 'enrich.so',
-        confidence: 'high' as const,
-        enrichedAt: now,
-      };
-      const enrichmentMetadata: Record<string, any> = {};
-      for (const k of Object.keys(topLevel)) enrichmentMetadata[k] = fieldMetaForProvider;
-      for (const k of Object.keys(customFields)) enrichmentMetadata[k] = fieldMetaForProvider;
-
-      await crmDb.setLeadFields(listId, lead.leadId, { topLevel, enrichmentMetadata, customFields, ifNotExists: true });
+        await crmDb.setLeadFields(listId, lead.leadId, { topLevel, enrichmentMetadata, customFields: {}, ifNotExists: true });
 
         for (const k of Object.keys(topLevel)) populatedFieldNames.add(k);
-        for (const k of Object.keys(customFields)) populatedFieldNames.add(k);
         if (jobId) recordResult(jobId, { found: true });
       } catch (err) {
         console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
@@ -480,30 +441,9 @@ function isApplicableForFindEmail(lead: any): boolean {
   return (!!lead.firstName || !!lead.lastName) && (!!lead.company || !!lead.website);
 }
 
-function isApplicableForLookup(
-  lead: any,
-  config?: import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
-): boolean {
+function isApplicableForLookup(lead: any): boolean {
   if (!lead.email) return false;
-  // No config → legacy semantics: missing one of the 5 standard fields.
-  if (!config) {
-    return !lead.firstName || !lead.lastName || !lead.company || !lead.title || !lead.linkedin;
-  }
-  // With config → applicable when ANY enabled field is empty on the lead.
-  // Standard fields read from top-level columns; extended from customFields.
-  const standard: Array<['firstName' | 'lastName' | 'company' | 'title' | 'linkedin', string]> = [
-    ['firstName', 'firstName'], ['lastName', 'lastName'], ['company', 'company'],
-    ['title', 'title'], ['linkedin', 'linkedin'],
-  ];
-  for (const [cfgKey, leadKey] of standard) {
-    if (config[cfgKey] && !lead[leadKey]) return true;
-  }
-  const cf = (lead.customFields ?? {}) as Record<string, any>;
-  const extended = ['summary', 'skills', 'connectionCount', 'location', 'headline', 'pastCompanies', 'education'] as const;
-  for (const k of extended) {
-    if (config[k] && !cf[k]) return true;
-  }
-  return false;
+  return !lead.firstName || !lead.lastName || !lead.company || !lead.title || !lead.linkedin;
 }
 
 /**
@@ -530,17 +470,12 @@ router.get('/lists/:listId/leads/enrichment-counts', async (req: Request, res: R
     const validatePending = leads.filter((l: any) => l.email && !l.customFields?.email_validation).length;
     const validateAlreadyDone = withEmail - validatePending;
     const findPending = leads.filter(isApplicableForFindEmail).length;
-    // Lookup pending must respect the per-list config so the count matches what
-    // the bulk job will actually queue.
-    const lookupConfig = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    const lookupPending = leads.filter((l) => isApplicableForLookup(l, lookupConfig)).length;
+    const lookupPending = leads.filter(isApplicableForLookup).length;
     // "Already processed" for find = leads that NOW have email (we can't tell
     // if it was provider-found or user-typed, but for UX showing how many are
     // "complete" is what matters).
     const findAlreadyDone = withEmail;
-    // For lookup: "already done" = had email but isn't applicable per config.
+    // For lookup: "already done" = had email but isn't missing any standard field.
     const lookupAlreadyDone = withEmail - lookupPending;
 
     return res.json({
@@ -619,11 +554,6 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
     if (!(await canAccessCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
-    // Load the per-list config so the background job knows which fields the
-    // user actually wants populated. Defaults applied for any unset key.
-    const config = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
     let leads: any[];
     if (Array.isArray(leadIds)) {
       if (leadIds.length === 0) {
@@ -636,11 +566,11 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
     } else {
       leads = await fetchAllLeads(listId);
     }
-    const applicable = leads.filter((l) => isApplicableForLookup(l, config));
+    const applicable = leads.filter(isApplicableForLookup);
     const alreadyDone = leads.length - applicable.length - leads.filter((l: any) => !l.email).length;
     const skipped = leads.length - applicable.length - alreadyDone;
     const job = startEmailJob({ kind: 'lookup', listId, userId, total: applicable.length });
-    void lookupProfilesForLeadsInBackground(listId, applicable, userId, config, job.jobId);
+    void lookupProfilesForLeadsInBackground(listId, applicable, userId, job.jobId);
     return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk lookup-emails error:', error);
@@ -795,73 +725,6 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
     }
     console.error('[CRM enrich.so] lookup-by-email error:', error);
     return res.status(500).json({ message: error.message || 'Failed to look up email' });
-  }
-});
-
-/**
- * GET /lists/:listId/enrichment-field-config
- * Returns the per-list enrich.so field config with defaults filled in for any
- * unset key. Standard fields default to true, extended fields default to false.
- */
-router.get('/lists/:listId/enrichment-field-config', async (req: Request, res: Response) => {
-  const { listId } = req.params;
-  const userId = (req as AuthenticatedRequest).user?.userId;
-  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-
-  try {
-    const list = await crmDb.getLeadListById(listId);
-    if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-    const config = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    return res.json({ config });
-  } catch (error: any) {
-    console.error('[CRM enrich.so] get enrichment-field-config error:', error);
-    return res.status(500).json({ message: error.message || 'Failed to load enrichment field config' });
-  }
-});
-
-/**
- * PATCH /lists/:listId/enrichment-field-config
- * Body: { config: Partial<EnrichmentFieldConfig> }
- *   — only known boolean keys are accepted; unknown keys are ignored.
- * Returns: { config } the merged & persisted config.
- */
-router.patch('/lists/:listId/enrichment-field-config', async (req: Request, res: Response) => {
-  const { listId } = req.params;
-  const userId = (req as AuthenticatedRequest).user?.userId;
-  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-
-  const incoming = (req.body && typeof req.body === 'object') ? (req.body.config ?? req.body) : null;
-  if (!incoming || typeof incoming !== 'object') {
-    return res.status(400).json({ message: 'Body must include a `config` object' });
-  }
-
-  try {
-    const list = await crmDb.getLeadListById(listId);
-    if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    // Merge against existing config so a partial PATCH only updates the keys
-    // the client sent. Unknown keys are dropped by normalize.
-    const existing = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    const merged: EnrichmentFieldConfig = { ...existing };
-    for (const f of ALL_ENRICHMENT_FIELDS) {
-      if (typeof incoming[f] === 'boolean') merged[f] = incoming[f] as boolean;
-    }
-
-    await crmDb.updateLeadList(listId, { enrichmentFieldConfig: merged });
-    return res.json({ config: merged });
-  } catch (error: any) {
-    console.error('[CRM enrich.so] patch enrichment-field-config error:', error);
-    return res.status(500).json({ message: error.message || 'Failed to update enrichment field config' });
   }
 });
 
