@@ -16,7 +16,8 @@ import {
   getSlackUserDisplayName,
   getSlackUserEmail,
   resolveSlackMentionsInText,
-  downloadSlackFile
+  downloadSlackFile,
+  formatSlackHistoryAsContext
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -727,10 +728,13 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           console.log('📝 Creating Agent Mode session for user:', user.userId);
 
+          // Fetch recent channel history to use as session context
+          const slackHistory = await formatSlackHistoryAsContext(channel);
+
           // Create Agent Mode session
           const session = await chatbotDb.createChatSession(
             user.userId,
-            undefined, // pageContent
+            slackHistory || undefined, // pageContent: full Slack channel history as context
             'agent', // portalType
             pageIdentifier,
             undefined, // selectedStartupId

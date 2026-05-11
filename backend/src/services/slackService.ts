@@ -1348,6 +1348,60 @@ export async function postSlackMessage(
   };
 }
 
+/**
+ * Fetches recent channel messages and formats them as a readable transcript for use as
+ * session context when Emma starts a new session from a Slack @mention.
+ * Fetches up to `limit` messages (default 50) and resolves user display names.
+ * Returns a formatted string suitable for use as pageContent in createChatSession.
+ */
+export async function formatSlackHistoryAsContext(
+  channelId: string,
+  limit: number = 50
+): Promise<string> {
+  if (!slackClient) {
+    return '';
+  }
+
+  try {
+    const result = await slackClient.conversations.history({
+      channel: channelId,
+      limit,
+    });
+
+    const messages = (result.messages ?? []).reverse(); // oldest first
+    if (messages.length === 0) return '';
+
+    const displayNameMap = await resolveDisplayNames(messages);
+
+    let channelName = channelId;
+    try {
+      const info = await slackClient.conversations.info({ channel: channelId });
+      channelName = (info.channel as any)?.name || channelId;
+    } catch { /* non-blocking */ }
+
+    const lines: string[] = [
+      `Slack channel conversation history for #${channelName}:`,
+      '',
+    ];
+
+    for (const msg of messages) {
+      if (!msg.text || msg.subtype === 'bot_message' && !msg.text.trim()) continue;
+      const userId = msg.user ?? msg.bot_id ?? 'unknown';
+      const name = msg.user ? (displayNameMap.get(msg.user) ?? userId) : userId;
+      const ts = msg.ts ? new Date(parseFloat(msg.ts) * 1000).toISOString() : '';
+      const isBot = !!msg.bot_id && !msg.user;
+      const label = isBot ? `[Bot] ${name}` : name;
+      const text = (msg.text ?? '').replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1').replace(/<mailto:([^|>]+)>/g, '$1').trim();
+      lines.push(`[${ts}] ${label}: ${text}`);
+    }
+
+    return lines.join('\n');
+  } catch (error) {
+    console.error('Failed to fetch Slack channel history for context:', error);
+    return '';
+  }
+}
+
 export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   if (!process.env.SLACK_BOT_TOKEN) {
     throw new Error('SLACK_BOT_TOKEN not set');
