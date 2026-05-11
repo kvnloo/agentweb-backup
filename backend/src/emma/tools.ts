@@ -4030,14 +4030,14 @@ emmaToolRegistry.register({
   name: 'compose_video',
   definition: {
     name: 'compose_video',
-    description: 'Stitch pre-existing video clips together and add brand overlays using Remotion. Use this when you have already generated individual clips and need to combine them into a single branded video. For new multi-clip videos, prefer a single generate_video call with durationSeconds instead.',
+    description: 'Stitch pre-existing video clips together and add brand overlays using Remotion. Use this when you have already generated individual clips and need to combine them into a single branded video. For new multi-clip videos, prefer a single generate_video call with durationSeconds instead. CRITICAL: clip_urls order determines the final video sequence. Before calling this tool, explicitly list each clip URL in shot order (S1, S2, S3, ...) and verify the array matches. Never pass URLs in context/generation order — always pass them in intended playback order.',
     inputSchema: {
       type: 'object',
       properties: {
         clip_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Ordered list of S3/HTTPS URLs of the pre-generated video clips to stitch together (first to last)'
+          description: 'ORDERED list of clip URLs in intended playback sequence (S1 first, S2 second, etc.). The final video plays clips exactly in this order — wrong order here = wrong order in the output. Always sort by shot number before passing, regardless of what order clips were generated.'
         },
         filename: {
           type: 'string',
