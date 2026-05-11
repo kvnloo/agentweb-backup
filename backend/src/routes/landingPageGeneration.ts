@@ -1262,7 +1262,7 @@ router.get("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     // Custom env vars: anything not in a known integration
     const custom = Object.entries(envMap)
       .filter(([key]) => !knownKeys.has(key))
-      .map(([key, entry]) => ({ key, value: entry.value, id: entry.id }));
+      .map(([key, entry]) => ({ key, value: entry.value, id: entry.id, secret: entry.type === "encrypted" }));
 
     res.json({
       recaptcha: {
@@ -1297,7 +1297,7 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
 
     const { recaptcha, custom } = req.body as {
       recaptcha?: { siteKey?: string; secretKey?: string };
-      custom?: { key: string; value: string; id?: string; _delete?: boolean }[];
+      custom?: { key: string; value: string; secret?: boolean; id?: string; _delete?: boolean }[];
     };
 
     const envMap = await getProjectEnvVars(vercelProjectId);
@@ -1336,9 +1336,22 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
           if (existing?.id) await deleteEnvVar(vercelProjectId, existing.id);
         } else {
           const existing = envMap[entry.key];
-          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.id, "plain");
+          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.id, entry.secret ? "encrypted" : "plain");
         }
         updated.push(entry.key);
+      }
+    }
+
+    // Trigger a redeployment so the new env vars take effect
+    if (updated.length > 0 && page.githubRepoUrl) {
+      try {
+        const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+        if (repoMatch) {
+          const [, owner, repo] = repoMatch;
+          await triggerVercelDeployment(vercelProjectId, `${owner}/${repo.replace(".git", "")}`);
+        }
+      } catch (deployErr: any) {
+        console.warn(`[LP GENERATION] Could not trigger redeployment after env var update: ${deployErr.message}`);
       }
     }
 

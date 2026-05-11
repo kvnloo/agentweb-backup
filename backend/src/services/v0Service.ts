@@ -1961,7 +1961,7 @@ export const INTEGRATIONS = {
 
 export async function getProjectEnvVars(
   vercelProjectId: string
-): Promise<Record<string, { id: string; value: string }>> {
+): Promise<Record<string, { id: string; value: string; type: string }>> {
   const vercelToken = await getVercelToken();
   const headers = {
     Authorization: `Bearer ${vercelToken}`,
@@ -1972,10 +1972,10 @@ export async function getProjectEnvVars(
     { headers, timeout: VERCEL_API_TIMEOUT_MS }
   );
   const envs: any[] = res.data?.envs ?? [];
-  const result: Record<string, { id: string; value: string }> = {};
+  const result: Record<string, { id: string; value: string; type: string }> = {};
   for (const env of envs) {
     if (env.key) {
-      result[env.key] = { id: env.id, value: env.value ?? "" };
+      result[env.key] = { id: env.id, value: env.value ?? "", type: env.type ?? "plain" };
     }
   }
   return result;
