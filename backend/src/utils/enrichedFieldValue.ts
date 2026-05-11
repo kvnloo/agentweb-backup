@@ -6,7 +6,7 @@
  * lead column). UI joins value + meta at display time.
  */
 export interface EnrichedFieldMeta {
-  source: 'web_search' | 'linkedin' | 'existing_data' | 'manual';
+  source: 'web_search' | 'linkedin' | 'existing_data' | 'manual' | 'api';
   /**
    * Specific data provider that produced this value, when known. `source` says
    * what *kind* of data it is (web vs linkedin vs internal); `provider` says

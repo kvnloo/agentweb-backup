@@ -91,7 +91,9 @@ export interface LeadRecord {
   firstName?: string;
   lastName?: string;
   email?: string;
+  emailDomain?: string;
   company?: string;
+  website?: string;
   title?: string;
   linkedin?: string;
   phone?: string;

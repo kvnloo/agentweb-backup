@@ -353,6 +353,102 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.leads[0].leadId).toBe(leadId);
     });
 
+    // ─── in / not_in operators (Phase 1 infrastructure for v3.1 Req C) ───────
+
+    it("should filter by 'in' operator against an array value (case insensitive)", async () => {
+      const acmeLead = { ...mockLead, leadId: 'lead-1', company: 'Acme Corp' };
+      const fintechLead = { ...mockLead, leadId: 'lead-2', company: 'Fintech Inc' };
+      const otherLead = { ...mockLead, leadId: 'lead-3', company: 'Other Co' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [acmeLead, fintechLead, otherLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'in', value: ['acme corp', 'FINTECH INC'] },
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads.map((l: any) => l.leadId).sort()).toEqual(['lead-1', 'lead-2']);
+    });
+
+    it("'in' with an empty array matches no leads", async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'in', value: [] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(0);
+    });
+
+    it("'in' with a non-array value matches no leads (malformed filter, fail safe)", async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'in', value: 'Acme Corp' as any },
+      ], userId);
+
+      expect(result.leads).toHaveLength(0);
+    });
+
+    it("should filter by 'not_in' operator (negation of in)", async () => {
+      const acmeLead = { ...mockLead, leadId: 'lead-1', company: 'Acme Corp' };
+      const otherLead = { ...mockLead, leadId: 'lead-2', company: 'Other Co' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [acmeLead, otherLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'not_in', value: ['Acme Corp'] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].leadId).toBe('lead-2');
+    });
+
+    it("'not_in' with empty array matches ALL leads (exclude list is empty)", async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, { ...mockLead, leadId: 'lead-2', company: 'Other' }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'not_in', value: [] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(2);
+    });
+
+    it("'in' works on customFields too (industry in [SaaS, Tech])", async () => {
+      const techLead = { ...mockLead, leadId: 'lead-1', customFields: { industry: 'Tech' } };
+      const finLead = { ...mockLead, leadId: 'lead-2', customFields: { industry: 'Finance' } };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [techLead, finLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'industry', operator: 'in', value: ['SaaS', 'Tech'] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].leadId).toBe('lead-1');
+    });
+
     it('should handle is_empty and is_not_empty operators', async () => {
       const noPhoneLead = { ...mockLead, leadId: 'lead-2', phone: '' };
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);

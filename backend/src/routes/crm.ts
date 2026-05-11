@@ -50,8 +50,50 @@ import {
   validateSourcesPerField,
 } from '../utils/enrichmentValidation';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import {
+  getEnrichmentConfig as svcGetEnrichmentConfig,
+  setEnrichmentConfig as svcSetEnrichmentConfig,
+  suggestFieldTypes as svcSuggestFieldTypes,
+  type ConfigServiceDeps,
+  type FieldTypeSuggestion,
+} from '../services/enrichmentConfigService';
+import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
+import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
+
+// ─── v3.1 enrichment-config service-deps adapter ────────────────────────────
+// Wires the pure-logic config service to real DDB + a Phase-1 heuristic type
+// suggester. The LLM suggester slot is intentionally heuristic-only for now —
+// users can edit types in the UI; we revisit with a real LLM call in Phase 1.5.
+
+function heuristicTypeSuggestion(
+  fields: Array<{ name: string; instruction: string }>,
+): FieldTypeSuggestion[] {
+  return fields.map(({ name }) => {
+    const lc = name.toLowerCase();
+    if (/(_count|_at$|count$|number_of)/.test(lc) || lc === 'employees' || lc === 'revenue') {
+      return { name, type: 'number' as const };
+    }
+    if (/^is_|^has_|verified$/.test(lc)) {
+      return { name, type: 'boolean' as const };
+    }
+    if (lc.endsWith('_date') || lc.endsWith('date') || lc.endsWith('_at')) {
+      return { name, type: 'date' as const };
+    }
+    return { name, type: 'string' as const };
+  });
+}
+
+const enrichmentConfigDeps: ConfigServiceDeps = {
+  readListConfig: (listId) => crmDb.getEnrichmentConfig(listId),
+  writeListConfig: (listId, config) => crmDb.setEnrichmentConfig(listId, config),
+  loadListFieldNames: async (listId) => {
+    const list = await crmDb.getLeadListById(listId);
+    return Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : [];
+  },
+  llmSuggestTypes: async (fields) => heuristicTypeSuggestion(fields),
+};
 const d1StripeClient = d1StripeSecretKey
   ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
   : null;
@@ -1430,6 +1472,157 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error updating lead list:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead list' });
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/enrichment-config
+ * @desc Read the v3.1 enrichment config for a list. Returns the stored config
+ *       or a default built from the list's field schema (with isDefault: true).
+ * @access Private
+ */
+router.get('/lists/:listId/enrichment-config', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const result = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+    return res.json(result);
+  } catch (error) {
+    console.error('[crm] GET enrichment-config failed:', error);
+    return res.status(500).json({ message: 'Failed to read enrichment config' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/lists/:listId/enrichment-config
+ * @desc Save the v3.1 enrichment config for a list. Server stamps
+ *       updatedAt / updatedBy regardless of client-provided values.
+ * @access Private
+ */
+router.put('/lists/:listId/enrichment-config', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const config = req.body;
+    try {
+      const saved = await svcSetEnrichmentConfig(
+        { listId, userId, config },
+        enrichmentConfigDeps,
+      );
+      return res.json({ config: saved, isDefault: false });
+    } catch (validationError: any) {
+      if (validationError?.name === 'ConfigValidationError') {
+        return res.status(400).json({ message: validationError.message });
+      }
+      throw validationError;
+    }
+  } catch (error) {
+    console.error('[crm] PUT enrichment-config failed:', error);
+    return res.status(500).json({ message: 'Failed to save enrichment config' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/enrichment-config/suggest-types
+ * @desc Suggest a field type for each newly-added field. Phase 1 uses a
+ *       name-based heuristic; LLM upgrade in Phase 1.5.
+ * @access Private
+ */
+router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const fields = Array.isArray(req.body?.fields) ? req.body.fields : [];
+    const types = await svcSuggestFieldTypes({ fields }, enrichmentConfigDeps);
+    return res.json({ types });
+  } catch (error) {
+    console.error('[crm] POST suggest-types failed:', error);
+    return res.status(500).json({ message: 'Failed to suggest field types' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-v3?mode=preview|enrich
+ * @desc Run the v3.1 enrichment waterfall on all leads in the list using the
+ *       saved per-list config. Synchronous in Phase 1a — returns the final
+ *       run report directly. Phase 1b will switch this to async + Socket.IO
+ *       progress for larger lists.
+ *
+ *       Phase 1a scope: identity resolution + Apollo direct-map + writes work
+ *       with real services. Web tier and LLM extraction are stubbed (fields
+ *       not covered by Apollo will appear as `missing` in the report).
+ * @access Private
+ */
+router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
+
+    // Preview accepts a full inline config in body.inlineConfig; enrich uses
+    // the persisted per-list config.
+    let config: any;
+    if (mode === 'preview') {
+      if (!req.body?.inlineConfig) {
+        return res.status(400).json({ message: 'preview mode requires inlineConfig in request body' });
+      }
+      config = req.body.inlineConfig;
+    } else {
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      if (stored.isDefault) {
+        return res.status(400).json({
+          message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
+        });
+      }
+      config = stored.config;
+    }
+
+    const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
+    const deps = buildV3OrchestratorDeps();
+    const result = await svcRunEnrichmentV3(
+      { listId, userId, config, mode, refreshFields },
+      deps,
+    );
+    return res.json(result);
+  } catch (error) {
+    console.error('[crm] POST enrich-v3 failed:', error);
+    return res.status(500).json({ message: 'Enrichment run failed' });
   }
 });
 

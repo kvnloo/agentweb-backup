@@ -7189,6 +7189,21 @@ export class AgentModeService {
           if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
           return String(fieldValue || '') < String(value || '');
         }
+        case 'in': {
+          // Membership test against a value array. Used by v3.1 enrichment-
+          // config lead filters (`industry in [SaaS, Fintech, ...]`).
+          // Case-insensitive string compare matches existing `equals` convention.
+          // Malformed value (non-array) → fail-safe to no-match.
+          if (!Array.isArray(value)) return false;
+          const fv = String(fieldValue ?? '').toLowerCase();
+          return value.some((v: any) => String(v ?? '').toLowerCase() === fv);
+        }
+        case 'not_in': {
+          if (!Array.isArray(value)) return false;
+          const fv = String(fieldValue ?? '').toLowerCase();
+          // Empty exclude list → matches everything (vacuously not in nothing).
+          return !value.some((v: any) => String(v ?? '').toLowerCase() === fv);
+        }
         default:
           return false;
       }

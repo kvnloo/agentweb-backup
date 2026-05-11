@@ -1,0 +1,532 @@
+// Tests for enrichmentConfigService — config CRUD + LLM type-suggest.
+//
+// Design ref: tasks/crm-enrichment-v3.1-design.md §4.1 + §8.5.
+// Validates: GET returns default for empty lists, PUT enforces uniqueness +
+// reserved-name + enum-option rules, suggest-types passes through.
+
+import {
+  getEnrichmentConfig,
+  setEnrichmentConfig,
+  suggestFieldTypes,
+  RESERVED_FIELD_NAMES,
+  type ConfigServiceDeps,
+} from '../services/enrichmentConfigService';
+import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
+
+const LIST_ID = 'list-1';
+const USER_ID = 'user-1';
+
+function validConfig(overrides: Partial<EnrichmentConfig> = {}): EnrichmentConfig {
+  return {
+    fields: [
+      { name: 'industry', type: 'string', instruction: 'industry of the company', include: true, overwritePolicy: 'fill_if_empty' },
+    ],
+    globalOverwriteDefault: 'fill_if_empty',
+    schemaVersion: 1,
+    updatedAt: '2026-05-11T00:00:00Z',
+    updatedBy: USER_ID,
+    ...overrides,
+  };
+}
+
+function makeDeps(overrides: Partial<ConfigServiceDeps> = {}): ConfigServiceDeps {
+  return {
+    readListConfig: jest.fn().mockResolvedValue(null),
+    writeListConfig: jest.fn().mockResolvedValue(undefined),
+    loadListFieldNames: jest.fn().mockResolvedValue([]),
+    llmSuggestTypes: jest.fn().mockResolvedValue([]),
+    ...overrides,
+  };
+}
+
+// ─── getEnrichmentConfig ──────────────────────────────────────────────────────
+
+describe('getEnrichmentConfig', () => {
+  it('returns the stored config merged with standard candidates when one exists', async () => {
+    // After merge, the result includes saved fields PLUS the standard
+    // candidate fields the saved config might not have explicitly listed.
+    // Saved settings are preserved for saved fields.
+    const stored = validConfig();   // one field: industry with include=true
+    const deps = makeDeps({ readListConfig: jest.fn().mockResolvedValue(stored) });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+
+    expect(result.isDefault).toBe(false);
+    // Saved `industry` retains its custom settings
+    const industry = result.config.fields.find(f => f.name === 'industry')!;
+    expect(industry.include).toBe(true);
+    expect(industry.instruction).toBe('industry of the company');
+    // Standard candidates added (8 standard fields + saved 'industry' = 9)
+    const names = result.config.fields.map(f => f.name);
+    expect(names).toEqual(expect.arrayContaining([
+      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes', 'industry',
+    ]));
+  });
+
+  it('returns a default config with isDefault: true when none stored, including standard + custom list fields', async () => {
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue(['industry', 'tech_stack']),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+
+    expect(result.isDefault).toBe(true);
+    // 8 standard enrichable fields + 2 custom
+    expect(result.config.fields.map(f => f.name).sort()).toEqual([
+      'company', 'email', 'firstName', 'industry', 'lastName', 'linkedin', 'notes', 'phone', 'tech_stack', 'title',
+    ]);
+    // Default: include=true (opt-out), overwrite=fill_if_empty (safe)
+    expect(result.config.fields.every(f => f.include === true)).toBe(true);
+    expect(result.config.fields.every(f => f.overwritePolicy === 'fill_if_empty')).toBe(true);
+    expect(result.config.globalOverwriteDefault).toBe('fill_if_empty');
+    expect(result.config.schemaVersion).toBe(1);
+    expect(result.config.updatedBy).toBe(USER_ID);
+  });
+
+  it('keeps standard data columns AND filters truly-reserved system columns from defaults', async () => {
+    // Standard columns (firstName/email/etc.) are enrichable via Apollo — they
+    // appear in the default config with aliasFor pre-set. Truly reserved
+    // columns (leadId, enrichmentMetadata, ...) are filtered out entirely.
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue([
+        'firstName', 'lastName', 'email', 'company', 'linkedin', 'phone',
+        'leadId', 'enrichmentMetadata',     // truly reserved — filtered
+        'industry', 'employee_count',       // custom — kept without alias
+      ]),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const fields = result.config.fields;
+    const names = fields.map(f => f.name).sort();
+
+    expect(names).toEqual(['company', 'email', 'employee_count', 'firstName', 'industry', 'lastName', 'linkedin', 'notes', 'phone', 'title']);
+
+    // Standard data columns get auto-mapped aliasFor → canonical FIELD_GROUPS name
+    const byName = Object.fromEntries(fields.map(f => [f.name, f]));
+    expect(byName.firstName.aliasFor).toBe('first_name');
+    expect(byName.lastName.aliasFor).toBe('last_name');
+    expect(byName.linkedin.aliasFor).toBe('linkedin_url');
+    expect(byName.company.aliasFor).toBe('company_name');
+    expect(byName.email.aliasFor).toBe('email');
+    // Custom fields don't get an aliasFor — user assigns one if applicable.
+    expect(byName.industry.aliasFor).toBeUndefined();
+    expect(byName.employee_count.aliasFor).toBeUndefined();
+
+    // Default is saveable round-trip — alias-mapped standard names pass validation.
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config: result.config }, deps),
+    ).resolves.toBeDefined();
+  });
+
+  it('always includes the standard enrichable lead columns even when list.fieldNames lacks them', async () => {
+    // list.fieldNames may only contain custom fields — the dialog still needs
+    // to show standard columns (company, phone, etc.) so users can opt them in.
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue([]),   // empty list schema
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const names = result.config.fields.map(f => f.name);
+
+    // The 8 standard enrichable columns always present
+    expect(names).toEqual(
+      expect.arrayContaining(['firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes'])
+    );
+  });
+
+  it('merges saved config with current list fields (saved settings preserved, new fields appended)', async () => {
+    // Scenario: previously saved config had only `title` toggled on with custom
+    // settings. The list now has additional fields (location custom field). The
+    // merged config preserves `title`'s saved state and shows the rest.
+    const saved: any = {
+      fields: [
+        { name: 'title', type: 'string', instruction: 'job title', include: true, overwritePolicy: 'always_overwrite' },
+        { name: 'stag', type: 'string', instruction: 'funding stage', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+      globalOverwriteDefault: 'fill_if_empty',
+      schemaVersion: 1,
+      updatedAt: '2026-05-11T00:00:00Z',
+      updatedBy: USER_ID,
+    };
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(saved),
+      loadListFieldNames: jest.fn().mockResolvedValue(['location', 'firstName']),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const byName = Object.fromEntries(result.config.fields.map(f => [f.name, f]));
+
+    // Standard fields all surface (firstName + standard built-ins like company/phone/etc.)
+    expect(byName.firstName).toBeDefined();
+    expect(byName.company).toBeDefined();
+    expect(byName.phone).toBeDefined();
+
+    // Custom list field also surfaces
+    expect(byName.location).toBeDefined();
+    expect(byName.location.include).toBe(true);  // not in saved → default (opt-out)
+
+    // Saved entry's settings preserved
+    expect(byName.title.instruction).toBe('job title');
+    expect(byName.title.include).toBe(true);
+    expect(byName.title.overwritePolicy).toBe('always_overwrite');
+
+    // Saved manual-add (stag) preserved even though not in current candidates
+    expect(byName.stag).toBeDefined();
+    expect(byName.stag.include).toBe(true);
+
+    // isDefault is false — there IS a saved config
+    expect(result.isDefault).toBe(false);
+  });
+
+  it("excludes internal/system fields (enrichmentMetadata, status, dealValue) from candidates", async () => {
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue([
+        'enrichmentMetadata', 'syncMetadata', 'status', 'dealValue', 'dealCurrency',
+        'createdAt', 'updatedAt', 'industry',   // industry is a normal custom field, keep
+      ]),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    const names = result.config.fields.map(f => f.name);
+
+    expect(names).not.toContain('enrichmentMetadata');
+    expect(names).not.toContain('syncMetadata');
+    expect(names).not.toContain('status');
+    expect(names).not.toContain('dealValue');
+    expect(names).not.toContain('dealCurrency');
+    expect(names).not.toContain('createdAt');
+    expect(names).not.toContain('updatedAt');
+    expect(names).toContain('industry');
+  });
+
+  it('returns the standard 8 fields when the list has no custom field schema', async () => {
+    // Previously this test expected an empty fields array. After the merge
+    // change, standard enrichable lead columns are always surfaced.
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue([]),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+
+    expect(result.isDefault).toBe(true);
+    expect(result.config.fields).toHaveLength(8);
+    expect(result.config.fields.map(f => f.name).sort()).toEqual([
+      'company', 'email', 'firstName', 'lastName', 'linkedin', 'notes', 'phone', 'title',
+    ]);
+  });
+});
+
+// ─── setEnrichmentConfig — happy path ─────────────────────────────────────────
+
+describe('setEnrichmentConfig — happy path', () => {
+  it('persists a valid config and returns it', async () => {
+    const deps = makeDeps();
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config: validConfig() },
+      deps,
+    );
+
+    expect(deps.writeListConfig).toHaveBeenCalledTimes(1);
+    const writeCall = (deps.writeListConfig as jest.Mock).mock.calls[0];
+    expect(writeCall[0]).toBe(LIST_ID);
+    expect(writeCall[1].fields).toHaveLength(1);
+    expect(result.fields[0]?.name).toBe('industry');
+  });
+
+  it('stamps updatedAt and updatedBy at write time, overwriting client-provided values', async () => {
+    const before = Date.now();
+    const deps = makeDeps();
+    const result = await setEnrichmentConfig(
+      {
+        listId: LIST_ID,
+        userId: USER_ID,
+        config: validConfig({
+          updatedAt: '1999-01-01T00:00:00Z',  // bogus stale value the client tried to send
+          updatedBy: 'somebody-else',          // user trying to spoof
+        }),
+      },
+      deps,
+    );
+
+    expect(result.updatedBy).toBe(USER_ID);
+    expect(new Date(result.updatedAt).getTime()).toBeGreaterThanOrEqual(before);
+  });
+});
+
+// ─── setEnrichmentConfig — validation failures ────────────────────────────────
+
+describe('setEnrichmentConfig — validation', () => {
+  it('rejects when a field name is duplicated', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'industry', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/'industry'.*already/i);
+    expect(deps.writeListConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects truly-reserved system column names outright (no alias exception)', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'leadId', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/leadId.*reserved|reserved.*leadId/i);
+    expect(deps.writeListConfig).not.toHaveBeenCalled();
+  });
+
+  it('accepts a standard data column like "email" as a field name (no longer reserved)', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'email', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+      ],
+    });
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).resolves.toBeDefined();
+  });
+
+  it('rejects when an enum-typed field has no enumOptions', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'tier', type: 'enum', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/enum.*tier.*enumOptions/i);
+  });
+
+  it('rejects when an enum-typed field has empty enumOptions array', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'tier', type: 'enum', enumOptions: [], instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/enum.*tier.*enumOptions/i);
+  });
+
+  it('auto-infers aliasFor at save time for camelCase standard names (server-side, no UI)', async () => {
+    // User saves a config with a `firstName` field but no explicit aliasFor.
+    // Server should infer aliasFor='first_name' so the orchestrator routes
+    // through Apollo person_identity automatically.
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'firstName', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBe('first_name');
+  });
+
+  it('auto-infers aliasFor via camelCase → snake_case conversion for canonical-shaped names', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'companyLinkedinUrl', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBe('company_linkedin_url');
+  });
+
+  it('does NOT auto-infer aliasFor when the field name is already canonical', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'tech_stack', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBeUndefined();
+  });
+
+  it('auto-infers aliasFor via synonym map (funding_round → funding_stage)', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'funding_round', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBe('funding_stage');
+  });
+
+  it('auto-infers aliasFor via synonym map for "tech" → tech_stack', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'tech', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBe('tech_stack');
+  });
+
+  it('leaves opaque custom names without aliasFor (heuristic cannot guess)', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'stag', type: 'string', instruction: 'funding stage', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBeUndefined();
+    // Future: LLM fallback would set this to 'funding_stage'.
+  });
+
+  it('preserves explicit aliasFor passed by the client (heuristic never overrides)', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'stag', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'funding_stage' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields[0].aliasFor).toBe('funding_stage');
+  });
+
+  it("accepts a valid aliasFor pointing at a real FIELD_GROUPS field", async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'stag', type: 'string', instruction: 'funding stage', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'funding_stage' },
+      ],
+    });
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).resolves.toBeDefined();
+  });
+
+  it("rejects aliasFor that doesn't match any FIELD_GROUPS canonical field", async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'stag', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'not_a_real_canonical_field' },
+      ],
+    });
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/aliasFor.*not a known canonical field/i);
+  });
+
+  it('rejects two fields that map to the same canonical name (collision)', async () => {
+    // Real user scenario: default `email` field + user-added `Email` field
+    // both auto-route to canonical `email`. Without this check, the
+    // waterfall fills one and the other silently misses its value.
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'email', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+        { name: 'Email', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+      ],
+    });
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/both map to 'email'/i);
+  });
+
+  it("rejects collision between a self-canonical name and an inferred alias", async () => {
+    // `email` (its name IS canonical) + `Email` (aliasFor inferred → 'email')
+    // both route to canonical 'email' at run time. Catch it regardless of
+    // whether either field has an explicit aliasFor set.
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        // No explicit aliasFor — name itself is canonical
+        { name: 'email', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        // Inferred alias via camelCase
+        { name: 'Email', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+      ],
+    });
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/both map to 'email'/i);
+  });
+
+  it('rejects when schemaVersion is not 1', async () => {
+    const deps = makeDeps();
+    const config = validConfig({ schemaVersion: 2 as any });
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).rejects.toThrow(/schemaVersion/i);
+  });
+
+  it('exports TRULY_RESERVED_NAMES with the expected system columns', async () => {
+    // Sanity check — system/sidecar columns that never enter customFields
+    expect(RESERVED_FIELD_NAMES).toEqual(
+      expect.arrayContaining(['leadId', 'listId', 'enrichmentMetadata', 'customFields']),
+    );
+  });
+});
+
+// ─── suggestFieldTypes ────────────────────────────────────────────────────────
+
+describe('suggestFieldTypes', () => {
+  it('delegates to llmSuggestTypes and returns the result', async () => {
+    const deps = makeDeps({
+      llmSuggestTypes: jest.fn().mockResolvedValue([
+        { name: 'stag', type: 'enum', enumOptions: ['Seed', 'A', 'B', 'C'] },
+        { name: 'employees', type: 'number' },
+      ]),
+    });
+
+    const result = await suggestFieldTypes(
+      {
+        fields: [
+          { name: 'stag', instruction: 'funding stage of the company' },
+          { name: 'employees', instruction: 'number of employees' },
+        ],
+      },
+      deps,
+    );
+
+    expect(deps.llmSuggestTypes).toHaveBeenCalledWith([
+      { name: 'stag', instruction: 'funding stage of the company' },
+      { name: 'employees', instruction: 'number of employees' },
+    ]);
+    expect(result).toHaveLength(2);
+    expect(result[0]?.type).toBe('enum');
+    expect(result[1]?.type).toBe('number');
+  });
+
+  it('returns empty result for empty input without calling the LLM', async () => {
+    const deps = makeDeps();
+    const result = await suggestFieldTypes({ fields: [] }, deps);
+
+    expect(result).toEqual([]);
+    expect(deps.llmSuggestTypes).not.toHaveBeenCalled();
+  });
+});

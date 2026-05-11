@@ -3953,6 +3953,44 @@ export const crmDb = {
   },
 
   /**
+   * v3.1 enrichment config — `enrichmentConfig` attribute on AW-LeadLists.
+   * Per-list scoped. Returns null when no config has ever been saved (callers
+   * should fall back to a default built from the list's field schema).
+   */
+  async getEnrichmentConfig(listId: string): Promise<any | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        ProjectionExpression: 'enrichmentConfig',
+      }).promise();
+      return result.Item?.enrichmentConfig ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentConfig');
+      throw error;
+    }
+  },
+
+  async setEnrichmentConfig(listId: string, config: any): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: 'SET enrichmentConfig = :c, #updatedAt = :now',
+        ExpressionAttributeNames: { '#updatedAt': 'updatedAt' },
+        ExpressionAttributeValues: {
+          ':c': config,
+          ':now': new Date().toISOString(),
+        },
+        ConditionExpression: 'attribute_exists(listId)',
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setEnrichmentConfig');
+      throw error;
+    }
+  },
+
+  /**
    * Persists the Unipile search cursor for a given (listId, criteriaHash) so
    * the next find-leads top-up loop with the same filters resumes where the
    * previous one stopped instead of re-paginating from page 1.
