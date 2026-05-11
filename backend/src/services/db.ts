@@ -3600,6 +3600,17 @@ export const crmDb = {
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
+      // mergeFieldNames uses list_append (atomic, non-idempotent), which
+      // can leave duplicate entries when concurrent appenders race or when
+      // the same key is written across many leads. Dedupe + sort on read
+      // so /api/crm/lists (and the Configure Display Fields dialog it
+      // powers) never surfaces duplicates. Mirrors getLeadListById's
+      // behavior for the multi-list query path.
+      for (const item of items) {
+        if (Array.isArray(item.fieldNames)) {
+          item.fieldNames = Array.from(new Set(item.fieldNames as string[])).sort();
+        }
+      }
       return items;
     } catch (error: any) {
       // If index doesn't exist, use scan with filter
@@ -3621,6 +3632,11 @@ export const crmDb = {
           lastEvaluatedKey = result.LastEvaluatedKey;
         } while (lastEvaluatedKey);
 
+        for (const item of items) {
+          if (Array.isArray(item.fieldNames)) {
+            item.fieldNames = Array.from(new Set(item.fieldNames as string[])).sort();
+          }
+        }
         return items;
       }
       handleDynamoDbError(error, "getLeadListsByUserId");
@@ -6318,16 +6334,29 @@ export const crmDb = {
     // Keep the parent list's fieldNames in sync. Without this, enrichment
     // writes customFields.X on the lead, the Configure Display Fields dialog
     // (which reads list.fieldNames) doesn't see X, and the user thinks the
-    // enriched field "disappeared." mergeFieldNames is atomic + idempotent,
-    // so concurrent enrichment writes can't race or duplicate.
+    // enriched field "disappeared."
+    //
+    // We only call mergeFieldNames for TRULY-NEW keys — appending a key that
+    // already exists with DDB's list_append leaves a duplicate behind. Each
+    // per-lead enrichment otherwise spam-appends the same shared key (e.g.
+    // "website") once per lead, leaving N copies after a list-wide run.
+    // Read-then-conditional-write does have a small race window (two
+    // concurrent writers seeing the same "missing" key both append once),
+    // but getLeadListById dedupes on read so the UI never shows the dup.
     if (hasCustomKeys) {
       try {
-        await this.mergeFieldNames(listId, Object.keys(options.customFields!));
+        const newKeys = Object.keys(options.customFields!);
+        const list = await this.getLeadListById(listId);
+        const existing = new Set((list?.fieldNames as string[] | undefined) ?? []);
+        const trulyNew = newKeys.filter(k => !existing.has(k));
+        if (trulyNew.length > 0) {
+          await this.mergeFieldNames(listId, trulyNew);
+        }
       } catch (err) {
         // Field-name sync is best-effort — the lead write already succeeded.
         // Logging keeps the failure visible without failing the caller.
         // eslint-disable-next-line no-console
-        console.warn('[setLeadFields] mergeFieldNames failed:', (err as Error).message);
+        console.warn('[setLeadFields] fieldNames sync failed:', (err as Error).message);
       }
     }
   },
