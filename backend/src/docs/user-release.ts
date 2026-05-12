@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-12',
     changes: [
+      'Admin: Display Name Editable in Users Tab',
+      '- Admins can now set a display name for any user directly from the Users tab in the Admin Dashboard',
+      '- The display name appears in the customer portal Organization tab, replacing the email fallback for users who did not sign up via Google',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
       'Fixed: Video Agent Now Stitches Clips in the Correct Shot Order',
       '- Previously, when an AI video agent generated multiple clips individually (rather than in a single call), the final composed video could stitch shots out of narrative order — e.g. S3 appearing at position 8 instead of position 3',
       '- Root cause: the agent was passing clip URLs to the compose step in the order they appeared in context (generation order), not in shot order',

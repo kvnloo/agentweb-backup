@@ -224,6 +224,7 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string;
+  displayName?: string;
   supportNote?: string;
   role?: "partner" | "customer" | "free"; // For single role from API
   roles?: ("partner" | "customer" | "free")[];
@@ -807,6 +808,9 @@ export default function AdminDashboard() {
   const [editingEmailUserId, setEditingEmailUserId] = useState<string | null>(null);
   const [currentEmailText, setCurrentEmailText] = useState("");
   const [emailEditLoading, setEmailEditLoading] = useState(false);
+  const [editingNameUserId, setEditingNameUserId] = useState<string | null>(null);
+  const [currentDisplayName, setCurrentDisplayName] = useState("");
+  const [nameEditLoading, setNameEditLoading] = useState(false);
   const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
   const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
   const [emailDomain, setEmailDomain] = useState("");
@@ -2296,6 +2300,34 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update contact email");
     } finally {
       setEmailEditLoading(false);
+    }
+  };
+
+  const handleSaveName = async (userId: string) => {
+    try {
+      setNameEditLoading(true);
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/name`),
+        { displayName: currentDisplayName.trim() || null },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((u: User) =>
+            u.userId === userId
+              ? { ...u, displayName: response.data.displayName }
+              : u
+          )
+        );
+        setSuccess("Display name updated successfully!");
+        setEditingNameUserId(null);
+        setCurrentDisplayName("");
+      }
+    } catch (error: any) {
+      console.error("Error updating display name:", error);
+      setError(error.response?.data?.message || "Failed to update display name");
+    } finally {
+      setNameEditLoading(false);
     }
   };
 
@@ -4232,6 +4264,23 @@ export default function AdminDashboard() {
                                   </Box>
                                 </Grid>
                                 {/* Config details — all with inline edit */}
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Display Name</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingNameUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentDisplayName} onChange={(e) => setCurrentDisplayName(e.target.value)} placeholder="Full name" sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveName(user.userId)} disabled={nameEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => { setEditingNameUserId(null); setCurrentDisplayName(""); }}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2" sx={{ fontSize: "0.75rem" }}>{user.displayName || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingNameUserId(user.userId); setCurrentDisplayName(user.displayName || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Contact Email</Typography>
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
