@@ -265,6 +265,19 @@ router.post('/test/:listId/:provider', async (req: any, res) => {
     const { apiKey, accountId } = req.body ?? {};
     const result = await externalCrmSyncService.testConnection(userId, listId, provider, { apiKey, accountId });
     console.log(`[CrmSync] Test result:`, JSON.stringify(result));
+
+    // On successful test with new inline credentials, persist a minimal config so the
+    // webhookSecret is generated immediately and the webhook URL can be copied without
+    // requiring a separate Save step.
+    if (result.valid && (apiKey || accountId)) {
+      const saved = await externalCrmSyncService.saveConfig(userId, listId, provider, { apiKey, accountId });
+      const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
+      const webhookUrl = saved.webhookSecret
+        ? `${backendUrl}/api/crm/${provider}/${listId}/webhook?secret=${saved.webhookSecret}`
+        : undefined;
+      return res.json({ ...result, webhookUrl });
+    }
+
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to test connection' });
