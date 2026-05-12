@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Video Agent Now Stitches Clips in the Correct Shot Order',
+      '- Previously, when an AI video agent generated multiple clips individually (rather than in a single call), the final composed video could stitch shots out of narrative order — e.g. S3 appearing at position 8 instead of position 3',
+      '- Root cause: the agent was passing clip URLs to the compose step in the order they appeared in context (generation order), not in shot order',
+      '- The compose_video tool now includes an explicit ordering requirement: the agent must build a shot-number manifest (S1, S2, S3...) and verify ascending order before composing',
+      '- The Video Production skill prompt has been updated with a mandatory pre-compose checklist enforcing this',
+      '- Haven users: your 30s Meta ad has been re-composed in the correct S1→S8 sequence',
+    ],
+  },
+  {
     date: '2026-05-11',
     changes: [
       'Admin: Connected Accounts Tab Added to Admin Dashboard',
