@@ -49,7 +49,11 @@ function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
 function makeDeps(overrides: Partial<OrchestratorDeps> = {}): OrchestratorDeps {
   return {
     loadLeads: jest.fn().mockResolvedValue([]),
-    resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {} }),
+    // `siblings: []` matches the production `resolveIdentity` contract added
+    // in 5ecf5ad3 — Tier 0b iterates this array, so omitting it would throw
+    // `siblings is not iterable` for every test that exercises a successful
+    // identity-resolution path.
+    resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
     runWaterfall: jest.fn().mockResolvedValue({
       fields: [],
       missing: [],
