@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-12',
     changes: [
+      'Fixed: Emma No Longer Incorrectly Suggests Co-Owner Assignment Is Possible',
+      '- Emma (the AI assistant) was incorrectly telling users that making someone a co-owner of an organization was possible, causing support escalations',
+      '- Emma\'s system prompt now explicitly states: only 1 owner is supported per organization, co-owner roles do not exist, and members cannot edit Brand Guidelines or Market Strategy',
+      '- This context is injected automatically whenever the current user is an organization member',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
       'Fixed: Video Agent Now Stitches Clips in the Correct Shot Order',
       '- Previously, when an AI video agent generated multiple clips individually (rather than in a single call), the final composed video could stitch shots out of narrative order — e.g. S3 appearing at position 8 instead of position 3',
       '- Root cause: the agent was passing clip URLs to the compose step in the order they appeared in context (generation order), not in shot order',

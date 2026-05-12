@@ -3361,11 +3361,24 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
+const ORG_MEMBER_ADDENDUM = `
+
+## Organization membership — current user is a member (not the owner)
+
+The current user is a **member** of an organization, not the owner. Be accurate about what members can and cannot do:
+
+- There is only **1 owner** per organization. Co-owner roles do not exist on this platform. Do NOT suggest that someone can be made a co-owner or share ownership.
+- Members **cannot** edit Brand Guidelines or Market Strategy — those pages are read-only for members. Only the owner can modify them.
+- Members can use all other platform features (tasks, schedules, marketing hub, social posts, SEO, CRM, etc.) within the organization.
+
+If a user asks about making someone a co-owner, giving ownership to another person, or assigning owner-level permissions, clearly explain that only one owner is supported per organization and that co-owner assignment is not a feature of this platform.`;
+
 // Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
-export function getEmmaSystemContext(sessionType?: string): string {
-  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}`;
+export function getEmmaSystemContext(sessionType?: string, orgRole?: string): string {
+  const memberAddendum = orgRole === "member" ? ORG_MEMBER_ADDENDUM : "";
+  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}${memberAddendum}`;
 }
 
 // Exported for backwards-compatibility with existing tests — no-op since there is no longer a cache.
@@ -3665,6 +3678,8 @@ export interface ChatResponseOptions {
   isDelegatedAdmin?: boolean;
   /** Email of the admin when isDelegatedAdmin is true. */
   adminEmail?: string;
+  /** Organization role of the current user ("owner" | "member"). Used to inject accurate org-permission context into Emma's system prompt. */
+  orgRole?: string;
 }
 
 // Update generateChatResponse to use platform knowledge base when needed
@@ -3685,6 +3700,7 @@ export async function generateChatResponse(
     onToolStart,
     isDelegatedAdmin,
     adminEmail,
+    orgRole,
   } = options;
   try {
     const timestamp = new Date().toISOString();
@@ -3729,7 +3745,7 @@ export async function generateChatResponse(
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
-    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType) : null;
+    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType, orgRole) : null;
     const messages = [...session.messages];
     if (freshSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
