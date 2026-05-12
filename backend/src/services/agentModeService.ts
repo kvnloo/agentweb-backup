@@ -21952,13 +21952,26 @@ async function batchParseCompaniesFromTitlesWithLLM(
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_completion_tokens: Math.max(200, titles.length * 30),
+      max_completion_tokens: Math.max(500, titles.length * 30),
       temperature: 0.1,
     });
-    let raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
-    // Strip optional ```json fences the LLM sometimes adds despite instructions.
-    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-    const parsed = JSON.parse(raw);
+    const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
+    // Gemini Flash often adds preamble / postamble / markdown fences despite
+    // explicit instructions. Locate the widest `[ ... ]` substring instead of
+    // strict-parsing the whole response.
+    const firstBracket = raw.indexOf('[');
+    const lastBracket = raw.lastIndexOf(']');
+    if (firstBracket < 0 || lastBracket <= firstBracket) {
+      console.warn('[batchParseCompaniesFromTitlesWithLLM] no JSON array in response:', raw.slice(0, 200));
+      return titles.map(() => 'NONE');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw.slice(firstBracket, lastBracket + 1));
+    } catch (parseErr: any) {
+      console.warn('[batchParseCompaniesFromTitlesWithLLM] JSON.parse failed:', parseErr?.message, '| raw:', raw.slice(0, 200));
+      return titles.map(() => 'NONE');
+    }
     if (!Array.isArray(parsed) || parsed.length !== titles.length) {
       return titles.map(() => 'NONE');
     }

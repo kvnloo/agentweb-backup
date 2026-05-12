@@ -205,6 +205,28 @@ describe('batchParseCompaniesFromTitlesWithLLM (Gemini Flash, batched)', () => {
     });
     expect(await batchParse(['a', 'b'], fakeLlmClient)).toEqual(['Google', 'Acme']);
   });
+
+  // Robustness — Gemini Flash often wraps the JSON array in extra text.
+  it('extracts the JSON array when LLM adds a preamble', async () => {
+    mockChatCreate.mockResolvedValue({
+      choices: [{ message: { content: 'Sure! Here are the results:\n["Shopify"]' } }],
+    });
+    expect(await batchParse(['VP of Engineering'], fakeLlmClient)).toEqual(['Shopify']);
+  });
+
+  it('extracts the JSON array when LLM adds a postamble', async () => {
+    mockChatCreate.mockResolvedValue({
+      choices: [{ message: { content: '["Google", "Stripe"]\n\nHope this helps!' } }],
+    });
+    expect(await batchParse(['t1', 't2'], fakeLlmClient)).toEqual(['Google', 'Stripe']);
+  });
+
+  it('extracts the JSON array when LLM wraps in fence + preamble', async () => {
+    mockChatCreate.mockResolvedValue({
+      choices: [{ message: { content: 'Here is the JSON:\n```json\n["Acme Inc"]\n```' } }],
+    });
+    expect(await batchParse(['Founder | Acme Inc'], fakeLlmClient)).toEqual(['Acme Inc']);
+  });
 });
 
 describe('AgentModeService.importLeadsFromSearch — company fallback chain', () => {
