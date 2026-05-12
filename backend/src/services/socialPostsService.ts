@@ -163,7 +163,7 @@ export async function getPostsForUser(
 
 // ─── Engagement Memory Generation ─────────────────────────────────────────────
 
-const MEMORY_MODEL = 'gemini-3.1-flash-lite-preview';
+const MEMORY_MODEL = 'gemini-3.1-flash-lite';
 
 const GENERATE_MEMORY_PROMPT = `You are an expert profile analyst. Based on the LinkedIn profile and recent posts provided, create a concise engagement persona profile in markdown format.
 
