@@ -95,7 +95,7 @@ export interface ResolveIdentityInput {
 
 export type ResolveIdentityResult =
   | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string } }
-  | { ok: false; reason: 'no_email' | 'identity_unresolvable' };
+  | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
 function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
   return {
@@ -110,22 +110,25 @@ export async function resolveIdentity(
   deps: IdentityResolverDeps,
 ): Promise<ResolveIdentityResult> {
   const { lead, needsPersonFields, needsCompanyFields, mode, listId } = input;
+  const logTag = `[resolveIdentity ${lead.leadId}]`;
 
-  // 1. Need at least one of: email, LinkedIn URL, or (firstName + lastName).
+  // 1. Need at least one identity signal: email, linkedin, or (firstName + lastName).
   // Apollo matches on email/linkedin; the waterfall's web tier (Unipile
-  // tier 3.5) can resolve LinkedIn from name+company. If none of these
-  // are present we can't resolve the lead's identity.
-  let email = typeof lead.email === 'string' ? lead.email.trim() : '';
+  // tier 3.5) resolves LinkedIn from name+company. Without ANY of these
+  // we can't resolve the lead.
+  // Email is normalized (trim+lowercase) once at entry so every downstream
+  // dep sees the same cache key.
+  let email = typeof lead.email === 'string' ? lead.email.trim().toLowerCase() : '';
   const linkedinUrl = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
   const hasName =
     typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
     typeof lead.lastName === 'string' && lead.lastName.trim() !== '';
-  if (!email && !linkedinUrl && !hasName) return { ok: false, reason: 'no_email' };
+  if (!email && !linkedinUrl && !hasName) return { ok: false, reason: 'no_identity_signal' };
 
   const resolved: Partial<LeadRecord> & { emailDomain?: string } = {};
   const meta: Record<string, EnrichedFieldMeta> = {};
 
-  // 1.5. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Queries all
+  // 2. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Queries all
   // three GSIs in parallel and does per-field best-of-N merge across the
   // returned candidates so complementary siblings (one has firstName only,
   // another has company only) can both contribute. Fills empties; respects
@@ -152,8 +155,6 @@ export async function resolveIdentity(
         const currentValue = (lead as any)[field];
         if (typeof currentValue === 'string' && currentValue.trim() !== '') continue;
         if (refresh && refresh.has(`${lead.leadId}:${field}`)) continue;
-        // Walk candidates freshest-first; take the first non-empty value for
-        // this field. The chosen sibling's IDs land in the per-field audit meta.
         for (const sib of siblings) {
           const v = sib[field];
           if (typeof v !== 'string' || v.trim() === '') continue;
@@ -170,125 +171,145 @@ export async function resolveIdentity(
         }
       }
       // If Tier 0 filled email, downstream Apollo-by-email paths can use it.
+      // Cross-tenant note: this email may have originated on another customer's
+      // lead — the locked design accepts cross-tenant pooling. Sanitizer strips
+      // the sibling audit IDs before responses leave the backend.
       if (resolved.email && !email) email = resolved.email;
     }
   } catch (err) {
     // findSiblingLeads failures must NEVER block enrichment — Apollo path
     // can still resolve identity. Log and continue.
-    console.warn('[resolveIdentity] tier 0 findSiblingLeads failed:', (err as Error).message);
+    console.warn(`${logTag} tier 0 findSiblingLeads failed:`, (err as Error).message);
   }
 
-  // 2. LinkedIn-first path: if we have a LinkedIn URL but no email, use
-  //    Apollo people-match on linkedinUrl — that returns email plus other
-  //    person fields. Once email is back, the rest of the flow uses it.
+  // 3. LinkedIn-first Apollo. Fires only when local `email` is still empty
+  // after Tier 0 — we have a linkedin URL but no email to match by. Apollo
+  // returns the email plus optional person fields. Each field is guarded
+  // by both `!lead.X` and `!resolved.X` so Tier 0 fills are not overwritten.
   if (!email && linkedinUrl) {
-    const byLinkedin = await deps.apolloPeopleMatch({ linkedinUrl });
-    if (byLinkedin) {
-      const apolloMeta = makeApiMeta('apollo');
-      if (byLinkedin.email) {
-        email = byLinkedin.email;
-        resolved.email = byLinkedin.email;
-        meta.email = apolloMeta;
+    try {
+      const byLinkedin = await deps.apolloPeopleMatch({ linkedinUrl });
+      if (byLinkedin) {
+        const apolloMeta = makeApiMeta('apollo');
+        if (byLinkedin.email && !resolved.email) {
+          email = byLinkedin.email;
+          resolved.email = byLinkedin.email;
+          meta.email = apolloMeta;
+        }
+        if (byLinkedin.firstName && !lead.firstName && !resolved.firstName) {
+          resolved.firstName = byLinkedin.firstName;
+          meta.firstName = apolloMeta;
+        }
+        if (byLinkedin.lastName && !lead.lastName && !resolved.lastName) {
+          resolved.lastName = byLinkedin.lastName;
+          meta.lastName = apolloMeta;
+        }
+        if (byLinkedin.title && !lead.title && !resolved.title) {
+          resolved.title = byLinkedin.title;
+          meta.title = apolloMeta;
+        }
       }
-      // Fill other person fields from the same Apollo response — saves a
-      // second people-match call in step 3.
-      if (byLinkedin.firstName && !lead.firstName) {
-        resolved.firstName = byLinkedin.firstName;
-        meta.firstName = apolloMeta;
-      }
-      if (byLinkedin.lastName && !lead.lastName) {
-        resolved.lastName = byLinkedin.lastName;
-        meta.lastName = apolloMeta;
-      }
-      if (byLinkedin.title && !lead.title) {
-        resolved.title = byLinkedin.title;
-        meta.title = apolloMeta;
-      }
+    } catch (err) {
+      console.warn(`${logTag} step 3 apolloPeopleMatch(linkedinUrl) failed:`, (err as Error).message);
     }
   }
 
-  // After LinkedIn fallback, we still might not have an email. Without it,
-  // Apollo person/org match by email can't run — but the waterfall's web
-  // tier can still resolve fields from name+company, so don't fail-early.
-  // Skip the email-dependent steps and let the completeness check below
-  // decide whether we resolved enough.
-
-  // 3. Derive emailDomain from email if present. Pure local op, no API call.
+  // 4. Derive emailDomain from email if present. Pure local op, no API call.
   if (email && !lead.emailDomain) {
     const derived = extractDomainFromEmail(email);
     if (derived) resolved.emailDomain = derived;
   }
   const emailDomain = lead.emailDomain || resolved.emailDomain;
 
-  // 4. Person resolution — only when needed AND still missing AND we have
-  // email for Apollo. Without email, the downstream web tier handles it.
+  // 5. Apollo person-match by email. Fires only when name fields are still
+  // missing after Tier 0 and we have an email to match by.
   const personStillMissing =
     needsPersonFields &&
     (!lead.firstName || !lead.lastName) &&
     (!resolved.firstName || !resolved.lastName);
   if (personStillMissing && email) {
-    const apolloPerson = await deps.apolloPeopleMatch({ email });
-    if (apolloPerson) {
-      const apolloMeta = makeApiMeta('apollo');
-      if (apolloPerson.firstName && !lead.firstName && !resolved.firstName) {
-        resolved.firstName = apolloPerson.firstName;
-        meta.firstName = apolloMeta;
+    try {
+      const apolloPerson = await deps.apolloPeopleMatch({ email });
+      if (apolloPerson) {
+        const apolloMeta = makeApiMeta('apollo');
+        if (apolloPerson.firstName && !lead.firstName && !resolved.firstName) {
+          resolved.firstName = apolloPerson.firstName;
+          meta.firstName = apolloMeta;
+        }
+        if (apolloPerson.lastName && !lead.lastName && !resolved.lastName) {
+          resolved.lastName = apolloPerson.lastName;
+          meta.lastName = apolloMeta;
+        }
+        if (apolloPerson.title && !lead.title && !resolved.title) {
+          resolved.title = apolloPerson.title;
+          meta.title = apolloMeta;
+        }
+        if (apolloPerson.linkedin && !lead.linkedin && !resolved.linkedin) {
+          resolved.linkedin = apolloPerson.linkedin;
+          meta.linkedin = apolloMeta;
+        }
       }
-      if (apolloPerson.lastName && !lead.lastName && !resolved.lastName) {
-        resolved.lastName = apolloPerson.lastName;
-        meta.lastName = apolloMeta;
-      }
-      if (apolloPerson.title && !lead.title && !resolved.title) {
-        resolved.title = apolloPerson.title;
-        meta.title = apolloMeta;
-      }
-      if (apolloPerson.linkedin && !lead.linkedin) {
-        resolved.linkedin = apolloPerson.linkedin;
-        meta.linkedin = apolloMeta;
-      }
+    } catch (err) {
+      console.warn(`${logTag} step 5 apolloPeopleMatch(email) failed:`, (err as Error).message);
     }
   }
 
-  // 4. Company resolution — Apollo first, enrich.so fallback.
-  // Note: completeness requires `company` only — `website` is a bonus.
-  // Canonical key building (enrichmentGroups.ts) can resolve company-level
-  // canonical IDs from email domain or normalized company name, so missing
-  // website doesn't block downstream waterfall tiers.
-  // Tier 0 may have already filled company/website — check `resolved` too so
-  // we don't make a redundant Apollo call when the sibling supplied both.
+  // 6. Company resolution — Apollo org first, enrich.so reverse fallback.
+  // Completeness requires `company` only — `website` is a bonus (the canonical
+  // key builder in enrichmentGroups.ts can resolve company-level IDs from
+  // email domain or normalized name). Tier 0 may have filled either or both;
+  // we skip Apollo when both are already present.
   const companyEffective = lead.company || resolved.company;
   const websiteEffective = lead.website || resolved.website;
   if (needsCompanyFields && (!companyEffective || !websiteEffective)) {
     if (emailDomain) {
-      const apolloOrg = await deps.apolloOrgMatch({ emailDomain });
-      if (apolloOrg) {
-        const apolloMeta = makeApiMeta('apollo');
-        if (apolloOrg.company && !lead.company && !resolved.company) {
-          resolved.company = apolloOrg.company;
-          meta.company = apolloMeta;
+      try {
+        const apolloOrg = await deps.apolloOrgMatch({ emailDomain });
+        if (apolloOrg) {
+          const apolloMeta = makeApiMeta('apollo');
+          if (apolloOrg.company && !lead.company && !resolved.company) {
+            resolved.company = apolloOrg.company;
+            meta.company = apolloMeta;
+          }
+          if (apolloOrg.website && !lead.website && !resolved.website) {
+            resolved.website = apolloOrg.website;
+            meta.website = apolloMeta;
+          }
         }
-        if (apolloOrg.website && !lead.website && !resolved.website) {
-          resolved.website = apolloOrg.website;
-          meta.website = apolloMeta;
-        }
+      } catch (err) {
+        console.warn(`${logTag} step 6 apolloOrgMatch failed:`, (err as Error).message);
       }
     }
 
-    // Fallback to enrich.so if company is still missing — requires email.
+    // enrich.so reverse lookup — fires when company is still missing and we
+    // have an email. Honors firstName/lastName the response carries — fills
+    // them too if Tier 0 + Apollo didn't.
     const companyStillMissing = !lead.company && !resolved.company;
     if (companyStillMissing && email) {
-      const enrichSo = await deps.enrichSoReverseLookup({ email });
-      if (enrichSo) {
-        const enrichSoMeta = makeApiMeta('enrich.so');
-        if (enrichSo.company && !lead.company) {
-          resolved.company = enrichSo.company;
-          meta.company = enrichSoMeta;
+      try {
+        const enrichSo = await deps.enrichSoReverseLookup({ email });
+        if (enrichSo) {
+          const enrichSoMeta = makeApiMeta('enrich.so');
+          if (enrichSo.company) {
+            resolved.company = enrichSo.company;
+            meta.company = enrichSoMeta;
+          }
+          if (enrichSo.firstName && !lead.firstName && !resolved.firstName) {
+            resolved.firstName = enrichSo.firstName;
+            meta.firstName = enrichSoMeta;
+          }
+          if (enrichSo.lastName && !lead.lastName && !resolved.lastName) {
+            resolved.lastName = enrichSo.lastName;
+            meta.lastName = enrichSoMeta;
+          }
         }
+      } catch (err) {
+        console.warn(`${logTag} step 6 enrichSoReverseLookup failed:`, (err as Error).message);
       }
     }
   }
 
-  // 5. Did we resolve everything that was needed?
+  // 7. Completeness gate.
   if (needsPersonFields) {
     const personOk = (lead.firstName || resolved.firstName) &&
                      (lead.lastName  || resolved.lastName);
@@ -299,7 +320,9 @@ export async function resolveIdentity(
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
-  // 6. Persist newly-resolved attributes ONLY in enrich mode.
+  // 8. Persist newly-resolved attributes ONLY in enrich mode. We also project
+  // `meta` down to only the fields that made it into writableFields so the
+  // write never carries audit entries for absent attributes.
   const writableFields: Record<string, string> = {};
   for (const [key, value] of Object.entries(resolved)) {
     if (key === 'emailDomain') continue;  // derived locally, not an API result
@@ -308,11 +331,15 @@ export async function resolveIdentity(
     }
   }
   if (mode === 'enrich' && Object.keys(writableFields).length > 0) {
+    const writableMeta: Record<string, EnrichedFieldMeta> = {};
+    for (const k of Object.keys(writableFields)) {
+      if (meta[k]) writableMeta[k] = meta[k];
+    }
     await deps.writeLeadFields({
       listId,
       leadId: lead.leadId,
       fields: writableFields,
-      meta,
+      meta: writableMeta,
     });
   }
 

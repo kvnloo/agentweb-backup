@@ -85,21 +85,21 @@ describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
 // ─── Failure paths (TDD: cover the unhappy branches first) ────────────────────
 
 describe('resolveIdentity — failure paths', () => {
-  it("returns { ok: false, reason: 'no_email' } when lead has no email", async () => {
+  it("returns { ok: false, reason: 'no_identity_signal' } when lead has no email", async () => {
     const deps = makeDeps();
     const result = await resolveIdentity(
       makeInput({ lead: { leadId: LEAD_ID } }),
       deps,
     );
 
-    expect(result).toEqual({ ok: false, reason: 'no_email' });
+    expect(result).toEqual({ ok: false, reason: 'no_identity_signal' });
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
     expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
 
-  it("returns { ok: false, reason: 'no_email' } when email is empty string", async () => {
+  it("returns { ok: false, reason: 'no_identity_signal' } when email is empty string", async () => {
     const deps = makeDeps();
     const result = await resolveIdentity(
       makeInput({ lead: { leadId: LEAD_ID, email: '   ' } }),
@@ -107,7 +107,7 @@ describe('resolveIdentity — failure paths', () => {
     );
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe('no_email');
+    if (!result.ok) expect(result.reason).toBe('no_identity_signal');
   });
 
   it("returns 'identity_unresolvable' when person fields requested AND all sources miss", async () => {

@@ -296,3 +296,160 @@ describe('resolveIdentity — Tier 0 per-field best-of-N merge', () => {
     expect(result.resolved.lastName).toBe('Doe');
   });
 });
+
+// ─── Regression tests for review-identified bugs ─────────────────────────────
+
+describe('resolveIdentity — Tier 0 fills are not silently overwritten', () => {
+  it('Bug 1: step 2 (LinkedIn-first Apollo) does NOT overwrite Tier 0 firstName/lastName/title when sibling had no email', async () => {
+    // Sibling has names + title but no email → Tier 0 fills names but
+    // doesn't fill email → local `email` stays '' → step 2 fires.
+    // Apollo people-match by linkedin returns different values. Must NOT clobber Tier 0.
+    const sib: SiblingLeadResult = {
+      leadId: 'sib-1', listId: 'list-1', userId: 'user-1',
+      firstName: 'TierZero', lastName: 'TierZero', title: 'TierZeroTitle',
+      // intentionally no email — forces step 2 gate to fire
+    };
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([sib]),
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'ApolloFirst', lastName: 'ApolloLast', title: 'ApolloTitle',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, linkedin: 'https://linkedin.com/in/x' } as LeadRecord,
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.firstName).toBe('TierZero');
+    expect(result.resolved.lastName).toBe('TierZero');
+    expect(result.resolved.title).toBe('TierZeroTitle');
+  });
+
+  it('Bug 2: step 4 (Apollo people-by-email) does NOT overwrite Tier 0 linkedin', async () => {
+    // Sibling has linkedin only (no names) → personStillMissing is true → step 4 fires.
+    // Apollo returns names AND a different linkedin — Apollo's linkedin must not clobber.
+    const sib: SiblingLeadResult = {
+      leadId: 'sib-1', listId: 'list-1', userId: 'user-1',
+      linkedin: 'https://linkedin.com/in/tierzero-linkedin',
+    };
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([sib]),
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe',
+        linkedin: 'https://linkedin.com/in/apollo-different',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' } as LeadRecord,
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.firstName).toBe('Jane');                                     // from Apollo (Tier 0 didn't have it)
+    expect(result.resolved.linkedin).toBe('https://linkedin.com/in/tierzero-linkedin'); // from Tier 0, preserved
+  });
+
+  it('Bug 3: Apollo throw preserves Tier 0 fills instead of discarding them', async () => {
+    // Tier 0 fills all required identity fields. Apollo people-match throws.
+    // The resolver must return ok:true with the Tier 0 data, not bubble the error.
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([makeSibling()]),
+      apolloPeopleMatch: jest.fn().mockRejectedValue(new Error('Apollo 500')),
+      apolloOrgMatch: jest.fn().mockRejectedValue(new Error('Apollo 500')),
+    });
+    const result = await resolveIdentity(
+      makeInput({ lead: { leadId: LEAD_ID, email: 'jane@acme.com' } as LeadRecord }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.firstName).toBe('Jane');
+    expect(result.resolved.lastName).toBe('Doe');
+    expect(result.resolved.company).toBe('Acme');
+  });
+
+  it('Bug 3: enrich.so throw preserves prior fills', async () => {
+    // Tier 0 fills names. Apollo people works. Apollo org returns nothing.
+    // enrich.so throws — the resolver must still return ok:true with the
+    // company missing only iff needsCompanyFields was true.
+    // We assert resolved is preserved regardless of completeness gate.
+    const sib: SiblingLeadResult = {
+      leadId: 'sib-1', listId: 'list-1', userId: 'user-1',
+      firstName: 'Jane', lastName: 'Doe',
+    };
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([sib]),
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
+      apolloOrgMatch: jest.fn().mockResolvedValue(null),
+      enrichSoReverseLookup: jest.fn().mockRejectedValue(new Error('enrich.so 503')),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' } as LeadRecord,
+        needsCompanyFields: false,   // don't fail on missing company
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('resolveIdentity — cosmetic fixes', () => {
+  it("returns reason 'no_identity_signal' when no email, linkedin, or name available", async () => {
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({ lead: { leadId: LEAD_ID } as LeadRecord }),
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('no_identity_signal');
+  });
+
+  it('lowercases email before passing to deps so cache keys are normalized', async () => {
+    const findSpy = jest.fn().mockResolvedValue([]);
+    const apolloSpy = jest.fn().mockResolvedValue({ firstName: 'Jane', lastName: 'Doe' });
+    const deps = makeDeps({
+      findSiblingLeads: findSpy,
+      apolloPeopleMatch: apolloSpy,
+    });
+    await resolveIdentity(
+      makeInput({
+        needsCompanyFields: false,
+        lead: { leadId: LEAD_ID, email: '  Jane@ACME.com  ' } as LeadRecord,
+      }),
+      deps,
+    );
+    expect(findSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
+    expect(apolloSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
+  });
+
+  it('reads enrich.so firstName/lastName when Tier 0 + Apollo did not fill them', async () => {
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([]),
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
+      apolloOrgMatch: jest.fn().mockResolvedValue(null),
+      enrichSoReverseLookup: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' } as LeadRecord,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.firstName).toBe('Jane');
+    expect(result.resolved.lastName).toBe('Doe');
+    expect(result.resolved.company).toBe('Acme');
+  });
+});
