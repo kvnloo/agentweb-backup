@@ -1,6 +1,6 @@
 import { chatbotDb, ChatSession } from "./chatbotService";
 
-const SUMMARY_MODEL = "gemini-3.1-flash-lite-preview";
+const SUMMARY_MODEL = "gemini-3.1-flash-lite";
 const MAX_MESSAGES_FOR_SUMMARY = 50;
 const MIN_USER_MESSAGES = 1;
 const SUMMARY_TIMEOUT_MS = 20000;

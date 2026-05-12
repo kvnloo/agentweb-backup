@@ -191,17 +191,17 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should include Gemini 3.1 Flash Lite Preview in the supported models', async () => {
       const models = await agentModeService.getSupportedModels();
-      expect(models).toContain('gemini-3.1-flash-lite-preview');
+      expect(models).toContain('gemini-3.1-flash-lite');
     });
 
     it('should have temperature support enabled for Gemini 3.1 Flash Lite Preview', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-flash-lite-preview'].supportsTemperature).toBe(true);
+      expect(llmModels['gemini-3.1-flash-lite'].supportsTemperature).toBe(true);
     });
 
     it('should have null client initially for Gemini 3.1 Flash Lite Preview (lazy-loaded)', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-flash-lite-preview'].client).toBeNull();
+      expect(llmModels['gemini-3.1-flash-lite'].client).toBeNull();
     });
 
     it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
@@ -399,7 +399,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.1-pro-preview'].client).toBe(mockGeminiClient);
     });
 
-    it('should lazy-load Gemini client for gemini-3.1-flash-lite-preview on first callLLM', async () => {
+    it('should lazy-load Gemini client for gemini-3.1-flash-lite on first callLLM', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'test response' } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
@@ -413,12 +413,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         { role: 'user', content: 'Hello' },
       ];
 
-      await (agentModeService as any).callLLM('gemini-3.1-flash-lite-preview', messages);
+      await (agentModeService as any).callLLM('gemini-3.1-flash-lite', messages);
 
       expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
 
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-flash-lite-preview'].client).toBe(mockGeminiClient);
+      expect(llmModels['gemini-3.1-flash-lite'].client).toBe(mockGeminiClient);
     });
   });
 
