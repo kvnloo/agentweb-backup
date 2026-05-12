@@ -33,8 +33,12 @@ import { createLLMService } from '../utils/llmService';
 
 // Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
 // `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
-const EXTRACT_MODEL = process.env.CRM_ENRICH_V3_EXTRACT_MODEL || 'gpt-5-chat-2';
-const CRITIC_MODEL  = process.env.CRM_ENRICH_V3_CRITIC_MODEL  || 'gpt-5-chat-2';
+const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
+const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
+// Model used for Tier 4 web extraction — must support web search tool.
+// Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
+// or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
+const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRACT_MODEL;
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
@@ -315,11 +319,6 @@ async function extractFieldsViaLLMReal(input: {
     return `- ${name}${instr ? `: ${instr}` : ''}`;
   }).join('\n');
 
-  const systemPrompt =
-    `You extract structured CRM data from the provided context. Return strict JSON: ` +
-    `an object with one key per requested field. Use null when the value isn't ` +
-    `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
-
   const leadContext = JSON.stringify({
     email: input.lead.email,
     company: input.lead.company,
@@ -328,6 +327,19 @@ async function extractFieldsViaLLMReal(input: {
     lastName: input.lead.lastName,
   });
 
+  const isWebTier = input.tier === 'web';
+
+  const systemPrompt = isWebTier
+    ? `You extract structured CRM data for a given lead. Follow this priority order:\n` +
+      `1. Extract from the provided web context if the information is clearly present.\n` +
+      `2. If information is missing or insufficient, use your web search capability to look it up.\n` +
+      `3. If web search yields no result, use your own training knowledge if you are FULLY confident.\n` +
+      `4. If you do not know a value with confidence, return null for that field.\n` +
+      `NEVER guess, infer, or fabricate. Return strict JSON only, strings only, no markdown.`
+    : `You extract structured CRM data from the provided context. Return strict JSON: ` +
+      `an object with one key per requested field. Use null when the value isn't ` +
+      `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
+
   const userPrompt =
     `Lead: ${leadContext}\n\n` +
     `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
@@ -335,8 +347,14 @@ async function extractFieldsViaLLMReal(input: {
     `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose.`;
 
   try {
-    const llm = createLLMService(EXTRACT_MODEL, 0.0);
-    const parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
+    let parsed: Record<string, any>;
+    if (isWebTier) {
+      const llm = createLLMService(WEB_SEARCH_MODEL, 0.0);
+      parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt);
+    } else {
+      const llm = createLLMService(EXTRACT_MODEL, 0.0);
+      parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
+    }
     const filled: Record<string, string> = {};
     const missing: string[] = [];
     for (const field of input.fields) {
