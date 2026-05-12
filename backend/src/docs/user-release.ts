@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-12',
     changes: [
+      'Fixed: Research Report Preview No Longer Freezes on Open',
+      '- Previously, opening the HTML report preview dialog would trigger an immediate background fetch of the full HTML file from S3, causing the iframe to re-render twice and freeze the UI for large reports',
+      '- The HTML source is now only fetched when the user explicitly switches to the Editor tab — the default Agentic Revision view loads instantly via the report\'s direct URL',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
       'Admin: Display Name Editable in Users Tab',
       '- Admins can now set a display name for any user directly from the Users tab in the Admin Dashboard',
       '- The display name appears in the customer portal Organization tab, replacing the email fallback for users who did not sign up via Google',
