@@ -5313,9 +5313,6 @@ export const crmDb = {
             company: lead.company || '',
             title: lead.title || '',
             notes: lead.notes || '',
-            // Store LinkedIn URL in canonical form so future dedup reads match
-            // regardless of the source's formatting (Unipile, CSV upload, manual entry).
-            linkedin: normalizeLinkedInUrl(lead.linkedin),
             companyLinkedin: lead.companyLinkedin?.trim() || '',
             customFields: lead.customFields || {},
             syncMetadata: lead.syncMetadata || {},
@@ -5326,9 +5323,15 @@ export const crmDb = {
             updatedAt: new Date().toISOString(),
           };
 
-          // Only include email if it's provided (GSI key cannot be empty string)
+          // Only include email/linkedin if non-empty — GSI key cannot be empty string
           if (emailValue) {
             item.email = emailValue;
+          }
+          // Store LinkedIn URL in canonical form so future dedup reads match
+          // regardless of the source's formatting (Unipile, CSV upload, manual entry).
+          const linkedinValue = normalizeLinkedInUrl(lead.linkedin);
+          if (linkedinValue) {
+            item.linkedin = linkedinValue;
           }
           if (lead.status) {
             item.status = lead.status;
