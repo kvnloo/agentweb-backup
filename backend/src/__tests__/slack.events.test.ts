@@ -54,7 +54,7 @@ jest.mock('../services/slackService', () => {
     deleteSlackMessage: jest.fn().mockResolvedValue(undefined),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('John Doe'),
     downloadSlackFile: jest.fn().mockResolvedValue(Buffer.from('file-content')),
-    formatSlackHistoryAsContext: jest.fn().mockResolvedValue('Slack channel conversation history for #general:\n\n[2026-01-01T00:00:00.000Z] Harsha: As far as I\'m aware, here is our current pipeline'),
+    formatSlackHistoryAsContext: jest.fn().mockResolvedValue('Context from recent Slack conversation in #general:\n\nHarsha is discussing the current pipeline with the team. Key prospect data and pricing were mentioned.'),
   };
 });
 
@@ -155,10 +155,10 @@ describe('Slack Events API', () => {
       const { formatSlackHistoryAsContext } = require('../services/slackService');
       expect(formatSlackHistoryAsContext).toHaveBeenCalledWith('C12345');
 
-      // Verify session creation with channel history as pageContent
+      // Verify session creation with summarized channel history as pageContent
       expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
         'user-123',
-        'Slack channel conversation history for #general:\n\n[2026-01-01T00:00:00.000Z] Harsha: As far as I\'m aware, here is our current pipeline',
+        'Context from recent Slack conversation in #general:\n\nHarsha is discussing the current pipeline with the team. Key prospect data and pricing were mentioned.',
         'agent',
         'slack-bot',
         undefined,
