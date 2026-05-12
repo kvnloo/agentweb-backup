@@ -23,9 +23,10 @@ The service-level `AW-EnrichmentRawCache` already dedupes at the **API-cost** la
 | Feature flag | None — Tier 0 self-gates on whether the GSIs return matches. Pre-backfill leads with missing `nameCompanyKey` simply don't appear in `NameCompanyIndex` (sparse). Email/linkedin existing columns mean those indexes light up immediately on GSI creation. |
 | Audit metadata | Yes — `EnrichedFieldMeta` records `siblingLeadId` + `siblingListId` + `siblingUserId` (cross-user traceability required for any future "data lineage" or "delete my data" workflow). |
 | `refreshFields` semantics | Tier 0 respects `refreshFields` (same way the waterfall's Tier 1 does) |
-| Multiple sibling matches | Take the freshest by `updatedAt desc` |
+| Multiple sibling matches | **Per-field best-of-N merge** — for each field, walk all candidates freshest-first and take the first non-empty value. Different fields may come from different siblings. |
+| GSI query strategy | All three GSIs (Email/Linkedin/NameCompany) queried **in parallel**, results combined + deduped by leadId, sorted by `updatedAt` desc, capped at 30. |
 | Overwrite policy | Tier 0 fills empties only — never overwrites a non-empty lead value |
-| Self-match | `findSiblingLead` filters out the current `leadId` |
+| Self-match | `findSiblingLeads` filters out the current `leadId` |
 
 ### Privacy / business note
 
@@ -140,16 +141,16 @@ The UI has icons for each value at `customer-portal/src/components/crm/EnrichedV
 ### `backend/src/services/enrichmentIdentityResolver.ts`
 - Extend `IdentityResolverDeps`:
   ```ts
-  findSiblingLead(input: {
+  findSiblingLeads(input: {
     excludeLeadId: string;
     email?: string;
     linkedinUrl?: string;
     firstName?: string;
     lastName?: string;
     company?: string;
-  }): Promise<LeadRecord | null>;
+  }): Promise<SiblingLeadResult[]>;   // deduped, sorted freshest-first
   ```
-  Note: no `userId` parameter — cross-tenant lookup. The current lead's `userId` is only used by the resolver for AUDIT meta, not for filtering candidates.
+  Note: no `userId` parameter — cross-tenant lookup. Returns an array so the resolver can do per-field best-of-N merge across complementary siblings.
 - New **Step 1.5** in `resolveIdentity`, between current steps 1 (input check) and 2 (LinkedIn-first Apollo):
   - Skip if neither email nor linkedinUrl nor (firstName+lastName+company) is present (existing line-85 early return covers most of this)
   - Call `findSiblingLead` with all available keys
@@ -165,12 +166,11 @@ The UI has icons for each value at `customer-portal/src/components/crm/EnrichedV
 - Pass `refreshFields` set down to the resolver (currently only the waterfall sees it)
 
 ### `backend/src/services/enrichmentV3RealDeps.ts`
-- `buildIdentityDeps()` gets a new `findSiblingLead` impl:
-  1. Try email first (most precise) → `crmDb.findLeadsByEmail`
-  2. Try linkedinUrl on miss → `crmDb.findLeadsByLinkedin`
-  3. Try name+company on miss → `crmDb.findLeadsByNameCompany`
-  4. Filter out `excludeLeadId` (self-match)
-  5. Return the first survivor (already sorted by GSI sort key, freshest-first)
+- `buildIdentityDeps()` gets a new `findSiblingLeads` impl:
+  1. Query `crmDb.findLeadsByEmail`, `findLeadsByLinkedin`, `findLeadsByNameCompany` **in parallel** via `Promise.all`. Each is sparse and cheap; running all three avoids the short-circuit problem where an email match with empty fields beat a linkedin match with full data.
+  2. Combine the three result sets, dedupe by `leadId` (siblings can match multiple keys), filter out `excludeLeadId`.
+  3. Sort the unioned set by `updatedAt` desc so the resolver's per-field walk picks the most recent non-empty value per field.
+  4. Cap at 30 candidates to bound work when an email is unusually shared across tenants.
 
 ### `backend/src/scripts/backfill-leads-userid.ts` (new)
 - Build `listId → userId` map from `AW-Lists`
