@@ -194,6 +194,12 @@ function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> 
     const loc = [m.hqCity, m.hqState, m.hqCountry].filter(Boolean).join(', ');
     if (loc) out.hq_location = loc;
   }
+  if (m.hqRawAddress) out.hq_address = m.hqRawAddress;
+  if (m.phone) out.company_phone = m.phone;
+  if (m.twitterUrl) {
+    const handle = m.twitterUrl.replace(/\/$/, '').split('/').pop();
+    if (handle) out.twitter_handle = handle;
+  }
   return out;
 }
 
@@ -205,6 +211,8 @@ function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
   if (p.linkedin) out.linkedin_url = p.linkedin;
   if (p.email) out.email = p.email;
   if (p.phone) out.phone = p.phone;
+  if (p.seniority) out.seniority = p.seniority;
+  if (p.departments && p.departments.length) out.department = p.departments[0];
   // Compose location from city / state / country — Apollo returns these
   // separately but the canonical `location` field is a single string.
   const loc = [p.city, p.state, p.country].filter(Boolean).join(', ');
@@ -457,7 +465,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         if (!domain) return null;
         try {
           const result = await getApolloService().matchOrg(domain);
-          return result?.organization ? mapApolloOrgToCrmFields(result.organization) : null;
+          if (!result?.organization) return null;
+          return {
+            mapped: mapApolloOrgToCrmFields(result.organization),
+            raw: result.organizationRaw ?? null,
+          };
         } catch (err) {
           console.warn('[v3 deps] fetchApolloOrg failed:', (err as Error).message);
           throw err;
@@ -469,7 +481,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         if (!lead.email) return null;
         try {
           const result = await getApolloService().matchPerson({ email: lead.email });
-          return result?.match?.person ? mapApolloPersonToCrmFields(result.match.person) : null;
+          if (!result?.match?.person) return null;
+          return {
+            mapped: mapApolloPersonToCrmFields(result.match.person),
+            raw: result.personRaw ?? null,
+          };
         } catch (err) {
           console.warn('[v3 deps] fetchApolloPerson failed:', (err as Error).message);
           throw err;

@@ -15,6 +15,7 @@ import {
   type WaterfallDeps,
   type RunWaterfallInput,
   type ApolloFetchContext,
+  type ApolloFetchResult,
 } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
@@ -39,6 +40,10 @@ function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
     customFields: {},
     ...overrides,
   } as LeadRecord;
+}
+
+function apolloResult(mapped: Record<string, string>, raw: any = null): ApolloFetchResult {
+  return { mapped, raw };
 }
 
 function makeDeps(overrides: Partial<WaterfallDeps> = {}): WaterfallDeps {
@@ -91,8 +96,8 @@ describe('APOLLO_GROUP_COVERAGE', () => {
     expect(APOLLO_GROUP_COVERAGE.intent_signals ?? []).toEqual([]);
   });
 
-  it('has ZERO coverage for company_social (web-only by design)', () => {
-    expect(APOLLO_GROUP_COVERAGE.company_social ?? []).toEqual([]);
+  it('covers twitter_handle in company_social', () => {
+    expect(APOLLO_GROUP_COVERAGE.company_social ?? []).toContain('twitter_handle');
   });
 
   it('has ZERO coverage for company_product (Apollo gap)', () => {
@@ -152,7 +157,7 @@ describe('runWaterfall — Tier 1 (CRM)', () => {
   it('falls through when CRM values are stale (older than group TTL)', async () => {
     // company_firmographic ttlDays = 180. Make values 200 days old → stale.
     const deps = makeDeps({
-      fetchApolloOrg: jest.fn().mockResolvedValue({ company_name: 'Acme Corp' }),
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({ company_name: 'Acme Corp' })),
     });
     const lead = makeLead({
       customFields: { company_name: 'Acme Old' },
@@ -174,7 +179,7 @@ describe('runWaterfall — Tier 1 (CRM)', () => {
 
   it('refreshFields bypasses Tier 1 even when CRM value is fresh', async () => {
     const deps = makeDeps({
-      fetchApolloOrg: jest.fn().mockResolvedValue({ company_name: 'Acme Refreshed' }),
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({ company_name: 'Acme Refreshed' })),
     });
     const lead = makeLead({
       customFields: { company_name: 'Acme Cached' },
@@ -196,7 +201,7 @@ describe('runWaterfall — Tier 1 (CRM)', () => {
 
   it('falls through when lead has the field key but empty value', async () => {
     const deps = makeDeps({
-      fetchApolloOrg: jest.fn().mockResolvedValue({ company_name: 'Acme Real' }),
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({ company_name: 'Acme Real' })),
     });
     const lead = makeLead({
       customFields: { company_name: '' },
@@ -218,9 +223,9 @@ describe('runWaterfall — Tier 1 (CRM)', () => {
 describe('runWaterfall — Tier 2 (Apollo)', () => {
   it('Apollo hit covers all residuals → no Tier 3, no Tier 4', async () => {
     const deps = makeDeps({
-      fetchApolloOrg: jest.fn().mockResolvedValue({
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({
         company_name: 'Acme Corp', industry: 'SaaS',
-      }),
+      })),
     });
     const result = await runWaterfall(
       makeInput({ requestedFields: ['company_name', 'industry'] }),
@@ -263,9 +268,10 @@ describe('runWaterfall — Tier 3 (LLM over Apollo)', () => {
   it('runs LLM reconciliation when Apollo non-null AND residuals within Apollo coverage', async () => {
     // Apollo returns company_name directly but does NOT structure tech_stack — Tier 3
     // LLM picks tech_stack from Apollo's free-text fields.
-    const apolloData = { company_name: 'Acme', _rawTechBlob: 'AWS HubSpot Stripe' };
+    const apolloMapped = { company_name: 'Acme' };
+    const apolloRaw = { company_name: 'Acme', _rawTechBlob: 'AWS HubSpot Stripe' };
     const deps = makeDeps({
-      fetchApolloOrg: jest.fn().mockResolvedValue(apolloData),
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult(apolloMapped, apolloRaw)),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
         filled: { tech_stack: 'AWS, HubSpot, Stripe' },
         missing: [],
@@ -315,7 +321,7 @@ describe('runWaterfall — Tier 3 (LLM over Apollo)', () => {
     // company_technographic but NOT in APOLLO_GROUP_COVERAGE.company_technographic.
     // Apollo returns null for crm_used (not in coverage). Tier 3 has nothing to reconcile.
     const deps = makeDeps({
-      fetchApolloOrg: jest.fn().mockResolvedValue({ tech_stack: 'AWS' }),
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({ tech_stack: 'AWS' })),
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp...' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
         filled: { crm_used: 'HubSpot' }, missing: [],
@@ -480,7 +486,7 @@ describe('runWaterfall — Apollo memoization (per-lead-per-entity)', () => {
 
   it('person and org Apollo contexts are independent (one failing does not affect the other)', async () => {
     const orgMock = jest.fn().mockRejectedValue(new Error('Apollo org down'));
-    const personMock = jest.fn().mockResolvedValue({ first_name: 'Jane', last_name: 'Doe' });
+    const personMock = jest.fn().mockResolvedValue(apolloResult({ first_name: 'Jane', last_name: 'Doe' }));
     const deps = makeDeps({
       fetchApolloOrg: orgMock,
       fetchApolloPerson: personMock,

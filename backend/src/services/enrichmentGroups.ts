@@ -54,7 +54,7 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
     fields: [
       'company_name', 'website', 'industry', 'employee_count',
       'founded_year', 'hq_location', 'company_description',
-      'company_type', 'company_linkedin_url',
+      'company_type', 'company_linkedin_url', 'company_phone',
     ],
     sources: ['web_search'],
     searchTemplate: '{{emailDomain}} company overview',

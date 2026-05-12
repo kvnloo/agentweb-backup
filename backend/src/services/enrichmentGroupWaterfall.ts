@@ -28,6 +28,7 @@ export const APOLLO_GROUP_COVERAGE: Record<string, string[]> = {
   company_firmographic: [
     'company_name', 'website', 'industry', 'employee_count',
     'founded_year', 'hq_location', 'company_description', 'company_linkedin_url',
+    'company_phone',
   ],
   company_financial: [
     'revenue_range', 'funding_stage', 'total_funding', 'last_funding_date',
@@ -35,14 +36,17 @@ export const APOLLO_GROUP_COVERAGE: Record<string, string[]> = {
   company_technographic: [
     'tech_stack',
   ],
-  company_social: [],           // verified zero coverage
+  company_social: [
+    'twitter_handle',
+  ],
   intent_signals: [],           // verified zero coverage (volatile data)
   company_geography: [
-    'country', 'region',
+    'country', 'region', 'hq_address',
   ],
   company_product: [],          // verified zero coverage
   person_identity: [
     'first_name', 'last_name', 'title', 'linkedin_url', 'email', 'phone',
+    'seniority', 'department',
   ],
   person_career: [],            // weak coverage in Phase 1 — treat as empty
 };
@@ -52,6 +56,8 @@ export const APOLLO_GROUP_COVERAGE: Record<string, string[]> = {
 export interface ApolloFetchContext {
   orgRaw: Record<string, string> | null;
   personRaw: Record<string, string> | null;
+  orgRawJson: any;
+  personRawJson: any;
   orgFetchAttempted: boolean;
   personFetchAttempted: boolean;
   orgFetchFailed: boolean;
@@ -62,6 +68,8 @@ export function createApolloFetchContext(): ApolloFetchContext {
   return {
     orgRaw: null,
     personRaw: null,
+    orgRawJson: null,
+    personRawJson: null,
     orgFetchAttempted: false,
     personFetchAttempted: false,
     orgFetchFailed: false,
@@ -97,9 +105,14 @@ export interface LLMExtractResult {
   missing: string[];
 }
 
+export interface ApolloFetchResult {
+  mapped: Record<string, string>;
+  raw: any;
+}
+
 export interface WaterfallDeps {
-  fetchApolloOrg(lead: LeadRecord): Promise<Record<string, string> | null>;
-  fetchApolloPerson(lead: LeadRecord): Promise<Record<string, string> | null>;
+  fetchApolloOrg(lead: LeadRecord): Promise<ApolloFetchResult | null>;
+  fetchApolloPerson(lead: LeadRecord): Promise<ApolloFetchResult | null>;
   extractFieldsViaLLM(input: LLMExtractInput): Promise<LLMExtractResult>;
   fetchWebForGroup(
     lead: LeadRecord,
@@ -135,7 +148,9 @@ async function ensureApolloFetched(
     if (ctx.orgFetchAttempted) return ctx.orgRaw;
     ctx.orgFetchAttempted = true;
     try {
-      ctx.orgRaw = await deps.fetchApolloOrg(lead);
+      const result = await deps.fetchApolloOrg(lead);
+      ctx.orgRaw = result?.mapped ?? null;
+      ctx.orgRawJson = result?.raw ?? null;
       return ctx.orgRaw;
     } catch {
       ctx.orgFetchFailed = true;
@@ -146,7 +161,9 @@ async function ensureApolloFetched(
   if (ctx.personFetchAttempted) return ctx.personRaw;
   ctx.personFetchAttempted = true;
   try {
-    ctx.personRaw = await deps.fetchApolloPerson(lead);
+    const result = await deps.fetchApolloPerson(lead);
+    ctx.personRaw = result?.mapped ?? null;
+    ctx.personRawJson = result?.raw ?? null;
     return ctx.personRaw;
   } catch {
     ctx.personFetchFailed = true;
@@ -251,14 +268,27 @@ export async function runWaterfall(
   filled.push(...apolloHits);
   remaining = remaining.filter(f => !apolloHits.find(a => a.field === f));
 
-  // ─ Tier 3: LLM over Apollo context ─────────────────────────────────────────
-  // Only when Apollo returned data AND residuals are within Apollo's coverage.
+  // ─ Tier 3: LLM over full Apollo context ────────────────────────────────────
+  // Uses the raw Apollo JSON (not the pre-mapped subset) so LLM can extract
+  // fields we don't explicitly map in Tier 2 (e.g. raw_address, phone, etc.).
+  // Noisy / large keys are stripped before sending to reduce token cost.
+  const STRIP_ORG_KEYS = new Set(['suborganizations', 'current_technologies', 'keywords']);
+  const STRIP_PERSON_KEYS = new Set(['employment_history']);
+
   let tier3Fills = 0;
   if (apolloRaw && remaining.some(f => coverage.includes(f))) {
     const tier3Targets = remaining.filter(f => coverage.includes(f));
+    const entityType = groupEntityType(groupName);
+    const rawJson = entityType === 'person' ? apolloCtx.personRawJson : apolloCtx.orgRawJson;
+    const stripKeys = entityType === 'person' ? STRIP_PERSON_KEYS : STRIP_ORG_KEYS;
+    const sourceContext = rawJson
+      ? JSON.stringify(Object.fromEntries(
+          Object.entries(rawJson).filter(([k]) => !stripKeys.has(k)),
+        ))
+      : JSON.stringify(apolloRaw);
     const llmResult = await deps.extractFieldsViaLLM({
       tier: 'apollo',
-      sourceContext: JSON.stringify(apolloRaw),
+      sourceContext,
       fields: tier3Targets,
       groupName,
       lead,

@@ -42,6 +42,7 @@ import type { ApolloQuotaTracker } from './apolloQuota';
 export interface MatchResult {
   found: boolean;
   match?: MappedMatch;
+  personRaw?: any;
   fromCache: boolean;
   checkedAt: string;
 }
@@ -64,6 +65,7 @@ export interface FindResult {
 export interface OrgResult {
   found: boolean;
   organization?: MappedOrganization;
+  organizationRaw?: any;
   fromCache: boolean;
   checkedAt: string;
 }
@@ -329,6 +331,7 @@ export class ApolloService {
     return {
       found: true,
       match: mapped,
+      personRaw: result.row.rawData?.person ?? result.row.rawData ?? undefined,
       fromCache: result.fromCache,
       checkedAt: result.row.fetchedAt,
     };
@@ -439,6 +442,7 @@ export class ApolloService {
     return {
       found: true,
       organization: mapApolloOrganization(orgRaw),
+      organizationRaw: orgRaw ?? undefined,
       fromCache: result.fromCache,
       checkedAt: result.row.fetchedAt,
     };

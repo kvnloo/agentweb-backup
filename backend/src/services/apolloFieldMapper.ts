@@ -65,8 +65,11 @@ export interface MappedOrganization {
   hqCity?: string;
   hqState?: string;
   hqCountry?: string;
+  hqRawAddress?: string;
   websiteUrl?: string;
   linkedinUrl?: string;
+  twitterUrl?: string;
+  phone?: string;
   shortDescription?: string;
 }
 
@@ -228,8 +231,11 @@ export function mapApolloOrganization(apolloOrg: any): MappedOrganization {
     hqCity: strOrUndef(o.city),
     hqState: strOrUndef(o.state),
     hqCountry: strOrUndef(o.country),
+    hqRawAddress: strOrUndef(o.raw_address),
     websiteUrl: strOrUndef(o.website_url),
     linkedinUrl: strOrUndef(o.linkedin_url),
+    twitterUrl: strOrUndef(o.twitter_url),
+    phone: strOrUndef(o.sanitized_phone) ?? strOrUndef(o.phone),
     shortDescription: strOrUndef(o.short_description) ?? strOrUndef(o.seo_description),
   };
 }

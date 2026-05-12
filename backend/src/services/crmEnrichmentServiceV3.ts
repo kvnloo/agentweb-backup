@@ -15,6 +15,7 @@ import {
   type FieldFill,
   type ApolloFetchContext,
 } from './enrichmentGroupWaterfall';
+import { normalizeFills } from './enrichmentNormalizer';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import type { LeadRecord, SocketEmitFn } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
@@ -474,24 +475,9 @@ async function writeLeadOutcome(
   };
 
   try {
-    if (fillIfEmpty.length > 0) {
-      const split = splitBucket(fillIfEmpty);
-      await deps.setLeadFields({
-        listId: input.listId,
-        leadId: lead.leadId,
-        topLevel: split.topLevel,
-        customFields: split.customFields,
-        enrichmentMetadata: split.enrichmentMetadata,
-        // `fill_if_empty` is now enforced app-side by `leadValueIsEmpty`
-        // (treats both missing and empty-string as empty). We can write
-        // unconditionally at DDB level — bucketByOverwritePolicy already
-        // dropped fields where the lead has a non-empty value.
-        ifNotExists: false,
-      });
-    }
-
-    if (alwaysOverwrite.length > 0) {
-      const split = splitBucket(alwaysOverwrite);
+    const allFills = [...fillIfEmpty, ...alwaysOverwrite];
+    if (allFills.length > 0) {
+      const split = splitBucket(allFills);
       await deps.setLeadFields({
         listId: input.listId,
         leadId: lead.leadId,
@@ -541,7 +527,11 @@ export async function runEnrichment(
   const { routing, needsPerson, needsCompany } = routeFields(input.config);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
-  for (const f of input.config.fields) configFieldsByName[f.name] = f;
+  const fieldAliasMap: Record<string, string> = {};
+  for (const f of input.config.fields) {
+    configFieldsByName[f.name] = f;
+    if (f.aliasFor) fieldAliasMap[f.name] = f.aliasFor;
+  }
 
   const includedFieldNames = input.config.fields
     .filter(f => f.include)
@@ -602,8 +592,7 @@ export async function runEnrichment(
 
     for (const { lead, outcome } of outcomes) {
       // Apollo failures are independent of pass/fail — count them regardless of outcome.
-      if (outcome.apolloOrgFailed) apolloFailed += 1;
-      if (outcome.apolloPersonFailed) apolloFailed += 1;
+      if (outcome.apolloOrgFailed || outcome.apolloPersonFailed) apolloFailed += 1;
 
       // Aggregate tier counts only on success or partial success — failed leads
       // (identity / waterfall errors) contribute nothing useful to the breakdown.
@@ -629,6 +618,8 @@ export async function runEnrichment(
         case null:
           break;     // success path falls through
       }
+
+      outcome.fills = normalizeFills(outcome.fills, fieldAliasMap);
 
       if (input.mode === 'preview') {
         const extractedFields: Record<string, string> = {};
