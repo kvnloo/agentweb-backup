@@ -335,7 +335,7 @@ emmaToolRegistry.register({
     }
 
     // Probe the worker with a trivial task — this catches a hung worker that still serves /health.
-    // Codex startup alone can take 60s, so use a generous 120s HTTP timeout with a 90s task timeout.
+    // The relay is single-threaded; if it's mid-task it won't respond until it finishes, so allow 120s.
     let taskResponse: { status: number; data: string };
     try {
       taskResponse = await httpRequest('POST', base + '/task', config.apiKey, {
