@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-12',
     changes: [
+      'CRM Sequences: LinkedIn DM Steps Now Supported',
+      '- Drip sequences now support LinkedIn direct message steps alongside email steps — mix and match in any order',
+      '- Each step has an Email / LinkedIn channel toggle; LinkedIn steps show a message text field with variable support ({{firstName}}, {{lastName}}, {{company}})',
+      '- The sequences list shows channel badges (✉ / LinkedIn icon) so you can see at a glance which channels a sequence uses',
+      '- LinkedIn steps automatically resolve the connected Unipile outreach account; leads must have a LinkedIn URL set on their record',
+      '- Pre-save verification skips the email sender check for LinkedIn-only sequences',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
       'Fixed: Research Report Preview No Longer Freezes on Open',
       '- Previously, opening the HTML report preview dialog would trigger an immediate background fetch of the full HTML file from S3, causing the iframe to re-render twice and freeze the UI for large reports',
       '- The HTML source is now only fetched when the user explicitly switches to the Editor tab — the default Agentic Revision view loads instantly via the report\'s direct URL',
