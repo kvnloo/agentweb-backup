@@ -23,6 +23,11 @@ jest.mock('../utils/crypto', () => ({
   decryptPassword: (...args: any[]) => mockDecryptPassword(...args),
 }));
 
+const mockGetForeplayApiKey = jest.fn().mockResolvedValue(null);
+jest.mock('../utils/secretsManager', () => ({
+  getForeplayApiKey: (...args: any[]) => mockGetForeplayApiKey(...args),
+}));
+
 jest.mock('axios');
 
 jest.mock('../middleware/auth', () => ({

@@ -4243,3 +4243,40 @@ By ensuring these tools are present in the DB-configured foundation tools list, 
 ### Why This Helps (and Its Limits)
 
 Guaranteeing tool availability prevents the "tool not available" failure mode, but does not prevent the LLM from choosing not to call the tool. The prompt instruction at line 306 remains the primary enforcement mechanism. If the "forgot brand" pattern recurs, the next step is **Option C** from the investigation: programmatic pre-flight injection of brand context into the context window at session start (same pattern as account memory injection at `agentModeService.ts:1635`), making brand context available without requiring any LLM tool call decision.
+
+## Real Browser vs Headless for Emma (2026-05-12)
+
+### Background
+
+Emma uses `@playwright/mcp` as its browser automation tool, configured via the MCP Servers tab in the admin panel. The question was whether Emma could be switched to use a real (non-headless) Chrome instead of headless Playwright.
+
+### How Playwright MCP is Launched
+
+When the backend spawns a Playwright MCP stdio server, `mcpClientService.ts` (`createStdioTransport`, ~line 787) auto-detects the `@playwright/mcp` package and unconditionally injects `--headless`, `--no-sandbox`, and `--isolated` flags — even if the admin-panel config doesn't include them. The injection guard is:
+
+```typescript
+if (!resolvedArgs.includes('--headless')) {
+  resolvedArgs.push('--headless');
+}
+```
+
+So removing `--headless` from the MCP server config in the admin panel has no effect — the code re-adds it.
+
+### Why Truly Headed Chrome Is Not Feasible on EB
+
+The backend runs on AWS Elastic Beanstalk with no display server. A headed Chrome requires a real or virtual display (X11/Xvfb). Even with Xvfb it is still a virtual framebuffer, not a real browser, and adds significant operational complexity to the EB platform config.
+
+### Bot Detection Mitigation Already in Place
+
+The code already injects an extensive stealth script into every Playwright MCP session via a config file (`/tmp/playwright-mcp-configs/{key}.json`). It patches `navigator.webdriver`, `userAgentData`, `navigator.plugins`, `screen.colorDepth`, `document.visibilityState`, `IntersectionObserver`, and more. For most sites this is sufficient to avoid headless detection without needing a real browser.
+
+### Using a Real Browser via the Local Agent
+
+For use cases that genuinely need a real browser — particularly **testing or scraping public sites where no login is required** — the `run_local_agent_task` tool is the right path. This tool runs a task through the local agent relay (`local-agent-relay/`), which launches Playwright with `headless=False` against the user's local Chrome profile (`~/.codex-relay/chrome-profile`). Because the local agent runs on the user's machine, it has access to a real display and a persistent browser profile.
+
+Relevant code: `local-agent-relay/src/codex_relay/browser.py`, `load_page_with_playwright()` at line 76 (`headless=False` by default, persistent profile via `profile_dir`).
+
+**When to use `run_local_agent_task` vs Playwright MCP:**
+- Public sites, no auth needed, real browser fidelity required → `run_local_agent_task`
+- Any site where the user's saved cookies/session matter → `run_local_agent_task`
+- Most automation tasks, API calls, content generation → Playwright MCP (headless, faster, no local agent needed)

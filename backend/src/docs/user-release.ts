@@ -9,6 +9,57 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Video Agent Now Stitches Clips in the Correct Shot Order',
+      '- Previously, when an AI video agent generated multiple clips individually (rather than in a single call), the final composed video could stitch shots out of narrative order — e.g. S3 appearing at position 8 instead of position 3',
+      '- Root cause: the agent was passing clip URLs to the compose step in the order they appeared in context (generation order), not in shot order',
+      '- The compose_video tool now includes an explicit ordering requirement: the agent must build a shot-number manifest (S1, S2, S3...) and verify ascending order before composing',
+      '- The Video Production skill prompt has been updated with a mandatory pre-compose checklist enforcing this',
+      '- Haven users: your 30s Meta ad has been re-composed in the correct S1→S8 sequence',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'Admin: Connected Accounts Tab Added to Admin Dashboard',
+      '- A new Connected Accounts tab is available in the Admin Dashboard showing all Unipile (LinkedIn Outreach) accounts across all users',
+      '- Each row shows the user email, account name, account ID, and live Unipile connection status (OK / ERROR / UNKNOWN)',
+      '- Orphaned accounts — those that exist in Unipile but have no matching AgentWeb user (e.g. after a user was deleted or a disconnect failed) — are now surfaced with an ORPHAN status and highlighted in red',
+      '- Admins can force-delete any account directly from the tab, removing it from both the Unipile API and the AgentWeb database',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'Fixed: Scheduled Chat Results Now Always Appear in the Chat View',
+      '- Previously, if a scheduled chat generated a very large response (e.g. a detailed HTML report), the final message could silently fail to save — the email arrived correctly but the chat page showed no response',
+      '- The root cause was an oversized DynamoDB item exceeding the 400KB limit; the fix now correctly detects and truncates oversized messages regardless of content format',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'Improved: Foreplay Ad Library Now Available Platform-Wide',
+      '- The Foreplay Ad Library in the Knowledge Base is now active for all users without any setup required',
+      '- Previously, each user had to connect their own Foreplay API key to use swipefile and board search in agent mode',
+      '- A platform-wide Foreplay account is now used as a fallback, so AI agents can search and read Foreplay ads out of the box',
+      '- Users who connect their own Foreplay API key (via the Knowledge Base page) will continue to use their personal account — the platform key only applies when no personal key is configured',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Report Type Classification on the Reports Page',
+      '- All HTML reports are now automatically classified into one of three types: Creative, Research, or Performance',
+      '- Classification is powered by Gemini 3.1 Flash Lite and uses the report filename and content to determine the type',
+      '- A type badge (purple for Creative, blue for Research, orange for Performance) now appears on every report card',
+      '- Click the badge to manually override the type if the auto-classification is incorrect — the change is saved immediately',
+      '- Use the new All / Creative / Research / Performance tabs at the top of the Reports page to filter by type',
+      '- Existing reports are classified lazily on first page load and the result is cached, so you only pay the classification cost once per report',
+    ],
+  },
+  {
     date: '2026-05-11',
     changes: [
       'New: Inject Your Own Google Tag Manager Container into Landing Pages',
@@ -26,6 +77,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- If you have a LinkedIn outreach account connected, you can designate one as the default sender for LinkedIn messages',
       '- When sending a LinkedIn message from a lead, the configured default account is used automatically — no more relying on auto-resolution',
       '- If no default is set, the existing fallback behavior (your connected account, then a shared account) still applies',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Manage Environment Variables for Landing Pages',
+      '- Each deployed landing page card now has an "Env Vars" button that opens a configuration panel',
+      '- Set reCAPTCHA v2 Site Key and Secret Key directly from the portal — no Vercel access needed',
+      '- Add custom environment variables with optional secret/encrypted storage for sensitive values',
+      '- Saving automatically triggers a redeployment so all changes take effect immediately',
+      '- Variables are scoped to the Vercel project, so landing pages sharing a project share the same environment',
     ],
   },
   {

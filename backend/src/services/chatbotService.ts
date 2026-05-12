@@ -221,7 +221,7 @@ export interface ChatSession {
   assetCache?: {
     images: Array<{ url: string; filename: string; generatedAt: string }>;
     videos: Array<{ url: string; filename: string; generatedAt: string }>;
-    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>;
+    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string; reportType?: 'creative' | 'research' | 'performance' }>;
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
@@ -626,15 +626,26 @@ export class ChatbotDB {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
           let safeMessage = message;
-          // Fast path: only check serialized size when content is large enough to matter
-          const contentLen = typeof message.content === 'string' ? message.content.length : 0;
-          if (contentLen > MAX_MESSAGE_CONTENT_SIZE) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized content (${contentLen} chars), truncating`);
-            safeMessage = {
-              ...message,
-              content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                + `\n\n[Truncated — original size: ${contentLen} chars]`,
-            };
+          // Check serialized item size — covers both string content and content-block arrays.
+          // DynamoDB hard limit is 400KB per item; we use 350KB as a safety margin.
+          const serializedLen = JSON.stringify(message).length;
+          if (serializedLen > MAX_MESSAGE_CONTENT_SIZE) {
+            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} chars), truncating`);
+            if (typeof message.content === 'string') {
+              safeMessage = {
+                ...message,
+                content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
+              };
+            } else {
+              // Content is an array of blocks — stringify it, truncate, store as plain string
+              const contentStr = JSON.stringify(message.content);
+              safeMessage = {
+                ...message,
+                content: contentStr.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
+              };
+            }
           }
           return {
             PutRequest: {
@@ -1983,6 +1994,52 @@ export class ChatbotDB {
       }).promise();
     } catch (error) {
       console.error(`Error persisting searchableTexts for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Persist reportType values for specific htmlReport entries in a session's assetCache.
+   */
+  async persistReportTypes(
+    sessionId: string,
+    updates: Array<{ url: string; reportType: 'creative' | 'research' | 'performance' }>,
+    force = false
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    try {
+      const result = await dynamodb.get({
+        TableName: this.tableName,
+        Key: { sessionId },
+        ProjectionExpression: 'assetCache',
+      }).promise();
+
+      const item = result.Item as any;
+      if (!item?.assetCache) return;
+
+      const cache = item.assetCache as ChatSession['assetCache'];
+      if (!cache) return;
+
+      const updateMap = new Map(updates.map(u => [u.url, u.reportType]));
+      let changed = false;
+
+      for (const report of cache.htmlReports || []) {
+        const type = updateMap.get(report.url);
+        if (type && (force || !report.reportType)) {
+          report.reportType = type;
+          changed = true;
+        }
+      }
+
+      if (!changed) return;
+
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET assetCache = :cache',
+        ExpressionAttributeValues: { ':cache': cache },
+      }).promise();
+    } catch (error) {
+      console.error(`Error persisting reportTypes for session ${sessionId}:`, error);
     }
   }
 
