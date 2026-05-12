@@ -20,7 +20,7 @@ function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolv
     apolloPeopleMatch: jest.fn().mockResolvedValue(null),
     apolloOrgMatch: jest.fn().mockResolvedValue(null),
     enrichSoReverseLookup: jest.fn().mockResolvedValue(null),
-    findSiblingLead: jest.fn().mockResolvedValue(null),
+    findSiblingLeads: jest.fn().mockResolvedValue([]),
     writeLeadFields: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };

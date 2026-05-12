@@ -58,18 +58,21 @@ export interface IdentityResolverDeps {
   apolloOrgMatch(input: { emailDomain: string }): Promise<ApolloOrgResult | null>;
   enrichSoReverseLookup(input: { email: string }): Promise<EnrichSoReverseResult | null>;
   /**
-   * Cross-tenant lookup. Returns the freshest non-self lead matching by email,
-   * linkedin, or exact name+company across ALL users. Returns null if no
-   * match. Tier 0 of the v3.1 identity resolution waterfall.
+   * Cross-tenant lookup. Returns ALL non-self leads matching by email,
+   * linkedin, or exact name+company across ALL users — deduped by leadId,
+   * sorted freshest-first by `updatedAt`. The resolver does per-field
+   * best-of-N merge across the returned candidates so a sibling with only
+   * `firstName` and another with only `company` can complement each other.
+   * Empty array on no match. Tier 0 of the v3.1 identity resolution waterfall.
    */
-  findSiblingLead(input: {
+  findSiblingLeads(input: {
     excludeLeadId: string;
     email?: string;
     linkedinUrl?: string;
     firstName?: string;
     lastName?: string;
     company?: string;
-  }): Promise<SiblingLeadResult | null>;
+  }): Promise<SiblingLeadResult[]>;
   writeLeadFields(input: {
     listId: string;
     leadId: string;
@@ -122,14 +125,16 @@ export async function resolveIdentity(
   const resolved: Partial<LeadRecord> & { emailDomain?: string } = {};
   const meta: Record<string, EnrichedFieldMeta> = {};
 
-  // 1.5. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Before any
-  // external API call, see if any user's existing lead matches by email,
-  // linkedin, or exact name+company. Fills empties only; respects refreshFields.
-  // Sibling identifiers are kept in stored meta for audit; the response-layer
-  // sanitizer (utils/enrichmentMetadataPresentation.ts) strips them before
-  // they reach the customer-portal.
+  // 1.5. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Queries all
+  // three GSIs in parallel and does per-field best-of-N merge across the
+  // returned candidates so complementary siblings (one has firstName only,
+  // another has company only) can both contribute. Fills empties; respects
+  // refreshFields. Per-field audit meta records WHICH sibling supplied each
+  // field — different fields may point to different siblings. The response
+  // sanitizer (utils/enrichmentMetadataPresentation.ts) strips the sibling
+  // identifiers before sending to the customer-portal.
   try {
-    const sibling = await deps.findSiblingLead({
+    const siblings = await deps.findSiblingLeads({
       excludeLeadId: lead.leadId,
       email: email || undefined,
       linkedinUrl: linkedinUrl || undefined,
@@ -137,36 +142,40 @@ export async function resolveIdentity(
       lastName: hasName ? lead.lastName : undefined,
       company: lead.company || undefined,
     });
-    if (sibling) {
+    if (siblings && siblings.length > 0) {
       const enrichedAt = new Date().toISOString();
-      const baseMeta: EnrichedFieldMeta = {
-        source: 'crm-history',
-        provider: 'agentweb',
-        enrichedAt,
-        siblingLeadId: sibling.leadId,
-        siblingListId: sibling.listId,
-        siblingUserId: sibling.userId,
-      };
       const refresh = input.refreshFields;
       const copyableFields: Array<keyof SiblingLeadResult & keyof LeadRecord> = [
         'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
       ];
       for (const field of copyableFields) {
-        const siblingValue = sibling[field];
-        if (typeof siblingValue !== 'string' || siblingValue.trim() === '') continue;
         const currentValue = (lead as any)[field];
         if (typeof currentValue === 'string' && currentValue.trim() !== '') continue;
         if (refresh && refresh.has(`${lead.leadId}:${field}`)) continue;
-        (resolved as any)[field] = siblingValue;
-        meta[field] = { ...baseMeta };
+        // Walk candidates freshest-first; take the first non-empty value for
+        // this field. The chosen sibling's IDs land in the per-field audit meta.
+        for (const sib of siblings) {
+          const v = sib[field];
+          if (typeof v !== 'string' || v.trim() === '') continue;
+          (resolved as any)[field] = v;
+          meta[field] = {
+            source: 'crm-history',
+            provider: 'agentweb',
+            enrichedAt,
+            siblingLeadId: sib.leadId,
+            siblingListId: sib.listId,
+            siblingUserId: sib.userId,
+          };
+          break;
+        }
       }
       // If Tier 0 filled email, downstream Apollo-by-email paths can use it.
       if (resolved.email && !email) email = resolved.email;
     }
   } catch (err) {
-    // findSiblingLead failures must NEVER block enrichment — Apollo path
+    // findSiblingLeads failures must NEVER block enrichment — Apollo path
     // can still resolve identity. Log and continue.
-    console.warn('[resolveIdentity] tier 0 findSiblingLead failed:', (err as Error).message);
+    console.warn('[resolveIdentity] tier 0 findSiblingLeads failed:', (err as Error).message);
   }
 
   // 2. LinkedIn-first path: if we have a LinkedIn URL but no email, use

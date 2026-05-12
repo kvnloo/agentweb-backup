@@ -81,34 +81,42 @@ function buildIdentityDeps(): IdentityResolverDeps {
       }
     },
 
-    findSiblingLead: async ({ excludeLeadId, email, linkedinUrl, firstName, lastName, company }) => {
-      // Try email → linkedin → name+company, in that order of precision.
-      // Cross-tenant: each crmDb method queries a global GSI with no userId
-      // filter. excludeLeadId removes the current lead from results so the
-      // resolver can't match against itself.
-      const trySet = async (items: any[]): Promise<any | null> => {
-        const candidates = (items || []).filter(it => it && it.leadId !== excludeLeadId);
-        return candidates[0] || null;
-      };
-
+    findSiblingLeads: async ({ excludeLeadId, email, linkedinUrl, firstName, lastName, company }) => {
+      // Query all three Lookup GSIs in parallel. Email and linkedin can each
+      // miss; both are cheap (single GSI Query per key). Combining the result
+      // sets lets per-field best-of-N merge pick complementary data across
+      // siblings that only matched one key.
       const trimmedEmail = email?.trim().toLowerCase();
-      if (trimmedEmail) {
-        const items = await crmDb.findLeadsByEmail(trimmedEmail);
-        const hit = await trySet(items);
-        if (hit) return hit;
-      }
       const trimmedLinkedin = linkedinUrl?.trim();
-      if (trimmedLinkedin) {
-        const items = await crmDb.findLeadsByLinkedin(trimmedLinkedin);
-        const hit = await trySet(items);
-        if (hit) return hit;
+      const hasNameTriple = !!(firstName && lastName && company);
+
+      const [byEmail, byLinkedin, byNameCompany] = await Promise.all([
+        trimmedEmail ? crmDb.findLeadsByEmail(trimmedEmail) : Promise.resolve([]),
+        trimmedLinkedin ? crmDb.findLeadsByLinkedin(trimmedLinkedin) : Promise.resolve([]),
+        hasNameTriple ? crmDb.findLeadsByNameCompany(firstName!, lastName!, company!) : Promise.resolve([]),
+      ]);
+
+      // Dedupe by leadId (a sibling can match both email AND linkedin), then
+      // sort freshest-first so the resolver's per-field walk picks the most
+      // recent non-empty value per field. Cap at 30 candidates to bound work
+      // when an email is unusually shared across many tenants.
+      const seen = new Set<string>();
+      const merged: any[] = [];
+      for (const set of [byEmail, byLinkedin, byNameCompany]) {
+        for (const item of (set || [])) {
+          if (!item || !item.leadId || item.leadId === excludeLeadId) continue;
+          if (seen.has(item.leadId)) continue;
+          seen.add(item.leadId);
+          merged.push(item);
+        }
       }
-      if (firstName && lastName && company) {
-        const items = await crmDb.findLeadsByNameCompany(firstName, lastName, company);
-        const hit = await trySet(items);
-        if (hit) return hit;
-      }
-      return null;
+      merged.sort((a, b) => {
+        const ua = typeof a.updatedAt === 'string' ? a.updatedAt : '';
+        const ub = typeof b.updatedAt === 'string' ? b.updatedAt : '';
+        if (ua === ub) return 0;
+        return ua > ub ? -1 : 1;
+      });
+      return merged.slice(0, 30);
     },
 
     enrichSoReverseLookup: async ({ email }) => {
