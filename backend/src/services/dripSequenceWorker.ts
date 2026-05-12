@@ -11,8 +11,9 @@
  *      d. Otherwise: send the email via Resend, advance to next step (or complete)
  */
 
-import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition } from './dripSequenceDb';
+import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
 import { resendService } from './resendService';
+import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { isDoNotContact } from '../utils/leadContactStatus';
@@ -82,7 +83,9 @@ async function processEnrollment(
     return;
   }
 
-  // Build email context for variable substitution
+  const channel: SequenceChannel = step.channel ?? 'email';
+
+  // Build variable context for substitution (shared by both channels)
   const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
 
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
@@ -97,10 +100,7 @@ async function processEnrollment(
 
   const user = await userDb.getUserById(enrollment.userId).catch(() => null);
 
-  // Load configured senders for this user
-  const senderConfig = await loadSenderConfig(enrollment.userId);
-
-  const emailVars: Record<string, string> = {
+  const msgVars: Record<string, string> = {
     firstName: lead?.firstName ?? '',
     lastName: lead?.lastName ?? '',
     email: enrollment.leadEmail,
@@ -109,31 +109,50 @@ async function processEnrollment(
     senderEmail: user?.email ?? '',
   };
 
-  const subject = substituteVariables(step.subject, emailVars);
-  let bodyHtml = substituteVariables(step.bodyHtml, emailVars);
+  if (channel === 'linkedin') {
+    await sendLinkedInStep(enrollment, step, lead, msgVars);
+  } else {
+    await sendEmailStep(enrollment, step, user, msgVars);
+  }
 
-  // Rewrite S3 image URLs through the /asset/ proxy so image hostnames match the
-  // sending domain — reduces spam filtering by Gmail and other providers.
-  // Use EMAIL_ASSET_BASE_URL so emails always contain publicly accessible URLs,
-  // even when sent from a dev environment where BACKEND_URL is a private IP.
+  // Advance or complete only after confirmed send
+  const nextStepIndex = enrollment.currentStep + 1;
+  if (nextStepIndex >= sequence.steps.length) {
+    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed', 'completed', channel);
+  } else {
+    const nextStep = sequence.steps[nextStepIndex];
+    const nextSendAt = addDays(new Date(), nextStep.delayDays).toISOString();
+    await dripSequenceDb.advanceEnrollment(enrollment.enrollmentId, nextStepIndex, nextSendAt, channel);
+  }
+
+  stats.sent++;
+}
+
+async function sendEmailStep(
+  enrollment: SequenceEnrollment,
+  step: any,
+  user: any,
+  msgVars: Record<string, string>,
+): Promise<void> {
+  // Load configured senders for this user
+  const senderConfig = await loadSenderConfig(enrollment.userId);
+
+  const subject = substituteVariables(step.subject ?? '', msgVars);
+  let bodyHtml = substituteVariables(step.bodyHtml ?? '', msgVars);
+
   const assetBaseUrl = process.env.EMAIL_ASSET_BASE_URL || 'https://api.agentweb.pro';
   bodyHtml = rewriteS3ImageUrls(bodyHtml, assetBaseUrl);
-
-  // Convert youtu.be short URLs to full youtube.com URLs to avoid Gmail spam filters.
   bodyHtml = normalizeYoutubeUrls(bodyHtml);
 
-  // Inject unsubscribe URL — replaces {{unsubscribeUrl}} variable, updates an existing
-  // unsubscribe anchor href, or appends a footer if no unsubscribe link is present.
   const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
   const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
   bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
-  // Resolve sender config — use step's senderId if set, else account default
   const senderEmail = resolveSenderEmail(user, senderConfig, step.senderId);
   const senderName = resolveSenderName(user, senderConfig, step.senderId);
 
   if (!senderEmail) {
-    console.error(`[dripWorker] Skipping enrollment ${enrollment.enrollmentId}: user ${enrollment.userId} has no email sender configured (emailDomain + defaultSenderUsername + fromName required)`);
+    console.error(`[dripWorker] Skipping enrollment ${enrollment.enrollmentId}: user ${enrollment.userId} has no email sender configured`);
     throw new Error(`No email sender configured for user ${enrollment.userId}`);
   }
 
@@ -151,19 +170,37 @@ async function processEnrollment(
     throw new Error(`Email send failed for ${enrollment.leadEmail}`);
   }
 
-  console.log(`[dripWorker] Sent step ${step.stepNumber} to ${enrollment.leadEmail} (id: ${sendResult.id})`);
+  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} (id: ${sendResult.id})`);
+}
 
-  // Advance or complete only after confirmed send
-  const nextStepIndex = enrollment.currentStep + 1;
-  if (nextStepIndex >= sequence.steps.length) {
-    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed');
-  } else {
-    const nextStep = sequence.steps[nextStepIndex];
-    const nextSendAt = addDays(new Date(), nextStep.delayDays).toISOString();
-    await dripSequenceDb.advanceEnrollment(enrollment.enrollmentId, nextStepIndex, nextSendAt);
+async function sendLinkedInStep(
+  enrollment: SequenceEnrollment,
+  step: any,
+  lead: any,
+  msgVars: Record<string, string>,
+): Promise<void> {
+  const linkedInUrl = lead?.linkedin?.trim();
+  if (!linkedInUrl) {
+    console.error(`[dripWorker] LinkedIn step skipped for enrollment ${enrollment.enrollmentId}: lead has no LinkedIn URL`);
+    throw new Error(`Lead ${enrollment.leadEmail} has no LinkedIn URL for LinkedIn step`);
   }
 
-  stats.sent++;
+  // Resolve which LinkedIn account to send from
+  const accountId = step.linkedInAccountId
+    || await linkedInOutreachService.resolveAccountId(enrollment.userId);
+
+  if (!accountId) {
+    console.error(`[dripWorker] LinkedIn step failed for enrollment ${enrollment.enrollmentId}: no LinkedIn account available`);
+    throw new Error(`No LinkedIn account available for user ${enrollment.userId}`);
+  }
+
+  const messageText = substituteVariables(step.messageText ?? '', msgVars);
+  if (!messageText.trim()) {
+    throw new Error(`LinkedIn step ${step.stepNumber} has empty message text`);
+  }
+
+  await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  console.log(`[dripWorker] Sent LinkedIn step ${step.stepNumber} to ${linkedInUrl} (account: ${accountId})`);
 }
 
 async function checkExitConditions(
