@@ -87,6 +87,32 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
     );
   });
 
+  it('emits wire-level debug logs when LLM_WEB_SEARCH_DEBUG=1', async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => '{"output_text":"{\\"ok\\":1}"}',
+    });
+    (global as any).fetch = fetchMock;
+    process.env.LLM_WEB_SEARCH_DEBUG = '1';
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      const svc = makeService();
+      await svc.generateJSONContentWithWebSearch('s', 'u');
+
+      const logged = logSpy.mock.calls.map(c => c.join(' ')).join('\n');
+      expect(logged).toMatch(/\[llm\.webSearch\] → POST /);
+      expect(logged).toMatch(/\[llm\.webSearch\] → headers: api-key=\[redacted\]/);
+      expect(logged).toMatch(/\[llm\.webSearch\] → body: /);
+      expect(logged).toMatch(/\[llm\.webSearch\] ← status=200 in \d+ms/);
+      expect(logged).toMatch(/\[llm\.webSearch\] ← body: /);
+    } finally {
+      logSpy.mockRestore();
+      delete process.env.LLM_WEB_SEARCH_DEBUG;
+    }
+  });
+
   it('strips a trailing slash from AZURE_OPENAI_ENDPOINT', async () => {
     const fetchMock = jest.fn().mockResolvedValue({
       ok: true,
@@ -101,5 +127,66 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
     expect(url).toBe(
       'https://example.openai.azure.com/openai/responses?api-version=2025-03-01-preview',
     );
+  });
+});
+
+// ─── Gemini path — separate dynamic import, separate failure modes ───────────
+
+const mockGenerateContent = jest.fn();
+jest.mock('@google/genai', () => ({
+  GoogleGenAI: jest.fn().mockImplementation(() => ({
+    models: { generateContent: mockGenerateContent },
+  })),
+}));
+
+describe('LLMService.generateJSONContentWithWebSearch — Gemini path', () => {
+  beforeEach(() => {
+    mockGenerateContent.mockReset();
+    process.env.GEMINI_API_KEY = '  test-gemini-key  '; // intentional whitespace
+  });
+
+  it('routes Gemini models through @google/genai with googleSearch tool and parses .text', async () => {
+    mockGenerateContent.mockResolvedValueOnce({ text: '{"city":"Boston","industry":"SaaS"}' });
+
+    const svc = new LLMService('gemini-2.0-flash', 0);
+    // Constructor short-circuit branch — Gemini service must not initialize the
+    // Azure/Bedrock chatModel since the Gemini call uses a fresh GoogleGenAI client.
+    expect((svc as any).chatModel).toBeNull();
+
+    const out = await svc.generateJSONContentWithWebSearch<{ city: string; industry: string }>(
+      'sys', 'user',
+    );
+
+    expect(out).toEqual({ city: 'Boston', industry: 'SaaS' });
+    expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+    expect(mockGenerateContent.mock.calls[0][0]).toMatchObject({
+      model: 'gemini-2.0-flash',
+      contents: 'user',
+      config: {
+        systemInstruction: 'sys',
+        tools: [{ googleSearch: {} }],
+      },
+    });
+
+    // API key is trimmed before being passed to GoogleGenAI.
+    const { GoogleGenAI } = jest.requireMock('@google/genai');
+    expect(GoogleGenAI).toHaveBeenCalledWith({ apiKey: 'test-gemini-key' });
+  });
+
+  it('throws a clear error when GEMINI_API_KEY is unset', async () => {
+    delete process.env.GEMINI_API_KEY;
+    const svc = new LLMService('gemini-2.0-flash', 0);
+    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
+      /GEMINI_API_KEY not set/,
+    );
+    expect(mockGenerateContent).not.toHaveBeenCalled();
+  });
+
+  it('treats an empty .text response as an empty extraction (passes through extractJson failure)', async () => {
+    mockGenerateContent.mockResolvedValueOnce({ text: undefined });
+    const svc = new LLMService('gemini-2.0-flash', 0);
+    // extractJson on '' throws — Gemini path doesn't swallow it, so callers
+    // see the original error (the v3 deps wrapper catches it one level up).
+    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toBeDefined();
   });
 });
