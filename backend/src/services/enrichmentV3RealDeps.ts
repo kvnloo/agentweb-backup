@@ -81,6 +81,36 @@ function buildIdentityDeps(): IdentityResolverDeps {
       }
     },
 
+    findSiblingLead: async ({ excludeLeadId, email, linkedinUrl, firstName, lastName, company }) => {
+      // Try email → linkedin → name+company, in that order of precision.
+      // Cross-tenant: each crmDb method queries a global GSI with no userId
+      // filter. excludeLeadId removes the current lead from results so the
+      // resolver can't match against itself.
+      const trySet = async (items: any[]): Promise<any | null> => {
+        const candidates = (items || []).filter(it => it && it.leadId !== excludeLeadId);
+        return candidates[0] || null;
+      };
+
+      const trimmedEmail = email?.trim().toLowerCase();
+      if (trimmedEmail) {
+        const items = await crmDb.findLeadsByEmail(trimmedEmail);
+        const hit = await trySet(items);
+        if (hit) return hit;
+      }
+      const trimmedLinkedin = linkedinUrl?.trim();
+      if (trimmedLinkedin) {
+        const items = await crmDb.findLeadsByLinkedin(trimmedLinkedin);
+        const hit = await trySet(items);
+        if (hit) return hit;
+      }
+      if (firstName && lastName && company) {
+        const items = await crmDb.findLeadsByNameCompany(firstName, lastName, company);
+        const hit = await trySet(items);
+        if (hit) return hit;
+      }
+      return null;
+    },
+
     enrichSoReverseLookup: async ({ email }) => {
       try {
         const enrichSo = getEnrichSoService();

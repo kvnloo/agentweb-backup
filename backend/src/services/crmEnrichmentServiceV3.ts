@@ -129,6 +129,8 @@ export interface OrchestratorDeps {
     needsPersonFields: boolean;
     needsCompanyFields: boolean;
     mode: 'preview' | 'enrich';
+    /** Forwarded to enable Tier 0 (CRM-history) per-field bypass. */
+    refreshFields?: Set<string>;
   }): Promise<ResolveIdentityResult>;
 
   runWaterfall(input: {
@@ -325,6 +327,7 @@ async function processLead(
       needsPersonFields: needsPerson,
       needsCompanyFields: needsCompany,
       mode: input.mode,
+      refreshFields: refreshSet,
     });
     console.log(`[v3][lead ${lead.leadId}] identity resolved in ${Date.now() - idStart}ms (ok=${identity.ok})`);
   } catch (err) {
