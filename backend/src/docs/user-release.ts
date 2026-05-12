@@ -6071,6 +6071,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Soft-Deleted Accounts No Longer Appear as Org Owners',
+      '- When an admin changed a user\'s email, the old (tombstoned) account was incorrectly shown as an additional owner in the organization members list',
+      '- Tombstoned accounts are now excluded from org member listings',
+      '- Email changes also now clear the org membership fields from the old record at the source',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Organization Members Now See Their Owner\'s Subscription Plan',
