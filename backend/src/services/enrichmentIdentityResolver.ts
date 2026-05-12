@@ -8,6 +8,8 @@ import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { extractDomainFromEmail } from '../utils/leadSchema';
 
+const IDENTITY_FIELD_TTL_MS = 90 * 86400 * 1000; // 90 days — no FIELD_GROUP for identity fields
+
 export type IdentityProvider = 'apollo' | 'enrich.so';
 
 export interface ApolloPersonResult {
@@ -33,14 +35,14 @@ export interface EnrichSoReverseResult {
 }
 
 /**
- * CRM-history Tier 0 sibling. The resolver only cares about the identity
- * fields it might copy — the real impl returns a richer record but only
- * these get read here.
+ * CRM-history Tier 0 sibling. The resolver copies identity fields from here;
+ * Tier 0b (enrichmentSiblingConfigFields) copies config-requested custom fields.
  */
 export interface SiblingLeadResult {
   leadId: string;
   listId?: string;
   userId?: string;
+  updatedAt?: string;
   firstName?: string;
   lastName?: string;
   email?: string;
@@ -48,6 +50,7 @@ export interface SiblingLeadResult {
   company?: string;
   website?: string;
   title?: string;
+  customFields?: Record<string, string>;
 }
 
 export interface IdentityResolverDeps {
@@ -94,7 +97,7 @@ export interface ResolveIdentityInput {
 }
 
 export type ResolveIdentityResult =
-  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string } }
+  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[] }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
 function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
@@ -127,6 +130,7 @@ export async function resolveIdentity(
 
   const resolved: Partial<LeadRecord> & { emailDomain?: string } = {};
   const meta: Record<string, EnrichedFieldMeta> = {};
+  let fetchedSiblings: SiblingLeadResult[] = [];
 
   // 2. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Queries all
   // three GSIs in parallel and does per-field best-of-N merge across the
@@ -137,7 +141,7 @@ export async function resolveIdentity(
   // sanitizer (utils/enrichmentMetadataPresentation.ts) strips the sibling
   // identifiers before sending to the customer-portal.
   try {
-    const siblings = await deps.findSiblingLeads({
+    fetchedSiblings = await deps.findSiblingLeads({
       excludeLeadId: lead.leadId,
       email: email || undefined,
       linkedinUrl: linkedinUrl || undefined,
@@ -145,6 +149,10 @@ export async function resolveIdentity(
       lastName: hasName ? lead.lastName : undefined,
       company: lead.company || undefined,
     });
+    const now = Date.now();
+    const siblings = fetchedSiblings.filter(s =>
+      !s.updatedAt || now - new Date(s.updatedAt).getTime() <= IDENTITY_FIELD_TTL_MS,
+    );
     if (siblings && siblings.length > 0) {
       const enrichedAt = new Date().toISOString();
       const refresh = input.refreshFields;
@@ -320,6 +328,7 @@ export async function resolveIdentity(
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
+
   // 8. Persist newly-resolved attributes ONLY in enrich mode. We also project
   // `meta` down to only the fields that made it into writableFields so the
   // write never carries audit entries for absent attributes.
@@ -343,5 +352,5 @@ export async function resolveIdentity(
     });
   }
 
-  return { ok: true, resolved };
+  return { ok: true, resolved, siblings: fetchedSiblings };
 }

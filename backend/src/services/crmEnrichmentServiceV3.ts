@@ -20,6 +20,11 @@ import { FIELD_GROUPS } from './enrichmentGroups';
 import type { LeadRecord, SocketEmitFn } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import type { ResolveIdentityResult } from './enrichmentIdentityResolver';
+import {
+  buildSiblingFieldMappingTable,
+  copySiblingConfigFields,
+  type SiblingFieldMappingTable,
+} from './enrichmentSiblingConfigFields';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -130,9 +135,9 @@ export interface OrchestratorDeps {
     needsPersonFields: boolean;
     needsCompanyFields: boolean;
     mode: 'preview' | 'enrich';
-    /** Forwarded to enable Tier 0 (CRM-history) per-field bypass. */
+    /** Forwarded to enable Tier 0a (CRM-history) per-field bypass. */
     refreshFields?: Set<string>;
-  }): Promise<ResolveIdentityResult>;
+  }): Promise<ResolveIdentityResult>; // success result now includes `siblings` for Tier 0b
 
   runWaterfall(input: {
     listId: string;
@@ -311,6 +316,7 @@ async function processLead(
   needsCompany: boolean,
   refreshSet: Set<string>,
   configFieldsByName: Record<string, EnrichmentFieldConfig>,
+  siblingMappingTable: SiblingFieldMappingTable,
 ): Promise<PerLeadOutcome> {
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
@@ -357,6 +363,34 @@ async function processLead(
   // (Tier 1) can see them — the DB write was already done by the resolver
   // in mode=enrich; in preview it wasn't, but the waterfall benefits regardless.
   const enrichedLead = { ...lead, ...identity.resolved };
+
+  // Tier 0b — sibling config-field copy. Uses siblings already fetched by
+  // resolveIdentity (zero extra DDB queries). Fills config-requested custom
+  // fields from siblings before the waterfall runs, potentially skipping
+  // Apollo/web calls entirely for fields already present in the system.
+  const tier0bResult = copySiblingConfigFields(
+    enrichedLead,
+    identity.siblings,
+    input.config.fields,
+    siblingMappingTable,
+    refreshSet,
+  );
+  if (tier0bResult.fills.length > 0) {
+    allFills.push(...tier0bResult.fills.map(f => ({
+      field: f.field,
+      value: f.value,
+      meta: f.meta,
+    })));
+    // Merge into enrichedLead so waterfall sees these fields as already filled
+    for (const f of tier0bResult.fills) {
+      if ((enrichedLead as any)[f.field] !== undefined) {
+        (enrichedLead as any)[f.field] = f.value;
+      } else {
+        enrichedLead.customFields = { ...enrichedLead.customFields, [f.field]: f.value };
+      }
+    }
+    console.log(`[v3][lead ${lead.leadId}] tier0b filled ${tier0bResult.fills.length} config field(s) from siblings`);
+  }
 
   // Steps 1–3: waterfall + ungrouped + critic, wrapped together so any
   // mid-pipeline error is captured as llmOrParseFailed for this lead.
@@ -526,6 +560,10 @@ export async function runEnrichment(
 
   const { routing, needsPerson, needsCompany } = routeFields(input.config);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
+
+  // Build sibling field mapping table once per run (one LLM call for unaliased
+  // fields, canonical match is free). Passed to every processLead call.
+  const siblingMappingTable = await buildSiblingFieldMappingTable(input.config.fields);
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   const fieldAliasMap: Record<string, string> = {};
   for (const f of input.config.fields) {
@@ -582,7 +620,7 @@ export async function runEnrichment(
     const outcomes = await Promise.all(
       chunk.map(lead =>
         processLead(
-          lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName,
+          lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable,
         ).then(outcome => {
           emitPerLeadProgress();
           return { lead, outcome };
