@@ -21680,8 +21680,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (items.length === 0) break;
       totalFetched += items.length;
 
-      // Map Unipile search result fields → CRM lead fields.
-      const leads = items.map((item: any) => {
+      // Map Unipile search result fields → CRM lead fields, then resolve
+      // missing companies through a 4-tier fallback chain. Each tier runs
+      // only on leads still missing `company`:
+      //   1. item.work_experience[].company (sync, from search result)
+      //   2. parseCompanyFromTitle (regex, sync, instant)
+      //   3. batchParseCompaniesFromTitlesWithLLM (ONE Gemini Flash call for all titles in the batch)
+      //   4. Unipile getProfile via cache-first wrapper (HTTP, free on cache hit, parallel)
+
+      // Phase 1: sync map for Tier 1 (work_experience) + Tier 2 (regex).
+      const leads: any[] = items.map((item: any) => {
         const lead: any = {};
         if (item.name) {
           const parts = (item.name as string).trim().split(/\s+/);
@@ -21703,6 +21711,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (current?.company && !lead.company) lead.company = current.company;
           if (current?.position && !lead.title) lead.title = current.position;
         }
+        if (!lead.company && lead.title) {
+          const parsed = parseCompanyFromTitle(lead.title);
+          if (parsed) lead.company = parsed;
+        }
         if (item.location) {
           lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
         }
@@ -21715,6 +21727,47 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         return lead;
       });
+
+      // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
+      // missing a company. Skipped entirely when no candidates remain.
+      const llmIndices: number[] = [];
+      const llmTitles: string[] = [];
+      for (let i = 0; i < leads.length; i++) {
+        if (!leads[i].company && typeof leads[i].title === 'string' && leads[i].title) {
+          llmIndices.push(i);
+          llmTitles.push(leads[i].title);
+        }
+      }
+      if (llmTitles.length > 0) {
+        try {
+          const llmClient = await this.getClientForModel('gemini-2.5-flash');
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient);
+          for (let k = 0; k < llmIndices.length; k++) {
+            const v = results[k];
+            if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
+          }
+        } catch (e: any) {
+          console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
+        }
+      }
+
+      // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
+      await Promise.all(items.map(async (item: any, idx: number) => {
+        const lead = leads[idx];
+        if (lead.company || !item.public_identifier || !accountId) return;
+        try {
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profile = await getUnipileProfileService().getProfile(item.public_identifier, accountId);
+          const raw = (profile as any)?.rawData ?? profile;
+          const exp = raw?.work_experience;
+          if (Array.isArray(exp) && exp.length) {
+            const cur = exp.find((w: any) => w.current) || exp[0];
+            if (cur?.company) lead.company = cur.company;
+          }
+        } catch (e: any) {
+          console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
+        }
+      }));
 
       const result = await crmDb.batchCreateLeads(listId, leads);
       cumulativeNew += result.newCount ?? 0;
@@ -21851,12 +21904,100 @@ function computeFindLeadsCriteriaHash(filters: {
 }
 
 /**
+ * Tier 2 of company resolution for LinkedIn-search leads: cheap regex on
+ * the lead's headline / title. Looks for "Role at Company" or "Role @ Company"
+ * (case-insensitive on "at"). Other separators (|, ·, –) are left to Tier 3
+ * (LLM) so we don't false-positive on "Senior Engineer - Backend".
+ */
+function parseCompanyFromTitle(title: any): string | null {
+  if (typeof title !== 'string' || !title) return null;
+  const match = title.match(/^.*?\S\s+(?:at|@)\s+(\S.*?)\s*$/i);
+  if (!match) return null;
+  const company = match[1].split(/\s*[|·•‧]\s*/)[0].trim();
+  return company || null;
+}
+
+/**
+ * Tier 3 of company resolution: ONE Gemini Flash call per page that takes the
+ * full batch of titles and returns a parallel array of company names (or
+ * "NONE"). Caller passes the resolved llmClient so the helper stays pure and
+ * easily mockable. On any error or response-shape mismatch, returns an
+ * all-"NONE" array so callers fall through to Tier 4 (Unipile getProfile).
+ */
+async function batchParseCompaniesFromTitlesWithLLM(
+  titles: string[],
+  llmClient: any,
+): Promise<string[]> {
+  if (!Array.isArray(titles) || titles.length === 0) return [];
+  if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
+  try {
+    const systemPrompt = [
+      'You extract company names from professional / LinkedIn titles in batch.',
+      'Input is a JSON array of titles. Return a JSON array of the SAME length where each entry is either the extracted company name as plain text, or the literal string "NONE" if no company is identifiable.',
+      '',
+      'Examples:',
+      'Input:  ["Software Engineer at Google", "Founder | Acme Inc", "Senior Engineer", "Developer · Microsoft"]',
+      'Output: ["Google", "Acme Inc", "NONE", "Microsoft"]',
+      '',
+      'Output rules:',
+      '- Return ONLY the JSON array, no preamble, no markdown fence, no commentary.',
+      '- Same length as input.',
+      '- Plain text company names, no quotes inside the strings.',
+      '- Use "NONE" (uppercase) when uncertain.',
+    ].join('\n');
+    const userPrompt = `Titles: ${JSON.stringify(titles)}`;
+    const completion = await llmClient.chat.completions.create({
+      model: 'gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_completion_tokens: Math.max(500, titles.length * 30),
+      temperature: 0.1,
+    });
+    const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
+    // Gemini Flash often adds preamble / postamble / markdown fences despite
+    // explicit instructions. Locate the widest `[ ... ]` substring instead of
+    // strict-parsing the whole response.
+    const firstBracket = raw.indexOf('[');
+    const lastBracket = raw.lastIndexOf(']');
+    if (firstBracket < 0 || lastBracket <= firstBracket) {
+      console.warn('[batchParseCompaniesFromTitlesWithLLM] no JSON array in response:', raw.slice(0, 200));
+      return titles.map(() => 'NONE');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw.slice(firstBracket, lastBracket + 1));
+    } catch (parseErr: any) {
+      console.warn('[batchParseCompaniesFromTitlesWithLLM] JSON.parse failed:', parseErr?.message, '| raw:', raw.slice(0, 200));
+      return titles.map(() => 'NONE');
+    }
+    if (!Array.isArray(parsed) || parsed.length !== titles.length) {
+      return titles.map(() => 'NONE');
+    }
+    return parsed.map((v: any) => {
+      if (typeof v !== 'string') return 'NONE';
+      const t = v.trim();
+      if (!t) return 'NONE';
+      if (t.toUpperCase() === 'NONE') return 'NONE';
+      if (t.length > 100) return 'NONE';
+      return t;
+    });
+  } catch (e: any) {
+    console.warn('[batchParseCompaniesFromTitlesWithLLM] failed:', e?.message ?? String(e));
+    return titles.map(() => 'NONE');
+  }
+}
+
+/**
  * Test seam — exposes the autoEnrich glue so unit tests can spy/stub
  * without exporting it as production API. Mutating __testHooks in tests
  * is safe because each test file imports a fresh module instance.
  */
 export const __testHooks = {
   enqueueFindEmailJobForNewLeads,
+  parseCompanyFromTitle,
+  batchParseCompaniesFromTitlesWithLLM,
 };
 
 export const agentModeService = new AgentModeService();

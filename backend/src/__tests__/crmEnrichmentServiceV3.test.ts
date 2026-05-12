@@ -49,7 +49,11 @@ function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
 function makeDeps(overrides: Partial<OrchestratorDeps> = {}): OrchestratorDeps {
   return {
     loadLeads: jest.fn().mockResolvedValue([]),
-    resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {} }),
+    // `siblings: []` matches the production `resolveIdentity` contract added
+    // in 5ecf5ad3 — Tier 0b iterates this array, so omitting it would throw
+    // `siblings is not iterable` for every test that exercises a successful
+    // identity-resolution path.
+    resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
     runWaterfall: jest.fn().mockResolvedValue({
       fields: [],
       missing: [],
@@ -94,32 +98,34 @@ describe('runEnrichment — empty list', () => {
 });
 
 // ─── leadIds filter ──────────────────────────────────────────────────────────
+// The dep is now responsible for honoring leadIds (real impl uses BatchGetItem
+// when set, paginated Query otherwise). The orchestrator's job is to pass it
+// through faithfully and process whatever the dep returns.
 
 describe('runEnrichment — leadIds filter', () => {
-  it('processes only the leads whose ids are in input.leadIds', async () => {
-    const leads = [
-      makeLead({ leadId: 'lead-1' }),
+  it('passes input.leadIds through to deps.loadLeads when set', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([
       makeLead({ leadId: 'lead-2' }),
       makeLead({ leadId: 'lead-3' }),
-    ];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+    ]);
+    const deps = makeDeps({ loadLeads });
 
     const result = await runEnrichment(
       makeInput({ leadIds: ['lead-2', 'lead-3'] }),
       deps,
     );
 
+    expect(loadLeads).toHaveBeenCalledWith({
+      listId: LIST_ID,
+      userId: USER_ID,
+      leadIds: ['lead-2', 'lead-3'],
+    });
     expect(result.processed).toBe(2);
     expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
-    const processedIds = (deps.resolveIdentity as jest.Mock).mock.calls
-      .map(c => c[0].lead.leadId)
-      .sort();
-    expect(processedIds).toEqual(['lead-2', 'lead-3']);
   });
 
-  it('processes 0 leads when leadIds is provided but matches nothing', async () => {
-    const leads = [makeLead({ leadId: 'lead-1' })];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+  it('processes 0 leads when the dep returns no matches for the requested leadIds', async () => {
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
 
     const result = await runEnrichment(
       makeInput({ leadIds: ['nonexistent'] }),
@@ -130,28 +136,38 @@ describe('runEnrichment — leadIds filter', () => {
     expect(deps.resolveIdentity).not.toHaveBeenCalled();
   });
 
-  it('processes all loaded leads when leadIds is undefined (no filter)', async () => {
-    const leads = [
+  it('passes leadIds as undefined when input.leadIds is not set', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([
       makeLead({ leadId: 'lead-1' }),
       makeLead({ leadId: 'lead-2' }),
-    ];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+    ]);
+    const deps = makeDeps({ loadLeads });
 
     const result = await runEnrichment(makeInput(), deps);
 
+    expect(loadLeads).toHaveBeenCalledWith({
+      listId: LIST_ID,
+      userId: USER_ID,
+      leadIds: undefined,
+    });
     expect(result.processed).toBe(2);
     expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
   });
 
-  it('processes all loaded leads when leadIds is an empty array (treated as no filter)', async () => {
-    const leads = [
+  it('passes leadIds as undefined when input.leadIds is an empty array (treated as no filter)', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([
       makeLead({ leadId: 'lead-1' }),
       makeLead({ leadId: 'lead-2' }),
-    ];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+    ]);
+    const deps = makeDeps({ loadLeads });
 
     const result = await runEnrichment(makeInput({ leadIds: [] }), deps);
 
+    expect(loadLeads).toHaveBeenCalledWith({
+      listId: LIST_ID,
+      userId: USER_ID,
+      leadIds: undefined,
+    });
     expect(result.processed).toBe(2);
     expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
   });
@@ -374,9 +390,9 @@ describe('runEnrichment — write semantics', () => {
     expect(call.customFields).toEqual({ company_name: 'Acme' });
   });
 
-  it('batches by overwrite policy: mixed fields → two setLeadFields calls (one per policy)', async () => {
-    // company_name and industry are both in company_firmographic — ONE
-    // waterfall call returns both. The orchestrator then splits them by policy.
+  it('merges fill_if_empty and always_overwrite fields into a single setLeadFields call', async () => {
+    // company_name (fill_if_empty) and industry (always_overwrite) come from the same
+    // waterfall call. The orchestrator combines both policy buckets into one DB write.
     const deps = makeDeps({
       loadLeads: jest.fn().mockResolvedValue([makeLead()]),
       runWaterfall: jest.fn().mockResolvedValue({
@@ -396,14 +412,11 @@ describe('runEnrichment — write semantics', () => {
 
     await runEnrichment(makeInput({ config }), deps);
 
-    expect(deps.setLeadFields).toHaveBeenCalledTimes(2);
-    const calls = (deps.setLeadFields as jest.Mock).mock.calls.map(c => c[0]);
-    // company_name = fill_if_empty bucket; industry = always_overwrite bucket.
-    // Both write with ifNotExists=false now (fill_if_empty filters app-side).
-    const fillCall = calls.find(c => Object.keys(c.customFields || {}).includes('company_name'))!;
-    const overwriteCall = calls.find(c => Object.keys(c.customFields || {}).includes('industry'))!;
-    expect(fillCall.customFields).toEqual({ company_name: 'Acme' });
-    expect(overwriteCall.customFields).toEqual({ industry: 'SaaS' });
+    // Both policy buckets are merged into one setLeadFields call.
+    expect(deps.setLeadFields).toHaveBeenCalledTimes(1);
+    const call = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(call.customFields).toEqual({ company_name: 'Acme', industry: 'SaaS' });
+    expect(call.ifNotExists).toBe(false);
   });
 
   it('routes standard CRM column fills to setLeadFields.topLevel; custom names to customFields', async () => {
@@ -629,7 +642,7 @@ describe('runEnrichment — apolloFailed counter', () => {
     expect(result.failed.apolloFailed).toBe(1);
   });
 
-  it('counts org and person failures separately (each entity-type once per lead)', async () => {
+  it('counts apolloFailed as 1 per lead even when both org and person fetch failed', async () => {
     const deps = makeDeps({
       loadLeads: jest.fn().mockResolvedValue([makeLead()]),
       runWaterfall: jest.fn().mockImplementation(async (input: any) => {
@@ -649,8 +662,8 @@ describe('runEnrichment — apolloFailed counter', () => {
 
     const result = await runEnrichment(makeInput({ config }), deps);
 
-    // One lead with both org and person Apollo failures → apolloFailed = 2
-    expect(result.failed.apolloFailed).toBe(2);
+    // apolloFailed is incremented once per lead (org || person), not once per entity type.
+    expect(result.failed.apolloFailed).toBe(1);
   });
 
   it('does NOT increment apolloFailed when Apollo returns a clean null (miss, not error)', async () => {

@@ -33,8 +33,12 @@ import { createLLMService } from '../utils/llmService';
 
 // Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
 // `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
-const EXTRACT_MODEL = process.env.CRM_ENRICH_V3_EXTRACT_MODEL || 'gpt-5-chat-2';
-const CRITIC_MODEL  = process.env.CRM_ENRICH_V3_CRITIC_MODEL  || 'gpt-5-chat-2';
+const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
+const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
+// Model used for Tier 4 web extraction — must support web search tool.
+// Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
+// or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
+const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRACT_MODEL;
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
@@ -81,6 +85,44 @@ function buildIdentityDeps(): IdentityResolverDeps {
       }
     },
 
+    findSiblingLeads: async ({ excludeLeadId, email, linkedinUrl, firstName, lastName, company }) => {
+      // Query all three Lookup GSIs in parallel. Email and linkedin can each
+      // miss; both are cheap (single GSI Query per key). Combining the result
+      // sets lets per-field best-of-N merge pick complementary data across
+      // siblings that only matched one key.
+      const trimmedEmail = email?.trim().toLowerCase();
+      const trimmedLinkedin = linkedinUrl?.trim();
+      const hasNameTriple = !!(firstName && lastName && company);
+
+      const [byEmail, byLinkedin, byNameCompany] = await Promise.all([
+        trimmedEmail ? crmDb.findLeadsByEmail(trimmedEmail) : Promise.resolve([]),
+        trimmedLinkedin ? crmDb.findLeadsByLinkedin(trimmedLinkedin) : Promise.resolve([]),
+        hasNameTriple ? crmDb.findLeadsByNameCompany(firstName!, lastName!, company!) : Promise.resolve([]),
+      ]);
+
+      // Dedupe by leadId (a sibling can match both email AND linkedin), then
+      // sort freshest-first so the resolver's per-field walk picks the most
+      // recent non-empty value per field. Cap at 30 candidates to bound work
+      // when an email is unusually shared across many tenants.
+      const seen = new Set<string>();
+      const merged: any[] = [];
+      for (const set of [byEmail, byLinkedin, byNameCompany]) {
+        for (const item of (set || [])) {
+          if (!item || !item.leadId || item.leadId === excludeLeadId) continue;
+          if (seen.has(item.leadId)) continue;
+          seen.add(item.leadId);
+          merged.push(item);
+        }
+      }
+      merged.sort((a, b) => {
+        const ua = typeof a.updatedAt === 'string' ? a.updatedAt : '';
+        const ub = typeof b.updatedAt === 'string' ? b.updatedAt : '';
+        if (ua === ub) return 0;
+        return ua > ub ? -1 : 1;
+      });
+      return merged.slice(0, 30);
+    },
+
     enrichSoReverseLookup: async ({ email }) => {
       try {
         const enrichSo = getEnrichSoService();
@@ -93,6 +135,34 @@ function buildIdentityDeps(): IdentityResolverDeps {
         };
       } catch (err) {
         console.warn('[v3 deps] enrichSoReverseLookup failed:', (err as Error).message);
+        return null;
+      }
+    },
+
+    resolveCompanyDomainViaWebSearch: async ({ company, linkedin, title, firstName, lastName }) => {
+      try {
+        const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
+        const systemPrompt =
+          'You are a company researcher. Given company information, search the web to find the official company website. ' +
+          'STRICT RULES: Only return a website if you find it confirmed via web search. ' +
+          'Do NOT guess, infer, or construct a URL. Do NOT use your training knowledge alone. ' +
+          'If the web search does not return a clear, confirmed result, return null. ' +
+          'Return JSON with a single key "website" containing the full URL (e.g. "https://acme.com"), or null. ' +
+          'Return ONLY valid JSON, no explanation.';
+        const parts: string[] = [`Company name: ${company}`];
+        if (firstName || lastName) parts.push(`Contact name: ${[firstName, lastName].filter(Boolean).join(' ')}`);
+        if (title) parts.push(`Contact title: ${title}`);
+        if (linkedin) parts.push(`Contact LinkedIn: ${linkedin}`);
+        parts.push('Find the official website for this company.');
+        const userPrompt = parts.join('\n');
+        const result = await llm.generateJSONContentWithWebSearch<{ website: string | null }>(
+          systemPrompt,
+          userPrompt,
+        );
+        if (!result?.website || typeof result.website !== 'string') return null;
+        return { website: result.website.trim() };
+      } catch (err) {
+        console.warn('[v3 deps] resolveCompanyDomainViaWebSearch failed:', (err as Error).message);
         return null;
       }
     },
@@ -156,6 +226,12 @@ function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> 
     const loc = [m.hqCity, m.hqState, m.hqCountry].filter(Boolean).join(', ');
     if (loc) out.hq_location = loc;
   }
+  if (m.hqRawAddress) out.hq_address = m.hqRawAddress;
+  if (m.phone) out.company_phone = m.phone;
+  if (m.twitterUrl) {
+    const handle = m.twitterUrl.replace(/\/$/, '').split('/').pop();
+    if (handle) out.twitter_handle = handle;
+  }
   return out;
 }
 
@@ -167,6 +243,8 @@ function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
   if (p.linkedin) out.linkedin_url = p.linkedin;
   if (p.email) out.email = p.email;
   if (p.phone) out.phone = p.phone;
+  if (p.seniority) out.seniority = p.seniority;
+  if (p.departments && p.departments.length) out.department = p.departments[0];
   // Compose location from city / state / country — Apollo returns these
   // separately but the canonical `location` field is a single string.
   const loc = [p.city, p.state, p.country].filter(Boolean).join(', ');
@@ -269,11 +347,6 @@ async function extractFieldsViaLLMReal(input: {
     return `- ${name}${instr ? `: ${instr}` : ''}`;
   }).join('\n');
 
-  const systemPrompt =
-    `You extract structured CRM data from the provided context. Return strict JSON: ` +
-    `an object with one key per requested field. Use null when the value isn't ` +
-    `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
-
   const leadContext = JSON.stringify({
     email: input.lead.email,
     company: input.lead.company,
@@ -282,6 +355,19 @@ async function extractFieldsViaLLMReal(input: {
     lastName: input.lead.lastName,
   });
 
+  const isWebTier = input.tier === 'web';
+
+  const systemPrompt = isWebTier
+    ? `You extract structured CRM data for a given lead. Follow this priority order:\n` +
+      `1. Extract from the provided web context if the information is clearly present.\n` +
+      `2. If information is missing or insufficient, use your web search capability to look it up.\n` +
+      `3. If web search yields no result, use your own training knowledge if you are FULLY confident.\n` +
+      `4. If you do not know a value with confidence, return null for that field.\n` +
+      `NEVER guess, infer, or fabricate. Return strict JSON only, strings only, no markdown.`
+    : `You extract structured CRM data from the provided context. Return strict JSON: ` +
+      `an object with one key per requested field. Use null when the value isn't ` +
+      `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
+
   const userPrompt =
     `Lead: ${leadContext}\n\n` +
     `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
@@ -289,8 +375,14 @@ async function extractFieldsViaLLMReal(input: {
     `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose.`;
 
   try {
-    const llm = createLLMService(EXTRACT_MODEL, 0.0);
-    const parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
+    let parsed: Record<string, any>;
+    if (isWebTier) {
+      const llm = createLLMService(WEB_SEARCH_MODEL, 0.0);
+      parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt);
+    } else {
+      const llm = createLLMService(EXTRACT_MODEL, 0.0);
+      parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
+    }
     const filled: Record<string, string> = {};
     const missing: string[] = [];
     for (const field of input.fields) {
@@ -397,8 +489,16 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
   const identityDeps = buildIdentityDeps();
 
   return {
-    loadLeads: async ({ listId }) => {
-      const result = await crmDb.getLeadsByListId(listId, 500);
+    loadLeads: async ({ listId, leadIds }) => {
+      // Selection-scoped run (bulk-actions bar) → BatchGetItem on the
+      // requested keys, no over-fetch.
+      if (leadIds && leadIds.length > 0) {
+        const items = await crmDb.batchGetLeads(listId, leadIds);
+        return items as LeadRecord[];
+      }
+      // Whole-list run → single Query page. No explicit limit: DDB returns
+      // up to ~1MB worth of items in one round-trip.
+      const result = await crmDb.getLeadsByListId(listId);
       return (result?.items ?? []) as LeadRecord[];
     },
 
@@ -411,7 +511,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         if (!domain) return null;
         try {
           const result = await getApolloService().matchOrg(domain);
-          return result?.organization ? mapApolloOrgToCrmFields(result.organization) : null;
+          if (!result?.organization) return null;
+          return {
+            mapped: mapApolloOrgToCrmFields(result.organization),
+            raw: result.organizationRaw ?? null,
+          };
         } catch (err) {
           console.warn('[v3 deps] fetchApolloOrg failed:', (err as Error).message);
           throw err;
@@ -423,7 +527,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         if (!lead.email) return null;
         try {
           const result = await getApolloService().matchPerson({ email: lead.email });
-          return result?.match?.person ? mapApolloPersonToCrmFields(result.match.person) : null;
+          if (!result?.match?.person) return null;
+          return {
+            mapped: mapApolloPersonToCrmFields(result.match.person),
+            raw: result.personRaw ?? null,
+          };
         } catch (err) {
           console.warn('[v3 deps] fetchApolloPerson failed:', (err as Error).message);
           throw err;

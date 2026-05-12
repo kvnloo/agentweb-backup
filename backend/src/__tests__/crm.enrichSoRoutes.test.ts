@@ -31,7 +31,7 @@ jest.mock('../services/db', () => ({
 }));
 
 jest.mock('../services/enrichSoLeadValidation', () => ({
-  validateLeadsInBackground: jest.fn(),
+  validateLeadsInBackground: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockEnrichSo = {
@@ -723,7 +723,7 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
     expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('L1', expect.any(Set));
   });
 
-  it('does not queue a lead with all 5 standard fields filled, even if list has extended config', async () => {
+  it('returns 200 (not 202) when no leads are applicable — all 5 standard fields already filled', async () => {
     mockCrmDb.getLeadListById.mockResolvedValue({
       userId: 'u1',
       enrichmentFieldConfig: { skills: true },   // skills extended, on
@@ -737,7 +737,9 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
       lastEvaluatedKey: undefined,
     } as any);
     const res = await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
-    expect(res.status).toBe(202);
+    // Route returns 200 (not 202) when nothing is queued — 202 is reserved for
+    // accepted-and-running background jobs.
+    expect(res.status).toBe(200);
     expect(res.body.queued).toBe(0);
     expect(res.body.alreadyDone).toBe(1);
   });

@@ -20,6 +20,8 @@ function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolv
     apolloPeopleMatch: jest.fn().mockResolvedValue(null),
     apolloOrgMatch: jest.fn().mockResolvedValue(null),
     enrichSoReverseLookup: jest.fn().mockResolvedValue(null),
+    findSiblingLeads: jest.fn().mockResolvedValue([]),
+    resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
     writeLeadFields: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
@@ -84,21 +86,21 @@ describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
 // ─── Failure paths (TDD: cover the unhappy branches first) ────────────────────
 
 describe('resolveIdentity — failure paths', () => {
-  it("returns { ok: false, reason: 'no_email' } when lead has no email", async () => {
+  it("returns { ok: false, reason: 'no_identity_signal' } when lead has no email", async () => {
     const deps = makeDeps();
     const result = await resolveIdentity(
       makeInput({ lead: { leadId: LEAD_ID } }),
       deps,
     );
 
-    expect(result).toEqual({ ok: false, reason: 'no_email' });
+    expect(result).toEqual({ ok: false, reason: 'no_identity_signal' });
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
     expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
 
-  it("returns { ok: false, reason: 'no_email' } when email is empty string", async () => {
+  it("returns { ok: false, reason: 'no_identity_signal' } when email is empty string", async () => {
     const deps = makeDeps();
     const result = await resolveIdentity(
       makeInput({ lead: { leadId: LEAD_ID, email: '   ' } }),
@@ -106,7 +108,7 @@ describe('resolveIdentity — failure paths', () => {
     );
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe('no_email');
+    if (!result.ok) expect(result.reason).toBe('no_identity_signal');
   });
 
   it("returns 'identity_unresolvable' when person fields requested AND all sources miss", async () => {
@@ -401,5 +403,143 @@ describe('resolveIdentity — combined person + company resolution', () => {
       website: 'acme.com',
     });
     expect(deps.writeLeadFields).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Tier 0.5 — emailDomain derivation from LLM-resolved website ──────────────
+//
+// Bug repro: when a lead has only `company` (no email, no website, no
+// linkedin), Tier 0.5 used to fill `resolved.website` but never populated
+// `resolved.emailDomain`. That left every downstream provider gated on
+// emailDomain (Apollo org-match, enrich.so find-email) unfired, so the
+// company-name-only enrichment path produced no email and no person fields —
+// the exact "same bad output" behavior the user reported on 2026-05-12.
+
+describe('resolveIdentity — Tier 0.5 emailDomain derivation', () => {
+  const COMPANY_ONLY_LEAD = {
+    leadId: LEAD_ID,
+    firstName: 'Jane',
+    lastName: 'Doe',
+    company: 'Argusoft',
+  } as const;
+
+  it('derives emailDomain from the LLM-resolved website (strips https + www)', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://www.argusoft.com' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: COMPANY_ONLY_LEAD,
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.website).toBe('https://www.argusoft.com');
+    expect(result.resolved.emailDomain).toBe('argusoft.com');
+  });
+
+  it('surfaces the derived emailDomain in the resolved output so the downstream find-email waterfall can use it', async () => {
+    // The pipeline that actually consumes this is enrichmentGroupWaterfall
+    // (find_email tier and the canonical-key builder for company groups).
+    // Both read `resolved.emailDomain` after resolveIdentity returns. Without
+    // this field, find-email cannot run for a company-name-only lead.
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://www.argusoft.com' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: COMPANY_ONLY_LEAD,
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.emailDomain).toBe('argusoft.com');
+  });
+
+  it('writes emailDomain with provenance source=web_search, provider=llm_web_search', async () => {
+    const writeSpy = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://medixbio.com' }),
+      writeLeadFields: writeSpy,
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Sam',
+          lastName: 'Patel',
+          company: 'Medix Biotechnologies',
+        },
+        needsCompanyFields: true,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    const call = writeSpy.mock.calls[0][0];
+    expect(call.fields.emailDomain).toBe('medixbio.com');
+    expect(call.meta.emailDomain.source).toBe('web_search');
+    expect(call.meta.emailDomain.provider).toBe('llm_web_search');
+  });
+
+  it('does not overwrite an emailDomain already on the lead', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn(),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          company: 'Acme',
+          email: 'jane@acme.com',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    // With an email present, Tier 0.5 must not even fire (guard requires no
+    // email AND no website AND no emailDomain). The local extract from
+    // jane@acme.com remains the source of truth.
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.resolved.emailDomain ?? 'acme.com').toBe('acme.com');
+  });
+
+  it('skips emailDomain when the LLM returns a malformed URL (no crash, no derived domain)', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'not a url at all' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: COMPANY_ONLY_LEAD,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Website is stored as-is (existing behavior), but emailDomain must NOT
+    // be set to garbage — better to leave it empty than to feed bad data
+    // into Apollo org-match.
+    expect(result.resolved.emailDomain).toBeUndefined();
   });
 });

@@ -204,7 +204,9 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
     }
   }
 
-  // Shared lookup quota.
+  // Shared lookup quota — gate upfront so over-quota users never reach the
+  // expensive waterfall. Only record usage after the waterfall and only when
+  // the result was a real provider call (cache hits consume no credits).
   const tracker = getQuotaTracker();
   if (tracker) {
     try {
@@ -239,15 +241,10 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
       },
       { userId },
     );
-    // C8: Only debit the user's lookup quota when the call actually went to a
-    // provider. Cache hits don't consume credits, so charging the user against
-    // their daily lookup cap for them is wrong (and especially noticeable now
-    // that the layered Apollo+enrich.so waterfall produces many more cache hits
-    // than the previous single-provider path).
+    // C8: Only debit the quota counter when the call actually hit a provider.
+    // Cache hits consume no credits so the counter must not move.
     if (tracker && !result.fromCache) {
-      try { await tracker.recordLookupByEmailUsage(userId); } catch (e) {
-        console.error('[CRM enrich.so] recordLookupByEmail failed (find-email):', (e as Error).message);
-      }
+      await tracker.recordLookupByEmailUsage(userId);
     }
 
     // If caller asked us to persist and we got a hit, project + write directly.
@@ -525,8 +522,13 @@ router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Respon
     const applicable = leads.filter(isApplicableForFindEmail);
     const alreadyDone = leads.filter((l: any) => !!l.email).length;
     const skipped = leads.length - applicable.length - alreadyDone;
+    if (applicable.length === 0) {
+      return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
     const job = startEmailJob({ kind: 'find', listId, userId, total: applicable.length });
-    void findEmailsForLeadsInBackground(listId, applicable, userId, job.jobId);
+    findEmailsForLeadsInBackground(listId, applicable, userId, job.jobId).catch((err) => {
+      console.error('[CRM enrich.so] find-emails background job failed to start:', err);
+    });
     return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk find-emails error:', error);
@@ -567,10 +569,16 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
       leads = await fetchAllLeads(listId);
     }
     const applicable = leads.filter(isApplicableForLookup);
-    const alreadyDone = leads.length - applicable.length - leads.filter((l: any) => !l.email).length;
-    const skipped = leads.length - applicable.length - alreadyDone;
+    const withEmail = leads.filter((l: any) => !!l.email).length;
+    const alreadyDone = withEmail - applicable.length;
+    const skipped = leads.length - withEmail;
+    if (applicable.length === 0) {
+      return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
     const job = startEmailJob({ kind: 'lookup', listId, userId, total: applicable.length });
-    void lookupProfilesForLeadsInBackground(listId, applicable, userId, job.jobId);
+    lookupProfilesForLeadsInBackground(listId, applicable, userId, job.jobId).catch((err) => {
+      console.error('[CRM enrich.so] lookup-emails background job failed to start:', err);
+    });
     return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk lookup-emails error:', error);
@@ -652,8 +660,13 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
 
     // Fire and forget — pills update as each completes. Track progress so the
     // UI can show a live counter + final breakdown via /email-jobs/:jobId.
+    if (validatable.length === 0) {
+      return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
     const job = startEmailJob({ kind: 'validate', listId, userId, total: validatable.length });
-    void validateLeadsInBackground(listId, validatable, userId, job.jobId, { autoDncOnFailure });
+    validateLeadsInBackground(listId, validatable, userId, job.jobId, { autoDncOnFailure }).catch((err) => {
+      console.error('[CRM enrich.so] validate-emails background job failed to start:', err);
+    });
 
     return res.status(202).json({ jobId: job.jobId, queued: validatable.length, skipped, alreadyDone });
   } catch (error: any) {
@@ -682,6 +695,9 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
 
   // Tight per-route quota gate (50/day default). Independent from the
   // underlying reverseLookup API quota — this is what bounds abuse.
+  // Record usage BEFORE the API call (optimistic) so a recording failure
+  // surfaces as a 500 rather than silently allowing unlimited free calls.
+  // Retry the record up to 2 extra times to tolerate transient DynamoDB blips.
   const tracker = getQuotaTracker();
   if (tracker) {
     try {
@@ -692,15 +708,21 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
       }
       throw err;
     }
+    let recorded = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await tracker.recordLookupByEmailUsage(userId);
+        recorded = true;
+        break;
+      } catch (e) {
+        if (attempt === 2) throw e;
+      }
+    }
+    if (!recorded) throw new Error('Failed to record quota usage after retries');
   }
 
   try {
     const result = await getEnrichSoService().reverseLookup(email, { userId });
-    if (tracker) {
-      try { await tracker.recordLookupByEmailUsage(userId); } catch (e) {
-        console.error('[CRM enrich.so] recordLookupByEmail failed:', (e as Error).message);
-      }
-    }
     if (!result.found) {
       return res.json({ found: false, draft: null });
     }

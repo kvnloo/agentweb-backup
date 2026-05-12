@@ -71,10 +71,12 @@ const mockIterateLandingPage = jest.fn();
 const mockGetLandingPage = jest.fn();
 const mockListLandingPages = jest.fn();
 const mockDeleteLandingPage = jest.fn();
+const mockUpdateLandingPageGtm = jest.fn();
+const mockResolveVercelProjectId = jest.fn();
+const mockTriggerVercelDeployment = jest.fn();
 const mockGetProjectEnvVars = jest.fn();
 const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
-const mockResolveVercelProjectId = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
   generateLandingPage: (...args: any[]) => mockGenerateLandingPage(...args),
@@ -83,12 +85,16 @@ jest.mock("../services/v0Service", () => ({
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
+  updateLandingPageGtm: (...args: any[]) => mockUpdateLandingPageGtm(...args),
+  resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
+  triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
   getProjectEnvVars: (...args: any[]) => mockGetProjectEnvVars(...args),
   upsertEnvVar: (...args: any[]) => mockUpsertEnvVar(...args),
   deleteEnvVar: (...args: any[]) => mockDeleteEnvVar(...args),
-  resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   buildBrandEnrichedPrompt: jest.fn(),
   extractTemplateOutline: jest.fn(),
+  getDeploymentStatus: jest.fn(),
+  getPreviewDeploymentUrl: jest.fn(),
   BrandContext: {},
   INTEGRATIONS: {
     recaptcha: {
@@ -96,6 +102,16 @@ jest.mock("../services/v0Service", () => ({
       secretKey: { envKey: "RECAPTCHA_SECRET_KEY", type: "encrypted", target: ["production", "preview", "development"] },
     },
   },
+}));
+
+// Mock axios for GitHub API calls (used by GTM injection route)
+jest.mock("axios");
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockAxios: any = jest.requireMock("axios");
+
+// Mock secretsManager for GitHub token (used via dynamic import in GTM route)
+jest.mock("../utils/secretsManager", () => ({
+  getGitHubOrgToken: jest.fn().mockResolvedValue({ token: "gh-test-token" }),
 }));
 
 const mockedExtractOutline = extractTemplateOutline as jest.MockedFunction<typeof extractTemplateOutline>;
@@ -119,7 +135,11 @@ beforeEach(() => {
   mockListLandingPages.mockResolvedValue([]);
   mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
+  mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+  // main's tests rely on a non-null project id by default; HEAD's GTM tests
+  // override per-call with `.mockResolvedValueOnce(null)` where needed.
   mockResolveVercelProjectId.mockResolvedValue("vercel-proj-123");
+  mockTriggerVercelDeployment.mockResolvedValue(undefined);
   mockGetProjectEnvVars.mockResolvedValue({});
   mockUpsertEnvVar.mockResolvedValue("env-id-1");
   mockDeleteEnvVar.mockResolvedValue(undefined);
@@ -688,6 +708,121 @@ describe("Rate limiting on expensive endpoints", () => {
       .post("/api/landing-pages/v0/generate")
       .send({ prompt: "Valid prompt" });
     expect(res.status).toBe(429);
+  });
+});
+
+// =============================================================================
+// POST /generated/:id/gtm
+// =============================================================================
+describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
+  const PAGE_WITH_REPO = {
+    id: "page-1",
+    userId: "test-user-id",
+    githubRepoUrl: "https://github.com/testorg/testrepo",
+  };
+  const FAKE_LAYOUT = `<head>\n<title>Test</title>\n</head>\n<body>\nHello\n</body>`;
+  const ENCODED_LAYOUT = Buffer.from(FAKE_LAYOUT).toString("base64");
+
+  it("FAIL: missing gtmContainerId → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/gtmContainerId is required/);
+  });
+
+  it("FAIL: non-string gtmContainerId → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: 12345 });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/gtmContainerId is required/);
+  });
+
+  it("FAIL: invalid GTM container ID format → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "NOT-VALID" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid GTM container ID/);
+  });
+
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/missing/gtm")
+      .send({ gtmContainerId: "GTM-ABC123" });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page has no githubRepoUrl → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({ id: "page-1", userId: "test-user-id" });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-ABC123" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no GitHub repository/);
+  });
+
+  it("FAIL: malformed githubRepoUrl → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      githubRepoUrl: "https://gitlab.example.com/bad/url",
+    });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-ABC123" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid GitHub repo URL/);
+  });
+
+  it("SUCCESS: injects GTM and returns 200", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: ENCODED_LAYOUT, sha: "abc123sha" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-TESTX1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.gtmContainerId).toBe("GTM-TESTX1");
+    expect(mockUpdateLandingPageGtm).toHaveBeenCalledWith("page-1", "test-user-id", "GTM-TESTX1");
+    // Commit message should reference the container ID
+    const putCall = mockAxios.put.mock.calls[0][1] as any;
+    expect(putCall.message).toContain("GTM-TESTX1");
+    expect(putCall.sha).toBe("abc123sha");
+  });
+
+  it("SUCCESS: idempotent — strips existing GTM block before re-injecting", async () => {
+    const layoutWithExistingGtm =
+      `<head>\n        {/* Google Tag Manager */}\n        <script />\n        {/* End Google Tag Manager */}\n</head>\n<body></body>`;
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(layoutWithExistingGtm).toString("base64"), sha: "sha2" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-NEWVAL" });
+
+    expect(res.status).toBe(200);
+    // The committed content should contain the new container ID
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    const committed = Buffer.from(putBody.content, "base64").toString("utf-8");
+    expect(committed).toContain("GTM-NEWVAL");
+    // Old block is stripped — only one GTM head open-comment (not End/noscript variants)
+    const headOpenTags = (committed.match(/\{\/\* Google Tag Manager \*\//g) || []).length;
+    expect(headOpenTags).toBe(1);
   });
 });
 

@@ -15,10 +15,16 @@ import {
   type FieldFill,
   type ApolloFetchContext,
 } from './enrichmentGroupWaterfall';
+import { normalizeFills } from './enrichmentNormalizer';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import type { LeadRecord, SocketEmitFn } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import type { ResolveIdentityResult } from './enrichmentIdentityResolver';
+import {
+  buildSiblingFieldMappingTable,
+  copySiblingConfigFields,
+  type SiblingFieldMappingTable,
+} from './enrichmentSiblingConfigFields';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -114,7 +120,14 @@ export interface CriticResult {
 }
 
 export interface OrchestratorDeps {
-  loadLeads(input: { listId: string; userId: string }): Promise<LeadRecord[]>;
+  /** When `leadIds` is set and non-empty, the dep must return only those
+   *  leads (real impl uses BatchGetItem). When undefined/empty the dep
+   *  returns every lead in the list. The orchestrator does not re-filter. */
+  loadLeads(input: {
+    listId: string;
+    userId: string;
+    leadIds?: string[];
+  }): Promise<LeadRecord[]>;
 
   resolveIdentity(input: {
     listId: string;
@@ -122,7 +135,9 @@ export interface OrchestratorDeps {
     needsPersonFields: boolean;
     needsCompanyFields: boolean;
     mode: 'preview' | 'enrich';
-  }): Promise<ResolveIdentityResult>;
+    /** Forwarded to enable Tier 0a (CRM-history) per-field bypass. */
+    refreshFields?: Set<string>;
+  }): Promise<ResolveIdentityResult>; // success result now includes `siblings` for Tier 0b
 
   runWaterfall(input: {
     listId: string;
@@ -301,6 +316,7 @@ async function processLead(
   needsCompany: boolean,
   refreshSet: Set<string>,
   configFieldsByName: Record<string, EnrichmentFieldConfig>,
+  siblingMappingTable: SiblingFieldMappingTable,
 ): Promise<PerLeadOutcome> {
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
@@ -318,6 +334,7 @@ async function processLead(
       needsPersonFields: needsPerson,
       needsCompanyFields: needsCompany,
       mode: input.mode,
+      refreshFields: refreshSet,
     });
     console.log(`[v3][lead ${lead.leadId}] identity resolved in ${Date.now() - idStart}ms (ok=${identity.ok})`);
   } catch (err) {
@@ -346,6 +363,34 @@ async function processLead(
   // (Tier 1) can see them — the DB write was already done by the resolver
   // in mode=enrich; in preview it wasn't, but the waterfall benefits regardless.
   const enrichedLead = { ...lead, ...identity.resolved };
+
+  // Tier 0b — sibling config-field copy. Uses siblings already fetched by
+  // resolveIdentity (zero extra DDB queries). Fills config-requested custom
+  // fields from siblings before the waterfall runs, potentially skipping
+  // Apollo/web calls entirely for fields already present in the system.
+  const tier0bResult = copySiblingConfigFields(
+    enrichedLead,
+    identity.siblings,
+    input.config.fields,
+    siblingMappingTable,
+    refreshSet,
+  );
+  if (tier0bResult.fills.length > 0) {
+    allFills.push(...tier0bResult.fills.map(f => ({
+      field: f.field,
+      value: f.value,
+      meta: f.meta,
+    })));
+    // Merge into enrichedLead so waterfall sees these fields as already filled
+    for (const f of tier0bResult.fills) {
+      if ((enrichedLead as any)[f.field] !== undefined) {
+        (enrichedLead as any)[f.field] = f.value;
+      } else {
+        enrichedLead.customFields = { ...enrichedLead.customFields, [f.field]: f.value };
+      }
+    }
+    console.log(`[v3][lead ${lead.leadId}] tier0b filled ${tier0bResult.fills.length} config field(s) from siblings`);
+  }
 
   // Steps 1–3: waterfall + ungrouped + critic, wrapped together so any
   // mid-pipeline error is captured as llmOrParseFailed for this lead.
@@ -464,24 +509,9 @@ async function writeLeadOutcome(
   };
 
   try {
-    if (fillIfEmpty.length > 0) {
-      const split = splitBucket(fillIfEmpty);
-      await deps.setLeadFields({
-        listId: input.listId,
-        leadId: lead.leadId,
-        topLevel: split.topLevel,
-        customFields: split.customFields,
-        enrichmentMetadata: split.enrichmentMetadata,
-        // `fill_if_empty` is now enforced app-side by `leadValueIsEmpty`
-        // (treats both missing and empty-string as empty). We can write
-        // unconditionally at DDB level — bucketByOverwritePolicy already
-        // dropped fields where the lead has a non-empty value.
-        ifNotExists: false,
-      });
-    }
-
-    if (alwaysOverwrite.length > 0) {
-      const split = splitBucket(alwaysOverwrite);
+    const allFills = [...fillIfEmpty, ...alwaysOverwrite];
+    if (allFills.length > 0) {
+      const split = splitBucket(allFills);
       await deps.setLeadFields({
         listId: input.listId,
         leadId: lead.leadId,
@@ -518,16 +548,28 @@ export async function runEnrichment(
 
   console.log(`[v3] runEnrichment START listId=${input.listId} userId=${input.userId} mode=${input.mode} runId=${runId}`);
   const loadStart = Date.now();
-  const allLeads = await deps.loadLeads({ listId: input.listId, userId: input.userId });
-  const leads = (input.leadIds && input.leadIds.length > 0)
-    ? allLeads.filter(l => input.leadIds!.includes(l.leadId))
-    : allLeads;
-  console.log(`[v3] loadLeads → ${allLeads.length} lead(s) in ${Date.now() - loadStart}ms (after leadIds filter: ${leads.length})`);
+  // Treat empty leadIds as "no filter" so callers can pass an empty array
+  // without unexpectedly enriching zero leads.
+  const leadIdsFilter = input.leadIds && input.leadIds.length > 0 ? input.leadIds : undefined;
+  const leads = await deps.loadLeads({
+    listId: input.listId,
+    userId: input.userId,
+    leadIds: leadIdsFilter,
+  });
+  console.log(`[v3] loadLeads → ${leads.length} lead(s) in ${Date.now() - loadStart}ms (leadIds filter: ${leadIdsFilter ? leadIdsFilter.length : 'none'})`);
 
   const { routing, needsPerson, needsCompany } = routeFields(input.config);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
+
+  // Build sibling field mapping table once per run (one LLM call for unaliased
+  // fields, canonical match is free). Passed to every processLead call.
+  const siblingMappingTable = await buildSiblingFieldMappingTable(input.config.fields);
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
-  for (const f of input.config.fields) configFieldsByName[f.name] = f;
+  const fieldAliasMap: Record<string, string> = {};
+  for (const f of input.config.fields) {
+    configFieldsByName[f.name] = f;
+    if (f.aliasFor) fieldAliasMap[f.name] = f.aliasFor;
+  }
 
   const includedFieldNames = input.config.fields
     .filter(f => f.include)
@@ -578,7 +620,7 @@ export async function runEnrichment(
     const outcomes = await Promise.all(
       chunk.map(lead =>
         processLead(
-          lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName,
+          lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable,
         ).then(outcome => {
           emitPerLeadProgress();
           return { lead, outcome };
@@ -588,8 +630,7 @@ export async function runEnrichment(
 
     for (const { lead, outcome } of outcomes) {
       // Apollo failures are independent of pass/fail — count them regardless of outcome.
-      if (outcome.apolloOrgFailed) apolloFailed += 1;
-      if (outcome.apolloPersonFailed) apolloFailed += 1;
+      if (outcome.apolloOrgFailed || outcome.apolloPersonFailed) apolloFailed += 1;
 
       // Aggregate tier counts only on success or partial success — failed leads
       // (identity / waterfall errors) contribute nothing useful to the breakdown.
@@ -615,6 +656,8 @@ export async function runEnrichment(
         case null:
           break;     // success path falls through
       }
+
+      outcome.fills = normalizeFills(outcome.fills, fieldAliasMap);
 
       if (input.mode === 'preview') {
         const extractedFields: Record<string, string> = {};

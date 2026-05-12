@@ -1138,7 +1138,10 @@ const createLeadsTable = async () => {
       { AttributeName: 'email', AttributeType: 'S' },
       { AttributeName: 'isICP', AttributeType: 'N' },
       { AttributeName: 'isEngaged', AttributeType: 'N' },
-      { AttributeName: 'status', AttributeType: 'S' }
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'linkedin', AttributeType: 'S' },
+      { AttributeName: 'nameCompanyKey', AttributeType: 'S' },
+      { AttributeName: 'updatedAt', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },
@@ -1192,6 +1195,48 @@ const createLeadsTable = async () => {
         KeySchema: [
           { AttributeName: 'listId', KeyType: 'HASH' },
           { AttributeName: 'status', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'EmailLookupIndex',
+        KeySchema: [
+          { AttributeName: 'email', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'LinkedinLookupIndex',
+        KeySchema: [
+          { AttributeName: 'linkedin', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'NameCompanyLookupIndex',
+        KeySchema: [
+          { AttributeName: 'nameCompanyKey', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'

@@ -1360,6 +1360,29 @@ describe('CRM Routes', () => {
         defaultSenderId: null,
       });
     });
+
+    it('should include defaultLinkedInAccountId from stored config', async () => {
+      const mockSetting = {
+        settingName: 'crm_sender_emails_test-user-id',
+        settingValue: JSON.stringify({
+          senders: [],
+          defaultSenderId: null,
+          defaultLinkedInAccountId: 'linkedin-acc-42',
+        }),
+      };
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(mockSetting);
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sender-emails' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ defaultLinkedInAccountId: 'linkedin-acc-42' })
+      );
+    });
   });
 
   describe('POST /api/crm/sender-emails', () => {
@@ -1367,37 +1390,74 @@ describe('CRM Routes', () => {
       const senders = [
         { id: '1', email: 'sender@example.com', fromName: 'Sender Name', notes: 'Test notes' },
       ];
-      
+
       (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
-      
+
       mockRequest.body = {
         senders,
         defaultSenderId: '1',
       };
-      
-      const handler = router.stack.find((r: any) => 
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(settingsService.setSetting).toHaveBeenCalled();
       expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    it('should save defaultLinkedInAccountId when provided', async () => {
+      (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+
+      mockRequest.body = {
+        senders: [{ id: '1', email: 'sender@example.com', fromName: 'Sender' }],
+        defaultSenderId: '1',
+        defaultLinkedInAccountId: 'li-acc-xyz',
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sender-emails' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(settingsService.setSetting).toHaveBeenCalled();
+      const savedConfig = JSON.parse((settingsService.setSetting as jest.Mock).mock.calls[0][1]);
+      expect(savedConfig.defaultLinkedInAccountId).toBe('li-acc-xyz');
+    });
+
+    it('should return 400 if defaultLinkedInAccountId is not a string', async () => {
+      mockRequest.body = {
+        senders: [{ id: '1', email: 'sender@example.com', fromName: 'Sender' }],
+        defaultLinkedInAccountId: 12345,
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sender-emails' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
 
     it('should return 400 if senders is not an array', async () => {
       mockRequest.body = {
         senders: 'not-an-array',
       };
-      
-      const handler = router.stack.find((r: any) => 
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
 
@@ -1405,14 +1465,14 @@ describe('CRM Routes', () => {
       mockRequest.body = {
         senders: [{ email: 'test@example.com' }], // missing fromName
       };
-      
-      const handler = router.stack.find((r: any) => 
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
   });

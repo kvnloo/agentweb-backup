@@ -596,6 +596,9 @@ export async function waterfallFindEmail(
           // placeholder only needs to survive that window plus a generous
           // buffer for retries / stuck queues. 7 days is plenty.
           const ttl = 7 * 86400;
+          // C9: Without the placeholder the eventual webhook has no lead to
+          // attribute the result to — the email is silently lost. Let the
+          // error propagate so the lead is marked failed rather than dropped.
           await crmDb.putEnrichmentCacheItem({
             canonicalId: key.canonicalId,
             fieldGroup: key.sk,
@@ -616,17 +619,6 @@ export async function waterfallFindEmail(
             fetchedAt: new Date().toISOString(),
             expiresAt: Math.floor(Date.now() / 1000) + ttl,
             cacheType: 'apollo',
-          }).catch((err) => {
-            // C9: surface placeholder write failures. Without the placeholder,
-            // the eventual webhook arrival has no way to attribute the result
-            // to a lead — the email is silently lost. Log loudly so this is
-            // visible in dashboards/alerts.
-            console.error(
-              '[waterfall] Tier 3 placeholder write failed for request_id',
-              f.asyncRequestId,
-              '— webhook will not be attributable:',
-              (err as Error).message,
-            );
           });
         }
         // Wait for the webhook to deposit the result onto the placeholder.

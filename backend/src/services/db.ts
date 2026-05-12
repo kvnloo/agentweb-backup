@@ -4,7 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -4300,6 +4300,10 @@ export const crmDb = {
     lastTouch?: AttributionTouch;
     utmSource?: string;
     utmMedium?: string;
+    // CRM-history Tier 0: list-owner denormalized onto the lead for audit
+    // metadata. Lookup GSIs partition on email/linkedin/nameCompanyKey, not
+    // userId, so userId is not load-bearing for retrieval — only audit.
+    userId?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -4313,6 +4317,7 @@ export const crmDb = {
       }
 
       const emailValue = leadData.email?.trim().toLowerCase();
+      const linkedinValue = leadData.linkedin?.trim();
       const item: any = {
         listId,
         leadId,
@@ -4322,19 +4327,45 @@ export const crmDb = {
         company: leadData.company || '',
         title: leadData.title || '',
         notes: leadData.notes || '',
-        linkedin: leadData.linkedin?.trim() || '',
         companyLinkedin: leadData.companyLinkedin?.trim() || '',
         customFields: leadData.customFields || {},
-        engagements: [], // Initialize with empty array
+        engagements: [],
         isICP: 0,
         isEngaged: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
-      // Only include email if it's provided (GSI key cannot be empty string)
       if (emailValue) {
         item.email = emailValue;
+      }
+      // Keep linkedin sparse so LinkedinLookupIndex GSI only indexes leads
+      // with a real value (empty-string HASH keys are wasteful in the GSI).
+      if (linkedinValue) {
+        item.linkedin = linkedinValue;
+      }
+      // Derive the list-owner's userId for CRM-history Tier 0 audit metadata.
+      // Caller may override (e.g., backfill / admin tooling); otherwise it
+      // matches the parent list's userId, guaranteeing lead.userId never
+      // desyncs from list.userId.
+      let ownerUserId: string | undefined = leadData.userId;
+      if (!ownerUserId) {
+        try {
+          const list = await this.getLeadListById(listId) as any;
+          if (list?.userId) ownerUserId = String(list.userId);
+        } catch {
+          // List-fetch failures here are non-fatal — userId stays undefined
+          // and the backfill script can repair it later.
+        }
+      }
+      if (ownerUserId) {
+        item.userId = ownerUserId;
+      }
+      const nameCompanyKey = computeNameCompanyKey(
+        leadData.firstName, leadData.lastName, leadData.company,
+      );
+      if (nameCompanyKey) {
+        item.nameCompanyKey = nameCompanyKey;
       }
       if (leadData.selectedSenderId) {
         item.selectedSenderId = leadData.selectedSenderId;
@@ -4615,6 +4646,101 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Cross-tenant lookup by email — backs CRM-history Tier 0. Queries the
+   * EmailLookupIndex GSI globally (no userId filter) so a sibling lead
+   * enriched on ANY user's list is returned. Sort key `updatedAt` means
+   * `ScanIndexForward: false` gives the freshest match first.
+   */
+  async findLeadsByEmail(email: string) {
+    const value = (email ?? '').trim().toLowerCase();
+    if (!value) return [];
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'EmailLookupIndex',
+        KeyConditionExpression: 'email = :email',
+        ExpressionAttributeValues: { ':email': value },
+        ScanIndexForward: false,
+        Limit: 10,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsByEmail');
+      throw error;
+    }
+  },
+
+  async findLeadsByLinkedin(linkedin: string) {
+    const value = (linkedin ?? '').trim();
+    if (!value) return [];
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'LinkedinLookupIndex',
+        KeyConditionExpression: 'linkedin = :linkedin',
+        ExpressionAttributeValues: { ':linkedin': value },
+        ScanIndexForward: false,
+        Limit: 10,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsByLinkedin');
+      throw error;
+    }
+  },
+
+  async findLeadsByNameCompany(firstName: string, lastName: string, company: string) {
+    const key = computeNameCompanyKey(firstName, lastName, company);
+    if (!key) return [];
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'NameCompanyLookupIndex',
+        KeyConditionExpression: 'nameCompanyKey = :nameCompanyKey',
+        ExpressionAttributeValues: { ':nameCompanyKey': key },
+        ScanIndexForward: false,
+        Limit: 10,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsByNameCompany');
+      throw error;
+    }
+  },
+
+  async batchGetLeads(listId: string, leadIds: string[]) {
+    if (leadIds.length === 0) return [];
+
+    // DynamoDB BatchGetItem caps at 100 keys per call; matching approvalDb's
+    // conservative 25 keeps payloads small and leaves headroom for retries.
+    const BATCH_SIZE = 25;
+    const results: any[] = [];
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+
+    for (let i = 0; i < leadIds.length; i += BATCH_SIZE) {
+      const batch = leadIds.slice(i, i + BATCH_SIZE);
+      const params = {
+        RequestItems: {
+          [tableName]: {
+            Keys: batch.map(leadId => ({ listId, leadId })),
+          },
+        },
+      };
+
+      try {
+        const result = await dynamodb.batchGet(params).promise();
+        const batchItems = (result.Responses?.[tableName] as any[]) || [];
+        results.push(...batchItems);
+      } catch (error) {
+        handleDynamoDbError(error, "batchGetLeads");
+        throw error;
+      }
+    }
+
+    return results;
+  },
+
   async getLeadByEmail(listId: string, email: string) {
     try {
       // Use email-index GSI to query by listId and email
@@ -4772,8 +4898,36 @@ export const crmDb = {
       }
 
       if (updates.linkedin !== undefined) {
-        setExpressions.push('linkedin = :linkedin');
-        expressionAttributeValues[':linkedin'] = updates.linkedin.trim();
+        const trimmedLinkedin = updates.linkedin.trim();
+        if (trimmedLinkedin) {
+          setExpressions.push('linkedin = :linkedin');
+          expressionAttributeValues[':linkedin'] = trimmedLinkedin;
+        } else {
+          // Keep LinkedinLookupIndex sparse — empty values must not appear.
+          removeExpressions.push('linkedin');
+        }
+      }
+
+      // Recompute nameCompanyKey when any of firstName/lastName/company is in
+      // the update payload. Requires a read-before-write to merge the values
+      // we DIDN'T touch (so a partial update doesn't blank-out the key just
+      // because not every field was provided).
+      if (
+        updates.firstName !== undefined ||
+        updates.lastName !== undefined ||
+        updates.company !== undefined
+      ) {
+        const current = await this.getLeadById(listId, leadId) as any;
+        const mergedFirst = updates.firstName !== undefined ? updates.firstName : (current?.firstName || '');
+        const mergedLast = updates.lastName !== undefined ? updates.lastName : (current?.lastName || '');
+        const mergedCompany = updates.company !== undefined ? updates.company : (current?.company || '');
+        const nck = computeNameCompanyKey(mergedFirst, mergedLast, mergedCompany);
+        if (nck) {
+          setExpressions.push('nameCompanyKey = :nameCompanyKey');
+          expressionAttributeValues[':nameCompanyKey'] = nck;
+        } else {
+          removeExpressions.push('nameCompanyKey');
+        }
       }
 
       if (updates.companyLinkedin !== undefined) {
@@ -5160,9 +5314,6 @@ export const crmDb = {
             company: lead.company || '',
             title: lead.title || '',
             notes: lead.notes || '',
-            // Store LinkedIn URL in canonical form so future dedup reads match
-            // regardless of the source's formatting (Unipile, CSV upload, manual entry).
-            linkedin: normalizeLinkedInUrl(lead.linkedin),
             companyLinkedin: lead.companyLinkedin?.trim() || '',
             customFields: lead.customFields || {},
             syncMetadata: lead.syncMetadata || {},
@@ -5173,9 +5324,15 @@ export const crmDb = {
             updatedAt: new Date().toISOString(),
           };
 
-          // Only include email if it's provided (GSI key cannot be empty string)
+          // Only include email/linkedin if non-empty — GSI key cannot be empty string
           if (emailValue) {
             item.email = emailValue;
+          }
+          // Store LinkedIn URL in canonical form so future dedup reads match
+          // regardless of the source's formatting (Unipile, CSV upload, manual entry).
+          const linkedinValue = normalizeLinkedInUrl(lead.linkedin);
+          if (linkedinValue) {
+            item.linkedin = linkedinValue;
           }
           if (lead.status) {
             item.status = lead.status;
@@ -6273,9 +6430,38 @@ export const crmDb = {
     const attrValues: Record<string, any> = { ':ts': new Date().toISOString() };
 
     const ine = options.ifNotExists ?? false;
+    const topLevelChangesNameOrCompany =
+      options.topLevel && (
+        'firstName' in options.topLevel ||
+        'lastName' in options.topLevel ||
+        'company' in options.topLevel
+      );
     for (const [k, v] of Object.entries(options.topLevel ?? {})) {
       attrValues[`:tl_${k}`] = v;
       setClauses.push(ine ? `${k} = if_not_exists(${k}, :tl_${k})` : `${k} = :tl_${k}`);
+    }
+
+    // Recompute nameCompanyKey when firstName/lastName/company is in topLevel.
+    // With ifNotExists=true the actual top-level SET is skipped for any field
+    // the lead already has — we mirror that here: when the lead has an existing
+    // value for a field, the merged key uses the EXISTING value, not the
+    // proposed one. This keeps the key in sync with the actual stored values.
+    if (topLevelChangesNameOrCompany) {
+      const current = await this.getLeadById(listId, leadId) as any;
+      const tl = options.topLevel!;
+      const pickField = (field: 'firstName' | 'lastName' | 'company'): string => {
+        const proposedVal = field in tl ? String(tl[field] ?? '') : '';
+        const existingVal = current?.[field] ? String(current[field]) : '';
+        if (ine) return existingVal || proposedVal;
+        return field in tl ? proposedVal : existingVal;
+      };
+      const nck = computeNameCompanyKey(pickField('firstName'), pickField('lastName'), pickField('company'));
+      if (nck) {
+        attrValues[':nck'] = nck;
+        setClauses.push(ine ? `nameCompanyKey = if_not_exists(nameCompanyKey, :nck)` : `nameCompanyKey = :nck`);
+      } else {
+        removeClauses.push('nameCompanyKey');
+      }
     }
 
     let idx = 0;
