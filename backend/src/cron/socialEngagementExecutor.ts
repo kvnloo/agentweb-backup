@@ -5,7 +5,7 @@ import { agentModeService } from '../services/agentModeService';
 import { v4 as uuidv4 } from 'uuid';
 
 const INSTANCE_ID = uuidv4();
-const COMMENT_MODEL = 'gemini-3.1-flash-lite-preview';
+const COMMENT_MODEL = 'gemini-3.1-flash-lite';
 
 const POST_COMMENT_SYSTEM_PROMPT = `You are writing a LinkedIn comment on behalf of a real person. Write exactly as a human would — natural, specific, and personal to the post content.
 

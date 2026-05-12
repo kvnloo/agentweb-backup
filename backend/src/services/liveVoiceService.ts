@@ -443,7 +443,7 @@ export async function sendTextTurn(sessionId: string, text: string): Promise<voi
   });
 }
 
-const ARTIFACT_EXTRACT_MODEL = 'gemini-3.1-flash-lite-preview';
+const ARTIFACT_EXTRACT_MODEL = 'gemini-3.1-flash-lite';
 
 /**
  * Use a fast LLM to both summarize a tool result in natural language and extract
