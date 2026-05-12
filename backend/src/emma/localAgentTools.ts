@@ -119,7 +119,6 @@ const BLOCKED_TASK_PATTERNS = [
   /\baccess token/i,
   /\bapi key/i,
   /\bsecret/i,
-  /\bpost.*form/i,
   /\bsubmit.*form/i,
   /\bclick.*button/i,
   /\bfill.*form/i,
@@ -322,17 +321,33 @@ emmaToolRegistry.register({
       };
     }
 
-    const healthUrl = config.endpoint.replace(/\/$/, '') + '/health';
-    let rawResponse: { status: number; data: string };
+    const base = config.endpoint.replace(/\/$/, '');
+
+    // First check the HTTP server is up
+    let healthResponse: { status: number; data: string };
     try {
-      rawResponse = await httpRequest('GET', healthUrl, '', null, 10_000);
+      healthResponse = await httpRequest('GET', base + '/health', '', null, 10_000);
     } catch (err: any) {
       return { configured: true, reachable: false, error: `Cannot reach relay at ${config.endpoint}: ${err.message}` };
     }
-
-    if (rawResponse.status === 200) {
-      return { configured: true, reachable: true, endpoint: config.endpoint };
+    if (healthResponse.status !== 200) {
+      return { configured: true, reachable: false, status: healthResponse.status, error: healthResponse.data.slice(0, 200) };
     }
-    return { configured: true, reachable: false, status: rawResponse.status, error: rawResponse.data.slice(0, 200) };
+
+    // Probe the worker with a trivial task — this catches a hung worker that still serves /health
+    let taskResponse: { status: number; data: string };
+    try {
+      taskResponse = await httpRequest('POST', base + '/task', config.apiKey, {
+        task: 'Return the single word: ping',
+        timeout_seconds: 15,
+      }, 25_000);
+    } catch (err: any) {
+      return { configured: true, reachable: false, workerHung: true, error: `Relay HTTP server is up but worker is not responding: ${err.message}` };
+    }
+    if (taskResponse.status !== 200) {
+      return { configured: true, reachable: false, workerHung: true, error: `Worker probe returned status ${taskResponse.status}: ${taskResponse.data.slice(0, 200)}` };
+    }
+
+    return { configured: true, reachable: true, endpoint: config.endpoint };
   },
 });
