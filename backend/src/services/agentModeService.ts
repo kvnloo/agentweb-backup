@@ -2944,6 +2944,9 @@ export class AgentModeService {
     // Session Notifications (no email integration required)
     'notify_session',
 
+    // Email — always available so agents can send reports/summaries via connected email accounts
+    'email',
+
     // Local Agent Relay (Codex agent running on user's machine)
     'run_local_agent_task',
     'check_local_agent_status',
