@@ -177,7 +177,7 @@ describe('userDb.updateUserEmail tombstone clears org fields', () => {
   beforeEach(() => {
     // getUserById uses docClient.query with UserIdIndex — return the live user
     // getUserByEmail also uses docClient.query with EmailIndex — return empty (new email not taken)
-    mockDocClientInstance.query = jest.fn((params: any) => ({
+    (mockDocClientInstance.query as jest.Mock).mockImplementation((params: any) => ({
       promise: jest.fn().mockResolvedValue(
         params.IndexName === 'UserIdIndex'
           ? { Items: [LIVE_USER] }
