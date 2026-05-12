@@ -4614,6 +4614,38 @@ export const crmDb = {
     }
   },
 
+  async batchGetLeads(listId: string, leadIds: string[]) {
+    if (leadIds.length === 0) return [];
+
+    // DynamoDB BatchGetItem caps at 100 keys per call; matching approvalDb's
+    // conservative 25 keeps payloads small and leaves headroom for retries.
+    const BATCH_SIZE = 25;
+    const results: any[] = [];
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+
+    for (let i = 0; i < leadIds.length; i += BATCH_SIZE) {
+      const batch = leadIds.slice(i, i + BATCH_SIZE);
+      const params = {
+        RequestItems: {
+          [tableName]: {
+            Keys: batch.map(leadId => ({ listId, leadId })),
+          },
+        },
+      };
+
+      try {
+        const result = await dynamodb.batchGet(params).promise();
+        const batchItems = (result.Responses?.[tableName] as any[]) || [];
+        results.push(...batchItems);
+      } catch (error) {
+        handleDynamoDbError(error, "batchGetLeads");
+        throw error;
+      }
+    }
+
+    return results;
+  },
+
   async getLeadByEmail(listId: string, email: string) {
     try {
       // Use email-index GSI to query by listId and email

@@ -94,32 +94,34 @@ describe('runEnrichment — empty list', () => {
 });
 
 // ─── leadIds filter ──────────────────────────────────────────────────────────
+// The dep is now responsible for honoring leadIds (real impl uses BatchGetItem
+// when set, paginated Query otherwise). The orchestrator's job is to pass it
+// through faithfully and process whatever the dep returns.
 
 describe('runEnrichment — leadIds filter', () => {
-  it('processes only the leads whose ids are in input.leadIds', async () => {
-    const leads = [
-      makeLead({ leadId: 'lead-1' }),
+  it('passes input.leadIds through to deps.loadLeads when set', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([
       makeLead({ leadId: 'lead-2' }),
       makeLead({ leadId: 'lead-3' }),
-    ];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+    ]);
+    const deps = makeDeps({ loadLeads });
 
     const result = await runEnrichment(
       makeInput({ leadIds: ['lead-2', 'lead-3'] }),
       deps,
     );
 
+    expect(loadLeads).toHaveBeenCalledWith({
+      listId: LIST_ID,
+      userId: USER_ID,
+      leadIds: ['lead-2', 'lead-3'],
+    });
     expect(result.processed).toBe(2);
     expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
-    const processedIds = (deps.resolveIdentity as jest.Mock).mock.calls
-      .map(c => c[0].lead.leadId)
-      .sort();
-    expect(processedIds).toEqual(['lead-2', 'lead-3']);
   });
 
-  it('processes 0 leads when leadIds is provided but matches nothing', async () => {
-    const leads = [makeLead({ leadId: 'lead-1' })];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+  it('processes 0 leads when the dep returns no matches for the requested leadIds', async () => {
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
 
     const result = await runEnrichment(
       makeInput({ leadIds: ['nonexistent'] }),
@@ -130,28 +132,38 @@ describe('runEnrichment — leadIds filter', () => {
     expect(deps.resolveIdentity).not.toHaveBeenCalled();
   });
 
-  it('processes all loaded leads when leadIds is undefined (no filter)', async () => {
-    const leads = [
+  it('passes leadIds as undefined when input.leadIds is not set', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([
       makeLead({ leadId: 'lead-1' }),
       makeLead({ leadId: 'lead-2' }),
-    ];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+    ]);
+    const deps = makeDeps({ loadLeads });
 
     const result = await runEnrichment(makeInput(), deps);
 
+    expect(loadLeads).toHaveBeenCalledWith({
+      listId: LIST_ID,
+      userId: USER_ID,
+      leadIds: undefined,
+    });
     expect(result.processed).toBe(2);
     expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
   });
 
-  it('processes all loaded leads when leadIds is an empty array (treated as no filter)', async () => {
-    const leads = [
+  it('passes leadIds as undefined when input.leadIds is an empty array (treated as no filter)', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([
       makeLead({ leadId: 'lead-1' }),
       makeLead({ leadId: 'lead-2' }),
-    ];
-    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue(leads) });
+    ]);
+    const deps = makeDeps({ loadLeads });
 
     const result = await runEnrichment(makeInput({ leadIds: [] }), deps);
 
+    expect(loadLeads).toHaveBeenCalledWith({
+      listId: LIST_ID,
+      userId: USER_ID,
+      leadIds: undefined,
+    });
     expect(result.processed).toBe(2);
     expect(deps.resolveIdentity).toHaveBeenCalledTimes(2);
   });

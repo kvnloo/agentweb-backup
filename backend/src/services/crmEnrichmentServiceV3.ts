@@ -114,7 +114,14 @@ export interface CriticResult {
 }
 
 export interface OrchestratorDeps {
-  loadLeads(input: { listId: string; userId: string }): Promise<LeadRecord[]>;
+  /** When `leadIds` is set and non-empty, the dep must return only those
+   *  leads (real impl uses BatchGetItem). When undefined/empty the dep
+   *  returns every lead in the list. The orchestrator does not re-filter. */
+  loadLeads(input: {
+    listId: string;
+    userId: string;
+    leadIds?: string[];
+  }): Promise<LeadRecord[]>;
 
   resolveIdentity(input: {
     listId: string;
@@ -518,11 +525,15 @@ export async function runEnrichment(
 
   console.log(`[v3] runEnrichment START listId=${input.listId} userId=${input.userId} mode=${input.mode} runId=${runId}`);
   const loadStart = Date.now();
-  const allLeads = await deps.loadLeads({ listId: input.listId, userId: input.userId });
-  const leads = (input.leadIds && input.leadIds.length > 0)
-    ? allLeads.filter(l => input.leadIds!.includes(l.leadId))
-    : allLeads;
-  console.log(`[v3] loadLeads → ${allLeads.length} lead(s) in ${Date.now() - loadStart}ms (after leadIds filter: ${leads.length})`);
+  // Treat empty leadIds as "no filter" so callers can pass an empty array
+  // without unexpectedly enriching zero leads.
+  const leadIdsFilter = input.leadIds && input.leadIds.length > 0 ? input.leadIds : undefined;
+  const leads = await deps.loadLeads({
+    listId: input.listId,
+    userId: input.userId,
+    leadIds: leadIdsFilter,
+  });
+  console.log(`[v3] loadLeads → ${leads.length} lead(s) in ${Date.now() - loadStart}ms (leadIds filter: ${leadIdsFilter ? leadIdsFilter.length : 'none'})`);
 
   const { routing, needsPerson, needsCompany } = routeFields(input.config);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);

@@ -397,8 +397,16 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
   const identityDeps = buildIdentityDeps();
 
   return {
-    loadLeads: async ({ listId }) => {
-      const result = await crmDb.getLeadsByListId(listId, 500);
+    loadLeads: async ({ listId, leadIds }) => {
+      // Selection-scoped run (bulk-actions bar) → BatchGetItem on the
+      // requested keys, no over-fetch.
+      if (leadIds && leadIds.length > 0) {
+        const items = await crmDb.batchGetLeads(listId, leadIds);
+        return items as LeadRecord[];
+      }
+      // Whole-list run → single Query page. No explicit limit: DDB returns
+      // up to ~1MB worth of items in one round-trip.
+      const result = await crmDb.getLeadsByListId(listId);
       return (result?.items ?? []) as LeadRecord[];
     },
 
