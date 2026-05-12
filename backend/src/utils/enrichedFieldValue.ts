@@ -6,7 +6,22 @@
  * lead column). UI joins value + meta at display time.
  */
 export interface EnrichedFieldMeta {
-  source: 'web_search' | 'linkedin' | 'existing_data' | 'manual' | 'api';
+  /**
+   * Origin classification.
+   *  - 'crm-history': internal-only marker for CRM-history Tier 0 fills. The
+   *    response sanitizer in `sanitizeEnrichmentMetadataForResponse` rewrites
+   *    this to 'agentweb' before returning to the customer-portal so that the
+   *    cross-tenant origin is never surfaced to end users.
+   *  - 'agentweb': the public-facing source value the UI sees for those fills.
+   */
+  source: 'web_search' | 'linkedin' | 'existing_data' | 'manual' | 'api' | 'crm-history' | 'agentweb';
+  /**
+   * For 'crm-history' fills: the leadId of the sibling we copied from.
+   * Stripped before responses reach the customer-portal.
+   */
+  siblingLeadId?: string;
+  siblingListId?: string;
+  siblingUserId?: string;
   /**
    * Specific data provider that produced this value, when known. `source` says
    * what *kind* of data it is (web vs linkedin vs internal); `provider` says
