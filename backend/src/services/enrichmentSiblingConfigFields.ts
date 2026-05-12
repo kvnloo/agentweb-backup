@@ -22,7 +22,11 @@ const IDENTITY_FIELDS = new Set([
 ]);
 
 const DEFAULT_TTL_DAYS = 90;
-const MAPPING_MODEL = 'claude-haiku-4-5-20251001';
+// Must be a model that `createLLMService` can construct successfully — the
+// Azure deployment used by the rest of the v3 enrichment pipeline. Bedrock
+// Claude IDs only resolve here when an inference-profile mapping is added
+// in `llmService.ts`, so changing this requires updating that map too.
+const MAPPING_MODEL = process.env.CRM_ENRICH_V3_EXTRACT_MODEL || 'gpt-5-chat-2';
 
 // ─── TTL helpers ──────────────────────────────────────────────────────────────
 
