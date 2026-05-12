@@ -121,6 +121,22 @@ function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
   };
 }
 
+// Best-effort: convert a website URL into a bare emailDomain (host, no www).
+// Returns null when the input is not a parseable URL so downstream Apollo /
+// enrich.so calls aren't fed garbage (e.g., if the LLM hallucinates).
+function deriveDomainFromWebsite(website: string): string | null {
+  const trimmed = (website || '').trim();
+  if (!trimmed) return null;
+  const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const host = new URL(candidate).hostname.toLowerCase();
+    if (!host || !host.includes('.')) return null;
+    return host.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveIdentity(
   input: ResolveIdentityInput,
   deps: IdentityResolverDeps,
@@ -223,7 +239,17 @@ export async function resolveIdentity(
       if (domainResult?.website) {
         resolved.website = domainResult.website;
         meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
-        console.log(`${logTag} tier 0.5 website=${domainResult.website} for company="${companyForDomainLookup}"`);
+        // Derive emailDomain from the resolved website so downstream
+        // emailDomain-gated steps (step 6 Apollo org-match, enrich.so
+        // find-email) can fire when the lead arrived with only a company
+        // name. Without this the Tier 0.5 fix is cosmetic — the website
+        // populates but no email is ever found.
+        const derivedDomain = deriveDomainFromWebsite(domainResult.website);
+        if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
+          resolved.emailDomain = derivedDomain;
+          meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+        }
+        console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'} for company="${companyForDomainLookup}"`);
       }
     } catch (err) {
       console.warn(`${logTag} tier 0.5 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
@@ -374,7 +400,11 @@ export async function resolveIdentity(
   // write never carries audit entries for absent attributes.
   const writableFields: Record<string, string> = {};
   for (const [key, value] of Object.entries(resolved)) {
-    if (key === 'emailDomain') continue;  // derived locally, not an API result
+    // emailDomain is normally derived locally from email and not worth
+    // persisting on its own. Exception: when Tier 0.5 derived it from a
+    // web-search-resolved website, the lead has no email to re-derive
+    // from on the next run — persist it so the value is not lost.
+    if (key === 'emailDomain' && !meta.emailDomain) continue;
     if (typeof value === 'string' && value.length > 0) {
       writableFields[key] = value;
     }
