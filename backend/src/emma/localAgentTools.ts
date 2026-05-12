@@ -244,7 +244,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
 
     let rawResponse: { status: number; data: string };
     try {
-      rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 30) * 1000);
+      rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 90) * 1000);
     } catch (err: any) {
       return { success: false, error: `Failed to reach local agent relay: ${err.message}` };
     }
