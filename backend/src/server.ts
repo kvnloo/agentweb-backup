@@ -8,6 +8,7 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { generateChatResponse, chatbotDb } from './services/chatbotService';
 import { checkTokenUsage } from './services/tokenUsageService';
+import { userDb } from './services/db';
 import {
   startLiveSession,
   sendAudioChunk,
@@ -225,10 +226,11 @@ io.on('connection', (socket: Socket) => {
       }
 
       const portalType = data.portal || 'partner';
+      const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin }
+        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
       );
 
       // Send response back to the client

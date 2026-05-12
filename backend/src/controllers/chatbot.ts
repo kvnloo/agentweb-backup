@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { userDb } from '../services/db';
 
 // Create a new chat session
 export const createChatSession = async (req: AuthenticatedRequest, res: Response) => {
@@ -165,7 +166,8 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       const delegateInfo = (req as any).delegateInfo;
       const isDelegatedAdmin = delegateInfo?.isDelegated === true;
       const adminEmail = isDelegatedAdmin ? delegateInfo.adminEmail : undefined;
-      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model, isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail });
+      const orgRole = userId ? (await userDb.getUserById(userId))?.orgRole : undefined;
+      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model, isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail, orgRole });
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -267,12 +269,13 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     const delegateInfo = (req as any).delegateInfo;
     const isDelegatedAdmin = delegateInfo?.isDelegated === true;
     const adminEmail = isDelegatedAdmin ? delegateInfo.adminEmail : undefined;
+    const orgRole = (await userDb.getUserById(userId))?.orgRole;
     const response = await generateChatResponse(
       sessionId, message,
       {
         currentUrl, pageContent: pageContext, portalType, userId,
         structuredContext, screenshot, model,
-        isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail,
+        isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail, orgRole,
         onToolStart: (toolName: string) => sendEvent({ type: 'tool_start', name: toolName })
       }
     );
