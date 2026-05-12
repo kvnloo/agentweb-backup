@@ -116,6 +116,24 @@ const FREE_EMAIL_DOMAINS = new Set([
   'pm.me',
 ]);
 
+/**
+ * Synthesized lookup key for the cross-tenant NameCompanyLookupIndex GSI.
+ * Only returned when all three components are non-empty strings — otherwise
+ * the attribute is omitted from the lead item and the lead never appears in
+ * the sparse GSI.
+ */
+export function computeNameCompanyKey(
+  firstName: string | null | undefined,
+  lastName: string | null | undefined,
+  company: string | null | undefined,
+): string | undefined {
+  const f = typeof firstName === 'string' ? firstName.trim().toLowerCase() : '';
+  const l = typeof lastName === 'string' ? lastName.trim().toLowerCase() : '';
+  const c = typeof company === 'string' ? company.trim().toLowerCase() : '';
+  if (!f || !l || !c) return undefined;
+  return `${f}|${l}|${c}`;
+}
+
 export function extractDomainFromEmail(email: string | null | undefined): string | undefined {
   if (!email || typeof email !== 'string') return undefined;
   const trimmed = email.trim().toLowerCase();
