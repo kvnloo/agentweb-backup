@@ -334,15 +334,16 @@ emmaToolRegistry.register({
       return { configured: true, reachable: false, status: healthResponse.status, error: healthResponse.data.slice(0, 200) };
     }
 
-    // Probe the worker with a trivial task — this catches a hung worker that still serves /health
+    // Probe the worker with a trivial task — this catches a hung worker that still serves /health.
+    // Codex startup alone can take 60s, so use a generous 120s HTTP timeout with a 90s task timeout.
     let taskResponse: { status: number; data: string };
     try {
       taskResponse = await httpRequest('POST', base + '/task', config.apiKey, {
         task: 'Return the single word: ping',
-        timeout_seconds: 15,
-      }, 25_000);
+        timeout_seconds: 90,
+      }, 120_000);
     } catch (err: any) {
-      return { configured: true, reachable: false, workerHung: true, error: `Relay HTTP server is up but worker is not responding: ${err.message}` };
+      return { configured: true, reachable: false, workerHung: true, error: `Relay HTTP server is up but worker is not responding within 120s: ${err.message}` };
     }
     if (taskResponse.status !== 200) {
       return { configured: true, reachable: false, workerHung: true, error: `Worker probe returned status ${taskResponse.status}: ${taskResponse.data.slice(0, 200)}` };
