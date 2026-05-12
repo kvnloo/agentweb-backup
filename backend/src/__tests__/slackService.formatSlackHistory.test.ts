@@ -1,41 +1,27 @@
 /**
  * Tests for formatSlackHistoryAsContext in slackService.
- * Uses jest.isolateModules so SLACK_BOT_TOKEN is set before the module initializes.
+ * The function looks up the user's most recent prior slack-bot session and returns
+ * its already-computed sessionSummary as context. No Slack API or LLM calls needed.
  */
 
-const mockHistoryConversationsHistory = jest.fn();
-const mockHistoryConversationsInfo = jest.fn();
-const mockHistoryUsersInfo = jest.fn();
-const mockCallLLM = jest.fn();
+const mockGetUserSessions = jest.fn();
 
-jest.mock('@slack/web-api', () => ({
-  WebClient: jest.fn().mockImplementation(() => ({
-    conversations: {
-      history: mockHistoryConversationsHistory,
-      info: mockHistoryConversationsInfo,
-    },
-    users: { info: mockHistoryUsersInfo },
-  })),
-}));
-
-jest.mock('../services/agentModeService', () => ({
-  agentModeService: {
-    callLLM: mockCallLLM,
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    getUserSessions: mockGetUserSessions,
   },
 }));
 
+// Slack web-api mock still needed because slackService imports WebClient at module level
+jest.mock('@slack/web-api', () => ({
+  WebClient: jest.fn().mockImplementation(() => ({})),
+}));
+
 describe('formatSlackHistoryAsContext', () => {
-  let formatSlackHistoryAsContext: (channelId: string, limit?: number) => Promise<string>;
+  let formatSlackHistoryAsContext: (userId: string) => Promise<string>;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockHistoryConversationsInfo.mockResolvedValue({
-      ok: true,
-      channel: { name: 'general' },
-    });
-    mockCallLLM.mockResolvedValue({
-      choices: [{ message: { content: 'Summary of the Slack conversation.' } }],
-    });
     jest.isolateModules(() => {
       process.env.SLACK_BOT_TOKEN = 'xoxb-test-token';
       // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -43,164 +29,75 @@ describe('formatSlackHistoryAsContext', () => {
     });
   });
 
-  it('returns empty string when Slack client is not initialized', async () => {
-    let fn: (channelId: string) => Promise<string>;
-    jest.isolateModules(() => {
-      delete process.env.SLACK_BOT_TOKEN;
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      fn = require('../services/slackService').formatSlackHistoryAsContext;
-    });
-    const result = await fn!('C12345');
+  it('returns empty string when user has no prior sessions', async () => {
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
+    const result = await formatSlackHistoryAsContext('user-123');
     expect(result).toBe('');
   });
 
-  it('returns empty string when channel has no messages', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({ ok: true, messages: [] });
-    const result = await formatSlackHistoryAsContext('C12345');
+  it('returns empty string when prior session has no sessionSummary', async () => {
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ sessionId: 'sess-1', userId: 'user-123', title: 'Old task' }],
+    });
+    const result = await formatSlackHistoryAsContext('user-123');
     expect(result).toBe('');
   });
 
-  it('defaults to fetching the last 10 messages', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({ ok: true, messages: [] });
-    await formatSlackHistoryAsContext('C12345');
-    expect(mockHistoryConversationsHistory).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 10 })
-    );
-  });
-
-  it('passes a custom limit parameter to conversations.history', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({ ok: true, messages: [] });
-    await formatSlackHistoryAsContext('C12345', 5);
-    expect(mockHistoryConversationsHistory).toHaveBeenCalledWith(
-      expect.objectContaining({ channel: 'C12345', limit: 5 })
-    );
-  });
-
-  it('calls Gemini Flash Lite to summarize the transcript', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({
-      ok: true,
-      messages: [
-        { ts: '1746057000.000000', user: 'U222', text: 'Thanks!' },
-        { ts: '1746056000.000000', user: 'U111', text: 'Here is the pipeline update' },
-      ],
-    });
-    mockHistoryUsersInfo.mockImplementation(({ user }: { user: string }) => {
-      const names: Record<string, string> = { U111: 'Harsha', U222: 'Rui' };
-      return Promise.resolve({
-        ok: true,
-        user: {
-          profile: { display_name: names[user] ?? user, real_name: names[user] ?? user },
-          real_name: names[user] ?? user,
+  it('returns formatted context string from sessionSummary when available', async () => {
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{
+        sessionId: 'sess-1',
+        userId: 'user-123',
+        title: 'Pipeline review',
+        sessionSummary: {
+          summary: 'Reviewed Q2 pipeline with Harsha. Identified 3 high-priority prospects.',
+          evaluatedAt: '2026-05-10T10:00:00.000Z',
+          evaluatedMessageIndex: 5,
         },
-      });
+      }],
     });
 
-    const result = await formatSlackHistoryAsContext('C12345');
+    const result = await formatSlackHistoryAsContext('user-123');
+    expect(result).toContain('Pipeline review');
+    expect(result).toContain('Reviewed Q2 pipeline with Harsha. Identified 3 high-priority prospects.');
+    expect(result).toContain('most recent previous AgentWeb session');
+  });
 
-    // Should have called the LLM with the transcript
-    expect(mockCallLLM).toHaveBeenCalledWith(
-      'gemini-3.1-flash-lite-preview',
-      expect.arrayContaining([
-        expect.objectContaining({ role: 'system' }),
-        expect.objectContaining({ role: 'user', content: expect.stringContaining('Harsha: Here is the pipeline update') }),
-      ]),
-      expect.objectContaining({ temperature: 0 })
+  it('queries for the most recent agent/slack-bot session (limit 1, descending)', async () => {
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
+    await formatSlackHistoryAsContext('user-456');
+    expect(mockGetUserSessions).toHaveBeenCalledWith(
+      'user-456',
+      'agent',
+      1,
+      true,
+      undefined,
+      'slack-bot'
     );
-
-    // Result should contain the Gemini summary, not raw timestamps
-    expect(result).toContain('Summary of the Slack conversation.');
-    expect(result).toContain('#general');
   });
 
-  it('includes display names (oldest first) in the transcript sent to LLM', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({
-      ok: true,
-      messages: [
-        // Slack returns newest-first; function reverses to oldest-first
-        { ts: '1746057000.000000', user: 'U222', text: 'Thanks!' },
-        { ts: '1746056000.000000', user: 'U111', text: 'Here is the pipeline update' },
-      ],
-    });
-    mockHistoryUsersInfo.mockImplementation(({ user }: { user: string }) => {
-      const names: Record<string, string> = { U111: 'Harsha', U222: 'Rui' };
-      return Promise.resolve({
-        ok: true,
-        user: {
-          profile: { display_name: names[user] ?? user, real_name: names[user] ?? user },
-          real_name: names[user] ?? user,
+  it('omits title from output when prior session has no title', async () => {
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{
+        sessionId: 'sess-2',
+        userId: 'user-123',
+        sessionSummary: {
+          summary: 'Updated CRM records.',
+          evaluatedAt: '2026-05-10T10:00:00.000Z',
+          evaluatedMessageIndex: 3,
         },
-      });
+      }],
     });
 
-    await formatSlackHistoryAsContext('C12345');
-
-    const llmCall = mockCallLLM.mock.calls[0];
-    const userMessage = llmCall[1].find((m: any) => m.role === 'user').content as string;
-    // Oldest message (Harsha) should appear before newest (Rui)
-    expect(userMessage.indexOf('Harsha')).toBeLessThan(userMessage.indexOf('Rui'));
+    const result = await formatSlackHistoryAsContext('user-123');
+    expect(result).toContain('Updated CRM records.');
+    // No title in parentheses
+    expect(result).not.toContain('(\"');
   });
 
-  it('falls back to raw transcript when Gemini summarization fails', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({
-      ok: true,
-      messages: [
-        { ts: '1746056000.000000', user: 'U111', text: 'Hello world' },
-      ],
-    });
-    mockHistoryUsersInfo.mockResolvedValue({
-      ok: true,
-      user: { profile: { display_name: 'Alice', real_name: 'Alice' }, real_name: 'Alice' },
-    });
-    mockCallLLM.mockRejectedValue(new Error('LLM unavailable'));
-
-    const result = await formatSlackHistoryAsContext('C12345');
-    // Falls back to raw transcript
-    expect(result).toContain('Alice: Hello world');
-    expect(result).toContain('#general');
-  });
-
-  it('normalizes mailto Slack links in message text before summarizing', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({
-      ok: true,
-      messages: [
-        { ts: '1746056000.000000', user: 'U111', text: 'Contact <mailto:test@example.com|test@example.com> for details' },
-      ],
-    });
-    mockHistoryUsersInfo.mockResolvedValue({
-      ok: true,
-      user: { profile: { display_name: 'Alice', real_name: 'Alice' }, real_name: 'Alice' },
-    });
-
-    await formatSlackHistoryAsContext('C12345');
-
-    const llmCall = mockCallLLM.mock.calls[0];
-    const userMessage = llmCall[1].find((m: any) => m.role === 'user').content as string;
-    expect(userMessage).toContain('test@example.com for details');
-    expect(userMessage).not.toContain('<mailto:');
-  });
-
-  it('returns empty string when conversations.history throws', async () => {
-    mockHistoryConversationsHistory.mockRejectedValue(new Error('Slack API error'));
-    const result = await formatSlackHistoryAsContext('C12345');
+  it('returns empty string when getUserSessions throws', async () => {
+    mockGetUserSessions.mockRejectedValue(new Error('DynamoDB error'));
+    const result = await formatSlackHistoryAsContext('user-123');
     expect(result).toBe('');
-  });
-
-  it('gracefully continues when conversations.info fails (falls back to channel ID in output)', async () => {
-    mockHistoryConversationsHistory.mockResolvedValue({
-      ok: true,
-      messages: [
-        { ts: '1746056000.000000', user: 'U111', text: 'Hello' },
-      ],
-    });
-    mockHistoryConversationsInfo.mockRejectedValue(new Error('no channel info'));
-    mockHistoryUsersInfo.mockResolvedValue({
-      ok: true,
-      user: { profile: { display_name: 'Bob', real_name: 'Bob' }, real_name: 'Bob' },
-    });
-
-    const result = await formatSlackHistoryAsContext('C99999');
-    // Falls back to channel ID when name lookup fails
-    expect(result).toContain('C99999');
-    expect(result).toContain('Summary of the Slack conversation.');
   });
 });

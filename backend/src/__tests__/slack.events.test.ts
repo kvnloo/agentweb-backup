@@ -54,7 +54,7 @@ jest.mock('../services/slackService', () => {
     deleteSlackMessage: jest.fn().mockResolvedValue(undefined),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('John Doe'),
     downloadSlackFile: jest.fn().mockResolvedValue(Buffer.from('file-content')),
-    formatSlackHistoryAsContext: jest.fn().mockResolvedValue('Context from recent Slack conversation in #general:\n\nHarsha is discussing the current pipeline with the team. Key prospect data and pricing were mentioned.'),
+    formatSlackHistoryAsContext: jest.fn().mockResolvedValue('Summary of your most recent previous AgentWeb session ("Pipeline review"):\n\nReviewed Q2 pipeline. Identified 3 high-priority prospects.'),
   };
 });
 
@@ -151,14 +151,14 @@ describe('Slack Events API', () => {
       expect(settingsService.getSetting).toHaveBeenCalledWith('slack_channel_mapping_C12345');
       expect(userDb.getUserById).toHaveBeenCalledWith('user-123');
 
-      // Verify channel history was fetched for context
+      // Verify prior session summary was fetched for context
       const { formatSlackHistoryAsContext } = require('../services/slackService');
-      expect(formatSlackHistoryAsContext).toHaveBeenCalledWith('C12345');
+      expect(formatSlackHistoryAsContext).toHaveBeenCalledWith('user-123');
 
-      // Verify session creation with summarized channel history as pageContent
+      // Verify session creation with prior session summary as pageContent
       expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
         'user-123',
-        'Context from recent Slack conversation in #general:\n\nHarsha is discussing the current pipeline with the team. Key prospect data and pricing were mentioned.',
+        'Summary of your most recent previous AgentWeb session ("Pipeline review"):\n\nReviewed Q2 pipeline. Identified 3 high-priority prospects.',
         'agent',
         'slack-bot',
         undefined,

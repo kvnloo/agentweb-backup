@@ -1348,95 +1348,33 @@ export async function postSlackMessage(
   };
 }
 
-const SLACK_HISTORY_LIMIT = 10;
-const SLACK_HISTORY_SUMMARY_MODEL = 'gemini-3.1-flash-lite-preview';
-const SLACK_HISTORY_SUMMARY_TIMEOUT_MS = 15000;
-const SLACK_HISTORY_SUMMARY_PROMPT = `You are summarizing a Slack channel conversation to give an AI assistant context before it responds to a new request.
-
-Write a detailed summary of the conversation covering:
-- Who is involved and their roles/relationships
-- The main topics and questions being discussed
-- Key facts, data points, or decisions mentioned (names, numbers, dates, etc.)
-- Any pending questions or unresolved issues
-- The overall tone and urgency
-
-Be thorough and specific — the AI assistant needs this context to give a helpful response. Include all concrete details.`;
-
 /**
- * Fetches the last 10 messages from a Slack channel, then uses Gemini Flash Lite to
- * generate a detailed summary. The summary is returned as pageContent for the new session,
- * giving Emma rich context without flooding her with the raw transcript.
+ * Looks up the most recent previous Emma (slack-bot) session for the user and returns
+ * its summary as context for the new session. Uses the already-computed sessionSummary
+ * field — no LLM call needed. Returns empty string if no prior session exists.
  */
-export async function formatSlackHistoryAsContext(
-  channelId: string,
-  limit: number = SLACK_HISTORY_LIMIT
-): Promise<string> {
-  if (!slackClient) {
-    return '';
-  }
-
+export async function formatSlackHistoryAsContext(userId: string): Promise<string> {
   try {
-    const result = await slackClient.conversations.history({
-      channel: channelId,
-      limit,
-    });
+    const { chatbotDb } = await import('./chatbotService');
+    const { sessions } = await chatbotDb.getUserSessions(
+      userId,
+      'agent',
+      1,        // only need the most recent one
+      true,     // descending (most recent first)
+      undefined,
+      'slack-bot'
+    );
 
-    const messages = (result.messages ?? []).reverse(); // oldest first
-    if (messages.length === 0) return '';
+    if (sessions.length === 0) return '';
 
-    const displayNameMap = await resolveDisplayNames(messages);
+    const prior = sessions[0];
+    const summary = prior.sessionSummary?.summary;
+    if (!summary) return '';
 
-    let channelName = channelId;
-    try {
-      const info = await slackClient.conversations.info({ channel: channelId });
-      channelName = (info.channel as any)?.name || channelId;
-    } catch { /* non-blocking */ }
-
-    const lines: string[] = [];
-    for (const msg of messages) {
-      if (!msg.text?.trim()) continue;
-      const userId = msg.user ?? msg.bot_id ?? 'unknown';
-      const name = msg.user ? (displayNameMap.get(msg.user) ?? userId) : userId;
-      const isBot = !!msg.bot_id && !msg.user;
-      const label = isBot ? `[Bot] ${name}` : name;
-      const text = (msg.text ?? '').replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1').replace(/<mailto:([^|>]+)>/g, '$1').trim();
-      lines.push(`${label}: ${text}`);
-    }
-
-    if (lines.length === 0) return '';
-
-    const transcript = lines.join('\n');
-
-    // Summarize via Gemini Flash Lite
-    try {
-      const { agentModeService } = await import('./agentModeService');
-      const summaryPromise = agentModeService.callLLM(
-        SLACK_HISTORY_SUMMARY_MODEL,
-        [
-          { role: 'system', content: SLACK_HISTORY_SUMMARY_PROMPT },
-          { role: 'user', content: `Slack channel #${channelName} — last ${lines.length} messages:\n\n${transcript}` },
-        ],
-        { temperature: 0, max_completion_tokens: 500 }
-      );
-
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Slack history summary timed out')), SLACK_HISTORY_SUMMARY_TIMEOUT_MS)
-      );
-
-      const res = await Promise.race([summaryPromise, timeoutPromise]);
-      const summary = res.choices?.[0]?.message?.content?.trim() ?? '';
-
-      if (summary) {
-        return `Context from recent Slack conversation in #${channelName}:\n\n${summary}`;
-      }
-    } catch (summaryError) {
-      console.error('Failed to summarize Slack history, falling back to raw transcript:', summaryError);
-    }
-
-    // Fallback: return raw transcript if summarization fails
-    return `Recent Slack conversation in #${channelName}:\n\n${transcript}`;
+    const title = prior.title ? ` ("${prior.title}")` : '';
+    return `Summary of your most recent previous AgentWeb session${title}:\n\n${summary}`;
   } catch (error) {
-    console.error('Failed to fetch Slack channel history for context:', error);
+    console.error('Failed to fetch prior session context for Slack session:', error);
     return '';
   }
 }

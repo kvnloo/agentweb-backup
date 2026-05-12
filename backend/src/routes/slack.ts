@@ -728,8 +728,8 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           console.log('📝 Creating Agent Mode session for user:', user.userId);
 
-          // Fetch recent channel history to use as session context
-          const slackHistory = await formatSlackHistoryAsContext(channel);
+          // Fetch prior session summary to use as context for the new session
+          const slackHistory = await formatSlackHistoryAsContext(user.userId);
 
           // Create Agent Mode session
           const session = await chatbotDb.createChatSession(
