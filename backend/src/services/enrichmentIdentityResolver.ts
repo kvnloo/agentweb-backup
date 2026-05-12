@@ -76,6 +76,19 @@ export interface IdentityResolverDeps {
     lastName?: string;
     company?: string;
   }): Promise<SiblingLeadResult[]>;
+  /**
+   * Tier 0.5 — LLM web-search domain lookup. Called when `website` is still
+   * empty after Tier 0 sibling lookup but a company name is known. Uses a
+   * web-search-capable LLM (Gemini) to find the official company website.
+   * Returns null on failure or when no confident match is found.
+   */
+  resolveCompanyDomainViaWebSearch(input: {
+    company: string;
+    linkedin?: string;
+    title?: string;
+    firstName?: string;
+    lastName?: string;
+  }): Promise<{ website: string } | null>;
   writeLeadFields(input: {
     listId: string;
     leadId: string;
@@ -188,6 +201,33 @@ export async function resolveIdentity(
     // findSiblingLeads failures must NEVER block enrichment — Apollo path
     // can still resolve identity. Log and continue.
     console.warn(`${logTag} tier 0 findSiblingLeads failed:`, (err as Error).message);
+  }
+
+  // 2.5. Tier 0.5 — LLM web-search domain lookup. Fires when `website` is
+  // still empty after Tier 0 sibling lookup and a company name is known.
+  // Resolves the official website via a web-search-capable LLM (Gemini), then
+  // derives emailDomain from it in-memory so step 6's Apollo org-match can run
+  // even when there is no email address to extract a domain from.
+  const websiteAfterTier0 = lead.website || resolved.website;
+  const emailDomainAfterTier0 = lead.emailDomain || resolved.emailDomain;
+  const companyForDomainLookup = lead.company || resolved.company;
+  if (!websiteAfterTier0 && !emailDomainAfterTier0 && !extractDomainFromEmail(email) && companyForDomainLookup) {
+    try {
+      const domainResult = await deps.resolveCompanyDomainViaWebSearch({
+        company: companyForDomainLookup,
+        linkedin: lead.linkedin || resolved.linkedin || undefined,
+        title: lead.title || resolved.title || undefined,
+        firstName: lead.firstName || resolved.firstName || undefined,
+        lastName: lead.lastName || resolved.lastName || undefined,
+      });
+      if (domainResult?.website) {
+        resolved.website = domainResult.website;
+        meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+        console.log(`${logTag} tier 0.5 website=${domainResult.website} for company="${companyForDomainLookup}"`);
+      }
+    } catch (err) {
+      console.warn(`${logTag} tier 0.5 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
+    }
   }
 
   // 3. LinkedIn-first Apollo. Fires only when local `email` is still empty

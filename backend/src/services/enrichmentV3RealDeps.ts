@@ -139,6 +139,34 @@ function buildIdentityDeps(): IdentityResolverDeps {
       }
     },
 
+    resolveCompanyDomainViaWebSearch: async ({ company, linkedin, title, firstName, lastName }) => {
+      try {
+        const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
+        const systemPrompt =
+          'You are a company researcher. Given company information, search the web to find the official company website. ' +
+          'STRICT RULES: Only return a website if you find it confirmed via web search. ' +
+          'Do NOT guess, infer, or construct a URL. Do NOT use your training knowledge alone. ' +
+          'If the web search does not return a clear, confirmed result, return null. ' +
+          'Return JSON with a single key "website" containing the full URL (e.g. "https://acme.com"), or null. ' +
+          'Return ONLY valid JSON, no explanation.';
+        const parts: string[] = [`Company name: ${company}`];
+        if (firstName || lastName) parts.push(`Contact name: ${[firstName, lastName].filter(Boolean).join(' ')}`);
+        if (title) parts.push(`Contact title: ${title}`);
+        if (linkedin) parts.push(`Contact LinkedIn: ${linkedin}`);
+        parts.push('Find the official website for this company.');
+        const userPrompt = parts.join('\n');
+        const result = await llm.generateJSONContentWithWebSearch<{ website: string | null }>(
+          systemPrompt,
+          userPrompt,
+        );
+        if (!result?.website || typeof result.website !== 'string') return null;
+        return { website: result.website.trim() };
+      } catch (err) {
+        console.warn('[v3 deps] resolveCompanyDomainViaWebSearch failed:', (err as Error).message);
+        return null;
+      }
+    },
+
     writeLeadFields: async ({ listId, leadId, fields, meta }) => {
       // Split by destination: standard lead columns go to top-level (where
       // the lead table reads them); custom names go to customFields.
