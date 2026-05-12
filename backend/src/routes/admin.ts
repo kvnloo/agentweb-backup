@@ -714,6 +714,27 @@ router.put("/users/:userId/support-note", async (req, res) => {
   }
 });
 
+// Update user display name
+router.put("/users/:userId/name", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { displayName } = req.body;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedUser = await userDb.updateUser(userId, {
+      displayName: displayName || null,
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user display name:", error);
+    res.status(500).json({ message: "Error updating user display name" });
+  }
+});
+
 // --- User Notes (stored in AW-Settings as usernote_<userId>) ---
 const USER_NOTES_MAX = 50;
 

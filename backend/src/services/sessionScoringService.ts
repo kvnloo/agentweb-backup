@@ -1,6 +1,6 @@
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 
-const SCORING_MODEL = "gemini-3.1-flash-lite-preview";
+const SCORING_MODEL = "gemini-3.1-flash-lite";
 
 const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring context
 

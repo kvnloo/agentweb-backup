@@ -64,7 +64,7 @@ Three key trends to watch:
 
     // Verify the scoring system was called with the correct prompt
     expect(mockCallLLM).toHaveBeenCalledWith(
-      'gemini-3.1-flash-lite-preview',
+      'gemini-3.1-flash-lite',
       expect.arrayContaining([
         expect.objectContaining({ role: 'system' }),
         expect.objectContaining({ role: 'user' }),

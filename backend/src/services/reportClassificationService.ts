@@ -2,7 +2,7 @@ import { agentModeService } from './agentModeService';
 
 export type ReportType = 'creative' | 'research' | 'performance';
 
-const CLASSIFICATION_MODEL = 'gemini-3.1-flash-lite-preview';
+const CLASSIFICATION_MODEL = 'gemini-3.1-flash-lite';
 const CLASSIFICATION_TIMEOUT_MS = 10000;
 const MAX_CONTENT_CHARS = 500;
 

@@ -116,7 +116,7 @@ describe('summarizeSession', () => {
     );
 
     expect(mockCallLLM).toHaveBeenCalledWith(
-      'gemini-3.1-flash-lite-preview',
+      'gemini-3.1-flash-lite',
       expect.arrayContaining([
         expect.objectContaining({ role: 'system' }),
         expect.objectContaining({ role: 'user' }),

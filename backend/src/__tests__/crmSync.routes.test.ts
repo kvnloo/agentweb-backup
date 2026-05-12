@@ -131,3 +131,97 @@ describe('PUT /api/crm-sync/config/:listId/:provider — Attio API key validatio
     expect(res.body.configured).toBe(true);
   });
 });
+
+describe('POST /api/crm-sync/test/:listId/:provider — persist on success', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    externalCrmSyncService.getDefaultMappings.mockResolvedValue({ contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [] });
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot',
+      listId: 'list-1',
+      userId: 'user-1',
+      autoSyncEnabled: false,
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      deleteOnPush: false,
+      deleteOnPull: false,
+      webhookEnabled: true,
+      webhookSecret: 'secret-xyz',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      apiKeyEncrypted: 'enc:token',
+    });
+    process.env.BACKEND_URL = 'http://backend.test';
+  });
+
+  it('persists minimal config and returns webhookUrl when test succeeds with apiKey', async () => {
+    externalCrmSyncService.testConnection.mockResolvedValueOnce({ valid: true });
+
+    const res = await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({ apiKey: 'pat-na1-xyz' })
+      .expect(200);
+
+    expect(res.body.valid).toBe(true);
+    expect(res.body.webhookUrl).toBe('http://backend.test/api/crm/hubspot/list-1/webhook?secret=secret-xyz');
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalledWith(
+      'user-1', 'list-1', 'hubspot',
+      expect.objectContaining({ apiKey: 'pat-na1-xyz' })
+    );
+  });
+
+  it('persists minimal config and returns webhookUrl when test succeeds with accountId (OAuth)', async () => {
+    externalCrmSyncService.testConnection.mockResolvedValueOnce({ valid: true });
+
+    const res = await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({ accountId: 'acct-123' })
+      .expect(200);
+
+    expect(res.body.valid).toBe(true);
+    expect(res.body.webhookUrl).toMatch(/secret=secret-xyz$/);
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalledWith(
+      'user-1', 'list-1', 'hubspot',
+      expect.objectContaining({ accountId: 'acct-123' })
+    );
+  });
+
+  it('does NOT persist config when test fails', async () => {
+    externalCrmSyncService.testConnection.mockResolvedValueOnce({ valid: false, error: 'Invalid token' });
+
+    const res = await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({ apiKey: 'bad-token' })
+      .expect(200);
+
+    expect(res.body.valid).toBe(false);
+    expect(res.body.webhookUrl).toBeUndefined();
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it('does NOT persist when test succeeds without inline credentials (re-test existing config)', async () => {
+    externalCrmSyncService.testConnection.mockResolvedValueOnce({ valid: true });
+
+    await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({})
+      .expect(200);
+
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects unauthorized list access', async () => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadListById.mockResolvedValueOnce({ listId: 'list-1', userId: 'other-user' });
+
+    await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({ apiKey: 'pat-na1-xyz' })
+      .expect(403);
+
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+});

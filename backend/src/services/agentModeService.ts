@@ -170,7 +170,7 @@ interface LLMCallOptions {
 }
 
 // Diagnosis agent configuration
-const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
+const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
@@ -1382,7 +1382,7 @@ export class AgentModeService {
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
-    'gemini-3.1-flash-lite-preview': { client: null, supportsTemperature: true },
+    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
@@ -1554,7 +1554,7 @@ export class AgentModeService {
       'gemini-3-pro-preview': [1.25, 10],
       'gemini-3-flash-preview': [0.15, 0.6],
       'gemini-3.1-pro-preview': [1.25, 10],
-      'gemini-3.1-flash-lite-preview': [0.075, 0.3],
+      'gemini-3.1-flash-lite': [0.075, 0.3],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
     // Cache reads are 10% of input price; cache writes are 125% of input price
@@ -10342,7 +10342,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
 
   /**
    * Generate a 2-3 word summary of what was achieved in a scheduled chat run.
-   * Uses gemini-3.1-flash-lite-preview for fast, low-cost summarization.
+   * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
   async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
@@ -10371,7 +10371,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
 
   /**
    * Generate 2-3 contextual follow-up suggestion chips for the user after each agent turn.
-   * Uses gemini-3.1-flash-lite-preview for fast, low-cost generation.
+   * Uses gemini-3.1-flash-lite for fast, low-cost generation.
    * Returns null on failure so the caller can fall back to client-side regex heuristics.
    */
   async generateSuggestedReplies(
@@ -10425,7 +10425,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
 
   /**
    * Triage a Slack message to determine if it requires handling (e.g. a client question).
-   * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
+   * Uses gemini-3.1-flash-lite for fast, low-cost classification.
    * Returns true if the message needs to be handled, false otherwise.
    */
   public async triageSlackMessage(message: string): Promise<boolean> {

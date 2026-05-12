@@ -1223,12 +1223,13 @@ class UserDB {
       .put({ TableName: this.tableName, Item: newItem })
       .promise();
 
-    // Tombstone the old item: update its userId to "deleted_<userId>" so it can be cleaned up later
+    // Tombstone the old item: update its userId to "deleted_<userId>" and clear org membership
+    // so the stale record doesn't appear in org member listings.
     await this.docClient
       .update({
         TableName: this.tableName,
         Key: { email: user.email },
-        UpdateExpression: "SET userId = :tombstone",
+        UpdateExpression: "SET userId = :tombstone REMOVE orgId, orgRole",
         ExpressionAttributeValues: { ":tombstone": `deleted_${userId}` },
       })
       .promise();
@@ -7106,8 +7107,8 @@ export const orgDb = {
     do {
       const result = await dynamodb.scan({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId",
-        ExpressionAttributeValues: { ":orgId": orgId },
+        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
       allItems.push(...(result.Items || []));
@@ -7122,8 +7123,8 @@ export const orgDb = {
     do {
       const result = await dynamodb.scan({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId",
-        ExpressionAttributeValues: { ":orgId": orgId },
+        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         Select: "COUNT",
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
