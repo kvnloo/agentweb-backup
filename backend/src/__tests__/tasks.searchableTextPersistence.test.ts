@@ -117,12 +117,12 @@ describe('Tasks Routes - searchableText persistence', () => {
       // S3 fetch should be skipped when searchableText is already cached
       expect(mockedAxios.get).not.toHaveBeenCalledWith(reportUrl, expect.anything());
 
-      // The response should include the cached searchableText
+      // searchableText is stripped from the response to keep payload small
       const taskKey = `agent-mode-${sessionId}`;
       const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
       expect(file).toBeDefined();
-      expect(file.searchableText).toBe('already cached text');
+      expect(file.searchableText).toBeUndefined();
     });
 
     it('should background-fetch from S3 and persist searchableText for agent-mode report without cached text', async () => {
@@ -353,7 +353,8 @@ describe('Tasks Routes - searchableText persistence', () => {
 
       const files = response.body['task-1']?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
-      expect(file?.searchableText).toBe('already cached task text');
+      // searchableText is stripped from the response to keep payload small
+      expect(file?.searchableText).toBeUndefined();
     });
 
     it('should background-fetch from S3 and persist searchableText for task execution report without cached text', async () => {
@@ -510,7 +511,7 @@ describe('Tasks Routes - searchableText persistence', () => {
   });
 
   describe('response payload size', () => {
-    it('truncates searchableText to 500 chars in the response to keep payload small', async () => {
+    it('strips searchableText entirely from the response to keep payload small (long text)', async () => {
       const reportUrl = 'https://s3.example.com/reports/large-report.html';
       const longSearchableText = 'A'.repeat(3000);
 
@@ -545,11 +546,10 @@ describe('Tasks Routes - searchableText persistence', () => {
       const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
       expect(file).toBeDefined();
-      expect(file.searchableText).toHaveLength(500);
-      expect(file.searchableText).toBe('A'.repeat(500));
+      expect(file.searchableText).toBeUndefined();
     });
 
-    it('does not truncate searchableText that is already within 500 chars', async () => {
+    it('strips searchableText entirely from the response even for short text', async () => {
       const reportUrl = 'https://s3.example.com/reports/small-report.html';
       const shortSearchableText = 'Short content';
 
@@ -584,7 +584,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
       expect(file).toBeDefined();
-      expect(file.searchableText).toBe(shortSearchableText);
+      expect(file.searchableText).toBeUndefined();
     });
   });
 });
