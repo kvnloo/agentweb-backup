@@ -6171,6 +6171,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-13',
     changes: [
+      'Fixed: Send LinkedIn Message in CRM No Longer Fails with a Validation Error',
+      '- Clicking "Send on LinkedIn" in the CRM lead panel was showing a DynamoDB validation error after the message was sent',
+      '- The error was caused by an empty string being written to a required index field when recording the engagement event',
+      '- Messages now send and record correctly, and engagement history updates immediately in the lead panel',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
       'Fixed: Create Ad Video Task — Selecting One ICP No Longer Selects All',
       '- Previously, clicking a single ICP in the Create Ad Video task dialog caused all ICPs to appear selected',
       '- Only the chosen ICP is now activated; others remain unaffected',
