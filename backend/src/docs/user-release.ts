@@ -11,6 +11,19 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-13',
     changes: [
+      'Fixed: Data Analysis No Longer Fails When Passed Large Tool-Response Files',
+      '- perform_data_analysis was receiving bare S3 storage keys (e.g. tool-responses/<uuid>/file.txt) as file URLs instead of HTTP URLs, causing an "Invalid URL" error',
+      '- The tool now automatically reads those S3 keys and passes the content inline to the analysis model — no change required from the LLM',
+      '- If an S3 key cannot be accessed, the tool now returns a clear error message instead of silently proceeding with empty data',
+      'Fixed: Scheduled Sessions No Longer Loop Indefinitely on S3 / Browser Errors',
+      '- Sessions were retrying S3 tool-response reads (NoSuchBucket, AccessDenied, NoSuchKey) and browser_run_code ReferenceErrors in an infinite loop',
+      '- S3 access failures on read_tool_response / search_tool_response are now flagged as fatal — the LLM is told not to retry and to summarize from in-context data',
+      '- browser_run_code ReferenceErrors now include a targeted fix hint: only `page` is in scope in the sandbox',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
       'Fixed: Local Agent Web Browsing More Reliable',
       '- Fixed a safety filter false-positive that was blocking legitimate LinkedIn screenshot tasks (the pattern incorrectly matched phrases like "posted and formatted")',
       '- Health check now probes the actual Codex worker instead of just the HTTP server — so Emma correctly detects a hung or busy agent rather than falsely reporting it as available',
