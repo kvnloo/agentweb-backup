@@ -4753,10 +4753,25 @@ export class AgentModeService {
           // Normalize content-type: strip any charset/extra params and trim whitespace
           const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
           const contentType = rawContentType || 'image/png';
-          const imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let finalContentType = contentType;
+          // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
+          if (imageBuffer.length > 4 * 1024 * 1024) {
+            try {
+              const sharp = (await import('sharp')).default;
+              imageBuffer = await sharp(imageBuffer)
+                .resize({ width: 1200, withoutEnlargement: true })
+                .jpeg({ quality: 85 })
+                .toBuffer();
+              finalContentType = 'image/jpeg';
+              console.log(`AgentMode: describeImage resized large image to ${imageBuffer.length} bytes (JPEG 85%, max 1200px wide)`);
+            } catch (resizeError) {
+              console.error('AgentMode: Failed to resize image, proceeding with original:', resizeError instanceof Error ? resizeError.message : resizeError);
+            }
+          }
           const base64 = imageBuffer.toString('base64');
-          resolvedImageUrl = `data:${contentType};base64,${base64}`;
-          console.log(`AgentMode: describeImage downloaded ${imageBuffer.length} bytes, contentType="${contentType}", dataUri prefix="${resolvedImageUrl.substring(0, 40)}"`);
+          resolvedImageUrl = `data:${finalContentType};base64,${base64}`;
+          console.log(`AgentMode: describeImage downloaded image, final size=${imageBuffer.length} bytes, contentType="${finalContentType}", dataUri prefix="${resolvedImageUrl.substring(0, 40)}"`);
         } catch (downloadError) {
           console.error('AgentMode: Failed to download image for Bedrock, falling back to URL:', downloadError instanceof Error ? downloadError.message : downloadError);
         }
