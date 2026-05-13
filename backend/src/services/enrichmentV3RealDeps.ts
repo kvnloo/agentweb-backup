@@ -14,7 +14,6 @@
 import { crmDb } from './db';
 import { getApolloService, isApolloServiceReady } from './apolloService';
 import { getEnrichSoService } from './enrichSoService';
-import { mapApolloOrganization } from './apolloFieldMapper';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
@@ -42,45 +41,34 @@ const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRA
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
-function buildIdentityDeps(): IdentityResolverDeps {
+function buildIdentityDeps(userId: string): IdentityResolverDeps {
   return {
     apolloPeopleMatch: async ({ email, linkedinUrl }) => {
       if (!isApolloServiceReady()) return null;
       if (!email && !linkedinUrl) return null;
+      // Adapter-level guard: personal emails give poor Apollo results.
+      if (email && CrmEnrichmentService.isPersonalEmailDomain(email)) return null;
       try {
         const apollo = getApolloService();
-        const result = await apollo.matchPerson({ email, linkedinUrl });
+        const input = email ? { email, linkedinUrl } : { linkedinUrl: linkedinUrl! };
+        const result = await apollo.matchPerson(input);
         const p = result?.match?.person;
         if (!p) return null;
+        const org = result?.match?.organization;
         return {
           firstName: p.firstName,
           lastName: p.lastName,
           title: p.title,
           linkedin: p.linkedin,
-          email: p.email,           // returned when matched by linkedinUrl
+          email: p.email,
+          company: org?.name ?? undefined,
+          website: org?.websiteUrl ?? undefined,
           city: p.city,
           state: p.state,
           country: p.country,
         };
       } catch (err) {
         console.warn('[v3 deps] apolloPeopleMatch failed:', (err as Error).message);
-        return null;
-      }
-    },
-
-    apolloOrgMatch: async ({ emailDomain }) => {
-      if (!isApolloServiceReady()) return null;
-      try {
-        const apollo = getApolloService();
-        const result = await apollo.matchOrg(emailDomain);
-        const o = result?.organization;
-        if (!o) return null;
-        return {
-          company: o.name,
-          website: (o as any).websiteUrl ?? (o as any).domain,
-        };
-      } catch (err) {
-        console.warn('[v3 deps] apolloOrgMatch failed:', (err as Error).message);
         return null;
       }
     },
@@ -138,6 +126,22 @@ function buildIdentityDeps(): IdentityResolverDeps {
         return null;
       }
     },
+
+    enrichSoFindEmail: async ({ firstName, lastName, domain }) => {
+      if (CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`)) return null;
+      try {
+        const enrichSo = getEnrichSoService();
+        const result = await enrichSo.findEmail({ firstName, lastName, domain });
+        if (!result?.found || !result.email) return null;
+        return { email: result.email };
+      } catch (err) {
+        console.warn('[v3 deps] enrichSoFindEmail failed:', (err as Error).message);
+        return null;
+      }
+    },
+
+    findLinkedInUrl: ({ firstName, lastName, company }) =>
+      findLinkedInUrlImpl(userId, firstName, lastName, company),
 
     resolveCompanyDomainViaWebSearch: async ({ company, linkedin, title, firstName, lastName }) => {
       try {
@@ -443,6 +447,34 @@ async function runCriticReal(input: {
   }
 }
 
+// ─── Shared Unipile LinkedIn lookup ──────────────────────────────────────────
+
+async function findLinkedInUrlImpl(
+  userId: string,
+  firstName: string | undefined,
+  lastName: string | undefined,
+  company: string | undefined,
+): Promise<string | null> {
+  try {
+    const { linkedInOutreachService } = await import('./linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) return null;
+    const keywords = [firstName, lastName].filter(Boolean).join(' ');
+    if (!keywords) return null;
+    const result = await linkedInOutreachService.searchPeople(accountId, {
+      keywords,
+      company: company || undefined,
+    });
+    const first = result?.items?.[0];
+    if (!first?.public_identifier) return null;
+    if (!unipileNameMatches(first, firstName, lastName)) return null;
+    return `https://www.linkedin.com/in/${first.public_identifier}`;
+  } catch (err) {
+    console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
+    return null;
+  }
+}
+
 // ─── Orchestrator deps ────────────────────────────────────────────────────────
 
 /**
@@ -486,7 +518,7 @@ export function unipileNameMatches(
 }
 
 export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
-  const identityDeps = buildIdentityDeps();
+  const identityDeps = buildIdentityDeps(userId);
 
   return {
     loadLeads: async ({ listId, leadIds }) => {
@@ -524,9 +556,15 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       fetchApolloPerson: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        if (!lead.email) return null;
+        const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
+        const personalDomain = !!domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`);
+        const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain && !personalDomain;
+        if (!lead.email && !hasNameAndDomain) return null;
         try {
-          const result = await getApolloService().matchPerson({ email: lead.email });
+          const input = lead.email
+            ? { email: lead.email }
+            : { firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined, domain: domain! };
+          const result = await getApolloService().matchPerson(input);
           if (!result?.match?.person) return null;
           return {
             mapped: mapApolloPersonToCrmFields(result.match.person),
@@ -541,26 +579,8 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       extractFieldsViaLLM: extractFieldsViaLLMReal,
       fetchWebForGroup: fetchWebForGroupReal,
 
-      findLinkedInUrl: async (lead: LeadRecord): Promise<string | null> => {
-        try {
-          const { linkedInOutreachService } = await import('./linkedInOutreachService');
-          const accountId = await linkedInOutreachService.resolveAccountId(userId);
-          if (!accountId) return null;
-          const keywords = [lead.firstName, lead.lastName].filter(Boolean).join(' ');
-          if (!keywords) return null;
-          const result = await linkedInOutreachService.searchPeople(accountId, {
-            keywords,
-            company: lead.company || undefined,
-          });
-          const first = result?.items?.[0];
-          if (!first?.public_identifier) return null;
-          if (!unipileNameMatches(first, lead.firstName, lead.lastName)) return null;
-          return `https://www.linkedin.com/in/${first.public_identifier}`;
-        } catch (err) {
-          console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
-          return null;
-        }
-      },
+      findLinkedInUrl: (lead: LeadRecord) =>
+        findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"

@@ -18,8 +18,9 @@ const LEAD_ID = 'lead-001';
 function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolverDeps {
   return {
     apolloPeopleMatch: jest.fn().mockResolvedValue(null),
-    apolloOrgMatch: jest.fn().mockResolvedValue(null),
     enrichSoReverseLookup: jest.fn().mockResolvedValue(null),
+    enrichSoFindEmail: jest.fn().mockResolvedValue(null),
+    findLinkedInUrl: jest.fn().mockResolvedValue(null),
     findSiblingLeads: jest.fn().mockResolvedValue([]),
     resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
     writeLeadFields: jest.fn().mockResolvedValue(undefined),
@@ -65,7 +66,6 @@ describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
     // No email → no Apollo/enrich.so calls are even possible. The waterfall
     // downstream handles LinkedIn lookup via Unipile by name+company.
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
-    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
   });
 
@@ -95,7 +95,6 @@ describe('resolveIdentity — failure paths', () => {
 
     expect(result).toEqual({ ok: false, reason: 'no_identity_signal' });
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
-    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
@@ -130,7 +129,7 @@ describe('resolveIdentity — failure paths', () => {
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
 
-  it("returns 'identity_unresolvable' when company fields requested AND Apollo + enrich.so both miss", async () => {
+  it("returns 'identity_unresolvable' when company fields requested AND all sources miss", async () => {
     const deps = makeDeps();
     const result = await resolveIdentity(
       makeInput({
@@ -142,7 +141,6 @@ describe('resolveIdentity — failure paths', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
-    expect(deps.apolloOrgMatch).toHaveBeenCalledWith({ emailDomain: 'unknown-domain.com' });
     expect(deps.enrichSoReverseLookup).toHaveBeenCalledWith({ email: 'jane@unknown-domain.com' });
   });
 });
@@ -164,7 +162,6 @@ describe('resolveIdentity — no work needed', () => {
       expect(result.resolved).toEqual({ emailDomain: 'acme.com' });
     }
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
-    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
     // emailDomain is not persisted (it's derived, not an API result).
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
@@ -180,7 +177,6 @@ describe('resolveIdentity — no work needed', () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.resolved.emailDomain).toBe('acme.com');
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
-    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
   });
 
   it('skips Apollo person-match when lead already has firstName and lastName', async () => {
@@ -196,7 +192,7 @@ describe('resolveIdentity — no work needed', () => {
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
   });
 
-  it('skips Apollo org-match when lead already has company AND website', async () => {
+  it('skips company resolution when lead already has company AND website', async () => {
     const deps = makeDeps();
     await resolveIdentity(
       makeInput({
@@ -206,7 +202,6 @@ describe('resolveIdentity — no work needed', () => {
       deps,
     );
 
-    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
   });
 });
@@ -240,17 +235,46 @@ describe('resolveIdentity — Apollo person hit', () => {
   });
 });
 
-describe('resolveIdentity — Apollo org hit', () => {
-  it('fills company / website from Apollo org-match without calling enrich.so', async () => {
+describe('resolveIdentity — Unipile LinkedIn discovery', () => {
+  it('uses Unipile linkedin URL for Apollo lookup and stamps provider=unipile for linkedin meta', async () => {
+    const apolloPeopleMatch = jest
+      .fn()
+      .mockResolvedValue({ email: 'jane@acme.com', firstName: 'Jane', lastName: 'Doe' });
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
-      apolloOrgMatch: jest.fn().mockResolvedValue({
-        company: 'Acme Corp', website: 'acme.com',
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://linkedin.com/in/jane-unipile'),
+      apolloPeopleMatch,
+      writeLeadFields,
+    });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    expect(apolloPeopleMatch).toHaveBeenCalledWith({ linkedinUrl: 'https://linkedin.com/in/jane-unipile' });
+    const call = writeLeadFields.mock.calls[0][0];
+    expect(call.meta.linkedin.provider).toBe('unipile');
+    expect(call.meta.linkedin.source).toBe('api');
+  });
+});
+
+describe('resolveIdentity — Apollo people-match fills company from embedded org', () => {
+  it('fills company / website from embedded org in Apollo people-match without separate org call', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme Corp', website: 'acme.com',
       }),
     });
     const result = await resolveIdentity(
       makeInput({
         lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
         needsCompanyFields: true,
+        needsPersonFields: true,
       }),
       deps,
     );
@@ -259,15 +283,14 @@ describe('resolveIdentity — Apollo org hit', () => {
     if (result.ok) {
       expect(result.resolved).toMatchObject({ company: 'Acme Corp', website: 'acme.com' });
     }
-    expect(deps.apolloOrgMatch).toHaveBeenCalledWith({ emailDomain: 'acme.com' });
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
   });
 });
 
-describe('resolveIdentity — enrich.so fallback when Apollo org misses', () => {
-  it('falls through to enrich.so reverse-lookup when Apollo org returns null', async () => {
+describe('resolveIdentity — enrich.so reverse-lookup company fallback', () => {
+  it('calls enrich.so reverse-lookup when Apollo people-match returns no company', async () => {
     const deps = makeDeps({
-      apolloOrgMatch: jest.fn().mockResolvedValue(null),
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
       enrichSoReverseLookup: jest.fn().mockResolvedValue({
         firstName: 'Jane', lastName: 'Doe', company: 'Acme Corp',
       }),
@@ -282,7 +305,6 @@ describe('resolveIdentity — enrich.so fallback when Apollo org misses', () => 
 
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.resolved.company).toBe('Acme Corp');
-    expect(deps.apolloOrgMatch).toHaveBeenCalledTimes(1);
     expect(deps.enrichSoReverseLookup).toHaveBeenCalledTimes(1);
   });
 });
@@ -315,7 +337,6 @@ describe('resolveIdentity — write semantics', () => {
 
   it('mode=enrich: enrich.so-resolved fields carry provider="enrich.so"', async () => {
     const deps = makeDeps({
-      apolloOrgMatch: jest.fn().mockResolvedValue(null),
       enrichSoReverseLookup: jest.fn().mockResolvedValue({ company: 'Acme Corp' }),
     });
     await resolveIdentity(
@@ -379,10 +400,12 @@ describe('resolveIdentity — write semantics', () => {
 // ─── Combined flow ────────────────────────────────────────────────────────────
 
 describe('resolveIdentity — combined person + company resolution', () => {
-  it('resolves both person and company in one call when both are needed', async () => {
+  it('resolves person and company from single Apollo people-match (embedded org)', async () => {
     const deps = makeDeps({
-      apolloPeopleMatch: jest.fn().mockResolvedValue({ firstName: 'Jane', lastName: 'Doe' }),
-      apolloOrgMatch: jest.fn().mockResolvedValue({ company: 'Acme Corp', website: 'acme.com' }),
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe',
+        company: 'Acme Corp', website: 'acme.com',
+      }),
     });
     const result = await resolveIdentity(
       makeInput({
@@ -541,5 +564,157 @@ describe('resolveIdentity — Tier 0.5 emailDomain derivation', () => {
     // be set to garbage — better to leave it empty than to feed bad data
     // into Apollo org-match.
     expect(result.resolved.emailDomain).toBeUndefined();
+  });
+});
+
+// ─── Step 5.5 — enrich.so email-finder → reverse-lookup chain ────────────────
+
+describe('resolveIdentity — step 5.5 enrich.so email-finder chain', () => {
+  it('calls enrichSoFindEmail then enrichSoReverseLookup when no email but has name+emailDomain', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme', firstName: 'Jane', lastName: 'Doe' });
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).toHaveBeenCalledWith({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' });
+    expect(enrichSoReverseLookup).toHaveBeenCalledWith({ email: 'jane@acme.com' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('jane@acme.com');
+    expect(result.resolved.company).toBe('Acme');
+  });
+
+  it('does not overwrite existing firstName/lastName from 5.5 reverse-lookup — names already known at gate', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
+    // enrich.so returns different names — must NOT overwrite lead names
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme', firstName: 'Janet', lastName: 'Smith' });
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.firstName).toBeUndefined(); // lead.firstName already set — no overwrite
+    expect(result.resolved.lastName).toBeUndefined();  // lead.lastName already set — no overwrite
+    expect(result.resolved.company).toBe('Acme');
+  });
+
+  it('resolved email from email-finder makes step 6 enrichSoReverseLookup eligible for company', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme Inc' });
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(enrichSoReverseLookup).toHaveBeenCalledWith({ email: 'jane@acme.com' });
+    if (!result.ok) return;
+    expect(result.resolved.company).toBe('Acme Inc');
+  });
+
+  it('does not call enrichSoFindEmail when email already present', async () => {
+    const enrichSoFindEmail = jest.fn();
+    const deps = makeDeps({ enrichSoFindEmail });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com', firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).not.toHaveBeenCalled();
+  });
+
+  it('does not call enrichSoFindEmail when firstName missing', async () => {
+    const enrichSoFindEmail = jest.fn();
+    const deps = makeDeps({ enrichSoFindEmail });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).not.toHaveBeenCalled();
+  });
+
+  it('does not call enrichSoFindEmail when emailDomain missing', async () => {
+    const enrichSoFindEmail = jest.fn();
+    const deps = makeDeps({ enrichSoFindEmail });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).not.toHaveBeenCalled();
+  });
+
+  it('skips reverse-lookup when email-finder returns null', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue(null);
+    const enrichSoReverseLookup = jest.fn();
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).toHaveBeenCalledTimes(1);
+    expect(enrichSoReverseLookup).not.toHaveBeenCalled();
+  });
+
+  it('step 6 does not call enrichSoReverseLookup again when 5.5 chain already filled company', async () => {
+    // 5.5: findEmail → resolves email, reverse-lookup fills company.
+    // Step 6 gate: companyStillMissing = false → inner block must not fire.
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme' });
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    // enrichSoReverseLookup called exactly once — inside 5.5 chain, not again in step 6.
+    expect(enrichSoReverseLookup).toHaveBeenCalledTimes(1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.company).toBe('Acme');
   });
 });
