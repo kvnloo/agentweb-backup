@@ -29,12 +29,20 @@ jest.mock('../services/resendService', () => ({
   }
 }));
 
+jest.mock('../services/gmailService', () => ({
+  gmailService: {
+    sendEmail: jest.fn(),
+  }
+}));
+
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { gmailService } from '../services/gmailService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockResend = resendService as jest.Mocked<typeof resendService>;
+const mockGmail = gmailService as jest.Mocked<typeof gmailService>;
 
 describe('AgentModeService - CRM Tools', () => {
   let service: AgentModeService;
@@ -1339,6 +1347,91 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Email send failed');
+    });
+
+    it('should send via Gmail when senderType is gmail', async () => {
+      const gmailSender = {
+        id: 'sender-g1',
+        email: 'shopify@pmps.ai',
+        fromName: 'PMPS Outreach',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'shopify@pmps.ai',
+      };
+      const leadWithGmailSender = { ...leadWithDraft, selectedSenderId: 'sender-g1' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithGmailSender as any);
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g1',
+      });
+      mockGmail.sendEmail.mockResolvedValue({ messageId: 'gmail-msg-1', threadId: 'thread-1' } as any);
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.emailId).toBe('gmail-msg-1');
+      expect(result.from).toBe('shopify@pmps.ai');
+      expect(mockGmail.sendEmail).toHaveBeenCalledWith(
+        userId,
+        'shopify@pmps.ai',
+        expect.objectContaining({
+          to: 'john@acme.com',
+          subject: 'Hello John',
+          body: '<p>Hi John</p>',
+          isHtml: true,
+        })
+      );
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+      expect(mockCrmDb.updateLead).toHaveBeenCalledWith(listId, leadId, { emailDraft: null });
+    });
+
+    it('should return error when Gmail sender is missing gmailAccountId', async () => {
+      const brokenGmailSender = {
+        id: 'sender-g-broken',
+        email: 'x@x.com',
+        fromName: 'X',
+        senderType: 'gmail' as const,
+        // gmailAccountId intentionally omitted
+      };
+      const leadWithBrokenSender = { ...leadWithDraft, selectedSenderId: 'sender-g-broken' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithBrokenSender as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [brokenGmailSender],
+        defaultSenderId: 'sender-g-broken',
+      });
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Gmail sender misconfigured');
+      expect(mockGmail.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should propagate Gmail send errors gracefully', async () => {
+      const gmailSender = {
+        id: 'sender-g2',
+        email: 'test@gmail.com',
+        fromName: 'Test',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'test@gmail.com',
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g2',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new Error('Token revoked'));
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Token revoked');
     });
   });
 
