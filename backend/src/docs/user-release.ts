@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- describe_image was returning a hard error when called with images over 5MB (e.g. 16–22MB PNG ad creatives from S3)',
       '- The tool now automatically resizes oversized images to max 1200px wide at JPEG 85% quality before sending to the vision model — no caller changes needed',
       '- This restores the ability to fact-check and analyze production-quality ad images in Emma workflows',
+      'Fixed: Research Reports Page Loads Faster',
+      '- The Reports page was loading slowly (and sometimes appearing frozen) for accounts with many reports',
+      '- The API response was ~415KB because each report\'s searchable text was sent in full; it is now trimmed to 500 characters, reducing the payload to ~150KB',
+      '- Page load and report preview are now fast regardless of how many reports are in your account',
     ],
   },
   {

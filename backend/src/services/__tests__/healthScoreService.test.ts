@@ -261,9 +261,13 @@ describe('shouldRecoverToPaying', () => {
 
 describe('computeForContact + recomputeBatch', () => {
   it('computeForContact delegates to the injected loader', async () => {
+    // Use a real recent timestamp so the 30-day usage penalty never triggers
+    // regardless of when the test runs. FIXED_NOW-relative dates would drift
+    // past the 30-day window as calendar time advances.
+    const recentUsage = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const loadSignals = jest.fn().mockResolvedValue({
       subscriptionState: 'active',
-      lastUsageAt: isoDaysAgo(1),
+      lastUsageAt: recentUsage,
     });
 
     const score = await computeForContact('user@example.com', { loadSignals });

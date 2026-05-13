@@ -2632,6 +2632,18 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
     }
 
     const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
+    // Truncate searchableText in the response to reduce payload size (~415KB → ~150KB for large accounts).
+    // The full text is stored in DynamoDB; 500 chars is sufficient for client-side keyword matching.
+    const SEARCH_TEXT_RESPONSE_LIMIT = 500;
+    for (const task of Object.values(result) as any[]) {
+      for (const execution of task.executions || []) {
+        for (const file of execution.result_files || []) {
+          if (file.searchableText && file.searchableText.length > SEARCH_TEXT_RESPONSE_LIMIT) {
+            file.searchableText = file.searchableText.slice(0, SEARCH_TEXT_RESPONSE_LIMIT);
+          }
+        }
+      }
+    }
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);
