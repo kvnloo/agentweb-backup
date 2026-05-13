@@ -106,6 +106,27 @@ or if no email found:
 }
 
 /**
+ * Detects @mentions of other people in a resolved Slack message (e.g. "@John can you...").
+ * When present, appends a context note so Emma understands the user may be addressing that
+ * person rather than her.
+ *
+ * @param formattedMessage The message already formatted as "DisplayName: text" with mentions resolved
+ * @returns The message with an optional context note appended
+ */
+function appendThirdPartyMentionNote(formattedMessage: string): string {
+  // After "DisplayName: " prefix, extract the actual message body
+  const colonIdx = formattedMessage.indexOf(': ');
+  const body = colonIdx !== -1 ? formattedMessage.slice(colonIdx + 2) : formattedMessage;
+
+  // Find all @Name mentions in the message body (word chars, spaces allowed for display names)
+  const mentionMatches = body.match(/@[\w][\w .'-]*/g);
+  if (!mentionMatches || mentionMatches.length === 0) return formattedMessage;
+
+  const names = [...new Set(mentionMatches)].join(', ');
+  return `${formattedMessage}\n[Note: this message mentions ${names} — it appears the user may be addressing them rather than you. Acknowledge this if appropriate and offer to help draft a response to them.]`;
+}
+
+/**
  * Helper: handles the full slack triggered session flow for non-Emma messages.
  * Triages message, creates session, generates Emma response, emails founders.
  * Does NOT post to Slack — email only, so the team can decide how to respond.
@@ -362,7 +383,7 @@ async function handleSlackSessionResponse(params: {
   try {
     const response = await generateSessionResponse(
       session.sessionId,
-      userMessage,
+      appendThirdPartyMentionNote(userMessage),
       user.userId,
       llmModel,
       attachments
@@ -832,12 +853,16 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                 }
 
                 const displayName = await getSlackUserDisplayName(slackUserId);
-                const formattedMessage = `${displayName}: ${text}`.trim();
+                const resolvedText = (await resolveSlackMentionsInText(text))
+                  .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
+                  .replace(/<mailto:([^|>]+)>/g, '$1')
+                  .trim();
+                const formattedMessage = `${displayName}: ${resolvedText}`.trim();
 
                 const llmModel = session.llmModel || await agentModeService.getDefaultModel();
                 let emmaResponse = '';
                 try {
-                  const result = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel);
+                  const result = await generateSessionResponse(sessionId, appendThirdPartyMentionNote(formattedMessage), userId, llmModel);
                   emmaResponse = result.content;
                 } catch (genError) {
                   console.error('❌ Error generating response for monitored thread:', genError);
@@ -877,8 +902,14 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
               const displayName = await getSlackUserDisplayName(slackUserId);
               // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
-              const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
-              const formattedMessage = `${displayName}: ${messageText}`.trim();
+              const rawMessageText = text || (files && files.length > 0 ? '[attached file]' : '');
+              const resolvedMessageText = text
+                ? (await resolveSlackMentionsInText(text))
+                    .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
+                    .replace(/<mailto:([^|>]+)>/g, '$1')
+                    .trim() || rawMessageText
+                : rawMessageText;
+              const formattedMessage = `${displayName}: ${resolvedMessageText}`.trim();
 
               const attachments: any[] = [];
               if (files && files.length > 0) {
@@ -912,7 +943,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
               try {
-                const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
+                const response = await generateSessionResponse(sessionId, appendThirdPartyMentionNote(formattedMessage), userId, llmModel, attachments);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
                 if (response.content) await postThreadResponse(channel, threadTs, response.content);
               } catch (genError) {
