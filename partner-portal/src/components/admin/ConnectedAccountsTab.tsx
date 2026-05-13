@@ -18,10 +18,11 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TextField,
   Tooltip,
   Typography,
 } from '@mui/material';
-import { Delete as DeleteIcon, Refresh as RefreshIcon } from '@mui/icons-material';
+import { Delete as DeleteIcon, PersonAdd as PersonAddIcon, Refresh as RefreshIcon } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../../config';
 import { useAuth } from '../../contexts/AuthContext';
@@ -45,6 +46,9 @@ export default function ConnectedAccountsTab() {
   const [success, setSuccess] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<UnipileAccount | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [assignTarget, setAssignTarget] = useState<UnipileAccount | null>(null);
+  const [assignEmail, setAssignEmail] = useState('');
+  const [assigning, setAssigning] = useState(false);
 
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -92,6 +96,32 @@ export default function ConnectedAccountsTab() {
     }
   };
 
+  const handleAssign = async () => {
+    if (!assignTarget || !assignEmail.trim()) return;
+    setAssigning(true);
+    try {
+      const { data } = await axios.post(
+        buildApiUrl(`/api/admin/unipile-accounts/${assignTarget.account_id}/assign`),
+        { email: assignEmail.trim() },
+        { headers },
+      );
+      setSuccess(`Assigned ${data.account_name} to ${data.user_email}`);
+      setAccounts((prev) =>
+        prev.map((a) =>
+          a.account_id === assignTarget.account_id
+            ? { ...a, user_email: data.user_email, is_orphan: false, unipile_status: 'UNKNOWN' }
+            : a,
+        ),
+      );
+      setAssignTarget(null);
+      setAssignEmail('');
+    } catch (err: any) {
+      setError(err.response?.data?.message || 'Failed to assign account');
+    } finally {
+      setAssigning(false);
+    }
+  };
+
   const statusColor = (status: string): 'success' | 'error' | 'warning' | 'default' => {
     if (status === 'OK') return 'success';
     if (status === 'ORPHAN') return 'error';
@@ -114,7 +144,7 @@ export default function ConnectedAccountsTab() {
           <Typography variant="body2" color="text.secondary">
             Shows all LinkedIn accounts in Unipile matched against our DB.
             <strong> ORPHAN</strong> = exists in Unipile but not in AgentWeb DB (user was deleted or disconnect failed).
-            Use force-delete to clean up stale records.
+            Use <strong>Assign</strong> to link an orphan to a user, or force-delete to clean up stale records.
           </Typography>
         </Box>
         <Tooltip title="Refresh">
@@ -171,6 +201,18 @@ export default function ConnectedAccountsTab() {
                   <TableCell>{acc.created_at ? new Date(acc.created_at).toLocaleString() : '—'}</TableCell>
                   <TableCell>{acc.updated_at ? new Date(acc.updated_at).toLocaleString() : '—'}</TableCell>
                   <TableCell align="right">
+                    {acc.is_orphan && (
+                      <Tooltip title="Assign to a user">
+                        <IconButton
+                          size="small"
+                          color="primary"
+                          onClick={() => { setAssignTarget(acc); setAssignEmail(''); }}
+                          sx={{ mr: 0.5 }}
+                        >
+                          <PersonAddIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    )}
                     <Tooltip title={acc.is_orphan ? 'Delete orphan from Unipile' : 'Force delete (Unipile API + DB)'}>
                       <IconButton
                         size="small"
@@ -188,6 +230,45 @@ export default function ConnectedAccountsTab() {
         </TableContainer>
       )}
 
+      {/* Assign orphan dialog */}
+      <Dialog
+        open={Boolean(assignTarget)}
+        onClose={() => !assigning && setAssignTarget(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Assign Orphan Account to User</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Assign <strong>{assignTarget?.account_name}</strong> ({assignTarget?.account_id}) to an AgentWeb user.
+            The account will appear in their Connected Accounts list immediately.
+          </DialogContentText>
+          <TextField
+            autoFocus
+            label="User email"
+            type="email"
+            fullWidth
+            value={assignEmail}
+            onChange={(e) => setAssignEmail(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleAssign()}
+            disabled={assigning}
+            placeholder="user@example.com"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAssignTarget(null)} disabled={assigning}>Cancel</Button>
+          <Button
+            onClick={handleAssign}
+            color="primary"
+            variant="contained"
+            disabled={assigning || !assignEmail.trim()}
+          >
+            {assigning ? 'Assigning…' : 'Assign'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Delete dialog */}
       <Dialog open={Boolean(deleteTarget)} onClose={() => !deleting && setDeleteTarget(null)}>
         <DialogTitle>
           {deleteTarget?.is_orphan ? 'Delete Orphan Unipile Account?' : 'Force Delete Unipile Account?'}

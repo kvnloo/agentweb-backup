@@ -6,7 +6,7 @@ import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
-import { deleteAccountById } from "../services/connectedAccountsDb";
+import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -194,6 +194,55 @@ router.delete("/unipile-accounts/:accountId", async (req, res) => {
   } catch (error) {
     console.error("Error force-deleting Unipile account:", error);
     res.status(500).json({ message: "Failed to delete Unipile account" });
+  }
+});
+
+// Assign an orphan Unipile account to a user by email
+router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
+  const { accountId } = req.params;
+  const { email } = req.body as { email?: string };
+
+  if (!email || typeof email !== 'string') {
+    return res.status(400).json({ message: 'email is required' });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const user = await userDb.getUserByEmail(normalizedEmail);
+  if (!user) {
+    return res.status(404).json({ message: `No user found with email ${normalizedEmail}` });
+  }
+
+  try {
+    // Fetch account details from Unipile to get the real name
+    let accountName = 'LinkedIn Account';
+    let username: string | undefined;
+    try {
+      const unipileAccount = await linkedInOutreachService.getAccount(accountId);
+      if ((unipileAccount as any).name) accountName = (unipileAccount as any).name;
+      username = (unipileAccount as any).connection_params?.im?.username;
+    } catch (unipileErr: any) {
+      console.warn(`[Admin] Could not fetch Unipile account details for ${accountId}:`, unipileErr?.message);
+    }
+
+    await createAccount((user as any).userId, 'unipile', {
+      account_id: accountId,
+      account_name: accountName,
+      config: {
+        account_type: 'personal',
+        unipile_account_id: accountId,
+        username,
+        access_token: `unipile:${accountId}`,
+        token_expires_at: Number.MAX_SAFE_INTEGER,
+        scopes: [],
+      },
+    });
+
+    linkedInOutreachService.clearStatusCache(accountId);
+    console.log(`[Admin] Assigned orphan Unipile account ${accountId} to user ${normalizedEmail}`);
+    res.json({ success: true, account_name: accountName, user_email: normalizedEmail });
+  } catch (error) {
+    console.error('[Admin] Error assigning Unipile account:', error);
+    res.status(500).json({ message: 'Failed to assign account' });
   }
 });
 
