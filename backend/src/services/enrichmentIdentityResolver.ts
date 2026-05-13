@@ -257,7 +257,7 @@ export async function resolveIdentity(
     }
   }
 
-  // 2. Unipile LinkedIn search. Fires when linkedin is still missing but
+  // 2.7. Unipile LinkedIn search. Fires when linkedin is still missing but
   // firstName + lastName + company are known. Finds the linkedin_url so
   // step 3 (Apollo-by-LinkedIn) can fire and resolve email + org in one shot.
   const linkedinEffective = lead.linkedin || resolved.linkedin || linkedinUrl;
@@ -379,23 +379,13 @@ export async function resolveIdentity(
         email = found.email;
         resolved.email = found.email;
         meta.email = makeApiMeta('enrich.so');
-        // Chain: reverse-lookup on the resolved email fills company + person fields.
+        // Chain: reverse-lookup on the resolved email fills company.
+        // Names are already known (gate ensures firstName+lastName present).
         try {
           const enrichSo = await deps.enrichSoReverseLookup({ email });
-          if (enrichSo) {
-            const enrichSoMeta = makeApiMeta('enrich.so');
-            if (enrichSo.company && !lead.company && !resolved.company) {
-              resolved.company = enrichSo.company;
-              meta.company = enrichSoMeta;
-            }
-            if (enrichSo.firstName && !lead.firstName && !resolved.firstName) {
-              resolved.firstName = enrichSo.firstName;
-              meta.firstName = enrichSoMeta;
-            }
-            if (enrichSo.lastName && !lead.lastName && !resolved.lastName) {
-              resolved.lastName = enrichSo.lastName;
-              meta.lastName = enrichSoMeta;
-            }
+          if (enrichSo?.company && !lead.company && !resolved.company) {
+            resolved.company = enrichSo.company;
+            meta.company = makeApiMeta('enrich.so');
           }
         } catch (err) {
           console.warn(`${logTag} step 5.5 enrichSoReverseLookup chain failed:`, (err as Error).message);

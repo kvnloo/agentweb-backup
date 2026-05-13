@@ -140,26 +140,8 @@ function buildIdentityDeps(userId: string): IdentityResolverDeps {
       }
     },
 
-    findLinkedInUrl: async ({ firstName, lastName, company }) => {
-      try {
-        const { linkedInOutreachService } = await import('./linkedInOutreachService');
-        const accountId = await linkedInOutreachService.resolveAccountId(userId);
-        if (!accountId) return null;
-        const keywords = [firstName, lastName].filter(Boolean).join(' ');
-        if (!keywords) return null;
-        const result = await linkedInOutreachService.searchPeople(accountId, {
-          keywords,
-          company: company || undefined,
-        });
-        const first = result?.items?.[0];
-        if (!first?.public_identifier) return null;
-        if (!unipileNameMatches(first, firstName, lastName)) return null;
-        return `https://www.linkedin.com/in/${first.public_identifier}`;
-      } catch (err) {
-        console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
-        return null;
-      }
-    },
+    findLinkedInUrl: ({ firstName, lastName, company }) =>
+      findLinkedInUrlImpl(userId, firstName, lastName, company),
 
     resolveCompanyDomainViaWebSearch: async ({ company, linkedin, title, firstName, lastName }) => {
       try {
@@ -465,6 +447,34 @@ async function runCriticReal(input: {
   }
 }
 
+// ─── Shared Unipile LinkedIn lookup ──────────────────────────────────────────
+
+async function findLinkedInUrlImpl(
+  userId: string,
+  firstName: string | undefined,
+  lastName: string | undefined,
+  company: string | undefined,
+): Promise<string | null> {
+  try {
+    const { linkedInOutreachService } = await import('./linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) return null;
+    const keywords = [firstName, lastName].filter(Boolean).join(' ');
+    if (!keywords) return null;
+    const result = await linkedInOutreachService.searchPeople(accountId, {
+      keywords,
+      company: company || undefined,
+    });
+    const first = result?.items?.[0];
+    if (!first?.public_identifier) return null;
+    if (!unipileNameMatches(first, firstName, lastName)) return null;
+    return `https://www.linkedin.com/in/${first.public_identifier}`;
+  } catch (err) {
+    console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
+    return null;
+  }
+}
+
 // ─── Orchestrator deps ────────────────────────────────────────────────────────
 
 /**
@@ -569,26 +579,8 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       extractFieldsViaLLM: extractFieldsViaLLMReal,
       fetchWebForGroup: fetchWebForGroupReal,
 
-      findLinkedInUrl: async (lead: LeadRecord): Promise<string | null> => {
-        try {
-          const { linkedInOutreachService } = await import('./linkedInOutreachService');
-          const accountId = await linkedInOutreachService.resolveAccountId(userId);
-          if (!accountId) return null;
-          const keywords = [lead.firstName, lead.lastName].filter(Boolean).join(' ');
-          if (!keywords) return null;
-          const result = await linkedInOutreachService.searchPeople(accountId, {
-            keywords,
-            company: lead.company || undefined,
-          });
-          const first = result?.items?.[0];
-          if (!first?.public_identifier) return null;
-          if (!unipileNameMatches(first, lead.firstName, lead.lastName)) return null;
-          return `https://www.linkedin.com/in/${first.public_identifier}`;
-        } catch (err) {
-          console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
-          return null;
-        }
-      },
+      findLinkedInUrl: (lead: LeadRecord) =>
+        findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"

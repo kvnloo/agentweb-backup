@@ -592,6 +592,28 @@ describe('resolveIdentity — step 5.5 enrich.so email-finder chain', () => {
     expect(result.resolved.company).toBe('Acme');
   });
 
+  it('does not overwrite existing firstName/lastName from 5.5 reverse-lookup — names already known at gate', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
+    // enrich.so returns different names — must NOT overwrite lead names
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme', firstName: 'Janet', lastName: 'Smith' });
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.firstName).toBeUndefined(); // lead.firstName already set — no overwrite
+    expect(result.resolved.lastName).toBeUndefined();  // lead.lastName already set — no overwrite
+    expect(result.resolved.company).toBe('Acme');
+  });
+
   it('resolved email from email-finder makes step 6 enrichSoReverseLookup eligible for company', async () => {
     const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
     const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme Inc' });
@@ -671,5 +693,28 @@ describe('resolveIdentity — step 5.5 enrich.so email-finder chain', () => {
 
     expect(enrichSoFindEmail).toHaveBeenCalledTimes(1);
     expect(enrichSoReverseLookup).not.toHaveBeenCalled();
+  });
+
+  it('step 6 does not call enrichSoReverseLookup again when 5.5 chain already filled company', async () => {
+    // 5.5: findEmail → resolves email, reverse-lookup fills company.
+    // Step 6 gate: companyStillMissing = false → inner block must not fire.
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'jane@acme.com' });
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Acme' });
+    const deps = makeDeps({ enrichSoFindEmail, enrichSoReverseLookup });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    // enrichSoReverseLookup called exactly once — inside 5.5 chain, not again in step 6.
+    expect(enrichSoReverseLookup).toHaveBeenCalledTimes(1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.company).toBe('Acme');
   });
 });

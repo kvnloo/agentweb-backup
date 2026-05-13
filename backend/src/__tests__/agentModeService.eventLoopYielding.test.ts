@@ -68,8 +68,11 @@ describe('AgentModeService - generateMarketingResponse', () => {
     // Create service instance
     agentModeService = new AgentModeService();
 
-    // Spy on callLLM method
-    llmCallSpy = jest.spyOn(agentModeService as any, 'callLLM');
+    // Spy on callLLM method. Default fallback prevents real HTTP calls when
+    // a test's mockResolvedValueOnce chain is exhausted (e.g. suggested-replies call).
+    llmCallSpy = jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+      choices: [{ message: { content: '', tool_calls: null } }],
+    });
   });
 
   afterEach(() => {
