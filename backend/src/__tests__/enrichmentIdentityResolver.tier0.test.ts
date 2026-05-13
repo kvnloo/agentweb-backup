@@ -17,8 +17,9 @@ const LEAD_ID = 'lead-001';
 function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolverDeps {
   return {
     apolloPeopleMatch: jest.fn().mockResolvedValue(null),
-    apolloOrgMatch: jest.fn().mockResolvedValue(null),
     enrichSoReverseLookup: jest.fn().mockResolvedValue(null),
+    enrichSoFindEmail: jest.fn().mockResolvedValue(null),
+    findLinkedInUrl: jest.fn().mockResolvedValue(null),
     findSiblingLeads: jest.fn().mockResolvedValue([]),
     resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
     writeLeadFields: jest.fn().mockResolvedValue(undefined),
@@ -67,7 +68,6 @@ describe('resolveIdentity — Tier 0 CRM-history (single sibling)', () => {
     expect(result.resolved.lastName).toBe('Doe');
     expect(result.resolved.company).toBe('Acme');
     expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
-    expect(deps.apolloOrgMatch).not.toHaveBeenCalled();
   });
 
   it('stamps source crm-history and sibling IDs in the meta for audit', async () => {
@@ -153,6 +153,27 @@ describe('resolveIdentity — Tier 0 CRM-history (single sibling)', () => {
     expect(findSpy).toHaveBeenCalledWith(
       expect.objectContaining({ excludeLeadId: LEAD_ID }),
     );
+  });
+
+  it('returns only fresh siblings in response payload (stale siblings are filtered out)', async () => {
+    const fresh = makeSibling({
+      leadId: 'sib-fresh',
+      updatedAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    const stale = makeSibling({
+      leadId: 'sib-stale',
+      updatedAt: new Date(Date.now() - 120 * 24 * 60 * 60 * 1000).toISOString(),
+      firstName: 'StaleFirst',
+    });
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([fresh, stale]),
+    });
+
+    const result = await resolveIdentity(makeInput(), deps);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.siblings.map(s => s.leadId)).toEqual(['sib-fresh']);
   });
 
   it('continues with Apollo when findSiblingLeads throws (Tier 0 failure is non-fatal)', async () => {
@@ -260,10 +281,9 @@ describe('resolveIdentity — Tier 0 per-field best-of-N merge', () => {
 
   it('falls through to Apollo for fields no sibling could fill (partial Tier 0)', async () => {
     const sibA = makeSibling({ leadId: 'sib-A', firstName: 'Jane', lastName: 'Doe', company: undefined, website: undefined });
-    const apolloOrgSpy = jest.fn().mockResolvedValue({ company: 'FromApollo', website: 'https://apollo.example.com' });
     const deps = makeDeps({
       findSiblingLeads: jest.fn().mockResolvedValue([sibA]),
-      apolloOrgMatch: apolloOrgSpy,
+      apolloPeopleMatch: jest.fn().mockResolvedValue({ company: 'FromApollo', website: 'https://apollo.example.com' }),
     });
     const result = await resolveIdentity(
       makeInput({ lead: { leadId: LEAD_ID, email: 'jane@acme.com' } as LeadRecord }),
@@ -272,7 +292,7 @@ describe('resolveIdentity — Tier 0 per-field best-of-N merge', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.resolved.firstName).toBe('Jane');         // Tier 0
-    expect(result.resolved.company).toBe('FromApollo');     // Apollo filled what Tier 0 didn't
+    expect(result.resolved.company).toBe('FromApollo');     // Apollo embedded org filled what Tier 0 didn't
   });
 
   it('refreshFields skips per-field even when many siblings have the value', async () => {
@@ -363,7 +383,6 @@ describe('resolveIdentity — Tier 0 fills are not silently overwritten', () => 
     const deps = makeDeps({
       findSiblingLeads: jest.fn().mockResolvedValue([makeSibling()]),
       apolloPeopleMatch: jest.fn().mockRejectedValue(new Error('Apollo 500')),
-      apolloOrgMatch: jest.fn().mockRejectedValue(new Error('Apollo 500')),
     });
     const result = await resolveIdentity(
       makeInput({ lead: { leadId: LEAD_ID, email: 'jane@acme.com' } as LeadRecord }),
@@ -388,7 +407,6 @@ describe('resolveIdentity — Tier 0 fills are not silently overwritten', () => 
     const deps = makeDeps({
       findSiblingLeads: jest.fn().mockResolvedValue([sib]),
       apolloPeopleMatch: jest.fn().mockResolvedValue(null),
-      apolloOrgMatch: jest.fn().mockResolvedValue(null),
       enrichSoReverseLookup: jest.fn().mockRejectedValue(new Error('enrich.so 503')),
     });
     const result = await resolveIdentity(
@@ -436,7 +454,6 @@ describe('resolveIdentity — cosmetic fixes', () => {
     const deps = makeDeps({
       findSiblingLeads: jest.fn().mockResolvedValue([]),
       apolloPeopleMatch: jest.fn().mockResolvedValue(null),
-      apolloOrgMatch: jest.fn().mockResolvedValue(null),
       enrichSoReverseLookup: jest.fn().mockResolvedValue({
         firstName: 'Jane', lastName: 'Doe', company: 'Acme',
       }),
