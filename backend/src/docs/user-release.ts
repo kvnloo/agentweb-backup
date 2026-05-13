@@ -6160,6 +6160,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Create Ad Video Task — Selecting One ICP No Longer Selects All',
+      '- Previously, clicking a single ICP in the Create Ad Video task dialog caused all ICPs to appear selected',
+      '- Only the chosen ICP is now activated; others remain unaffected',
+    ],
+  },
+  {
     date: '2026-05-06',
     changes: [
       'Improved: Organization Members Now See Their Owner\'s Subscription Plan',
