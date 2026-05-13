@@ -1,21 +1,26 @@
 import express from "express";
 import { skillService } from "../services/skillService";
 import { emailService } from "../services/emailService";
+import { userDb } from "../services/db";
 
 const router = express.Router();
 
-// Get user's own skills + public/system skills
+// Get user's own skills + org members' skills + public/system skills
 router.get("/", async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const [ownSkills, publicSkills, systemSkills] = await Promise.all([
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    const [ownSkills, publicSkills, systemSkills, orgSkills] = await Promise.all([
       skillService.getSkillsByOwner(userId),
       skillService.getSkillsByVisibility('public'),
       skillService.getSkillsByVisibility('system'),
+      orgId ? skillService.getSkillsByOrg(orgId) : Promise.resolve([]),
     ]);
-    // Dedupe by skillId
+
     const seen = new Set<string>();
-    const all = [...ownSkills, ...publicSkills, ...systemSkills].filter(s => {
+    const all = [...ownSkills, ...orgSkills, ...publicSkills, ...systemSkills].filter(s => {
       if (seen.has(s.skillId)) return false;
       seen.add(s.skillId);
       return true;
@@ -49,6 +54,9 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Name and description are required" });
     }
 
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
     const skill = await skillService.createSkill(
       name,
       description,
@@ -57,10 +65,11 @@ router.post("/", async (req, res) => {
       false // not published
     );
 
-    // Set ownership and visibility
+    // Set ownership, visibility, and org membership
     skill.ownerId = userId;
     skill.visibility = 'private';
     skill.isBuiltIn = false;
+    if (orgId) skill.orgId = orgId;
     await skillService.updateSkill(skill);
 
     res.status(201).json(skill);

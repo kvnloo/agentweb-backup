@@ -6160,6 +6160,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-13',
+    changes: [
+      'New: Private Work Plans and Skills Are Now Shared Across Your Organization',
+      '- When you create a private work plan or skill, it is automatically shared with all members of your organization',
+      '- Org members can view and use each other\'s private work plans when starting a new agent session',
+      '- Org members can view and install each other\'s private skills within any session',
+      '- Only the original owner can edit, delete, or submit their plan/skill for platform-wide review',
+      '- Org-shared items are labeled "From org" in the Settings > Skills and Work Plans tabs',
+    ],
+  },
+  {
     date: '2026-05-12',
     changes: [
       'Fixed: Soft-Deleted Accounts No Longer Appear as Org Owners',

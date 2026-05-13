@@ -1,19 +1,25 @@
 import express from "express";
 import { workPlanService } from "../services/workPlanService";
 import { emailService } from "../services/emailService";
+import { userDb } from "../services/db";
 
 const router = express.Router();
 
-// Get user's own plans + public/system plans
+// Get user's own plans + org members' plans + public/system plans
 router.get("/", async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const [ownPlans, publicPlans] = await Promise.all([
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    const [ownPlans, publicPlans, orgPlans] = await Promise.all([
       workPlanService.getWorkPlansByOwner(userId),
       workPlanService.getPublicPlansForAgentMode(),
+      orgId ? workPlanService.getWorkPlansByOrg(orgId) : Promise.resolve([]),
     ]);
+
     const seen = new Set<string>();
-    const all = [...ownPlans, ...publicPlans].filter(p => {
+    const all = [...ownPlans, ...orgPlans, ...publicPlans].filter(p => {
       if (seen.has(p.planId)) return false;
       seen.add(p.planId);
       return true;
@@ -56,6 +62,9 @@ router.post("/", async (req, res) => {
       skillIds: s.skillIds || [],
     }));
 
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
     const plan = await workPlanService.createWorkPlan({
       title,
       description,
@@ -67,6 +76,7 @@ router.post("/", async (req, res) => {
       showInAgentMode: false,
       defaultModel,
       ownerId: userId,
+      ...(orgId && { orgId }),
       visibility: 'private',
       isBuiltIn: false,
     });

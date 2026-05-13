@@ -2834,7 +2834,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId);
+      let sessionUserOrgId: string | undefined;
+      try {
+        const { userDb: uDb } = await import('./db');
+        const sessionUser = await uDb.getUserById(userId);
+        sessionUserOrgId = sessionUser?.orgId;
+      } catch { /* skip — org-sharing is best-effort */ }
+      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
 
       if (!publishedSkills.length)
         return { message: "No skills available in the library." };
@@ -3087,8 +3093,16 @@ export class AgentModeService {
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    let userOrgId: string | undefined;
+    if (userId) {
+      try {
+        const { userDb: uDb } = await import('./db');
+        const u = await uDb.getUserById(userId);
+        userOrgId = u?.orgId;
+      } catch { /* skip */ }
+    }
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      userId ? skillService.getSkillsAvailableToUser(userId) : skillService.getPublishedSkills(),
+      userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
@@ -3144,8 +3158,14 @@ export class AgentModeService {
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
+      let installUserOrgId: string | undefined;
+      try {
+        const { userDb: uDb } = await import('./db');
+        const installUser = await uDb.getUserById(userId);
+        installUserOrgId = installUser?.orgId;
+      } catch { /* skip — org-sharing is best-effort */ }
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId),
+        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
         getAllowedSkills(userId)
       ]);
 
