@@ -8315,7 +8315,7 @@ export class AgentModeService {
       // Resolve sender: lead → list → account default → first available
       const sendersResult = await this.getCrmSenders(userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
-        return { success: false, message: 'No senders configured', error: 'No CRM sender emails are configured. Please set up a sender email in CRM settings first.' };
+        return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
 
       let sender = null;

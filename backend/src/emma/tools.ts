@@ -3338,7 +3338,7 @@ emmaToolRegistry.register({
   name: 'send_email_to_lead',
   definition: {
     name: 'send_email_to_lead',
-    description: 'Send the existing email draft to a lead using the configured CRM sender. The lead must have an email address and an email draft already created.',
+    description: 'Send the existing email draft to a lead using the configured CRM sender. The lead must have an email address and an email draft already created. A sender email must be configured for the lead list first — this is set per lead list by selecting the lead list and clicking "Senders". If no sender is configured, inform the user to select their lead list and click "Senders" to configure one.',
     inputSchema: {
       type: 'object',
       properties: {

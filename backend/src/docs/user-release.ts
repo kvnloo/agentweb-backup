@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-13',
     changes: [
+      'Fixed: Emma Now Gives Correct Instructions for Setting Up CRM Sender Email',
+      '- Emma was directing users to "CRM Settings → Sender Email" to configure a sender, but that location does not exist',
+      '- The correct flow is per lead list: select a lead list, then click "Senders" in the list header',
+      '- Error messages and alert emails now reflect the correct navigation path',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
       'Fixed: Ad Image Analysis No Longer Fails for Large Images',
       '- describe_image was returning a hard error when called with images over 5MB (e.g. 16–22MB PNG ad creatives from S3)',
       '- The tool now automatically resizes oversized images to max 1200px wide at JPEG 85% quality before sending to the vision model — no caller changes needed',
