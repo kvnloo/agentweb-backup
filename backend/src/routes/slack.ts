@@ -374,7 +374,10 @@ async function handleSlackSessionResponse(params: {
     }
 
     // Post Emma's response to the Slack thread
-    if (response.content) {
+    if (response.content === 'BE_SILENT') {
+      // Emma determined the message wasn't directed at her — suppress all output
+      console.log(`🤫 Slack session ${session.sessionId}: Emma chose to be silent (message not directed at her)`);
+    } else if (response.content) {
       await postThreadResponse(channel, ts, response.content);
     } else {
       // Generation succeeded but produced no text content — log and post a fallback so the
@@ -384,8 +387,8 @@ async function handleSlackSessionResponse(params: {
       await postThreadResponse(channel, ts, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
     }
 
-    // Post iShare link and GTM Tracker link as a separate follow-up message
-    if (ishareLink) {
+    // Post iShare link and GTM Tracker link as a separate follow-up message (skip if Emma was silent)
+    if (ishareLink && response.content !== 'BE_SILENT') {
       const { WebClient } = await import('@slack/web-api');
       const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
@@ -914,7 +917,11 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               try {
                 const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                if (response.content) await postThreadResponse(channel, threadTs, response.content);
+                if (response.content === 'BE_SILENT') {
+                  console.log(`🤫 Slack thread reply: Emma chose to be silent for session ${sessionId}`);
+                } else if (response.content) {
+                  await postThreadResponse(channel, threadTs, response.content);
+                }
               } catch (genError) {
                 console.error('❌ Error generating thread response:', genError);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
