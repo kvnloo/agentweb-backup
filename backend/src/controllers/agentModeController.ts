@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
-import { ABOUT_AGENTWEB_TEAM } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
@@ -1543,7 +1542,7 @@ export async function generateSessionResponse(
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
         // knows who is on the team and can distinguish teammates from external parties.
         if ((session.pageIdentifier || '').toLowerCase().includes('slack')) {
-          systemPrompt += `\n\n[Slack Context] You are part of the AgentWeb team.\n${ABOUT_AGENTWEB_TEAM}\nMessages in this Slack thread are prefixed with the sender's name (e.g. "Rui Wang: message text"). When a team member asks you to help reply, you are drafting a response FROM that team member TO the other person in the thread — not answering the team member as if they were asking you a direct question. Always respond in the voice of the team member addressing their conversation partner.\n\nIf a message mentions someone else by @name, the user may be pulling that person into the conversation rather than asking you something. In that case keep your response brief and non-intrusive — acknowledge you saw the mention, don't over-explain, and wait to see if they actually need your help.`;
+          systemPrompt += `\n\n[Slack Context] Messages in this Slack thread are prefixed with the sender's name (e.g. "Rui Wang: message text"). Focus on the task the sender is asking you to help with. If a message contains an @mention of someone else, the sender is likely tagging that person in Slack — do not comment on the mention, just focus on any task or question in the message.`;
         }
       }
 
