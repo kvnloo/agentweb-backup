@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-13',
     changes: [
+      'Slack Agent Mode: Emma Recognizes When You\'re Talking to Someone Else',
+      '- When a Slack message in an Agent Mode session mentions another person (e.g. "@John can you send the report?"), Emma now detects the third-party mention and understands you may be addressing that person rather than her',
+      '- Emma will acknowledge the context and offer to help you draft a response to the mentioned person instead of responding as if the question was directed at her',
+      '- Applies to initial @Emma mentions, thread replies in Emma sessions, and monitored (email-suggest) sessions',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
       'Fixed: Ad Image Analysis No Longer Fails for Large Images',
       '- describe_image was returning a hard error when called with images over 5MB (e.g. 16–22MB PNG ad creatives from S3)',
       '- The tool now automatically resizes oversized images to max 1200px wide at JPEG 85% quality before sending to the vision model — no caller changes needed',
