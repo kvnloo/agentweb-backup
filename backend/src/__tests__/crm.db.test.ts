@@ -702,7 +702,14 @@ describe('CRM Database Service', () => {
         skipFieldNamesUpdate: true,
       } as any);
 
-      expect(mockDocumentClientMethods.get).not.toHaveBeenCalled();
+      // updateLead always reads the lead row up-front (self-heal pass for
+      // legacy empty-string GSI keys). What skipFieldNamesUpdate=true must
+      // suppress is the AW-LeadLists read + write that the fieldNames sync
+      // would otherwise trigger.
+      const listGets = mockDocumentClientMethods.get.mock.calls.filter(
+        (call: any) => call[0].TableName === `${process.env.TABLE_PREFIX || ''}AW-LeadLists`
+      );
+      expect(listGets.length).toBe(0);
       const listUpdates = mockDocumentClientMethods.update.mock.calls.filter(
         (call: any) => call[0].TableName === `${process.env.TABLE_PREFIX || ''}AW-LeadLists`
       );

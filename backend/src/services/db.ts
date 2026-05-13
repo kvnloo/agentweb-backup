@@ -4845,6 +4845,20 @@ export const crmDb = {
       const expressionAttributeValues: any = {};
       const expressionAttributeNames: Record<string, string> = {};
 
+      // Read the existing row once up-front. Used for two purposes:
+      //   1. Self-heal legacy empty-string GSI key attributes (see below).
+      //   2. Merge values for the nameCompanyKey recompute block further down,
+      //      so we don't do a second getLeadById call.
+      // Empty-string HASH keys are invalid on the three sparse cross-tenant
+      // lookup GSIs (EmailLookupIndex, LinkedinLookupIndex,
+      // NameCompanyLookupIndex). Any updateLead call SETs updatedAt (the
+      // range key on all three), which forces DDB to re-project the GSI
+      // entry; if the row carries email/linkedin/nameCompanyKey as "" from
+      // before the sparse-index guards landed, the update fails with
+      // ValidationException. Queue a REMOVE for each offending attribute
+      // here so the same UpdateExpression cleans the row in-place.
+      const existingLeadForGuard: any = await this.getLeadById(listId, leadId);
+
       // CRM extension: accountOwnerUserId. Supports null => REMOVE.
       if (updates.accountOwnerUserId !== undefined) {
         if (updates.accountOwnerUserId === null || updates.accountOwnerUserId === '') {
@@ -4911,13 +4925,13 @@ export const crmDb = {
       // Recompute nameCompanyKey when any of firstName/lastName/company is in
       // the update payload. Requires a read-before-write to merge the values
       // we DIDN'T touch (so a partial update doesn't blank-out the key just
-      // because not every field was provided).
-      if (
+      // because not every field was provided). Reuses existingLeadForGuard.
+      const nameCompanyTouched =
         updates.firstName !== undefined ||
         updates.lastName !== undefined ||
-        updates.company !== undefined
-      ) {
-        const current = await this.getLeadById(listId, leadId) as any;
+        updates.company !== undefined;
+      if (nameCompanyTouched) {
+        const current = existingLeadForGuard as any;
         const mergedFirst = updates.firstName !== undefined ? updates.firstName : (current?.firstName || '');
         const mergedLast = updates.lastName !== undefined ? updates.lastName : (current?.lastName || '');
         const mergedCompany = updates.company !== undefined ? updates.company : (current?.company || '');
@@ -5097,8 +5111,33 @@ export const crmDb = {
       setExpressions.push('updatedAt = :updatedAt');
       expressionAttributeValues[':updatedAt'] = new Date().toISOString();
 
+      // Self-heal legacy empty-string GSI key attributes. Must run AFTER all
+      // the field-specific SET/REMOVE blocks above so we can tell whether the
+      // caller is already touching the attribute (SET wins; never emit both
+      // SET and REMOVE for the same name in one UpdateExpression).
+      if (existingLeadForGuard) {
+        const gsiKeyFields: Array<'email' | 'linkedin' | 'nameCompanyKey'> = [
+          'email',
+          'linkedin',
+          'nameCompanyKey',
+        ];
+        const placeholderByField: Record<string, string> = {
+          email: ':email',
+          linkedin: ':linkedin',
+          nameCompanyKey: ':nameCompanyKey',
+        };
+        for (const field of gsiKeyFields) {
+          const current = (existingLeadForGuard as any)[field];
+          if (typeof current !== 'string' || current !== '') continue;
+          const alreadySet = expressionAttributeValues[placeholderByField[field]] !== undefined;
+          const alreadyRemoved = removeExpressions.includes(field);
+          if (alreadySet || alreadyRemoved) continue;
+          removeExpressions.push(field);
+        }
+      }
+
       if (setExpressions.length === 0 && removeExpressions.length === 0) {
-        return await this.getLeadById(listId, leadId);
+        return existingLeadForGuard;
       }
 
       // Build UpdateExpression with proper SET and REMOVE clauses
