@@ -45,9 +45,41 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
 
 
 /**
+ * Fetch Unipile account details with up to maxRetries attempts, backing off between each.
+ * A newly-created Unipile account may not be fully provisioned for a second or two after
+ * the hosted-auth callback fires, so we retry rather than failing immediately.
+ */
+async function fetchAccountWithRetry(
+  accountId: string,
+  maxRetries = 3,
+  delayMs = 1500
+): Promise<{ name: string; username?: string } | null> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const account = await linkedInOutreachService.getAccount(accountId);
+      if ((account as any).type === 'LINKEDIN') {
+        return {
+          name: (account as any).name || '',
+          username: (account as any).connection_params?.im?.username,
+        };
+      }
+      console.warn(`[LinkedIn Outreach] getAccount attempt ${attempt}: unexpected type "${(account as any).type}" for ${accountId}`);
+    } catch (err: any) {
+      console.warn(`[LinkedIn Outreach] getAccount attempt ${attempt} failed for ${accountId}: ${err.message}`);
+    }
+    if (attempt < maxRetries) {
+      await new Promise(resolve => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+  return null;
+}
+
+/**
  * POST /save-account
  * Called by the frontend after the popup callback delivers the Unipile account_id.
- * Fetches account details from Unipile and saves the account to the user's profile.
+ * Fetches account details from Unipile (with retry) and saves the account to the user's
+ * profile. If Unipile is still provisioning the account, we fall back to a placeholder
+ * name rather than failing — the name updates on the next connected-accounts load.
  */
 router.post('/save-account', authenticateToken, async (req: any, res: any) => {
   const { unipileAccountId } = req.body;
@@ -58,15 +90,11 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
   }
 
   try {
-    // Fetch account details from Unipile to get the LinkedIn username/name
-    const unipileAccount = await linkedInOutreachService.getAccount(unipileAccountId);
+    // Fetch account details with retry — new accounts may not be provisioned immediately.
+    const accountDetails = await fetchAccountWithRetry(unipileAccountId);
 
-    if ((unipileAccount as any).type !== 'LINKEDIN') {
-      return res.status(400).json({ error: 'Account is not a LinkedIn account' });
-    }
-
-    const accountName = unipileAccount.name || 'LinkedIn Account';
-    const username: string | undefined = (unipileAccount as any).connection_params?.im?.username;
+    const accountName = accountDetails?.name || 'LinkedIn Account';
+    const username = accountDetails?.username;
 
     const accountInput = {
       account_id: unipileAccountId,
@@ -88,7 +116,7 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
     // re-checks Unipile rather than returning the stale "disconnected" result.
     linkedInOutreachService.clearStatusCache(unipileAccountId);
 
-    console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} for user ${userId}`);
+    console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} (name: "${accountName}") for user ${userId}`);
     res.json({ success: true, account });
 
   } catch (error: any) {
