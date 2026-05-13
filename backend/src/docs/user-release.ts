@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Ad Image Analysis No Longer Fails for Large Images',
+      '- describe_image was returning a hard error when called with images over 5MB (e.g. 16–22MB PNG ad creatives from S3)',
+      '- The tool now automatically resizes oversized images to max 1200px wide at JPEG 85% quality before sending to the vision model — no caller changes needed',
+      '- This restores the ability to fact-check and analyze production-quality ad images in Emma workflows',
+    ],
+  },
+  {
     date: '2026-05-12',
     changes: [
       'CRM Sequences: LinkedIn DM Steps Now Supported',
