@@ -57,6 +57,9 @@ export interface IdentityResolverDeps {
   apolloPeopleMatch(input: {
     email?: string;
     linkedinUrl?: string;
+    firstName?: string;
+    lastName?: string;
+    domain?: string;
   }): Promise<ApolloPersonResult | null>;
   apolloOrgMatch(input: { emailDomain: string }): Promise<ApolloOrgResult | null>;
   enrichSoReverseLookup(input: { email: string }): Promise<EnrichSoReverseResult | null>;
@@ -325,6 +328,37 @@ export async function resolveIdentity(
       }
     } catch (err) {
       console.warn(`${logTag} step 5 apolloPeopleMatch(email) failed:`, (err as Error).message);
+    }
+  }
+
+  // 5.5. Apollo person-match by name+domain. Fires when email is still absent
+  // after steps 3–5 but we have a name and a domain (typically resolved by
+  // tier 0.5). Apollo can return email + identity fields from a name+domain
+  // match, making that email available for step 6's enrichSoReverseLookup
+  // and for downstream waterfall calls within the same run.
+  if (!email && emailDomain && (lead.firstName || resolved.firstName) && (lead.lastName || resolved.lastName)) {
+    try {
+      const firstName = lead.firstName || resolved.firstName;
+      const lastName = lead.lastName || resolved.lastName;
+      const byNameDomain = await deps.apolloPeopleMatch({ firstName, lastName, domain: emailDomain });
+      if (byNameDomain) {
+        const apolloMeta = makeApiMeta('apollo');
+        if (byNameDomain.email && !resolved.email) {
+          email = byNameDomain.email;
+          resolved.email = byNameDomain.email;
+          meta.email = apolloMeta;
+        }
+        if (byNameDomain.title && !lead.title && !resolved.title) {
+          resolved.title = byNameDomain.title;
+          meta.title = apolloMeta;
+        }
+        if (byNameDomain.linkedin && !lead.linkedin && !resolved.linkedin) {
+          resolved.linkedin = byNameDomain.linkedin;
+          meta.linkedin = apolloMeta;
+        }
+      }
+    } catch (err) {
+      console.warn(`${logTag} step 5.5 apolloPeopleMatch(name+domain) failed:`, (err as Error).message);
     }
   }
 
