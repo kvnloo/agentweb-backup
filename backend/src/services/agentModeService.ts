@@ -5191,6 +5191,32 @@ export class AgentModeService {
 
       for (const fileUrl of urlsToProcess) {
         try {
+          // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
+          // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
+          const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
+          if (bareS3KeyPattern.test(fileUrl)) {
+            const s3Content = await getS3ObjectAsString(fileUrl);
+            if (!s3Content) {
+              console.warn(`AgentMode: performDataAnalysis empty S3 content for key ${fileUrl}`);
+              continue;
+            }
+            const contentBuffer = Buffer.from(s3Content, 'utf-8');
+            totalSize += contentBuffer.byteLength;
+            if (totalSize > maxTotalSize) {
+              return {
+                success: false,
+                message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+              };
+            }
+            fileParts.push({
+              inlineData: {
+                mimeType: fileUrl.endsWith('.json') ? 'application/json' : 'text/plain',
+                data: contentBuffer.toString('base64'),
+              }
+            });
+            continue;
+          }
+
           // Download the file
           const response = await axios.get(fileUrl, {
             responseType: 'arraybuffer',
