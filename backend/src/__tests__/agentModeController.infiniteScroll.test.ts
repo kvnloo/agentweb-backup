@@ -5,7 +5,12 @@ import { chatbotDb } from '../services/chatbotService';
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getUserSessions: jest.fn()
-  }
+  },
+  filterMessagesForClient: (msgs: any[]) => msgs,
+}));
+
+jest.mock('../services/sessionSummaryService', () => ({
+  summarizeSessionIfNeeded: jest.fn().mockResolvedValue(null),
 }));
 
 describe('Agent Mode Controller - Infinite Scroll', () => {
@@ -34,6 +39,28 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         { role: 'user', content: 'Another message' },
         { role: 'assistant', content: 'Another response' }
       ],
+      createdAt: '2024-01-02T00:00:00Z',
+      updatedAt: '2024-01-02T00:00:00Z'
+    }
+  ];
+
+  // Sessions as they appear in the list response: messages stripped, previewText added
+  const mockSessionsStripped = [
+    {
+      sessionId: 'session-1',
+      userId: 'user-123',
+      title: 'Session 1',
+      messages: [],
+      previewText: 'Hello',
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z'
+    },
+    {
+      sessionId: 'session-2',
+      userId: 'user-123',
+      title: 'Session 2',
+      messages: [],
+      previewText: 'Another message',
       createdAt: '2024-01-02T00:00:00Z',
       updatedAt: '2024-01-02T00:00:00Z'
     }
@@ -78,7 +105,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
-        sessions: mockSessions,
+        sessions: mockSessionsStripped,
         lastEvaluatedKey: { sessionId: 'session-2', createdAt: '2024-01-02T00:00:00Z' },
         hasMore: true
       });
@@ -110,7 +137,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
-        sessions: mockSessions,
+        sessions: mockSessionsStripped,
         lastEvaluatedKey: { sessionId: 'session-2', createdAt: '2024-01-02T00:00:00Z' },
         hasMore: true
       });
@@ -175,13 +202,13 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
       await agentModeController.getSessions(req, res);
 
       expect(res.json).toHaveBeenCalledWith({
-        sessions: mockSessions,
+        sessions: mockSessionsStripped,
         lastEvaluatedKey: null,
         hasMore: false
       });
     });
 
-    it('should filter messages for client display', async () => {
+    it('should strip all messages from sessions to keep payload small', async () => {
       const sessionsWithToolMessages = [
         {
           sessionId: 'session-1',
@@ -208,23 +235,9 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
 
       await agentModeController.getSessions(req, res);
 
-      expect(res.json).toHaveBeenCalledWith({
-        sessions: [
-          {
-            sessionId: 'session-1',
-            userId: 'user-123',
-            title: 'Session 1',
-            messages: [
-              { role: 'user', content: 'Hello' },
-              { role: 'assistant', content: 'Hi there!' }
-            ],
-            createdAt: '2024-01-01T00:00:00Z',
-            updatedAt: '2024-01-01T00:00:00Z'
-          }
-        ],
-        lastEvaluatedKey: null,
-        hasMore: false
-      });
+      const { sessions } = res.json.mock.calls[0][0];
+      expect(sessions[0].messages).toEqual([]);
+      expect(sessions[0].previewText).toBe('Hello');
     });
 
     it('should handle database errors gracefully', async () => {
