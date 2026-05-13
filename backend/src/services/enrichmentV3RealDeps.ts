@@ -46,7 +46,8 @@ function buildIdentityDeps(): IdentityResolverDeps {
   return {
     apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain }) => {
       if (!isApolloServiceReady()) return null;
-      const hasNameAndDomain = !!(firstName || lastName) && !!domain;
+      const personalDomain = !!domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`);
+      const hasNameAndDomain = !!(firstName || lastName) && !!domain && !personalDomain;
       if (!email && !linkedinUrl && !hasNameAndDomain) return null;
       try {
         const apollo = getApolloService();
@@ -80,6 +81,7 @@ function buildIdentityDeps(): IdentityResolverDeps {
 
     apolloOrgMatch: async ({ emailDomain }) => {
       if (!isApolloServiceReady()) return null;
+      if (CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)) return null;
       try {
         const apollo = getApolloService();
         const result = await apollo.matchOrg(emailDomain);
@@ -535,7 +537,8 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       fetchApolloPerson: async (lead) => {
         if (!isApolloServiceReady()) return null;
         const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
-        const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain;
+        const personalDomain = !!domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`);
+        const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain && !personalDomain;
         if (!lead.email && !hasNameAndDomain) return null;
         try {
           const input = lead.email

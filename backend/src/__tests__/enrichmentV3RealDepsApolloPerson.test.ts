@@ -116,6 +116,26 @@ describe('fetchApolloPerson — no email, name+website path', () => {
     );
   });
 
+  it('does not call matchPerson when domain is a personal email domain (gmail.com)', async () => {
+    const matchPersonSpy = jest.fn();
+    mockApolloService(matchPersonSpy);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const lead = makeLead({ firstName: 'Jane', lastName: 'Doe', emailDomain: 'gmail.com' });
+
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead,
+      groupName: 'person_identity',
+      requestedFields: ['email'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(matchPersonSpy).not.toHaveBeenCalled();
+  });
+
   it('returns null without calling matchPerson when no email and no name+domain', async () => {
     const matchPersonSpy = jest.fn();
     mockApolloService(matchPersonSpy);
@@ -286,5 +306,87 @@ describe('apolloPeopleMatch confidence gate — name+domain path', () => {
 
     // Email came from the lead itself, not Apollo — must be present regardless
     expect(result.ok).toBe(true);
+  });
+});
+
+// ─── Personal domain guard — apolloOrgMatch + enrichSoReverseLookup ──────────
+
+import * as enrichSoServiceModule from '../services/enrichSoService';
+import type { EnrichSoService } from '../services/enrichSoService';
+
+function mockEnrichSoService(reverseLookup = jest.fn().mockResolvedValue(null)) {
+  const svc = { reverseLookup } as unknown as EnrichSoService;
+  return jest.spyOn(enrichSoServiceModule, 'getEnrichSoService').mockReturnValue(svc);
+}
+
+describe('personal domain guard — adapter level', () => {
+  it('apolloOrgMatch does not call matchOrg for personal emailDomain', async () => {
+    const matchOrg = jest.fn().mockResolvedValue(null);
+    const svc = { matchPerson: jest.fn(), matchOrg, findEmail: jest.fn() } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.resolveIdentity({
+      listId: 'list-1',
+      lead: { leadId: 'lead-1', firstName: 'Jane', lastName: 'Doe', emailDomain: 'gmail.com' },
+      needsPersonFields: false,
+      needsCompanyFields: true,
+      mode: 'enrich',
+    });
+
+    expect(matchOrg).not.toHaveBeenCalled();
+  });
+
+  it('apolloOrgMatch calls matchOrg for a business domain', async () => {
+    const matchOrg = jest.fn().mockResolvedValue(null);
+    const svc = { matchPerson: jest.fn(), matchOrg, findEmail: jest.fn() } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.resolveIdentity({
+      listId: 'list-1',
+      lead: { leadId: 'lead-1', firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+      needsPersonFields: false,
+      needsCompanyFields: true,
+      mode: 'enrich',
+    });
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+  });
+
+  it('enrichSoReverseLookup calls reverseLookup for personal email (enrich.so resolves personal → work)', async () => {
+    const reverseLookup = jest.fn().mockResolvedValue(null);
+    mockEnrichSoService(reverseLookup);
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.resolveIdentity({
+      listId: 'list-1',
+      lead: { leadId: 'lead-1', firstName: 'Jane', lastName: 'Doe', email: 'jane@gmail.com' },
+      needsPersonFields: false,
+      needsCompanyFields: true,
+      mode: 'enrich',
+    });
+
+    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com');
+  });
+
+  it('enrichSoReverseLookup calls reverseLookup for business email', async () => {
+    const reverseLookup = jest.fn().mockResolvedValue(null);
+    mockEnrichSoService(reverseLookup);
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.resolveIdentity({
+      listId: 'list-1',
+      lead: { leadId: 'lead-1', firstName: 'Jane', lastName: 'Doe', email: 'jane@acme.com' },
+      needsPersonFields: false,
+      needsCompanyFields: true,
+      mode: 'enrich',
+    });
+
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
   });
 });
