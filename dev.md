@@ -1,3 +1,35 @@
+## Emma Silent on Slack Third-Party Mentions — Investigation (2026-05-13)
+
+### Problem
+
+In Slack agent mode sessions, when a thread message mentions another person (e.g. `<@U08TWRKGESG> test`), Emma responds to it as if it's a task for her — creating noise. The message is directed at a third party, not at Emma.
+
+### What Was Tried (All Failed)
+
+**Attempt 1: BE_SILENT in system prompt**
+Added a `[Silence Rule]` to the Slack session system prompt instructing Emma to respond with `BE_SILENT` if the message isn't directed at her. The Slack handler then checked for this sentinel and suppressed posting.
+- Failed because the system prompt is only injected on the *first message* of a session. Thread replies in existing sessions never see the rule.
+
+**Attempt 2: Structural pre-flight check (skip LLM entirely)**
+Added `isMessageDirectedElsewhere()` — extract `<@USERID>` mentions from message text, and if none are Emma's bot ID, `return` before calling `generateSessionResponse`.
+- Rejected by user: Emma loses context on silent turns because the message is never saved to the session, breaking future responses.
+
+**Attempt 3: BE_SILENT appended to each thread reply message**
+Appended `[Silence Rule] ... respond with exactly: BE_SILENT` to `formattedMessage` on every thread reply, so Emma sees the instruction on every turn regardless of when the session was created.
+- Failed because Emma's agent instructions are stronger than the hint. She interpreted `<@U08TWRKGESG> test` as "send a Slack message tagging that user with text 'test'" rather than a side-conversation to ignore.
+
+**Attempt 4: Save context + skip LLM (structural, with context preserved)**
+Before calling `generateSessionResponse`, detect third-party mentions structurally. If found: save the message to the session (for context) then return. Emma sees the message in history but doesn't respond.
+- User rejected this too — they want Emma herself to decide whether to be silent, not backend logic.
+
+### Resolution
+
+No code change applied. The correct approach is to simply tell Emma to be silent — i.e. keep the `BE_SILENT` sentinel approach — but the instruction must be injected **per-message** in a way Emma will actually honor. The key lesson: the message-appended hint fails because Emma's tool-use / action-bias overrides it. The right future fix would be to inject the silence check as a **system message added to the conversation mid-session** (a new system role message appended before each turn), not as user message content. This preserves full context while giving Emma a true system-level instruction on every turn.
+
+For now, the behavior remains as-is (Emma responds to all thread mentions).
+
+---
+
 ## SeaDance 2.0 Video Generation — Investigation & Blocked (2026-05-09)
 
 ### Context

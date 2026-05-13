@@ -374,10 +374,7 @@ async function handleSlackSessionResponse(params: {
     }
 
     // Post Emma's response to the Slack thread
-    if (response.content === 'BE_SILENT') {
-      // Emma determined the message wasn't directed at her — suppress all output
-      console.log(`🤫 Slack session ${session.sessionId}: Emma chose to be silent (message not directed at her)`);
-    } else if (response.content) {
+    if (response.content) {
       await postThreadResponse(channel, ts, response.content);
     } else {
       // Generation succeeded but produced no text content — log and post a fallback so the
@@ -387,8 +384,8 @@ async function handleSlackSessionResponse(params: {
       await postThreadResponse(channel, ts, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
     }
 
-    // Post iShare link and GTM Tracker link as a separate follow-up message (skip if Emma was silent)
-    if (ishareLink && response.content !== 'BE_SILENT') {
+    // Post iShare link and GTM Tracker link as a separate follow-up message
+    if (ishareLink) {
       const { WebClient } = await import('@slack/web-api');
       const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
@@ -881,28 +878,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               const displayName = await getSlackUserDisplayName(slackUserId);
               // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
               const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
-
-              // If the message mentions someone else but NOT Emma, save it as context but stay silent.
-              // This keeps Emma's conversation history intact without generating a noisy response.
-              const emmaBotId = await getEmmaBotUserId();
-              const mentionPattern = /<@([A-Z0-9]+)>/g;
-              const mentions: string[] = [];
-              let mentionMatch: RegExpExecArray | null;
-              while ((mentionMatch = mentionPattern.exec(messageText || '')) !== null) {
-                mentions.push(mentionMatch[1]);
-              }
-              const mentionsThirdParty = mentions.length > 0 && !(emmaBotId && mentions.includes(emmaBotId));
-              if (mentionsThirdParty) {
-                console.log(`🤫 Slack thread reply: message mentions a third party (not Emma) — saving context, staying silent`);
-                await chatbotDb.addMessageToSession(sessionId, {
-                  role: 'user',
-                  content: `${displayName}: ${messageText}`,
-                  timestamp: new Date().toISOString(),
-                  metadata: { portalType: 'agent', timestamp: new Date().toISOString(), attachments: [] },
-                });
-                return;
-              }
-
               const formattedMessage = `${displayName}: ${messageText}`.trim();
 
               const attachments: any[] = [];
@@ -939,11 +914,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               try {
                 const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                if (response.content === 'BE_SILENT') {
-                  console.log(`🤫 Slack thread reply: Emma chose to be silent for session ${sessionId}`);
-                } else if (response.content) {
-                  await postThreadResponse(channel, threadTs, response.content);
-                }
+                if (response.content) await postThreadResponse(channel, threadTs, response.content);
               } catch (genError) {
                 console.error('❌ Error generating thread response:', genError);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
