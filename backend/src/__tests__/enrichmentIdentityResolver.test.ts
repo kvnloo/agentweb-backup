@@ -543,3 +543,100 @@ describe('resolveIdentity — Tier 0.5 emailDomain derivation', () => {
     expect(result.resolved.emailDomain).toBeUndefined();
   });
 });
+
+// ─── Step 5.5 — Apollo person-match by name+domain ───────────────────────────
+
+describe('resolveIdentity — step 5.5 name+domain Apollo path', () => {
+  it('calls apolloPeopleMatch with name+domain when email absent but emailDomain resolved', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue({ website: 'https://acme.com' }),
+      apolloPeopleMatch: jest.fn().mockResolvedValue({ email: 'jane@acme.com', title: 'Engineer' }),
+    });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+    );
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('jane@acme.com');
+    expect(result.resolved.title).toBe('Engineer');
+  });
+
+  it('resolved email from step 5.5 makes enrichSoReverseLookup eligible in step 6', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue({ website: 'https://acme.com' }),
+      apolloPeopleMatch: jest.fn().mockResolvedValue({ email: 'jane@acme.com' }),
+      enrichSoReverseLookup: jest.fn().mockResolvedValue({ company: 'Acme Inc', firstName: 'Jane', lastName: 'Doe' }),
+    });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(deps.enrichSoReverseLookup).toHaveBeenCalledWith({ email: 'jane@acme.com' });
+  });
+
+  it('does not call apolloPeopleMatch(name+domain) when email already present', async () => {
+    const apolloPeopleMatch = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloPeopleMatch });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com', firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    // apolloPeopleMatch may be called for step 5 (email path), but NOT with domain
+    const domainCalls = apolloPeopleMatch.mock.calls.filter((c: any[]) => c[0]?.domain);
+    expect(domainCalls).toHaveLength(0);
+  });
+
+  it('does not call apolloPeopleMatch(name+domain) when name absent', async () => {
+    const apolloPeopleMatch = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloPeopleMatch });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, emailDomain: 'acme.com' },
+        needsPersonFields: false,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    const domainCalls = apolloPeopleMatch.mock.calls.filter((c: any[]) => c[0]?.domain);
+    expect(domainCalls).toHaveLength(0);
+  });
+
+  it('does not call apolloPeopleMatch(name+domain) when emailDomain absent', async () => {
+    const apolloPeopleMatch = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloPeopleMatch });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    const domainCalls = apolloPeopleMatch.mock.calls.filter((c: any[]) => c[0]?.domain);
+    expect(domainCalls).toHaveLength(0);
+  });
+});

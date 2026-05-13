@@ -44,20 +44,30 @@ const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRA
 
 function buildIdentityDeps(): IdentityResolverDeps {
   return {
-    apolloPeopleMatch: async ({ email, linkedinUrl }) => {
+    apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain }) => {
       if (!isApolloServiceReady()) return null;
-      if (!email && !linkedinUrl) return null;
+      const hasNameAndDomain = !!(firstName || lastName) && !!domain;
+      if (!email && !linkedinUrl && !hasNameAndDomain) return null;
       try {
         const apollo = getApolloService();
-        const result = await apollo.matchPerson({ email, linkedinUrl });
+        const input = email ? { email, linkedinUrl }
+          : linkedinUrl ? { linkedinUrl }
+          : { firstName: firstName ?? undefined, lastName: lastName ?? undefined, domain: domain! };
+        const result = await apollo.matchPerson(input);
         const p = result?.match?.person;
         if (!p) return null;
+        // Name+domain is a weak identifier — Apollo's confidence on the returned
+        // email is 'low' when it's guessed/extrapolated. Only surface the email
+        // when confidence is medium or high to prevent a wrong email cascading
+        // into enrich.so and poisoning the lead's identity.
+        const emailConfidence = p.fieldConfidence?.email;
+        const emailSafe = !hasNameAndDomain || (emailConfidence && emailConfidence !== 'low');
         return {
           firstName: p.firstName,
           lastName: p.lastName,
           title: p.title,
           linkedin: p.linkedin,
-          email: p.email,           // returned when matched by linkedinUrl
+          email: emailSafe ? p.email : undefined,
           city: p.city,
           state: p.state,
           country: p.country,
@@ -524,9 +534,14 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       fetchApolloPerson: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        if (!lead.email) return null;
+        const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
+        const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain;
+        if (!lead.email && !hasNameAndDomain) return null;
         try {
-          const result = await getApolloService().matchPerson({ email: lead.email });
+          const input = lead.email
+            ? { email: lead.email }
+            : { firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined, domain: domain! };
+          const result = await getApolloService().matchPerson(input);
           if (!result?.match?.person) return null;
           return {
             mapped: mapApolloPersonToCrmFields(result.match.person),
