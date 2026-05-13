@@ -24,9 +24,7 @@ Before calling `generateSessionResponse`, detect third-party mentions structural
 
 ### Resolution
 
-No code change applied. The correct approach is to simply tell Emma to be silent — i.e. keep the `BE_SILENT` sentinel approach — but the instruction must be injected **per-message** in a way Emma will actually honor. The key lesson: the message-appended hint fails because Emma's tool-use / action-bias overrides it. The right future fix would be to inject the silence check as a **system message added to the conversation mid-session** (a new system role message appended before each turn), not as user message content. This preserves full context while giving Emma a true system-level instruction on every turn.
-
-For now, the behavior remains as-is (Emma responds to all thread mentions).
+No code change applied. The actual solution is simple: the **user can just tell Emma to be silent** in the Slack thread (e.g. "ignore messages not directed at you"). Emma will honor a direct instruction from the user in conversation far more reliably than any injected hint or system prompt addition. No backend change needed — this is a prompt/UX pattern, not an engineering problem.
 
 ---
 
