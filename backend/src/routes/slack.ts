@@ -881,7 +881,29 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               const displayName = await getSlackUserDisplayName(slackUserId);
               // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
               const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
-              const formattedMessage = `${displayName}: ${messageText}\n\n[Silence Rule] If this message is a side-conversation between other people not directed at you, respond with exactly: BE_SILENT`.trim();
+
+              // If the message mentions someone else but NOT Emma, save it as context but stay silent.
+              // This keeps Emma's conversation history intact without generating a noisy response.
+              const emmaBotId = await getEmmaBotUserId();
+              const mentionPattern = /<@([A-Z0-9]+)>/g;
+              const mentions: string[] = [];
+              let mentionMatch: RegExpExecArray | null;
+              while ((mentionMatch = mentionPattern.exec(messageText || '')) !== null) {
+                mentions.push(mentionMatch[1]);
+              }
+              const mentionsThirdParty = mentions.length > 0 && !(emmaBotId && mentions.includes(emmaBotId));
+              if (mentionsThirdParty) {
+                console.log(`🤫 Slack thread reply: message mentions a third party (not Emma) — saving context, staying silent`);
+                await chatbotDb.addMessageToSession(sessionId, {
+                  role: 'user',
+                  content: `${displayName}: ${messageText}`,
+                  timestamp: new Date().toISOString(),
+                  metadata: { portalType: 'agent', timestamp: new Date().toISOString(), attachments: [] },
+                });
+                return;
+              }
+
+              const formattedMessage = `${displayName}: ${messageText}`.trim();
 
               const attachments: any[] = [];
               if (files && files.length > 0) {

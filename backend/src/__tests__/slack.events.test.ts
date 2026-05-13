@@ -437,10 +437,10 @@ describe('Slack Events API', () => {
         // Verify thinking message posted
         expect(postThinkingMessage).toHaveBeenCalledWith('C12345', '1234567890.123456');
 
-        // Verify message forwarded with username prefix and silence rule
+        // Verify message forwarded with username prefix
         expect(generateSessionResponse).toHaveBeenCalledWith(
           'session-123',
-          'John Doe: Can you also add some images?\n\n[Silence Rule] If this message is a side-conversation between other people not directed at you, respond with exactly: BE_SILENT',
+          'John Doe: Can you also add some images?',
           'user-123',
           'gpt-4o',
           []
@@ -561,10 +561,10 @@ describe('Slack Events API', () => {
           'video/mp4'
         );
 
-        // Verify Emma received the message with the attachment and silence rule
+        // Verify Emma received the message with the attachment
         expect(generateSessionResponse).toHaveBeenCalledWith(
           'session-123',
-          'John Doe: Checkout the video and make again\n\n[Silence Rule] If this message is a side-conversation between other people not directed at you, respond with exactly: BE_SILENT',
+          'John Doe: Checkout the video and make again',
           'user-123',
           'gpt-4o',
           [
@@ -627,10 +627,10 @@ describe('Slack Events API', () => {
         // Verify file was downloaded
         expect(downloadSlackFile).toHaveBeenCalledWith('https://files.slack.com/image.png');
 
-        // Verify Emma received a placeholder message text when no text was provided, with silence rule
+        // Verify Emma received a placeholder message text when no text was provided
         expect(generateSessionResponse).toHaveBeenCalledWith(
           'session-123',
-          'John Doe: [attached file]\n\n[Silence Rule] If this message is a side-conversation between other people not directed at you, respond with exactly: BE_SILENT',
+          'John Doe: [attached file]',
           'user-123',
           'gpt-4o',
           expect.arrayContaining([
