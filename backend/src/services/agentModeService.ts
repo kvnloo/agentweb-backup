@@ -5195,10 +5195,21 @@ export class AgentModeService {
           // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
           const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
           if (bareS3KeyPattern.test(fileUrl)) {
-            const s3Content = await getS3ObjectAsString(fileUrl);
+            let s3Content: string;
+            try {
+              s3Content = await getS3ObjectAsString(fileUrl);
+            } catch (s3Err) {
+              const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+              return {
+                success: false,
+                message: `Cannot read tool-response file "${fileUrl}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
+              };
+            }
             if (!s3Content) {
-              console.warn(`AgentMode: performDataAnalysis empty S3 content for key ${fileUrl}`);
-              continue;
+              return {
+                success: false,
+                message: `Tool-response file "${fileUrl}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
+              };
             }
             const contentBuffer = Buffer.from(s3Content, 'utf-8');
             totalSize += contentBuffer.byteLength;
