@@ -6151,6 +6151,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-13',
+    changes: [
+      'New: Use Gmail as a CRM Email Sender',
+      '- You can now connect a Gmail account and use it to send CRM emails directly — no email subdomain setup required',
+      '- In CRM → Senders, click "Connect Gmail" to link your Gmail account via OAuth. Once connected, click "Use as Sender" to add it',
+      '- Note: Gmail senders do not have open/click tracking. Emma reads your Gmail inbox to find reply history for context',
+    ],
+  },
+  {
     date: '2026-05-12',
     changes: [
       'Fixed: Soft-Deleted Accounts No Longer Appear as Org Owners',

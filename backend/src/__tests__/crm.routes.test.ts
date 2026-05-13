@@ -1347,17 +1347,19 @@ describe('CRM Routes', () => {
 
     it('should return empty configuration if not set', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
-      
-      const handler = router.stack.find((r: any) => 
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ connected_accounts: [] });
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.get
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.json).toHaveBeenCalledWith({
         senders: [],
         defaultSenderId: null,
+        connectedGmailAccounts: [],
       });
     });
 

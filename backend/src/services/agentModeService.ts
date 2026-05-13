@@ -5592,7 +5592,7 @@ export class AgentModeService {
   // Get CRM sender emails configuration
   public async getCrmSenders(userId: string): Promise<{
     success: boolean;
-    senders: Array<{ id: string; email: string; fromName: string; notes?: string }>;
+    senders: Array<{ id: string; email: string; fromName: string; notes?: string; senderType?: 'gmail'; gmailAccountId?: string }>;
     defaultSenderId: string | null;
     error?: string;
   }> {
@@ -8391,19 +8391,38 @@ export class AgentModeService {
         return { success: false, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
       }
 
-      // Send via Resend
-      const { resendService } = await import('./resendService');
-      const from = `${sender.fromName} <${sender.email}>`;
-      const result = await resendService.sendEmail({
-        from,
-        to: lead.email,
-        subject: draft.subject,
-        html: draft.htmlContent,
-        text: draft.textContent
-      });
+      let emailId: string;
 
-      if (!result) {
-        return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+      if ((sender as any).senderType === 'gmail') {
+        // Send via connected Gmail account
+        const gmailAccountId = (sender as any).gmailAccountId;
+        if (!gmailAccountId) {
+          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+        }
+        const { gmailService } = await import('./gmailService');
+        const body = draft.htmlContent || draft.textContent || '';
+        const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+          to: lead.email,
+          subject: draft.subject,
+          body,
+          isHtml: !!draft.htmlContent,
+        });
+        emailId = gmailResult.messageId;
+      } else {
+        // Send via Resend (custom domain sender)
+        const { resendService } = await import('./resendService');
+        const from = `${sender.fromName} <${sender.email}>`;
+        const result = await resendService.sendEmail({
+          from,
+          to: lead.email,
+          subject: draft.subject,
+          html: draft.htmlContent,
+          text: draft.textContent
+        });
+        if (!result) {
+          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        }
+        emailId = result.id;
       }
 
       // Clear the draft after successful send
@@ -8412,7 +8431,7 @@ export class AgentModeService {
       return {
         success: true,
         message: `Email sent successfully to ${lead.email}`,
-        emailId: result.id,
+        emailId,
         to: lead.email,
         from: sender.email,
         subject: draft.subject
