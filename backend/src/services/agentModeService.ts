@@ -4682,9 +4682,18 @@ export class AgentModeService {
         matches,
       };
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
+      if (isFatal) {
+        return {
+          success: false,
+          fatal: true,
+          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+        };
+      }
       return {
         success: false,
-        message: `Failed to search tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        message: `Failed to search tool response: ${errMsg}`,
       };
     }
   }
@@ -4719,9 +4728,18 @@ export class AgentModeService {
         content: slice,
       };
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
+      if (isFatal) {
+        return {
+          success: false,
+          fatal: true,
+          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+        };
+      }
       return {
         success: false,
-        message: `Failed to read tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        message: `Failed to read tool response: ${errMsg}`,
       };
     }
   }
@@ -5081,7 +5099,7 @@ export class AgentModeService {
       if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
         return {
           success: false,
-          message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). The dataset embedded in the instruction is too large to send inline. Please use the save_file tool first to upload the dataset as a .csv or .txt file, then call perform_data_analysis again with the returned file URL in the file_urls parameter and a concise analysis_instruction describing what to analyze.`
+          message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`
         };
       }
 
@@ -5124,7 +5142,7 @@ export class AgentModeService {
         if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
           return {
             success: false,
-            message: `After resolving tool-response references, the analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). Use save_file to upload the dataset as a .csv or .txt file, then call perform_data_analysis with the returned file URL in file_urls and a concise analysis_instruction.`
+            message: `After resolving tool-response references, the analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`
           };
         }
       } else if (localPathPattern.test(analysisInstruction)) {
@@ -5173,6 +5191,43 @@ export class AgentModeService {
 
       for (const fileUrl of urlsToProcess) {
         try {
+          // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
+          // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
+          const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
+          if (bareS3KeyPattern.test(fileUrl)) {
+            let s3Content: string;
+            try {
+              s3Content = await getS3ObjectAsString(fileUrl);
+            } catch (s3Err) {
+              const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+              return {
+                success: false,
+                message: `Cannot read tool-response file "${fileUrl}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
+              };
+            }
+            if (!s3Content) {
+              return {
+                success: false,
+                message: `Tool-response file "${fileUrl}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
+              };
+            }
+            const contentBuffer = Buffer.from(s3Content, 'utf-8');
+            totalSize += contentBuffer.byteLength;
+            if (totalSize > maxTotalSize) {
+              return {
+                success: false,
+                message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+              };
+            }
+            fileParts.push({
+              inlineData: {
+                mimeType: fileUrl.endsWith('.json') ? 'application/json' : 'text/plain',
+                data: contentBuffer.toString('base64'),
+              }
+            });
+            continue;
+          }
+
           // Download the file
           const response = await axios.get(fileUrl, {
             responseType: 'arraybuffer',
@@ -5381,7 +5436,7 @@ export class AgentModeService {
       if (isPayloadTooLarge) {
         return {
           success: false,
-          message: `The data payload sent to Gemini was too large. Please use the save_file tool to upload the dataset as a .csv or .txt file first, then call perform_data_analysis with the returned file URL in the file_urls parameter instead of embedding the data inline.`,
+          message: `The data payload sent to Gemini was too large. IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`,
           error: errorMessage
         };
       }
@@ -13381,6 +13436,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       safeMessage.includes('service temporarily unavailable');
     if (isConnectionTimeout) {
       return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
+    }
+    // ReferenceError from browser_run_code means the code references variables not available in
+    // the VM sandbox (only `page` is in scope). Guide the LLM to fix the code, not retry as-is.
+    const isBrowserRunCode =
+      toolName === 'browser_run_code' || toolName.endsWith('_browser_run_code');
+    if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
+    }
+    // Data analysis "too large" errors — LLM must use save_file, not keep retrying with inline data
+    if (toolName === 'perform_data_analysis' &&
+        (safeMessage.includes('too large') || safeMessage.includes('exceeds'))) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST use the save_file tool first to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
