@@ -44,23 +44,6 @@ async function getEmmaBotUserId(): Promise<string | null> {
   return emmaBotUserId;
 }
 
-// Returns true when a thread reply mentions someone OTHER than Emma and does not
-// also mention Emma — i.e. the message is directed at a third party, not at Emma.
-function isMessageDirectedElsewhere(text: string, emmaBotId: string | null): boolean {
-  if (!text) return false;
-  const mentionPattern = /<@([A-Z0-9]+)>/g;
-  const mentions: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = mentionPattern.exec(text)) !== null) {
-    mentions.push(m[1]);
-  }
-  if (mentions.length === 0) return false;
-  // If Emma is explicitly mentioned, always respond
-  if (emmaBotId && mentions.includes(emmaBotId)) return false;
-  // There are mentions but none are Emma — message is directed elsewhere
-  return true;
-}
-
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
@@ -898,7 +881,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               const displayName = await getSlackUserDisplayName(slackUserId);
               // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
               const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
-              const formattedMessage = `${displayName}: ${messageText}`.trim();
+              const formattedMessage = `${displayName}: ${messageText}\n\n[Silence Rule] If this message is a side-conversation between other people not directed at you, respond with exactly: BE_SILENT`.trim();
 
               const attachments: any[] = [];
               if (files && files.length > 0) {
@@ -926,13 +909,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                     console.error('❌ Error downloading Slack file:', fileError);
                   }
                 }
-              }
-
-              // Suppress response if message mentions someone other than Emma (not directed at her)
-              const emmaBotId = await getEmmaBotUserId();
-              if (messageText && isMessageDirectedElsewhere(messageText, emmaBotId)) {
-                console.log(`🤫 Slack thread reply: message mentions a third party, not Emma — staying silent`);
-                return;
               }
 
               const thinkingTs = await postThinkingMessage(channel, threadTs);
