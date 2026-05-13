@@ -290,5 +290,37 @@ describe('Slack @mention detection in Agent Mode', () => {
       expect(calledWith).toContain('@Sarah');
       expect(calledWith).toContain('[Note:');
     });
+
+    it('should NOT append context note when sender mentions themselves', async () => {
+      const { resolveSlackMentionsInText, getSlackUserDisplayName } = require('../services/slackService');
+      // Sender is "Alice" and she types "@Alice hello"
+      getSlackUserDisplayName.mockResolvedValue('Alice');
+      resolveSlackMentionsInText.mockImplementation((text: string) =>
+        Promise.resolve(text.replace(/<@UALICE>/g, '@Alice').replace(/<@[A-Z0-9]+>/g, ''))
+      );
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'message',
+            user: 'UALICE',
+            text: '<@UALICE> hello this is a test',
+            channel: 'C12345',
+            ts: '1234567891.000000',
+            thread_ts: '1111111111.111111',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(generateSessionResponse).toHaveBeenCalled();
+      const calledWith = generateSessionResponse.mock.calls[0][1] as string;
+
+      // Self-mention should not trigger the context note
+      expect(calledWith).not.toContain('[Note:');
+    });
   });
 });

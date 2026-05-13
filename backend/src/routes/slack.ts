@@ -111,18 +111,30 @@ or if no email found:
  * person rather than her.
  *
  * @param formattedMessage The message already formatted as "DisplayName: text" with mentions resolved
+ * @param senderDisplayName The display name of the sender (used to exclude self-mentions)
  * @returns The message with an optional context note appended
  */
-function appendThirdPartyMentionNote(formattedMessage: string): string {
+function appendThirdPartyMentionNote(formattedMessage: string, senderDisplayName?: string): string {
   // After "DisplayName: " prefix, extract the actual message body
   const colonIdx = formattedMessage.indexOf(': ');
   const body = colonIdx !== -1 ? formattedMessage.slice(colonIdx + 2) : formattedMessage;
 
-  // Find all @Name mentions in the message body (word chars, spaces allowed for display names)
-  const mentionMatches = body.match(/@[\w][\w .'-]*/g);
+  // Match @mentions: one or two capitalized words (e.g. @John, @John Smith, @ftan).
+  // Deliberately NOT matching trailing lowercase words to avoid swallowing message content
+  // like "@Rui Wang hello" → should match "@Rui Wang", not "@Rui Wang hello".
+  const mentionMatches = body.match(/@[A-Za-z]\w*(?:\s+[A-Z]\w*)?\b/g);
   if (!mentionMatches || mentionMatches.length === 0) return formattedMessage;
 
-  const names = [...new Set(mentionMatches)].join(', ');
+  // Filter out self-mentions (the sender mentioning their own name)
+  const senderNorm = senderDisplayName?.toLowerCase().trim();
+  const thirdPartyMentions = [...new Set(mentionMatches)].filter(m => {
+    const nameNorm = m.slice(1).toLowerCase().trim(); // strip leading @
+    return !senderNorm || !senderNorm.includes(nameNorm) && !nameNorm.includes(senderNorm);
+  });
+
+  if (thirdPartyMentions.length === 0) return formattedMessage;
+
+  const names = thirdPartyMentions.join(', ');
   return `${formattedMessage}\n[Note: this message mentions ${names} — it appears the user may be addressing them rather than you. Acknowledge this if appropriate and offer to help draft a response to them.]`;
 }
 
@@ -380,10 +392,11 @@ async function handleSlackSessionResponse(params: {
     }
   }
 
+  const senderName = userMessage.includes(': ') ? userMessage.split(': ')[0] : undefined;
   try {
     const response = await generateSessionResponse(
       session.sessionId,
-      appendThirdPartyMentionNote(userMessage),
+      appendThirdPartyMentionNote(userMessage, senderName),
       user.userId,
       llmModel,
       attachments
@@ -862,7 +875,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                 const llmModel = session.llmModel || await agentModeService.getDefaultModel();
                 let emmaResponse = '';
                 try {
-                  const result = await generateSessionResponse(sessionId, appendThirdPartyMentionNote(formattedMessage), userId, llmModel);
+                  const result = await generateSessionResponse(sessionId, appendThirdPartyMentionNote(formattedMessage, displayName), userId, llmModel);
                   emmaResponse = result.content;
                 } catch (genError) {
                   console.error('❌ Error generating response for monitored thread:', genError);
@@ -943,7 +956,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
               try {
-                const response = await generateSessionResponse(sessionId, appendThirdPartyMentionNote(formattedMessage), userId, llmModel, attachments);
+                const response = await generateSessionResponse(sessionId, appendThirdPartyMentionNote(formattedMessage, displayName), userId, llmModel, attachments);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
                 if (response.content) await postThreadResponse(channel, threadTs, response.content);
               } catch (genError) {
