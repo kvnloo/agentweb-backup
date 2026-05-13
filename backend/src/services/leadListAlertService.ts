@@ -58,7 +58,7 @@ const buildEventDetails = (eventType: string, eventData: any) => {
       } else if (eventData.autoSendStatus === 'skipped_already_sent_today') {
         details.push({ label: 'Auto Send', value: 'Skipped — an email was already sent to this lead today', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
       } else if (eventData.autoSendStatus === 'skipped_no_sender') {
-        details.push({ label: 'Warning', value: 'Auto send skipped — no sender email configured. Please configure a sender in CRM settings.', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+        details.push({ label: 'Warning', value: 'Auto send skipped — no sender email configured for this lead list. To set one up, select the lead list and click "Senders".', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
       } else if (eventData.autoSendStatus === 'skipped_no_email') {
         details.push({ label: 'Warning', value: 'Auto send skipped — lead has no email address.', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
       } else if (eventData.autoSendStatus === 'failed') {
