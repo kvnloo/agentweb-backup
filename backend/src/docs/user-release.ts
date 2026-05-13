@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-11
+// Last updated: 2026-05-13
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Local Agent Web Browsing More Reliable',
+      '- Fixed a safety filter false-positive that was blocking legitimate LinkedIn screenshot tasks (the pattern incorrectly matched phrases like "posted and formatted")',
+      '- Health check now probes the actual Codex worker instead of just the HTTP server — so Emma correctly detects a hung or busy agent rather than falsely reporting it as available',
+      '- Extended the HTTP timeout buffer for long-running tasks (+90s instead of +30s) to prevent spurious timeout errors on tasks that take 120–160 seconds',
+    ],
+  },
   {
     date: '2026-05-13',
     changes: [
