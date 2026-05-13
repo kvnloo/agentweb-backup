@@ -272,4 +272,54 @@ describe('agentModeController.getSessions', () => {
       'reCAPTCHA'
     );
   });
+
+  // --- PAYLOAD SIZE ---
+
+  test('strips messages from response and returns empty array to keep payload small', async () => {
+    const session = makeSession({
+      messages: [
+        { role: 'user', content: 'Hello, can you help me?' },
+        { role: 'assistant', content: 'Sure!' },
+      ],
+    });
+    mockGetUserSessions.mockResolvedValue({ sessions: [session], lastEvaluatedKey: null });
+
+    const res = makeResponse();
+    await agentModeController.getSessions(makeRequest(), res);
+
+    const { sessions } = res.json.mock.calls[0][0];
+    expect(sessions[0].messages).toEqual([]);
+  });
+
+  test('derives previewText from first user message when not already set', async () => {
+    const session = makeSession({
+      messages: [
+        { role: 'user', content: 'What is the capital of France?' },
+        { role: 'assistant', content: 'Paris.' },
+      ],
+    });
+    mockGetUserSessions.mockResolvedValue({ sessions: [session], lastEvaluatedKey: null });
+
+    const res = makeResponse();
+    await agentModeController.getSessions(makeRequest(), res);
+
+    const { sessions } = res.json.mock.calls[0][0];
+    expect(sessions[0].previewText).toBe('What is the capital of France?');
+  });
+
+  test('uses existing previewText from session record rather than messages', async () => {
+    const session = makeSession({
+      previewText: 'Cached preview from DB',
+      messages: [
+        { role: 'user', content: 'Different message' },
+      ],
+    });
+    mockGetUserSessions.mockResolvedValue({ sessions: [session], lastEvaluatedKey: null });
+
+    const res = makeResponse();
+    await agentModeController.getSessions(makeRequest(), res);
+
+    const { sessions } = res.json.mock.calls[0][0];
+    expect(sessions[0].previewText).toBe('Cached preview from DB');
+  });
 });

@@ -1818,17 +1818,21 @@ export const agentModeController = {
       const pageIdentifier = req.query.pageIdentifier as string | undefined;
       const search = req.query.search as string | undefined;
 
-      // Get sessions with pagination
+      // Get sessions with pagination — messages are stripped here and replaced with
+      // a lightweight previewText so the list payload stays small (the full message
+      // history is loaded on-demand when a session is actually opened).
       const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier, search);
 
-      // Filter out tool messages and assistant messages with tool calls for user display
-      const filteredSessions = result.sessions.map(session => ({
-        ...session,
-        messages: filterMessagesForClient(session.messages)
-      }));
+      const listSessions = result.sessions.map(session => {
+        // Derive previewText from first user message if not already stored
+        const previewText: string | null = (session as any).previewText ||
+          session.messages?.find((m: any) => m.role === 'user')?.content?.slice(0, 200) || null;
+        const { messages: _, ...sessionWithoutMessages } = session as any;
+        return { ...sessionWithoutMessages, messages: [], previewText };
+      });
 
       res.json({
-        sessions: filteredSessions,
+        sessions: listSessions,
         lastEvaluatedKey: result.lastEvaluatedKey,
         hasMore: !!result.lastEvaluatedKey
       });
