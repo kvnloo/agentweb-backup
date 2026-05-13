@@ -4295,8 +4295,23 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
     const settingName = `crm_sender_emails_${userId}`;
     const setting = await settingsService.getSetting(settingName);
 
+    // Fetch connected Gmail accounts so the frontend can offer them as sender options
+    let connectedGmailAccounts: Array<{ account_id: string; account_name: string; email: string }> = [];
+    try {
+      const user = await userDb.getUserById(userId);
+      connectedGmailAccounts = (user?.connected_accounts || [])
+        .filter((a: any) => a.platform === 'gmail')
+        .map((a: any) => ({
+          account_id: a.account_id,
+          account_name: a.account_name,
+          email: a.config?.email || a.account_id,
+        }));
+    } catch (_) {
+      // Non-fatal — proceed without connected accounts
+    }
+
     if (!setting) {
-      return res.json({ senders: [], defaultSenderId: null });
+      return res.json({ senders: [], defaultSenderId: null, connectedGmailAccounts });
     }
 
     try {
@@ -4304,11 +4319,12 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
       res.json({
         senders: config.senders || [],
         defaultSenderId: config.defaultSenderId || null,
-        defaultLinkedInAccountId: config.defaultLinkedInAccountId || null
+        defaultLinkedInAccountId: config.defaultLinkedInAccountId || null,
+        connectedGmailAccounts,
       });
     } catch (parseError) {
       console.error('Error parsing CRM sender emails:', parseError);
-      res.json({ senders: [], defaultSenderId: null, defaultLinkedInAccountId: null });
+      res.json({ senders: [], defaultSenderId: null, defaultLinkedInAccountId: null, connectedGmailAccounts });
     }
   } catch (error: any) {
     console.error('Error fetching CRM sender emails:', error);
@@ -4351,6 +4367,13 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       if (sender.notes !== undefined && typeof sender.notes !== 'string') {
         return res.status(400).json({ message: 'Notes must be a string if provided' });
       }
+      // Gmail sender validation
+      if (sender.senderType !== undefined && sender.senderType !== 'gmail') {
+        return res.status(400).json({ message: `Invalid senderType: ${sender.senderType}` });
+      }
+      if (sender.senderType === 'gmail' && !sender.gmailAccountId) {
+        return res.status(400).json({ message: 'Gmail senders must include gmailAccountId' });
+      }
     }
 
     // Validate defaultSenderId if provided
@@ -4376,7 +4399,8 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
         id: s.id || index.toString(),
         email: s.email.trim(),
         fromName: s.fromName.trim(),
-        notes: s.notes ? s.notes.trim() : undefined
+        notes: s.notes ? s.notes.trim() : undefined,
+        ...(s.senderType === 'gmail' ? { senderType: 'gmail', gmailAccountId: s.gmailAccountId } : {}),
       })),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
       defaultLinkedInAccountId: defaultLinkedInAccountId || null
