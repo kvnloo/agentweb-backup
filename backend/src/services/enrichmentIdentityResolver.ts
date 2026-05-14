@@ -7,6 +7,7 @@
 import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { extractDomainFromEmail } from '../utils/leadSchema';
+import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
 
 const IDENTITY_FIELD_TTL_MS = 90 * 86400 * 1000; // 90 days — no FIELD_GROUP for identity fields
 
@@ -18,6 +19,7 @@ export interface ApolloPersonResult {
   title?: string;
   linkedin?: string;
   email?: string;
+  emailStatus?: string;
   company?: string;          // from embedded person.organization
   website?: string;          // from embedded person.organization
   city?: string;
@@ -54,9 +56,29 @@ export interface IdentityResolverDeps {
   apolloPeopleMatch(input: {
     email?: string;
     linkedinUrl?: string;
+    firstName?: string;
+    lastName?: string;
+    domain?: string;
+    company?: string;
   }): Promise<ApolloPersonResult | null>;
   enrichSoReverseLookup(input: { email: string }): Promise<EnrichSoReverseResult | null>;
   enrichSoFindEmail(input: { firstName: string; lastName: string; domain: string }): Promise<{ email: string } | null>;
+  apolloBrokerChain(
+    input: {
+      firstName: string;
+      lastName: string;
+      domain?: string;
+      company?: string;
+      linkedinUrl?: string;
+      linkedToEmail?: string;
+    },
+    leadHint: { listId: string; leadId: string },
+  ): Promise<{ email?: string; emailStatus?: string } | null>;
+  findEmailViaPatterns(input: {
+    firstName: string;
+    lastName: string;
+    domain: string;
+  }): Promise<{ email: string; pattern?: string } | null>;
   /** Step 2 — Unipile LinkedIn people search. Finds linkedin_url from name+company.
    *  Returns null when no connected LinkedIn account or no confident match. */
   findLinkedInUrl(input: { firstName: string; lastName: string; company: string }): Promise<string | null>;
@@ -107,10 +129,14 @@ export interface ResolveIdentityInput {
    *  CRM-history Tier 0 skips any field present in this set so Apollo runs
    *  for it instead. Same shape used by the waterfall (`enrichmentGroupWaterfall.ts:215`). */
   refreshFields?: Set<string>;
+  /** Tier 6.5 only. When set, the resolver may call Apollo's broker chain
+   *  (run_waterfall_email) via `deps.apolloBrokerChain`. Without this hint
+   *  there is no lead to write the async result back to, so Tier 6.5 is skipped. */
+  leadHint?: { listId: string; leadId: string };
 }
 
 export type ResolveIdentityResult =
-  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[] }
+  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
 function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
@@ -278,43 +304,89 @@ export async function resolveIdentity(
     }
   }
 
-  // 3. LinkedIn-first Apollo. Fires only when local `email` is still empty
-  // after Tier 0 — we have a linkedin URL but no email to match by. Apollo
-  // returns the email plus optional person fields and embedded org fields.
-  const linkedinForApollo = lead.linkedin || resolved.linkedin || linkedinUrl;
-  if (!email && linkedinForApollo) {
+  // 3. Unified Apollo call — fires when any signal is available AND fields are still
+  // incomplete. Sends all available signals combined so Apollo can return the best
+  // match. Merges the former two-tier split (linkedin-first + email-first) into one
+  // call: more signals → higher Apollo match confidence → better field coverage.
+  const linkedinForApollo = linkedinUrl || resolved.linkedin;
+  const firstNameEff = lead.firstName || resolved.firstName;
+  const lastNameEff = lead.lastName || resolved.lastName;
+  const domainForApollo =
+    lead.emailDomain || resolved.emailDomain ||
+    extractDomainFromEmail(email) ||
+    deriveDomainFromWebsite(lead.website || resolved.website || '') ||
+    undefined;
+  const companyForApollo = lead.company || resolved.company;
+  const hasNameOrg = !!(firstNameEff && lastNameEff && (domainForApollo || companyForApollo));
+  const apolloSignalAvailable = !!(email || linkedinForApollo || hasNameOrg);
+  const apolloNeeded =
+    !email ||
+    (needsPersonFields && (!(lead.firstName || resolved.firstName) || !(lead.lastName || resolved.lastName))) ||
+    (needsCompanyFields && !(lead.company || resolved.company));
+
+  if (apolloSignalAvailable && apolloNeeded) {
     try {
-      const byLinkedin = await deps.apolloPeopleMatch({ linkedinUrl: linkedinForApollo });
-      if (byLinkedin) {
+      const apolloInput: Parameters<IdentityResolverDeps['apolloPeopleMatch']>[0] = {};
+      if (email) apolloInput.email = email;
+      if (linkedinForApollo) apolloInput.linkedinUrl = linkedinForApollo;
+      if (firstNameEff) apolloInput.firstName = firstNameEff;
+      if (lastNameEff) apolloInput.lastName = lastNameEff;
+      if (domainForApollo) apolloInput.domain = domainForApollo;
+      else if (companyForApollo) apolloInput.company = companyForApollo;
+
+      // weakSignalOnly = no email/linkedin anchor — name+domain/company only.
+      // Used below to gate non-email field fills (prevents false-positive person match).
+      const weakSignalOnly = !email && !linkedinForApollo;
+
+      const apolloResult = await deps.apolloPeopleMatch(apolloInput);
+      if (apolloResult) {
         const apolloMeta = makeApiMeta('apollo');
-        if (byLinkedin.email && !resolved.email) {
-          email = byLinkedin.email;
-          resolved.email = byLinkedin.email;
-          meta.email = apolloMeta;
+
+        let emailTrusted = false;
+        if (apolloResult.email && !email && !resolved.email) {
+          email = apolloResult.email;
+          resolved.email = apolloResult.email;
+          meta.email = {
+            ...apolloMeta,
+            confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
+          };
+          emailTrusted = true;
         }
-        if (byLinkedin.firstName && !lead.firstName && !resolved.firstName) {
-          resolved.firstName = byLinkedin.firstName;
-          meta.firstName = apolloMeta;
-        }
-        if (byLinkedin.lastName && !lead.lastName && !resolved.lastName) {
-          resolved.lastName = byLinkedin.lastName;
-          meta.lastName = apolloMeta;
-        }
-        if (byLinkedin.title && !lead.title && !resolved.title) {
-          resolved.title = byLinkedin.title;
-          meta.title = apolloMeta;
-        }
-        if (byLinkedin.company && !lead.company && !resolved.company) {
-          resolved.company = byLinkedin.company;
-          meta.company = apolloMeta;
-        }
-        if (byLinkedin.website && !lead.website && !resolved.website) {
-          resolved.website = byLinkedin.website;
-          meta.website = apolloMeta;
+
+        // Non-email fields: fill only when match is confident.
+        // Strong anchor (email/linkedin present) → always confident.
+        // Weak anchor (name+domain only) → confident only if Apollo returned a
+        // trusted email (confirms it found the right person record).
+        const matchConfident = !weakSignalOnly || emailTrusted;
+        if (matchConfident) {
+          if (apolloResult.firstName && !lead.firstName && !resolved.firstName) {
+            resolved.firstName = apolloResult.firstName;
+            meta.firstName = apolloMeta;
+          }
+          if (apolloResult.lastName && !lead.lastName && !resolved.lastName) {
+            resolved.lastName = apolloResult.lastName;
+            meta.lastName = apolloMeta;
+          }
+          if (apolloResult.title && !lead.title && !resolved.title) {
+            resolved.title = apolloResult.title;
+            meta.title = apolloMeta;
+          }
+          if (apolloResult.linkedin && !lead.linkedin && !resolved.linkedin) {
+            resolved.linkedin = apolloResult.linkedin;
+            meta.linkedin = apolloMeta;
+          }
+          if (apolloResult.company && !lead.company && !resolved.company) {
+            resolved.company = apolloResult.company;
+            meta.company = apolloMeta;
+          }
+          if (apolloResult.website && !lead.website && !resolved.website) {
+            resolved.website = apolloResult.website;
+            meta.website = apolloMeta;
+          }
         }
       }
     } catch (err) {
-      console.warn(`${logTag} step 3 apolloPeopleMatch(linkedinUrl) failed:`, (err as Error).message);
+      console.warn(`${logTag} unified Apollo match failed:`, (err as Error).message);
     }
   }
 
@@ -325,47 +397,7 @@ export async function resolveIdentity(
   }
   const emailDomain = lead.emailDomain || resolved.emailDomain;
 
-  // 5. Apollo person-match by company email. Adapter guards personal emails.
-  // Fires when any person or company fields are still missing. Extracts
-  // company+website from the embedded org in the response — no separate org call needed.
-  const personStillMissing =
-    needsPersonFields &&
-    (!(lead.firstName || resolved.firstName) || !(lead.lastName || resolved.lastName));
-  const companyStillMissingForApollo = needsCompanyFields && !lead.company && !resolved.company;
-  if (email && (personStillMissing || companyStillMissingForApollo)) {
-    try {
-      const apolloPerson = await deps.apolloPeopleMatch({ email });
-      if (apolloPerson) {
-        const apolloMeta = makeApiMeta('apollo');
-        if (apolloPerson.firstName && !lead.firstName && !resolved.firstName) {
-          resolved.firstName = apolloPerson.firstName;
-          meta.firstName = apolloMeta;
-        }
-        if (apolloPerson.lastName && !lead.lastName && !resolved.lastName) {
-          resolved.lastName = apolloPerson.lastName;
-          meta.lastName = apolloMeta;
-        }
-        if (apolloPerson.title && !lead.title && !resolved.title) {
-          resolved.title = apolloPerson.title;
-          meta.title = apolloMeta;
-        }
-        if (apolloPerson.linkedin && !lead.linkedin && !resolved.linkedin) {
-          resolved.linkedin = apolloPerson.linkedin;
-          meta.linkedin = apolloMeta;
-        }
-        if (apolloPerson.company && !lead.company && !resolved.company) {
-          resolved.company = apolloPerson.company;
-          meta.company = apolloMeta;
-        }
-        if (apolloPerson.website && !lead.website && !resolved.website) {
-          resolved.website = apolloPerson.website;
-          meta.website = apolloMeta;
-        }
-      }
-    } catch (err) {
-      console.warn(`${logTag} step 5 apolloPeopleMatch(email) failed:`, (err as Error).message);
-    }
-  }
+  // (Tier 5 merged into unified Apollo call above.)
 
   // 5.5. enrich.so email-finder → reverse-lookup chain. Fires when email is
   // still absent but we have firstName + lastName + emailDomain. email-finder
@@ -394,6 +426,78 @@ export async function resolveIdentity(
     } catch (err) {
       console.warn(`${logTag} step 5.5 enrichSoFindEmail failed:`, (err as Error).message);
     }
+  }
+
+  // 6.5. Apollo broker chain — fires when email is still absent AND a leadHint
+  // is present (so the async result can be written back) AND we have name +
+  // (emailDomain or company). Respects the same emailStatus gate as the
+  // unified Apollo Tier 3: weak signal (no linkedin) → only verified/unverified/
+  // extrapolated accepted; strong signal (has linkedin) → anything except guessed.
+  const emailDomainForBroker = lead.emailDomain || resolved.emailDomain;
+  const firstNameForBroker = lead.firstName || resolved.firstName;
+  const lastNameForBroker = lead.lastName || resolved.lastName;
+  const companyForBroker = lead.company || resolved.company;
+  if (
+    !email &&
+    input.leadHint &&
+    firstNameForBroker &&
+    lastNameForBroker &&
+    (emailDomainForBroker || companyForBroker)
+  ) {
+    try {
+      const linkedinForBroker = lead.linkedin || resolved.linkedin;
+      const brokerInput: Parameters<IdentityResolverDeps['apolloBrokerChain']>[0] = {
+        firstName: firstNameForBroker,
+        lastName: lastNameForBroker,
+      };
+      if (emailDomainForBroker) brokerInput.domain = emailDomainForBroker;
+      else if (companyForBroker) brokerInput.company = companyForBroker;
+      if (linkedinForBroker) brokerInput.linkedinUrl = linkedinForBroker;
+
+      const brokerResult = await deps.apolloBrokerChain(brokerInput, input.leadHint);
+      if (brokerResult?.email) {
+        email = brokerResult.email;
+        resolved.email = brokerResult.email;
+        meta.email = {
+          ...makeApiMeta('apollo'),
+          confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? ''),
+        };
+      }
+    } catch (err) {
+      console.warn(`${logTag} tier 6.5 apolloBrokerChain failed:`, (err as Error).message);
+    }
+  }
+
+  // 7. Pattern matching — fires when email is still absent AND emailDomain +
+  // firstName + lastName are known. Does NOT require leadHint. Quality is
+  // inherent (enrich.so deliverability check); no emailStatus gate needed.
+  let emailPattern: string | undefined;
+  const emailDomainForPatterns = lead.emailDomain || resolved.emailDomain;
+  const firstNameForPatterns = lead.firstName || resolved.firstName;
+  const lastNameForPatterns = lead.lastName || resolved.lastName;
+  if (!email && emailDomainForPatterns && firstNameForPatterns && lastNameForPatterns) {
+    try {
+      const patternResult = await deps.findEmailViaPatterns({
+        firstName: firstNameForPatterns,
+        lastName: lastNameForPatterns,
+        domain: emailDomainForPatterns,
+      });
+      if (patternResult?.email) {
+        email = patternResult.email;
+        resolved.email = patternResult.email;
+        meta.email = makeApiMeta('enrich.so');
+        emailPattern = patternResult.pattern;
+      }
+    } catch (err) {
+      console.warn(`${logTag} tier 7 findEmailViaPatterns failed:`, (err as Error).message);
+    }
+  }
+
+  // After Tier 6.5 / 7: re-derive emailDomain from the newly-found email
+  // when neither the lead nor the resolved object already has one.
+  if (email && !lead.emailDomain && !resolved.emailDomain) {
+    const derived = extractDomainFromEmail(email);
+    if (derived) resolved.emailDomain = derived;
   }
 
   // 6. enrich.so reverse-lookup — fires when company is still missing and we
@@ -466,5 +570,5 @@ export async function resolveIdentity(
     });
   }
 
-  return { ok: true, resolved, siblings: validSiblings };
+  return { ok: true, resolved, siblings: validSiblings, emailPattern };
 }

@@ -147,6 +147,7 @@ export interface OrchestratorDeps {
     configFieldsByName: Record<string, { instruction?: string } | undefined>;
     apolloCtx: ApolloFetchContext;
     refreshFields: Set<string>;
+    leadHint?: { listId: string; leadId: string };
   }): Promise<GroupResult>;
 
   extractUngroupedFieldsViaWeb(input: {
@@ -408,6 +409,7 @@ async function processLead(
         configFieldsByName,
         apolloCtx,
         refreshFields: refreshSet,
+        leadHint: { listId: input.listId, leadId: lead.leadId },
       });
       // Translate each fill from CANONICAL field name back to the user's
       // chosen name. e.g. waterfall fills `funding_stage` but the user

@@ -405,6 +405,111 @@ describe('runWaterfall — Tier 4 (Web)', () => {
 
 // ─── Apollo memoization + failure semantics ───────────────────────────────────
 
+describe('runWaterfall — Tier 3.5a (Apollo broker chain)', () => {
+  const LEAD_HINT = { listId: LIST_ID, leadId: LEAD_ID };
+
+  it('fires for person_identity when email missing + name + emailDomain + leadHint', async () => {
+    const apolloBrokerChain = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloBrokerChain });
+    await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['email'],
+        lead: makeLead({ email: undefined, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' }),
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(apolloBrokerChain).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' }),
+      LEAD_HINT,
+    );
+  });
+
+  it('skipped when no leadHint', async () => {
+    const apolloBrokerChain = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloBrokerChain });
+    await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['email'],
+        lead: makeLead({ email: undefined, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' }),
+        // no leadHint
+      }),
+      deps,
+    );
+    expect(apolloBrokerChain).not.toHaveBeenCalled();
+  });
+
+  it('accepts guessed email with confidence=low', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: 'guessed' }),
+    });
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['email'],
+        lead: makeLead({ email: undefined, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' }),
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'email');
+    expect(fill?.value).toBe('jane@acme.com');
+    expect(fill?.meta.confidence).toBe('low');
+  });
+
+  it('accepts verified email with confidence=high', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: 'verified' }),
+    });
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['email'],
+        lead: makeLead({ email: undefined, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' }),
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'email');
+    expect(fill?.value).toBe('jane@acme.com');
+    expect(fill?.meta.confidence).toBe('high');
+  });
+
+  it('accepts undefined emailStatus with confidence=medium', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: undefined }),
+    });
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['email'],
+        lead: makeLead({ email: undefined, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' }),
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'email');
+    expect(fill?.value).toBe('jane@acme.com');
+    expect(fill?.meta.confidence).toBe('medium');
+  });
+
+  it('skipped for non-person_identity groups', async () => {
+    const apolloBrokerChain = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloBrokerChain });
+    await runWaterfall(
+      makeInput({
+        groupName: 'company_firmographic',
+        requestedFields: ['company_name'],
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(apolloBrokerChain).not.toHaveBeenCalled();
+  });
+});
+
 describe('runWaterfall — Apollo memoization (per-lead-per-entity)', () => {
   it('TWO company groups share ONE Apollo org fetch via the shared context', async () => {
     const apolloMock = jest.fn().mockResolvedValue({

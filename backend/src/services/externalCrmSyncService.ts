@@ -98,7 +98,7 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
 // 'notes' has no standard HubSpot contact property — pushed as a custom property
 // so ensureContactProperty runs before the push and creates it if absent.
 export const DEFAULT_HUBSPOT_CUSTOM_MAPPING: FieldMapping[] = [
-  { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: false },
+  { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
 ];
 
 export const DEFAULT_HUBSPOT_DEAL_MAPPING: FieldMapping[] = [
@@ -122,7 +122,7 @@ export const DEFAULT_ATTIO_CONTACT_MAPPING: FieldMapping[] = [
 export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
 
 export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
-  { agentwebField: 'notes', crmProperty: 'notes', direction: 'push', enabled: false },
+  { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

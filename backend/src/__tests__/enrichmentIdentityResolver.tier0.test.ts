@@ -23,6 +23,8 @@ function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolv
     findSiblingLeads: jest.fn().mockResolvedValue([]),
     resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
     writeLeadFields: jest.fn().mockResolvedValue(undefined),
+    apolloBrokerChain: jest.fn().mockResolvedValue(null),
+    findEmailViaPatterns: jest.fn().mockResolvedValue(null),
     ...overrides,
   };
 }

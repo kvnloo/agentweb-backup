@@ -36,6 +36,7 @@ import express, { Request, Response, Router } from 'express';
 import { timingSafeEqual } from 'crypto';
 import { crmDb } from '../services/db';
 import { apolloAsyncRequestCacheKey } from '../services/apolloCacheKeys';
+import { apolloEmailStatusToConfidence } from '../services/apolloFieldMapper';
 import { getApolloWebhookSecret } from '../utils/secretsManager';
 
 /**
@@ -205,10 +206,7 @@ router.post('/:secret', async (req: Request, res: Response) => {
     }
 
     const status = (emailStatus ?? '').toLowerCase();
-    const confidence: 'high' | 'medium' | 'low' =
-      status === 'verified' ? 'high' :
-      status === 'guessed' ? 'low' :
-      'medium';
+    const confidence = apolloEmailStatusToConfidence(status);
     const emailMeta = {
       source: 'web_search',
       provider: 'apollo',
