@@ -30,6 +30,9 @@ import {
 import { fetchTopPages } from './webContentFetcher';
 import { agentModeService } from './agentModeService';
 import { createLLMService } from '../utils/llmService';
+import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
+import { getUnipileProfileService } from './unipileProfileServiceFactory';
+import { extractCompanyIdentifierFromInput } from './unipileCompanyCacheKeys';
 
 // Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
 // `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
@@ -684,6 +687,64 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       findLinkedInUrl: (lead: LeadRecord) =>
         findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
+
+      findUnipileCompany: async (lead: LeadRecord, companyLinkedInUrl?: string): Promise<any | null> => {
+        try {
+          const { linkedInOutreachService } = await import('./linkedInOutreachService');
+          const accountId = await linkedInOutreachService.resolveAccountId(userId);
+          if (!accountId) return null;
+
+          let companyIdentifier: string | null = null;
+
+          // Approach 2: company LinkedIn URL → extract identifier directly (1 API call)
+          if (companyLinkedInUrl) {
+            companyIdentifier = extractCompanyIdentifierFromInput(companyLinkedInUrl);
+          }
+
+          // Approach 1: person LinkedIn URL → profile → current work_experience company_id (2 API calls)
+          if (!companyIdentifier && lead.linkedin) {
+            try {
+              const profileResult = await getUnipileProfileService().getProfile(lead.linkedin, accountId);
+              if (profileResult?.found && profileResult.rawData?.work_experience) {
+                const current = (profileResult.rawData.work_experience as any[]).find((e) => !e.end);
+                if (current?.company_id) companyIdentifier = String(current.company_id);
+              }
+            } catch {
+              // Approach 1 failed — continue to Approach 3
+            }
+          }
+
+          // Approach 3: name + company search → profile → company_id (3 API calls)
+          if (!companyIdentifier && lead.firstName && lead.lastName && lead.company) {
+            try {
+              const searchResult = await linkedInOutreachService.searchPeople(accountId, {
+                keywords: `${lead.firstName} ${lead.lastName}`,
+                company: lead.company,
+              });
+              const first = searchResult?.items?.[0];
+              if (first?.public_identifier && unipileNameMatches(first, lead.firstName, lead.lastName)) {
+                const profileUrl = `https://www.linkedin.com/in/${first.public_identifier}`;
+                const profileResult = await getUnipileProfileService().getProfile(profileUrl, accountId);
+                if (profileResult?.found && profileResult.rawData?.work_experience) {
+                  const current = (profileResult.rawData.work_experience as any[]).find((e) => !e.end);
+                  if (current?.company_id) companyIdentifier = String(current.company_id);
+                }
+              }
+            } catch {
+              // Approach 3 failed — no identifier resolved
+            }
+          }
+
+          if (!companyIdentifier) return null;
+
+          const companyResult = await getUnipileCompanyService().getCompany(companyIdentifier, accountId);
+          if (!companyResult.found || !companyResult.rawData) return null;
+          return companyResult.rawData;
+        } catch (err) {
+          console.warn('[v3 deps] findUnipileCompany failed:', (err as Error).message);
+          return null;
+        }
+      },
 
       apolloBrokerChain: async ({ firstName, lastName, emailDomain, company, linkedin }, leadHint) => {
         const result = await identityDeps.apolloBrokerChain(
