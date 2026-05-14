@@ -4416,3 +4416,26 @@ Relevant code: `local-agent-relay/src/codex_relay/browser.py`, `load_page_with_p
 - Public sites, no auth needed, real browser fidelity required → `run_local_agent_task`
 - Any site where the user's saved cookies/session matter → `run_local_agent_task`
 - Most automation tasks, API calls, content generation → Playwright MCP (headless, faster, no local agent needed)
+
+## Drip Sequence Email — SVG Logo Display Issues (2026-05-14)
+
+### User Report
+
+A user reported that sequence emails sent from `founders@agentweb.pro` had a bad logo display in their email client. Two separate rendering bugs were discovered:
+
+1. **Superhuman:** The bird logo SVG rendered at enormous size (native `viewBox` dimensions, ~500px wide).
+2. **Slashy:** The bird logo appeared completely white (invisible on a white background).
+
+### Investigation
+
+**Superhuman (oversized SVG):**
+Superhuman is an Electron/Chromium webview app that sanitizes email HTML before rendering. Its sanitizer strips `style` attributes from `<svg>` elements as an XSS precaution, so `style="max-width:100%;width:100%"` and even native `width` attributes were being removed, leaving the SVG to render at its `viewBox` intrinsic size.
+
+**Slashy (white logo):**
+Decoding the raw email HTML revealed the logo `<img>` (converted from SVG) had `filter:brightness(0) invert(1)` in its style attribute. This filter inverts the image to white, which is intentional for display on the purple gradient email header. Slashy strips the header's background color while preserving the filter, making the white logo invisible against the white background.
+
+### Status
+
+**Superhuman:** We contacted Superhuman support to report the SVG sanitization behavior. **Awaiting their response.** No fix has been applied at our end for this issue. If Superhuman confirms this is by design (i.e., SVGs will always have styles stripped), the mitigation would be to convert SVGs to PNGs server-side before sending (already prototyped: `convertEmailSvgsToPng` in `emailVariables.ts` using `sharp` + content-addressed S3 keys — `email-svgs/<sha256>.png`).
+
+**Slashy:** A server-side fix was applied: `removeInvertedImgFilters()` in `emailVariables.ts` strips `filter:brightness(0) invert(1)` from `<img>` style attributes before send. This ensures the logo renders in its original colors on all clients. Trade-off: on clients that correctly render the purple header (Gmail, Apple Mail), the logo now appears dark against the purple background rather than white — acceptable since it remains legible. The proper long-term fix is a white-variant logo asset that does not rely on CSS filters.
