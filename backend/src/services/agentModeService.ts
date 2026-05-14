@@ -3203,12 +3203,13 @@ export class AgentModeService {
       }
 
       // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill)
+      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
       const validSkillIds = skillIds.filter(id => {
         const skill = publishedSkills.find(s => s.skillId === id);
         const isOwnSkill = skill && skill.ownerId === userId;
+        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
         return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
+          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
