@@ -5211,6 +5211,50 @@ export class AgentModeService {
 
       for (const fileUrl of urlsToProcess) {
         try {
+          // If the LLM passed an s3:// URI (e.g. "s3://bucket/key"), fetch directly via SDK
+          // instead of handing it to axios which only supports http/https.
+          if (fileUrl.startsWith('s3://')) {
+            const withoutScheme = fileUrl.slice('s3://'.length);
+            const slashIdx = withoutScheme.indexOf('/');
+            const s3Bucket = slashIdx === -1 ? withoutScheme : withoutScheme.slice(0, slashIdx);
+            const s3Key = slashIdx === -1 ? '' : withoutScheme.slice(slashIdx + 1);
+            if (!s3Key) {
+              return {
+                success: false,
+                message: `Cannot parse S3 URL "${fileUrl}": no object key found. Use the full s3://bucket/key format.`,
+              };
+            }
+            let s3Content: string;
+            try {
+              s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
+            } catch (s3Err) {
+              const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+              return {
+                success: false,
+                message: `Failed to download or process file: ${fileUrl}`,
+                error: s3ErrMsg,
+              };
+            }
+            const contentBuffer = Buffer.from(s3Content, 'utf-8');
+            totalSize += contentBuffer.byteLength;
+            if (totalSize > maxTotalSize) {
+              return {
+                success: false,
+                message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+              };
+            }
+            const mimeTypeForS3 = fileUrl.endsWith('.json') ? 'application/json'
+              : fileUrl.endsWith('.csv') ? 'text/csv'
+              : 'text/plain';
+            fileParts.push({
+              inlineData: {
+                mimeType: mimeTypeForS3,
+                data: contentBuffer.toString('base64'),
+              }
+            });
+            continue;
+          }
+
           // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
           // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
           const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
