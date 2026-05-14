@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-14',
+    changes: [
+      'Fixed: Daily User Activity Report and Scheduled Reports No Longer Silently Stop Responding',
+      '- Gemini extended-thinking models can return empty text after completing tool calls on large contexts (~108K tokens), causing reports to finish with no output',
+      '- The agent now detects this condition and injects a synthesis prompt to recover — the report is generated correctly in the follow-up response',
+      '- This prevents scheduled sessions from completing with an empty response and a satisfaction score of 1',
+    ],
+  },
+  {
     date: '2026-05-13',
     changes: [
       'Fixed: Data Analysis No Longer Fails When Passed Large Tool-Response Files',
