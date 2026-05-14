@@ -195,7 +195,7 @@ export async function assessClientHealth(
         const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
         const accessToken = await getMetaAccessToken();
-        const apiVersion = process.env.META_API_VERSION || 'v18.0';
+        const apiVersion = process.env.META_API_VERSION || 'v25.0';
         const adAccountId = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
 
         if (adAccountId) {

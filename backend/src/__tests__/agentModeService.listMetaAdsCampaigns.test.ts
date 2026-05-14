@@ -242,7 +242,7 @@ describe('AgentModeService - List Meta Ads Campaigns', () => {
                 }
               ],
               paging: {
-                next: 'https://graph.facebook.com/v18.0/act_123456789/campaigns?after=cursor123'
+                next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=cursor123'
               }
             })
           });

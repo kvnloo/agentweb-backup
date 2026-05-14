@@ -2,10 +2,10 @@ import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getG
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
-const META_GRAPH_VERSION = process.env.META_API_VERSION || 'v24.0';
+const META_GRAPH_VERSION = process.env.META_API_VERSION || 'v25.0';
 // Instagram Business Login API version — separate from Facebook Graph API version
 // because graph.instagram.com only supports specific versions (v21.0+)
-const META_INSTAGRAM_VERSION = process.env.META_INSTAGRAM_API_VERSION || 'v24.0';
+const META_INSTAGRAM_VERSION = process.env.META_INSTAGRAM_API_VERSION || 'v25.0';
 
 export type MetaFlowType = 'marketing' | 'instagram';
 
