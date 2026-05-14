@@ -3087,3 +3087,110 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     expect(matchOrg).toHaveBeenCalledWith('beta.com');
   });
 });
+
+// ─── techStackFocusInstruction ────────────────────────────────────────────────
+
+describe('enrichLead — techStackFocusInstruction', () => {
+  let service: CrmEnrichmentService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.setLeadFields.mockImplementation(async (listId: string, leadId: string, options: any) => {
+      const payload: Record<string, any> = { ...(options?.topLevel || {}) };
+      if (options?.customFields) payload.customFields = options.customFields;
+      if (options?.enrichmentMetadata) payload.enrichmentMetadata = options.enrichmentMetadata;
+      await mockCrmDb.updateLead(listId, leadId, payload as any);
+    });
+    mockCrmDb.mergeFieldNames.mockImplementation(async (listId: string, newFields: Set<string> | string[]) => {
+      await mockCrmDb.updateFieldNames(listId, Array.from(newFields as any));
+    });
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', snippet: 'Uses AWS and Stripe' }],
+    });
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('appends focus instruction to LLM system prompt when provided', async () => {
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ tech_stack_infrastructure: 'AWS', tech_stack_analytics: null }),
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute({
+      listId: 'list-1',
+      userId: 'user-1',
+      instruction: 'Find tech stack',
+      outputFields: ['tech_stack_analytics', 'tech_stack_infrastructure'],
+      sources: ['web_search'],
+      techStackFocusInstruction: 'only backend infrastructure tools',
+    });
+
+    const allPrompts = mockGeminiCreate.mock.calls.map(c => JSON.stringify(c[0])).join('\n');
+    expect(allPrompts).toContain('only backend infrastructure tools');
+  });
+
+  it('does not alter prompt when techStackFocusInstruction is absent', async () => {
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_infrastructure: 'AWS' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute({
+      listId: 'list-1',
+      userId: 'user-1',
+      instruction: 'Find tech stack',
+      outputFields: ['tech_stack_infrastructure'],
+      sources: ['web_search'],
+    });
+
+    const allPrompts = mockGeminiCreate.mock.calls.map(c => JSON.stringify(c[0])).join('\n');
+    expect(allPrompts).not.toContain('User focus');
+  });
+
+  it('does not write null fields returned by LLM to the lead', async () => {
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ tech_stack_infrastructure: 'AWS', tech_stack_analytics: null }),
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute({
+      listId: 'list-1',
+      userId: 'user-1',
+      instruction: 'Find tech stack',
+      outputFields: ['tech_stack_analytics', 'tech_stack_infrastructure'],
+      sources: ['web_search'],
+      techStackFocusInstruction: 'only backend infrastructure',
+    });
+
+    const updateCall = mockCrmDb.updateLead.mock.calls.find(c => c[1] === 'lead-1');
+    expect(updateCall).toBeDefined();
+    const written = updateCall![2] as any;
+    const writtenFields = { ...written, ...(written.customFields || {}) };
+    expect(writtenFields.tech_stack_infrastructure).toBe('AWS');
+    expect(writtenFields.tech_stack_analytics).toBeUndefined();
+  });
+});
