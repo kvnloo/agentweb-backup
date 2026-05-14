@@ -4,6 +4,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { workPlanService } from '../services/workPlanService';
 import { agentModeService } from '../services/agentModeService';
 import { getUserFromToken } from '../middleware/auth';
+import { userDb } from '../services/db';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 
@@ -25,7 +26,12 @@ jest.mock('../services/workPlanService', () => ({
   workPlanService: {
     getWorkPlansByVisibility: jest.fn(),
     getWorkPlansByOwner: jest.fn(),
+    getWorkPlansByOrg: jest.fn(),
   }
+}));
+
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -68,6 +74,7 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorkPlanService = workPlanService as jest.Mocked<typeof workPlanService>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockGetUserFromToken = getUserFromToken as jest.MockedFunction<typeof getUserFromToken>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 
 describe('AgentModeController - createSessionWithPlan', () => {
   const mockPlanTitle = 'Onboarding';
@@ -137,6 +144,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
     // Default: no private plans for authenticated users
     mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([]);
+    mockWorkPlanService.getWorkPlansByOrg.mockResolvedValue([]);
+    mockUserDb.getUserById.mockResolvedValue(undefined);
 
     // Mock agent mode service methods
     mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-5-chat', 'gemini-3-pro-preview', 'claude-opus-4']);
@@ -991,6 +1000,60 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       // No fire-and-forget should have been triggered
       expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Org-shared private work plan access', () => {
+    const orgId = 'org-123';
+    const ownerUserId = 'owner-user-456';
+    const orgMemberUserId = 'member-user-789';
+
+    const orgPrivatePlan = {
+      planId: 'org-private-plan-1',
+      title: 'Org Private Plan',
+      ownerId: ownerUserId,
+      orgId,
+      visibility: 'private' as const,
+      isBuiltIn: false,
+      steps: [{ stepCount: 1, title: 'Step 1', description: 'Do thing' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    };
+
+    beforeEach(() => {
+      mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockResolvedValue([]);
+    });
+
+    it('allows an org member to create a session with another member\'s private plan', async () => {
+      mockGetUserFromToken.mockResolvedValue({
+        user: { userId: orgMemberUserId, email: 'member@org.com', isAdmin: false, roles: ['customer'] as any }
+      });
+      mockUserDb.getUserById.mockResolvedValue({ userId: orgMemberUserId, orgId } as any);
+      mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([]);
+      mockWorkPlanService.getWorkPlansByOrg.mockResolvedValue([orgPrivatePlan]);
+
+      const req = mockRequest('Org Private Plan', { authorization: 'Bearer member-token' });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'test-session-123' }));
+    });
+
+    it('denies an unauthenticated user from using a private plan even if title matches', async () => {
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      // Private plan is NOT loaded for unauthenticated users (the controller only loads
+      // private plans inside the `if (result.user)` block), so 404 is expected.
+      const req = mockRequest('Org Private Plan');
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
   });
 });

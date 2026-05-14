@@ -15,6 +15,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Gemini extended-thinking models can return empty text after completing tool calls on large contexts (~108K tokens), causing reports to finish with no output',
       '- The agent now detects this condition and injects a synthesis prompt to recover — the report is generated correctly in the follow-up response',
       '- This prevents scheduled sessions from completing with an empty response and a satisfaction score of 1',
+      'Fixed: Organization Members Can Now Use Private Work Plans and Skills Created by Other Org Members',
+      '- Starting a session from a private work plan created by another org member was returning "Not authorized to use this private work plan" (403)',
+      '- Org members can now launch sessions from any private work plan owned by someone in their organization, matching the existing view access that was already in place',
+      '- Installing a private skill created by another org member was silently rejected even though the skill appeared in the skill picker',
+      '- Org members can now install and use private skills shared within their organization, as intended by the org-sharing feature',
+      '- Only the original owner can still edit, delete, or submit their work plan or skill for platform-wide review',
     ],
   },
   {
