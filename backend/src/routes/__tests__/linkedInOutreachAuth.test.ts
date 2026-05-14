@@ -83,16 +83,24 @@ describe('LinkedIn Outreach Auth Router', () => {
       expect(response.body).toEqual({ error: 'Missing or invalid unipileAccountId' });
     });
 
-    it('should return 400 if fetched account is not of type LINKEDIN', async () => {
+    it('should save with fallback name when getAccount returns non-LINKEDIN type on all retries', async () => {
+      jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
       const invalidAccount = { type: 'TWITTER' };
       (linkedInOutreachService.getAccount as jest.Mock).mockResolvedValue(invalidAccount);
+      const mockCreatedAccount = { id: 'db-acc-1', account_name: 'LinkedIn Account' };
+      (createAccount as jest.Mock).mockResolvedValue(mockCreatedAccount);
 
       const response = await request(app).post('/save-account').send({ unipileAccountId: 'acc-123' });
 
-      expect(response.status).toBe(400);
-      expect(response.body).toEqual({ error: 'Account is not a LinkedIn account' });
-      expect(linkedInOutreachService.getAccount).toHaveBeenCalledWith('acc-123');
-    });
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ success: true, account: mockCreatedAccount });
+      // Retried 3 times before falling back
+      expect(linkedInOutreachService.getAccount).toHaveBeenCalledTimes(3);
+      expect(createAccount).toHaveBeenCalledWith('user-123', 'unipile', expect.objectContaining({
+        account_name: 'LinkedIn Account',
+      }));
+      jest.restoreAllMocks();
+    }, 10000);
 
     it('should successfully save a valid LinkedIn account', async () => {
       const mockUnipileAccount = {
@@ -127,14 +135,18 @@ describe('LinkedIn Outreach Auth Router', () => {
       });
     });
 
-    it('should handle errors when saving account fails', async () => {
+    it('should return 500 when createAccount throws after getAccount retries are exhausted', async () => {
+      jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
       const errorMessage = 'Database error';
-      (linkedInOutreachService.getAccount as jest.Mock).mockRejectedValue(new Error(errorMessage));
+      // getAccount always fails — falls through to fallback name; createAccount then throws
+      (linkedInOutreachService.getAccount as jest.Mock).mockRejectedValue(new Error('Unipile unavailable'));
+      (createAccount as jest.Mock).mockRejectedValue(new Error(errorMessage));
 
       const response = await request(app).post('/save-account').send({ unipileAccountId: 'acc-123' });
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'Failed to save LinkedIn Outreach account', details: errorMessage });
-    });
+      jest.restoreAllMocks();
+    }, 10000);
   });
 });

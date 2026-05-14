@@ -37,6 +37,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma was directing users to "CRM Settings → Sender Email" to configure a sender, but that location does not exist',
       '- The correct flow is per lead list: select a lead list, then click "Senders" in the list header',
       '- Error messages and alert emails now reflect the correct navigation path',
+      'Fixed: LinkedIn Outreach Account Now Saves Reliably After OAuth Completes',
+      '- Connecting a LinkedIn account via Unipile occasionally failed silently — the OAuth popup succeeded but the account never appeared in Connected Accounts',
+      '- The root cause was a timing gap: the save-account call fired before Unipile finished provisioning the new account, causing the account lookup to fail',
+      '- The backend now retries the account lookup up to 3 times with backoff; if retries are exhausted it saves with a fallback name so the connection is never lost',
+      'Fixed: Connected Accounts Page No Longer Crashes on Corrupted Records',
+      '- In rare cases a connected account record was missing required fields, causing the Connected Accounts settings page to show nothing',
+      '- Records missing platform, account_id, or config are now filtered out defensively before processing',
     ],
   },
   {

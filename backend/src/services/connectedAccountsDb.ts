@@ -25,7 +25,10 @@ const normalizeAccounts = (connectedAccounts: any): ConnectedAccountConfig[] => 
   }
 
   if (Array.isArray(connectedAccounts)) {
-    return connectedAccounts as ConnectedAccountConfig[];
+    // Filter out entries missing required fields — guards against corrupted records.
+    return (connectedAccounts as ConnectedAccountConfig[]).filter(
+      (acc) => acc && acc.platform && acc.account_id && acc.config
+    );
   }
 
   return [];
