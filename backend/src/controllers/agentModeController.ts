@@ -5180,8 +5180,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership for private plans
-      if (predefinedPlan.visibility === 'private' && predefinedPlan.ownerId !== userId) {
+      // Enforce ownership/org-membership for private plans.
+      // allPlans already only includes private plans belonging to the user or their org,
+      // so a plan found in allPlans is already authorized. Only block unauthenticated users.
+      if (predefinedPlan.visibility === 'private' && !result.user) {
         return res.status(403).json({ error: 'Not authorized to use this private work plan' });
       }
 
