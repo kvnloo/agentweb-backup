@@ -766,7 +766,7 @@ describe('resolveIdentity — unified Apollo call with expanded signals', () => 
     expect(result.resolved.email).toBe('ayush@agoda.com');
   });
 
-  it('rejects guessed email AND drops all other Apollo fields when only name+domain signal', async () => {
+  it('accepts guessed email AND fills all Apollo fields on weak signal (name+domain only)', async () => {
     const deps = makeDeps({
       apolloPeopleMatch: jest.fn().mockResolvedValue({
         email: 'ayush@agoda.com',
@@ -779,18 +779,65 @@ describe('resolveIdentity — unified Apollo call with expanded signals', () => 
       makeInput({
         lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', emailDomain: 'agoda.com' },
         needsPersonFields: true,
-        needsCompanyFields: false,  // don't gate on company — testing field-drop behavior only
+        needsCompanyFields: false,
       }),
       deps,
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.resolved.email).toBeUndefined();    // guessed → rejected
-    expect(result.resolved.title).toBeUndefined();    // matchConfident=false → dropped
-    expect(result.resolved.company).toBeUndefined();  // matchConfident=false → dropped
+    expect(result.resolved.email).toBe('ayush@agoda.com');  // guessed → accepted
+    expect(result.resolved.title).toBe('Engineer');          // emailTrusted=true → matchConfident=true
   });
 
-  it('rejects guessed email even with linkedin anchor, but still fills non-email fields (match is confident via linkedin)', async () => {
+  it('stores confidence=low in email meta for guessed status', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'ayush@agoda.com',
+        emailStatus: 'guessed',
+      }),
+      writeLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', emailDomain: 'agoda.com' },
+        needsPersonFields: true,
+        mode: 'enrich',
+        listId: 'list-1',
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const writeCalls = (deps.writeLeadFields as jest.Mock).mock.calls;
+    const emailMeta = writeCalls[0]?.[0]?.meta?.email;
+    expect(emailMeta?.confidence).toBe('low');
+  });
+
+  it('stores confidence=high in email meta for verified status', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'ayush@agoda.com',
+        emailStatus: 'verified',
+      }),
+      writeLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', emailDomain: 'agoda.com' },
+        needsPersonFields: true,
+        mode: 'enrich',
+        listId: 'list-1',
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const writeCalls = (deps.writeLeadFields as jest.Mock).mock.calls;
+    const emailMeta = writeCalls[0]?.[0]?.meta?.email;
+    expect(emailMeta?.confidence).toBe('high');
+  });
+
+  it('accepts guessed email with linkedin anchor and fills all non-email fields', async () => {
     const deps = makeDeps({
       apolloPeopleMatch: jest.fn().mockResolvedValue({
         email: 'ayush@agoda.com',
@@ -815,9 +862,9 @@ describe('resolveIdentity — unified Apollo call with expanded signals', () => 
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.resolved.email).toBeUndefined();   // guessed → rejected
-    expect(result.resolved.title).toBe('Engineer');  // linkedin anchor → confident → filled
-    expect(result.resolved.company).toBe('Agoda');   // linkedin anchor → confident → filled
+    expect(result.resolved.email).toBe('ayush@agoda.com');  // guessed → accepted
+    expect(result.resolved.title).toBe('Engineer');
+    expect(result.resolved.company).toBe('Agoda');
   });
 
   it('sends all available signals combined when lead has email+linkedin+name+domain (company missing)', async () => {
@@ -951,9 +998,10 @@ describe('resolveIdentity — broker chain (Tier 6.5)', () => {
     expect(result.resolved.email).toBe('jane@acme.com');
   });
 
-  it('rejects guessed email regardless of signal strength', async () => {
+  it('accepts guessed email (confidence=low) regardless of signal strength', async () => {
     const deps = makeDeps({
       apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: 'guessed' }),
+      writeLeadFields: jest.fn().mockResolvedValue(undefined),
     });
     const result = await resolveIdentity(
       makeInput({
@@ -966,32 +1014,43 @@ describe('resolveIdentity — broker chain (Tier 6.5)', () => {
         },
         needsPersonFields: true,
         leadHint: LEAD_HINT,
+        mode: 'enrich',
+        listId: 'list-1',
       }),
       deps,
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.resolved.email).toBeUndefined();
+    expect(result.resolved.email).toBe('jane@acme.com');
+    const writeCalls = (deps.writeLeadFields as jest.Mock).mock.calls;
+    const emailMeta = writeCalls[0]?.[0]?.meta?.email;
+    expect(emailMeta?.confidence).toBe('low');
   });
 
-  it('rejects undefined emailStatus on weak signal (name+domain only)', async () => {
+  it('accepts undefined emailStatus on weak signal (confidence=medium)', async () => {
     const deps = makeDeps({
       apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: undefined }),
+      writeLeadFields: jest.fn().mockResolvedValue(undefined),
     });
     const result = await resolveIdentity(
       makeInput({
         lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
         needsPersonFields: true,
         leadHint: LEAD_HINT,
+        mode: 'enrich',
+        listId: 'list-1',
       }),
       deps,
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.resolved.email).toBeUndefined();
+    expect(result.resolved.email).toBe('jane@acme.com');
+    const writeCalls = (deps.writeLeadFields as jest.Mock).mock.calls;
+    const emailMeta = writeCalls[0]?.[0]?.meta?.email;
+    expect(emailMeta?.confidence).toBe('medium');
   });
 
-  it('accepts undefined emailStatus when linkedin present (strong signal)', async () => {
+  it('accepts undefined emailStatus with linkedin (confidence=medium)', async () => {
     const deps = makeDeps({
       apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: undefined }),
     });

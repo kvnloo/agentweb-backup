@@ -43,10 +43,21 @@ jest.mock('../services/enrichSoService', () => ({
   getEnrichSoService: () => mockEnrichSo,
 }));
 
+jest.mock('../services/enrichmentIdentityResolver', () => ({
+  resolveIdentity: jest.fn(),
+}));
+
+jest.mock('../services/enrichmentV3RealDeps', () => ({
+  buildIdentityDeps: jest.fn().mockReturnValue({}),
+}));
+
 import enrichSoRouter, { setQuotaTrackerForLookupRoute } from '../routes/crmEnrichSo';
 import { crmDb } from '../services/db';
 import { authenticateToken } from '../middleware/auth';
 import { LookupByEmailQuotaExceededError } from '../services/enrichSoQuota';
+import { resolveIdentity } from '../services/enrichmentIdentityResolver';
+
+const mockResolveIdentity = resolveIdentity as jest.Mock;
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 
@@ -336,31 +347,30 @@ describe('POST /api/crm/leads/find-email', () => {
   });
 
   it('strips https:// and www. prefixes from domain', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({ found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x' });
+    mockResolveIdentity.mockResolvedValue({ ok: true, resolved: { email: 'a@acme.com' }, siblings: [] });
     const res = await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'A', lastName: 'B', domain: 'https://www.acme.com/about',
     });
     expect(res.status).toBe(200);
-    expect(mockEnrichSo.findEmail).toHaveBeenCalledWith(
-      expect.objectContaining({ domain: 'acme.com' }),
+    expect(mockResolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ lead: expect.objectContaining({ emailDomain: 'acme.com' }) }),
       expect.any(Object),
     );
   });
 
-  it('happy path: returns found result', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({
-      found: true, email: 'alice@acme.com', confidence: 'high', isCatchAll: false,
-      fromCache: false, checkedAt: '2026-05-04',
+  it('happy path: returns found result with resolvedFields', async () => {
+    mockResolveIdentity.mockResolvedValue({
+      ok: true, resolved: { email: 'alice@acme.com', firstName: 'Alice' }, siblings: [],
     });
     const res = await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'Alice', lastName: 'Smith', domain: 'acme.com',
     });
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ found: true, email: 'alice@acme.com', confidence: 'high' });
+    expect(res.body).toMatchObject({ found: true, email: 'alice@acme.com', resolvedFields: expect.objectContaining({ email: 'alice@acme.com' }) });
   });
 
-  it('returns found:false when no email found', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({ found: false, fromCache: false, checkedAt: 'x' });
+  it('returns found:false when resolver finds no email', async () => {
+    mockResolveIdentity.mockResolvedValue({ ok: false, reason: 'identity_unresolvable' });
     const res = await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'A', lastName: 'B', company: 'Nowhere',
     });
@@ -368,13 +378,13 @@ describe('POST /api/crm/leads/find-email', () => {
     expect(res.body.found).toBe(false);
   });
 
-  it('falls back to company when domain absent', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({ found: false, fromCache: false, checkedAt: 'x' });
+  it('passes company in lead when domain absent', async () => {
+    mockResolveIdentity.mockResolvedValue({ ok: false, reason: 'identity_unresolvable' });
     await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'A', lastName: 'B', company: 'Acme Inc',
     });
-    expect(mockEnrichSo.findEmail).toHaveBeenCalledWith(
-      expect.objectContaining({ company: 'Acme Inc', domain: undefined }),
+    expect(mockResolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ lead: expect.objectContaining({ company: 'Acme Inc' }) }),
       expect.any(Object),
     );
   });
@@ -396,9 +406,6 @@ describe('POST /api/crm/leads/find-email', () => {
   // ─── persistToListId/persistToLeadId authorization ─────────────────────────
   describe('persistTo* authorization', () => {
     it('returns 403 when persistToListId references a list owned by another user', async () => {
-      mockEnrichSo.findEmail.mockResolvedValue({
-        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
-      });
       // List belongs to a different user, no shared org.
       mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'someone-else' } as any);
 
@@ -408,13 +415,10 @@ describe('POST /api/crm/leads/find-email', () => {
       });
 
       expect(res.status).toBe(403);
-      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+      expect(mockResolveIdentity).not.toHaveBeenCalled();
     });
 
     it('returns 404 when persistToListId references a list that does not exist', async () => {
-      mockEnrichSo.findEmail.mockResolvedValue({
-        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
-      });
       mockCrmDb.getLeadListById.mockResolvedValue(null);
 
       const res = await request(app).post('/api/crm/leads/find-email').send({
@@ -423,12 +427,12 @@ describe('POST /api/crm/leads/find-email', () => {
       });
 
       expect(res.status).toBe(404);
-      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+      expect(mockResolveIdentity).not.toHaveBeenCalled();
     });
 
-    it('persists when caller owns the list', async () => {
-      mockEnrichSo.findEmail.mockResolvedValue({
-        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+    it('calls resolveIdentity with mode=enrich when caller owns the list', async () => {
+      mockResolveIdentity.mockResolvedValue({
+        ok: true, resolved: { email: 'a@acme.com' }, siblings: [],
       });
       mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
       mockCrmDb.getLeadById.mockResolvedValue({
@@ -441,49 +445,34 @@ describe('POST /api/crm/leads/find-email', () => {
       });
 
       expect(res.status).toBe(200);
-      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
-      const [listId, leadId, payload] = mockCrmDb.updateLead.mock.calls[0] as any;
-      expect(listId).toBe('L1');
-      expect(leadId).toBe('LD1');
-      expect(payload.email).toBe('a@acme.com');
+      expect(mockResolveIdentity).toHaveBeenCalledWith(
+        expect.objectContaining({ mode: 'enrich', listId: 'L1' }),
+        expect.any(Object),
+      );
+      expect(res.body.found).toBe(true);
+      expect(res.body.filledFields).toContain('email');
     });
 
-    it('skips recordLookupByEmailUsage when result is a cache hit (C8)', async () => {
+    it('always records lookup usage (no fromCache concept in identity resolver)', async () => {
       const tracker: any = {
         checkLookupByEmailQuota: jest.fn(),
         recordLookupByEmailUsage: jest.fn(),
       };
       setQuotaTrackerForLookupRoute(tracker);
-      mockEnrichSo.findEmail.mockResolvedValue({
-        found: true, email: 'a@acme.com', confidence: 'high', fromCache: true, checkedAt: 'x',
+      mockResolveIdentity.mockResolvedValue({
+        ok: true, resolved: { email: 'a@acme.com' }, siblings: [],
       });
       const res = await request(app).post('/api/crm/leads/find-email').send({
         firstName: 'A', lastName: 'B', domain: 'acme.com',
       });
       expect(res.status).toBe(200);
       expect(tracker.checkLookupByEmailQuota).toHaveBeenCalled();
-      expect(tracker.recordLookupByEmailUsage).not.toHaveBeenCalled();
-    });
-
-    it('records lookup usage when the call hit a provider (cache miss)', async () => {
-      const tracker: any = {
-        checkLookupByEmailQuota: jest.fn(),
-        recordLookupByEmailUsage: jest.fn(),
-      };
-      setQuotaTrackerForLookupRoute(tracker);
-      mockEnrichSo.findEmail.mockResolvedValue({
-        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
-      });
-      const res = await request(app).post('/api/crm/leads/find-email').send({
-        firstName: 'A', lastName: 'B', domain: 'acme.com',
-      });
-      expect(res.status).toBe(200);
       expect(tracker.recordLookupByEmailUsage).toHaveBeenCalledTimes(1);
     });
 
-    it('does not call getLeadListById / updateLead when persistTo* is omitted', async () => {
-      mockEnrichSo.findEmail.mockResolvedValue({
-        found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x',
+    it('does not call getLeadListById / resolveIdentity-enrich when persistTo* is omitted', async () => {
+      mockResolveIdentity.mockResolvedValue({
+        ok: true, resolved: { email: 'a@acme.com' }, siblings: [],
       });
 
       const res = await request(app).post('/api/crm/leads/find-email').send({
@@ -492,7 +481,11 @@ describe('POST /api/crm/leads/find-email', () => {
 
       expect(res.status).toBe(200);
       expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
-      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+      expect(mockResolveIdentity).toHaveBeenCalledWith(
+        expect.objectContaining({ mode: 'preview' }),
+        expect.any(Object),
+      );
+      expect(res.body.filledFields).toEqual([]);
     });
   });
 });

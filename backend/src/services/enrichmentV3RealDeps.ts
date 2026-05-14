@@ -42,7 +42,7 @@ const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRA
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
-function buildIdentityDeps(userId: string): IdentityResolverDeps {
+export function buildIdentityDeps(userId: string): IdentityResolverDeps {
   return {
     apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain, company }) => {
       if (!isApolloServiceReady()) return null;
@@ -181,6 +181,7 @@ function buildIdentityDeps(userId: string): IdentityResolverDeps {
 
     apolloBrokerChain: async (input, leadHint) => {
       if (!isApolloServiceReady()) return null;
+      if (input.domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${input.domain}`)) return null;
       try {
         const apollo = getApolloService();
         const f = await apollo.findEmail(
@@ -681,6 +682,15 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       findLinkedInUrl: (lead: LeadRecord) =>
         findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
+
+      apolloBrokerChain: async ({ firstName, lastName, emailDomain, company, linkedin }, leadHint) => {
+        const result = await identityDeps.apolloBrokerChain(
+          { firstName, lastName, domain: emailDomain, company, linkedinUrl: linkedin },
+          leadHint,
+        );
+        if (result?.email) return { email: result.email, emailStatus: result.emailStatus };
+        return null;
+      },
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"

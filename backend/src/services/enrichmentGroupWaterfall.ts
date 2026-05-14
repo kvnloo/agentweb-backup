@@ -16,6 +16,7 @@
 
 import { isFresh } from './enrichmentTtl';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
 import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 
@@ -119,6 +120,12 @@ export interface WaterfallDeps {
     groupName: string,
   ): Promise<{ webContext: string } | null>;
   findLinkedInUrl(lead: LeadRecord): Promise<string | null>;
+  /** Tier 3.5: Apollo broker chain (run_waterfall_email). Optional — only
+   *  wired when the caller has a persisted lead to receive the webhook result. */
+  apolloBrokerChain?: (
+    input: { firstName: string; lastName: string; emailDomain?: string; company?: string; linkedin?: string },
+    leadHint: { listId: string; leadId: string },
+  ) => Promise<{ email: string; emailStatus?: string } | null>;
 }
 
 export interface RunWaterfallInput {
@@ -129,6 +136,9 @@ export interface RunWaterfallInput {
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
   apolloCtx: ApolloFetchContext;
   refreshFields: Set<string>;   // entries shaped "<leadId>:<fieldName>"
+  /** When set, enables Tier 3.5 Apollo broker chain for the person_identity
+   *  group. The webhook writes the async result back to this lead. */
+  leadHint?: { listId: string; leadId: string };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -317,7 +327,56 @@ export async function runWaterfall(
     };
   }
 
-  // ─ Tier 3.5: Unipile LinkedIn search ───────────────────────────────────────
+  // ─ Tier 3.5a: Apollo broker chain (run_waterfall_email) ────────────────────
+  // Only for person_identity when email is still missing after Apollo tiers.
+  // Fires Apollo's async run_waterfall_email; result arrives via webhook and
+  // is written directly to the lead. Same weak/strong-signal quality gate as
+  // identity resolver Tier 6.5.
+  if (
+    groupName === 'person_identity' &&
+    remaining.includes('email') &&
+    input.leadHint &&
+    deps.apolloBrokerChain
+  ) {
+    const firstName = (lead.firstName ?? '').trim();
+    const lastName  = (lead.lastName  ?? '').trim();
+    const emailDomain = lead.emailDomain || undefined;
+    const company     = lead.company    || undefined;
+    const linkedin    = lead.linkedin   || undefined;
+    if (firstName && lastName && (emailDomain || company)) {
+      try {
+        const brokerResult = await deps.apolloBrokerChain(
+          { firstName, lastName, emailDomain, company, linkedin },
+          input.leadHint,
+        );
+        if (brokerResult?.email) {
+          filled.push({
+            field: 'email',
+            value: brokerResult.email,
+            meta: { ...metaApollo(), confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? '') },
+          });
+          remaining = remaining.filter(f => f !== 'email');
+        }
+      } catch (err) {
+        console.warn('[waterfall tier3.5a] apolloBrokerChain failed:', (err as Error).message);
+      }
+    }
+  }
+
+  if (remaining.length === 0) {
+    return {
+      fields: filled,
+      missing: [],
+      tierFills: {
+        crm: crmHits.length,
+        apollo: apolloHits.length + tier3Fills,
+        web: 0,
+        missing: 0,
+      },
+    };
+  }
+
+  // ─ Tier 3.5b: Unipile LinkedIn search ───────────────────────────────────────
   // Only for person_identity group when linkedin_url still missing after Apollo tiers.
   // Searches by firstName + lastName + company to find the LinkedIn public_identifier.
   let unipileFills = 0;

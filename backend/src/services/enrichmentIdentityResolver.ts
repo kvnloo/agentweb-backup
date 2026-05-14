@@ -7,6 +7,7 @@
 import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { extractDomainFromEmail } from '../utils/leadSchema';
+import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
 
 const IDENTITY_FIELD_TTL_MS = 90 * 86400 * 1000; // 90 days — no FIELD_GROUP for identity fields
 
@@ -334,27 +335,22 @@ export async function resolveIdentity(
       else if (companyForApollo) apolloInput.company = companyForApollo;
 
       // weakSignalOnly = no email/linkedin anchor — name+domain/company only.
-      // Apollo match quality is lower; apply stricter gates below.
+      // Used below to gate non-email field fills (prevents false-positive person match).
       const weakSignalOnly = !email && !linkedinForApollo;
 
       const apolloResult = await deps.apolloPeopleMatch(apolloInput);
       if (apolloResult) {
         const apolloMeta = makeApiMeta('apollo');
 
-        // Email: reject 'guessed' always. On weak signal also reject undefined/unknown
-        // status — only explicit known-good statuses accepted.
         let emailTrusted = false;
         if (apolloResult.email && !email && !resolved.email) {
-          const status = (apolloResult.emailStatus ?? '').toLowerCase();
-          const emailAccepted = weakSignalOnly
-            ? ['verified', 'unverified', 'extrapolated'].includes(status)
-            : status !== 'guessed';
-          if (emailAccepted) {
-            email = apolloResult.email;
-            resolved.email = apolloResult.email;
-            meta.email = apolloMeta;
-            emailTrusted = true;
-          }
+          email = apolloResult.email;
+          resolved.email = apolloResult.email;
+          meta.email = {
+            ...apolloMeta,
+            confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
+          };
+          emailTrusted = true;
         }
 
         // Non-email fields: fill only when match is confident.
@@ -450,7 +446,6 @@ export async function resolveIdentity(
   ) {
     try {
       const linkedinForBroker = lead.linkedin || resolved.linkedin;
-      const weakSignalOnly = !linkedinForBroker;
       const brokerInput: Parameters<IdentityResolverDeps['apolloBrokerChain']>[0] = {
         firstName: firstNameForBroker,
         lastName: lastNameForBroker,
@@ -461,15 +456,12 @@ export async function resolveIdentity(
 
       const brokerResult = await deps.apolloBrokerChain(brokerInput, input.leadHint);
       if (brokerResult?.email) {
-        const status = (brokerResult.emailStatus ?? '').toLowerCase();
-        const emailAccepted = weakSignalOnly
-          ? ['verified', 'unverified', 'extrapolated'].includes(status)
-          : status !== 'guessed';
-        if (emailAccepted) {
-          email = brokerResult.email;
-          resolved.email = brokerResult.email;
-          meta.email = makeApiMeta('apollo');
-        }
+        email = brokerResult.email;
+        resolved.email = brokerResult.email;
+        meta.email = {
+          ...makeApiMeta('apollo'),
+          confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? ''),
+        };
       }
     } catch (err) {
       console.warn(`${logTag} tier 6.5 apolloBrokerChain failed:`, (err as Error).message);
