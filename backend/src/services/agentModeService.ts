@@ -5694,13 +5694,15 @@ export class AgentModeService {
   public async getSenderForLead(
     userId: string,
     leadSelectedSenderId?: string | null,
-    listSenderId?: string | null
+    listSenderId?: string | null,
+    listOwnerId?: string | null
   ): Promise<{
     fromName: string;
     notes?: string;
   } | null> {
     try {
-      const sendersResult = await this.getCrmSenders(userId);
+      // Use list owner's sender config so org members can send using the owner's senders
+      const sendersResult = await this.getCrmSenders(listOwnerId || userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return null;
       }
@@ -8398,7 +8400,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessSend) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
       }
 
@@ -8432,7 +8435,8 @@ export class AgentModeService {
       }
 
       // Resolve sender: lead → list → account default → first available
-      const sendersResult = await this.getCrmSenders(userId);
+      // Use the list owner's sender config so org members can send using the owner's senders
+      const sendersResult = await this.getCrmSenders(list.userId || userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
@@ -8714,8 +8718,9 @@ export class AgentModeService {
       const marketStrategy = await this.readMarketStrategy(userId);
 
       // Get sender information (from lead record, or default sender from CRM configuration)
+      // Pass list.userId so org members use the list owner's sender config
       const leadSelectedSenderId = (lead as any).selectedSenderId;
-      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId);
+      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId, list?.userId);
 
       // Get existing draft if it exists
       const existingDraft = (lead as any).emailDraft;
