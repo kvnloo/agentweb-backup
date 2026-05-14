@@ -19,6 +19,7 @@ import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOve
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
+import { approvalDb } from './approvalDb';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -1836,7 +1837,9 @@ export class ChatbotDB {
   async searchUserAssets(
     userId: string,
     type?: 'images' | 'videos' | 'htmlReports' | 'all',
-    query?: string
+    query?: string,
+    favoritesOnly?: boolean,
+    approvedOnly?: boolean
   ): Promise<Array<{
     url: string;
     filename: string;
@@ -1844,6 +1847,8 @@ export class ChatbotDB {
     assetType: 'image' | 'video' | 'htmlReport';
     sessionId: string;
     sessionTitle: string;
+    isFavorited: boolean;
+    approvalStatus?: string;
   }>> {
     const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
     const results: Array<{
@@ -1853,6 +1858,7 @@ export class ChatbotDB {
       assetType: 'image' | 'video' | 'htmlReport';
       sessionId: string;
       sessionTitle: string;
+      isFavorited: boolean;
     }> = [];
 
     const assetTypeFilter = type === 'all' || !type ? null : type;
@@ -1862,6 +1868,7 @@ export class ChatbotDB {
       if (!session.assetCache) continue;
       const sessionId = session.sessionId;
       const sessionTitle = session.title || 'Untitled session';
+      const favorites = session.favorites ?? {};
 
       const pushAssets = (
         assets: Array<{ url: string; filename: string; generatedAt: string }>,
@@ -1869,7 +1876,9 @@ export class ChatbotDB {
       ) => {
         for (const asset of assets) {
           if (lowerQuery && !asset.filename.toLowerCase().includes(lowerQuery) && !asset.url.toLowerCase().includes(lowerQuery)) continue;
-          results.push({ ...asset, assetType, sessionId, sessionTitle });
+          const isFavorited = !!favorites[asset.url];
+          if (favoritesOnly && !isFavorited) continue;
+          results.push({ ...asset, assetType, sessionId, sessionTitle, isFavorited });
         }
       };
 
@@ -1879,7 +1888,20 @@ export class ChatbotDB {
     }
 
     // Sort newest first
-    return results.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+    results.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+
+    if (!approvedOnly) {
+      return results;
+    }
+
+    // Fetch approval statuses and filter to approved-only
+    const assetUrls = results.map(r => r.url);
+    const approvals = await approvalDb.getApprovalsByAssetUrls(assetUrls);
+    const approvalMap = new Map(approvals.map(a => [a.assetUrl, a.status]));
+
+    return results
+      .map(r => ({ ...r, approvalStatus: approvalMap.get(r.url) }))
+      .filter(r => r.approvalStatus === 'approved');
   }
 
   /**
