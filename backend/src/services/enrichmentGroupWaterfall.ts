@@ -119,6 +119,7 @@ export interface WaterfallDeps {
     groupName: string,
   ): Promise<{ webContext: string } | null>;
   findLinkedInUrl(lead: LeadRecord): Promise<string | null>;
+  findUnipileCompany?(lead: LeadRecord, companyLinkedInUrl?: string): Promise<any | null>;
 }
 
 export interface RunWaterfallInput {
@@ -317,7 +318,7 @@ export async function runWaterfall(
     };
   }
 
-  // ─ Tier 3.5: Unipile LinkedIn search ───────────────────────────────────────
+  // ─ Tier 3.5b: Unipile LinkedIn search (person) ─────────────────────────────
   // Only for person_identity group when linkedin_url still missing after Apollo tiers.
   // Searches by firstName + lastName + company to find the LinkedIn public_identifier.
   let unipileFills = 0;
@@ -330,13 +331,42 @@ export async function runWaterfall(
     }
   }
 
+  // ─ Tier 3.5c: Unipile company enrichment ────────────────────────────────────
+  // Fires for company entity groups when fields remain after Apollo tiers.
+  // Cascades: company LinkedIn URL → lead LinkedIn URL → name+company search.
+  let unipileCompanyFills = 0;
+  if (deps.findUnipileCompany && groupEntityType(groupName) === 'company' && remaining.length > 0) {
+    const companyLinkedInUrl: string | undefined =
+      lead.company_linkedin_url ||
+      filled.find(f => f.field === 'company_linkedin_url')?.value;
+    const companyRaw = await deps.findUnipileCompany(lead, companyLinkedInUrl);
+    if (companyRaw) {
+      const llmResult = await deps.extractFieldsViaLLM({
+        tier: 'apollo',
+        sourceContext: JSON.stringify(companyRaw),
+        fields: remaining,
+        groupName,
+        lead,
+        configFieldsByName: input.configFieldsByName,
+      });
+      for (const f of remaining) {
+        const value = llmResult.filled[f];
+        if (typeof value === 'string' && value.length > 0) {
+          filled.push({ field: f, value, meta: metaUnipile() });
+          unipileCompanyFills += 1;
+        }
+      }
+      remaining = remaining.filter(f => !llmResult.filled[f]);
+    }
+  }
+
   if (remaining.length === 0) {
     return {
       fields: filled,
       missing: [],
       tierFills: {
         crm: crmHits.length,
-        apollo: apolloHits.length + tier3Fills + unipileFills,
+        apollo: apolloHits.length + tier3Fills + unipileFills + unipileCompanyFills,
         web: 0,
         missing: 0,
       },
@@ -370,7 +400,7 @@ export async function runWaterfall(
     missing: remaining,
     tierFills: {
       crm: crmHits.length,
-      apollo: apolloHits.length + tier3Fills + unipileFills,
+      apollo: apolloHits.length + tier3Fills + unipileFills + unipileCompanyFills,
       web: webFills,
       missing: remaining.length,
     },
