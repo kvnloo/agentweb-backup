@@ -43,14 +43,20 @@ const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRA
 
 function buildIdentityDeps(userId: string): IdentityResolverDeps {
   return {
-    apolloPeopleMatch: async ({ email, linkedinUrl }) => {
+    apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain, company }) => {
       if (!isApolloServiceReady()) return null;
-      if (!email && !linkedinUrl) return null;
+      if (!email && !linkedinUrl && !firstName && !lastName) return null;
       // Adapter-level guard: personal emails give poor Apollo results.
       if (email && CrmEnrichmentService.isPersonalEmailDomain(email)) return null;
       try {
         const apollo = getApolloService();
-        const input = email ? { email, linkedinUrl } : { linkedinUrl: linkedinUrl! };
+        const input: Parameters<typeof apollo.matchPerson>[0] = {};
+        if (email) input.email = email;
+        if (linkedinUrl) input.linkedinUrl = linkedinUrl;
+        if (firstName) input.firstName = firstName;
+        if (lastName) input.lastName = lastName;
+        if (domain) input.domain = domain;
+        else if (company) input.organizationName = company;
         const result = await apollo.matchPerson(input);
         const p = result?.match?.person;
         if (!p) return null;
@@ -61,6 +67,7 @@ function buildIdentityDeps(userId: string): IdentityResolverDeps {
           title: p.title,
           linkedin: p.linkedin,
           email: p.email,
+          emailStatus: p.emailStatus,
           company: org?.name ?? undefined,
           website: org?.websiteUrl ?? undefined,
           city: p.city,

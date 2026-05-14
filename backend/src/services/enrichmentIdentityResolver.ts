@@ -18,6 +18,7 @@ export interface ApolloPersonResult {
   title?: string;
   linkedin?: string;
   email?: string;
+  emailStatus?: string;
   company?: string;          // from embedded person.organization
   website?: string;          // from embedded person.organization
   city?: string;
@@ -54,6 +55,10 @@ export interface IdentityResolverDeps {
   apolloPeopleMatch(input: {
     email?: string;
     linkedinUrl?: string;
+    firstName?: string;
+    lastName?: string;
+    domain?: string;
+    company?: string;
   }): Promise<ApolloPersonResult | null>;
   enrichSoReverseLookup(input: { email: string }): Promise<EnrichSoReverseResult | null>;
   enrichSoFindEmail(input: { firstName: string; lastName: string; domain: string }): Promise<{ email: string } | null>;
@@ -278,43 +283,94 @@ export async function resolveIdentity(
     }
   }
 
-  // 3. LinkedIn-first Apollo. Fires only when local `email` is still empty
-  // after Tier 0 — we have a linkedin URL but no email to match by. Apollo
-  // returns the email plus optional person fields and embedded org fields.
-  const linkedinForApollo = lead.linkedin || resolved.linkedin || linkedinUrl;
-  if (!email && linkedinForApollo) {
+  // 3. Unified Apollo call — fires when any signal is available AND fields are still
+  // incomplete. Sends all available signals combined so Apollo can return the best
+  // match. Merges the former two-tier split (linkedin-first + email-first) into one
+  // call: more signals → higher Apollo match confidence → better field coverage.
+  const linkedinForApollo = linkedinUrl || resolved.linkedin;
+  const firstNameEff = lead.firstName || resolved.firstName;
+  const lastNameEff = lead.lastName || resolved.lastName;
+  const domainForApollo =
+    lead.emailDomain || resolved.emailDomain ||
+    extractDomainFromEmail(email) ||
+    deriveDomainFromWebsite(lead.website || resolved.website || '') ||
+    undefined;
+  const companyForApollo = lead.company || resolved.company;
+  const hasNameOrg = !!(firstNameEff && lastNameEff && (domainForApollo || companyForApollo));
+  const apolloSignalAvailable = !!(email || linkedinForApollo || hasNameOrg);
+  const apolloNeeded =
+    !email ||
+    (needsPersonFields && (!(lead.firstName || resolved.firstName) || !(lead.lastName || resolved.lastName))) ||
+    (needsCompanyFields && !(lead.company || resolved.company));
+
+  if (apolloSignalAvailable && apolloNeeded) {
     try {
-      const byLinkedin = await deps.apolloPeopleMatch({ linkedinUrl: linkedinForApollo });
-      if (byLinkedin) {
+      const apolloInput: Parameters<IdentityResolverDeps['apolloPeopleMatch']>[0] = {};
+      if (email) apolloInput.email = email;
+      if (linkedinForApollo) apolloInput.linkedinUrl = linkedinForApollo;
+      if (firstNameEff) apolloInput.firstName = firstNameEff;
+      if (lastNameEff) apolloInput.lastName = lastNameEff;
+      if (domainForApollo) apolloInput.domain = domainForApollo;
+      else if (companyForApollo) apolloInput.company = companyForApollo;
+
+      // weakSignalOnly = no email/linkedin anchor — name+domain/company only.
+      // Apollo match quality is lower; apply stricter gates below.
+      const weakSignalOnly = !email && !linkedinForApollo;
+
+      const apolloResult = await deps.apolloPeopleMatch(apolloInput);
+      if (apolloResult) {
         const apolloMeta = makeApiMeta('apollo');
-        if (byLinkedin.email && !resolved.email) {
-          email = byLinkedin.email;
-          resolved.email = byLinkedin.email;
-          meta.email = apolloMeta;
+
+        // Email: reject 'guessed' always. On weak signal also reject undefined/unknown
+        // status — only explicit known-good statuses accepted.
+        let emailTrusted = false;
+        if (apolloResult.email && !email && !resolved.email) {
+          const status = (apolloResult.emailStatus ?? '').toLowerCase();
+          const emailAccepted = weakSignalOnly
+            ? ['verified', 'unverified', 'extrapolated'].includes(status)
+            : status !== 'guessed';
+          if (emailAccepted) {
+            email = apolloResult.email;
+            resolved.email = apolloResult.email;
+            meta.email = apolloMeta;
+            emailTrusted = true;
+          }
         }
-        if (byLinkedin.firstName && !lead.firstName && !resolved.firstName) {
-          resolved.firstName = byLinkedin.firstName;
-          meta.firstName = apolloMeta;
-        }
-        if (byLinkedin.lastName && !lead.lastName && !resolved.lastName) {
-          resolved.lastName = byLinkedin.lastName;
-          meta.lastName = apolloMeta;
-        }
-        if (byLinkedin.title && !lead.title && !resolved.title) {
-          resolved.title = byLinkedin.title;
-          meta.title = apolloMeta;
-        }
-        if (byLinkedin.company && !lead.company && !resolved.company) {
-          resolved.company = byLinkedin.company;
-          meta.company = apolloMeta;
-        }
-        if (byLinkedin.website && !lead.website && !resolved.website) {
-          resolved.website = byLinkedin.website;
-          meta.website = apolloMeta;
+
+        // Non-email fields: fill only when match is confident.
+        // Strong anchor (email/linkedin present) → always confident.
+        // Weak anchor (name+domain only) → confident only if Apollo returned a
+        // trusted email (confirms it found the right person record).
+        const matchConfident = !weakSignalOnly || emailTrusted;
+        if (matchConfident) {
+          if (apolloResult.firstName && !lead.firstName && !resolved.firstName) {
+            resolved.firstName = apolloResult.firstName;
+            meta.firstName = apolloMeta;
+          }
+          if (apolloResult.lastName && !lead.lastName && !resolved.lastName) {
+            resolved.lastName = apolloResult.lastName;
+            meta.lastName = apolloMeta;
+          }
+          if (apolloResult.title && !lead.title && !resolved.title) {
+            resolved.title = apolloResult.title;
+            meta.title = apolloMeta;
+          }
+          if (apolloResult.linkedin && !lead.linkedin && !resolved.linkedin) {
+            resolved.linkedin = apolloResult.linkedin;
+            meta.linkedin = apolloMeta;
+          }
+          if (apolloResult.company && !lead.company && !resolved.company) {
+            resolved.company = apolloResult.company;
+            meta.company = apolloMeta;
+          }
+          if (apolloResult.website && !lead.website && !resolved.website) {
+            resolved.website = apolloResult.website;
+            meta.website = apolloMeta;
+          }
         }
       }
     } catch (err) {
-      console.warn(`${logTag} step 3 apolloPeopleMatch(linkedinUrl) failed:`, (err as Error).message);
+      console.warn(`${logTag} unified Apollo match failed:`, (err as Error).message);
     }
   }
 
@@ -325,47 +381,7 @@ export async function resolveIdentity(
   }
   const emailDomain = lead.emailDomain || resolved.emailDomain;
 
-  // 5. Apollo person-match by company email. Adapter guards personal emails.
-  // Fires when any person or company fields are still missing. Extracts
-  // company+website from the embedded org in the response — no separate org call needed.
-  const personStillMissing =
-    needsPersonFields &&
-    (!(lead.firstName || resolved.firstName) || !(lead.lastName || resolved.lastName));
-  const companyStillMissingForApollo = needsCompanyFields && !lead.company && !resolved.company;
-  if (email && (personStillMissing || companyStillMissingForApollo)) {
-    try {
-      const apolloPerson = await deps.apolloPeopleMatch({ email });
-      if (apolloPerson) {
-        const apolloMeta = makeApiMeta('apollo');
-        if (apolloPerson.firstName && !lead.firstName && !resolved.firstName) {
-          resolved.firstName = apolloPerson.firstName;
-          meta.firstName = apolloMeta;
-        }
-        if (apolloPerson.lastName && !lead.lastName && !resolved.lastName) {
-          resolved.lastName = apolloPerson.lastName;
-          meta.lastName = apolloMeta;
-        }
-        if (apolloPerson.title && !lead.title && !resolved.title) {
-          resolved.title = apolloPerson.title;
-          meta.title = apolloMeta;
-        }
-        if (apolloPerson.linkedin && !lead.linkedin && !resolved.linkedin) {
-          resolved.linkedin = apolloPerson.linkedin;
-          meta.linkedin = apolloMeta;
-        }
-        if (apolloPerson.company && !lead.company && !resolved.company) {
-          resolved.company = apolloPerson.company;
-          meta.company = apolloMeta;
-        }
-        if (apolloPerson.website && !lead.website && !resolved.website) {
-          resolved.website = apolloPerson.website;
-          meta.website = apolloMeta;
-        }
-      }
-    } catch (err) {
-      console.warn(`${logTag} step 5 apolloPeopleMatch(email) failed:`, (err as Error).message);
-    }
-  }
+  // (Tier 5 merged into unified Apollo call above.)
 
   // 5.5. enrich.so email-finder → reverse-lookup chain. Fires when email is
   // still absent but we have firstName + lastName + emailDomain. email-finder

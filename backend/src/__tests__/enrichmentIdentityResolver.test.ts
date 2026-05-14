@@ -63,9 +63,10 @@ describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
     );
 
     expect(result.ok).toBe(true);
-    // No email → no Apollo/enrich.so calls are even possible. The waterfall
-    // downstream handles LinkedIn lookup via Unipile by name+company.
-    expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
+    // Unified Apollo fires for name+company leads — expanded signal support.
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Ayush', lastName: 'Jha', company: 'Agoda' }),
+    );
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
   });
 
@@ -231,7 +232,7 @@ describe('resolveIdentity — Apollo person hit', () => {
         linkedin: 'https://www.linkedin.com/in/janedoe',
       });
     }
-    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith({ email: 'jane@acme.com' });
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
   });
 });
 
@@ -256,7 +257,9 @@ describe('resolveIdentity — Unipile LinkedIn discovery', () => {
       deps,
     );
 
-    expect(apolloPeopleMatch).toHaveBeenCalledWith({ linkedinUrl: 'https://linkedin.com/in/jane-unipile' });
+    expect(apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ linkedinUrl: 'https://linkedin.com/in/jane-unipile' }),
+    );
     const call = writeLeadFields.mock.calls[0][0];
     expect(call.meta.linkedin.provider).toBe('unipile');
     expect(call.meta.linkedin.source).toBe('api');
@@ -716,5 +719,165 @@ describe('resolveIdentity — step 5.5 enrich.so email-finder chain', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.resolved.company).toBe('Acme');
+  });
+});
+
+// ─── Unified Apollo call (expanded signals) ────────────────────────────────────
+
+describe('resolveIdentity — unified Apollo call with expanded signals', () => {
+  it('fires Apollo for name+company lead (no email, no linkedin)', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', company: 'Agoda' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Ayush', lastName: 'Jha', company: 'Agoda' }),
+    );
+  });
+
+  it('resolves email from Apollo when lead has name+emailDomain (verified status)', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'ayush@agoda.com',
+        emailStatus: 'verified',
+        firstName: 'Ayush',
+        lastName: 'Jha',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', emailDomain: 'agoda.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('ayush@agoda.com');
+  });
+
+  it('rejects guessed email AND drops all other Apollo fields when only name+domain signal', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'ayush@agoda.com',
+        emailStatus: 'guessed',
+        title: 'Engineer',
+        company: 'Agoda',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', emailDomain: 'agoda.com' },
+        needsPersonFields: true,
+        needsCompanyFields: false,  // don't gate on company — testing field-drop behavior only
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBeUndefined();    // guessed → rejected
+    expect(result.resolved.title).toBeUndefined();    // matchConfident=false → dropped
+    expect(result.resolved.company).toBeUndefined();  // matchConfident=false → dropped
+  });
+
+  it('rejects guessed email even with linkedin anchor, but still fills non-email fields (match is confident via linkedin)', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'ayush@agoda.com',
+        emailStatus: 'guessed',
+        title: 'Engineer',
+        company: 'Agoda',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Ayush',
+          lastName: 'Jha',
+          linkedin: 'https://linkedin.com/in/ayush',
+          emailDomain: 'agoda.com',
+        },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBeUndefined();   // guessed → rejected
+    expect(result.resolved.title).toBe('Engineer');  // linkedin anchor → confident → filled
+    expect(result.resolved.company).toBe('Agoda');   // linkedin anchor → confident → filled
+  });
+
+  it('sends all available signals combined when lead has email+linkedin+name+domain (company missing)', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'jane@acme.com',
+          linkedin: 'https://linkedin.com/in/jane',
+          firstName: 'Jane',
+          lastName: 'Doe',
+          emailDomain: 'acme.com',
+        },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        email: 'jane@acme.com',
+        linkedinUrl: 'https://linkedin.com/in/jane',
+        firstName: 'Jane',
+        lastName: 'Doe',
+        domain: 'acme.com',
+      }),
+    );
+  });
+
+  it('skips Apollo when no signals at all (no email, linkedin, or name)', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, company: 'Acme' },
+        needsPersonFields: true,
+      }),
+      deps,
+    ).catch(() => {});
+    expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
+  });
+
+  it('found email flows into enrich.so reverse-lookup chain (Tier 5.5 uses Apollo-found email)', async () => {
+    const enrichSoReverseLookup = jest.fn().mockResolvedValue({ company: 'Agoda' });
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'ayush@agoda.com',
+        emailStatus: 'verified',
+      }),
+      enrichSoReverseLookup,
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ayush', lastName: 'Jha', emailDomain: 'agoda.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('ayush@agoda.com');
+    expect(result.resolved.company).toBe('Agoda');
   });
 });
