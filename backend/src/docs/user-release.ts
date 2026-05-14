@@ -6189,6 +6189,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-14',
     changes: [
+      'Fixed: Data Analysis — Files with s3:// URLs Now Download Correctly',
+      '- Passing an s3:// URL (e.g. s3://bucket/key) to the perform_data_analysis tool was failing with "Unsupported protocol s3:"',
+      '- The tool now fetches s3:// URLs directly via the AWS S3 SDK instead of passing them to an HTTP client',
+      '- Mixed s3:// and https:// URLs in the same call are both handled correctly',
+    ],
+  },
+  {
+    date: '2026-05-14',
+    changes: [
       'Fixed: CRM Email Draft — Organization Members Can Now Draft Emails for Leads in Any Org List',
       '- Creating an email draft for a lead in a CRM list owned by another org member was returning "Access denied — You do not have permission to access this lead list"',
       '- The permission check now correctly allows any org member to draft emails for leads across all lists in their organization, consistent with how other CRM actions (viewing leads, sending emails) already work',
