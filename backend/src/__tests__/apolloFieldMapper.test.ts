@@ -2,6 +2,7 @@ import {
   mapApolloPerson,
   mapApolloOrganization,
   mapApolloMatchResponse,
+  apolloEmailStatusToConfidence,
 } from '../services/apolloFieldMapper';
 
 describe('apolloFieldMapper', () => {
@@ -133,5 +134,29 @@ describe('apolloFieldMapper', () => {
       expect(r!.organization!.name).toBe('Acme');
       expect(r!.requestId).toBe('req_xyz');
     });
+  });
+});
+
+describe('apolloEmailStatusToConfidence', () => {
+  it('verified → high', () => {
+    expect(apolloEmailStatusToConfidence('verified')).toBe('high');
+  });
+  it('VERIFIED (uppercase) → high', () => {
+    expect(apolloEmailStatusToConfidence('VERIFIED')).toBe('high');
+  });
+  it('guessed → low', () => {
+    expect(apolloEmailStatusToConfidence('guessed')).toBe('low');
+  });
+  it('unverified → medium', () => {
+    expect(apolloEmailStatusToConfidence('unverified')).toBe('medium');
+  });
+  it('extrapolated → medium', () => {
+    expect(apolloEmailStatusToConfidence('extrapolated')).toBe('medium');
+  });
+  it('empty string → medium', () => {
+    expect(apolloEmailStatusToConfidence('')).toBe('medium');
+  });
+  it('unknown status → medium', () => {
+    expect(apolloEmailStatusToConfidence('some_unknown_status')).toBe('medium');
   });
 });

@@ -20,6 +20,7 @@ import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
+import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import {
   getRawDataFromCache,
@@ -41,16 +42,22 @@ const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRA
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
-function buildIdentityDeps(userId: string): IdentityResolverDeps {
+export function buildIdentityDeps(userId: string): IdentityResolverDeps {
   return {
-    apolloPeopleMatch: async ({ email, linkedinUrl }) => {
+    apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain, company }) => {
       if (!isApolloServiceReady()) return null;
-      if (!email && !linkedinUrl) return null;
+      if (!email && !linkedinUrl && !firstName && !lastName) return null;
       // Adapter-level guard: personal emails give poor Apollo results.
       if (email && CrmEnrichmentService.isPersonalEmailDomain(email)) return null;
       try {
         const apollo = getApolloService();
-        const input = email ? { email, linkedinUrl } : { linkedinUrl: linkedinUrl! };
+        const input: Parameters<typeof apollo.matchPerson>[0] = {};
+        if (email) input.email = email;
+        if (linkedinUrl) input.linkedinUrl = linkedinUrl;
+        if (firstName) input.firstName = firstName;
+        if (lastName) input.lastName = lastName;
+        if (domain) input.domain = domain;
+        else if (company) input.organizationName = company;
         const result = await apollo.matchPerson(input);
         const p = result?.match?.person;
         if (!p) return null;
@@ -61,6 +68,7 @@ function buildIdentityDeps(userId: string): IdentityResolverDeps {
           title: p.title,
           linkedin: p.linkedin,
           email: p.email,
+          emailStatus: p.emailStatus,
           company: org?.name ?? undefined,
           website: org?.websiteUrl ?? undefined,
           city: p.city,
@@ -167,6 +175,101 @@ function buildIdentityDeps(userId: string): IdentityResolverDeps {
         return { website: result.website.trim() };
       } catch (err) {
         console.warn('[v3 deps] resolveCompanyDomainViaWebSearch failed:', (err as Error).message);
+        return null;
+      }
+    },
+
+    apolloBrokerChain: async (input, leadHint) => {
+      if (!isApolloServiceReady()) return null;
+      if (input.domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${input.domain}`)) return null;
+      try {
+        const apollo = getApolloService();
+        const f = await apollo.findEmail(
+          {
+            firstName: input.firstName,
+            lastName: input.lastName,
+            domain: input.domain,
+            company: input.domain ? undefined : input.company,
+            linkedinUrl: input.linkedinUrl,
+            linkedToEmail: input.linkedToEmail,
+          },
+          { userId, runWaterfall: true, leadHint },
+        );
+        if (f.found && f.email) {
+          return { email: f.email, emailStatus: f.emailStatus };
+        }
+        if (f.asyncPending && f.asyncRequestId) {
+          const key = apolloAsyncRequestCacheKey({ requestId: f.asyncRequestId });
+          if (key) {
+            const ttl = 7 * 86400;
+            await crmDb.putEnrichmentCacheItem({
+              canonicalId: key.canonicalId,
+              fieldGroup: key.sk,
+              canonicalKey: key.canonicalKey,
+              entityKey: key.entityKey,
+              entityType: 'apollo',
+              rawData: {
+                listId: leadHint.listId,
+                leadId: leadHint.leadId,
+                userId,
+                status: 'pending',
+                firstName: input.firstName,
+                lastName: input.lastName,
+                domain: input.domain ?? null,
+              },
+              queryUsed: '',
+              sourcesUsed: ['apollo'],
+              resultCount: 0,
+              schemaVersion: APOLLO_SCHEMA_VERSION,
+              fetchedAt: new Date().toISOString(),
+              expiresAt: Math.floor(Date.now() / 1000) + ttl,
+              cacheType: 'apollo',
+            });
+          }
+          // Inline polling logic: up to 30s with backoff schedule.
+          const budgetMs = 30_000;
+          if (key) {
+            const intervals = [2000, 5000, 10000, 15000];
+            let attempt = 0;
+            const start = Date.now();
+            while (true) {
+              const remaining = budgetMs - (Date.now() - start);
+              if (remaining <= 0) return null;
+              const row: any = await crmDb.getEnrichmentCacheItem(key.canonicalId, key.sk).catch(() => null);
+              const status = row?.rawData?.status;
+              if (status === 'completed') {
+                const result = row.rawData.result || {};
+                if (typeof result.email === 'string' && result.email.length > 0) {
+                  return { email: result.email, emailStatus: result.emailStatus };
+                }
+                return null;
+              }
+              if (status === 'no_email' || status === 'rejected') return null;
+              const remainingAfterRead = budgetMs - (Date.now() - start);
+              if (remainingAfterRead <= 0) return null;
+              const baseDelay = intervals[Math.min(attempt, intervals.length - 1)];
+              const delay = Math.min(baseDelay, remainingAfterRead);
+              await new Promise((r) => setTimeout(r, delay));
+              attempt++;
+            }
+          }
+        }
+        return null;
+      } catch (err) {
+        console.warn('[v3 deps] apolloBrokerChain failed:', (err as Error).message);
+        return null;
+      }
+    },
+
+    findEmailViaPatterns: async ({ firstName, lastName, domain }) => {
+      if (CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`)) return null;
+      try {
+        const { findEmailViaPatterns: patternFinder } = await import('./emailPatternFinder');
+        const result = await patternFinder(firstName, lastName, domain, { userId });
+        if (!result.found || !result.email) return null;
+        return { email: result.email, pattern: result.pattern };
+      } catch (err) {
+        console.warn('[v3 deps] findEmailViaPatterns failed:', (err as Error).message);
         return null;
       }
     },
@@ -581,6 +684,15 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       findLinkedInUrl: (lead: LeadRecord) =>
         findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
+
+      apolloBrokerChain: async ({ firstName, lastName, emailDomain, company, linkedin }, leadHint) => {
+        const result = await identityDeps.apolloBrokerChain(
+          { firstName, lastName, domain: emailDomain, company, linkedinUrl: linkedin },
+          leadHint,
+        );
+        if (result?.email) return { email: result.email, emailStatus: result.emailStatus };
+        return null;
+      },
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"

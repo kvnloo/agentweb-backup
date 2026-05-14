@@ -18,15 +18,15 @@ import { crmDb, userDb } from '../services/db';
 import { getEnrichSoService } from '../services/enrichSoService';
 import { QuotaExceededError, LookupByEmailQuotaExceededError, type QuotaTracker } from '../services/enrichSoQuota';
 import { validateLeadsInBackground } from '../services/enrichSoLeadValidation';
-import { waterfallFindEmail } from '../services/enrichmentWaterfall';
 import {
   startEmailJob,
   recordResult,
   completeJob,
   getJob,
 } from '../services/emailJobTracker';
-import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
 import type { LeadRecord } from '../services/crmEnrichmentService';
+import { resolveIdentity } from '../services/enrichmentIdentityResolver';
+import { buildIdentityDeps } from '../services/enrichmentV3RealDeps';
 import {
   runWithConcurrency,
   BULK_ENRICH_CONCURRENCY,
@@ -220,36 +220,25 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
   }
 
   // Optional: caller can pass persistToListId+persistToLeadId to have the
-  // route apply applyApolloMatchToLead and persist directly. Lets the
-  // LeadDetailPanel button reuse the same single-source-of-truth projection
-  // helper instead of duplicating it in React. Quick-Add (no lead yet) calls
-  // omit these and just consume the JSON response.
+  // resolver write results directly to the lead in enrich mode.
+  // Quick-Add (no lead yet) omits these and just consumes the JSON response.
   const persistToListId = (req.body?.persistToListId ?? '').toString().trim();
   const persistToLeadId = (req.body?.persistToLeadId ?? '').toString().trim();
 
   try {
-    // Waterfall: enrich.so first (cheap, doesn't need email as input), then
-    // Apollo basic /people/match if enrich.so misses. Apollo finds many
-    // emails enrich.so misses (verified, ~1 credit per call).
-    const result = await waterfallFindEmail(
-      {
-        firstName,
-        lastName,
-        domain: domain || undefined,
-        company: domain ? undefined : company,
-        linkedin: linkedin || undefined,
-      },
-      { userId },
-    );
-    // C8: Only debit the quota counter when the call actually hit a provider.
-    // Cache hits consume no credits so the counter must not move.
-    if (tracker && !result.fromCache) {
-      await tracker.recordLookupByEmailUsage(userId);
-    }
+    // Seed lead from request params (used when no DB lead is available).
+    let leadForResolver: LeadRecord = {
+      leadId: '',
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+      linkedin: linkedin || undefined,
+      emailDomain: domain || undefined,
+      company: company || undefined,
+    };
+    let resolverMode: 'preview' | 'enrich' = 'preview';
+    let resolverListId = '';
 
-    // If caller asked us to persist and we got a hit, project + write directly.
-    let filledFields: string[] = [];
-    if (result.found && result.email && persistToListId && persistToLeadId) {
+    if (persistToListId && persistToLeadId) {
       // Authorization: persistTo* lets the caller specify any (listId, leadId)
       // pair, so we MUST verify the auth'd user owns/can-access the target list
       // before writing — otherwise this is an IDOR.
@@ -260,64 +249,62 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
       if (!(await canAccessCrmList(userId, persistList as any))) {
         return res.status(403).json({ message: 'Access denied' });
       }
-      const lead = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null) as LeadRecord | null;
-      if (lead) {
-        if (result.apolloMatch) {
-          // Apollo win: full projection (single source of truth lives here).
-          const proj = applyApolloMatchToLead(lead, result.apolloMatch, { fillEmail: true });
-          // Stamp Apollo email_status into sourceQuote when available.
-          if (result.emailStatus && proj.enrichmentMetadata.email) {
-            proj.enrichmentMetadata.email.sourceQuote = `Apollo (${result.emailStatus})`;
-          }
-          if (proj.changed.size > 0) {
-            const payload: Parameters<typeof crmDb.updateLead>[2] = {
-              ...proj.updates,
-              enrichmentMetadata: proj.enrichmentMetadata,
-            };
-            if (Object.keys(proj.customFields).length > 0) {
-              payload.customFields = { ...(lead.customFields ?? {}), ...proj.customFields };
-            }
-            if (!payload.email) payload.email = result.email;   // belt + suspenders
-            await crmDb.updateLead(persistToListId, persistToLeadId, payload);
-            filledFields = Array.from(proj.changed);
-          }
-        } else if (!lead.email) {
-          // Non-Apollo hit (enrich.so / pattern). Only the email is meaningful.
-          const newMeta: Record<string, any> = {
-            ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
-            email: {
-              source: 'web_search',
-              provider: result.provider ?? 'enrich.so',
-              confidence: result.confidence ?? 'medium',
-              enrichedAt: new Date().toISOString(),
-              sourceQuote: result.pattern
-                ? `Pattern: ${result.pattern}`
-                : (result.emailStatus ? `${result.provider} (${result.emailStatus})` : undefined),
-            },
-          };
-          await crmDb.updateLead(persistToListId, persistToLeadId, { email: result.email, enrichmentMetadata: newMeta });
-          filledFields = ['email'];
-        }
+      const dbLead = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null) as LeadRecord | null;
+      if (dbLead) {
+        // Merge request params into the DB lead so domain/name hints from
+        // the UI supplement what the lead already has.
+        leadForResolver = {
+          ...dbLead,
+          emailDomain: dbLead.emailDomain || domain || undefined,
+          company: dbLead.company || company || undefined,
+          firstName: dbLead.firstName || firstName || undefined,
+          lastName: dbLead.lastName || lastName || undefined,
+          linkedin: dbLead.linkedin || linkedin || undefined,
+        };
+        resolverMode = 'enrich';
+        resolverListId = persistToListId;
       }
     }
 
+    const deps = buildIdentityDeps(userId);
+    const result = await resolveIdentity(
+      {
+        lead: leadForResolver,
+        mode: resolverMode,
+        listId: resolverListId,
+        needsPersonFields: false,
+        needsCompanyFields: false,
+        leadHint: (resolverMode === 'enrich')
+          ? { listId: persistToListId, leadId: persistToLeadId }
+          : undefined,
+      },
+      deps,
+    );
+
+    if (!result.ok || !result.resolved.email) {
+      return res.json({ found: false, fromCache: false, checkedAt: new Date().toISOString() });
+    }
+
+    if (tracker) {
+      await tracker.recordLookupByEmailUsage(userId);
+    }
+
+    const filledFields = (resolverMode === 'enrich')
+      ? Object.keys(result.resolved).filter(k => {
+          if (k === 'emailDomain') return false;
+          const prev = (leadForResolver as any)[k];
+          return !prev;
+        })
+      : [];
+
     return res.json({
-      found: result.found,
-      email: result.email,
-      confidence: result.confidence,
-      provider: result.provider,
-      emailStatus: result.emailStatus,
-      pattern: result.pattern,
-      tier: result.tier,
-      fromCache: result.fromCache,
-      checkedAt: new Date().toISOString(),
-      // When Apollo provided the match, expose the rich profile so the UI
-      // can show / persist title, linkedin, employment history, tech stack,
-      // funding, etc. — without making a second API call.
-      apolloMatch: result.apolloMatch,
-      // When persistTo was set, list of field names actually written to the
-      // lead (so the UI can show "Filled X fields" without re-deriving).
+      found: true,
+      email: result.resolved.email,
+      resolvedFields: result.resolved,
+      emailPattern: result.emailPattern,
       filledFields,
+      fromCache: false,
+      checkedAt: new Date().toISOString(),
     });
   } catch (error: any) {
     if (error instanceof QuotaExceededError) {

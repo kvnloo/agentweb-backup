@@ -8,7 +8,7 @@
  * when email is absent but name + (website or emailDomain) are present.
  */
 
-import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
+import { buildOrchestratorDeps, buildIdentityDeps } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 import { createApolloFetchContext } from '../services/enrichmentGroupWaterfall';
@@ -207,7 +207,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
 // ─── resolveIdentity no longer uses Apollo name+domain path ───────────────────
 
 describe('resolveIdentity name+domain path', () => {
-  it('does not surface email from Apollo when lead has only name + emailDomain', async () => {
+  it('surfaces email from Apollo when lead has only name + emailDomain (all statuses accepted)', async () => {
     const matchPerson = jest.fn().mockResolvedValue(MATCH_RESULT);
     jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
     jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue({
@@ -227,8 +227,7 @@ describe('resolveIdentity name+domain path', () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.resolved.email).toBeUndefined();
-    expect(matchPerson).not.toHaveBeenCalledWith(expect.objectContaining({ domain: 'acme.com' }));
+    expect(result.resolved.email).toBe('jane@acme.com');
   });
 });
 
@@ -321,5 +320,47 @@ describe('enrichSoFindEmail adapter', () => {
     expect(result.resolved.email).toBe('jane@acme.com');
     // reverse-lookup should be chained automatically after email found
     expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+  });
+});
+
+describe('apolloBrokerChain adapter — personal domain guard', () => {
+  it('does not call findEmail when domain is a personal email domain (gmail.com)', async () => {
+    const findEmail = jest.fn().mockResolvedValue({ found: false });
+    const svc = {
+      matchPerson: jest.fn(),
+      matchOrg: jest.fn(),
+      findEmail,
+    } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+
+    const deps = buildIdentityDeps('user-1');
+    const result = await deps.apolloBrokerChain(
+      { firstName: 'Jane', lastName: 'Doe', domain: 'gmail.com' },
+      { listId: 'list-1', leadId: 'lead-1' },
+    );
+
+    expect(findEmail).not.toHaveBeenCalled();
+    expect(result).toBeNull();
+  });
+
+  it('calls findEmail when domain is a business domain', async () => {
+    const findEmail = jest.fn().mockResolvedValue({ found: true, email: 'jane@acme.com', emailStatus: 'verified' });
+    const svc = {
+      matchPerson: jest.fn(),
+      matchOrg: jest.fn(),
+      findEmail,
+    } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+
+    const deps = buildIdentityDeps('user-1');
+    const result = await deps.apolloBrokerChain(
+      { firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' },
+      { listId: 'list-1', leadId: 'lead-1' },
+    );
+
+    expect(findEmail).toHaveBeenCalled();
+    expect(result?.email).toBe('jane@acme.com');
   });
 });

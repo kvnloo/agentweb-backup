@@ -258,3 +258,10 @@ export function mapApolloMatchResponse(apiData: any, inputs: MapMatchInputs = {}
     requestId: strOrUndef(apiData.request_id) ?? strOrUndef(personRaw.request_id),
   };
 }
+
+export function apolloEmailStatusToConfidence(status: string): 'high' | 'medium' | 'low' {
+  const s = status.toLowerCase();
+  if (s === 'verified') return 'high';
+  if (s === 'guessed') return 'low';
+  return 'medium';
+}
