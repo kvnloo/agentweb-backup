@@ -274,23 +274,27 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
         listId: resolverListId,
         needsPersonFields: false,
         needsCompanyFields: false,
-        leadHint: (persistToListId && persistToLeadId)
+        leadHint: (resolverMode === 'enrich')
           ? { listId: persistToListId, leadId: persistToLeadId }
           : undefined,
       },
       deps,
     );
 
-    if (tracker) {
-      await tracker.recordLookupByEmailUsage(userId);
-    }
-
     if (!result.ok || !result.resolved.email) {
       return res.json({ found: false, fromCache: false, checkedAt: new Date().toISOString() });
     }
 
-    const filledFields = (persistToListId && persistToLeadId)
-      ? Object.keys(result.resolved).filter(k => k !== 'emailDomain')
+    if (tracker) {
+      await tracker.recordLookupByEmailUsage(userId);
+    }
+
+    const filledFields = (resolverMode === 'enrich')
+      ? Object.keys(result.resolved).filter(k => {
+          if (k === 'emailDomain') return false;
+          const prev = (leadForResolver as any)[k];
+          return !prev;
+        })
       : [];
 
     return res.json({

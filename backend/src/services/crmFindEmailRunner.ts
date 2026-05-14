@@ -62,7 +62,7 @@ export async function findEmailsForLeadsInBackground(
             if (k !== 'emailDomain') populatedFieldNames.add(k);
           }
           void validateLeadEmailInBackground(listId, lead.leadId, result.resolved.email, userId);
-          if (jobId) recordResult(jobId, { found: true, tier: undefined });
+          if (jobId) recordResult(jobId, { found: true });
         } else {
           if (jobId) recordResult(jobId, { found: false });
         }

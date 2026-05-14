@@ -228,11 +228,13 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           }
           // Inline polling logic: up to 30s with backoff schedule.
           const budgetMs = 30_000;
-          if (budgetMs > 0 && key) {
+          if (key) {
             const intervals = [2000, 5000, 10000, 15000];
             let attempt = 0;
             const start = Date.now();
             while (true) {
+              const remaining = budgetMs - (Date.now() - start);
+              if (remaining <= 0) return null;
               const row: any = await crmDb.getEnrichmentCacheItem(key.canonicalId, key.sk).catch(() => null);
               const status = row?.rawData?.status;
               if (status === 'completed') {
@@ -243,10 +245,10 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
                 return null;
               }
               if (status === 'no_email' || status === 'rejected') return null;
-              const remaining = budgetMs - (Date.now() - start);
-              if (remaining <= 0) return null;
+              const remainingAfterRead = budgetMs - (Date.now() - start);
+              if (remainingAfterRead <= 0) return null;
               const baseDelay = intervals[Math.min(attempt, intervals.length - 1)];
-              const delay = Math.min(baseDelay, remaining);
+              const delay = Math.min(baseDelay, remainingAfterRead);
               await new Promise((r) => setTimeout(r, delay));
               attempt++;
             }
