@@ -8629,7 +8629,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
