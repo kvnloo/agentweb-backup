@@ -1236,6 +1236,10 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── sendEmailToLead ───────────────────────────────────────────────────
 
   describe('sendEmailToLead', () => {
+    beforeEach(() => {
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     const leadWithDraft = {
       ...mockLead,
       emailDraft: {
@@ -1433,6 +1437,38 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(false);
       expect(result.error).toBe('Token revoked');
     });
+
+    it('should deny access when user is not an org member', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Access denied');
+    });
+
+    it('should use list owner senders when org member sends email', async () => {
+      const orgMemberUserId = 'org-member-id';
+      const listOwnerId = 'list-owner-id';
+      const orgMemberList = { ...mockList, userId: listOwnerId };
+      mockCrmDb.getLeadListById.mockResolvedValue(orgMemberList as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      const getCrmSendersSpy = jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [{ id: 'sender-1', email: 'owner@acme.com', fromName: 'Owner' }],
+        defaultSenderId: 'sender-1',
+      });
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-789' } as any);
+
+      const result = await service.sendEmailToLead(listId, leadId, orgMemberUserId);
+
+      expect(result.success).toBe(true);
+      // Should fetch senders using the list owner's userId, not the caller's
+      expect(getCrmSendersSpy).toHaveBeenCalledWith(listOwnerId);
+    });
   });
 
   // ─── Shared: ownership & error handling ────────────────────────────────
@@ -1440,6 +1476,7 @@ describe('AgentModeService - CRM Tools', () => {
   describe('Shared ownership checks', () => {
     it('getLeadDetails denies access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
       const result = await service.getLeadDetails(listId, leadId, userId);
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
@@ -1469,6 +1506,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('searchLeads denies access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
       const result = await service.searchLeads(listId, [{ field: 'email', operator: 'contains', value: 'test' }], userId);
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
