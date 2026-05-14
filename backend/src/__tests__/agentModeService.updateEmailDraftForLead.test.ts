@@ -187,7 +187,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
       expect(mockReadMarketStrategy).toHaveBeenCalledWith(userId);
-      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined);
+      // list.userId === userId here (same user), so listOwnerId === userId
+      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined, userId);
       expect(crmDb.updateLead).toHaveBeenCalled();
     });
 
@@ -469,6 +470,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
 
       expect(result.success).toBe(true);
       expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, mockList);
+      // Should use the list owner's userId for sender lookup, not the org member's
+      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined, 'other-org-member');
     });
 
     it('should return error if lead not found', async () => {
