@@ -1785,6 +1785,11 @@ export class AgentModeService {
       let maxTokensContinuations = 0;
       const MAX_TOKEN_CONTINUATIONS = 3;
 
+      // Track empty-synthesis retries (Gemini extended-thinking can return empty text
+      // after tool calls when the context is large; a single nudge is enough to recover)
+      let emptySynthesisRetries = 0;
+      const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
+
       let wasCancelled = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
@@ -2016,6 +2021,19 @@ export class AgentModeService {
             if (!content) {
               content = "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
             }
+          }
+
+          // If the model returned empty text but tool calls ran earlier this session,
+          // it skipped the synthesis step (observed with Gemini extended-thinking on
+          // large contexts). Nudge it once to produce the final response.
+          if (!content && toolCalls.length > 0 && emptySynthesisRetries < MAX_EMPTY_SYNTHESIS_RETRIES) {
+            emptySynthesisRetries++;
+            console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
+            (messages as any[]).push({
+              role: 'user',
+              content: '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.'
+            });
+            continue;
           }
 
           // Log the stop reason for debugging
