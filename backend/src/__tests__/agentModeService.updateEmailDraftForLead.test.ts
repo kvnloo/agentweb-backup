@@ -31,11 +31,14 @@ jest.mock('../services/db', () => ({
     getLeadById: jest.fn(),
     getLeadEngagements: jest.fn(),
     updateLead: jest.fn(),
+    canOrgMemberAccessList: jest.fn(),
   }
 }));
 
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb } from '../services/db';
+
+const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 
 // Get the mock function from global scope
 const getMockCreate = () => (global as any).__openaiMockCreate as jest.Mock;
@@ -49,13 +52,16 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     agentModeService = new AgentModeService();
     // Use jest.spyOn to properly mock private methods
     mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines') as jest.Mock;
     mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy') as jest.Mock;
     mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead') as jest.Mock;
-    
+
+    // Default: allow access (most tests use list owned by userId)
+    mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
+
     // Get and clear the OpenAI mock
     mockCreate = getMockCreate();
     if (mockCreate) {
@@ -409,20 +415,17 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(result.message).toContain('not found');
     });
 
-    it('should return error if user does not own the list', async () => {
+    it('should return error if user does not own the list and is not an org member', async () => {
       const listId = 'list1';
       const leadId = 'lead1';
       const userId = 'user1';
       const sessionId = 'session1';
       const instruction = 'Create email';
 
-      const mockList = {
-        listId,
-        name: 'Test List',
-        userId: 'other-user',
-      };
+      const mockList = { listId, name: 'Test List', userId: 'other-user' };
 
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      mockCrmDb.canOrgMemberAccessList.mockResolvedValue(false);
 
       const result = await (agentModeService as any).updateEmailDraftForLead(
         listId,
@@ -434,6 +437,38 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Access denied');
+    });
+
+    it('should allow access when user is an org member of the list owner', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+
+      // List belongs to a different user in the same org
+      const mockList = { listId, name: 'Org List', userId: 'other-org-member' };
+      const mockLead = { leadId, listId, email: 'lead@example.com', firstName: 'John' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      // canOrgMemberAccessList returns true because same org
+      mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify({ subject: 'Welcome', textContent: 'Hi John!' }) } }],
+      });
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId, leadId, instruction, sessionId, userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, mockList);
     });
 
     it('should return error if lead not found', async () => {

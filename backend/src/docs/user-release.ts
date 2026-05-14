@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-13
+// Last updated: 2026-05-14
 
 export interface UserReleaseNote {
   date: string;
@@ -6184,6 +6184,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When an admin changed a user\'s email, the old (tombstoned) account was incorrectly shown as an additional owner in the organization members list',
       '- Tombstoned accounts are now excluded from org member listings',
       '- Email changes also now clear the org membership fields from the old record at the source',
+    ],
+  },
+  {
+    date: '2026-05-14',
+    changes: [
+      'Fixed: CRM Email Draft — Organization Members Can Now Draft Emails for Leads in Any Org List',
+      '- Creating an email draft for a lead in a CRM list owned by another org member was returning "Access denied — You do not have permission to access this lead list"',
+      '- The permission check now correctly allows any org member to draft emails for leads across all lists in their organization, consistent with how other CRM actions (viewing leads, sending emails) already work',
     ],
   },
   {
