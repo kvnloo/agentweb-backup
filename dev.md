@@ -1,3 +1,109 @@
+## DynamoDB Versioning for Brand Guidelines & Market Strategy (2026-05-14)
+
+### Problem
+
+Brand guidelines and market strategy data stored in `AW-Users` and `AW-Organizations` can be overwritten by agent actions or user edits with no way to recover a previous good state.
+
+### Investigation
+
+Considered an application-level versions table (`AW-ContentVersions`) with snapshot-on-write, but rejected it because:
+- Requires wiring up every save path in code
+- Doesn't cover future data fields automatically
+- Adds write overhead and table maintenance
+
+**Decision: DynamoDB Point-in-Time Recovery (PITR)**
+
+PITR was already the right answer — it covers every field in every table automatically, requires zero application code, costs ~$0.20/GB/month, and retains 35 days of continuous backups.
+
+### Status
+
+PITR enabled manually via AWS Console on:
+- `AW-Users`
+- `AW-Organizations`
+
+No code changes required.
+
+### How to Recover a Corrupted Record
+
+When a brand guideline, market strategy, or any other field is corrupted and needs to be reverted:
+
+**Step 1 — Restore the table to a point in time**
+
+In AWS Console → DynamoDB → Tables → select the table (e.g. `AW-Users`) → Backups tab → "Restore to point in time". Choose a timestamp just before the corruption occurred. Restore to a new table name, e.g. `AW-Users-restore-YYYYMMDD-HHMM`. This takes 5–20 minutes depending on table size.
+
+Or via CLI:
+```bash
+aws dynamodb restore-table-to-point-in-time \
+  --source-table-name AW-Users \
+  --target-table-name AW-Users-restore-20260514-1400 \
+  --restore-date-time 2026-05-14T14:00:00Z \
+  --region us-west-2
+```
+
+**Step 2 — Extract the old item from the restored table**
+
+```bash
+# For AW-Users (key: email)
+aws dynamodb get-item \
+  --table-name AW-Users-restore-20260514-1400 \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --region us-west-2
+
+# For AW-Organizations (key: orgId)
+aws dynamodb get-item \
+  --table-name AW-Organizations-restore-20260514-1400 \
+  --key '{"orgId": {"S": "org_abc123"}}' \
+  --region us-west-2
+```
+
+To extract just the specific field (e.g. brandGuidelines):
+```bash
+aws dynamodb get-item \
+  --table-name AW-Users-restore-20260514-1400 \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --query 'Item.brandGuidelines' \
+  --region us-west-2
+```
+
+**Step 3 — Write the recovered field back to the live table**
+
+Use `update-item` to patch only the affected field without touching anything else:
+```bash
+# Save the recovered value to a file first
+aws dynamodb get-item \
+  --table-name AW-Users-restore-20260514-1400 \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --query 'Item.brandGuidelines' \
+  --region us-west-2 > /tmp/recovered-brand.json
+
+# Then apply it back (wrap in the DynamoDB attribute format)
+aws dynamodb update-item \
+  --table-name AW-Users \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --update-expression "SET brandGuidelines = :val" \
+  --expression-attribute-values '{":val": <paste-recovered-value-here>}' \
+  --region us-west-2
+```
+
+For orgs, use `AW-Organizations` with key `{"orgId": {"S": "org_abc123"}}`.
+
+**Step 4 — Delete the restore table**
+
+```bash
+aws dynamodb delete-table \
+  --table-name AW-Users-restore-20260514-1400 \
+  --region us-west-2
+```
+
+### Notes
+
+- Restored tables inherit no GSIs automatically — they're read-only lookup tables, so this is fine for recovery purposes.
+- The restore operation creates a full independent copy of the table — it does not affect the live table at all.
+- PITR window is 35 days. For older recovery needs, use DynamoDB on-demand backups (manual snapshots via AWS Console).
+- If you need to recover a different field (e.g. `marketStrategy`, `configs`, any future field), the same procedure applies — just change the `--query` path and `--update-expression` field name.
+
+---
+
 ## Emma Silent on Slack Third-Party Mentions — Investigation (2026-05-13)
 
 ### Problem

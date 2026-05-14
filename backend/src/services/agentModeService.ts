@@ -1785,6 +1785,11 @@ export class AgentModeService {
       let maxTokensContinuations = 0;
       const MAX_TOKEN_CONTINUATIONS = 3;
 
+      // Track empty-synthesis retries (Gemini extended-thinking can return empty text
+      // after tool calls when the context is large; a single nudge is enough to recover)
+      let emptySynthesisRetries = 0;
+      const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
+
       let wasCancelled = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
@@ -2016,6 +2021,19 @@ export class AgentModeService {
             if (!content) {
               content = "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
             }
+          }
+
+          // If the model returned empty text but tool calls ran earlier this session,
+          // it skipped the synthesis step (observed with Gemini extended-thinking on
+          // large contexts). Nudge it once to produce the final response.
+          if (!content && toolCalls.length > 0 && emptySynthesisRetries < MAX_EMPTY_SYNTHESIS_RETRIES) {
+            emptySynthesisRetries++;
+            console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
+            (messages as any[]).push({
+              role: 'user',
+              content: '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.'
+            });
+            continue;
           }
 
           // Log the stop reason for debugging
@@ -5211,6 +5229,50 @@ export class AgentModeService {
 
       for (const fileUrl of urlsToProcess) {
         try {
+          // If the LLM passed an s3:// URI (e.g. "s3://bucket/key"), fetch directly via SDK
+          // instead of handing it to axios which only supports http/https.
+          if (fileUrl.startsWith('s3://')) {
+            const withoutScheme = fileUrl.slice('s3://'.length);
+            const slashIdx = withoutScheme.indexOf('/');
+            const s3Bucket = slashIdx === -1 ? withoutScheme : withoutScheme.slice(0, slashIdx);
+            const s3Key = slashIdx === -1 ? '' : withoutScheme.slice(slashIdx + 1);
+            if (!s3Key) {
+              return {
+                success: false,
+                message: `Cannot parse S3 URL "${fileUrl}": no object key found. Use the full s3://bucket/key format.`,
+              };
+            }
+            let s3Content: string;
+            try {
+              s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
+            } catch (s3Err) {
+              const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+              return {
+                success: false,
+                message: `Failed to download or process file: ${fileUrl}`,
+                error: s3ErrMsg,
+              };
+            }
+            const contentBuffer = Buffer.from(s3Content, 'utf-8');
+            totalSize += contentBuffer.byteLength;
+            if (totalSize > maxTotalSize) {
+              return {
+                success: false,
+                message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+              };
+            }
+            const mimeTypeForS3 = fileUrl.endsWith('.json') ? 'application/json'
+              : fileUrl.endsWith('.csv') ? 'text/csv'
+              : 'text/plain';
+            fileParts.push({
+              inlineData: {
+                mimeType: mimeTypeForS3,
+                data: contentBuffer.toString('base64'),
+              }
+            });
+            continue;
+          }
+
           // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
           // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
           const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
@@ -5650,13 +5712,15 @@ export class AgentModeService {
   public async getSenderForLead(
     userId: string,
     leadSelectedSenderId?: string | null,
-    listSenderId?: string | null
+    listSenderId?: string | null,
+    listOwnerId?: string | null
   ): Promise<{
     fromName: string;
     notes?: string;
   } | null> {
     try {
-      const sendersResult = await this.getCrmSenders(userId);
+      // Use list owner's sender config so org members can send using the owner's senders
+      const sendersResult = await this.getCrmSenders(listOwnerId || userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return null;
       }
@@ -8354,7 +8418,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessSend) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
       }
 
@@ -8388,7 +8453,8 @@ export class AgentModeService {
       }
 
       // Resolve sender: lead → list → account default → first available
-      const sendersResult = await this.getCrmSenders(userId);
+      // Use the list owner's sender config so org members can send using the owner's senders
+      const sendersResult = await this.getCrmSenders(list.userId || userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
@@ -8629,7 +8695,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
@@ -8669,8 +8736,9 @@ export class AgentModeService {
       const marketStrategy = await this.readMarketStrategy(userId);
 
       // Get sender information (from lead record, or default sender from CRM configuration)
+      // Pass list.userId so org members use the list owner's sender config
       const leadSelectedSenderId = (lead as any).selectedSenderId;
-      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId);
+      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId, list?.userId);
 
       // Get existing draft if it exists
       const existingDraft = (lead as any).emailDraft;
