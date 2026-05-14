@@ -303,6 +303,71 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(mockedAxiosPost).not.toHaveBeenCalled();
   });
 
+  // ─── s3:// URL handling ────────────────────────────────────────────────────
+
+  test('downloads file via S3 SDK when file_url uses s3:// scheme', async () => {
+    const s3Url = 's3://agentweb-user-files/users/user-1/files/1234/abc/data.csv';
+    const csvContent = 'name,value\nfoo,1\nbar,2';
+
+    mockedGetS3ObjectAsString.mockResolvedValueOnce(csvContent);
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [{ content: { parts: [{ text: 'Analysis complete.' }] } }]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([s3Url], 'Summarize the data.', 'user-1');
+
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files');
+    expect(mockedAxiosGet).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+  });
+
+  test('returns error when s3:// URL file cannot be fetched from S3', async () => {
+    const s3Url = 's3://agentweb-user-files/users/user-1/files/missing.csv';
+
+    mockedGetS3ObjectAsString.mockRejectedValueOnce(new Error('NoSuchKey'));
+
+    const result = await (service as any).performDataAnalysis([s3Url], 'Summarize.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain(s3Url);
+    expect(mockedAxiosGet).not.toHaveBeenCalled();
+  });
+
+  test('returns error when s3:// URL has no key path', async () => {
+    const s3Url = 's3://agentweb-user-files';
+
+    const result = await (service as any).performDataAnalysis([s3Url], 'Summarize.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain(s3Url);
+    expect(mockedAxiosGet).not.toHaveBeenCalled();
+  });
+
+  test('handles mixed s3:// and https:// URLs in the same call', async () => {
+    const s3Url = 's3://agentweb-user-files/users/user-1/files/1234/abc/data.csv';
+    const httpsUrl = 'https://example.com/extra.csv';
+    const csvContent = 'name,value\nfoo,1';
+
+    mockedGetS3ObjectAsString.mockResolvedValueOnce(csvContent);
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from('col1,col2\na,b'),
+      headers: { 'content-type': 'text/csv' }
+    });
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [{ content: { parts: [{ text: 'Done.' }] } }]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([s3Url, httpsUrl], 'Summarize both.', 'user-1');
+
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledTimes(1);
+    expect(mockedAxiosGet).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(true);
+  });
+
   test('prompt instructs Gemini to use matplotlib, not altair', async () => {
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
