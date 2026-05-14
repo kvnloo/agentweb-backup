@@ -62,6 +62,22 @@ export interface IdentityResolverDeps {
   }): Promise<ApolloPersonResult | null>;
   enrichSoReverseLookup(input: { email: string }): Promise<EnrichSoReverseResult | null>;
   enrichSoFindEmail(input: { firstName: string; lastName: string; domain: string }): Promise<{ email: string } | null>;
+  apolloBrokerChain(
+    input: {
+      firstName: string;
+      lastName: string;
+      domain?: string;
+      company?: string;
+      linkedinUrl?: string;
+      linkedToEmail?: string;
+    },
+    leadHint: { listId: string; leadId: string },
+  ): Promise<{ email?: string; emailStatus?: string } | null>;
+  findEmailViaPatterns(input: {
+    firstName: string;
+    lastName: string;
+    domain: string;
+  }): Promise<{ email: string; pattern?: string } | null>;
   /** Step 2 — Unipile LinkedIn people search. Finds linkedin_url from name+company.
    *  Returns null when no connected LinkedIn account or no confident match. */
   findLinkedInUrl(input: { firstName: string; lastName: string; company: string }): Promise<string | null>;
@@ -112,10 +128,14 @@ export interface ResolveIdentityInput {
    *  CRM-history Tier 0 skips any field present in this set so Apollo runs
    *  for it instead. Same shape used by the waterfall (`enrichmentGroupWaterfall.ts:215`). */
   refreshFields?: Set<string>;
+  /** Tier 6.5 only. When set, the resolver may call Apollo's broker chain
+   *  (run_waterfall_email) via `deps.apolloBrokerChain`. Without this hint
+   *  there is no lead to write the async result back to, so Tier 6.5 is skipped. */
+  leadHint?: { listId: string; leadId: string };
 }
 
 export type ResolveIdentityResult =
-  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[] }
+  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
 function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
@@ -412,6 +432,82 @@ export async function resolveIdentity(
     }
   }
 
+  // 6.5. Apollo broker chain — fires when email is still absent AND a leadHint
+  // is present (so the async result can be written back) AND we have name +
+  // (emailDomain or company). Respects the same emailStatus gate as the
+  // unified Apollo Tier 3: weak signal (no linkedin) → only verified/unverified/
+  // extrapolated accepted; strong signal (has linkedin) → anything except guessed.
+  const emailDomainForBroker = lead.emailDomain || resolved.emailDomain;
+  const firstNameForBroker = lead.firstName || resolved.firstName;
+  const lastNameForBroker = lead.lastName || resolved.lastName;
+  const companyForBroker = lead.company || resolved.company;
+  if (
+    !email &&
+    input.leadHint &&
+    firstNameForBroker &&
+    lastNameForBroker &&
+    (emailDomainForBroker || companyForBroker)
+  ) {
+    try {
+      const linkedinForBroker = lead.linkedin || resolved.linkedin;
+      const weakSignalOnly = !linkedinForBroker;
+      const brokerInput: Parameters<IdentityResolverDeps['apolloBrokerChain']>[0] = {
+        firstName: firstNameForBroker,
+        lastName: lastNameForBroker,
+      };
+      if (emailDomainForBroker) brokerInput.domain = emailDomainForBroker;
+      else if (companyForBroker) brokerInput.company = companyForBroker;
+      if (linkedinForBroker) brokerInput.linkedinUrl = linkedinForBroker;
+
+      const brokerResult = await deps.apolloBrokerChain(brokerInput, input.leadHint);
+      if (brokerResult?.email) {
+        const status = (brokerResult.emailStatus ?? '').toLowerCase();
+        const emailAccepted = weakSignalOnly
+          ? ['verified', 'unverified', 'extrapolated'].includes(status)
+          : status !== 'guessed';
+        if (emailAccepted) {
+          email = brokerResult.email;
+          resolved.email = brokerResult.email;
+          meta.email = makeApiMeta('apollo');
+        }
+      }
+    } catch (err) {
+      console.warn(`${logTag} tier 6.5 apolloBrokerChain failed:`, (err as Error).message);
+    }
+  }
+
+  // 7. Pattern matching — fires when email is still absent AND emailDomain +
+  // firstName + lastName are known. Does NOT require leadHint. Quality is
+  // inherent (enrich.so deliverability check); no emailStatus gate needed.
+  let emailPattern: string | undefined;
+  const emailDomainForPatterns = lead.emailDomain || resolved.emailDomain;
+  const firstNameForPatterns = lead.firstName || resolved.firstName;
+  const lastNameForPatterns = lead.lastName || resolved.lastName;
+  if (!email && emailDomainForPatterns && firstNameForPatterns && lastNameForPatterns) {
+    try {
+      const patternResult = await deps.findEmailViaPatterns({
+        firstName: firstNameForPatterns,
+        lastName: lastNameForPatterns,
+        domain: emailDomainForPatterns,
+      });
+      if (patternResult?.email) {
+        email = patternResult.email;
+        resolved.email = patternResult.email;
+        meta.email = makeApiMeta('enrich.so');
+        emailPattern = patternResult.pattern;
+      }
+    } catch (err) {
+      console.warn(`${logTag} tier 7 findEmailViaPatterns failed:`, (err as Error).message);
+    }
+  }
+
+  // After Tier 6.5 / 7: re-derive emailDomain from the newly-found email
+  // when neither the lead nor the resolved object already has one.
+  if (email && !lead.emailDomain && !resolved.emailDomain) {
+    const derived = extractDomainFromEmail(email);
+    if (derived) resolved.emailDomain = derived;
+  }
+
   // 6. enrich.so reverse-lookup — fires when company is still missing and we
   // have an email (either from the lead or resolved in earlier steps).
   // Covers personal email leads where enrich.so reverses personal → work.
@@ -482,5 +578,5 @@ export async function resolveIdentity(
     });
   }
 
-  return { ok: true, resolved, siblings: validSiblings };
+  return { ok: true, resolved, siblings: validSiblings, emailPattern };
 }

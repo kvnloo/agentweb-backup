@@ -15,6 +15,8 @@ import {
 const LIST_ID = 'list-test';
 const LEAD_ID = 'lead-001';
 
+const LEAD_HINT = { listId: LIST_ID, leadId: LEAD_ID };
+
 function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolverDeps {
   return {
     apolloPeopleMatch: jest.fn().mockResolvedValue(null),
@@ -24,6 +26,8 @@ function makeDeps(overrides: Partial<IdentityResolverDeps> = {}): IdentityResolv
     findSiblingLeads: jest.fn().mockResolvedValue([]),
     resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
     writeLeadFields: jest.fn().mockResolvedValue(undefined),
+    apolloBrokerChain: jest.fn().mockResolvedValue(null),
+    findEmailViaPatterns: jest.fn().mockResolvedValue(null),
     ...overrides,
   };
 }
@@ -879,5 +883,233 @@ describe('resolveIdentity — unified Apollo call with expanded signals', () => 
     if (!result.ok) return;
     expect(result.resolved.email).toBe('ayush@agoda.com');
     expect(result.resolved.company).toBe('Agoda');
+  });
+});
+
+// ─── Tier 6.5 — Apollo broker chain ──────────────────────────────────────────
+
+describe('resolveIdentity — broker chain (Tier 6.5)', () => {
+  it('fires when email missing + name + emailDomain + leadHint', async () => {
+    const apolloBrokerChain = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloBrokerChain });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(apolloBrokerChain).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      LEAD_HINT,
+    );
+  });
+
+  it('skipped when no leadHint', async () => {
+    const apolloBrokerChain = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloBrokerChain });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        // no leadHint
+      }),
+      deps,
+    );
+    expect(apolloBrokerChain).not.toHaveBeenCalled();
+  });
+
+  it('skipped when email already present on lead', async () => {
+    const apolloBrokerChain = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloBrokerChain });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com', firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(apolloBrokerChain).not.toHaveBeenCalled();
+  });
+
+  it('accepts verified email on weak signal (name+domain only)', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: 'verified' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('jane@acme.com');
+  });
+
+  it('rejects guessed email regardless of signal strength', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: 'guessed' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Jane',
+          lastName: 'Doe',
+          emailDomain: 'acme.com',
+          linkedin: 'https://linkedin.com/in/jane',
+        },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBeUndefined();
+  });
+
+  it('rejects undefined emailStatus on weak signal (name+domain only)', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: undefined }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBeUndefined();
+  });
+
+  it('accepts undefined emailStatus when linkedin present (strong signal)', async () => {
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue({ email: 'jane@acme.com', emailStatus: undefined }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Jane',
+          lastName: 'Doe',
+          emailDomain: 'acme.com',
+          linkedin: 'https://linkedin.com/in/jane',
+        },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('jane@acme.com');
+  });
+
+  it('falls through to pattern matching when broker chain returns null', async () => {
+    const findEmailViaPatterns = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({
+      apolloBrokerChain: jest.fn().mockResolvedValue(null),
+      findEmailViaPatterns,
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        leadHint: LEAD_HINT,
+      }),
+      deps,
+    );
+    expect(findEmailViaPatterns).toHaveBeenCalled();
+  });
+});
+
+// ─── Tier 7 — Pattern matching ────────────────────────────────────────────────
+
+describe('resolveIdentity — pattern matching (Tier 7)', () => {
+  it('fires when email missing + name + emailDomain (no leadHint required)', async () => {
+    const findEmailViaPatterns = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findEmailViaPatterns });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        // no leadHint
+      }),
+      deps,
+    );
+    expect(findEmailViaPatterns).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+    );
+  });
+
+  it('skipped when email already present', async () => {
+    const findEmailViaPatterns = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findEmailViaPatterns });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com', firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+    expect(findEmailViaPatterns).not.toHaveBeenCalled();
+  });
+
+  it('skipped when emailDomain missing (company only)', async () => {
+    const findEmailViaPatterns = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findEmailViaPatterns });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+    expect(findEmailViaPatterns).not.toHaveBeenCalled();
+  });
+
+  it('resolves email and sets emailPattern on result', async () => {
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'j.doe@acme.com', pattern: 'f.last@domain' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.email).toBe('j.doe@acme.com');
+    expect(result.emailPattern).toBe('f.last@domain');
+  });
+
+  it('meta.email provider is enrich.so when pattern finds email', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'j.doe@acme.com', pattern: 'f.last@domain' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+        needsPersonFields: true,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+    expect(writeLeadFields).toHaveBeenCalled();
+    const call = writeLeadFields.mock.calls[0][0];
+    expect(call.meta.email.provider).toBe('enrich.so');
   });
 });

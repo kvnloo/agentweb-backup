@@ -238,6 +238,9 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
         domain: domain || undefined,
         company: domain ? undefined : company,
         linkedin: linkedin || undefined,
+        leadHint: (persistToListId && persistToLeadId)
+          ? { listId: persistToListId, leadId: persistToLeadId }
+          : undefined,
       },
       { userId },
     );
