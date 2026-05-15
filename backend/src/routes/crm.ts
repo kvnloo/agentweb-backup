@@ -3898,7 +3898,6 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
     const forceEnrich = req.body.forceEnrich === true;
     const socketId = typeof req.body.socketId === 'string' ? req.body.socketId : undefined;
     const leadIds: string[] | undefined = Array.isArray(req.body.leadIds) ? req.body.leadIds : undefined;
-    const focusInstruction = typeof req.body.focusInstruction === 'string' ? req.body.focusInstruction.trim() : undefined;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -3923,7 +3922,6 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
       forceOverwrite: forceEnrich,
       leadIds,
       apolloTechStack: true,
-      ...(focusInstruction ? { techStackFocusInstruction: focusInstruction } : {}),
     };
 
     if (mode === 'preview') {

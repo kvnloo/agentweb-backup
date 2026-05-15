@@ -139,10 +139,6 @@ export interface EnrichmentJobSpec {
    *  in loadAndFilterLeads and passed through to runSpecialists. Optional: when
    *  absent, defaults apply (standard fields ON, extended fields OFF). */
   enrichmentFieldConfig?: import('./enrichmentFieldConfig').EnrichmentFieldConfig;
-  /** Natural-language filter for Discover Tech Stack runs. When provided, the
-   *  LLM is instructed to return null for fields outside this focus — so only
-   *  relevant categories are written to leads. Empty string treated as absent. */
-  techStackFocusInstruction?: string;
   /** When true, attempts Apollo org enrichment as Tier 1 before web search.
    *  If Apollo returns technology_names, those are fed to the LLM and web
    *  search is skipped. Falls back to web search when Apollo is unavailable,
@@ -912,11 +908,7 @@ export class CrmEnrichmentService {
     lead: LeadRecord,
     enrichConfig: { enrichmentModel: string; dataExtractionModel: string }
   ): Promise<{ fields: Record<string, string | null>; metadata: Record<string, FieldCitation> }> {
-    const baseInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
-    const focusClause = spec.techStackFocusInstruction?.trim()
-      ? `\n\nUser focus: ${spec.techStackFocusInstruction.trim()}. Only populate fields relevant to this focus. Return null for all other fields.`
-      : '';
-    const resolvedInstruction = baseInstruction + focusClause;
+    const resolvedInstruction = CrmEnrichmentService.applySearchTemplate(spec.instruction, lead);
     const { dataExtractionModel } = enrichConfig;
 
     const systemPrompt = buildDataExtractionSystemPrompt({
