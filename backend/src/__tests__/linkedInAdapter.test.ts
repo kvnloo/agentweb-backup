@@ -25,6 +25,8 @@ jest.mock('../services/linkedInService', () => ({
 jest.mock('../services/linkedInPostsDb', () => ({
   createPost: jest.fn(),
   getPostsByAccount: jest.fn().mockResolvedValue([]),
+  getPostsCacheAge: jest.fn().mockResolvedValue(null), // null = no cache = always refresh
+  upsertApiPost: jest.fn().mockResolvedValue(undefined),
   getPostByUrn: jest.fn(),
   getPostById: jest.fn(),
   updatePostMetrics: jest.fn().mockResolvedValue(undefined),
@@ -326,6 +328,87 @@ describe('LinkedInAdapter', () => {
       await expect(
         adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123')
       ).rejects.toThrow();
+    });
+
+    it('should serve from cache without calling API when cache is fresh (within 1 day)', async () => {
+      const freshCachedPost = {
+        userId: 'user-123',
+        postId: 'urn:li:share:fresh-post',
+        accountId: 'urn:li:organization:123456',
+        content: 'Fresh cached post',
+        createdAt: new Date().toISOString(),
+        cachedAt: new Date().toISOString(), // just cached
+      };
+      mockPostsDb.getPostsByAccount.mockResolvedValue([freshCachedPost]);
+      // Cache is 1 hour old — within 1-day TTL
+      mockPostsDb.getPostsCacheAge.mockResolvedValue(new Date(Date.now() - 60 * 60 * 1000));
+
+      const result = await adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123');
+
+      expect(mockLinkedInService.listPosts).not.toHaveBeenCalled(); // API should be skipped
+      expect(result).toHaveLength(1);
+      expect(result[0].id).toBe('urn:li:share:fresh-post');
+      expect(result[0]._fromCache).toBe(true);
+    });
+
+    it('should call API when cache is stale (older than 1 day)', async () => {
+      const stalePost = {
+        userId: 'user-123',
+        postId: 'urn:li:share:stale-post',
+        accountId: 'urn:li:organization:123456',
+        content: 'Stale cached post',
+        createdAt: new Date().toISOString(),
+        cachedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(), // 25h ago
+      };
+      const freshApiPost = { id: 'urn:li:share:api-post', commentary: 'Fresh from API', author: 'urn:li:organization:123456', visibility: 'PUBLIC' as const, lifecycleState: 'PUBLISHED' as const };
+      mockPostsDb.getPostsByAccount.mockResolvedValue([stalePost]);
+      // Cache is 25 hours old — exceeds 1-day TTL
+      mockPostsDb.getPostsCacheAge.mockResolvedValue(new Date(Date.now() - 25 * 60 * 60 * 1000));
+      mockLinkedInService.listPosts.mockResolvedValue({ elements: [freshApiPost] });
+
+      const result = await adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123');
+
+      expect(mockLinkedInService.listPosts).toHaveBeenCalled(); // API should be called
+      expect(result[0].id).toBe('urn:li:share:api-post');
+    });
+
+    it('should bypass cache and call API when force_reload is true', async () => {
+      const cachedPost = {
+        userId: 'user-123',
+        postId: 'urn:li:share:cached-post',
+        accountId: 'urn:li:organization:123456',
+        content: 'Cached post',
+        createdAt: new Date().toISOString(),
+        cachedAt: new Date().toISOString(), // very fresh
+      };
+      const freshApiPost = { id: 'urn:li:share:reloaded-post', commentary: 'Reloaded from API', author: 'urn:li:organization:123456', visibility: 'PUBLIC' as const, lifecycleState: 'PUBLISHED' as const };
+      mockPostsDb.getPostsByAccount.mockResolvedValue([cachedPost]);
+      mockPostsDb.getPostsCacheAge.mockResolvedValue(new Date()); // fresh cache
+      mockLinkedInService.listPosts.mockResolvedValue({ elements: [freshApiPost] });
+
+      const result = await adapter.listPosts(mockCompanyAccount, { limit: 5, force_reload: true }, 'user-123');
+
+      expect(mockLinkedInService.listPosts).toHaveBeenCalled(); // API called despite fresh cache
+      expect(result[0].id).toBe('urn:li:share:reloaded-post');
+    });
+
+    it('should write API posts back into the local cache', async () => {
+      mockPostsDb.getPostsByAccount.mockResolvedValue([]);
+      mockPostsDb.getPostsCacheAge.mockResolvedValue(null);
+      const apiPost = { id: 'urn:li:share:api-post', commentary: 'New post', author: 'urn:li:organization:123456', createdAt: Date.now(), visibility: 'PUBLIC' as const, lifecycleState: 'PUBLISHED' as const };
+      mockLinkedInService.listPosts.mockResolvedValue({ elements: [apiPost] });
+
+      await adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123');
+
+      // Give the fire-and-forget upsert time to run
+      await new Promise(r => setTimeout(r, 10));
+      expect(mockPostsDb.upsertApiPost).toHaveBeenCalledWith(
+        'user-123',
+        'urn:li:organization:123456',
+        'urn:li:share:api-post',
+        'New post',
+        expect.any(String)
+      );
     });
   });
 
