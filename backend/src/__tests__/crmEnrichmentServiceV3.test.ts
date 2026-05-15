@@ -301,6 +301,80 @@ describe('runEnrichment — aliasFor routing', () => {
     expect(writeCall.customFields.funding_stage).toBeUndefined();
   });
 
+  it('fans out a single canonical fill to every user-facing field that maps to it', async () => {
+    // Real CRM lists frequently have data in BOTH `company` and `company_name`.
+    // Both config fields route to canonical `company_name`; the waterfall fills
+    // it once and the orchestrator must write the same value under BOTH user
+    // names so neither column silently misses its enriched value.
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme Corp', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-05-11T00:00:00Z' } as any },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+    const config = makeConfig({
+      fields: [
+        { name: 'company',      type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+        { name: 'company_name', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    // Waterfall is called exactly once for the canonical (no duplicate work).
+    expect(deps.runWaterfall).toHaveBeenCalledTimes(1);
+    const wfCall = (deps.runWaterfall as jest.Mock).mock.calls[0][0];
+    expect(wfCall.requestedFields).toEqual(['company_name']);
+
+    // setLeadFields was given both user-facing columns with the same value.
+    // `company` is a STANDARD_LEAD_COLUMN → topLevel; `company_name` is not → customFields.
+    expect(deps.setLeadFields).toHaveBeenCalledTimes(1);
+    const writeCall = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(writeCall.topLevel).toEqual({ company: 'Acme Corp' });
+    expect(writeCall.customFields).toEqual({ company_name: 'Acme Corp' });
+  });
+
+  it('fans out to all three user fields when three configs alias the same canonical', async () => {
+    // Lead has empty email so the fill_if_empty policy lets the canonical
+    // `email` value through to the top-level column.
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ email: '' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'email', value: 'jane@acme.com', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-05-11T00:00:00Z' } as any },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+    const config = makeConfig({
+      fields: [
+        { name: 'email',  type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'Email',  type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+        { name: 'e_mail', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    expect(deps.runWaterfall).toHaveBeenCalledTimes(1);
+    const writeCall = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    // `email` is a STANDARD_LEAD_COLUMN → topLevel; the two aliases land in customFields.
+    expect(writeCall.topLevel).toEqual({ email: 'jane@acme.com' });
+    expect(writeCall.customFields).toEqual({
+      Email: 'jane@acme.com',
+      e_mail: 'jane@acme.com',
+    });
+  });
+
   it('leaves ungrouped fields alone when aliasFor is not set', async () => {
     // No aliasFor → "stag" stays ungrouped → routed to extractUngroupedFieldsViaWeb
     const deps = makeDeps({
