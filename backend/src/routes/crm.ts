@@ -3602,13 +3602,22 @@ Please analyze each lead and return a JSON array with your assessment.`;
               if (leadIndex >= 0 && leadIndex < chunk.length) {
                 const lead = chunk[leadIndex];
 
-                // Pick the highest-scoring category as the winner
+                // Coerce non-finite LLM scores ("abc", null, NaN, undefined)
+                // to 0 BEFORE clamping. `Math.max(0, NaN)` returns NaN, which
+                // DynamoDB rejects on write and breaks comparisons silently;
+                // `cat.score ?? 0` only catches null/undefined.
                 const rawCategoryMatches = result.categoryMatches || [];
-                // Clamp scores to 0-100
-                const categoryMatches = rawCategoryMatches.map(cat => ({
-                  ...cat,
-                  score: Math.min(100, Math.max(0, cat.score ?? 0)),
-                }));
+                const categoryMatches = rawCategoryMatches.map(cat => {
+                  const n = typeof cat.score === 'number' && Number.isFinite(cat.score) ? cat.score : 0;
+                  return { ...cat, score: Math.min(100, Math.max(0, n)) };
+                });
+                if (rawCategoryMatches.length === 0) {
+                  // Almost always means the LLM returned the old top-level
+                  // {isMatch, score, reason} shape instead of categoryMatches.
+                  // Without this log the regression looks like "every lead is
+                  // a bad fit" in the UI.
+                  console.warn(`[crm] match-icps: LLM returned empty categoryMatches for lead ${lead.leadId} — possible schema regression`);
+                }
                 const winner = categoryMatches.length > 0
                   ? categoryMatches.reduce((best, cat) => cat.score > best.score ? cat : best)
                   : { icpTitle: '', isMatch: false, score: 0, reason: 'Insufficient lead data to evaluate against ICP categories.' };
