@@ -1215,6 +1215,7 @@ export async function runScheduledChat(
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
     console.error('Full error details:', {
       message: error instanceof Error ? error.message : String(error),
+      originalMessage: (error as any)?.originalMessage || null,
       stack: error instanceof Error ? error.stack : undefined,
       name: error instanceof Error ? error.name : 'Unknown'
     });
@@ -1272,6 +1273,7 @@ export async function runScheduledChat(
     }
 
     // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
+    const originalMessage = (error as any)?.originalMessage;
     sendAgentModeOncallAlert({
       subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
       message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
@@ -1282,6 +1284,7 @@ export async function runScheduledChat(
         'User ID': userId,
         'Is Test Run': isTest ? 'Yes' : 'No',
         'Error Message': errorMessage,
+        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
         'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
         'Execution Time (ms)': errorResult.executionTime,
         'Timestamp': errorResult.createdAt
@@ -1289,7 +1292,7 @@ export async function runScheduledChat(
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
     createOncallItem({
       title: `Scheduled Chat Error: ${schedule.scheduleName}`,
-      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
       additionalTags: ['Scheduled Chat'],
       context: {
         'Schedule ID': schedule.scheduleId,
@@ -1297,6 +1300,7 @@ export async function runScheduledChat(
         'Session ID': sessionId || 'N/A',
         'Is Test Run': isTest ? 'Yes' : 'No',
         'Error Message': errorMessage,
+        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
     }).catch(err => console.error('Failed to create Notion item for scheduled chat error:', err));
 
