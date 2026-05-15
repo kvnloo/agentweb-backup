@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
+      'Tips from Emma: now powered by a hand-curated bank of 160 GTM best practices',
+      '- The "Tips from Emma" card during long generations no longer asks the AI to invent tips on the fly',
+      '- Tips are now drawn from 160 hand-written GTM best practices spanning Paid Ads, Founder-Led Sales, Organic Content, and Competitor / GTM Strategy — 40 per category',
+      '- Your prompt is keyword-matched to the most relevant category, then 3 tips are picked from that bank with no repeats in the same session',
+      '- Result: instant (no API call), consistent voice, and never hallucinated content',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
       'Fixed: Emma No Longer Answers Twice When @Mentioned in a Slack Thread',
       '- When a user @mentioned Emma inside an existing Slack thread, Slack sent both an app_mention and a message event for the same message',
       '- Both event handlers were running independently, causing Emma to generate and post two separate responses',
