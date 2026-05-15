@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-15',
+    changes: [
+      'Improved: Emma Can Now Find Your Favorited and Approved Images',
+      '- Asking Emma "show me my favorited images" now returns only the images you\'ve starred (❤️) on the Images page',
+      '- Asking Emma "show me my approved images" now returns only images that have been approved via the Slack approval workflow',
+      '- Every image result now includes its favorite status, making it easier to reference and act on your curated assets',
+    ],
+  },
+  {
     date: '2026-05-14',
     changes: [
       'Fixed: Slack User Mentions Now Show Display Names Instead of Raw IDs',
