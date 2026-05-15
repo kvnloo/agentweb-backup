@@ -142,6 +142,34 @@ const enrichmentConfigDeps: ConfigServiceDeps = {
       return {};
     }
   },
+
+  llmClassifySmartFields: async (fields) => {
+    if (fields.length === 0) return {};
+    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
+    const { createLLMService: mkLLM } = await import('../utils/llmService');
+    const {
+      buildSmartFieldClassificationSystemPrompt,
+      buildSmartFieldClassificationUserPrompt,
+    } = await import('../services/enrichmentPrompts');
+
+    const canonicalFieldList = Object.entries(FIELD_GROUPS)
+      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
+      .join('\n');
+
+    try {
+      const llm = mkLLM(process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
+      const result = await llm.generateJSONContent<
+        Record<string, { isSmartField: boolean; dependencies: string[]; fieldType?: 'string' | 'number' | 'boolean' | 'date' | 'enum'; enumOptions?: string[] }>
+      >(
+        buildSmartFieldClassificationSystemPrompt(canonicalFieldList),
+        buildSmartFieldClassificationUserPrompt(fields),
+      );
+      return result ?? {};
+    } catch (err) {
+      console.warn('[crm] llmClassifySmartFields failed:', (err as Error).message);
+      return {};
+    }
+  },
 };
 const d1StripeClient = d1StripeSecretKey
   ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })

@@ -103,6 +103,10 @@ export const TRULY_RESERVED_NAMES = [
 
 const TRULY_RESERVED_SET = new Set<string>(TRULY_RESERVED_NAMES);
 
+/** Fields that are auto-derived from other lead data and should never receive
+ *  an aliasFor assignment — they have no external enrichment source. */
+const ALIAS_INFERENCE_BLOCKLIST = new Set(['emailDomain', 'email_domain']);
+
 /** Maps the lead's standard column name → canonical FIELD_GROUPS field
  *  it enriches against. Used by `buildDefaultConfig` to auto-set aliasFor.  */
 export const STANDARD_DATA_ALIASES: Record<string, string> = {
@@ -137,6 +141,8 @@ const EXCLUDED_LIST_FIELD_NAMES = new Set<string>([
   'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
   // System timestamps
   'createdAt', 'updatedAt',
+  // Identity-derived fields — auto-computed from other lead data, not enrichable
+  'emailDomain',
 ]);
 
 // Back-compat re-export — callers still importing the old name get the strict set.
@@ -147,6 +153,13 @@ export const RESERVED_FIELD_NAMES = TRULY_RESERVED_NAMES;
 export interface FieldTypeSuggestion {
   name: string;
   type: 'string' | 'number' | 'boolean' | 'enum' | 'date';
+  enumOptions?: string[];
+}
+
+export interface SmartFieldClassification {
+  isSmartField: boolean;
+  dependencies: string[];
+  fieldType?: 'string' | 'number' | 'boolean' | 'date' | 'enum';
   enumOptions?: string[];
 }
 
@@ -165,6 +178,13 @@ export interface ConfigServiceDeps {
   llmInferAliases(
     input: Array<{ name: string; instruction: string }>,
   ): Promise<Record<string, string | null>>;
+  /** Called once per save to classify fields as smart (computed/derived) or
+   *  normal (directly fetchable). For smart fields also extracts canonical
+   *  dependency field names. Implementations should fail soft (return {} on
+   *  error) so the rest of the save still proceeds. */
+  llmClassifySmartFields(
+    input: Array<{ name: string; instruction: string }>,
+  ): Promise<Record<string, SmartFieldClassification>>;
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -231,6 +251,16 @@ function validateConfig(config: EnrichmentConfig): void {
         throw new ConfigValidationError(
           `field '${field.name}' aliasFor='${field.aliasFor}' is not a known canonical field`,
         );
+      }
+    }
+
+    if (field.smartDependencies != null) {
+      for (const dep of field.smartDependencies) {
+        if (!CANONICAL_FIELD_NAMES.has(dep)) {
+          throw new ConfigValidationError(
+            `smart field '${field.name}' dependency '${dep}' is not a known canonical field`,
+          );
+        }
       }
     }
   }
@@ -367,14 +397,16 @@ export async function setEnrichmentConfig(
     ...input.config,
     fields: input.config.fields.map(f => ({
       ...f,
-      aliasFor: f.aliasFor ?? inferAliasFor(f.name),
+      // Blocklisted fields (e.g. emailDomain) must never get an aliasFor —
+      // strip even if the stored config has a stale one from old inference.
+      aliasFor: ALIAS_INFERENCE_BLOCKLIST.has(f.name) ? undefined : (f.aliasFor ?? inferAliasFor(f.name)),
     })),
   };
 
   // Step 2: LLM fallback for fields the heuristic couldn't resolve. One LLM
   // call total per save (not per enrichment run) — cheap. LLM matches opaque
   // names like `stag` → `funding_stage` based on the user's instruction text.
-  const llmCandidates = enriched.fields.filter(f => !f.aliasFor);
+  const llmCandidates = enriched.fields.filter(f => !f.aliasFor && !ALIAS_INFERENCE_BLOCKLIST.has(f.name));
   if (llmCandidates.length > 0) {
     try {
       const llmAliases = await deps.llmInferAliases(
@@ -395,6 +427,59 @@ export async function setEnrichmentConfig(
       // Fail soft — heuristic results stand. Don't block save on LLM failure.
       // eslint-disable-next-line no-console
       console.warn('[enrichmentConfigService] LLM alias inference failed:', err);
+    }
+  }
+
+  // Step 3: Classify smart fields via LLM. Only classify fields that have an
+  // instruction but haven't been classified yet (smartCondition absent).
+  // Fields without instructions can't be smart — nothing to derive from.
+  // Classify fields that are new (no smartCondition) OR whose instruction has
+  // changed since last classification (smartCondition holds the old instruction).
+  const classificationCandidates = enriched.fields.filter(
+    f => f.instruction && (
+      !f.smartCondition ||
+      f.smartCondition !== f.instruction
+    ),
+  );
+  if (classificationCandidates.length > 0) {
+    try {
+      const classifications = await deps.llmClassifySmartFields(
+        classificationCandidates.map(f => ({ name: f.name, instruction: f.instruction })),
+      );
+      enriched = {
+        ...enriched,
+        fields: enriched.fields.map(f => {
+          const cls = classifications[f.name];
+          if (!cls) return f;  // not in classification batch — leave unchanged
+
+          const VALID_INFERRED_TYPES = new Set(['string', 'number', 'boolean', 'date', 'enum']);
+          const inferredType = cls.fieldType && VALID_INFERRED_TYPES.has(cls.fieldType)
+            ? cls.fieldType as 'string' | 'number' | 'boolean' | 'date' | 'enum'
+            : undefined;
+          const validEnumOptions = (cls.enumOptions ?? []).filter(o => typeof o === 'string' && o.trim());
+          const typeOverride: Partial<EnrichmentFieldConfig> = inferredType
+            ? inferredType === 'enum' && validEnumOptions.length > 0
+              ? { type: 'enum', enumOptions: validEnumOptions }
+              : inferredType !== 'enum'
+                ? { type: inferredType, enumOptions: undefined }  // clear stale enumOptions
+                : {}  // enum with no valid options — skip type change
+            : {};
+
+          if (cls.isSmartField) {
+            const validDeps = (cls.dependencies ?? []).filter(d => CANONICAL_FIELD_NAMES.has(d));
+            return { ...f, ...typeOverride, smartCondition: f.instruction, smartDependencies: validDeps };
+          }
+          // LLM says not smart — strip stale smart tags, apply inferred type.
+          const out = { ...f, ...typeOverride };
+          delete (out as any).smartCondition;
+          delete (out as any).smartDependencies;
+          return out;
+        }),
+      };
+    } catch (err) {
+      // Fail soft — alias results still stand, save proceeds without smart tags.
+      // eslint-disable-next-line no-console
+      console.warn('[enrichmentConfigService] smart field classification failed:', err);
     }
   }
 
