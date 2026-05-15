@@ -10,6 +10,7 @@ interface GetPostsOptions {
   accountId?: string;
   limit?: number;
   includeMetrics?: boolean;
+  forceReload?: boolean;
 }
 
 interface NormalizedPost {
@@ -50,7 +51,7 @@ export async function getPostsForUser(
   userId: string,
   options: GetPostsOptions = {}
 ): Promise<GetPostsResult> {
-  const { accountId, limit = 20, includeMetrics = true } = options;
+  const { accountId, limit = 20, includeMetrics = true, forceReload = false } = options;
 
   const allAccounts = await getAccountsByUserId(userId);
 
@@ -68,7 +69,7 @@ export async function getPostsForUser(
   for (const account of accounts) {
     try {
       const adapter = socialPlatformService.getAdapter(account.platform);
-      let posts = await adapter.listPosts(account, { limit }, userId);
+      let posts = await adapter.listPosts(account, { limit, force_reload: forceReload }, userId);
 
       if (includeMetrics && posts.length > 0) {
         try {
