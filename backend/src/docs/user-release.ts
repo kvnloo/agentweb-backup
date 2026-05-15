@@ -11,6 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
+      'Tips from Emma: now powered by a hand-curated bank of 160 GTM best practices',
+      '- The "Tips from Emma" card during long generations no longer asks the AI to invent tips on the fly',
+      '- Tips are now drawn from 160 hand-written GTM best practices spanning Paid Ads, Founder-Led Sales, Organic Content, and Competitor / GTM Strategy — 40 per category',
+      '- Your prompt is keyword-matched to the most relevant category, then 3 tips are picked from that bank with no repeats in the same session',
+      '- Result: instant (no API call), consistent voice, and never hallucinated content',
       'Fixed: LinkedIn Company Page Posts Now Load Correctly',
       '- list_connected_account_posts now returns posts for LinkedIn company pages instead of always returning an empty list',
       '- Posts created through AgentWeb are stored locally and served as a fallback when the LinkedIn API is unavailable or returns empty',
