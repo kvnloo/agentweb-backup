@@ -15653,11 +15653,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const response = await axios.get(fileUrl, {
         timeout: 30000,
         responseType: 'arraybuffer',
-        maxContentLength: 25 * 1024 * 1024, // 25MB — matches the upload cap
         headers: {
           'User-Agent': 'AgentWeb-Backend/1.0',
         },
-      } as any);
+      });
 
       const buffer = Buffer.from(response.data as ArrayBuffer);
       const contentType = response.headers['content-type'] || '';
@@ -15779,9 +15778,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let errorMessage = 'Failed to read file content';
       let statusCode = 500;
 
-      if (error.code === 'ERR_FR_MAX_BODY_LENGTH_EXCEEDED' || error.message?.includes('maxContentLength')) {
-        errorMessage = 'File is too large to read (maximum 25 MB)';
-      } else if (error.response) {
+      if (error.response) {
         statusCode = error.response.status;
         errorMessage = `HTTP ${error.response.status}: ${error.response.statusText}`;
       } else if (error.code === 'ENOTFOUND') {
