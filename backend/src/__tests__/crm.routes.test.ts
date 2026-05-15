@@ -826,9 +826,14 @@ describe('CRM Routes', () => {
         generateJSONContent: jest.fn().mockResolvedValue([
           {
             index: 1,
-            isMatch: true,
-            score: 88,
-            reason: 'Founder aligns with ICP.',
+            categoryMatches: [
+              {
+                icpTitle: 'SaaS founders',
+                isMatch: true,
+                score: 88,
+                reason: 'Founder aligns with ICP.',
+              },
+            ],
           },
         ]),
       };
@@ -846,10 +851,19 @@ describe('CRM Routes', () => {
       expect(createLLMService).toHaveBeenCalledWith('gpt-5.2-chat', 1);
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
         icpMatch: {
-          isMatch: true,
+          isMatch: true,   // score 88 >= threshold 70
           score: 88,
           reason: 'Founder aligns with ICP.',
+          matchedIcpTitle: 'SaaS founders',
           matchedAt: expect.any(String),
+          categoryMatches: [
+            {
+              icpTitle: 'SaaS founders',
+              isMatch: true,
+              score: 88,
+              reason: 'Founder aligns with ICP.',
+            },
+          ],
         },
       });
       expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
