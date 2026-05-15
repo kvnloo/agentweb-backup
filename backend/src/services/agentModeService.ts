@@ -1246,7 +1246,9 @@ export class AgentModeService {
             });
           }
         }
-        if (contentBlocks.length === 0) contentBlocks.push({ text: '' });
+        // Bedrock rejects blank text blocks — use a non-empty placeholder if the assistant
+        // message has neither text content nor tool calls (e.g. stored with empty content field).
+        if (contentBlocks.length === 0) contentBlocks.push({ text: '...' });
       } else if (msg.role === 'tool') {
         // Tool results become user messages with toolResult blocks
         role = 'user';
@@ -2701,6 +2703,13 @@ export class AgentModeService {
       // Skip empty assistant messages (no content and no tool_calls) — these are artifacts
       // from failed LLM responses where content was lost (e.g. Gemini safety filter)
       if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
+        continue;
+      }
+      // Skip assistant messages that have tool_calls in the DB but whose tool results are
+      // not present in the context window (unresolved tool calls) AND have no text content.
+      // Sending them as plain assistant messages with empty content causes Bedrock 400:
+      // "The text field in the ContentBlock object is blank."
+      if (msg.role === 'assistant' && !msg.content && (msg as any).tool_calls?.length > 0 && !resolvedToolCallIndices.has(sliceIdx)) {
         continue;
       }
       // Skip error messages — they carry no useful context for the LLM and accumulate
