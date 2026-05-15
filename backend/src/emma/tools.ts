@@ -4384,13 +4384,17 @@ emmaToolRegistry.register({
   name: "search_foreplay_discovery",
   definition: {
     name: "search_foreplay_discovery",
-    description: "Search Foreplay's global discovery database of millions of ads by query, brand, niche, or format. Use this when the user wants competitive intelligence or ad inspiration beyond their own saved library. IMPORTANT: Each result costs 1 Foreplay API credit — keep maxResults small (5–10). This searches the full Foreplay database, not just the user's saved swipefile. For searching the user's own saved ads, use search_ads_knowledge_base instead.",
+    description: "Search Foreplay's global discovery database of millions of ads by company name, keyword, niche, or format. Use this when the user wants competitive intelligence or ad inspiration beyond their own saved library. IMPORTANT: Each result costs 1 Foreplay API credit — keep max_results small (5–10). This searches the full Foreplay database, not just the user's saved swipefile. For searching the user's own saved ads, use search_ads_knowledge_base instead. When the user asks to find ads by a specific company or brand, use company_name.",
     inputSchema: {
       type: "object",
       properties: {
+        company_name: {
+          type: "string",
+          description: "Company or brand name to search ads for (e.g. 'Nike', 'Shopify', 'Apple'). Use this when the user wants ads from a specific company. Can be combined with query for more precision."
+        },
         query: {
           type: "string",
-          description: "Search query — brand name, product category, ad copy keyword, or niche (e.g. 'ecommerce checkout', 'SaaS onboarding', 'skincare')"
+          description: "Additional search keyword — product category, ad copy keyword, or niche (e.g. 'ecommerce checkout', 'SaaS onboarding', 'skincare'). Optional when company_name is provided."
         },
         max_results: {
           type: "number",
@@ -4421,8 +4425,7 @@ emmaToolRegistry.register({
           enum: ["newest", "oldest", "longest_running"],
           description: "Sort order for results (default: newest)"
         }
-      },
-      required: ["query"]
+      }
     }
   },
   execute: async (args: any, context?: any) => {
@@ -4430,6 +4433,7 @@ emmaToolRegistry.register({
       args.query,
       {
         maxResults: args.max_results || 10,
+        companyName: args.company_name,
         format: args.format,
         platform: args.platform,
         niche: args.niche,
