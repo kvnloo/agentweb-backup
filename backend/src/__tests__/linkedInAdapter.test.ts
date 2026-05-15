@@ -274,6 +274,59 @@ describe('LinkedInAdapter', () => {
         adapter.listPosts(expiredCompanyAccount, { limit: 5 }, 'user-123')
       ).rejects.toThrow('expired');
     });
+
+    it('should return cached posts when LinkedIn API returns empty elements', async () => {
+      const cachedPost = {
+        userId: 'user-123',
+        postId: 'urn:li:share:cached-post',
+        accountId: 'urn:li:organization:123456',
+        content: 'Cached company post',
+        createdAt: new Date().toISOString(),
+      };
+      mockPostsDb.getPostsByAccount.mockResolvedValue([cachedPost]);
+      mockLinkedInService.listPosts.mockResolvedValue({ elements: [] });
+
+      const result = await adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123');
+
+      // API returned empty, should fall back to cached posts
+      expect(result).toHaveLength(1);
+      expect(result[0].id).toBe('urn:li:share:cached-post');
+      expect(result[0].commentary).toBe('Cached company post');
+    });
+
+    it('should return cached posts when LinkedIn API fails with 403', async () => {
+      const cachedPost = {
+        userId: 'user-123',
+        postId: 'urn:li:share:cached-post',
+        accountId: 'urn:li:organization:123456',
+        content: 'Cached company post',
+        createdAt: new Date().toISOString(),
+      };
+      mockPostsDb.getPostsByAccount.mockResolvedValue([cachedPost]);
+      const apiError = Object.assign(new Error('LinkedIn Permission Denied: Not enough permissions'), {
+        response: { status: 403, data: { message: 'Not enough permissions' } },
+        isAxiosError: true,
+      });
+      mockLinkedInService.listPosts.mockRejectedValue(apiError);
+
+      const result = await adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123');
+
+      expect(result).toHaveLength(1);
+      expect(result[0].id).toBe('urn:li:share:cached-post');
+    });
+
+    it('should throw when LinkedIn API fails and no cached posts exist', async () => {
+      mockPostsDb.getPostsByAccount.mockResolvedValue([]);
+      const apiError = Object.assign(new Error('LinkedIn Permission Denied'), {
+        response: { status: 403, data: { message: 'Permission denied' } },
+        isAxiosError: true,
+      });
+      mockLinkedInService.listPosts.mockRejectedValue(apiError);
+
+      await expect(
+        adapter.listPosts(mockCompanyAccount, { limit: 5 }, 'user-123')
+      ).rejects.toThrow();
+    });
   });
 
   describe('getPostMetrics', () => {
@@ -565,7 +618,7 @@ describe('LinkedInAdapter', () => {
       );
     });
 
-    it('should NOT store post in database for company accounts', async () => {
+    it('should store post in database for company page accounts', async () => {
       // Arrange
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:company-post');
 
@@ -577,8 +630,14 @@ describe('LinkedInAdapter', () => {
         'user-123'
       );
 
-      // Assert - DB should NOT be called for company accounts
-      expect(mockPostsDb.createPost).not.toHaveBeenCalled();
+      // Assert - DB should be called for company page accounts (enables local cache fallback)
+      expect(mockPostsDb.createPost).toHaveBeenCalledWith(
+        'user-123',
+        'urn:li:organization:123456',
+        'urn:li:share:company-post',
+        'Company announcement',
+        undefined
+      );
     });
 
     it('should continue successfully even if DB storage fails', async () => {
