@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
+      'Fixed: Emma No Longer Answers Twice When @Mentioned in a Slack Thread',
+      '- When a user @mentioned Emma inside an existing Slack thread, Slack sent both an app_mention and a message event for the same message',
+      '- Both event handlers were running independently, causing Emma to generate and post two separate responses',
+      '- The thread message handler now skips any message that @mentions Emma, letting the app_mention handler process it exclusively',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
       'Fixed: Emma Now Correctly Composites Real Logos on Image Ads',
       '- Emma previously claimed AI image generation "cannot reliably composite a real logo" and silently fell back to building an HTML file instead of the requested image — this was incorrect behavior',
       '- Emma now uses the logo_image parameter with your brand guidelines logo PNG and generates a proper image ad using Gemini or GPT models',
