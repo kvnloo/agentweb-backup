@@ -1369,7 +1369,7 @@ export class AgentModeService {
           blocks.push({ text: JSON.stringify(item) });
         }
       }
-      return blocks.length > 0 ? blocks : [{ text: '' }];
+      return blocks.length > 0 ? blocks : [{ text: '.' }];
     }
     return [{ text: String(content) }];
   }
