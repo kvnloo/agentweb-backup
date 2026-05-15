@@ -773,7 +773,8 @@ export async function getForeplayApiKey(): Promise<string | null> {
       : 'dev/AgentWeb/Foreplay';
     const key = await getSecret(secretName);
     return key && key.trim() ? key.trim() : null;
-  } catch {
+  } catch (err: any) {
+    console.warn(`[Foreplay] Platform API key not found in Secrets Manager (${process.env.NODE_ENV}): ${err?.code || err?.message}`);
     return null;
   }
 }

@@ -4381,6 +4381,67 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: "search_foreplay_discovery",
+  definition: {
+    name: "search_foreplay_discovery",
+    description: "Search Foreplay's global discovery database of millions of ads by query, brand, niche, or format. Use this when the user wants competitive intelligence or ad inspiration beyond their own saved library. IMPORTANT: Each result costs 1 Foreplay API credit — keep maxResults small (5–10). This searches the full Foreplay database, not just the user's saved swipefile. For searching the user's own saved ads, use search_ads_knowledge_base instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search query — brand name, product category, ad copy keyword, or niche (e.g. 'ecommerce checkout', 'SaaS onboarding', 'skincare')"
+        },
+        max_results: {
+          type: "number",
+          description: "Max results to return (default 10, max 20). Each result costs 1 Foreplay credit.",
+          default: 10
+        },
+        format: {
+          type: "array",
+          items: { type: "string", enum: ["image", "video", "carousel", "dco"] },
+          description: "Filter by ad format (e.g. ['video', 'image'])"
+        },
+        platform: {
+          type: "array",
+          items: { type: "string", enum: ["facebook", "instagram"] },
+          description: "Filter by publisher platform"
+        },
+        niche: {
+          type: "array",
+          items: { type: "string" },
+          description: "Filter by niche tags (e.g. ['ecommerce', 'saas'])"
+        },
+        live: {
+          type: "boolean",
+          description: "If true, return only currently-running ads. If false, return only stopped ads. Omit to include both."
+        },
+        sort: {
+          type: "string",
+          enum: ["newest", "oldest", "longest_running"],
+          description: "Sort order for results (default: newest)"
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.searchForeplayDiscovery(
+      args.query,
+      {
+        maxResults: args.max_results || 10,
+        format: args.format,
+        platform: args.platform,
+        niche: args.niche,
+        live: args.live,
+        sort: args.sort,
+      },
+      context?.userId
+    );
+  }
+});
+
+emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
