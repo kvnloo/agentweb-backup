@@ -6442,8 +6442,10 @@ export const crmDb = {
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
     if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
 
-    // Step 1: ensure parent maps exist so document-path SETs don't throw.
-    if (hasMetaKeys || hasCustomKeys) {
+    // Step 1: ensure parent maps exist so document-path SETs/REMOVEs don't throw.
+    // REMOVE on a nested path (e.g. customFields.key) also requires the parent
+    // map to exist — bootstrap whenever we touch either map at all.
+    if (hasMetaKeys || hasCustomKeys || hasRemoveMeta || hasRemoveCustom) {
       try {
         await dynamodb.update({
           TableName: tableName,
