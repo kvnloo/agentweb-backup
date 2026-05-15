@@ -6295,6 +6295,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-15',
+    changes: [
+      'Fixed: Landing Page Generation Now Recovers from Transient GitHub Errors',
+      '- Some landing page generation sessions were failing with "Request failed with status code 422" when GitHub transiently rejected the repo creation request',
+      '- The service now automatically retries GitHub repo creation up to 3 times, preventing failures caused by momentary GitHub API glitches',
+      '- Orphaned failed landing page records that were never deployed can now be deleted and regenerated cleanly',
+    ],
+  },
+  {
     date: '2026-05-13',
     changes: [
       'Fixed: Send LinkedIn Message in CRM No Longer Fails with a Validation Error',

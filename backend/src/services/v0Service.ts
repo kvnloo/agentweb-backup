@@ -1415,17 +1415,46 @@ async function createGitHubRepoAndPush(
     Accept: "application/vnd.github.v3+json",
   };
 
-  // Create the repo
-  const createRepoRes = await axios.post<any>(
-    `https://api.github.com/orgs/${org}/repos`,
-    {
-      name: repoName,
-      description: `Landing page: ${description}`,
-      private: true,
-      auto_init: true, // Creates an initial commit with README
-    },
-    { headers, timeout: GITHUB_API_TIMEOUT_MS }
-  );
+  // Create the repo — GitHub occasionally returns 422 "Repository creation failed" transiently
+  let createRepoRes: any;
+  let lastGhCreateError: any;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      createRepoRes = await axios.post<any>(
+        `https://api.github.com/orgs/${org}/repos`,
+        {
+          name: repoName,
+          description: `Landing page: ${description}`,
+          private: true,
+          auto_init: true, // Creates an initial commit with README
+        },
+        { headers, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+      break; // success
+    } catch (err: any) {
+      const status = err.response?.status;
+      const ghMessage = err.response?.data?.message || err.response?.data?.errors?.[0]?.message || err.message;
+      lastGhCreateError = err;
+
+      const isTransient422 = status === 422 && (
+        !ghMessage || // no message = GitHub internal glitch
+        ghMessage.includes("Repository creation failed") ||
+        ghMessage.includes("already exists") === false
+      );
+      // Also retry on 5xx or network errors
+      const isRetryable = isTransient422 || status >= 500 ||
+        err.message?.includes("fetch failed") || err.message?.includes("ECONNRESET") ||
+        err.code === "ECONNRESET";
+
+      if (!isRetryable || attempt === 3) {
+        console.error(`[V0 SERVICE] GitHub repo creation failed (HTTP ${status}): ${ghMessage}`);
+        throw err;
+      }
+      const delay = 2000 * attempt;
+      console.warn(`[V0 SERVICE] GitHub repo creation failed (HTTP ${status}): ${ghMessage} — retrying in ${delay}ms (attempt ${attempt}/3)`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
 
   const githubRepoUrl = createRepoRes.data.html_url;
   const repoFullName = createRepoRes.data.full_name; // e.g. "AgentWebPro/lp-acme-a1b2c3"
@@ -2261,7 +2290,12 @@ export async function deleteLandingPage(
     throw new Error("Landing page not found");
   }
 
-  if (record.isRootPage) {
+  // Allow deleting a failed root page that was never deployed (no GitHub repo created).
+  // A deployed root page still cannot be deleted — it would orphan the repo and Vercel project.
+  if (record.isRootPage && record.githubRepoUrl) {
+    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
+  }
+  if (record.isRootPage && record.status !== "failed") {
     throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
   }
 
