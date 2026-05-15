@@ -11,6 +11,7 @@
 #   AWS_PROFILE=staging ./repair-leads-add-lookup-indexes.sh
 #   SKIP_BACKFILL=1 ./repair-leads-add-lookup-indexes.sh       # GSIs only
 #   SKIP_GSI=1      ./repair-leads-add-lookup-indexes.sh       # backfill only
+#   DRY_RUN=1 SKIP_GSI=1 ./repair-leads-add-lookup-indexes.sh  # dry-run backfill
 #
 # Env:
 #   TABLE         — table name (default: AW-Leads)
@@ -18,6 +19,7 @@
 #   POLL_SECS     — seconds between status polls (default: 30)
 #   SKIP_BACKFILL — set to 1 to skip the backfill step
 #   SKIP_GSI      — set to 1 to skip GSI creation (run backfill only)
+#   DRY_RUN       — set to 1 to pass --dry-run to the backfill (no writes)
 #   REPO_ROOT     — path to agentweb repo root (auto-detected from script path)
 
 set -euo pipefail
@@ -27,6 +29,7 @@ AWS_REGION="${AWS_REGION:-us-west-2}"
 POLL_SECS="${POLL_SECS:-30}"
 SKIP_BACKFILL="${SKIP_BACKFILL:-0}"
 SKIP_GSI="${SKIP_GSI:-0}"
+DRY_RUN="${DRY_RUN:-0}"
 
 # Resolve the script's own directory so we can find backfillLeadsUserId.ts
 # even when the admin runs the script from somewhere else.
@@ -188,6 +191,12 @@ run_backfill() {
     return 1
   fi
 
+  local dry_flag=""
+  if [[ "$DRY_RUN" == "1" ]]; then
+    dry_flag="--dry-run"
+    echo "→ DRY_RUN=1 — backfill will report what it WOULD write, no UpdateItem calls"
+  fi
+
   echo "→ Running backfill from $REPO_ROOT/backend"
   echo "   (NODE_ENV=production — backfill uses un-prefixed table name; AWS profile selects account)"
   echo
@@ -198,7 +207,7 @@ run_backfill() {
       echo "→ node_modules missing — running npm install (one-time)..."
       npm install
     fi
-    NODE_ENV=production npx ts-node src/scripts/backfillLeadsUserId.ts
+    NODE_ENV=production npx ts-node src/scripts/backfillLeadsUserId.ts $dry_flag
   )
 }
 
