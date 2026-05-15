@@ -3855,7 +3855,7 @@ emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images. IMPORTANT: When adding a logo to an image, always provide the logo URL in the dedicated logo_image parameter (NOT in inputImages). The logo_image parameter ensures the logo is reproduced with exact precision in text, shape, and color.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image-preview or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image-preview renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3869,7 +3869,7 @@ emmaToolRegistry.register({
         },
         size: {
           type: 'string',
-          description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 Pro Image (gemini-3-pro-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
+          description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 models (gemini-3-pro-image-preview, gemini-3.1-flash-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
           default: 'auto'
         },
         quality: {
@@ -3891,7 +3891,7 @@ emmaToolRegistry.register({
         },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gpt-image-2 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          description: 'Optional: Specific image generation model to use. Model guide: gemini-3.1-flash-image-preview (Google, BEST for logo compositing — renders logo most prominently, 4K output), gemini-3-pro-image-preview (Google, excellent for logo compositing, 4K output), gpt-image-2 (Azure, good for logo compositing — preserves logo faithfully, 1024×1024, may add extra design elements), gpt-image-1 (Azure, DO NOT USE for logo compositing — rewrites logo text instead of preserving it; fine for text-to-image with no logo), gemini-2.5-flash-image (Google, text-to-image only, no logo compositing), gen4_image (Runway, cinematic/photorealistic), gemini_2.5_flash (Runway). When logo_image is provided and no model is specified, gemini-3-pro-image-preview is the default.',
           enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
         }
       },

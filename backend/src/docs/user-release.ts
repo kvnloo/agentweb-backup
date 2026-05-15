@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
+      'Fixed: Emma Now Correctly Composites Real Logos on Image Ads',
+      '- Emma previously claimed AI image generation "cannot reliably composite a real logo" and silently fell back to building an HTML file instead of the requested image — this was incorrect behavior',
+      '- Emma now uses the logo_image parameter with your brand guidelines logo PNG and generates a proper image ad using Gemini or GPT models',
+      '- Gemini 3.1 Flash and Gemini 3 Pro produce the highest logo fidelity at 4K resolution; GPT-image-2 is also reliable at 1024×1024',
+      '- Emma will never silently switch the output format from image to HTML without explicit approval',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
       'Improved: Emma Can Now Find Your Favorited and Approved Images',
       '- Asking Emma "show me my favorited images" now returns only the images you\'ve starred (❤️) on the Images page',
       '- Asking Emma "show me my approved images" now returns only images that have been approved via the Slack approval workflow',
