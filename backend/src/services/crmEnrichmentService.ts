@@ -459,6 +459,23 @@ export class CrmEnrichmentService {
     return false;
   }
 
+  static isPersonalDomain(domain: string): boolean {
+    const d = domain.toLowerCase().trim();
+    if (!d) return false;
+    if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(d)) return true;
+    if (CrmEnrichmentService.isInstitutionalDomain(d)) return true;
+    return false;
+  }
+
+  static extractDomain(website: string): string | null {
+    try {
+      const url = new URL(website.includes('://') ? website : `https://${website}`);
+      return url.hostname.replace(/^www\./, '').trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Substitute {{placeholder}} tokens in a search query template with actual lead field values.
    * Multi-space gaps left by empty substitutions are collapsed to a single space.
@@ -509,7 +526,7 @@ export class CrmEnrichmentService {
     });
 
     const isPersonalDomain = emailDomain
-      ? CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)
+      ? CrmEnrichmentService.isPersonalDomain(emailDomain)
       : false;
     const businessDomain = isPersonalDomain ? '' : emailDomain;
 
@@ -671,7 +688,7 @@ export class CrmEnrichmentService {
     if (hasCompanyLinkedinField) {
       const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
       const isPersonalDomain = emailDomain
-        ? CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)
+        ? CrmEnrichmentService.isPersonalDomain(emailDomain)
         : false;
       const companyTerm = (!isPersonalDomain && emailDomain) || String(lead.company || '').trim();
       if (companyTerm) {
@@ -1254,13 +1271,13 @@ export class CrmEnrichmentService {
     if (spec.apolloTechStack && llmWebSearchFields.length > 0 && isApolloServiceReady()) {
       const domain =
         lead.emailDomain ||
-        (lead.website ? lead.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0] : null) ||
+        (lead.website ? CrmEnrichmentService.extractDomain(lead.website) : null) ||
         null;
-      const isPersonalDomain = domain ? CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`) : false;
+      const isPersonalDomain = domain ? CrmEnrichmentService.isPersonalDomain(domain) : false;
       if (domain && !isPersonalDomain) {
         try {
           const orgResult = await getApolloService().matchOrg(domain);
-          const techStack = orgResult.found ? orgResult.organization?.techStack : undefined;
+          const techStack = orgResult.organization?.techStack;
           if (techStack && techStack.length > 0) {
             apolloTechStackContext = `Apollo technology data for ${domain}:\n${techStack.join(', ')}`;
             console.log(`[CrmEnrichment][enrichLead] apollo tech stack HIT domain=${domain} lead=${lead.leadId} tools=${techStack.length}`);
@@ -1270,6 +1287,8 @@ export class CrmEnrichmentService {
         } catch (err: any) {
           console.warn(`[CrmEnrichment][enrichLead] apollo tech stack error domain=${domain} lead=${lead.leadId}: ${err?.message}`);
         }
+      } else {
+        console.log(`[CrmEnrichment][enrichLead] apollo tech stack SKIP lead=${lead.leadId} reason=${!domain ? 'no-domain' : 'personal-domain'}`);
       }
       if (apolloTechStackContext) {
         units.push({ webContext: apolloTechStackContext, linkedinContext: '', fields: llmWebSearchFields, label: 'apollo:tech_stack' });
