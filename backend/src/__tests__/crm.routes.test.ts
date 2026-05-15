@@ -952,6 +952,98 @@ describe('CRM Routes', () => {
         }),
       }));
     });
+
+    it('persists isMatch=false and no matchedIcpTitle when winner score is below threshold', async () => {
+      // Coverage gap from initial PR: winner exists but score < 70.
+      // matchedIcpTitle must stay undefined so the frontend doesn't render a
+      // stale title on a non-match.
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          {
+            index: 1,
+            categoryMatches: [
+              { icpTitle: 'SaaS founders', isMatch: false, score: 50, reason: 'Wrong segment.' },
+            ],
+          },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updateCall.icpMatch.isMatch).toBe(false);
+      expect(updateCall.icpMatch.score).toBe(50);
+      expect(updateCall.icpMatch.matchedIcpTitle).toBeUndefined();
+    });
+
+    it('coerces non-numeric scores (string, NaN) to 0 so DDB writes do not fail', async () => {
+      // `cat.score ?? 0` only catches null/undefined. A string like "high" or
+      // NaN survives the ?? then poisons Math.max with NaN, which would crash
+      // the DDB write for the whole chunk. Coercion must use Number.isFinite.
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          {
+            index: 1,
+            categoryMatches: [
+              { icpTitle: 'SaaS founders', isMatch: false, score: 'high' as unknown as number, reason: 'LLM hallucinated string score.' },
+            ],
+          },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updateCall.icpMatch.score).toBe(0);
+      expect(Number.isNaN(updateCall.icpMatch.score)).toBe(false);
+      // Stored categoryMatches must also have the coerced score so the
+      // frontend doesn't read NaN out of DynamoDB later.
+      expect(updateCall.icpMatch.categoryMatches[0].score).toBe(0);
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/enrich-web', () => {
