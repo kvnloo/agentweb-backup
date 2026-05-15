@@ -3000,6 +3000,11 @@ export class AgentModeService {
     // header but has no tool to retrieve the full content.
     'search_tool_response',
     'read_tool_response',
+
+    // Data Analysis — core analytical primitive needed by scheduled reports and
+    // ad-hoc analysis tasks. Must be available even when no skill is installed
+    // so that scheduled chats with empty requiredFunctionCalls can still call it.
+    'perform_data_analysis',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -5538,10 +5543,19 @@ export class AgentModeService {
       const statusCode = (error as any)?.response?.status;
       const isPayloadTooLarge = statusCode === 413 ||
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
+      const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
+        /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
       if (isPayloadTooLarge) {
         return {
           success: false,
           message: `The data payload sent to Gemini was too large. IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`,
+          error: errorMessage
+        };
+      }
+      if (isTimeout) {
+        return {
+          success: false,
+          message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
         };
       }
@@ -13571,6 +13585,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       toolName === 'browser_run_code' || toolName.endsWith('_browser_run_code');
     if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
+    }
+    // Data analysis timeout — LLM must break the analysis into smaller chunks
+    // (checked before too-large to avoid "too large for a single call" matching the wrong branch)
+    if (toolName === 'perform_data_analysis' &&
+        (safeMessage.includes('timed out') || safeMessage.includes('timeout') || safeMessage.includes('too large for a single call'))) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The analysis timed out because the dataset or task is too large. Break it into smaller pieces: split the data by date range or category, call perform_data_analysis separately for each subset with a focused instruction, then combine the partial results into a final summary.`;
     }
     // Data analysis "too large" errors — LLM must use save_file, not keep retrying with inline data
     if (toolName === 'perform_data_analysis' &&
