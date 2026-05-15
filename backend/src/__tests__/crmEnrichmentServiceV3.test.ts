@@ -14,6 +14,11 @@ import {
 } from '../services/crmEnrichmentServiceV3';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
+jest.mock('../services/enrichmentSiblingConfigFields', () => ({
+  ...jest.requireActual('../services/enrichmentSiblingConfigFields'),
+  buildSiblingFieldMappingTable: jest.fn().mockResolvedValue({ canonical: new Map(), llm: new Map() }),
+}));
+
 const LIST_ID = 'list-1';
 const USER_ID = 'user-1';
 
