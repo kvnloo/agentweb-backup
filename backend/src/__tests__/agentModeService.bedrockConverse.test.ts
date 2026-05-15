@@ -190,7 +190,8 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
 
       expect(messages).toHaveLength(2);
       expect(messages[0].content).toEqual([{ text: '' }]);
-      expect(messages[1].content).toEqual([{ text: '' }]);
+      // Bedrock rejects { text: '' } for assistant messages — fallback uses '...'
+      expect(messages[1].content).toEqual([{ text: '...' }]);
     });
 
     it('should handle tool_calls stored as a JSON string (legacy/corrupt data)', () => {

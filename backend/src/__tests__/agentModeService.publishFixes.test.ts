@@ -302,6 +302,71 @@ describe('trimToolMessagesForContext', () => {
     expect(trimmed[1].content).toBe(longUserMsg);
     expect(trimmed[2].content).toBe('response');
   });
+
+  it('should trim large content_draft in old create_blog_article assistant messages', () => {
+    const service = new AgentModeService();
+    const largeDraft = 'x'.repeat(5000);
+    const messages: any[] = [
+      { role: 'system', content: 'system' },
+      // Old assistant message with large content_draft
+      {
+        role: 'assistant', content: null,
+        tool_calls: [{
+          id: 'tc1',
+          function: {
+            name: 'create_blog_article',
+            arguments: JSON.stringify({ title_draft: 'My Blog', content_draft: largeDraft })
+          }
+        }]
+      },
+      { role: 'tool', tool_call_id: 'tc1', name: 'create_blog_article', content: JSON.stringify({ success: true, htmlUrl: 'https://s3/blog.html' }) },
+      // 3 more recent tool calls to push tc1 outside the preserve window
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc2', function: { name: 'search_web', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tc2', name: 'search_web', content: 'results' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc3', function: { name: 'search_web', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tc3', name: 'search_web', content: 'results2' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc4', function: { name: 'search_web', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tc4', name: 'search_web', content: 'results3' },
+    ];
+
+    const trimmed = service.trimToolMessagesForContext(messages);
+
+    // The old assistant message's content_draft should be truncated
+    const oldAssistantMsg = trimmed[1];
+    expect(oldAssistantMsg.role).toBe('assistant');
+    const args = JSON.parse(oldAssistantMsg.tool_calls[0].function.arguments);
+    expect(args.content_draft.length).toBeLessThan(5000);
+    expect(args.content_draft).toContain('[…trimmed]');
+    // title_draft should be unchanged (not in trim list)
+    expect(args.title_draft).toBe('My Blog');
+  });
+
+  it('should not trim create_blog_article args in recent assistant messages', () => {
+    const service = new AgentModeService();
+    const largeDraft = 'x'.repeat(5000);
+    const messages: any[] = [
+      { role: 'system', content: 'system' },
+      {
+        role: 'assistant', content: null,
+        tool_calls: [{
+          id: 'tc1',
+          function: {
+            name: 'create_blog_article',
+            arguments: JSON.stringify({ title_draft: 'My Blog', content_draft: largeDraft })
+          }
+        }]
+      },
+      // Only 1 tool result — stays in the recent preserve window
+      { role: 'tool', tool_call_id: 'tc1', name: 'create_blog_article', content: JSON.stringify({ success: true }) },
+    ];
+
+    const trimmed = service.trimToolMessagesForContext(messages);
+
+    // Only 1 tool result total, so recentToPreserve (3) covers it — no trimming
+    const assistantMsg = trimmed[1];
+    const args = JSON.parse(assistantMsg.tool_calls[0].function.arguments);
+    expect(args.content_draft).toBe(largeDraft);
+  });
 });
 
 // ─── 4. Worker uncaught error requestId ──────────────────────────────────────

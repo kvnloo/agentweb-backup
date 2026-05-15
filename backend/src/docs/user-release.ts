@@ -20,6 +20,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
+      'Fixed: Scheduled Chats No Longer Fail with a Blank Content Error on Follow-Up Messages',
+      '- Scheduled chats that ran a full multi-step pipeline (blog, hero image, SEO QA, LinkedIn post) were crashing on the next user message with a Bedrock 400 "ContentBlock text is blank" error',
+      '- The error occurred because unresolved assistant tool-call messages with no text content were being passed to the AI as empty content blocks',
+      '- Those messages are now skipped when building the conversation context, and the empty content fallback no longer sends a blank block that Bedrock rejects',
+      '- Long scheduled sessions also trim large tool call arguments (e.g. full blog draft content) in older parts of the conversation to prevent context window overflow',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
       'Fixed: Emma Now Correctly Composites Real Logos on Image Ads',
       '- Emma previously claimed AI image generation "cannot reliably composite a real logo" and silently fell back to building an HTML file instead of the requested image — this was incorrect behavior',
       '- Emma now uses the logo_image parameter with your brand guidelines logo PNG and generates a proper image ad using Gemini or GPT models',
