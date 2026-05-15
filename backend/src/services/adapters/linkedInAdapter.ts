@@ -105,8 +105,8 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Create post (with or without images)
       const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
 
-      // Store post in database for personal accounts only
-      if (userId && config.account_type === 'personal') {
+      // Store post in database for both personal and company page accounts
+      if (userId && (config.account_type === 'personal' || config.account_type === 'company_page')) {
         try {
           const { createPost: storePost } = await import('../linkedInPostsDb');
           await storePost(userId, authorUrn, postUrn, content, mediaUrls);
@@ -290,12 +290,50 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
     }
 
-    // Organization accounts: use LinkedIn API
-    const { token } = await this.getValidToken(account, userId);
-    const authorUrn = account.account_id;
+    // Organization accounts: check local DB cache first, then try LinkedIn API
+    const { getPostsByAccount } = await import('../linkedInPostsDb');
+    const cachedPosts = await getPostsByAccount(account.account_id, limit);
 
-    const response = await linkedInService.listPosts(token, authorUrn, 0, limit);
-    return response.elements || [];
+    try {
+      const { token } = await this.getValidToken(account, userId);
+      const authorUrn = account.account_id;
+      const response = await linkedInService.listPosts(token, authorUrn, 0, limit);
+      const apiPosts = response.elements || [];
+
+      // If API returned posts, use them
+      if (apiPosts.length > 0) {
+        return apiPosts;
+      }
+
+      // API returned empty — fall back to locally cached posts (created via AgentWeb)
+      if (cachedPosts.length > 0) {
+        return cachedPosts.map(post => ({
+          id: post.postId,
+          author: post.accountId,
+          commentary: post.content,
+          created: { time: new Date(post.createdAt).getTime() },
+          lifecycleState: 'PUBLISHED',
+          visibility: 'PUBLIC',
+        }));
+      }
+
+      return [];
+    } catch (error: any) {
+      // If API call fails but we have cached posts, return those
+      if (cachedPosts.length > 0) {
+        console.warn('[LinkedInAdapter] LinkedIn API failed for company page, returning cached posts:', error?.message);
+        return cachedPosts.map(post => ({
+          id: post.postId,
+          author: post.accountId,
+          commentary: post.content,
+          created: { time: new Date(post.createdAt).getTime() },
+          lifecycleState: 'PUBLISHED',
+          visibility: 'PUBLIC',
+        }));
+      }
+      // No cache available — re-throw so caller surfaces the real error
+      throw error;
+    }
   }
 
   /**

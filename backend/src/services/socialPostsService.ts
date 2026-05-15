@@ -37,6 +37,7 @@ interface AccountSummary {
   platform: string;
   accountType: string;
   postCount: number;
+  error?: string;
 }
 
 interface GetPostsResult {
@@ -140,7 +141,7 @@ export async function getPostsForUser(
         accountType,
         postCount: normalizedPosts.length,
       });
-    } catch (error) {
+    } catch (error: any) {
       console.warn(`[SocialPosts] Failed to load posts for account ${account.account_id}:`, error);
       // Still include the account in summaries so it remains visible on the page
       const accountType = (account.config as any)?.account_type || 'unknown';
@@ -150,6 +151,7 @@ export async function getPostsForUser(
         platform: account.platform,
         accountType,
         postCount: 0,
+        error: error?.message || 'Failed to load posts',
       });
     }
   }

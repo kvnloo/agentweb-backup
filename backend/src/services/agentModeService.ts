@@ -20895,6 +20895,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // If the account errored (0 posts + error field), surface the real error
+      const accountResult = result.accounts.find(a => a.accountId === accountId);
+      if (accountResult?.error && result.posts.length === 0) {
+        return {
+          success: false,
+          message: `Failed to load posts: ${accountResult.error}`,
+          error: accountResult.error,
+        };
+      }
+
       return {
         success: true,
         message: `Successfully loaded ${result.posts.length} posts`,
