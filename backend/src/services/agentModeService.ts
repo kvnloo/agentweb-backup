@@ -10670,8 +10670,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
 
       // Fetch campaigns
       console.log('AgentMode: Fetching Meta ad campaigns for user:', userId);
@@ -10919,7 +10918,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             );
           })();
 
-      const version = process.env.META_API_VERSION || "v24.0";
+      const version = process.env.META_API_VERSION || "v25.0";
       const baseUrl = `https://graph.facebook.com/${version}`;
       const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
 
@@ -12062,8 +12061,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
 
       // Calculate date range based on timeframe
       // Exclude today since it's not fully complete - use yesterday as end date

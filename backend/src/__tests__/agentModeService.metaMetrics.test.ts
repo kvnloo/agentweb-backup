@@ -706,7 +706,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
                 { id: 'camp2', name: 'Campaign 2' }
               ],
               paging: {
-                next: 'https://graph.facebook.com/v18.0/act_123456789/campaigns?after=cursor123'
+                next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=cursor123'
               }
             })
           });
@@ -780,7 +780,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
                 { id: 'camp2', name: 'Campaign 2' }
               ],
               paging: {
-                next: 'https://graph.facebook.com/v18.0/act_123456789/campaigns?after=page2'
+                next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=page2'
               }
             })
           });
@@ -796,7 +796,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
                 { id: 'camp4', name: 'Campaign 4' }
               ],
               paging: {
-                next: 'https://graph.facebook.com/v18.0/act_123456789/campaigns?after=page3'
+                next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=page3'
               }
             })
           });
@@ -865,7 +865,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
             json: () => Promise.resolve({
               data: [{ id: 'camp1', name: 'Campaign 1' }],
               paging: {
-                next: 'https://graph.facebook.com/v18.0/act_123456789/campaigns?after=cursor'
+                next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=cursor'
               }
             })
           });
@@ -932,7 +932,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
             json: () => Promise.resolve({
               data: [{ id: 'camp1' }],
               paging: {
-                next: 'https://graph.facebook.com/v18.0/act_123456789/campaigns?after=cursor'
+                next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=cursor'
               }
             })
           });

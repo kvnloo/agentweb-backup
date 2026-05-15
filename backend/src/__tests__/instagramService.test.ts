@@ -6,7 +6,7 @@ jest.mock('axios');
 
 describe('InstagramService', () => {
     const mockAxios = axios as jest.Mocked<typeof axios>;
-    const BASE_URL = 'https://graph.instagram.com/v18.0';
+    const BASE_URL = 'https://graph.instagram.com/v25.0';
 
     beforeEach(() => {
         jest.clearAllMocks();

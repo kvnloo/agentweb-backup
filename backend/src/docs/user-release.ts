@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-14
+// Last updated: 2026-05-15
 
 export interface UserReleaseNote {
   date: string;
@@ -15,6 +15,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Asking Emma "show me my favorited images" now returns only the images you\'ve starred (❤️) on the Images page',
       '- Asking Emma "show me my approved images" now returns only images that have been approved via the Slack approval workflow',
       '- Every image result now includes its favorite status, making it easier to reference and act on your curated assets',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
+      'Infrastructure: Meta Marketing API upgraded to v25.0',
+      '- All Meta API calls now use v25.0 by default, ahead of Meta\'s deprecation of versions prior to v24.0 on June 9, 2026',
     ],
   },
   {

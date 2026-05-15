@@ -1034,7 +1034,7 @@ export class MetaService {
    */
   public async listPixels(adAccountId: string, accessToken: string) {
     try {
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,is_created_by_business&access_token=${accessToken}`;
       const { fetchWithRetry } = await import('../utils/metaApiFetch');
       const response = await fetchWithRetry(url);
@@ -1053,7 +1053,7 @@ export class MetaService {
    */
   public async listDatasets(pixelId: string, accessToken: string) {
     try {
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/datasets?fields=id,name&access_token=${accessToken}`;
       const { fetchWithRetry } = await import('../utils/metaApiFetch');
       const response = await fetchWithRetry(url);
@@ -1072,7 +1072,7 @@ export class MetaService {
    */
   public async getDatasetEventStats(datasetId: string, accessToken: string) {
     try {
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${datasetId}?fields=id,name,event_stats&access_token=${accessToken}`;
       const { fetchWithRetry } = await import('../utils/metaApiFetch');
       const response = await fetchWithRetry(url);

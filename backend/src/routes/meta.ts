@@ -102,8 +102,7 @@ router.get("/ad-performance", async (req, res) => {
       return res.status(400).json({ message: error.message || "Ad account not configured" });
     }
 
-    // Get API version from environment or default to v18.0
-    const apiVersion = process.env.META_API_VERSION || 'v18.0';
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
     console.log("Using Meta Graph API version:", apiVersion);
 
     // Test the access token with a simple API call first
@@ -607,7 +606,7 @@ router.get("/campaigns-and-adsets", async (req, res) => {
       return res.status(400).json({ message: error.message || "Ad account not configured" });
     }
 
-    const apiVersion = process.env.META_API_VERSION || 'v18.0';
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
 
     // Fetch campaigns
     const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status&access_token=${accessToken}`;
@@ -761,8 +760,8 @@ router.post("/create-ad", async (req, res) => {
       return res.status(400).json({ message: error.message || "Ad account not configured" });
     }
 
-    const apiVersion = process.env.META_API_VERSION || 'v18.0';
-    
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+
     console.log("=== Creating Meta Ad ===");
     console.log("Received pageId:", pageId);
     console.log("Received adName:", adName);
