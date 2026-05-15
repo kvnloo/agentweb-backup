@@ -1246,7 +1246,9 @@ export class AgentModeService {
             });
           }
         }
-        if (contentBlocks.length === 0) contentBlocks.push({ text: '' });
+        // Bedrock rejects blank text blocks — use a non-empty placeholder if the assistant
+        // message has neither text content nor tool calls (e.g. stored with empty content field).
+        if (contentBlocks.length === 0) contentBlocks.push({ text: '...' });
       } else if (msg.role === 'tool') {
         // Tool results become user messages with toolResult blocks
         role = 'user';
@@ -1284,9 +1286,10 @@ export class AgentModeService {
               }
             }
           }
-          if (toolResultContent.length === 0) toolResultContent = [{ text: '' }];
+          // Bedrock rejects empty text blocks — fall back to a placeholder
+          if (toolResultContent.length === 0) toolResultContent = [{ text: '(empty)' }];
         } else {
-          toolResultContent = [{ text: String(msg.content || '') }];
+          toolResultContent = [{ text: String(msg.content || '(empty)') }];
         }
         contentBlocks.push({
           toolResult: {
@@ -1366,7 +1369,7 @@ export class AgentModeService {
           blocks.push({ text: JSON.stringify(item) });
         }
       }
-      return blocks.length > 0 ? blocks : [{ text: '' }];
+      return blocks.length > 0 ? blocks : [{ text: '.' }];
     }
     return [{ text: String(content) }];
   }
@@ -2454,7 +2457,17 @@ export class AgentModeService {
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
-      console.error('AgentMode: Response generation failed:', error);
+      // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
+      const errorMsg = error?.message || String(error);
+      const bedrockMsg = error?.$response?.body ? String(error.$response.body).slice(0, 500) : undefined;
+      console.error('AgentMode: Response generation failed:', {
+        message: errorMsg,
+        name: error?.name,
+        code: error?.code,
+        httpStatus: error?.status ?? error?.$metadata?.httpStatusCode,
+        bedrockBody: bedrockMsg,
+        sessionId,
+      });
 
       // Determine user-friendly message based on error type
       let userMessage: string;
@@ -2462,13 +2475,15 @@ export class AgentModeService {
         || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
       // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
+      // Check for context-limit patterns in the raw error message before falling through to generic 400
+      const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
       } else if (isTimeout) {
         userMessage = 'Your request took longer than expected. Please try again.';
-      } else if (httpStatus === 400) {
+      } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
@@ -2689,6 +2704,13 @@ export class AgentModeService {
       // Skip empty assistant messages (no content and no tool_calls) — these are artifacts
       // from failed LLM responses where content was lost (e.g. Gemini safety filter)
       if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
+        continue;
+      }
+      // Skip assistant messages that have tool_calls in the DB but whose tool results are
+      // not present in the context window (unresolved tool calls) AND have no text content.
+      // Sending them as plain assistant messages with empty content causes Bedrock 400:
+      // "The text field in the ContentBlock object is blank."
+      if (msg.role === 'assistant' && !msg.content && (msg as any).tool_calls?.length > 0 && !resolvedToolCallIndices.has(sliceIdx)) {
         continue;
       }
       // Skip error messages — they carry no useful context for the LLM and accumulate
@@ -2978,6 +3000,11 @@ export class AgentModeService {
     // header but has no tool to retrieve the full content.
     'search_tool_response',
     'read_tool_response',
+
+    // Data Analysis — core analytical primitive needed by scheduled reports and
+    // ad-hoc analysis tasks. Must be available even when no skill is installed
+    // so that scheduled chats with empty requiredFunctionCalls can still call it.
+    'perform_data_analysis',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -5516,10 +5543,19 @@ export class AgentModeService {
       const statusCode = (error as any)?.response?.status;
       const isPayloadTooLarge = statusCode === 413 ||
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
+      const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
+        /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
       if (isPayloadTooLarge) {
         return {
           success: false,
           message: `The data payload sent to Gemini was too large. IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`,
+          error: errorMessage
+        };
+      }
+      if (isTimeout) {
+        return {
+          success: false,
+          message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
         };
       }
@@ -13550,6 +13586,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
     }
+    // Data analysis timeout — LLM must break the analysis into smaller chunks
+    // (checked before too-large to avoid "too large for a single call" matching the wrong branch)
+    if (toolName === 'perform_data_analysis' &&
+        (safeMessage.includes('timed out') || safeMessage.includes('timeout') || safeMessage.includes('too large for a single call'))) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The analysis timed out because the dataset or task is too large. Break it into smaller pieces: split the data by date range or category, call perform_data_analysis separately for each subset with a focused instruction, then combine the partial results into a final summary.`;
+    }
     // Data analysis "too large" errors — LLM must use save_file, not keep retrying with inline data
     if (toolName === 'perform_data_analysis' &&
         (safeMessage.includes('too large') || safeMessage.includes('exceeds'))) {
@@ -14770,6 +14812,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'read_market_strategy': 50000,
     'search_tool_response': 20000,
     'read_tool_response': 60000,
+    'read_brand_guidelines': 15000,
+    'read_knowledge_base_files': 10000,
+    'read_page_source': 8000,
+  };
+
+  // Tool call argument fields to trim in old assistant messages when context is large.
+  // Maps tool name -> list of argument field names that can be truncated.
+  private static readonly LARGE_TOOL_ARG_TRIM: Record<string, { fields: string[]; limit: number }> = {
+    'create_blog_article': { fields: ['content_draft'], limit: 500 },
+    'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
@@ -14786,6 +14838,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
+    // Track which assistant messages are "old" (all their tool_calls have been resolved
+    // and are not in the preserve set). We identify these to trim large argument fields.
+    const oldAssistantIndices = new Set<number>();
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === 'assistant' && msg.tool_calls?.length) {
+        // Find the tool result indices for this assistant message's tool calls
+        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
+        let allOld = true;
+        for (let j = i + 1; j < messages.length; j++) {
+          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
+            if (preserveSet.has(j)) {
+              allOld = false;
+              break;
+            }
+          }
+        }
+        if (allOld) {
+          oldAssistantIndices.add(i);
+        }
+      }
+    }
+
     // Shallow-copy the array; only deep-copy messages that need modification
     const result = messages.map((msg, idx) => {
       if (
@@ -14800,6 +14875,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
         }
       }
+
+      // Trim large tool call arguments in old assistant messages to prevent context overflow
+      if (msg.role === 'assistant' && oldAssistantIndices.has(idx) && msg.tool_calls?.length) {
+        let modified = false;
+        const newToolCalls = msg.tool_calls.map((tc: any) => {
+          const trimSpec = AgentModeService.LARGE_TOOL_ARG_TRIM[tc.function?.name];
+          if (!trimSpec) return tc;
+          let args: Record<string, any>;
+          try {
+            args = JSON.parse(tc.function.arguments || '{}');
+          } catch {
+            return tc;
+          }
+          let changed = false;
+          for (const field of trimSpec.fields) {
+            if (typeof args[field] === 'string' && args[field].length > trimSpec.limit) {
+              args[field] = args[field].slice(0, trimSpec.limit) + '[…trimmed]';
+              changed = true;
+            }
+          }
+          if (!changed) return tc;
+          modified = true;
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(args) } };
+        });
+        if (modified) {
+          return { ...msg, tool_calls: newToolCalls };
+        }
+      }
+
       return msg;
     });
 
@@ -20776,7 +20880,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async loadConnectedAccountPosts(
     userId: string,
     accountId: string,
-    options: { limit?: number; include_metrics?: boolean } = {}
+    options: { limit?: number; include_metrics?: boolean; force_reload?: boolean } = {}
   ): Promise<any> {
     console.log('[AgentMode] loadConnectedAccountPosts called:', {
       userId,
@@ -20801,6 +20905,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
+        forceReload: options.force_reload === true,
       });
 
       // If the account wasn't processed (adapter threw), treat as failure
@@ -20808,6 +20913,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return {
           success: false,
           message: 'Failed to load posts',
+        };
+      }
+
+      // If the account errored (0 posts + error field), surface the real error
+      const accountResult = result.accounts.find(a => a.accountId === accountId);
+      if (accountResult?.error && result.posts.length === 0) {
+        return {
+          success: false,
+          message: `Failed to load posts: ${accountResult.error}`,
+          error: accountResult.error,
         };
       }
 

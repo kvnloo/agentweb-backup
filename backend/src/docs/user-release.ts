@@ -16,6 +16,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Tips are now drawn from 160 hand-written GTM best practices spanning Paid Ads, Founder-Led Sales, Organic Content, and Competitor / GTM Strategy — 40 per category',
       '- Your prompt is keyword-matched to the most relevant category, then 3 tips are picked from that bank with no repeats in the same session',
       '- Result: instant (no API call), consistent voice, and never hallucinated content',
+      'Fixed: LinkedIn Company Page Posts Now Load Correctly',
+      '- list_connected_account_posts now returns posts for LinkedIn company pages instead of always returning an empty list',
+      '- Posts created through AgentWeb are stored locally and served as a fallback when the LinkedIn API is unavailable or returns empty',
+      '- Posts fetched from LinkedIn are cached for 1 day to reduce API calls; use force_reload: true to fetch fresh posts on demand',
+      '- API errors (e.g. permission denied) are now surfaced as a clear error message instead of silently returning 0 posts',
     ],
   },
   {
@@ -25,6 +30,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When a user @mentioned Emma inside an existing Slack thread, Slack sent both an app_mention and a message event for the same message',
       '- Both event handlers were running independently, causing Emma to generate and post two separate responses',
       '- The thread message handler now skips any message that @mentions Emma, letting the app_mention handler process it exclusively',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail with a Blank Content Error on Bedrock',
+      '- Scheduled chats that ran a full multi-step pipeline (blog, hero image, SEO QA, LinkedIn post) could crash with a Bedrock 400 "ContentBlock text is blank" error',
+      '- Empty assistant tool-call messages with no text and empty tool result content are now given non-empty placeholder text before sending to Bedrock, preventing the ValidationException',
+      '- Long scheduled sessions also trim large tool call arguments in older parts of the conversation to prevent context window overflow',
+      '- Oncall alerts for scheduled chat failures now include the original API error message for faster diagnosis',
     ],
   },
   {
@@ -6282,6 +6297,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Email Draft — Organization Members Can Now Draft Emails for Leads in Any Org List',
       '- Creating an email draft for a lead in a CRM list owned by another org member was returning "Access denied — You do not have permission to access this lead list"',
       '- The permission check now correctly allows any org member to draft emails for leads across all lists in their organization, consistent with how other CRM actions (viewing leads, sending emails) already work',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
+      'Fixed: Landing Page Generation Now Recovers from Transient GitHub Errors',
+      '- Some landing page generation sessions were failing with "Request failed with status code 422" when GitHub transiently rejected the repo creation request',
+      '- The service now automatically retries GitHub repo creation up to 3 times, preventing failures caused by momentary GitHub API glitches',
+      '- Orphaned failed landing page records that were never deployed can now be deleted and regenerated cleanly',
     ],
   },
   {

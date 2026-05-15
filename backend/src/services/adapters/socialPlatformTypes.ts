@@ -96,7 +96,7 @@ export interface SocialPlatformAdapter {
    * List posts from the account
    * @throws Error if not supported by account type
    */
-  listPosts(account: ConnectedAccount, options?: { limit?: number }, userId?: string): Promise<any[]>;
+  listPosts(account: ConnectedAccount, options?: { limit?: number; force_reload?: boolean }, userId?: string): Promise<any[]>;
 
   /**
    * Get metrics for specific posts

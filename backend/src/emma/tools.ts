@@ -3385,13 +3385,14 @@ emmaToolRegistry.register({
   name: 'list_connected_account_posts',
   definition: {
     name: 'list_connected_account_posts',
-    description: 'List posts from a connected social media account with optional metrics',
+    description: 'List posts from a connected social media account with optional metrics. For company pages, posts are cached locally for 1 day to reduce API calls — use force_reload to bypass the cache and fetch the latest posts from LinkedIn.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: { type: 'string', description: 'The connected account ID' },
         limit: { type: 'number', description: 'Maximum number of posts to return', default: 10 },
-        include_metrics: { type: 'boolean', description: 'Whether to include per-post metrics (likes, comments, etc.)', default: false }
+        include_metrics: { type: 'boolean', description: 'Whether to include per-post metrics (likes, comments, etc.)', default: false },
+        force_reload: { type: 'boolean', description: 'Force a fresh fetch from LinkedIn API, bypassing the local cache. Use this when the cached posts may be outdated.', default: false }
       },
       required: ['account_id']
     }
@@ -3402,7 +3403,8 @@ emmaToolRegistry.register({
       args.account_id,
       {
         limit: args.limit,
-        include_metrics: args.include_metrics
+        include_metrics: args.include_metrics,
+        force_reload: args.force_reload
       }
     );
   }
