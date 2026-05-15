@@ -20,11 +20,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
-      'Fixed: Scheduled Chats No Longer Fail with a Blank Content Error on Follow-Up Messages',
-      '- Scheduled chats that ran a full multi-step pipeline (blog, hero image, SEO QA, LinkedIn post) were crashing on the next user message with a Bedrock 400 "ContentBlock text is blank" error',
-      '- The error occurred because unresolved assistant tool-call messages with no text content were being passed to the AI as empty content blocks',
-      '- Those messages are now skipped when building the conversation context, and the empty content fallback no longer sends a blank block that Bedrock rejects',
-      '- Long scheduled sessions also trim large tool call arguments (e.g. full blog draft content) in older parts of the conversation to prevent context window overflow',
+      'Fixed: Scheduled Chats No Longer Fail with a Blank Content Error on Bedrock',
+      '- Scheduled chats that ran a full multi-step pipeline (blog, hero image, SEO QA, LinkedIn post) could crash with a Bedrock 400 "ContentBlock text is blank" error',
+      '- Empty assistant tool-call messages with no text and empty tool result content are now given non-empty placeholder text before sending to Bedrock, preventing the ValidationException',
+      '- Long scheduled sessions also trim large tool call arguments in older parts of the conversation to prevent context window overflow',
+      '- Oncall alerts for scheduled chat failures now include the original API error message for faster diagnosis',
     ],
   },
   {

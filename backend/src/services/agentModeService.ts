@@ -1286,9 +1286,10 @@ export class AgentModeService {
               }
             }
           }
-          if (toolResultContent.length === 0) toolResultContent = [{ text: '' }];
+          // Bedrock rejects empty text blocks — fall back to a placeholder
+          if (toolResultContent.length === 0) toolResultContent = [{ text: '(empty)' }];
         } else {
-          toolResultContent = [{ text: String(msg.content || '') }];
+          toolResultContent = [{ text: String(msg.content || '(empty)') }];
         }
         contentBlocks.push({
           toolResult: {
@@ -1368,7 +1369,7 @@ export class AgentModeService {
           blocks.push({ text: JSON.stringify(item) });
         }
       }
-      return blocks.length > 0 ? blocks : [{ text: '' }];
+      return blocks.length > 0 ? blocks : [{ text: '.' }];
     }
     return [{ text: String(content) }];
   }
