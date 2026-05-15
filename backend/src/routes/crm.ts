@@ -3374,6 +3374,14 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 });
 
 /**
+ * Score above which a lead is considered a match for an ICP category.
+ * Interpolated into the LLM prompt AND used to compute the persisted
+ * `isMatch` from the winning category's score — single source of truth so
+ * the prompt and the backend can't drift apart on what "match" means.
+ */
+const ICP_MATCH_THRESHOLD = 70;
+
+/**
  * @route POST /api/crm/lists/:listId/leads/match-icps
  * @desc Match leads against ICPs using AI
  * @access Private
@@ -3533,13 +3541,13 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
 
 Your task is to analyze each lead against EACH ICP category defined in the market strategy and determine how well they match.
 
-IMPORTANT: A score of 70 or above means the lead is a strong match for that ICP category. A score below 70 means they do not sufficiently match. Write your "reason" consistent with this threshold — if score >= 70, explain why this lead is a good fit; if score < 70, explain why they fall short.
+IMPORTANT: A score of ${ICP_MATCH_THRESHOLD} or above means the lead is a strong match for that ICP category. A score below ${ICP_MATCH_THRESHOLD} means they do not sufficiently match. Write your "reason" consistent with this threshold — if score >= ${ICP_MATCH_THRESHOLD}, explain why this lead is a good fit; if score < ${ICP_MATCH_THRESHOLD}, explain why they fall short.
 
 For each lead, evaluate it against every ICP category and provide:
 1. "icpTitle": string (exact title of the ICP category from the market strategy)
-2. "isMatch": boolean (true if score >= 70, false otherwise)
+2. "isMatch": boolean (true if score >= ${ICP_MATCH_THRESHOLD}, false otherwise)
 3. "score": number (0-100, how well the lead fits this ICP category)
-4. "reason": string (1-2 sentences consistent with the score — positive framing if score >= 70, explains the gap if score < 70)
+4. "reason": string (1-2 sentences consistent with the score — positive framing if score >= ${ICP_MATCH_THRESHOLD}, explains the gap if score < ${ICP_MATCH_THRESHOLD})
 
 Consider factors like:
 - Job title and seniority level
@@ -3605,8 +3613,6 @@ Please analyze each lead and return a JSON array with your assessment.`;
                   ? categoryMatches.reduce((best, cat) => cat.score > best.score ? cat : best)
                   : { icpTitle: '', isMatch: false, score: 0, reason: 'Insufficient lead data to evaluate against ICP categories.' };
 
-                // Threshold-based match: score >= 70 → Is ICP true
-                const ICP_MATCH_THRESHOLD = 70;
                 const isMatch = winner.score >= ICP_MATCH_THRESHOLD;
                 const matchedIcpTitle = isMatch ? winner.icpTitle : undefined;
 
