@@ -871,6 +871,87 @@ describe('CRM Routes', () => {
         processedCount: 1,
       }));
     });
+
+    it('should clamp out-of-range scores to 0-100', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          {
+            index: 1,
+            categoryMatches: [
+              { icpTitle: 'SaaS founders', isMatch: true, score: 150, reason: 'Over max score.' },
+            ],
+          },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
+        icpMatch: expect.objectContaining({ score: 100 }),
+      }));
+    });
+
+    it('should use fallback reason when LLM returns empty categoryMatches', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          { index: 1, categoryMatches: [] },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
+        icpMatch: expect.objectContaining({
+          isMatch: false,
+          score: 0,
+          reason: 'Insufficient lead data to evaluate against ICP categories.',
+        }),
+      }));
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/enrich-web', () => {

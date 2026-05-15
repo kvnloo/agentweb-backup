@@ -3595,10 +3595,15 @@ Please analyze each lead and return a JSON array with your assessment.`;
                 const lead = chunk[leadIndex];
 
                 // Pick the highest-scoring category as the winner
-                const categoryMatches = result.categoryMatches || [];
+                const rawCategoryMatches = result.categoryMatches || [];
+                // Clamp scores to 0-100
+                const categoryMatches = rawCategoryMatches.map(cat => ({
+                  ...cat,
+                  score: Math.min(100, Math.max(0, cat.score ?? 0)),
+                }));
                 const winner = categoryMatches.length > 0
                   ? categoryMatches.reduce((best, cat) => cat.score > best.score ? cat : best)
-                  : { icpTitle: '', isMatch: false, score: 0, reason: 'No ICP categories evaluated.' };
+                  : { icpTitle: '', isMatch: false, score: 0, reason: 'Insufficient lead data to evaluate against ICP categories.' };
 
                 // Threshold-based match: score >= 70 → Is ICP true
                 const ICP_MATCH_THRESHOLD = 70;
