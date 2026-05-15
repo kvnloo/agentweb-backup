@@ -856,6 +856,30 @@ describe('CRM Database Service', () => {
       expect(mergeSpy).not.toHaveBeenCalled();
       mergeSpy.mockRestore();
     });
+
+    it('runs bootstrap when only removeCustomFieldKeys is set (no SET keys)', async () => {
+      // Regression guard: DynamoDB REMOVE customFields.key throws ValidationException
+      // when the customFields map does not exist. Bootstrap must fire even when there
+      // are no keys to SET — only REMOVE keys present.
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        removeCustomFieldKeys: ['tech_stack_analytics', 'tech_stack_cms'],
+        removeEnrichmentMetadataKeys: ['tech_stack_analytics', 'tech_stack_cms'],
+      });
+
+      // Call 1: bootstrap (if_not_exists both maps)
+      // Call 2: combined REMOVE expression
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const bootstrap = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(bootstrap.UpdateExpression).toContain('if_not_exists(customFields');
+      expect(bootstrap.UpdateExpression).toContain('if_not_exists(enrichmentMetadata');
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('REMOVE');
+      expect(main.UpdateExpression).toContain('customFields.#rmcf0');
+    });
   });
 
   describe('mergeFieldNames', () => {

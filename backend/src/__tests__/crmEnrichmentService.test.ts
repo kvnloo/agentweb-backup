@@ -3086,4 +3086,47 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     expect(matchOrg).toHaveBeenCalledWith('beta.com');
   });
+
+  it('falls back to web search when Apollo matchOrg rejects', async () => {
+    const matchOrg = jest.fn().mockRejectedValue(new Error('Apollo timeout'));
+    const svc = { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Mixpanel' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
+
+  it('falls back to web search when Apollo returns found:true with empty techStack', async () => {
+    const matchOrg = jest.fn().mockResolvedValue({
+      found: true,
+      organization: { techStack: [] },
+      fromCache: false,
+      checkedAt: new Date().toISOString(),
+    });
+    const svc = { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Mixpanel' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
 });
