@@ -39,6 +39,14 @@ jest.mock('crypto', () => ({
 // Mock pdf-parse
 jest.mock('pdf-parse', () => jest.fn());
 
+// Mock xlsx
+jest.mock('xlsx', () => ({
+  read: jest.fn(),
+  utils: {
+    sheet_to_csv: jest.fn(),
+  },
+}));
+
 describe('readFileContent', () => {
   let agentModeService: AgentModeService;
   let mockDynamoDB: jest.Mocked<DynamoDB>;
@@ -348,6 +356,115 @@ describe('readFileContent', () => {
       expect(result.content_length).toBe(testContent.length);
       expect(result.file_url).toBe('https://example.com/file.txt');
       expect(result.message).toContain('Successfully read text file content');
+    });
+  });
+
+  describe('XLSX / Excel file parsing', () => {
+    beforeEach(() => {
+      const XLSX = require('xlsx');
+      XLSX.read.mockReturnValue({
+        SheetNames: ['Sheet1'],
+        Sheets: { Sheet1: {} },
+      });
+      XLSX.utils.sheet_to_csv.mockReturnValue('Campaign,Impressions,Clicks\nPost A,10000,500\nPost B,8000,320');
+    });
+
+    it('should parse an XLSX file and return CSV content', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake xlsx binary'),
+        headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/report.xlsx');
+
+      expect(result.success).toBe(true);
+      expect(result.file_type).toBe('spreadsheet');
+      expect(result.content).toContain('Sheet: Sheet1');
+      expect(result.content).toContain('Campaign,Impressions,Clicks');
+      expect(result.content).toContain('Post A,10000,500');
+    });
+
+    it('should detect xlsx by file extension regardless of content-type', async () => {
+      const mockResponse = {
+        data: Buffer.from('fake xlsx binary'),
+        headers: { 'content-type': 'application/octet-stream' },
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const result = await (agentModeService as any).readFileContent('https://s3.amazonaws.com/bucket/PostAnalytics.xlsx');
+
+      expect(result.success).toBe(true);
+      expect(result.file_type).toBe('spreadsheet');
+    });
+
+    it('should handle multi-sheet XLSX and label each sheet', async () => {
+      const XLSX = require('xlsx');
+      XLSX.read.mockReturnValue({
+        SheetNames: ['Overview', 'Details'],
+        Sheets: { Overview: {}, Details: {} },
+      });
+      XLSX.utils.sheet_to_csv
+        .mockReturnValueOnce('Metric,Value\nTotal,100')
+        .mockReturnValueOnce('Date,Post,Clicks\n2024-01,Post A,50');
+
+      const mockResponse = {
+        data: Buffer.from('fake xlsx binary'),
+        headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/multi.xlsx');
+
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('Sheet: Overview');
+      expect(result.content).toContain('Sheet: Details');
+      expect(result.content).toContain('Metric,Value');
+      expect(result.content).toContain('Date,Post,Clicks');
+    });
+
+    it('should skip blank sheets and only include sheets with content', async () => {
+      const XLSX = require('xlsx');
+      XLSX.read.mockReturnValue({
+        SheetNames: ['Data', 'Empty'],
+        Sheets: { Data: {}, Empty: {} },
+      });
+      XLSX.utils.sheet_to_csv
+        .mockReturnValueOnce('Col1,Col2\nA,B')
+        .mockReturnValueOnce('');
+
+      const mockResponse = {
+        data: Buffer.from('fake xlsx binary'),
+        headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/sparse.xlsx');
+
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('Sheet: Data');
+      expect(result.content).not.toContain('Sheet: Empty');
+    });
+
+    it('should return error when XLSX parsing fails', async () => {
+      const XLSX = require('xlsx');
+      XLSX.read.mockImplementation(() => { throw new Error('Corrupted workbook'); });
+
+      const mockResponse = {
+        data: Buffer.from('garbage'),
+        headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/bad.xlsx');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to parse Excel file');
     });
   });
 
