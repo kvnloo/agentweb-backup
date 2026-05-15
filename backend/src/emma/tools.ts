@@ -6630,7 +6630,7 @@ emmaToolRegistry.register({
   name: 'search_user_assets',
   definition: {
     name: 'search_user_assets',
-    description: "Search for assets (images, videos, HTML reports) that were generated in the user's Agent Mode sessions. Returns matching assets with their URLs, filenames, creation dates, asset type, and the session they came from (sessionId + title). Use this when the user asks to find images, videos, reports, or files they've created.",
+    description: "Search for assets (images, videos, HTML reports) that were generated in the user's Agent Mode sessions. Returns matching assets with their URLs, filenames, creation dates, asset type, favorite status, and the session they came from (sessionId + title). Use this when the user asks to find images, videos, reports, or files they've created. Supports filtering by favorite status and approval status.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -6642,6 +6642,14 @@ emmaToolRegistry.register({
         query: {
           type: 'string',
           description: 'Optional keyword to filter by filename (case-insensitive partial match).'
+        },
+        favorites_only: {
+          type: 'boolean',
+          description: "When true, return only assets the user has favorited/starred (❤️ button on the Images page). Use this when the user asks for their favorites, starred, or bookmarked images."
+        },
+        approved_only: {
+          type: 'boolean',
+          description: "When true, return only assets that have been approved via the Slack approval workflow. Use this when the user asks for approved images or assets."
         }
       },
       required: []
@@ -6651,7 +6659,13 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     if (!userId) throw new Error('Authentication required');
 
-    const assets = await chatbotDb.searchUserAssets(userId, args.type, args.query);
+    const assets = await chatbotDb.searchUserAssets(
+      userId,
+      args.type,
+      args.query,
+      args.favorites_only,
+      args.approved_only
+    );
 
     if (assets.length === 0) {
       return { message: 'No assets found matching your criteria.', assets: [] };
@@ -6666,6 +6680,8 @@ emmaToolRegistry.register({
         generatedAt: a.generatedAt,
         sessionId: a.sessionId,
         sessionTitle: a.sessionTitle,
+        isFavorited: a.isFavorited,
+        ...(a.approvalStatus !== undefined && { approvalStatus: a.approvalStatus }),
       })),
     };
   }
