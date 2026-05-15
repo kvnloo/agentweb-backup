@@ -1,3 +1,139 @@
+## DynamoDB Versioning for Brand Guidelines & Market Strategy (2026-05-14)
+
+### Problem
+
+Brand guidelines and market strategy data stored in `AW-Users` and `AW-Organizations` can be overwritten by agent actions or user edits with no way to recover a previous good state.
+
+### Investigation
+
+Considered an application-level versions table (`AW-ContentVersions`) with snapshot-on-write, but rejected it because:
+- Requires wiring up every save path in code
+- Doesn't cover future data fields automatically
+- Adds write overhead and table maintenance
+
+**Decision: DynamoDB Point-in-Time Recovery (PITR)**
+
+PITR was already the right answer — it covers every field in every table automatically, requires zero application code, costs ~$0.20/GB/month, and retains 35 days of continuous backups.
+
+### Status
+
+PITR enabled manually via AWS Console on:
+- `AW-Users`
+- `AW-Organizations`
+
+No code changes required.
+
+### How to Recover a Corrupted Record
+
+When a brand guideline, market strategy, or any other field is corrupted and needs to be reverted:
+
+**Step 1 — Restore the table to a point in time**
+
+In AWS Console → DynamoDB → Tables → select the table (e.g. `AW-Users`) → Backups tab → "Restore to point in time". Choose a timestamp just before the corruption occurred. Restore to a new table name, e.g. `AW-Users-restore-YYYYMMDD-HHMM`. This takes 5–20 minutes depending on table size.
+
+Or via CLI:
+```bash
+aws dynamodb restore-table-to-point-in-time \
+  --source-table-name AW-Users \
+  --target-table-name AW-Users-restore-20260514-1400 \
+  --restore-date-time 2026-05-14T14:00:00Z \
+  --region us-west-2
+```
+
+**Step 2 — Extract the old item from the restored table**
+
+```bash
+# For AW-Users (key: email)
+aws dynamodb get-item \
+  --table-name AW-Users-restore-20260514-1400 \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --region us-west-2
+
+# For AW-Organizations (key: orgId)
+aws dynamodb get-item \
+  --table-name AW-Organizations-restore-20260514-1400 \
+  --key '{"orgId": {"S": "org_abc123"}}' \
+  --region us-west-2
+```
+
+To extract just the specific field (e.g. brandGuidelines):
+```bash
+aws dynamodb get-item \
+  --table-name AW-Users-restore-20260514-1400 \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --query 'Item.brandGuidelines' \
+  --region us-west-2
+```
+
+**Step 3 — Write the recovered field back to the live table**
+
+Use `update-item` to patch only the affected field without touching anything else:
+```bash
+# Save the recovered value to a file first
+aws dynamodb get-item \
+  --table-name AW-Users-restore-20260514-1400 \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --query 'Item.brandGuidelines' \
+  --region us-west-2 > /tmp/recovered-brand.json
+
+# Then apply it back (wrap in the DynamoDB attribute format)
+aws dynamodb update-item \
+  --table-name AW-Users \
+  --key '{"email": {"S": "user@example.com"}}' \
+  --update-expression "SET brandGuidelines = :val" \
+  --expression-attribute-values '{":val": <paste-recovered-value-here>}' \
+  --region us-west-2
+```
+
+For orgs, use `AW-Organizations` with key `{"orgId": {"S": "org_abc123"}}`.
+
+**Step 4 — Delete the restore table**
+
+```bash
+aws dynamodb delete-table \
+  --table-name AW-Users-restore-20260514-1400 \
+  --region us-west-2
+```
+
+### Notes
+
+- Restored tables inherit no GSIs automatically — they're read-only lookup tables, so this is fine for recovery purposes.
+- The restore operation creates a full independent copy of the table — it does not affect the live table at all.
+- PITR window is 35 days. For older recovery needs, use DynamoDB on-demand backups (manual snapshots via AWS Console).
+- If you need to recover a different field (e.g. `marketStrategy`, `configs`, any future field), the same procedure applies — just change the `--query` path and `--update-expression` field name.
+
+---
+
+## Emma Silent on Slack Third-Party Mentions — Investigation (2026-05-13)
+
+### Problem
+
+In Slack agent mode sessions, when a thread message mentions another person (e.g. `<@U08TWRKGESG> test`), Emma responds to it as if it's a task for her — creating noise. The message is directed at a third party, not at Emma.
+
+### What Was Tried (All Failed)
+
+**Attempt 1: BE_SILENT in system prompt**
+Added a `[Silence Rule]` to the Slack session system prompt instructing Emma to respond with `BE_SILENT` if the message isn't directed at her. The Slack handler then checked for this sentinel and suppressed posting.
+- Failed because the system prompt is only injected on the *first message* of a session. Thread replies in existing sessions never see the rule.
+
+**Attempt 2: Structural pre-flight check (skip LLM entirely)**
+Added `isMessageDirectedElsewhere()` — extract `<@USERID>` mentions from message text, and if none are Emma's bot ID, `return` before calling `generateSessionResponse`.
+- Rejected by user: Emma loses context on silent turns because the message is never saved to the session, breaking future responses.
+
+**Attempt 3: BE_SILENT appended to each thread reply message**
+Appended `[Silence Rule] ... respond with exactly: BE_SILENT` to `formattedMessage` on every thread reply, so Emma sees the instruction on every turn regardless of when the session was created.
+- Failed because Emma's agent instructions are stronger than the hint. She interpreted `<@U08TWRKGESG> test` as "send a Slack message tagging that user with text 'test'" rather than a side-conversation to ignore.
+
+**Attempt 4: Save context + skip LLM (structural, with context preserved)**
+Before calling `generateSessionResponse`, detect third-party mentions structurally. If found: save the message to the session (for context) then return. Emma sees the message in history but doesn't respond.
+- User rejected this too — they want Emma herself to decide whether to be silent, not backend logic.
+
+### Resolution
+
+No code change applied. The actual solution is simple: the **user can just tell Emma to be silent** in the Slack thread (e.g. "ignore messages not directed at you"). Emma will honor a direct instruction from the user in conversation far more reliably than any injected hint or system prompt addition. No backend change needed — this is a prompt/UX pattern, not an engineering problem.
+
+---
+
 ## SeaDance 2.0 Video Generation — Investigation & Blocked (2026-05-09)
 
 ### Context
@@ -4178,3 +4314,128 @@ Internal Emma gets a `clarify_context` tool. When context is insufficient, she a
 ### Decision
 
 **Stick with the current account-scoped Emma implementation for now.** Internal Slack coverage is not a near-term priority. No changes planned in the immediate roadmap. Revisit when the team actively needs Emma to answer platform-level questions in Slack — at that point Phase 1 (admin identity + internal system prompt) is the recommended starting point given it reuses the most existing infrastructure.
+
+---
+
+## May 10, 2026: Lesson - CI Must Fail Cheaply When Tests Regress
+
+### Incident
+
+A customer portal PR had serious test-suite issues that exhausted GitHub Actions credits before the test job could finish. The suite had real failures, stale assertions, timer leakage, and a same-tab state synchronization loop, but the workflow allowed every run to consume the full job budget.
+
+### Root Causes
+
+- PR test workflow did not cancel older runs when newer commits were pushed.
+- The test command did not fail fast, so one known failing area could leave the rest of the suite running.
+- Vitest workers were too aggressive for a memory-heavy suite in CI.
+- Fake timers leaked across files and caused unrelated tests to hang or time out later.
+- A hook wrote localStorage, dispatched a same-tab event, re-read a fresh array, set state again, and repeated.
+- Several tests were asserting obsolete UI output after the product had moved from raw JSON/debug text to humanized summaries.
+
+### Guardrails To Apply
+
+- Add PR workflow `concurrency` with `cancel-in-progress: true`.
+- Run expensive suites with fail-fast behavior, for example `--bail=1`.
+- Add a shell-level timeout shorter than the GitHub job timeout, so CI exits with useful logs before the platform kills the job.
+- Keep CI worker counts conservative for large jsdom suites.
+- Use fake timers only in tests that need them, and restore real timers in setup/cleanup.
+- Treat stale tests as production risk when they hide real failures or force full-suite retries.
+- Keep passing-test logs quiet enough that the first failure is obvious.
+
+### Principle
+
+Tests will occasionally fail or hang. CI must make that failure cheap, bounded, and easy to diagnose instead of letting a single regression consume the entire Actions budget.
+
+## Emma "Forgot Brand" — Root Cause & Fix (2026-05-10)
+
+### User Report
+
+User `phoenixtech@agentweb.pro` (Phoenix Technologies) reported that Emma "forgot their brand" during a session (`a93853a9-923a-44bb-a176-6c6eaefbe587`). The user was asking Emma to generate Meta Image Ad Prompts. Emma replied asking *"What's the product or company these Meta image ads are for?"* — even though the user had a rich, fully-populated brand profile (Phoenix Technologies, Kevin Zhang, detailed tone of voice, key messages, etc.).
+
+### Root Cause
+
+Emma violated the system prompt rule at `agentModeSystemPrompt.ts:306`:
+
+> "Before asking the user for business details... ALWAYS call `read_brand_guidelines` and `read_market_strategy` first."
+
+The LLM skipped this rule and asked the user for context it already had access to via tools. This is a prompt-instruction compliance failure — the system prompt said what to do, but the model chose a clarifying-question flow instead.
+
+Session transcript summary:
+1. User: "Generate Meta Image Ad Prompts for ChatGPT Images 2.0"
+2. Emma: "What's the product or company?" ← violated rule
+3. User: "My brand!" (frustrated)
+4. Emma: "Who is the target customer?" ← asked again
+5. User: "Look at Market Strategy"
+6. Emma: called `read_market_strategy`, then proceeded correctly
+
+The brand data was present in DynamoDB (`AW-Users.brandGuidelines`) and would have been returned had Emma called `read_brand_guidelines` upfront.
+
+### Fix Applied
+
+Added `read_brand_guidelines` and `read_market_strategy` to the foundation tools list in the admin Agent Mode settings page. These tools were already in `DEFAULT_FOUNDATION_TOOLS` in `agentModeService.ts` (line 2817–2819) as the code-level fallback, but were not present in the DB-stored foundation tools config, which takes precedence over the default when set.
+
+By ensuring these tools are present in the DB-configured foundation tools list, they are always available to Emma in every session — not just when the DB config falls back to defaults.
+
+### Why This Helps (and Its Limits)
+
+Guaranteeing tool availability prevents the "tool not available" failure mode, but does not prevent the LLM from choosing not to call the tool. The prompt instruction at line 306 remains the primary enforcement mechanism. If the "forgot brand" pattern recurs, the next step is **Option C** from the investigation: programmatic pre-flight injection of brand context into the context window at session start (same pattern as account memory injection at `agentModeService.ts:1635`), making brand context available without requiring any LLM tool call decision.
+
+## Real Browser vs Headless for Emma (2026-05-12)
+
+### Background
+
+Emma uses `@playwright/mcp` as its browser automation tool, configured via the MCP Servers tab in the admin panel. The question was whether Emma could be switched to use a real (non-headless) Chrome instead of headless Playwright.
+
+### How Playwright MCP is Launched
+
+When the backend spawns a Playwright MCP stdio server, `mcpClientService.ts` (`createStdioTransport`, ~line 787) auto-detects the `@playwright/mcp` package and unconditionally injects `--headless`, `--no-sandbox`, and `--isolated` flags — even if the admin-panel config doesn't include them. The injection guard is:
+
+```typescript
+if (!resolvedArgs.includes('--headless')) {
+  resolvedArgs.push('--headless');
+}
+```
+
+So removing `--headless` from the MCP server config in the admin panel has no effect — the code re-adds it.
+
+### Why Truly Headed Chrome Is Not Feasible on EB
+
+The backend runs on AWS Elastic Beanstalk with no display server. A headed Chrome requires a real or virtual display (X11/Xvfb). Even with Xvfb it is still a virtual framebuffer, not a real browser, and adds significant operational complexity to the EB platform config.
+
+### Bot Detection Mitigation Already in Place
+
+The code already injects an extensive stealth script into every Playwright MCP session via a config file (`/tmp/playwright-mcp-configs/{key}.json`). It patches `navigator.webdriver`, `userAgentData`, `navigator.plugins`, `screen.colorDepth`, `document.visibilityState`, `IntersectionObserver`, and more. For most sites this is sufficient to avoid headless detection without needing a real browser.
+
+### Using a Real Browser via the Local Agent
+
+For use cases that genuinely need a real browser — particularly **testing or scraping public sites where no login is required** — the `run_local_agent_task` tool is the right path. This tool runs a task through the local agent relay (`local-agent-relay/`), which launches Playwright with `headless=False` against the user's local Chrome profile (`~/.codex-relay/chrome-profile`). Because the local agent runs on the user's machine, it has access to a real display and a persistent browser profile.
+
+Relevant code: `local-agent-relay/src/codex_relay/browser.py`, `load_page_with_playwright()` at line 76 (`headless=False` by default, persistent profile via `profile_dir`).
+
+**When to use `run_local_agent_task` vs Playwright MCP:**
+- Public sites, no auth needed, real browser fidelity required → `run_local_agent_task`
+- Any site where the user's saved cookies/session matter → `run_local_agent_task`
+- Most automation tasks, API calls, content generation → Playwright MCP (headless, faster, no local agent needed)
+
+## Drip Sequence Email — SVG Logo Display Issues (2026-05-14)
+
+### User Report
+
+A user reported that sequence emails sent from `founders@agentweb.pro` had a bad logo display in their email client. Two separate rendering bugs were discovered:
+
+1. **Superhuman:** The bird logo SVG rendered at enormous size (native `viewBox` dimensions, ~500px wide).
+2. **Slashy:** The bird logo appeared completely white (invisible on a white background).
+
+### Investigation
+
+**Superhuman (oversized SVG):**
+Superhuman is an Electron/Chromium webview app that sanitizes email HTML before rendering. Its sanitizer strips `style` attributes from `<svg>` elements as an XSS precaution, so `style="max-width:100%;width:100%"` and even native `width` attributes were being removed, leaving the SVG to render at its `viewBox` intrinsic size.
+
+**Slashy (white logo):**
+Decoding the raw email HTML revealed the logo `<img>` (converted from SVG) had `filter:brightness(0) invert(1)` in its style attribute. This filter inverts the image to white, which is intentional for display on the purple gradient email header. Slashy strips the header's background color while preserving the filter, making the white logo invisible against the white background.
+
+### Status
+
+**Superhuman:** We contacted Superhuman support to report the SVG sanitization behavior. **Awaiting their response.** No fix has been applied at our end for this issue. If Superhuman confirms this is by design (i.e., SVGs will always have styles stripped), the mitigation would be to convert SVGs to PNGs server-side before sending (already prototyped: `convertEmailSvgsToPng` in `emailVariables.ts` using `sharp` + content-addressed S3 keys — `email-svgs/<sha256>.png`).
+
+**Slashy:** A server-side fix was applied: `removeInvertedImgFilters()` in `emailVariables.ts` strips `filter:brightness(0) invert(1)` from `<img>` style attributes before send. This ensures the logo renders in its original colors on all clients. Trade-off: on clients that correctly render the purple header (Gmail, Apple Mail), the logo now appears dark against the purple background rather than white — acceptable since it remains legible. The proper long-term fix is a white-variant logo asset that does not rely on CSS filters.

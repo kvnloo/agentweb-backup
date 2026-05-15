@@ -1818,17 +1818,21 @@ export const agentModeController = {
       const pageIdentifier = req.query.pageIdentifier as string | undefined;
       const search = req.query.search as string | undefined;
 
-      // Get sessions with pagination
+      // Get sessions with pagination — messages are stripped here and replaced with
+      // a lightweight previewText so the list payload stays small (the full message
+      // history is loaded on-demand when a session is actually opened).
       const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier, search);
 
-      // Filter out tool messages and assistant messages with tool calls for user display
-      const filteredSessions = result.sessions.map(session => ({
-        ...session,
-        messages: filterMessagesForClient(session.messages)
-      }));
+      const listSessions = result.sessions.map(session => {
+        // Derive previewText from first user message if not already stored
+        const previewText: string | null = (session as any).previewText ||
+          session.messages?.find((m: any) => m.role === 'user')?.content?.slice(0, 200) || null;
+        const { messages: _, ...sessionWithoutMessages } = session as any;
+        return { ...sessionWithoutMessages, messages: [], previewText };
+      });
 
       res.json({
-        sessions: filteredSessions,
+        sessions: listSessions,
         lastEvaluatedKey: result.lastEvaluatedKey,
         hasMore: !!result.lastEvaluatedKey
       });
@@ -3877,7 +3881,7 @@ export const agentModeController = {
         keywords: keywords !== undefined ? keywords : (existingSchedule.keywords || []),
         requiredFunctionCalls: requiredFunctionCalls !== undefined ? requiredFunctionCalls : (existingSchedule.requiredFunctionCalls || []),
         functionCallMinCalls: functionCallMinCalls !== undefined ? functionCallMinCalls : (existingSchedule.functionCallMinCalls || {}),
-        emailNotifications: emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || []),
+        emailNotifications: normalizeEmailList(emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])),
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
@@ -3889,9 +3893,9 @@ export const agentModeController = {
       if (variableError) {
         return res.status(400).json({ error: variableError });
       }
-      const effectiveEmailNotifications = Array.isArray(emailNotifications)
-        ? emailNotifications
-        : (Array.isArray(existingSchedule.emailNotifications) ? existingSchedule.emailNotifications : []);
+      const effectiveEmailNotifications = normalizeEmailList(
+        emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])
+      );
       updates.variables = normalizedVariables;
 
       // Preserve existing values for unchanged variables unless explicitly overwritten
@@ -5011,12 +5015,22 @@ export const agentModeController = {
     try {
       const publicPlans = await workPlanService.getPublicPlansForAgentMode();
 
-      // If user is authenticated, also include their private plans
+      // If user is authenticated, include their own private plans + org members' private plans
       let userPrivatePlans: any[] = [];
       const result = await getUserFromToken(req);
       if (result.user) {
-        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
-        userPrivatePlans = ownPlans.filter(p => p.visibility === 'private');
+        const user = await userDb.getUserById(result.user.userId);
+        const [ownPlans, orgPlans] = await Promise.all([
+          workPlanService.getWorkPlansByOwner(result.user.userId),
+          user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
+        ]);
+        const seen = new Set<string>();
+        for (const p of [...ownPlans, ...orgPlans]) {
+          if (p.visibility === 'private' && !seen.has(p.planId)) {
+            seen.add(p.planId);
+            userPrivatePlans.push(p);
+          }
+        }
       }
 
       // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
@@ -5072,9 +5086,18 @@ export const agentModeController = {
       const result = await getUserFromToken(req);
       const allPlans: any[] = [];
       if (result.user) {
-        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
-        const privatePlans = ownPlans.filter(p => p.visibility === 'private');
-        allPlans.push(...privatePlans);
+        const user = await userDb.getUserById(result.user.userId);
+        const [ownPlans, orgPlans] = await Promise.all([
+          workPlanService.getWorkPlansByOwner(result.user.userId),
+          user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
+        ]);
+        const seen = new Set<string>();
+        for (const p of [...ownPlans, ...orgPlans]) {
+          if (p.visibility === 'private' && !seen.has(p.planId)) {
+            seen.add(p.planId);
+            allPlans.push(p);
+          }
+        }
       }
       allPlans.push(...systemPlans, ...publicPlans);
 
@@ -5087,8 +5110,8 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership for private plans
-      if (workPlan.visibility === 'private' && (!result.user || workPlan.ownerId !== result.user.userId)) {
+      // Enforce ownership/org-membership for private plans
+      if (workPlan.visibility === 'private' && !result.user) {
         return res.status(403).json({ error: 'Not authorized to view this private work plan' });
       }
 
@@ -5133,9 +5156,18 @@ export const agentModeController = {
       // Put user's private plans FIRST so they take priority over system/public plans with same title
       const allPlans: any[] = [];
       if (result.user) {
-        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
-        const privatePlans = ownPlans.filter(p => p.visibility === 'private');
-        allPlans.push(...privatePlans);
+        const user = await userDb.getUserById(result.user.userId);
+        const [ownPlans, orgPlans] = await Promise.all([
+          workPlanService.getWorkPlansByOwner(result.user.userId),
+          user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
+        ]);
+        const seen = new Set<string>();
+        for (const p of [...ownPlans, ...orgPlans]) {
+          if (p.visibility === 'private' && !seen.has(p.planId)) {
+            seen.add(p.planId);
+            allPlans.push(p);
+          }
+        }
       }
       allPlans.push(...systemPlans, ...publicPlans);
 
@@ -5148,8 +5180,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership for private plans
-      if (predefinedPlan.visibility === 'private' && predefinedPlan.ownerId !== userId) {
+      // Enforce ownership/org-membership for private plans.
+      // allPlans already only includes private plans belonging to the user or their org,
+      // so a plan found in allPlans is already authorized. Only block unauthenticated users.
+      if (predefinedPlan.visibility === 'private' && !result.user) {
         return res.status(403).json({ error: 'Not authorized to use this private work plan' });
       }
 

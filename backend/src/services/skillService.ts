@@ -54,6 +54,7 @@ export interface Skill {
   maxIterations?: number;
   isBuiltIn?: boolean;
   ownerId?: string;
+  orgId?: string;
   visibility?: SkillVisibility;
   reviewFeedback?: string;
 }
@@ -183,19 +184,25 @@ export class SkillService {
   }
 
   /**
-   * Get all skills available to a specific user: published skills + their own private skills.
-   * User-created private skills are immediately usable by their owner without admin approval.
+   * Get all skills available to a specific user: published skills + their own private skills
+   * + any private skills shared across their org (when orgId is provided).
    */
-  async getSkillsAvailableToUser(userId: string): Promise<Skill[]> {
-    const [publishedSkills, userSkills] = await Promise.all([
+  async getSkillsAvailableToUser(userId: string, orgId?: string): Promise<Skill[]> {
+    const [publishedSkills, userSkills, orgSkills] = await Promise.all([
       this.getPublishedSkills(),
       this.getSkillsByOwner(userId),
+      orgId ? this.getSkillsByOrg(orgId) : Promise.resolve([]),
     ]);
 
-    // Merge: start with published, add user's private skills that aren't already published
-    const publishedIds = new Set(publishedSkills.map(s => s.skillId));
-    const privateUserSkills = userSkills.filter(s => !publishedIds.has(s.skillId));
-    return [...publishedSkills, ...privateUserSkills];
+    const seen = new Set(publishedSkills.map(s => s.skillId));
+    const privateSkills: Skill[] = [];
+    for (const s of [...userSkills, ...orgSkills]) {
+      if (!seen.has(s.skillId)) {
+        seen.add(s.skillId);
+        privateSkills.push(s);
+      }
+    }
+    return [...publishedSkills, ...privateSkills];
   }
 
 
@@ -354,6 +361,20 @@ export class SkillService {
         return (scanResult.Items || []).map(item => this.normalizeSkill(item));
       }
       console.error(`Error getting skills for owner ${ownerId}:`, error);
+      throw error;
+    }
+  }
+
+  async getSkillsByOrg(orgId: string): Promise<Skill[]> {
+    try {
+      const result = await dynamodb.scan({
+        TableName: this.tableName,
+        FilterExpression: 'orgId = :orgId',
+        ExpressionAttributeValues: { ':orgId': orgId },
+      }).promise();
+      return (result.Items || []).map(item => this.normalizeSkill(item));
+    } catch (error) {
+      console.error(`Error getting skills for org ${orgId}:`, error);
       throw error;
     }
   }

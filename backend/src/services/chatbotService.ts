@@ -19,6 +19,7 @@ import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOve
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { incrementUserTokenUsage } from './tokenUsageService';
+import { approvalDb } from './approvalDb';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -221,7 +222,7 @@ export interface ChatSession {
   assetCache?: {
     images: Array<{ url: string; filename: string; generatedAt: string }>;
     videos: Array<{ url: string; filename: string; generatedAt: string }>;
-    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>;
+    htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string; reportType?: 'creative' | 'research' | 'performance' }>;
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
@@ -626,15 +627,26 @@ export class ChatbotDB {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
           let safeMessage = message;
-          // Fast path: only check serialized size when content is large enough to matter
-          const contentLen = typeof message.content === 'string' ? message.content.length : 0;
-          if (contentLen > MAX_MESSAGE_CONTENT_SIZE) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized content (${contentLen} chars), truncating`);
-            safeMessage = {
-              ...message,
-              content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                + `\n\n[Truncated — original size: ${contentLen} chars]`,
-            };
+          // Check serialized item size — covers both string content and content-block arrays.
+          // DynamoDB hard limit is 400KB per item; we use 350KB as a safety margin.
+          const serializedLen = JSON.stringify(message).length;
+          if (serializedLen > MAX_MESSAGE_CONTENT_SIZE) {
+            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} chars), truncating`);
+            if (typeof message.content === 'string') {
+              safeMessage = {
+                ...message,
+                content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
+              };
+            } else {
+              // Content is an array of blocks — stringify it, truncate, store as plain string
+              const contentStr = JSON.stringify(message.content);
+              safeMessage = {
+                ...message,
+                content: contentStr.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
+              };
+            }
           }
           return {
             PutRequest: {
@@ -1825,7 +1837,9 @@ export class ChatbotDB {
   async searchUserAssets(
     userId: string,
     type?: 'images' | 'videos' | 'htmlReports' | 'all',
-    query?: string
+    query?: string,
+    favoritesOnly?: boolean,
+    approvedOnly?: boolean
   ): Promise<Array<{
     url: string;
     filename: string;
@@ -1833,6 +1847,8 @@ export class ChatbotDB {
     assetType: 'image' | 'video' | 'htmlReport';
     sessionId: string;
     sessionTitle: string;
+    isFavorited: boolean;
+    approvalStatus?: string;
   }>> {
     const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
     const results: Array<{
@@ -1842,6 +1858,7 @@ export class ChatbotDB {
       assetType: 'image' | 'video' | 'htmlReport';
       sessionId: string;
       sessionTitle: string;
+      isFavorited: boolean;
     }> = [];
 
     const assetTypeFilter = type === 'all' || !type ? null : type;
@@ -1851,6 +1868,7 @@ export class ChatbotDB {
       if (!session.assetCache) continue;
       const sessionId = session.sessionId;
       const sessionTitle = session.title || 'Untitled session';
+      const favorites = session.favorites ?? {};
 
       const pushAssets = (
         assets: Array<{ url: string; filename: string; generatedAt: string }>,
@@ -1858,7 +1876,9 @@ export class ChatbotDB {
       ) => {
         for (const asset of assets) {
           if (lowerQuery && !asset.filename.toLowerCase().includes(lowerQuery) && !asset.url.toLowerCase().includes(lowerQuery)) continue;
-          results.push({ ...asset, assetType, sessionId, sessionTitle });
+          const isFavorited = !!favorites[asset.url];
+          if (favoritesOnly && !isFavorited) continue;
+          results.push({ ...asset, assetType, sessionId, sessionTitle, isFavorited });
         }
       };
 
@@ -1868,7 +1888,20 @@ export class ChatbotDB {
     }
 
     // Sort newest first
-    return results.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+    results.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+
+    if (!approvedOnly) {
+      return results;
+    }
+
+    // Fetch approval statuses and filter to approved-only
+    const assetUrls = results.map(r => r.url);
+    const approvals = await approvalDb.getApprovalsByAssetUrls(assetUrls);
+    const approvalMap = new Map(approvals.map(a => [a.assetUrl, a.status]));
+
+    return results
+      .map(r => ({ ...r, approvalStatus: approvalMap.get(r.url) }))
+      .filter(r => r.approvalStatus === 'approved');
   }
 
   /**
@@ -1983,6 +2016,52 @@ export class ChatbotDB {
       }).promise();
     } catch (error) {
       console.error(`Error persisting searchableTexts for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Persist reportType values for specific htmlReport entries in a session's assetCache.
+   */
+  async persistReportTypes(
+    sessionId: string,
+    updates: Array<{ url: string; reportType: 'creative' | 'research' | 'performance' }>,
+    force = false
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    try {
+      const result = await dynamodb.get({
+        TableName: this.tableName,
+        Key: { sessionId },
+        ProjectionExpression: 'assetCache',
+      }).promise();
+
+      const item = result.Item as any;
+      if (!item?.assetCache) return;
+
+      const cache = item.assetCache as ChatSession['assetCache'];
+      if (!cache) return;
+
+      const updateMap = new Map(updates.map(u => [u.url, u.reportType]));
+      let changed = false;
+
+      for (const report of cache.htmlReports || []) {
+        const type = updateMap.get(report.url);
+        if (type && (force || !report.reportType)) {
+          report.reportType = type;
+          changed = true;
+        }
+      }
+
+      if (!changed) return;
+
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET assetCache = :cache',
+        ExpressionAttributeValues: { ':cache': cache },
+      }).promise();
+    } catch (error) {
+      console.error(`Error persisting reportTypes for session ${sessionId}:`, error);
     }
   }
 
@@ -3304,11 +3383,24 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
+const ORG_MEMBER_ADDENDUM = `
+
+## Organization membership — current user is a member (not the owner)
+
+The current user is a **member** of an organization, not the owner. Be accurate about what members can and cannot do:
+
+- There is only **1 owner** per organization. Co-owner roles do not exist on this platform. Do NOT suggest that someone can be made a co-owner or share ownership.
+- Members **cannot** edit Brand Guidelines or Market Strategy — those pages are read-only for members. Only the owner can modify them.
+- Members can use all other platform features (tasks, schedules, marketing hub, social posts, SEO, CRM, etc.) within the organization.
+
+If a user asks about making someone a co-owner, giving ownership to another person, or assigning owner-level permissions, clearly explain that only one owner is supported per organization and that co-owner assignment is not a feature of this platform.`;
+
 // Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
-export function getEmmaSystemContext(sessionType?: string): string {
-  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}`;
+export function getEmmaSystemContext(sessionType?: string, orgRole?: string): string {
+  const memberAddendum = orgRole === "member" ? ORG_MEMBER_ADDENDUM : "";
+  return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}${memberAddendum}`;
 }
 
 // Exported for backwards-compatibility with existing tests — no-op since there is no longer a cache.
@@ -3608,6 +3700,8 @@ export interface ChatResponseOptions {
   isDelegatedAdmin?: boolean;
   /** Email of the admin when isDelegatedAdmin is true. */
   adminEmail?: string;
+  /** Organization role of the current user ("owner" | "member"). Used to inject accurate org-permission context into Emma's system prompt. */
+  orgRole?: string;
 }
 
 // Update generateChatResponse to use platform knowledge base when needed
@@ -3628,6 +3722,7 @@ export async function generateChatResponse(
     onToolStart,
     isDelegatedAdmin,
     adminEmail,
+    orgRole,
   } = options;
   try {
     const timestamp = new Date().toISOString();
@@ -3672,7 +3767,7 @@ export async function generateChatResponse(
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
-    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType) : null;
+    const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType, orgRole) : null;
     const messages = [...session.messages];
     if (freshSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");

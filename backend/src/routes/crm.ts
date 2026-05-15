@@ -6,6 +6,8 @@ import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
 import axios from 'axios';
+import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
+import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
@@ -48,8 +50,99 @@ import {
   validateSourcesPerField,
 } from '../utils/enrichmentValidation';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import {
+  getEnrichmentConfig as svcGetEnrichmentConfig,
+  setEnrichmentConfig as svcSetEnrichmentConfig,
+  suggestFieldTypes as svcSuggestFieldTypes,
+  type ConfigServiceDeps,
+  type FieldTypeSuggestion,
+} from '../services/enrichmentConfigService';
+import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
+import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
+import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
+
+// ─── v3.1 enrichment-config service-deps adapter ────────────────────────────
+// Wires the pure-logic config service to real DDB + a Phase-1 heuristic type
+// suggester. The LLM suggester slot is intentionally heuristic-only for now —
+// users can edit types in the UI; we revisit with a real LLM call in Phase 1.5.
+
+function heuristicTypeSuggestion(
+  fields: Array<{ name: string; instruction: string }>,
+): FieldTypeSuggestion[] {
+  return fields.map(({ name }) => {
+    const lc = name.toLowerCase();
+    if (/(_count|_at$|count$|number_of)/.test(lc) || lc === 'employees' || lc === 'revenue') {
+      return { name, type: 'number' as const };
+    }
+    if (/^is_|^has_|verified$/.test(lc)) {
+      return { name, type: 'boolean' as const };
+    }
+    if (lc.endsWith('_date') || lc.endsWith('date') || lc.endsWith('_at')) {
+      return { name, type: 'date' as const };
+    }
+    return { name, type: 'string' as const };
+  });
+}
+
+const enrichmentConfigDeps: ConfigServiceDeps = {
+  readListConfig: (listId) => crmDb.getEnrichmentConfig(listId),
+  writeListConfig: (listId, config) => crmDb.setEnrichmentConfig(listId, config),
+  loadListFieldNames: async (listId) => {
+    const list = await crmDb.getLeadListById(listId);
+    return Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : [];
+  },
+  llmSuggestTypes: async (fields) => heuristicTypeSuggestion(fields),
+  llmInferAliases: async (fields) => {
+    if (fields.length === 0) return {};
+    // Lazy import — avoids circular deps + keeps the LLM service out of the
+    // hot path for callers that never hit alias inference.
+    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
+    const { createLLMService } = await import('../utils/llmService');
+
+    // Build the canonical-field cheat sheet for the system prompt. Grouping
+    // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
+    // → funding_stage instead of guessing across groups).
+    const canonicalCheatsheet = Object.entries(FIELD_GROUPS)
+      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
+      .join('\n');
+
+    const systemPrompt =
+      `You map user-named CRM enrichment fields to canonical field names ` +
+      `based on semantic intent (not just name similarity). ` +
+      `Return strict JSON keyed by user field name.\n\n` +
+      `Available canonical fields, grouped:\n${canonicalCheatsheet}\n\n` +
+      `Rules:\n` +
+      `- Match by MEANING, not string similarity. "stag" with instruction ` +
+      `"funding stage" → "funding_stage".\n` +
+      `- Return null when the user's field is a unique custom concept (no ` +
+      `confident canonical match).\n` +
+      `- Use the field's instruction text to disambiguate. If instruction is ` +
+      `empty, fall back to name alone.\n` +
+      `- Pick at most ONE canonical name per user field.`;
+
+    const userPrompt =
+      `Map each user field to a canonical name (or null):\n` +
+      fields.map(f => `- ${f.name}${f.instruction ? ` — "${f.instruction}"` : ''}`).join('\n') +
+      `\n\nReturn JSON: {"<userFieldName>": "<canonical_name>" | null} for each input.`;
+
+    try {
+      const llm = createLLMService(
+        process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
+        0.0,
+      );
+      const result = await llm.generateJSONContent<Record<string, string | null>>(
+        systemPrompt,
+        userPrompt,
+      );
+      return result ?? {};
+    } catch (err) {
+      console.warn('[crm] llmInferAliases failed:', (err as Error).message);
+      return {};
+    }
+  },
+};
 const d1StripeClient = d1StripeSecretKey
   ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
   : null;
@@ -184,6 +277,13 @@ router.use(authenticateToken);
 import enrichSoSubRouter from './crmEnrichSo';
 import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
 router.use(enrichSoSubRouter);
+
+// Apollo people-enrichment routes (lookup-by-linkedin, reveal-phone, bulk
+// enrich, and the /webhooks/apollo callback). The webhook handler attaches
+// its own express.raw body parser before HMAC verification — keep this
+// mounted before any global JSON body parser if we add one in the future.
+import apolloSubRouter from './crmApollo';
+router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
   if (alertEvents === undefined) {
@@ -534,6 +634,16 @@ router.post('/sync', async (req: Request, res: Response) => {
           'Invalid body. Required: source, sourceRecordId, eventType, identity.',
       });
     }
+
+    // IDOR guard: tenantId is the partition for downstream contact storage.
+    // If a client supplies a tenantId that doesn't match their auth identity,
+    // they're attempting to write into another tenant's timeline. Reject.
+    // If absent, stamp it from the authenticated user (or the delegation
+    // target — req.user.userId is already the customer in delegated sessions).
+    if (body.tenantId && body.tenantId !== authReq.user.userId) {
+      return res.status(403).json({ message: 'tenantId mismatch' });
+    }
+    body.tenantId = authReq.user.userId;
 
     const result = await syncContact(body as SyncInput);
     return res.json(result);
@@ -1415,6 +1525,168 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
 });
 
 /**
+ * @route GET /api/crm/lists/:listId/enrichment-config
+ * @desc Read the v3.1 enrichment config for a list. Returns the stored config
+ *       or a default built from the list's field schema (with isDefault: true).
+ * @access Private
+ */
+router.get('/lists/:listId/enrichment-config', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const result = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+    return res.json(result);
+  } catch (error) {
+    console.error('[crm] GET enrichment-config failed:', error);
+    return res.status(500).json({ message: 'Failed to read enrichment config' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/lists/:listId/enrichment-config
+ * @desc Save the v3.1 enrichment config for a list. Server stamps
+ *       updatedAt / updatedBy regardless of client-provided values.
+ * @access Private
+ */
+router.put('/lists/:listId/enrichment-config', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const config = req.body;
+    try {
+      const saved = await svcSetEnrichmentConfig(
+        { listId, userId, config },
+        enrichmentConfigDeps,
+      );
+      return res.json({ config: saved, isDefault: false });
+    } catch (validationError: any) {
+      if (validationError?.name === 'ConfigValidationError') {
+        return res.status(400).json({ message: validationError.message });
+      }
+      throw validationError;
+    }
+  } catch (error) {
+    console.error('[crm] PUT enrichment-config failed:', error);
+    return res.status(500).json({ message: 'Failed to save enrichment config' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/enrichment-config/suggest-types
+ * @desc Suggest a field type for each newly-added field. Phase 1 uses a
+ *       name-based heuristic; LLM upgrade in Phase 1.5.
+ * @access Private
+ */
+router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const fields = Array.isArray(req.body?.fields) ? req.body.fields : [];
+    const types = await svcSuggestFieldTypes({ fields }, enrichmentConfigDeps);
+    return res.json({ types });
+  } catch (error) {
+    console.error('[crm] POST suggest-types failed:', error);
+    return res.status(500).json({ message: 'Failed to suggest field types' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-v3?mode=preview|enrich
+ * @desc Run the v3.1 enrichment waterfall on all leads in the list using the
+ *       saved per-list config. Synchronous in Phase 1a — returns the final
+ *       run report directly. Phase 1b will switch this to async + Socket.IO
+ *       progress for larger lists.
+ *
+ *       Phase 1a scope: identity resolution + Apollo direct-map + writes work
+ *       with real services. Web tier and LLM extraction are stubbed (fields
+ *       not covered by Apollo will appear as `missing` in the report).
+ * @access Private
+ */
+router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
+
+    // Preview accepts a full inline config in body.inlineConfig; enrich uses
+    // the persisted per-list config.
+    let config: any;
+    if (mode === 'preview') {
+      if (!req.body?.inlineConfig) {
+        return res.status(400).json({ message: 'preview mode requires inlineConfig in request body' });
+      }
+      config = req.body.inlineConfig;
+    } else {
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      if (stored.isDefault) {
+        return res.status(400).json({
+          message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
+        });
+      }
+      config = stored.config;
+    }
+
+    const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
+    const leadIds = Array.isArray(req.body?.leadIds)
+      ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
+      : undefined;
+    const deps = buildV3OrchestratorDeps(userId);
+    const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
+    console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'} leadIds=${leadIds?.length ?? 'all'}`);
+    const result = await svcRunEnrichmentV3(
+      { listId, userId, config, mode, refreshFields, leadIds },
+      deps,
+      {
+        userId,
+        socketId,
+        socketEmit: (room, event, payload) => io.to(room).emit(event, payload),
+      },
+    );
+    console.log(`[v3][route] enrich-v3 response listId=${listId} processed=${result.processed} durationMs=${result.durationMs}`);
+    return res.json(result);
+  } catch (error) {
+    console.error('[v3][route] enrich-v3 failed:', error);
+    return res.status(500).json({ message: 'Enrichment run failed' });
+  }
+});
+
+/**
  * @route DELETE /api/crm/lists/:listId
  * @desc Delete a lead list and all its leads
  * @access Private
@@ -1586,16 +1858,18 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       hasMoreLeads = !!result.lastEvaluatedKey;
     }
 
-    // Add engagement counts to each lead
+    // Add engagement counts to each lead, then strip internal CRM-history
+    // audit fields (siblingLeadId/ListId/UserId, remap source) before sending
+    // to the customer-portal.
     const leadsWithCounts = await Promise.all(
       filteredLeads.map(async (lead: any) => {
         const engagementCounts = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
-        return {
+        return sanitizeLeadForResponse({
           ...lead,
-          engagementCount: engagementCounts.total, // Sent messages count
+          engagementCount: engagementCounts.total,
           engagementCountLast7Days: engagementCounts.last7Days,
-          totalAllMessages: engagementCounts.totalAllMessages, // Total messages (sent + received)
-        };
+          totalAllMessages: engagementCounts.totalAllMessages,
+        });
       })
     );
 
@@ -1764,6 +2038,19 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 });
 
 /**
+ * Normalize the `limit` query/body parameter for the find-leads routes.
+ * Guards against NaN, non-finite, non-positive, or non-numeric inputs and
+ * caps to 500. Floors fractional values. Returns the default (20) when the
+ * input is missing or invalid.
+ */
+function normalizeFindLeadsLimit(raw: any): number {
+  if (raw === undefined || raw === null) return 20;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 20;
+  return Math.min(Math.floor(n), 500);
+}
+
+/**
  * @route POST /api/crm/lists/:listId/leads/find
  * @desc Search LinkedIn for people using platform-wide outreach accounts and import results into the list.
  * @access Private
@@ -1775,10 +2062,27 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const { listId } = req.params;
-    const { keywords, title, company, search_url, limit } = req.body;
+    const {
+      keywords,
+      title,
+      company,
+      search_url,
+      location,
+      location_id,
+      industry,
+      industry_id,
+      school,
+      school_id,
+      cursor,
+      auto_enrich,
+      limit,
+    } = req.body;
 
-    if (!keywords && !title && !company && !search_url) {
-      return res.status(400).json({ message: 'At least one search filter is required: keywords, title, company, or search_url' });
+    // Cursor alone is a valid filter for pagination through a prior search.
+    // Same gate as importLeadsFromSearch — see agentModeService.ts.
+    if (!keywords && !title && !company && !search_url
+      && !location && !industry && !school && !cursor) {
+      return res.status(400).json({ message: 'At least one search filter is required: keywords, title, company, search_url, location, industry, school, or cursor' });
     }
 
     const list = await crmDb.getLeadListById(listId);
@@ -1792,7 +2096,16 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
       title,
       company,
       search_url,
-      limit: limit ? Math.min(Number(limit), 100) : 20,
+      location,
+      location_id,
+      industry,
+      industry_id,
+      school,
+      school_id,
+      cursor,
+      auto_enrich,
+      // Cap at 500 (was 100) to support larger ICP-sourcing runs.
+      limit: normalizeFindLeadsLimit(limit),
     });
 
     if (!result.success) {
@@ -1803,6 +2116,122 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
   } catch (error: any) {
     console.error('Error finding leads:', error);
     res.status(500).json({ message: error.message || 'Failed to find leads' });
+  }
+});
+
+/**
+ * @route GET /api/crm/icp/filters
+ * @desc Preview LLM-extracted LinkedIn search filter VARIANTS for one of
+ *       the user's ICP personas (icpResult[]). Returns 1–3 candidate
+ *       filter sets — does NOT run a search or import. The frontend uses
+ *       this to pre-fill the Find Leads modal; when multiple variants
+ *       come back, the modal renders a chip picker so the user chooses
+ *       an angle (broad vs. region-focused, etc.) before clicking Find
+ *       & Import.
+ *
+ *       Results are cached per persona on `user.icpResult[i].extractedFilters`
+ *       keyed by a hash of the persona content + a code-bumped version.
+ *       Cache hits skip the LLM entirely; cache misses regenerate and
+ *       persist via userDb.updateUser.
+ * @access Private
+ */
+router.get('/icp/filters', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const raw = req.query?.icpIndex;
+    const icpIndex = typeof raw === 'string' ? Number(raw) : NaN;
+    if (!Number.isFinite(icpIndex) || !Number.isInteger(icpIndex) || icpIndex < 0) {
+      return res.status(400).json({ message: 'icpIndex (non-negative integer) is required' });
+    }
+
+    const { userDb } = await import('../services/db');
+    const user: any = await userDb.getUserById(userId);
+    const personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+    if (personas.length === 0) {
+      return res.status(404).json({ message: 'No ICP personas found. Generate them on the GTM Plan page first.' });
+    }
+    if (icpIndex >= personas.length) {
+      return res.status(404).json({ message: `icpIndex ${icpIndex} out of range (have ${personas.length} personas)` });
+    }
+
+    const persona = personas[icpIndex];
+    const {
+      extractIcpFiltersWithLlm,
+      personaCacheKey,
+      ICP_FILTER_CACHE_VERSION,
+    } = await import('../services/icpFilterLlmExtractor');
+
+    const currentKey = personaCacheKey(persona);
+    const cached = persona.extractedFilters;
+    const cacheHit =
+      cached &&
+      cached.cacheKey === currentKey &&
+      cached.cacheVersion === ICP_FILTER_CACHE_VERSION &&
+      Array.isArray(cached.variants) &&
+      cached.variants.length > 0;
+
+    if (cacheHit) {
+      return res.status(200).json({
+        persona: { name: persona.name, index: icpIndex },
+        variants: cached.variants,
+        cached: true,
+      });
+    }
+
+    let variants;
+    try {
+      variants = await extractIcpFiltersWithLlm(persona);
+    } catch (llmError: any) {
+      console.error('Error extracting ICP filters via LLM:', llmError);
+      return res.status(503).json({
+        message: 'Failed to extract filters with the LLM, please try again.',
+      });
+    }
+
+    // Re-read user before persisting so we don't clobber concurrent edits
+    // made during the ~3s LLM window (e.g., GTM page regenerating
+    // personas). Mirrors the pattern in onboardingIcpService.ts: read →
+    // long-running work → re-read → write.
+    //
+    // If the persona at icpIndex is gone, or its content changed (hash
+    // mismatch), the LLM result we just produced no longer matches what
+    // the user has now — skip the write so the next click can regenerate
+    // against the current content. We still return the variants to the
+    // caller for the current request.
+    const freshUser: any = await userDb.getUserById(userId);
+    const freshPersonas: any[] = Array.isArray(freshUser?.icpResult) ? freshUser.icpResult : [];
+    const freshPersona = freshPersonas[icpIndex];
+    const cacheStillApplies =
+      freshPersona && personaCacheKey(freshPersona) === currentKey;
+
+    if (cacheStillApplies) {
+      const nextIcpResult = freshPersonas.map((p: any, i: number) =>
+        i === icpIndex
+          ? {
+              ...p,
+              extractedFilters: {
+                cacheKey: currentKey,
+                cacheVersion: ICP_FILTER_CACHE_VERSION,
+                variants,
+                generatedAt: new Date().toISOString(),
+              },
+            }
+          : p,
+      );
+      await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+    }
+
+    return res.status(200).json({
+      persona: { name: persona.name, index: icpIndex },
+      variants,
+      cached: false,
+    });
+  } catch (error: any) {
+    console.error('Error previewing ICP filters:', error);
+    res.status(500).json({ message: error.message || 'Failed to preview ICP filters' });
   }
 });
 
@@ -1836,7 +2265,7 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    res.json(lead);
+    res.json(sanitizeLeadForResponse(lead));
   } catch (error: any) {
     console.error('Error fetching lead:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead' });
@@ -2044,7 +2473,11 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'attio', 'updated'),
     ]);
 
-    res.json(updatedLead);
+    if (updates.email) {
+      void validateLeadEmailInBackground(listId, leadId, updates.email, userId);
+    }
+
+    res.json(sanitizeLeadForResponse(updatedLead));
   } catch (error: any) {
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
@@ -2085,8 +2518,234 @@ router.delete('/lists/:listId/leads/:leadId', async (req: Request, res: Response
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/import/preview
+ * @desc Parse a CSV file and return its headers, the first few sample rows,
+ *   and a suggested column→field mapping the wizard renders for the user
+ *   to review/override.
+ * @access Private
+ */
+router.post(
+  '/lists/:listId/leads/import/preview',
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    try {
+      const authReq = req as AuthenticatedRequest;
+      const userId = authReq.user?.userId;
+      const { listId } = req.params;
+
+      if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) return res.status(404).json({ message: 'Lead list not found' });
+      if (!(await canAccessCrmList(userId, list))) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ message: 'CSV file is required' });
+      }
+
+      const fileContent = req.file.buffer.toString('utf-8');
+      let records: any[];
+      try {
+        records = parse(fileContent, {
+          columns: true,
+          skip_empty_lines: true,
+          trim: true,
+          relax_column_count: true,
+        });
+      } catch (parseError: any) {
+        return res.status(400).json({ message: `Failed to parse CSV: ${parseError.message}` });
+      }
+
+      if (records.length === 0) {
+        return res.status(400).json({ message: 'CSV file is empty or has no valid rows' });
+      }
+
+      const headers = Object.keys(records[0]);
+      const { suggestColumnMapping } = await import('../services/csvColumnMatcher');
+      const standardLeadFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'companyLinkedin', 'notes'];
+      const existingCustomFields = ((list as any).fieldNames as string[] || []).filter(
+        (f: string) => !standardLeadFields.includes(f),
+      );
+      const suggestedMapping = suggestColumnMapping(headers, existingCustomFields);
+
+      // A required field is satisfied if any column maps to email or linkedin
+      // (we'll re-validate at import time with the user's final choices).
+      const mappedFields = new Set(
+        Object.values(suggestedMapping).map((s) => s.field),
+      );
+      const requiredFieldsSatisfied = mappedFields.has('email') || mappedFields.has('linkedin');
+
+      return res.json({
+        headers,
+        sampleRows: records.slice(0, 5),
+        totalRows: records.length,
+        suggestedMapping,
+        requiredFieldsSatisfied,
+        savedMapping: (list as any).lastImportMapping,
+      });
+    } catch (error: any) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ message: 'File too large. Maximum CSV size is 50 MB.' });
+      }
+      console.error('Error previewing CSV:', error);
+      return res.status(500).json({ message: error.message || 'Failed to preview CSV' });
+    }
+  },
+);
+
+type ColumnMappingTarget =
+  | 'email'
+  | 'firstName'
+  | 'lastName'
+  | 'phone'
+  | 'company'
+  | 'title'
+  | 'linkedin'
+  | 'companyLinkedin'
+  | 'notes'
+  | 'skip'
+  | { customField: string }
+  | { splitFullName: true | 'first' | 'last' };
+
+const STANDARD_LEAD_FIELDS: ReadonlyArray<string> = [
+  'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'companyLinkedin', 'notes',
+];
+
+/**
+ * Cap on the user-supplied column mapping before persisting it on the list.
+ * The list row already carries csvExportHistory/lastImportMapping/etc., so
+ * we leave plenty of headroom under the 400KB DDB item limit. Returns an
+ * error message string when the mapping is too large, null when it's fine.
+ */
+const MAX_MAPPING_KEYS = 500;
+const MAX_MAPPING_JSON_BYTES = 64 * 1024;
+function validateColumnMappingSize(mapping: Record<string, any>): string | null {
+  const keyCount = Object.keys(mapping).length;
+  if (keyCount > MAX_MAPPING_KEYS) {
+    return `columnMapping has too many entries (${keyCount}); maximum is ${MAX_MAPPING_KEYS}.`;
+  }
+  const serializedBytes = Buffer.byteLength(JSON.stringify(mapping), 'utf8');
+  if (serializedBytes > MAX_MAPPING_JSON_BYTES) {
+    return `columnMapping exceeds ${MAX_MAPPING_JSON_BYTES} bytes (got ${serializedBytes}).`;
+  }
+  return null;
+}
+
+/**
+ * Project a CSV record through a user-supplied column mapping into a lead
+ * shape ready for batchCreateLeads. Falls back to header-name auto-detect
+ * when no mapping is provided (legacy behavior, preserved so old clients keep
+ * working).
+ */
+/**
+ * S11: per-value/per-key caps for CSV import. Adversarial CSVs with multi-MB
+ * cells or hundreds of columns shouldn't push the lead row past the DDB
+ * 400KB item limit. Truncation is silent — users importing a 10KB blob into
+ * a single field weren't going to render it sensibly anyway.
+ */
+const MAX_CUSTOM_FIELD_VALUE_BYTES = 8 * 1024;
+const MAX_CUSTOM_FIELDS_PER_LEAD = 100;
+function truncateForLead(value: string): string {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (bytes <= MAX_CUSTOM_FIELD_VALUE_BYTES) return value;
+  // Slice by JS char index — close enough; we'd rather under-truncate by a
+  // few multibyte chars than introduce a fast utf8 byte-walker for this.
+  const approxCharCap = Math.floor(MAX_CUSTOM_FIELD_VALUE_BYTES / 2);
+  return value.slice(0, approxCharCap);
+}
+
+function projectRecordWithMapping(
+  record: Record<string, any>,
+  mapping: Record<string, ColumnMappingTarget> | null,
+): Record<string, any> {
+  const lead: Record<string, any> = {
+    email: '',
+    firstName: '',
+    lastName: '',
+    phone: '',
+    company: '',
+    title: '',
+    notes: '',
+    linkedin: '',
+    companyLinkedin: '',
+  };
+  const customFields: Record<string, any> = {};
+
+  if (mapping) {
+    for (const [csvHeader, target] of Object.entries(mapping)) {
+      const raw = record[csvHeader];
+      const value = typeof raw === 'string' ? raw.trim() : raw == null ? '' : String(raw);
+      if (!value) continue;
+
+      if (target === 'skip') continue;
+
+      if (typeof target === 'string' && STANDARD_LEAD_FIELDS.includes(target)) {
+        lead[target] = target === 'email' ? value.toLowerCase() : value;
+        continue;
+      }
+
+      if (typeof target === 'object' && target !== null) {
+        if ('customField' in target && target.customField) {
+          if (Object.keys(customFields).length >= MAX_CUSTOM_FIELDS_PER_LEAD) continue;
+          customFields[target.customField] = truncateForLead(value);
+          continue;
+        }
+        if ('splitFullName' in target) {
+          // "Jane Marie Doe" → first="Jane", last="Marie Doe". For the
+          // "first" / "last" sub-directives we only emit one half, used when
+          // the wizard maps two columns ("Full Name" + something else) — but
+          // typically both halves come from one column with the boolean form.
+          const parts = value.split(/\s+/);
+          const first = parts[0] || '';
+          const rest = parts.slice(1).join(' ');
+          if (target.splitFullName === 'last') {
+            lead.lastName = lead.lastName || rest;
+          } else if (target.splitFullName === 'first') {
+            lead.firstName = lead.firstName || first;
+          } else {
+            lead.firstName = lead.firstName || first;
+            lead.lastName = lead.lastName || rest;
+          }
+          continue;
+        }
+      }
+    }
+  } else {
+    // Legacy auto-detect — match column name case-insensitively to standard field.
+    Object.keys(record).forEach((key) => {
+      const lower = key.toLowerCase().trim();
+      const raw = record[key];
+      const value = typeof raw === 'string' ? raw.trim() : raw == null ? '' : String(raw);
+      if (!value) return;
+
+      if (['email', 'e-mail', 'e_mail'].includes(lower)) {
+        lead.email = value.toLowerCase();
+        return;
+      }
+      const matching = STANDARD_LEAD_FIELDS.find((sf) => sf.toLowerCase() === lower);
+      if (matching) {
+        lead[matching] = value;
+      } else {
+        if (Object.keys(customFields).length >= MAX_CUSTOM_FIELDS_PER_LEAD) return;
+        customFields[key] = truncateForLead(value);
+      }
+    });
+  }
+
+  if (Object.keys(customFields).length > 0) {
+    lead.customFields = customFields;
+  }
+  return lead;
+}
+
+/**
  * @route POST /api/crm/lists/:listId/leads/import
- * @desc Import leads from CSV file
+ * @desc Import leads from CSV file. Optionally accepts a `columnMapping`
+ *   field (multipart string, JSON-encoded) that controls how each CSV
+ *   column maps to a Lead field. When omitted, falls back to header-name
+ *   auto-detect for backwards compatibility.
  * @access Private
  */
 router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Request, res: Response) => {
@@ -2113,10 +2772,50 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       return res.status(400).json({ message: 'CSV file is required' });
     }
 
+    // Parse columnMapping if provided. Multipart bodies arrive as strings.
+    let columnMapping: Record<string, ColumnMappingTarget> | null = null;
+    if (req.body?.columnMapping) {
+      try {
+        columnMapping =
+          typeof req.body.columnMapping === 'string'
+            ? JSON.parse(req.body.columnMapping)
+            : req.body.columnMapping;
+      } catch (err: any) {
+        return res
+          .status(400)
+          .json({ message: `Invalid columnMapping JSON: ${err.message}` });
+      }
+    }
+
+    if (columnMapping) {
+      // C7: cap mapping size before doing anything with it. The mapping is
+      // persisted on the list row via lastImportMapping; without bounds, a
+      // pathological CSV (5000 columns) could push the lead-list DDB item
+      // past the 400KB limit and cause silent updateLeadList failures.
+      const mappingValidationError = validateColumnMappingSize(columnMapping);
+      if (mappingValidationError) {
+        return res.status(400).json({ message: mappingValidationError });
+      }
+
+      // Required fields: at least one of email or linkedin must be mapped, or
+      // we have no way to dedup or message the lead.
+      const mappedFields = Object.values(columnMapping)
+        .map((t) => (typeof t === 'string' ? t : ''))
+        .filter(Boolean);
+      const hasEmailOrLinkedIn =
+        mappedFields.includes('email') || mappedFields.includes('linkedin');
+      if (!hasEmailOrLinkedIn) {
+        return res.status(400).json({
+          message:
+            'At least one column must be mapped to Email or LinkedIn — these are required for deduplication.',
+        });
+      }
+    }
+
     // Parse CSV file
     const fileContent = req.file.buffer.toString('utf-8');
     let records: any[];
-    
+
     try {
       records = parse(fileContent, {
         columns: true,
@@ -2132,58 +2831,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       return res.status(400).json({ message: 'CSV file is empty or has no valid rows' });
     }
 
-    // Map CSV records to lead data
-    const leads = records.map((record, index) => {
-      // Only normalize email field for deduplication, all other fields pass through as-is
-      const standardFields = ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
-      
-      // Find and normalize email field (for deduplication)
-      let email = '';
-      Object.keys(record).forEach(key => {
-        const lower = key.toLowerCase().trim();
-        if (['email', 'e-mail', 'e_mail'].includes(lower)) {
-          email = record[key]?.trim() || '';
-        }
-      });
-
-      // Extract standard fields if they match exactly (case-insensitive)
-      const leadData: Record<string, any> = {};
-      const customFields: Record<string, any> = {};
-      
-      Object.keys(record).forEach(key => {
-        const lower = key.toLowerCase().trim();
-        const value = record[key]?.trim() || '';
-        
-        // Skip email (already extracted)
-        if (['email', 'e-mail', 'e_mail'].includes(lower)) {
-          return;
-        }
-        
-        // Check if it matches a standard field name (case-insensitive)
-        const matchingStandardField = standardFields.find(sf => 
-          sf.toLowerCase() === lower
-        );
-        
-        if (matchingStandardField && value) {
-          leadData[matchingStandardField] = value;
-        } else if (value) {
-          // All other fields go to customFields with original column name
-          customFields[key] = value;
-        }
-      });
-
-      return {
-        email: email,
-        firstName: leadData.firstName || '',
-        lastName: leadData.lastName || '',
-        phone: leadData.phone || '',
-        company: leadData.company || '',
-        title: leadData.title || '',
-        notes: leadData.notes || '',
-        linkedin: leadData.linkedin || '',
-        customFields: Object.keys(customFields).length > 0 ? customFields : undefined,
-      };
-    });
+    const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads);
@@ -2192,9 +2840,21 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       void autoEnrollListIntoSequences(userId, listId);
     }
 
+    // Persist the successful mapping so the next import of the same template
+    // is one-click. Best-effort — failing to save the mapping shouldn't fail
+    // the import the user already paid for.
+    if (columnMapping) {
+      try {
+        await crmDb.updateLeadList(listId, { lastImportMapping: columnMapping });
+      } catch (err) {
+        console.warn('Failed to persist lastImportMapping for list', listId, err);
+      }
+    }
+
     res.json({
       success: true,
       successCount: results.successCount,
+      mergedCount: results.mergedCount,
       errorCount: results.errorCount,
       errors: results.errors,
       message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`,
@@ -2245,7 +2905,7 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
     }
 
     // Build columns: standard fields + custom fields from fieldNames and lead data
-    const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'notes'];
+    const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'companyLinkedin', 'notes'];
     const customFieldSet = new Set<string>();
 
     if (list.fieldNames && Array.isArray(list.fieldNames)) {
@@ -3415,7 +4075,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { message } = req.body;
+    const { message, accountId: requestedAccountId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -3441,7 +4101,10 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    // Use the caller-specified account (user's configured default) if provided, otherwise auto-resolve
+    const accountId = (requestedAccountId && typeof requestedAccountId === 'string')
+      ? requestedAccountId
+      : await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
@@ -3526,7 +4189,7 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
     } catch (alertError) {
       console.error('Failed to send lead list alert email:', alertError);
     }
-    res.json({ success: true, lead: updatedLead });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
   } catch (error: any) {
     console.error('Error adding lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to add lead engagement' });
@@ -3575,7 +4238,7 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
     };
 
     const updatedLead = await crmDb.updateLeadEngagement(listId, leadId, eventId, engagement);
-    res.json({ success: true, lead: updatedLead });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
   } catch (error: any) {
     console.error('Error updating lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead engagement' });
@@ -3608,7 +4271,7 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
     }
 
     const updatedLead = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
-    res.json({ success: true, lead: updatedLead });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
   } catch (error: any) {
     console.error('Error deleting lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to delete lead engagement' });
@@ -3632,19 +4295,36 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
     const settingName = `crm_sender_emails_${userId}`;
     const setting = await settingsService.getSetting(settingName);
 
+    // Fetch connected Gmail accounts so the frontend can offer them as sender options
+    let connectedGmailAccounts: Array<{ account_id: string; account_name: string; email: string }> = [];
+    try {
+      const user = await userDb.getUserById(userId);
+      connectedGmailAccounts = (user?.connected_accounts || [])
+        .filter((a: any) => a.platform === 'gmail')
+        .map((a: any) => ({
+          account_id: a.account_id,
+          account_name: a.account_name,
+          email: a.config?.email || a.account_id,
+        }));
+    } catch (_) {
+      // Non-fatal — proceed without connected accounts
+    }
+
     if (!setting) {
-      return res.json({ senders: [], defaultSenderId: null });
+      return res.json({ senders: [], defaultSenderId: null, connectedGmailAccounts });
     }
 
     try {
       const config = JSON.parse(setting.settingValue);
       res.json({
         senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null
+        defaultSenderId: config.defaultSenderId || null,
+        defaultLinkedInAccountId: config.defaultLinkedInAccountId || null,
+        connectedGmailAccounts,
       });
     } catch (parseError) {
       console.error('Error parsing CRM sender emails:', parseError);
-      res.json({ senders: [], defaultSenderId: null });
+      res.json({ senders: [], defaultSenderId: null, defaultLinkedInAccountId: null, connectedGmailAccounts });
     }
   } catch (error: any) {
     console.error('Error fetching CRM sender emails:', error);
@@ -3666,7 +4346,7 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { senders, defaultSenderId } = req.body;
+    const { senders, defaultSenderId, defaultLinkedInAccountId } = req.body;
 
     // Validate senders array
     if (!Array.isArray(senders)) {
@@ -3687,11 +4367,18 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       if (sender.notes !== undefined && typeof sender.notes !== 'string') {
         return res.status(400).json({ message: 'Notes must be a string if provided' });
       }
+      // Gmail sender validation
+      if (sender.senderType !== undefined && sender.senderType !== 'gmail') {
+        return res.status(400).json({ message: `Invalid senderType: ${sender.senderType}` });
+      }
+      if (sender.senderType === 'gmail' && !sender.gmailAccountId) {
+        return res.status(400).json({ message: 'Gmail senders must include gmailAccountId' });
+      }
     }
 
     // Validate defaultSenderId if provided
     if (defaultSenderId !== null && defaultSenderId !== undefined) {
-      const defaultSenderExists = senders.some((s: any, index: number) => 
+      const defaultSenderExists = senders.some((s: any, index: number) =>
         s.id === defaultSenderId || index.toString() === defaultSenderId
       );
       if (!defaultSenderExists && senders.length > 0) {
@@ -3699,15 +4386,24 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       }
     }
 
+    // Validate defaultLinkedInAccountId if provided
+    if (defaultLinkedInAccountId !== null && defaultLinkedInAccountId !== undefined) {
+      if (typeof defaultLinkedInAccountId !== 'string') {
+        return res.status(400).json({ message: 'defaultLinkedInAccountId must be a string' });
+      }
+    }
+
     const settingName = `crm_sender_emails_${userId}`;
-    const config = {
+    const config: any = {
       senders: senders.map((s: any, index: number) => ({
         id: s.id || index.toString(),
         email: s.email.trim(),
         fromName: s.fromName.trim(),
-        notes: s.notes ? s.notes.trim() : undefined
+        notes: s.notes ? s.notes.trim() : undefined,
+        ...(s.senderType === 'gmail' ? { senderType: 'gmail', gmailAccountId: s.gmailAccountId } : {}),
       })),
-      defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null)
+      defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
+      defaultLinkedInAccountId: defaultLinkedInAccountId || null
     };
 
     await settingsService.setSetting(
@@ -4519,7 +5215,15 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
 
         // Inject unsubscribe URL — updates existing link or appends footer if none found
-        const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=${encodeURIComponent(lead.leadId)}&email=${encodeURIComponent(lead.email)}`;
+        // Signed URL — see backend/src/utils/unsubscribeUrl.ts. Verifier in
+        // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
+        // for emails sent before this change.
+        const unsubscribeUrl = signUnsubscribeUrl({
+          baseUrl: `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe`,
+          listId,
+          leadId: lead.leadId,
+          email: lead.email,
+        });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
 
         const result = await resendService.sendEmail({
@@ -4603,7 +5307,12 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     }
 
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
-    const testUnsubscribeUrl = `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=TEST&email=${encodeURIComponent(recipients[0]?.trim() || 'test@example.com')}`;
+    const testUnsubscribeUrl = signUnsubscribeUrl({
+      baseUrl: `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe`,
+      listId,
+      leadId: 'TEST',
+      email: recipients[0]?.trim() || 'test@example.com',
+    });
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
 
@@ -4685,11 +5394,31 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       return res.status(400).json({ message: 'Invalid URL format. Must be HTTP or HTTPS.' });
     }
 
+    // SSRF guard: refuse hostnames that resolve to private/internal IPs
+    // (RFC1918, loopback, cloud metadata, link-local, broadcast, multicast).
+    try {
+      await assertPublicHostname(url);
+    } catch (ssrfErr) {
+      if (ssrfErr instanceof SsrfBlockedError) {
+        return res.status(400).json({ message: 'URL resolves to a private/internal address' });
+      }
+      return res.status(400).json({ message: 'URL is not safe to fetch' });
+    }
+
+    // SSRF defence-in-depth: refuse to follow redirects. assertPublicHostname
+    // only validates the user-supplied URL; if axios follows a 302 to e.g.
+    // http://169.254.169.254/, the guard is bypassed. maxRedirects:0 makes
+    // axios surface the redirect as an error instead. validateStatus accepts
+    // only 2xx so 3xx becomes an error. The `as any` cast routes around the
+    // legacy @types/axios shim installed in this repo that doesn't carry
+    // maxRedirects/validateStatus on its config interface.
     const response = await axios.get(url, {
       timeout: 15000,
       responseType: 'text',
       headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
-    });
+      maxRedirects: 0,
+      validateStatus: (s: number) => s >= 200 && s < 300,
+    } as any);
 
     const html = response.data as string;
 
@@ -5277,8 +6006,12 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Re
 // Returns the raw Google CSE results so we can iterate on specialist queries
 // without redeploying. Remove once enrichment specialists stabilize.
 router.post('/debug/serp', async (req: Request, res: Response) => {
-  const userId = (req as AuthenticatedRequest).user?.userId;
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  if (!authReq.user?.isAdmin) {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
   const query = (req.body?.query || '').toString().trim();
   const n = Math.max(1, Math.min(10, Number(req.body?.n) || 5));
   if (!query) return res.status(400).json({ message: 'query required' });
@@ -5296,8 +6029,12 @@ router.post('/debug/serp', async (req: Request, res: Response) => {
 // ── TEMPORARY DEBUG: EnrichmentRawCache table inspection ─────────────────────
 // Remove this endpoint once cache behaviour is confirmed working in the test env.
 router.get('/debug/enrichment-raw-cache', async (req: Request, res: Response) => {
-  const userId = (req as AuthenticatedRequest).user?.userId;
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  if (!authReq.user?.isAdmin) {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
 
   const AWS = require('aws-sdk');
   const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';

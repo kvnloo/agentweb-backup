@@ -53,6 +53,11 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// Prevent classification LLM calls from interfering with searchableText persistence tests
+jest.mock('../services/reportClassificationService', () => ({
+  classifyReport: jest.fn().mockRejectedValue(new Error('mocked')),
+}));
+
 const router = require('../routes/tasks').default;
 
 const HTML_CONTENT = '<html><body><h1>Sales Report Q1</h1><p>Revenue increased by 20%.</p></body></html>';
@@ -112,12 +117,12 @@ describe('Tasks Routes - searchableText persistence', () => {
       // S3 fetch should be skipped when searchableText is already cached
       expect(mockedAxios.get).not.toHaveBeenCalledWith(reportUrl, expect.anything());
 
-      // The response should include the cached searchableText
+      // searchableText is stripped from the response to keep payload small
       const taskKey = `agent-mode-${sessionId}`;
       const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
       expect(file).toBeDefined();
-      expect(file.searchableText).toBe('already cached text');
+      expect(file.searchableText).toBeUndefined();
     });
 
     it('should background-fetch from S3 and persist searchableText for agent-mode report without cached text', async () => {
@@ -348,7 +353,8 @@ describe('Tasks Routes - searchableText persistence', () => {
 
       const files = response.body['task-1']?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
-      expect(file?.searchableText).toBe('already cached task text');
+      // searchableText is stripped from the response to keep payload small
+      expect(file?.searchableText).toBeUndefined();
     });
 
     it('should background-fetch from S3 and persist searchableText for task execution report without cached text', async () => {
@@ -501,6 +507,84 @@ describe('Tasks Routes - searchableText persistence', () => {
       await request(app).get('/api/tasks/executions/with-html-reports').expect(200);
 
       expect(taskDb.updateTaskExecutionResultFiles).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('response payload size', () => {
+    it('strips searchableText entirely from the response to keep payload small (long text)', async () => {
+      const reportUrl = 'https://s3.example.com/reports/large-report.html';
+      const longSearchableText = 'A'.repeat(3000);
+
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
+        sessionId: 'session-large',
+        userId: 'user123',
+        title: 'Large Report',
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T12:00:00Z',
+        archived: false,
+        messageCount: 1,
+        assetScanIndex: 1,
+        assetCache: {
+          images: [],
+          videos: [],
+          htmlReports: [{
+            url: reportUrl,
+            filename: 'large-report.html',
+            generatedAt: '2024-01-01T12:00:00Z',
+            searchableText: longSearchableText,
+          }],
+        },
+      }]);
+      (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
+      (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
+
+      const response = await request(app)
+        .get('/api/tasks/executions/with-html-reports')
+        .expect(200);
+
+      const taskKey = 'agent-mode-session-large';
+      const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
+      const file = files.find((f: any) => f.url === reportUrl);
+      expect(file).toBeDefined();
+      expect(file.searchableText).toBeUndefined();
+    });
+
+    it('strips searchableText entirely from the response even for short text', async () => {
+      const reportUrl = 'https://s3.example.com/reports/small-report.html';
+      const shortSearchableText = 'Short content';
+
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
+        sessionId: 'session-small',
+        userId: 'user123',
+        title: 'Small Report',
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T12:00:00Z',
+        archived: false,
+        messageCount: 1,
+        assetScanIndex: 1,
+        assetCache: {
+          images: [],
+          videos: [],
+          htmlReports: [{
+            url: reportUrl,
+            filename: 'small-report.html',
+            generatedAt: '2024-01-01T12:00:00Z',
+            searchableText: shortSearchableText,
+          }],
+        },
+      }]);
+      (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
+      (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
+
+      const response = await request(app)
+        .get('/api/tasks/executions/with-html-reports')
+        .expect(200);
+
+      const taskKey = 'agent-mode-session-small';
+      const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
+      const file = files.find((f: any) => f.url === reportUrl);
+      expect(file).toBeDefined();
+      expect(file.searchableText).toBeUndefined();
     });
   });
 });

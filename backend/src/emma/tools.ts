@@ -3338,7 +3338,7 @@ emmaToolRegistry.register({
   name: 'send_email_to_lead',
   definition: {
     name: 'send_email_to_lead',
-    description: 'Send the existing email draft to a lead using the configured CRM sender. The lead must have an email address and an email draft already created.',
+    description: 'Send the existing email draft to a lead using the configured CRM sender. The lead must have an email address and an email draft already created. A sender email must be configured for the lead list first — this is set per lead list by selecting the lead list and clicking "Senders". If no sender is configured, inform the user to select their lead list and click "Senders" to configure one.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3855,7 +3855,7 @@ emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images. IMPORTANT: When adding a logo to an image, always provide the logo URL in the dedicated logo_image parameter (NOT in inputImages). The logo_image parameter ensures the logo is reproduced with exact precision in text, shape, and color.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image-preview or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image-preview renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3869,7 +3869,7 @@ emmaToolRegistry.register({
         },
         size: {
           type: 'string',
-          description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 Pro Image (gemini-3-pro-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
+          description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 models (gemini-3-pro-image-preview, gemini-3.1-flash-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
           default: 'auto'
         },
         quality: {
@@ -3891,7 +3891,7 @@ emmaToolRegistry.register({
         },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gpt-image-2 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          description: 'Optional: Specific image generation model to use. Model guide: gemini-3.1-flash-image-preview (Google, BEST for logo compositing — renders logo most prominently, 4K output), gemini-3-pro-image-preview (Google, excellent for logo compositing, 4K output), gpt-image-2 (Azure, good for logo compositing — preserves logo faithfully, 1024×1024, may add extra design elements), gpt-image-1 (Azure, DO NOT USE for logo compositing — rewrites logo text instead of preserving it; fine for text-to-image with no logo), gemini-2.5-flash-image (Google, text-to-image only, no logo compositing), gen4_image (Runway, cinematic/photorealistic), gemini_2.5_flash (Runway). When logo_image is provided and no model is specified, gemini-3-pro-image-preview is the default.',
           enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
         }
       },
@@ -3991,6 +3991,14 @@ emmaToolRegistry.register({
             clipDurationSeconds: {
               type: 'number',
               description: 'Optional: Duration of the source clip in seconds. Defaults to 8 (Veo default). Used to set correct composition duration.'
+            },
+            audioUrl: {
+              type: 'string',
+              description: 'Optional S3 URL of an MP3 voiceover audio file to overlay on the composed video. Generate first with generate_voiceover, then pass the returned audioUrl here.'
+            },
+            audioVolume: {
+              type: 'number',
+              description: 'Optional voiceover volume (0.0–1.0). Defaults to 1.0.'
             }
           },
           required: ['brandName', 'primaryColor', 'secondaryColor']
@@ -4022,14 +4030,14 @@ emmaToolRegistry.register({
   name: 'compose_video',
   definition: {
     name: 'compose_video',
-    description: 'Stitch pre-existing video clips together and add brand overlays using Remotion. Use this when you have already generated individual clips and need to combine them into a single branded video. For new multi-clip videos, prefer a single generate_video call with durationSeconds instead.',
+    description: 'Stitch pre-existing video clips together and add brand overlays using Remotion. Use this when you have already generated individual clips and need to combine them into a single branded video. For new multi-clip videos, prefer a single generate_video call with durationSeconds instead. CRITICAL: clip_urls order determines the final video sequence. Before calling this tool, explicitly list each clip URL in shot order (S1, S2, S3, ...) and verify the array matches. Never pass URLs in context/generation order — always pass them in intended playback order.',
     inputSchema: {
       type: 'object',
       properties: {
         clip_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Ordered list of S3/HTTPS URLs of the pre-generated video clips to stitch together (first to last)'
+          description: 'ORDERED list of clip URLs in intended playback sequence (S1 first, S2 second, etc.). The final video plays clips exactly in this order — wrong order here = wrong order in the output. Always sort by shot number before passing, regardless of what order clips were generated.'
         },
         filename: {
           type: 'string',
@@ -4075,6 +4083,14 @@ emmaToolRegistry.register({
         cta_url: {
           type: 'string',
           description: 'Optional website URL shown alongside the CTA text'
+        },
+        audio_url: {
+          type: 'string',
+          description: 'Optional S3 URL of an MP3 voiceover audio file to overlay on the composed video. Generate first with generate_voiceover, then pass the returned audioUrl here.'
+        },
+        audio_volume: {
+          type: 'number',
+          description: 'Optional voiceover volume (0.0–1.0). Defaults to 1.0.'
         }
       },
       required: ['clip_urls', 'filename', 'brand_name', 'primary_color', 'secondary_color']
@@ -4094,10 +4110,93 @@ emmaToolRegistry.register({
         logoUrl: args.logo_url,
         ctaText: args.cta_text,
         ctaUrl: args.cta_url,
+        audioUrl: args.audio_url,
+        audioVolume: args.audio_volume,
       },
       args.clip_duration_seconds,
       args.target_duration_seconds,
       args.clip_durations_seconds
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'mux_video_with_audio',
+  definition: {
+    name: 'mux_video_with_audio',
+    description: 'Combine a silent or muted video (MP4) with a voiceover audio track (MP3) into a single video file with audio. Use this after generate_video and generate_voiceover to produce a final video+audio file. The audio is trimmed to the video length automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        video_url: {
+          type: 'string',
+          description: 'S3 URL of the video file (MP4) — e.g. the videoUrl returned by generate_video or compose_video'
+        },
+        audio_url: {
+          type: 'string',
+          description: 'S3 URL of the voiceover MP3 — the audioUrl returned by generate_voiceover'
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename for the final video (e.g. "agentweb_ad_final.mp4"). .mp4 extension added automatically.'
+        }
+      },
+      required: ['video_url', 'audio_url', 'filename']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.muxVideoWithAudio(
+      args.video_url,
+      args.audio_url,
+      args.filename,
+      context?.userId,
+      context?.sessionId
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'generate_voiceover',
+  definition: {
+    name: 'generate_voiceover',
+    description: 'Generate professional voiceover audio from a script using ElevenLabs TTS. Returns an S3 URL to an MP3 file. Use this to create narration for video ads, presentations, or any audio content. After generating, you can reference the audioUrl in your response so the user can download or play it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        script: {
+          type: 'string',
+          description: 'The voiceover script text to convert to speech'
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename for the audio file (e.g. "product_ad_voiceover.mp3"). .mp3 extension is added automatically if missing.'
+        },
+        voice: {
+          type: 'string',
+          description: 'Voice to use. Available presets: "george" (warm confident male, default), "rachel" (clear professional female), "adam" (deep authoritative male), "bella" (soft friendly female), "josh" (energetic young male), "dorothy" (conversational female). Or pass a raw ElevenLabs voice ID.',
+          enum: ['george', 'rachel', 'adam', 'bella', 'josh', 'dorothy']
+        },
+        stability: {
+          type: 'number',
+          description: 'Voice stability (0.0–1.0). Higher = more consistent but less expressive. Default: 0.5'
+        },
+        similarity_boost: {
+          type: 'number',
+          description: 'Voice similarity boost (0.0–1.0). Higher = closer to original voice. Default: 0.75'
+        }
+      },
+      required: ['script', 'filename']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.generateVoiceover(
+      args.script,
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      args.voice,
+      args.stability,
+      args.similarity_boost
     );
   }
 });
@@ -6531,7 +6630,7 @@ emmaToolRegistry.register({
   name: 'search_user_assets',
   definition: {
     name: 'search_user_assets',
-    description: "Search for assets (images, videos, HTML reports) that were generated in the user's Agent Mode sessions. Returns matching assets with their URLs, filenames, creation dates, asset type, and the session they came from (sessionId + title). Use this when the user asks to find images, videos, reports, or files they've created.",
+    description: "Search for assets (images, videos, HTML reports) that were generated in the user's Agent Mode sessions. Returns matching assets with their URLs, filenames, creation dates, asset type, favorite status, and the session they came from (sessionId + title). Use this when the user asks to find images, videos, reports, or files they've created. Supports filtering by favorite status and approval status.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -6543,6 +6642,14 @@ emmaToolRegistry.register({
         query: {
           type: 'string',
           description: 'Optional keyword to filter by filename (case-insensitive partial match).'
+        },
+        favorites_only: {
+          type: 'boolean',
+          description: "When true, return only assets the user has favorited/starred (❤️ button on the Images page). Use this when the user asks for their favorites, starred, or bookmarked images."
+        },
+        approved_only: {
+          type: 'boolean',
+          description: "When true, return only assets that have been approved via the Slack approval workflow. Use this when the user asks for approved images or assets."
         }
       },
       required: []
@@ -6552,7 +6659,13 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     if (!userId) throw new Error('Authentication required');
 
-    const assets = await chatbotDb.searchUserAssets(userId, args.type, args.query);
+    const assets = await chatbotDb.searchUserAssets(
+      userId,
+      args.type,
+      args.query,
+      args.favorites_only,
+      args.approved_only
+    );
 
     if (assets.length === 0) {
       return { message: 'No assets found matching your criteria.', assets: [] };
@@ -6567,6 +6680,8 @@ emmaToolRegistry.register({
         generatedAt: a.generatedAt,
         sessionId: a.sessionId,
         sessionTitle: a.sessionTitle,
+        isFavorited: a.isFavorited,
+        ...(a.approvalStatus !== undefined && { approvalStatus: a.approvalStatus }),
       })),
     };
   }
@@ -6768,7 +6883,14 @@ For more than ~30 results from a single query, use the cursor returned in the re
 
 When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
 
-After importing, recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.`,
+Setting auto_enrich=true queues a background email-finder job for the newly imported leads — the response then includes "autoEnrichJobId" so the caller can poll job status. When auto_enrich is false (default), no background work is started and you should recommend enriching the list with "Enrich with Web" to fill in missing details like email addresses.
+
+Response keys:
+- imported / skipped / errors / total — per-call counts (do not sum across calls)
+- list_total_after_import — actual post-import list size (trust this for cumulative counts)
+- cursor — pagination cursor for the next page of the same query (null when no more results)
+- importedLeads — array of the first 5 imported lead summaries (firstName, lastName, linkedin, title, company), useful for rendering a quick preview without a follow-up read
+- autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -6826,7 +6948,11 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of leads to import. Defaults to 20, max 100.'
+          description: 'Maximum number of leads to import. Defaults to 20, max 500.'
+        },
+        auto_enrich: {
+          type: 'boolean',
+          description: 'When true, after import, queue a background email-finder job for the new leads. Returns autoEnrichJobId in the response. Default: false.'
         }
       },
       required: ['list_id']
@@ -6834,7 +6960,7 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) throw new Error('Authentication required');
-    const limit = Math.min(args.limit ?? 20, 100);
+    const limit = Math.min(args.limit ?? 20, 500);
     return agentModeService.importLeadsFromSearch(context.userId, {
       listId: args.list_id,
       keywords: args.keywords,
@@ -6850,6 +6976,7 @@ After importing, recommend enriching the list with "Enrich with Web" to fill in 
       school_id: args.school_id,
       cursor: args.cursor,
       limit,
+      auto_enrich: args.auto_enrich,
     });
   }
 });

@@ -19,10 +19,19 @@ import { getEnrichSoService } from '../services/enrichSoService';
 import { QuotaExceededError, LookupByEmailQuotaExceededError, type QuotaTracker } from '../services/enrichSoQuota';
 import { validateLeadsInBackground } from '../services/enrichSoLeadValidation';
 import {
-  ALL_ENRICHMENT_FIELDS,
-  EnrichmentFieldConfig,
-  normalizeEnrichmentFieldConfig,
-} from '../services/enrichmentFieldConfig';
+  startEmailJob,
+  recordResult,
+  completeJob,
+  getJob,
+} from '../services/emailJobTracker';
+import type { LeadRecord } from '../services/crmEnrichmentService';
+import { resolveIdentity } from '../services/enrichmentIdentityResolver';
+import { buildIdentityDeps } from '../services/enrichmentV3RealDeps';
+import {
+  runWithConcurrency,
+  BULK_ENRICH_CONCURRENCY,
+} from '../services/crmEnrichmentConcurrency';
+import { findEmailsForLeadsInBackground } from '../services/crmFindEmailRunner';
 
 // Conservative RFC-5322-ish check — sufficient to reject obvious garbage and
 // catch typos. Real deliverability is what enrich.so checks; this is just a
@@ -33,42 +42,8 @@ function isValidEmailFormat(email: string): boolean {
   return EMAIL_REGEX.test(email) && email.length <= 254;
 }
 
-/**
- * Run an async fn over each item with a bounded concurrency window.
- * Used by bulk enrichment fan-out so a 5K-lead list doesn't fire 5K
- * simultaneous enrich.so + DDB calls.
- *
- * Per-item failures are returned as `Promise.allSettled`-style results so the
- * caller can log without aborting the rest of the batch.
- */
-async function runWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  const cap = Math.max(1, limit);
-  let i = 0;
-  const runners = Array.from({ length: Math.min(cap, items.length) }, async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) return;
-      try {
-        await worker(items[idx]);
-      } catch {
-        // Worker is expected to handle its own errors; this catch is
-        // belt-and-suspenders so one rejection doesn't kill the runner.
-      }
-    }
-  });
-  await Promise.all(runners);
-}
-
-/**
- * Concurrency cap for background bulk enrichment fan-out. Tuned to stay well
- * under enrich.so per-second rate limits while still finishing a 1K-lead list
- * in a few minutes.
- */
-const BULK_ENRICH_CONCURRENCY = 8;
+// runWithConcurrency + BULK_ENRICH_CONCURRENCY moved to
+// services/crmEnrichmentConcurrency.ts so non-route callers can share them.
 
 // Quota tracker is owned by the EnrichSoService singleton; the route reaches
 // it via this thin accessor so tests can inject a fake.
@@ -96,13 +71,21 @@ async function canAccessCrmList(
 
 /**
  * POST /lists/:listId/leads/:leadId/validate-email
- * Body: (none)
- * Returns: { status, confidence, isCatchAll, fromCache, checkedAt }
+ * Body: { autoDncOnFailure?: boolean }   — default true
+ *   When true and the result is undeliverable/risky, the lead is also flipped
+ *   to contactStatus='do-not-contact' (unless it was already DNC/unsubscribed,
+ *   in which case the existing reason/note is preserved).
+ * Returns: { status, confidence, isCatchAll, fromCache, checkedAt, dncApplied }
  */
 router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, res: Response) => {
   const { listId, leadId } = req.params;
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+  // Default true — UI checkbox is checked by default and the user must opt
+  // out to disable it. Explicit `false` opts out; everything else (including
+  // omitted / null / undefined) means "yes, auto-DNC".
+  const autoDncOnFailure = req.body?.autoDncOnFailure !== false;
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -138,6 +121,31 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
     };
     await crmDb.setLeadEmailValidation(listId, leadId, validation, metadata);
 
+    // Auto-DNC: only when the user opted in AND the result is undeliverable AND
+    // the lead isn't already DNC/unsubscribed (don't clobber a user-set reason).
+    // Risky is intentionally excluded — many risky results are catch-all domains
+    // that still deliver, so flipping them to DNC is too aggressive.
+    let dncApplied = false;
+    const isBadResult = result.status === 'undeliverable';
+    const alreadySuppressed =
+      lead.contactStatus === 'do-not-contact' || lead.contactStatus === 'unsubscribed';
+    if (autoDncOnFailure && isBadResult && !alreadySuppressed) {
+      try {
+        await crmDb.updateLead(listId, leadId, {
+          contactStatus: 'do-not-contact',
+          contactStatusReason: 'bounced',
+          contactStatusNote: `Email ${result.status}`,
+          contactStatusUpdatedAt: now,
+          contactStatusUpdatedBy: userId,
+        } as any);
+        dncApplied = true;
+      } catch (err) {
+        // Best-effort — validation result already persisted; surfacing a 500 here
+        // would mislead the caller about whether validation succeeded.
+        console.error('[CRM enrich.so] auto-DNC updateLead failed:', (err as Error).message);
+      }
+    }
+
     return res.json({
       success: true,
       status: result.status,
@@ -145,6 +153,7 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
       isCatchAll: result.isCatchAll,
       fromCache: result.fromCache,
       checkedAt: result.checkedAt,
+      dncApplied,
     });
   } catch (error: any) {
     if (error instanceof QuotaExceededError) {
@@ -157,11 +166,15 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
 
 /**
  * POST /leads/find-email
- * Body: { firstName, lastName, domain?, company? }
+ * Body: { firstName?, lastName?, domain?, company?, linkedin? }
  * Returns: { found, email?, confidence?, fromCache, checkedAt }
  *
  * Same auth + format gates as lookup-by-email; shares the same daily lookup
  * quota counter so the user can't burn extra credits via this route.
+ *
+ * Precondition: ONE of (linkedin URL) OR (name + domain/company) must be
+ * present. Linkedin alone is enough — Apollo's /people/match accepts it as
+ * a primary match key, so a lead with only a LinkedIn URL still resolves.
  */
 router.post('/leads/find-email', async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).user?.userId;
@@ -171,12 +184,16 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
   const lastName = (req.body?.lastName ?? '').toString().trim();
   const domainRaw = (req.body?.domain ?? '').toString().trim().toLowerCase();
   const company = (req.body?.company ?? '').toString().trim();
+  const linkedin = (req.body?.linkedin ?? '').toString().trim();
 
-  if (!firstName && !lastName) {
-    return res.status(400).json({ message: 'firstName or lastName is required' });
-  }
-  if (!domainRaw && !company) {
-    return res.status(400).json({ message: 'domain or company is required' });
+  const haveName = !!(firstName || lastName);
+  const haveOrg = !!(domainRaw || company);
+  const haveLinkedin = !!linkedin && /linkedin\.com\/in\//i.test(linkedin);
+
+  if (!haveLinkedin && !(haveName && haveOrg)) {
+    return res.status(400).json({
+      message: 'Provide either a LinkedIn URL, OR a name plus a domain or company.',
+    });
   }
   // If domain is supplied, sanity-check the format. Bare hostnames pass; URLs are stripped.
   let domain = domainRaw;
@@ -187,7 +204,9 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
     }
   }
 
-  // Shared lookup quota.
+  // Shared lookup quota — gate upfront so over-quota users never reach the
+  // expensive waterfall. Only record usage after the waterfall and only when
+  // the result was a real provider call (cache hits consume no credits).
   const tracker = getQuotaTracker();
   if (tracker) {
     try {
@@ -200,29 +219,98 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
     }
   }
 
+  // Optional: caller can pass persistToListId+persistToLeadId to have the
+  // resolver write results directly to the lead in enrich mode.
+  // Quick-Add (no lead yet) omits these and just consumes the JSON response.
+  const persistToListId = (req.body?.persistToListId ?? '').toString().trim();
+  const persistToLeadId = (req.body?.persistToLeadId ?? '').toString().trim();
+
   try {
-    const result = await getEnrichSoService().findEmail(
-      { firstName, lastName, domain: domain || undefined, company: domain ? undefined : company },
-      { userId },
-    );
-    if (tracker) {
-      try { await tracker.recordLookupByEmailUsage(userId); } catch (e) {
-        console.error('[CRM enrich.so] recordLookupByEmail failed (find-email):', (e as Error).message);
+    // Seed lead from request params (used when no DB lead is available).
+    let leadForResolver: LeadRecord = {
+      leadId: '',
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+      linkedin: linkedin || undefined,
+      emailDomain: domain || undefined,
+      company: company || undefined,
+    };
+    let resolverMode: 'preview' | 'enrich' = 'preview';
+    let resolverListId = '';
+
+    if (persistToListId && persistToLeadId) {
+      // Authorization: persistTo* lets the caller specify any (listId, leadId)
+      // pair, so we MUST verify the auth'd user owns/can-access the target list
+      // before writing — otherwise this is an IDOR.
+      const persistList = await crmDb.getLeadListById(persistToListId);
+      if (!persistList) {
+        return res.status(404).json({ message: 'persistTo lead list not found' });
+      }
+      if (!(await canAccessCrmList(userId, persistList as any))) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+      const dbLead = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null) as LeadRecord | null;
+      if (dbLead) {
+        // Merge request params into the DB lead so domain/name hints from
+        // the UI supplement what the lead already has.
+        leadForResolver = {
+          ...dbLead,
+          emailDomain: dbLead.emailDomain || domain || undefined,
+          company: dbLead.company || company || undefined,
+          firstName: dbLead.firstName || firstName || undefined,
+          lastName: dbLead.lastName || lastName || undefined,
+          linkedin: dbLead.linkedin || linkedin || undefined,
+        };
+        resolverMode = 'enrich';
+        resolverListId = persistToListId;
       }
     }
+
+    const deps = buildIdentityDeps(userId);
+    const result = await resolveIdentity(
+      {
+        lead: leadForResolver,
+        mode: resolverMode,
+        listId: resolverListId,
+        needsPersonFields: false,
+        needsCompanyFields: false,
+        leadHint: (resolverMode === 'enrich')
+          ? { listId: persistToListId, leadId: persistToLeadId }
+          : undefined,
+      },
+      deps,
+    );
+
+    if (!result.ok || !result.resolved.email) {
+      return res.json({ found: false, fromCache: false, checkedAt: new Date().toISOString() });
+    }
+
+    if (tracker) {
+      await tracker.recordLookupByEmailUsage(userId);
+    }
+
+    const filledFields = (resolverMode === 'enrich')
+      ? Object.keys(result.resolved).filter(k => {
+          if (k === 'emailDomain') return false;
+          const prev = (leadForResolver as any)[k];
+          return !prev;
+        })
+      : [];
+
     return res.json({
-      found: result.found,
-      email: result.email,
-      confidence: result.confidence,
-      isCatchAll: result.isCatchAll,
-      fromCache: result.fromCache,
-      checkedAt: result.checkedAt,
+      found: true,
+      email: result.resolved.email,
+      resolvedFields: result.resolved,
+      emailPattern: result.emailPattern,
+      filledFields,
+      fromCache: false,
+      checkedAt: new Date().toISOString(),
     });
   } catch (error: any) {
     if (error instanceof QuotaExceededError) {
       return res.status(429).json({ message: error.message, endpoint: error.endpoint, limit: error.limit });
     }
-    console.error('[CRM enrich.so] find-email error:', error);
+    console.error('[CRM find-email] error:', error);
     return res.status(500).json({ message: error.message || 'Failed to find email' });
   }
 });
@@ -248,171 +336,98 @@ async function fetchAllLeads(listId: string): Promise<any[]> {
   return out;
 }
 
-/**
- * Background bulk find-email — for leads with name + (company or website) but
- * no email, look up the email and write it back to the lead record. Does not
- * block the response. Failures per-lead are swallowed (logged).
- */
-async function findEmailsForLeadsInBackground(
-  listId: string,
-  leads: any[],
-  userId: string,
-): Promise<void> {
-  let svc;
-  try { svc = getEnrichSoService(); } catch { return; }
-  await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
-    const firstName = (lead.firstName ?? '').trim();
-    const lastName = (lead.lastName ?? '').trim();
-    const company = (lead.company ?? '').trim();
-    const website = (lead.website ?? '').trim();
-    const domain = website
-      ? website.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '')
-      : '';
-    if ((!firstName && !lastName) || (!domain && !company)) return;
-    try {
-      const r = await svc.findEmail(
-        { firstName, lastName, domain: domain || undefined, company: domain ? undefined : company },
-        { userId },
-      );
-      if (r.found && r.email) {
-        // Record provenance alongside the value so the UI badge shows where
-        // the email came from (admin/delegated only — gated in EnrichedValue).
-        const now = new Date().toISOString();
-        const enrichmentMetadata = {
-          ...((lead.enrichmentMetadata ?? {}) as Record<string, any>),
-          email: {
-            source: 'web_search' as const,
-            provider: 'enrich.so',
-            confidence: r.confidence,
-            enrichedAt: now,
-            sourceQuote: r.message,
-          },
-        };
-        await crmDb.updateLead(listId, lead.leadId, { email: r.email, enrichmentMetadata });
-      }
-    } catch (err) {
-      console.error('[CRM enrich.so] bulk find-email failed for', lead.leadId, ':', (err as Error).message);
-    }
-  });
-}
+// findEmailsForLeadsInBackground moved to services/crmFindEmailRunner.ts
+// so non-route callers (Phase 1 auto-enrich glue) can invoke it without a
+// service → route import smell.
 
 /**
  * Background bulk reverse-lookup — for leads with email but missing one or
- * more profile fields (firstName/lastName/company/title/linkedin), fetch the
- * profile and fill ONLY the empty fields. Never overwrites user data.
+ * more standard profile fields (firstName/lastName/company/title/linkedin),
+ * fetch the profile via enrich.so and fill ONLY the empty fields.
+ * Never overwrites existing data.
  */
-/** Format an extended-field value for storage in `customFields` (string only).
- * Returns null when the field has no usable value. */
-function pickExtendedFieldValue(
-  field: Exclude<keyof import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
-    'firstName' | 'lastName' | 'company' | 'title' | 'linkedin'>,
-  r: any,
-): string | null {
-  switch (field) {
-    case 'summary':         return typeof r.summary === 'string' && r.summary.trim() ? r.summary : null;
-    case 'location':        return typeof r.location === 'string' && r.location.trim() ? r.location : null;
-    case 'headline':        return typeof r.headline === 'string' && r.headline.trim() ? r.headline : null;
-    case 'connectionCount': return typeof r.connectionCount === 'number' ? String(r.connectionCount) : null;
-    case 'skills':          return Array.isArray(r.skills) && r.skills.length ? r.skills.slice(0, 5).join(', ') : null;
-    case 'pastCompanies':   return Array.isArray(r.pastCompanies) && r.pastCompanies.length ? r.pastCompanies.join('; ') : null;
-    case 'education':       return Array.isArray(r.education) && r.education.length ? r.education.join('; ') : null;
-  }
-}
-
 async function lookupProfilesForLeadsInBackground(
   listId: string,
   leads: any[],
   userId: string,
-  config: import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
+  jobId?: string,
 ): Promise<void> {
   let svc;
-  try { svc = getEnrichSoService(); } catch { return; }
-  await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
-    const email = (lead.email ?? '').trim();
-    if (!email) return;
-    try {
-      const r = await svc.reverseLookup(email, { userId });
-      if (!r.found) return;
-
-      // Standard fields → top-level lead columns. Each one is gated on the
-      // per-list config and only written when the lead's column is empty
-      // (never overwrites existing data).
-      const updates: Record<string, string> = {};
-      if (config.firstName && !lead.firstName && r.firstName) updates.firstName = r.firstName;
-      if (config.lastName  && !lead.lastName  && r.lastName)  updates.lastName  = r.lastName;
-      if (config.company   && !lead.company   && r.companyName) updates.company  = r.companyName;
-      if (config.title     && !lead.title     && r.jobTitle)  updates.title     = r.jobTitle;
-      if (config.linkedin  && !lead.linkedin  && r.profileUrl) updates.linkedin  = r.profileUrl;
-
-      // Extended fields → customFields[<field>]. Same never-overwrite rule:
-      // skip when the lead already has a value at that key.
-      const existingCustom = (lead.customFields ?? {}) as Record<string, any>;
-      const customUpdates: Record<string, string> = {};
-      const EXTENDED = ['summary', 'skills', 'connectionCount', 'location', 'headline', 'pastCompanies', 'education'] as const;
-      for (const f of EXTENDED) {
-        if (!config[f]) continue;
-        if (existingCustom[f]) continue;   // already present → don't overwrite
-        const v = pickExtendedFieldValue(f, r);
-        if (v) customUpdates[f] = v;
+  try { svc = getEnrichSoService(); } catch {
+    if (jobId) completeJob(jobId, 'enrich.so service not initialized');
+    return;
+  }
+  const populatedFieldNames = new Set<string>();
+  try {
+    await runWithConcurrency(leads, BULK_ENRICH_CONCURRENCY, async (lead) => {
+      const email = (lead.email ?? '').trim();
+      if (!email) {
+        if (jobId) recordResult(jobId, { found: false });
+        return;
       }
+      try {
+        const r = await svc.reverseLookup(email, { userId });
+        if (!r.found) {
+          if (jobId) recordResult(jobId, { found: false });
+          return;
+        }
 
-      const wroteAny = Object.keys(updates).length > 0 || Object.keys(customUpdates).length > 0;
-      if (!wroteAny) return;
+        // Standard fields → top-level lead columns. Only written when the
+        // lead's column is empty (never overwrites existing data).
+        const topLevel: Record<string, string> = {};
+        if (!lead.firstName && r.firstName)  topLevel.firstName = r.firstName;
+        if (!lead.lastName  && r.lastName)   topLevel.lastName  = r.lastName;
+        if (!lead.company   && r.companyName) topLevel.company  = r.companyName;
+        if (!lead.title     && r.jobTitle)   topLevel.title     = r.jobTitle;
+        if (!lead.linkedin  && r.profileUrl) topLevel.linkedin  = r.profileUrl;
 
-      // Tag every newly-filled field with provenance so the UI badge can
-      // attribute it to enrich.so (admin/delegated only).
-      const now = new Date().toISOString();
-      const fieldMetaForProvider = {
-        source: 'linkedin' as const,
-        provider: 'enrich.so',
-        confidence: 'high' as const,
-        enrichedAt: now,
-      };
-      const newMeta: Record<string, any> = { ...((lead.enrichmentMetadata ?? {}) as Record<string, any>) };
-      for (const k of Object.keys(updates)) newMeta[k] = fieldMetaForProvider;
-      for (const k of Object.keys(customUpdates)) newMeta[k] = fieldMetaForProvider;
+        if (Object.keys(topLevel).length === 0) {
+          if (jobId) recordResult(jobId, { found: false });
+          return;
+        }
 
-      const mergedCustom = { ...existingCustom, ...customUpdates };
-      const updatePayload: any = { ...updates, enrichmentMetadata: newMeta };
-      if (Object.keys(customUpdates).length > 0) updatePayload.customFields = mergedCustom;
+        const now = new Date().toISOString();
+        const fieldMetaForProvider = {
+          source: 'linkedin' as const,
+          provider: 'enrich.so',
+          confidence: 'high' as const,
+          enrichedAt: now,
+        };
+        const enrichmentMetadata: Record<string, any> = {};
+        for (const k of Object.keys(topLevel)) enrichmentMetadata[k] = fieldMetaForProvider;
 
-      await crmDb.updateLead(listId, lead.leadId, updatePayload);
+        await crmDb.setLeadFields(listId, lead.leadId, { topLevel, enrichmentMetadata, customFields: {}, ifNotExists: true });
+
+        for (const k of Object.keys(topLevel)) populatedFieldNames.add(k);
+        if (jobId) recordResult(jobId, { found: true });
+      } catch (err) {
+        console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
+        if (jobId) recordResult(jobId, { found: false, error: true });
+      }
+    });
+    try {
+      await crmDb.mergeFieldNames(listId, populatedFieldNames);
     } catch (err) {
-      console.error('[CRM enrich.so] bulk lookup failed for', lead.leadId, ':', (err as Error).message);
+      console.error('[CRM enrich.so] bulk lookup: failed to update fieldNames:', (err as Error).message);
     }
-  });
+    if (jobId) completeJob(jobId);
+  } catch (err) {
+    if (jobId) completeJob(jobId, (err as Error).message);
+    throw err;
+  }
 }
 
 function isApplicableForFindEmail(lead: any): boolean {
-  return !lead.email
-    && (!!lead.firstName || !!lead.lastName)
-    && (!!lead.company || !!lead.website);
+  if (lead.email) return false;
+  // Apollo's /people/match accepts linkedin_url as a primary match key, so
+  // a lead with ONLY a LinkedIn URL is still applicable.
+  if (lead.linkedin) return true;
+  return (!!lead.firstName || !!lead.lastName) && (!!lead.company || !!lead.website);
 }
 
-function isApplicableForLookup(
-  lead: any,
-  config?: import('../services/enrichmentFieldConfig').EnrichmentFieldConfig,
-): boolean {
+function isApplicableForLookup(lead: any): boolean {
   if (!lead.email) return false;
-  // No config → legacy semantics: missing one of the 5 standard fields.
-  if (!config) {
-    return !lead.firstName || !lead.lastName || !lead.company || !lead.title || !lead.linkedin;
-  }
-  // With config → applicable when ANY enabled field is empty on the lead.
-  // Standard fields read from top-level columns; extended from customFields.
-  const standard: Array<['firstName' | 'lastName' | 'company' | 'title' | 'linkedin', string]> = [
-    ['firstName', 'firstName'], ['lastName', 'lastName'], ['company', 'company'],
-    ['title', 'title'], ['linkedin', 'linkedin'],
-  ];
-  for (const [cfgKey, leadKey] of standard) {
-    if (config[cfgKey] && !lead[leadKey]) return true;
-  }
-  const cf = (lead.customFields ?? {}) as Record<string, any>;
-  const extended = ['summary', 'skills', 'connectionCount', 'location', 'headline', 'pastCompanies', 'education'] as const;
-  for (const k of extended) {
-    if (config[k] && !cf[k]) return true;
-  }
-  return false;
+  return !lead.firstName || !lead.lastName || !lead.company || !lead.title || !lead.linkedin;
 }
 
 /**
@@ -439,17 +454,12 @@ router.get('/lists/:listId/leads/enrichment-counts', async (req: Request, res: R
     const validatePending = leads.filter((l: any) => l.email && !l.customFields?.email_validation).length;
     const validateAlreadyDone = withEmail - validatePending;
     const findPending = leads.filter(isApplicableForFindEmail).length;
-    // Lookup pending must respect the per-list config so the count matches what
-    // the bulk job will actually queue.
-    const lookupConfig = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    const lookupPending = leads.filter((l) => isApplicableForLookup(l, lookupConfig)).length;
+    const lookupPending = leads.filter(isApplicableForLookup).length;
     // "Already processed" for find = leads that NOW have email (we can't tell
     // if it was provider-found or user-typed, but for UX showing how many are
     // "complete" is what matters).
     const findAlreadyDone = withEmail;
-    // For lookup: "already done" = had email but isn't applicable per config.
+    // For lookup: "already done" = had email but isn't missing any standard field.
     const lookupAlreadyDone = withEmail - lookupPending;
 
     return res.json({
@@ -466,13 +476,17 @@ router.get('/lists/:listId/leads/enrichment-counts', async (req: Request, res: R
 
 /**
  * POST /lists/:listId/leads/find-emails
- * Body: (none — operates on the whole list)
+ * Body: { leadIds?: string[] }   (omit → all leads in list; non-empty array → restrict to those)
  * Returns: 202 { queued, skipped, alreadyDone }
  */
 router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Response) => {
   const { listId } = req.params;
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const { leadIds } = req.body ?? {};
+  if (leadIds !== undefined && !Array.isArray(leadIds)) {
+    return res.status(400).json({ message: 'leadIds must be an array when provided' });
+  }
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -480,12 +494,29 @@ router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Respon
     if (!(await canAccessCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
-    const leads = await fetchAllLeads(listId);
+    let leads: any[];
+    if (Array.isArray(leadIds)) {
+      if (leadIds.length === 0) {
+        return res.status(202).json({ queued: 0, skipped: 0, alreadyDone: 0 });
+      }
+      const fetched = await Promise.all(
+        leadIds.map((id: string) => crmDb.getLeadById(listId, id).catch(() => null)),
+      );
+      leads = fetched.filter((l): l is any => !!l);
+    } else {
+      leads = await fetchAllLeads(listId);
+    }
     const applicable = leads.filter(isApplicableForFindEmail);
     const alreadyDone = leads.filter((l: any) => !!l.email).length;
     const skipped = leads.length - applicable.length - alreadyDone;
-    void findEmailsForLeadsInBackground(listId, applicable, userId);
-    return res.status(202).json({ queued: applicable.length, skipped, alreadyDone });
+    if (applicable.length === 0) {
+      return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
+    const job = startEmailJob({ kind: 'find', listId, userId, total: applicable.length });
+    findEmailsForLeadsInBackground(listId, applicable, userId, job.jobId).catch((err) => {
+      console.error('[CRM enrich.so] find-emails background job failed to start:', err);
+    });
+    return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk find-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue email finder' });
@@ -494,13 +525,17 @@ router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Respon
 
 /**
  * POST /lists/:listId/leads/lookup-emails
- * Body: (none — operates on the whole list)
+ * Body: { leadIds?: string[] }   (omit → all leads in list; non-empty array → restrict)
  * Returns: 202 { queued, skipped, alreadyDone }
  */
 router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Response) => {
   const { listId } = req.params;
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+  const { leadIds } = req.body ?? {};
+  if (leadIds !== undefined && !Array.isArray(leadIds)) {
+    return res.status(400).json({ message: 'leadIds must be an array when provided' });
+  }
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -508,17 +543,30 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
     if (!(await canAccessCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
-    // Load the per-list config so the background job knows which fields the
-    // user actually wants populated. Defaults applied for any unset key.
-    const config = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    const leads = await fetchAllLeads(listId);
-    const applicable = leads.filter((l) => isApplicableForLookup(l, config));
-    const alreadyDone = leads.length - applicable.length - leads.filter((l: any) => !l.email).length;
-    const skipped = leads.length - applicable.length - alreadyDone;
-    void lookupProfilesForLeadsInBackground(listId, applicable, userId, config);
-    return res.status(202).json({ queued: applicable.length, skipped, alreadyDone });
+    let leads: any[];
+    if (Array.isArray(leadIds)) {
+      if (leadIds.length === 0) {
+        return res.status(202).json({ queued: 0, skipped: 0, alreadyDone: 0 });
+      }
+      const fetched = await Promise.all(
+        leadIds.map((id: string) => crmDb.getLeadById(listId, id).catch(() => null)),
+      );
+      leads = fetched.filter((l): l is any => !!l);
+    } else {
+      leads = await fetchAllLeads(listId);
+    }
+    const applicable = leads.filter(isApplicableForLookup);
+    const withEmail = leads.filter((l: any) => !!l.email).length;
+    const alreadyDone = withEmail - applicable.length;
+    const skipped = leads.length - withEmail;
+    if (applicable.length === 0) {
+      return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
+    const job = startEmailJob({ kind: 'lookup', listId, userId, total: applicable.length });
+    lookupProfilesForLeadsInBackground(listId, applicable, userId, job.jobId).catch((err) => {
+      console.error('[CRM enrich.so] lookup-emails background job failed to start:', err);
+    });
+    return res.status(202).json({ jobId: job.jobId, queued: applicable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] bulk lookup-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue profile lookup' });
@@ -547,6 +595,10 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
   if (leadIds !== undefined && !Array.isArray(leadIds)) {
     return res.status(400).json({ message: 'leadIds must be an array when provided' });
   }
+  // Mirrors the single-lead validate route: default true unless the client
+  // explicitly opts out. The bulk dialog sends this from a checkbox the user
+  // can untick before confirming.
+  const autoDncOnFailure = req.body?.autoDncOnFailure !== false;
 
   try {
     const list = await crmDb.getLeadListById(listId);
@@ -593,10 +645,17 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
     const skipped = targetLeads.length - validatable.length;
     const alreadyDone = validatable.filter((l) => l.alreadyValidated).length;
 
-    // Fire and forget — pills update as each completes.
-    void validateLeadsInBackground(listId, validatable, userId);
+    // Fire and forget — pills update as each completes. Track progress so the
+    // UI can show a live counter + final breakdown via /email-jobs/:jobId.
+    if (validatable.length === 0) {
+      return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
+    const job = startEmailJob({ kind: 'validate', listId, userId, total: validatable.length });
+    validateLeadsInBackground(listId, validatable, userId, job.jobId, { autoDncOnFailure }).catch((err) => {
+      console.error('[CRM enrich.so] validate-emails background job failed to start:', err);
+    });
 
-    return res.status(202).json({ queued: validatable.length, skipped, alreadyDone });
+    return res.status(202).json({ jobId: job.jobId, queued: validatable.length, skipped, alreadyDone });
   } catch (error: any) {
     console.error('[CRM enrich.so] validate-emails error:', error);
     return res.status(500).json({ message: error.message || 'Failed to queue email validation' });
@@ -623,6 +682,9 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
 
   // Tight per-route quota gate (50/day default). Independent from the
   // underlying reverseLookup API quota — this is what bounds abuse.
+  // Record usage BEFORE the API call (optimistic) so a recording failure
+  // surfaces as a 500 rather than silently allowing unlimited free calls.
+  // Retry the record up to 2 extra times to tolerate transient DynamoDB blips.
   const tracker = getQuotaTracker();
   if (tracker) {
     try {
@@ -633,15 +695,21 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
       }
       throw err;
     }
+    let recorded = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await tracker.recordLookupByEmailUsage(userId);
+        recorded = true;
+        break;
+      } catch (e) {
+        if (attempt === 2) throw e;
+      }
+    }
+    if (!recorded) throw new Error('Failed to record quota usage after retries');
   }
 
   try {
     const result = await getEnrichSoService().reverseLookup(email, { userId });
-    if (tracker) {
-      try { await tracker.recordLookupByEmailUsage(userId); } catch (e) {
-        console.error('[CRM enrich.so] recordLookupByEmail failed:', (e as Error).message);
-      }
-    }
     if (!result.found) {
       return res.json({ found: false, draft: null });
     }
@@ -670,70 +738,28 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /lists/:listId/enrichment-field-config
- * Returns the per-list enrich.so field config with defaults filled in for any
- * unset key. Standard fields default to true, extended fields default to false.
+ * GET /lists/:listId/email-jobs/:jobId
+ *
+ * Polled by the frontend after a bulk find/validate/lookup is kicked off.
+ * Returns the job's running counts (processed / found / notFound / errors)
+ * plus the final status. Once `status === 'completed'` or `'error'`, the UI
+ * can refetch the lead list to show the new pills/values.
+ *
+ * Returns 404 if the job doesn't exist (e.g., backend restart wiped the
+ * in-memory tracker — the UI should surface "progress unknown" rather than
+ * spin forever).
  */
-router.get('/lists/:listId/enrichment-field-config', async (req: Request, res: Response) => {
-  const { listId } = req.params;
+router.get('/lists/:listId/email-jobs/:jobId', async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).user?.userId;
   if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-
-  try {
-    const list = await crmDb.getLeadListById(listId);
-    if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-    const config = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    return res.json({ config });
-  } catch (error: any) {
-    console.error('[CRM enrich.so] get enrichment-field-config error:', error);
-    return res.status(500).json({ message: error.message || 'Failed to load enrichment field config' });
+  const { listId, jobId } = req.params;
+  const job = getJob(jobId);
+  if (!job) return res.status(404).json({ message: 'Job not found or expired' });
+  if (job.userId !== userId || job.listId !== listId) {
+    // Don't leak job state across users or lists.
+    return res.status(404).json({ message: 'Job not found or expired' });
   }
-});
-
-/**
- * PATCH /lists/:listId/enrichment-field-config
- * Body: { config: Partial<EnrichmentFieldConfig> }
- *   — only known boolean keys are accepted; unknown keys are ignored.
- * Returns: { config } the merged & persisted config.
- */
-router.patch('/lists/:listId/enrichment-field-config', async (req: Request, res: Response) => {
-  const { listId } = req.params;
-  const userId = (req as AuthenticatedRequest).user?.userId;
-  if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-
-  const incoming = (req.body && typeof req.body === 'object') ? (req.body.config ?? req.body) : null;
-  if (!incoming || typeof incoming !== 'object') {
-    return res.status(400).json({ message: 'Body must include a `config` object' });
-  }
-
-  try {
-    const list = await crmDb.getLeadListById(listId);
-    if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    // Merge against existing config so a partial PATCH only updates the keys
-    // the client sent. Unknown keys are dropped by normalize.
-    const existing = normalizeEnrichmentFieldConfig(
-      (list as any).enrichmentFieldConfig as Partial<Record<string, unknown>> | null | undefined,
-    );
-    const merged: EnrichmentFieldConfig = { ...existing };
-    for (const f of ALL_ENRICHMENT_FIELDS) {
-      if (typeof incoming[f] === 'boolean') merged[f] = incoming[f] as boolean;
-    }
-
-    await crmDb.updateLeadList(listId, { enrichmentFieldConfig: merged });
-    return res.json({ config: merged });
-  } catch (error: any) {
-    console.error('[CRM enrich.so] patch enrichment-field-config error:', error);
-    return res.status(500).json({ message: error.message || 'Failed to update enrichment field config' });
-  }
+  return res.json(job);
 });
 
 export default router;

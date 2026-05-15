@@ -247,6 +247,28 @@ export class LinkedInOutreachService {
     }
   }
 
+  /**
+   * Fetch every account registered in Unipile (all pages), regardless of whether
+   * it exists in our DB. Used by the admin view to detect orphaned accounts that
+   * were not cleaned up when the AgentWeb user was deleted or disconnected.
+   */
+  async getAllUnipileAccounts(): Promise<Array<{ id: string; name: string; type: string; created_at?: string }>> {
+    const client = await this.getClient();
+    const items: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const res: any = await client.account.getAll(cursor ? { cursor } : undefined);
+      if (res?.items) items.push(...res.items);
+      cursor = res?.cursor || undefined;
+    } while (cursor);
+    return items.map((item: any) => ({
+      id: item.id,
+      name: item.name ?? item.connection_params?.im?.publicIdentifier ?? item.id,
+      type: item.type,
+      created_at: item.created_at,
+    }));
+  }
+
   // ─── Profile & outreach ──────────────────────────────────────────────────────
 
   /**
@@ -437,12 +459,15 @@ export class LinkedInOutreachService {
 
       let body: any;
 
-      if (url) {
-        // URL-based search: the URL overrides all other params
-        body = { url };
-      } else if (cursor) {
-        // Pagination: just pass the cursor
+      if (cursor) {
+        // Pagination: cursor wins over url because the cursor payload already
+        // encodes the original URL/filter set. Sending `{ url }` here would
+        // make Unipile re-run the search from page 1 on every iteration of
+        // a top-up loop — see find-leads "200 found / 1 imported" regression.
         body = { cursor };
+      } else if (url) {
+        // URL-based search (first page): the URL overrides all other params.
+        body = { url };
       } else {
         // Structured classic search
         body = {

@@ -19,6 +19,7 @@ import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { classifyReport, ReportType } from '../services/reportClassificationService';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -90,6 +91,7 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  reportType?: 'creative' | 'research' | 'performance';
   searchableText?: string;
   feedback?: {
     type: 'like' | 'dislike';
@@ -2167,7 +2169,10 @@ async function getExecutionsWithAssets(
   // the result object is mutated in-place, but we don't block the response on it;
   // cached values are already populated so this only runs for brand-new reports).
   if (assetType === 'html-reports') {
-    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich).catch(() => {/* non-fatal */});
+    // Run searchableText enrichment first (populates content used by classifier), then classify.
+    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
+      .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich))
+      .catch(() => {/* non-fatal */});
   }
 
   return result;
@@ -2258,16 +2263,77 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
 }
 
 /**
+ * Classify HTML reports that have no reportType yet.
+ * Uses the filename + cached searchableText as context for the LLM call.
+ * Persists results back to DynamoDB (same lazy-backfill pattern as searchableText).
+ */
+async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
+  const CONCURRENCY = 5;
+
+  const filesToClassify: Array<{ file: any; executionId: string; sessionId?: string }> = [];
+  for (const task of Object.values(result) as any[]) {
+    for (const execution of task.executions || []) {
+      for (const file of execution.result_files || []) {
+        if (!file.reportType && file.is_html) {
+          filesToClassify.push({ file, executionId: execution.executionId, sessionId: file.sessionId });
+        }
+      }
+    }
+  }
+
+  if (filesToClassify.length === 0) return;
+
+  for (let i = 0; i < filesToClassify.length; i += CONCURRENCY) {
+    const batch = filesToClassify.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async ({ file }) => {
+      try {
+        file.reportType = await classifyReport(file.filename || '', file.searchableText || '');
+      } catch {
+        // Non-fatal
+      }
+    }));
+  }
+
+  // Persist back — group by session (agent-mode) or execution (task)
+  const sessionUpdates = new Map<string, Array<{ url: string; reportType: ReportType }>>();
+  const executionUpdates = new Map<string, any[]>();
+
+  for (const { file, executionId, sessionId } of filesToClassify) {
+    if (!file.reportType) continue;
+    if (sessionId) {
+      if (!sessionUpdates.has(sessionId)) sessionUpdates.set(sessionId, []);
+      sessionUpdates.get(sessionId)!.push({ url: file.url, reportType: file.reportType });
+    } else {
+      if (!executionUpdates.has(executionId)) executionUpdates.set(executionId, []);
+      executionUpdates.get(executionId)!.push(file);
+    }
+  }
+
+  for (const [sessionId, updates] of sessionUpdates) {
+    chatbotDb.persistReportTypes(sessionId, updates).catch(() => {});
+  }
+  for (const [execId, files] of executionUpdates) {
+    for (const task of Object.values(result) as any[]) {
+      const exec = (task.executions || []).find((e: any) => e.executionId === execId);
+      if (exec) {
+        taskDb.updateTaskExecutionResultFiles(execId, exec.result_files).catch(() => {});
+        break;
+      }
+    }
+  }
+}
+
+/**
  * Scan messages in a single pass and extract all asset types.
  * Returns arrays of discovered images, videos, and HTML reports.
  */
 function scanMessagesForAssets(
   messages: any[],
   session: ChatSession
-): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }> } {
+): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string; reportType?: 'creative' | 'research' | 'performance' }> } {
   const images: Array<{ url: string; filename: string; generatedAt: string }> = [];
   const videos: Array<{ url: string; filename: string; generatedAt: string }> = [];
-  const htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }> = [];
+  const htmlReports: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string; reportType?: 'creative' | 'research' | 'performance' }> = [];
 
   const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
   const seenUrls = new Set<string>();
@@ -2433,7 +2499,7 @@ function addCachedHtmlReportsToResult(
   result: Record<string, any>,
   sessionKey: string,
   session: ChatSession,
-  assets: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string }>,
+  assets: Array<{ url: string; filename: string; generatedAt: string; searchableText?: string; reportType?: 'creative' | 'research' | 'performance' }>,
   messages: any[]
 ): void {
   for (const asset of assets) {
@@ -2481,6 +2547,7 @@ function addCachedHtmlReportsToResult(
         is_archived: false,
         feedback,
         ...(asset.searchableText ? { searchableText: asset.searchableText } : {}),
+        ...(asset.reportType ? { reportType: asset.reportType } : {}),
       });
     }
   }
@@ -2565,10 +2632,70 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
     }
 
     const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
-    res.json(result);
+    // Strip searchableText from the response payload without mutating result in-place.
+    // In-place deletion would race with the background enrichment that also writes
+    // file.searchableText on the same objects (microtask ordering puts the route
+    // handler continuation between the enrichment's fetch batch and its persist
+    // section). Using JSON round-trip creates a separate serialized copy so the
+    // live result objects used by enrichment/classify are untouched.
+    const responsePayload = JSON.parse(JSON.stringify(result));
+    for (const task of Object.values(responsePayload) as any[]) {
+      for (const execution of task.executions || []) {
+        for (const file of execution.result_files || []) {
+          delete file.searchableText;
+        }
+      }
+    }
+    res.json(responsePayload);
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Manually set reportType for an HTML report file
+router.post('/executions/:executionId/report-type', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { executionId } = req.params;
+    const { reportUrl, reportType } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!reportUrl || !reportType) return res.status(400).json({ message: 'reportUrl and reportType are required' });
+    if (!['creative', 'research', 'performance'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be creative, research, or performance' });
+    }
+
+    const isAgentModeHtml = executionId.endsWith('-html');
+    const agentSessionId = isAgentModeHtml ? executionId.replace('-html', '') : null;
+
+    if (agentSessionId) {
+      const chatbotDb = new ChatbotDB();
+      const session = await chatbotDb.getChatSession(agentSessionId);
+      if (!session) return res.status(404).json({ message: 'Session not found' });
+      if (session.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+        return res.status(403).json({ message: 'Not authorized' });
+      }
+      await chatbotDb.persistReportTypes(agentSessionId, [{ url: reportUrl, reportType }], true);
+      return res.json({ success: true });
+    }
+
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) return res.status(404).json({ message: 'Execution not found' });
+    if (execution.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    const updatedFiles = (execution.result_files || []).map((file: ResultFile) => {
+      if (file.url === reportUrl) return { ...file, reportType };
+      return file;
+    });
+
+    await taskDb.updateTaskExecutionResultFiles(executionId, updatedFiles);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Error updating report type:', error);
+    return res.status(500).json({ message: 'Internal server error' });
   }
 });
 

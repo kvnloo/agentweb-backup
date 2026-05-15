@@ -19,6 +19,8 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
+    setLeadFields: jest.fn(),
+    mergeFieldNames: jest.fn(),
     updateLeadList: jest.fn(),
     setLeadEmailValidation: jest.fn(),
     getLeadsByListId: jest.fn(),
@@ -29,7 +31,7 @@ jest.mock('../services/db', () => ({
 }));
 
 jest.mock('../services/enrichSoLeadValidation', () => ({
-  validateLeadsInBackground: jest.fn(),
+  validateLeadsInBackground: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockEnrichSo = {
@@ -41,10 +43,21 @@ jest.mock('../services/enrichSoService', () => ({
   getEnrichSoService: () => mockEnrichSo,
 }));
 
+jest.mock('../services/enrichmentIdentityResolver', () => ({
+  resolveIdentity: jest.fn(),
+}));
+
+jest.mock('../services/enrichmentV3RealDeps', () => ({
+  buildIdentityDeps: jest.fn().mockReturnValue({}),
+}));
+
 import enrichSoRouter, { setQuotaTrackerForLookupRoute } from '../routes/crmEnrichSo';
 import { crmDb } from '../services/db';
 import { authenticateToken } from '../middleware/auth';
 import { LookupByEmailQuotaExceededError } from '../services/enrichSoQuota';
+import { resolveIdentity } from '../services/enrichmentIdentityResolver';
+
+const mockResolveIdentity = resolveIdentity as jest.Mock;
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 
@@ -54,6 +67,16 @@ app.use('/api/crm', authenticateToken, enrichSoRouter);
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockCrmDb.setLeadFields.mockImplementation(async (listId: string, leadId: string, options: any) => {
+    const payload: Record<string, any> = { ...(options?.topLevel || {}) };
+    if (options?.customFields && Object.keys(options.customFields).length > 0) {
+      payload.customFields = options.customFields;
+    }
+    if (options?.enrichmentMetadata && Object.keys(options.enrichmentMetadata).length > 0) {
+      payload.enrichmentMetadata = options.enrichmentMetadata;
+    }
+    await mockCrmDb.updateLead(listId, leadId, payload as any);
+  });
   setQuotaTrackerForLookupRoute(null);
 });
 
@@ -132,7 +155,12 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/validate-email', () => {
       status: 'risky', confidence: 'medium', isCatchAll: true, fromCache: false, checkedAt: '2026-05-04T00:00:00Z',
     });
 
-    await request(app).post('/api/crm/lists/L1/leads/LD1/validate-email');
+    // autoDncOnFailure=false so the new auto-DNC path doesn't call updateLead;
+    // this test is specifically checking the customFields read-modify-write
+    // regression (M4), not the contactStatus flip.
+    await request(app)
+      .post('/api/crm/lists/L1/leads/LD1/validate-email')
+      .send({ autoDncOnFailure: false });
 
     // The whole point of the M4 fix: the route does NOT call updateLead({customFields: ...})
     // because that would clobber concurrent edits. Instead it calls the targeted DB method.
@@ -149,6 +177,151 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/validate-email', () => {
     expect(res.status).toBe(500);
     expect(res.body.message).toMatch(/quota/);
   });
+
+  // ─── auto-DNC on undeliverable/risky ──────────────────────────────────────
+  // The Validate Email checkbox in the UI sends `autoDncOnFailure` (default
+  // true). When validation comes back undeliverable/risky AND the lead isn't
+  // already DNC, the route flips the lead to contactStatus='do-not-contact'
+  // so it's automatically excluded from group-email sending.
+
+  describe('auto-DNC behavior', () => {
+    function setupLead(lead: Partial<Record<string, any>> = {}) {
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+      mockCrmDb.getLeadById.mockResolvedValue({
+        leadId: 'LD1',
+        email: 'a@b.com',
+        customFields: {},
+        enrichmentMetadata: {},
+        ...lead,
+      } as any);
+    }
+    function mockValidate(status: 'deliverable' | 'risky' | 'undeliverable' | 'unknown') {
+      mockEnrichSo.validateEmail.mockResolvedValue({
+        status, confidence: 'high', isCatchAll: false,
+        provider: 'GOOGLE', message: status, fromCache: false,
+        checkedAt: '2026-05-08T00:00:00Z',
+      });
+    }
+
+    it('undeliverable + autoDncOnFailure=true → marks lead as do-not-contact', async () => {
+      setupLead();
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(true);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+      const [listId, leadId, updates] = mockCrmDb.updateLead.mock.calls[0] as any;
+      expect(listId).toBe('L1');
+      expect(leadId).toBe('LD1');
+      expect(updates).toMatchObject({
+        contactStatus: 'do-not-contact',
+        contactStatusReason: 'bounced',
+        contactStatusUpdatedBy: 'u1',
+      });
+      expect(typeof updates.contactStatusNote).toBe('string');
+      expect(updates.contactStatusNote).toMatch(/undeliverable/i);
+    });
+
+    it('risky + autoDncOnFailure=true → does NOT mark DNC (risky is intentionally excluded)', async () => {
+      setupLead();
+      mockValidate('risky');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('deliverable + autoDncOnFailure=true → does NOT touch contactStatus', async () => {
+      setupLead();
+      mockValidate('deliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('unknown + autoDncOnFailure=true → does NOT mark DNC (only undeliverable/risky)', async () => {
+      setupLead();
+      mockValidate('unknown');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('undeliverable + autoDncOnFailure=false → leaves contactStatus alone', async () => {
+      setupLead();
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: false });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('autoDncOnFailure omitted → defaults to true (auto-DNC applied)', async () => {
+      setupLead();
+      mockValidate('undeliverable');
+
+      const res = await request(app).post('/api/crm/lists/L1/leads/LD1/validate-email');
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(true);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+    });
+
+    it('lead already do-not-contact → preserves existing reason/note (no overwrite)', async () => {
+      setupLead({
+        contactStatus: 'do-not-contact',
+        contactStatusReason: 'requested-removal',
+        contactStatusNote: 'User asked to be removed via email reply',
+      });
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('lead already unsubscribed → preserves existing status (no overwrite)', async () => {
+      setupLead({
+        contactStatus: 'unsubscribed',
+        contactStatusReason: 'opted-out',
+      });
+      mockValidate('undeliverable');
+
+      const res = await request(app)
+        .post('/api/crm/lists/L1/leads/LD1/validate-email')
+        .send({ autoDncOnFailure: true });
+
+      expect(res.status).toBe(200);
+      expect(res.body.dncApplied).toBe(false);
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // ─── find-email ──────────────────────────────────────────────────────────────
@@ -157,7 +330,8 @@ describe('POST /api/crm/leads/find-email', () => {
   it('returns 400 when no name is provided', async () => {
     const res = await request(app).post('/api/crm/leads/find-email').send({ domain: 'acme.com' });
     expect(res.status).toBe(400);
-    expect(res.body.message).toMatch(/firstName|lastName/);
+    // Combined gate: requires (linkedin) OR (name + domain/company).
+    expect(res.body.message).toMatch(/linkedin|name/i);
   });
 
   it('returns 400 when no domain or company', async () => {
@@ -173,31 +347,30 @@ describe('POST /api/crm/leads/find-email', () => {
   });
 
   it('strips https:// and www. prefixes from domain', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({ found: true, email: 'a@acme.com', confidence: 'high', fromCache: false, checkedAt: 'x' });
+    mockResolveIdentity.mockResolvedValue({ ok: true, resolved: { email: 'a@acme.com' }, siblings: [] });
     const res = await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'A', lastName: 'B', domain: 'https://www.acme.com/about',
     });
     expect(res.status).toBe(200);
-    expect(mockEnrichSo.findEmail).toHaveBeenCalledWith(
-      expect.objectContaining({ domain: 'acme.com' }),
+    expect(mockResolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ lead: expect.objectContaining({ emailDomain: 'acme.com' }) }),
       expect.any(Object),
     );
   });
 
-  it('happy path: returns found result', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({
-      found: true, email: 'alice@acme.com', confidence: 'high', isCatchAll: false,
-      fromCache: false, checkedAt: '2026-05-04',
+  it('happy path: returns found result with resolvedFields', async () => {
+    mockResolveIdentity.mockResolvedValue({
+      ok: true, resolved: { email: 'alice@acme.com', firstName: 'Alice' }, siblings: [],
     });
     const res = await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'Alice', lastName: 'Smith', domain: 'acme.com',
     });
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ found: true, email: 'alice@acme.com', confidence: 'high' });
+    expect(res.body).toMatchObject({ found: true, email: 'alice@acme.com', resolvedFields: expect.objectContaining({ email: 'alice@acme.com' }) });
   });
 
-  it('returns found:false when no email found', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({ found: false, fromCache: false, checkedAt: 'x' });
+  it('returns found:false when resolver finds no email', async () => {
+    mockResolveIdentity.mockResolvedValue({ ok: false, reason: 'identity_unresolvable' });
     const res = await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'A', lastName: 'B', company: 'Nowhere',
     });
@@ -205,13 +378,13 @@ describe('POST /api/crm/leads/find-email', () => {
     expect(res.body.found).toBe(false);
   });
 
-  it('falls back to company when domain absent', async () => {
-    mockEnrichSo.findEmail.mockResolvedValue({ found: false, fromCache: false, checkedAt: 'x' });
+  it('passes company in lead when domain absent', async () => {
+    mockResolveIdentity.mockResolvedValue({ ok: false, reason: 'identity_unresolvable' });
     await request(app).post('/api/crm/leads/find-email').send({
       firstName: 'A', lastName: 'B', company: 'Acme Inc',
     });
-    expect(mockEnrichSo.findEmail).toHaveBeenCalledWith(
-      expect.objectContaining({ company: 'Acme Inc', domain: undefined }),
+    expect(mockResolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ lead: expect.objectContaining({ company: 'Acme Inc' }) }),
       expect.any(Object),
     );
   });
@@ -228,6 +401,92 @@ describe('POST /api/crm/leads/find-email', () => {
     expect(res.status).toBe(429);
     expect(res.body.scope).toBe('lookup');
     expect(mockEnrichSo.findEmail).not.toHaveBeenCalled();
+  });
+
+  // ─── persistToListId/persistToLeadId authorization ─────────────────────────
+  describe('persistTo* authorization', () => {
+    it('returns 403 when persistToListId references a list owned by another user', async () => {
+      // List belongs to a different user, no shared org.
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'someone-else' } as any);
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+        persistToListId: 'L1', persistToLeadId: 'LD1',
+      });
+
+      expect(res.status).toBe(403);
+      expect(mockResolveIdentity).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when persistToListId references a list that does not exist', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+        persistToListId: 'missing-list', persistToLeadId: 'LD1',
+      });
+
+      expect(res.status).toBe(404);
+      expect(mockResolveIdentity).not.toHaveBeenCalled();
+    });
+
+    it('calls resolveIdentity with mode=enrich when caller owns the list', async () => {
+      mockResolveIdentity.mockResolvedValue({
+        ok: true, resolved: { email: 'a@acme.com' }, siblings: [],
+      });
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+      mockCrmDb.getLeadById.mockResolvedValue({
+        leadId: 'LD1', email: '', customFields: {}, enrichmentMetadata: {},
+      } as any);
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+        persistToListId: 'L1', persistToLeadId: 'LD1',
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockResolveIdentity).toHaveBeenCalledWith(
+        expect.objectContaining({ mode: 'enrich', listId: 'L1' }),
+        expect.any(Object),
+      );
+      expect(res.body.found).toBe(true);
+      expect(res.body.filledFields).toContain('email');
+    });
+
+    it('always records lookup usage (no fromCache concept in identity resolver)', async () => {
+      const tracker: any = {
+        checkLookupByEmailQuota: jest.fn(),
+        recordLookupByEmailUsage: jest.fn(),
+      };
+      setQuotaTrackerForLookupRoute(tracker);
+      mockResolveIdentity.mockResolvedValue({
+        ok: true, resolved: { email: 'a@acme.com' }, siblings: [],
+      });
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+      });
+      expect(res.status).toBe(200);
+      expect(tracker.checkLookupByEmailQuota).toHaveBeenCalled();
+      expect(tracker.recordLookupByEmailUsage).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not call getLeadListById / resolveIdentity-enrich when persistTo* is omitted', async () => {
+      mockResolveIdentity.mockResolvedValue({
+        ok: true, resolved: { email: 'a@acme.com' }, siblings: [],
+      });
+
+      const res = await request(app).post('/api/crm/leads/find-email').send({
+        firstName: 'A', lastName: 'B', domain: 'acme.com',
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
+      expect(mockResolveIdentity).toHaveBeenCalledWith(
+        expect.objectContaining({ mode: 'preview' }),
+        expect.any(Object),
+      );
+      expect(res.body.filledFields).toEqual([]);
+    });
   });
 });
 
@@ -265,7 +524,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     const res = await request(app).post('/api/crm/lists/list-1/leads/validate-emails').send({});
 
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 0 });
+    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 0, jobId: expect.any(String) });
   });
 
   it('queues only the selected leadIds when provided', async () => {
@@ -277,7 +536,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
       .post('/api/crm/lists/list-1/leads/validate-emails')
       .send({ leadIds: ['X', 'Y'] });
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 0 });
+    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 0, jobId: expect.any(String) });
   });
 
   it('treats explicit empty leadIds: [] as a no-op (does NOT fall through to fetch-all)', async () => {
@@ -314,7 +573,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     // No leadIds in body — should fetch the whole list.
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 0, alreadyDone: 0 });
+    expect(res.body).toEqual({ queued: 2, skipped: 0, alreadyDone: 0, jobId: expect.any(String) });
     expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(1);
   });
 
@@ -335,7 +594,7 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
 
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 1 });
+    expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 1, jobId: expect.any(String) });
   });
 });
 
@@ -387,7 +646,7 @@ describe('POST /api/crm/lists/:listId/leads/find-emails (bulk)', () => {
     } as any);
     const res = await request(app).post('/api/crm/lists/L1/leads/find-emails').send({});
     expect(res.status).toBe(202);
-    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 1 });
+    expect(res.body).toEqual({ queued: 1, skipped: 1, alreadyDone: 1, jobId: expect.any(String) });
   });
 
   it('returns 403 on cross-tenant access', async () => {
@@ -453,74 +712,11 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
     expect(payload.linkedin).toContain('linkedin.com/in/alice');
     // Extended fields disabled by default → not written.
     expect(payload.customFields).toBeUndefined();
+    expect(mockCrmDb.setLeadFields).toHaveBeenCalledTimes(1);
+    expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('L1', expect.any(Set));
   });
 
-  it('writes extended fields to customFields when enabled in config', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({
-      userId: 'u1',
-      enrichmentFieldConfig: { skills: true, summary: true, pastCompanies: true },
-    } as any);
-    mockCrmDb.getLeadsByListId.mockResolvedValue({
-      items: [{ leadId: '1', email: 'a@b.com' }],
-      lastEvaluatedKey: undefined,
-    } as any);
-    mockEnrichSo.reverseLookup.mockResolvedValue({
-      found: true,
-      firstName: 'Alice', lastName: 'Smith', companyName: 'Acme', jobTitle: 'CEO',
-      profileUrl: 'https://www.linkedin.com/in/alice',
-      summary: 'Designer who ships.',
-      skills: ['Figma', 'UX', 'Prototyping'],
-      pastCompanies: ['Airbnb', 'Stripe'],
-      fromCache: false, checkedAt: 'x',
-    });
-    await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
-    await new Promise((r) => setImmediate(r));
-    expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
-    const payload = mockCrmDb.updateLead.mock.calls[0][2] as any;
-    expect(payload.customFields).toEqual({
-      summary: 'Designer who ships.',
-      skills: 'Figma, UX, Prototyping',
-      pastCompanies: 'Airbnb; Stripe',
-    });
-    // Provenance metadata also tagged for each new field.
-    expect(payload.enrichmentMetadata.skills.provider).toBe('enrich.so');
-    expect(payload.enrichmentMetadata.summary.provider).toBe('enrich.so');
-  });
-
-  it('does not overwrite existing customFields entries', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({
-      userId: 'u1',
-      enrichmentFieldConfig: { skills: true },
-    } as any);
-    mockCrmDb.getLeadsByListId.mockResolvedValue({
-      items: [{
-        leadId: '1', email: 'a@b.com',
-        customFields: { skills: 'pre-existing value' },
-      }],
-      lastEvaluatedKey: undefined,
-    } as any);
-    mockEnrichSo.reverseLookup.mockResolvedValue({
-      found: true, firstName: 'A',
-      skills: ['Should', 'Not', 'Overwrite'],
-      fromCache: false, checkedAt: 'x',
-    });
-    await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
-    await new Promise((r) => setImmediate(r));
-    if (mockCrmDb.updateLead.mock.calls.length > 0) {
-      const payload = mockCrmDb.updateLead.mock.calls[0][2] as any;
-      // Either no customFields write (because nothing new), or skills preserved
-      if (payload.customFields) {
-        expect(payload.customFields.skills).toBe('pre-existing value');
-      }
-    }
-    // Whatever happens, the pre-existing value must not be replaced.
-    for (const call of mockCrmDb.updateLead.mock.calls) {
-      const cf = (call[2] as any).customFields;
-      if (cf && 'skills' in cf) expect(cf.skills).toBe('pre-existing value');
-    }
-  });
-
-  it('queues a lead with all 5 standards filled when an extended field is enabled and missing', async () => {
+  it('returns 200 (not 202) when no leads are applicable — all 5 standard fields already filled', async () => {
     mockCrmDb.getLeadListById.mockResolvedValue({
       userId: 'u1',
       enrichmentFieldConfig: { skills: true },   // skills extended, on
@@ -534,8 +730,11 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
       lastEvaluatedKey: undefined,
     } as any);
     const res = await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
-    expect(res.status).toBe(202);
-    expect(res.body.queued).toBe(1);   // applicable because skills missing
+    // Route returns 200 (not 202) when nothing is queued — 202 is reserved for
+    // accepted-and-running background jobs.
+    expect(res.status).toBe(200);
+    expect(res.body.queued).toBe(0);
+    expect(res.body.alreadyDone).toBe(1);
   });
 });
 
@@ -664,111 +863,5 @@ describe('POST /api/crm/leads/lookup-by-email', () => {
       expect(tracker.checkLookupByEmailQuota).toHaveBeenCalledWith('u1');
       expect(tracker.recordLookupByEmailUsage).toHaveBeenCalledWith('u1');
     });
-  });
-});
-
-// ─── enrichment-field-config (per-list) ──────────────────────────────────────
-
-describe('GET /lists/:listId/enrichment-field-config', () => {
-  it('returns 404 when list does not exist', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue(undefined as any);
-    const res = await request(app).get('/api/crm/lists/missing/enrichment-field-config');
-    expect(res.status).toBe(404);
-  });
-
-  it('returns 403 when user does not own the list and is not in same org', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'other' } as any);
-    // both users have no orgId → not in same org
-    require('../services/db').userDb.getUserById.mockResolvedValue({ userId: 'x' } as any);
-    const res = await request(app).get('/api/crm/lists/l1/enrichment-field-config');
-    expect(res.status).toBe(403);
-  });
-
-  it('returns defaults (standards on, extended off) when list has no config saved', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' } as any);
-    const res = await request(app).get('/api/crm/lists/l1/enrichment-field-config');
-    expect(res.status).toBe(200);
-    expect(res.body.config).toEqual({
-      firstName: true, lastName: true, company: true, title: true, linkedin: true,
-      summary: false, skills: false, connectionCount: false, location: false,
-      headline: false, pastCompanies: false, education: false,
-    });
-  });
-
-  it('returns the merged config when list has partial values saved', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({
-      listId: 'l1', userId: 'u1',
-      enrichmentFieldConfig: { skills: true, summary: true, firstName: false },
-    } as any);
-    const res = await request(app).get('/api/crm/lists/l1/enrichment-field-config');
-    expect(res.body.config.skills).toBe(true);
-    expect(res.body.config.summary).toBe(true);
-    expect(res.body.config.firstName).toBe(false);
-    expect(res.body.config.lastName).toBe(true);   // unset → standard default
-    expect(res.body.config.education).toBe(false); // unset → extended default
-  });
-});
-
-describe('PATCH /lists/:listId/enrichment-field-config', () => {
-  it('empty body is a no-op — returns current config without an update', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({
-      listId: 'l1', userId: 'u1',
-      enrichmentFieldConfig: { skills: true },
-    } as any);
-    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
-    const res = await request(app).patch('/api/crm/lists/l1/enrichment-field-config').send({});
-    expect(res.status).toBe(200);
-    expect(res.body.config.skills).toBe(true);
-  });
-
-  it('persists only known boolean keys, drops unknowns silently', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' } as any);
-    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
-    const res = await request(app)
-      .patch('/api/crm/lists/l1/enrichment-field-config')
-      .send({ config: { skills: true, banana: 'yes', firstName: 'not-bool' } });
-    expect(res.status).toBe(200);
-    const written = mockCrmDb.updateLeadList.mock.calls[0][1].enrichmentFieldConfig as any;
-    expect(written.skills).toBe(true);
-    expect(written.banana).toBeUndefined();
-    expect(written.firstName).toBe(true); // unchanged from default (string ignored)
-  });
-
-  it('partial PATCH preserves previously-saved values that the client did not send', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({
-      listId: 'l1', userId: 'u1',
-      enrichmentFieldConfig: { summary: true, skills: true },
-    } as any);
-    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
-    const res = await request(app)
-      .patch('/api/crm/lists/l1/enrichment-field-config')
-      .send({ config: { education: true } });    // only toggling education on
-    expect(res.status).toBe(200);
-    const written = mockCrmDb.updateLeadList.mock.calls[0][1].enrichmentFieldConfig as any;
-    expect(written.education).toBe(true);   // toggled
-    expect(written.summary).toBe(true);     // preserved
-    expect(written.skills).toBe(true);      // preserved
-  });
-
-  it('accepts the config-without-wrapper shape (body IS the config)', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' } as any);
-    mockCrmDb.updateLeadList.mockResolvedValue(undefined as any);
-    const res = await request(app)
-      .patch('/api/crm/lists/l1/enrichment-field-config')
-      .send({ skills: true });
-    expect(res.status).toBe(200);
-    const written = mockCrmDb.updateLeadList.mock.calls[0][1].enrichmentFieldConfig as any;
-    expect(written.skills).toBe(true);
-  });
-
-  it('returns 404 when list missing, 403 when not authorized', async () => {
-    mockCrmDb.getLeadListById.mockResolvedValue(undefined as any);
-    let res = await request(app).patch('/api/crm/lists/l1/enrichment-field-config').send({ config: { skills: true } });
-    expect(res.status).toBe(404);
-
-    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'l1', userId: 'someone-else' } as any);
-    require('../services/db').userDb.getUserById.mockResolvedValue({ userId: 'x' } as any);
-    res = await request(app).patch('/api/crm/lists/l1/enrichment-field-config').send({ config: { skills: true } });
-    expect(res.status).toBe(403);
   });
 });

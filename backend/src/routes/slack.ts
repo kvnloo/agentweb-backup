@@ -82,7 +82,7 @@ or if no email found:
 {"targetEmail": null, "taskMessage": null}`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite-preview',
+      model: 'gemini-3.1-flash-lite',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
         responseMimeType: 'application/json',
@@ -796,8 +796,18 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
       // Handle message events in threads (follow-up messages to Emma sessions, or non-Emma threads)
       // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
       // Allow file_share subtype so that Slack file uploads are also processed
+      // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
+      // directly, so processing them here too would cause Emma to answer twice.
       if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
         const { text, user: slackUserId, channel, thread_ts: threadTs, files } = event;
+
+        if (text) {
+          const botId = await getEmmaBotUserId();
+          if (botId && text.includes(`<@${botId}>`)) {
+            console.log('📨 Skipping thread message handler for Emma @mention (app_mention handler will process):', { channel, threadTs, user: slackUserId });
+            return;
+          }
+        }
 
         // Look up if this thread is associated with an Emma session
         const threadMappingKey = `slack_thread_${channel}_${threadTs}`;

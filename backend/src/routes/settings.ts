@@ -260,8 +260,8 @@ router.delete('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async
 const CRM_ENRICHMENT_CONFIG_KEY = 'crm-enrichment-config';
 
 const CRM_ENRICHMENT_DEFAULTS = {
-  enrichmentModel: 'gemini-3-flash-preview',
-  dataExtractionModel: 'gemini-3-flash-preview',
+  enrichmentModel: 'gpt-5-chat-2',
+  dataExtractionModel: 'gpt-5-chat-2',
 };
 
 router.get('/crm-enrichment-config', authenticateToken, requireAdmin, async (req, res) => {

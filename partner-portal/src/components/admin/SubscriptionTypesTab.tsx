@@ -277,10 +277,7 @@ const SubscriptionTypesTab: React.FC = () => {
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
-        allowedPages:
-          formData.allowedPages.length === availablePages.length && availablePages.length > 0
-            ? ['*']
-            : formData.allowedPages,
+        allowedPages: formData.allowedPages,
         hiddenPages: formData.hiddenPages || [],
         allowedSkills:
           formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0

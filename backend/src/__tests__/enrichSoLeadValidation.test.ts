@@ -40,9 +40,12 @@ describe('validateLeadEmailInBackground', () => {
     expect(mockEnrichSo.validateEmail).not.toHaveBeenCalled();
   });
 
-  it('returns silently (does not throw) when service errors', async () => {
+  it('returns null (does not throw) when service errors', async () => {
+    // Returns null on service error instead of undefined so upstream callers
+    // (validateLeadsInBackground) can distinguish success/failure when feeding
+    // the per-lead email-job tracker counters.
     mockEnrichSo.validateEmail.mockRejectedValue(new Error('rate limit'));
-    await expect(validateLeadEmailInBackground('L1', 'LD1', 'a@b.com')).resolves.toBeUndefined();
+    await expect(validateLeadEmailInBackground('L1', 'LD1', 'a@b.com')).resolves.toBeNull();
     expect(mockCrmDb.setLeadEmailValidation).not.toHaveBeenCalled();
   });
 
@@ -135,5 +138,150 @@ describe('validateLeadsInBackground', () => {
 
     // First call failed → no DB write; second succeeded → 1 DB write
     expect(mockCrmDb.setLeadEmailValidation).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── auto-DNC plumbed through opts ───────────────────────────────────────────
+// Bulk route passes autoDncOnFailure: true; worker should mark each
+// undeliverable/risky lead as do-not-contact (unless already DNC/unsub).
+
+describe('validateLeadEmailInBackground — autoDncOnFailure', () => {
+  beforeEach(() => {
+    mockCrmDb.setLeadEmailValidation.mockResolvedValue(undefined);
+  });
+
+  it('undeliverable + autoDnc=true → fetches lead and marks DNC', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', contactStatus: 'active' } as any);
+
+    await validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1', { autoDncOnFailure: true });
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+    const [, , updates] = mockCrmDb.updateLead.mock.calls[0] as any;
+    expect(updates).toMatchObject({
+      contactStatus: 'do-not-contact',
+      contactStatusReason: 'bounced',
+      contactStatusUpdatedBy: 'u1',
+    });
+  });
+
+  it('risky + autoDnc=true → does NOT mark DNC (risky is intentionally excluded)', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'risky', confidence: 'medium', isCatchAll: true,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+
+    await validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1', { autoDncOnFailure: true });
+
+    expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('deliverable + autoDnc=true → does NOT touch lead', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'deliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+
+    await validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1', { autoDncOnFailure: true });
+
+    expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('undeliverable + autoDnc not set → does NOT touch lead (preserves existing callers)', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+
+    // No opts → CSV import / single-create callers don't trip on this.
+    await validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1');
+
+    expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('lead already DNC → preserves it (no overwrite)', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'LD1',
+      contactStatus: 'do-not-contact',
+      contactStatusReason: 'requested-removal',
+    } as any);
+
+    await validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1', { autoDncOnFailure: true });
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('lead already unsubscribed → preserves it (no overwrite)', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'LD1',
+      contactStatus: 'unsubscribed',
+    } as any);
+
+    await validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1', { autoDncOnFailure: true });
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('updateLead failure does not throw — DNC flip is best-effort', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1' } as any);
+    mockCrmDb.updateLead.mockRejectedValue(new Error('throttled'));
+
+    await expect(
+      validateLeadEmailInBackground('L1', 'LD1', 'a@b.com', 'u1', { autoDncOnFailure: true }),
+    ).resolves.toEqual({ status: 'undeliverable' });
+  });
+});
+
+describe('validateLeadsInBackground — autoDncOnFailure plumbed', () => {
+  it('passes autoDncOnFailure through to per-lead worker', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+    mockCrmDb.setLeadEmailValidation.mockResolvedValue(undefined);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', contactStatus: 'active' } as any);
+
+    await validateLeadsInBackground(
+      'L1',
+      [{ leadId: 'LD1', email: 'a@b.com' }],
+      'u1',
+      undefined,
+      { autoDncOnFailure: true },
+    );
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(1);
+    expect((mockCrmDb.updateLead.mock.calls[0] as any)[2]).toMatchObject({
+      contactStatus: 'do-not-contact',
+    });
+  });
+
+  it('without opts → no DNC flips (back-compat with existing callers)', async () => {
+    mockEnrichSo.validateEmail.mockResolvedValue({
+      status: 'undeliverable', confidence: 'high', isCatchAll: false,
+      fromCache: false, checkedAt: '2026-05-08',
+    });
+    mockCrmDb.setLeadEmailValidation.mockResolvedValue(undefined);
+
+    await validateLeadsInBackground('L1', [{ leadId: 'LD1', email: 'a@b.com' }]);
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
   });
 });

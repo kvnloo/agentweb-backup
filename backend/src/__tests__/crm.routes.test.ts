@@ -39,6 +39,7 @@ import { resendService } from '../services/resendService';
 import { agentModeService } from '../services/agentModeService';
 import { createLLMService } from '../utils/llmService';
 import { emailEventsDb } from '../services/emailEventsDb';
+import { validateLeadEmailInBackground } from '../services/enrichSoLeadValidation';
 import router from '../routes/crm';
 
 // Mock dependencies
@@ -104,6 +105,10 @@ jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),
   }
+}));
+jest.mock('../services/enrichSoLeadValidation', () => ({
+  validateLeadEmailInBackground: jest.fn(),
+  validateLeadsInBackground: jest.fn(),
 }));
 
 const mockUploadFileToS3 = jest.fn();
@@ -746,6 +751,35 @@ describe('CRM Routes', () => {
       expect(mockResponse.status).toHaveBeenCalledWith(400);
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'selectedSenderId must reference a configured sender' });
     });
+
+    it('triggers background email validation when email is updated', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+      const updatedLead = {
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'new@example.com',
+      };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(updatedLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = { email: 'new@example.com' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({ email: 'new@example.com' }));
+      expect(validateLeadEmailInBackground).toHaveBeenCalledWith('list1', 'lead1', 'new@example.com', 'test-user-id');
+      expect(mockResponse.json).toHaveBeenCalledWith(updatedLead);
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/match-icps', () => {
@@ -1212,6 +1246,7 @@ describe('CRM Routes', () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
       (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({
         successCount: 1,
+        mergedCount: 0,
         errorCount: 0,
         errors: [],
       });
@@ -1245,6 +1280,7 @@ describe('CRM Routes', () => {
         expect.objectContaining({
           success: true,
           successCount: 1,
+          mergedCount: 0,
         })
       );
     });
@@ -1311,18 +1347,43 @@ describe('CRM Routes', () => {
 
     it('should return empty configuration if not set', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
-      
-      const handler = router.stack.find((r: any) => 
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ connected_accounts: [] });
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.get
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.json).toHaveBeenCalledWith({
         senders: [],
         defaultSenderId: null,
+        connectedGmailAccounts: [],
       });
+    });
+
+    it('should include defaultLinkedInAccountId from stored config', async () => {
+      const mockSetting = {
+        settingName: 'crm_sender_emails_test-user-id',
+        settingValue: JSON.stringify({
+          senders: [],
+          defaultSenderId: null,
+          defaultLinkedInAccountId: 'linkedin-acc-42',
+        }),
+      };
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(mockSetting);
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sender-emails' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ defaultLinkedInAccountId: 'linkedin-acc-42' })
+      );
     });
   });
 
@@ -1331,37 +1392,74 @@ describe('CRM Routes', () => {
       const senders = [
         { id: '1', email: 'sender@example.com', fromName: 'Sender Name', notes: 'Test notes' },
       ];
-      
+
       (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
-      
+
       mockRequest.body = {
         senders,
         defaultSenderId: '1',
       };
-      
-      const handler = router.stack.find((r: any) => 
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(settingsService.setSetting).toHaveBeenCalled();
       expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    it('should save defaultLinkedInAccountId when provided', async () => {
+      (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+
+      mockRequest.body = {
+        senders: [{ id: '1', email: 'sender@example.com', fromName: 'Sender' }],
+        defaultSenderId: '1',
+        defaultLinkedInAccountId: 'li-acc-xyz',
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sender-emails' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(settingsService.setSetting).toHaveBeenCalled();
+      const savedConfig = JSON.parse((settingsService.setSetting as jest.Mock).mock.calls[0][1]);
+      expect(savedConfig.defaultLinkedInAccountId).toBe('li-acc-xyz');
+    });
+
+    it('should return 400 if defaultLinkedInAccountId is not a string', async () => {
+      mockRequest.body = {
+        senders: [{ id: '1', email: 'sender@example.com', fromName: 'Sender' }],
+        defaultLinkedInAccountId: 12345,
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sender-emails' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
 
     it('should return 400 if senders is not an array', async () => {
       mockRequest.body = {
         senders: 'not-an-array',
       };
-      
-      const handler = router.stack.find((r: any) => 
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
 
@@ -1369,14 +1467,14 @@ describe('CRM Routes', () => {
       mockRequest.body = {
         senders: [{ email: 'test@example.com' }], // missing fromName
       };
-      
-      const handler = router.stack.find((r: any) => 
+
+      const handler = router.stack.find((r: any) =>
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
   });

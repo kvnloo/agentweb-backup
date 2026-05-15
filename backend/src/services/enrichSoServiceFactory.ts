@@ -184,11 +184,11 @@ function buildCacheStore(): EnrichSoCacheStore {
       if (item.cacheType !== 'enrichso') return null;
       return item;
     },
-    async put(row) {
+    async put(row, opts) {
       await crmDb.putEnrichmentCacheItem({
         ...row,
         cacheType: 'enrichso',
-      });
+      }, opts);
     },
   };
 }

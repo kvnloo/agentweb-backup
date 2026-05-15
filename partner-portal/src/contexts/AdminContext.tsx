@@ -26,6 +26,7 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string;
+  displayName?: string;
   supportNote?: string;
   roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;

@@ -23,6 +23,7 @@ import {
   type EnrichmentFieldName,
   normalizeEnrichmentFieldConfig,
 } from '../enrichmentFieldConfig';
+import { getFieldConfidence } from '../fieldConfidenceRegistry';
 
 const inflight = new Map<string, Promise<ReverseResult | null>>();
 
@@ -94,7 +95,10 @@ function buildSpec(field: EnrichmentFieldName): FieldSpecialist {
 
       return {
         value,
-        confidence: 'high',
+        // Confidence is sourced from the central registry so identity fields
+        // stay 'high' while drift-prone (title/company) and historical
+        // (pastCompanies, skills, education, summary) fields land at 'medium'.
+        confidence: getFieldConfidence('enrich.so', field, 'email'),
         source: 'linkedin',
         provider: 'enrich.so',
       } satisfies SpecialistResult;

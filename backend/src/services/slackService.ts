@@ -1278,17 +1278,17 @@ export async function getRecentChannelMessages(
   const messages = result.messages ?? [];
   const displayNameMap = await resolveDisplayNames(messages);
 
-  return messages.map((msg) => {
+  return Promise.all(messages.map(async (msg) => {
     const userId = msg.user ?? msg.bot_id ?? 'unknown';
     return {
       ts: msg.ts ?? '',
       user: userId,
       displayName: msg.user ? (displayNameMap.get(msg.user) ?? userId) : userId,
-      text: msg.text ?? '',
+      text: await resolveSlackMentionsInText(msg.text ?? ''),
       threadTs: msg.thread_ts,
       replyCount: msg.reply_count,
     } as SlackMessage;
-  });
+  }));
 }
 
 /**
@@ -1311,16 +1311,16 @@ export async function getThreadReplies(
   const messages = result.messages ?? [];
   const displayNameMap = await resolveDisplayNames(messages);
 
-  return messages.map((msg) => {
+  return Promise.all(messages.map(async (msg) => {
     const userId = msg.user ?? msg.bot_id ?? 'unknown';
     return {
       ts: msg.ts ?? '',
       user: userId,
       displayName: msg.user ? (displayNameMap.get(msg.user) ?? userId) : userId,
-      text: msg.text ?? '',
+      text: await resolveSlackMentionsInText(msg.text ?? ''),
       threadTs: msg.thread_ts,
     } as SlackMessage;
-  });
+  }));
 }
 
 /**

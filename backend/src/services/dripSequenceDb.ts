@@ -79,7 +79,11 @@ export type ExitReason =
   | 'engagement'
   | 'unsubscribed'
   | 'bounced'
-  | 'manual';
+  | 'manual'
+  | 'not_messageable'
+  | 'account_disconnected';
+
+export type SequenceChannel = 'email' | 'linkedin';
 
 export type StepConditionOperator = 'eq' | 'neq' | 'exists' | 'not_exists' | 'contains';
 
@@ -94,12 +98,17 @@ export interface SequenceStep {
   stepNumber: number;         // 1-based display order
   name: string;
   delayDays: number;          // days after previous step (or enrollment for step 1)
-  subject: string;
-  bodyHtml: string;
+  channel?: SequenceChannel;  // defaults to 'email' for backwards compatibility
+  // Email-specific fields
+  subject?: string;
+  bodyHtml?: string;
   senderId?: string;          // sender config id; falls back to user default
   spamCheckedAt?: string;     // ISO timestamp of last spam check
   spamPassed?: boolean;       // result of last spam check
   spamContentHash?: string;   // hash of subject+bodyHtml at check time; if content changes, result is stale
+  // LinkedIn-specific fields
+  messageText?: string;       // LinkedIn DM body text
+  linkedInAccountId?: string; // specific Unipile account to send from; auto-resolved if not set
 }
 
 export interface DripSequence {
@@ -172,6 +181,7 @@ export interface SequenceEnrollment {
 
   enrolledAt: string;
   lastEmailSentAt?: string;
+  lastLinkedInSentAt?: string;
   completedAt?: string;
 }
 
@@ -501,11 +511,13 @@ async function advanceEnrollment(
   enrollmentId: string,
   nextStep: number,
   nextSendAt: string,
+  channel: SequenceChannel = 'email',
 ): Promise<void> {
+  const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: 'SET currentStep = :step, nextSendAt = :next, lastEmailSentAt = :sent',
+    UpdateExpression: `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent`,
     ExpressionAttributeValues: {
       ':step': nextStep,
       ':next': nextSendAt,
@@ -518,11 +530,13 @@ async function completeEnrollment(
   enrollmentId: string,
   exitReason: ExitReason,
   finalStatus: EnrollmentStatus = 'completed',
+  channel: SequenceChannel = 'email',
 ): Promise<void> {
+  const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: 'SET #s = :status, exitReason = :reason, completedAt = :ts, lastEmailSentAt = :sent',
+    UpdateExpression: `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent`,
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: {
       ':status': finalStatus,

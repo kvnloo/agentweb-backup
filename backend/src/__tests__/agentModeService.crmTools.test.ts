@@ -29,12 +29,20 @@ jest.mock('../services/resendService', () => ({
   }
 }));
 
+jest.mock('../services/gmailService', () => ({
+  gmailService: {
+    sendEmail: jest.fn(),
+  }
+}));
+
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { gmailService } from '../services/gmailService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockResend = resendService as jest.Mocked<typeof resendService>;
+const mockGmail = gmailService as jest.Mocked<typeof gmailService>;
 
 describe('AgentModeService - CRM Tools', () => {
   let service: AgentModeService;
@@ -351,6 +359,102 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(true);
       expect(result.leads).toHaveLength(1);
       expect(result.leads[0].leadId).toBe(leadId);
+    });
+
+    // ─── in / not_in operators (Phase 1 infrastructure for v3.1 Req C) ───────
+
+    it("should filter by 'in' operator against an array value (case insensitive)", async () => {
+      const acmeLead = { ...mockLead, leadId: 'lead-1', company: 'Acme Corp' };
+      const fintechLead = { ...mockLead, leadId: 'lead-2', company: 'Fintech Inc' };
+      const otherLead = { ...mockLead, leadId: 'lead-3', company: 'Other Co' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [acmeLead, fintechLead, otherLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'in', value: ['acme corp', 'FINTECH INC'] },
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads.map((l: any) => l.leadId).sort()).toEqual(['lead-1', 'lead-2']);
+    });
+
+    it("'in' with an empty array matches no leads", async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'in', value: [] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(0);
+    });
+
+    it("'in' with a non-array value matches no leads (malformed filter, fail safe)", async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'in', value: 'Acme Corp' as any },
+      ], userId);
+
+      expect(result.leads).toHaveLength(0);
+    });
+
+    it("should filter by 'not_in' operator (negation of in)", async () => {
+      const acmeLead = { ...mockLead, leadId: 'lead-1', company: 'Acme Corp' };
+      const otherLead = { ...mockLead, leadId: 'lead-2', company: 'Other Co' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [acmeLead, otherLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'not_in', value: ['Acme Corp'] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].leadId).toBe('lead-2');
+    });
+
+    it("'not_in' with empty array matches ALL leads (exclude list is empty)", async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead, { ...mockLead, leadId: 'lead-2', company: 'Other' }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'company', operator: 'not_in', value: [] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(2);
+    });
+
+    it("'in' works on customFields too (industry in [SaaS, Tech])", async () => {
+      const techLead = { ...mockLead, leadId: 'lead-1', customFields: { industry: 'Tech' } };
+      const finLead = { ...mockLead, leadId: 'lead-2', customFields: { industry: 'Finance' } };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [techLead, finLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'industry', operator: 'in', value: ['SaaS', 'Tech'] },
+      ], userId);
+
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].leadId).toBe('lead-1');
     });
 
     it('should handle is_empty and is_not_empty operators', async () => {
@@ -1132,6 +1236,10 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── sendEmailToLead ───────────────────────────────────────────────────
 
   describe('sendEmailToLead', () => {
+    beforeEach(() => {
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    });
+
     const leadWithDraft = {
       ...mockLead,
       emailDraft: {
@@ -1244,6 +1352,123 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('Email send failed');
     });
+
+    it('should send via Gmail when senderType is gmail', async () => {
+      const gmailSender = {
+        id: 'sender-g1',
+        email: 'shopify@pmps.ai',
+        fromName: 'PMPS Outreach',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'shopify@pmps.ai',
+      };
+      const leadWithGmailSender = { ...leadWithDraft, selectedSenderId: 'sender-g1' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithGmailSender as any);
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g1',
+      });
+      mockGmail.sendEmail.mockResolvedValue({ messageId: 'gmail-msg-1', threadId: 'thread-1' } as any);
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.emailId).toBe('gmail-msg-1');
+      expect(result.from).toBe('shopify@pmps.ai');
+      expect(mockGmail.sendEmail).toHaveBeenCalledWith(
+        userId,
+        'shopify@pmps.ai',
+        expect.objectContaining({
+          to: 'john@acme.com',
+          subject: 'Hello John',
+          body: '<p>Hi John</p>',
+          isHtml: true,
+        })
+      );
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+      expect(mockCrmDb.updateLead).toHaveBeenCalledWith(listId, leadId, { emailDraft: null });
+    });
+
+    it('should return error when Gmail sender is missing gmailAccountId', async () => {
+      const brokenGmailSender = {
+        id: 'sender-g-broken',
+        email: 'x@x.com',
+        fromName: 'X',
+        senderType: 'gmail' as const,
+        // gmailAccountId intentionally omitted
+      };
+      const leadWithBrokenSender = { ...leadWithDraft, selectedSenderId: 'sender-g-broken' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithBrokenSender as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [brokenGmailSender],
+        defaultSenderId: 'sender-g-broken',
+      });
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Gmail sender misconfigured');
+      expect(mockGmail.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should propagate Gmail send errors gracefully', async () => {
+      const gmailSender = {
+        id: 'sender-g2',
+        email: 'test@gmail.com',
+        fromName: 'Test',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'test@gmail.com',
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g2',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new Error('Token revoked'));
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Token revoked');
+    });
+
+    it('should deny access when user is not an org member', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Access denied');
+    });
+
+    it('should use list owner senders when org member sends email', async () => {
+      const orgMemberUserId = 'org-member-id';
+      const listOwnerId = 'list-owner-id';
+      const orgMemberList = { ...mockList, userId: listOwnerId };
+      mockCrmDb.getLeadListById.mockResolvedValue(orgMemberList as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      const getCrmSendersSpy = jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [{ id: 'sender-1', email: 'owner@acme.com', fromName: 'Owner' }],
+        defaultSenderId: 'sender-1',
+      });
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-789' } as any);
+
+      const result = await service.sendEmailToLead(listId, leadId, orgMemberUserId);
+
+      expect(result.success).toBe(true);
+      // Should fetch senders using the list owner's userId, not the caller's
+      expect(getCrmSendersSpy).toHaveBeenCalledWith(listOwnerId);
+    });
   });
 
   // ─── Shared: ownership & error handling ────────────────────────────────
@@ -1251,6 +1476,7 @@ describe('AgentModeService - CRM Tools', () => {
   describe('Shared ownership checks', () => {
     it('getLeadDetails denies access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
       const result = await service.getLeadDetails(listId, leadId, userId);
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
@@ -1280,6 +1506,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('searchLeads denies access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
       const result = await service.searchLeads(listId, [{ field: 'email', operator: 'contains', value: 'test' }], userId);
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');

@@ -16,17 +16,26 @@ jest.mock('../utils/crypto', () => ({
   decryptPassword: (...args: any[]) => mockDecryptPassword(...args),
 }));
 
+const mockGetForeplayApiKey = jest.fn();
+jest.mock('../utils/secretsManager', () => ({
+  getForeplayApiKey: (...args: any[]) => mockGetForeplayApiKey(...args),
+}));
+
 describe('foreplayService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: no platform key configured
+    mockGetForeplayApiKey.mockResolvedValue(null);
     // Clear in-memory cache so each test starts with a clean slate
     clearForeplayCacheForToken('fp_token');
     clearForeplayCacheForToken('fp_test_token');
+    clearForeplayCacheForToken('platform_key');
   });
 
   describe('getAccessToken', () => {
-    it('should return null when user has no Foreplay token', async () => {
+    it('should return null when user has no token and no platform key', async () => {
       mockGetUserById.mockResolvedValue({ userId: 'user-1', secrets: {} });
+      mockGetForeplayApiKey.mockResolvedValue(null);
       const token = await getAccessToken('user-1');
       expect(token).toBeNull();
     });
@@ -43,21 +52,56 @@ describe('foreplayService', () => {
       expect(mockDecryptPassword).toHaveBeenCalledWith('encrypted-token');
     });
 
-    it('should return null when decryption fails', async () => {
+    it('should fall back to platform key when decryption fails', async () => {
       mockGetUserById.mockResolvedValue({
         userId: 'user-1',
         secrets: { foreplay_api_token: 'corrupted' },
       });
       mockDecryptPassword.mockImplementation(() => { throw new Error('Decryption failed'); });
+      mockGetForeplayApiKey.mockResolvedValue('platform_key');
+
+      const token = await getAccessToken('user-1');
+      expect(token).toBe('platform_key');
+    });
+
+    it('should return null when decryption fails and no platform key', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-1',
+        secrets: { foreplay_api_token: 'corrupted' },
+      });
+      mockDecryptPassword.mockImplementation(() => { throw new Error('Decryption failed'); });
+      mockGetForeplayApiKey.mockResolvedValue(null);
 
       const token = await getAccessToken('user-1');
       expect(token).toBeNull();
     });
 
-    it('should return null when user has null secrets', async () => {
+    it('should return null when user has null secrets and no platform key', async () => {
       mockGetUserById.mockResolvedValue({ userId: 'user-1', secrets: null });
+      mockGetForeplayApiKey.mockResolvedValue(null);
       const token = await getAccessToken('user-1');
       expect(token).toBeNull();
+    });
+
+    it('should fall back to platform key when user has no per-user token', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-1', secrets: {} });
+      mockGetForeplayApiKey.mockResolvedValue('platform_key');
+
+      const token = await getAccessToken('user-1');
+      expect(token).toBe('platform_key');
+    });
+
+    it('should prefer per-user token over platform key', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-1',
+        secrets: { foreplay_api_token: 'encrypted-token' },
+      });
+      mockDecryptPassword.mockReturnValue({ password: 'user_token' });
+      mockGetForeplayApiKey.mockResolvedValue('platform_key');
+
+      const token = await getAccessToken('user-1');
+      expect(token).toBe('user_token');
+      expect(mockGetForeplayApiKey).not.toHaveBeenCalled();
     });
   });
 

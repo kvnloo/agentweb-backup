@@ -24,6 +24,7 @@ import { extractVariables } from '../utils/templateParser';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
+import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -169,7 +170,7 @@ interface LLMCallOptions {
 }
 
 // Diagnosis agent configuration
-const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
+const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
@@ -182,6 +183,37 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+}
+
+/**
+ * Build a short, human-readable audit string describing why a lead was
+ * discovered. Written to lead.system.findReason (NOT customFields, which
+ * leaks into CSV exports and email-template variables). Returns null when
+ * only free-text keywords were used — in that case there's no structured
+ * filter worth capturing.
+ *
+ * Capped at 200 chars; long over-flow strings are sliced with an ellipsis
+ * marker so DynamoDB items stay small.
+ */
+function buildFindReason(filters: {
+  keywords?: string;
+  title?: string;
+  company?: string;
+  location?: string;
+  industry?: string;
+  school?: string;
+  search_url?: string;
+}): string | null {
+  const parts: string[] = [];
+  if (filters.title) parts.push(`title=${filters.title}`);
+  if (filters.company) parts.push(`company=${filters.company}`);
+  if (filters.location) parts.push(`location=${filters.location}`);
+  if (filters.industry) parts.push(`industry=${filters.industry}`);
+  if (filters.school) parts.push(`school=${filters.school}`);
+  if (filters.search_url) parts.push('from-url');
+  if (parts.length === 0) return null;
+  const joined = parts.join('; ');
+  return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
 
 
@@ -222,8 +254,52 @@ export class AgentModeService {
     // Ensure built-in skills exist in the database
     await this.ensureBuiltInSkills();
 
+    // Bootstrap downstream service singletons. Server boot also calls these
+    // (server.ts post-createTestAccount), but the forked Emma worker subprocess
+    // (generateMarketingResponseWorker) doesn't run that path — so any tool
+    // that resolves a singleton via getEnrichSoService / getUnipile*Service
+    // would throw "service not initialized" inside the worker. Each init is
+    // idempotent and wrapped in try/catch so a single failure (e.g. missing
+    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // initialize() returns fast — the inits resolve in the background by
+    // the time the first tool call lands.
+    void this.initializeDownstreamSingletons();
+
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
+  }
+
+  private async initializeDownstreamSingletons(): Promise<void> {
+    try {
+      const { initEnrichSoServiceFromEnv } = await import('./enrichSoServiceFactory');
+      await initEnrichSoServiceFromEnv();
+    } catch (err) {
+      console.warn('[AgentMode] enrich.so service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initApolloServiceFromEnv } = await import('./apolloServiceFactory');
+      await initApolloServiceFromEnv();
+    } catch (err) {
+      console.warn('[AgentMode] Apollo service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initUnipileProfileService } = await import('./unipileProfileServiceFactory');
+      initUnipileProfileService();
+    } catch (err) {
+      console.warn('[AgentMode] Unipile profile service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+      initUnipileCompanyService();
+    } catch (err) {
+      console.warn('[AgentMode] Unipile company service init skipped:', (err as Error).message);
+    }
+    try {
+      const { initUnipileSearchParamServiceFromEnv } = await import('./unipileSearchParamServiceFactory');
+      initUnipileSearchParamServiceFromEnv();
+    } catch (err) {
+      console.warn('[AgentMode] Unipile search-param resolver init skipped:', (err as Error).message);
+    }
   }
 
   /**
@@ -1306,7 +1382,7 @@ export class AgentModeService {
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
-    'gemini-3.1-flash-lite-preview': { client: null, supportsTemperature: true },
+    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
@@ -1478,7 +1554,7 @@ export class AgentModeService {
       'gemini-3-pro-preview': [1.25, 10],
       'gemini-3-flash-preview': [0.15, 0.6],
       'gemini-3.1-pro-preview': [1.25, 10],
-      'gemini-3.1-flash-lite-preview': [0.075, 0.3],
+      'gemini-3.1-flash-lite': [0.075, 0.3],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
     // Cache reads are 10% of input price; cache writes are 125% of input price
@@ -1708,6 +1784,11 @@ export class AgentModeService {
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
       const MAX_TOKEN_CONTINUATIONS = 3;
+
+      // Track empty-synthesis retries (Gemini extended-thinking can return empty text
+      // after tool calls when the context is large; a single nudge is enough to recover)
+      let emptySynthesisRetries = 0;
+      const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
       let wasCancelled = false;
       while (iteration < maxIterations) {
@@ -1942,6 +2023,19 @@ export class AgentModeService {
             }
           }
 
+          // If the model returned empty text but tool calls ran earlier this session,
+          // it skipped the synthesis step (observed with Gemini extended-thinking on
+          // large contexts). Nudge it once to produce the final response.
+          if (!content && toolCalls.length > 0 && emptySynthesisRetries < MAX_EMPTY_SYNTHESIS_RETRIES) {
+            emptySynthesisRetries++;
+            console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
+            (messages as any[]).push({
+              role: 'user',
+              content: '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.'
+            });
+            continue;
+          }
+
           // Log the stop reason for debugging
           if (finishReason && finishReason !== 'stop') {
             console.log(`AgentMode: Loop exiting with finish_reason=${finishReason}, stop_reason=${stopReason || 'N/A'}, session=${sessionId}`);
@@ -2090,7 +2184,7 @@ export class AgentModeService {
         // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
         const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
         const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
-          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video'
+          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
         );
 
         let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
@@ -2758,7 +2852,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId);
+      let sessionUserOrgId: string | undefined;
+      try {
+        const { userDb: uDb } = await import('./db');
+        const sessionUser = await uDb.getUserById(userId);
+        sessionUserOrgId = sessionUser?.orgId;
+      } catch { /* skip — org-sharing is best-effort */ }
+      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
 
       if (!publishedSkills.length)
         return { message: "No skills available in the library." };
@@ -3011,8 +3111,16 @@ export class AgentModeService {
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    let userOrgId: string | undefined;
+    if (userId) {
+      try {
+        const { userDb: uDb } = await import('./db');
+        const u = await uDb.getUserById(userId);
+        userOrgId = u?.orgId;
+      } catch { /* skip */ }
+    }
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      userId ? skillService.getSkillsAvailableToUser(userId) : skillService.getPublishedSkills(),
+      userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
@@ -3068,8 +3176,14 @@ export class AgentModeService {
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
+      let installUserOrgId: string | undefined;
+      try {
+        const { userDb: uDb } = await import('./db');
+        const installUser = await uDb.getUserById(userId);
+        installUserOrgId = installUser?.orgId;
+      } catch { /* skip — org-sharing is best-effort */ }
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId),
+        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
         getAllowedSkills(userId)
       ]);
 
@@ -3089,12 +3203,13 @@ export class AgentModeService {
       }
 
       // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill)
+      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
       const validSkillIds = skillIds.filter(id => {
         const skill = publishedSkills.find(s => s.skillId === id);
         const isOwnSkill = skill && skill.ownerId === userId;
+        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
         return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
+          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -3338,6 +3453,43 @@ export class AgentModeService {
         success: actualResult.success,
         description: actualResult.description,
         videoUrl: actualResult.videoUrl
+      };
+    }
+
+    if (toolName === 'generate_voiceover') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse generate_voiceover result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        audioUrl: actualResult.audioUrl,
+        filename: actualResult.filename,
+        durationSeconds: actualResult.durationSeconds,
+        ...(actualResult.error && { error: actualResult.error })
+      };
+    }
+
+    if (toolName === 'mux_video_with_audio') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse mux_video_with_audio result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        videoUrl: actualResult.videoUrl,
+        filename: actualResult.filename,
+        ...(actualResult.error && { error: actualResult.error })
       };
     }
 
@@ -4569,9 +4721,18 @@ export class AgentModeService {
         matches,
       };
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
+      if (isFatal) {
+        return {
+          success: false,
+          fatal: true,
+          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+        };
+      }
       return {
         success: false,
-        message: `Failed to search tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        message: `Failed to search tool response: ${errMsg}`,
       };
     }
   }
@@ -4606,9 +4767,18 @@ export class AgentModeService {
         content: slice,
       };
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
+      if (isFatal) {
+        return {
+          success: false,
+          fatal: true,
+          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+        };
+      }
       return {
         success: false,
-        message: `Failed to read tool response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        message: `Failed to read tool response: ${errMsg}`,
       };
     }
   }
@@ -4640,10 +4810,25 @@ export class AgentModeService {
           // Normalize content-type: strip any charset/extra params and trim whitespace
           const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
           const contentType = rawContentType || 'image/png';
-          const imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let finalContentType = contentType;
+          // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
+          if (imageBuffer.length > 4 * 1024 * 1024) {
+            try {
+              const sharp = (await import('sharp')).default;
+              imageBuffer = await sharp(imageBuffer)
+                .resize({ width: 1200, withoutEnlargement: true })
+                .jpeg({ quality: 85 })
+                .toBuffer();
+              finalContentType = 'image/jpeg';
+              console.log(`AgentMode: describeImage resized large image to ${imageBuffer.length} bytes (JPEG 85%, max 1200px wide)`);
+            } catch (resizeError) {
+              console.error('AgentMode: Failed to resize image, proceeding with original:', resizeError instanceof Error ? resizeError.message : resizeError);
+            }
+          }
           const base64 = imageBuffer.toString('base64');
-          resolvedImageUrl = `data:${contentType};base64,${base64}`;
-          console.log(`AgentMode: describeImage downloaded ${imageBuffer.length} bytes, contentType="${contentType}", dataUri prefix="${resolvedImageUrl.substring(0, 40)}"`);
+          resolvedImageUrl = `data:${finalContentType};base64,${base64}`;
+          console.log(`AgentMode: describeImage downloaded image, final size=${imageBuffer.length} bytes, contentType="${finalContentType}", dataUri prefix="${resolvedImageUrl.substring(0, 40)}"`);
         } catch (downloadError) {
           console.error('AgentMode: Failed to download image for Bedrock, falling back to URL:', downloadError instanceof Error ? downloadError.message : downloadError);
         }
@@ -4953,7 +5138,7 @@ export class AgentModeService {
       if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
         return {
           success: false,
-          message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). The dataset embedded in the instruction is too large to send inline. Please use the save_file tool first to upload the dataset as a .csv or .txt file, then call perform_data_analysis again with the returned file URL in the file_urls parameter and a concise analysis_instruction describing what to analyze.`
+          message: `The analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`
         };
       }
 
@@ -4996,7 +5181,7 @@ export class AgentModeService {
         if (analysisInstruction.length > MAX_INLINE_INSTRUCTION_CHARS) {
           return {
             success: false,
-            message: `After resolving tool-response references, the analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). Use save_file to upload the dataset as a .csv or .txt file, then call perform_data_analysis with the returned file URL in file_urls and a concise analysis_instruction.`
+            message: `After resolving tool-response references, the analysis_instruction is too large (${analysisInstruction.length.toLocaleString()} characters, max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`
           };
         }
       } else if (localPathPattern.test(analysisInstruction)) {
@@ -5045,6 +5230,87 @@ export class AgentModeService {
 
       for (const fileUrl of urlsToProcess) {
         try {
+          // If the LLM passed an s3:// URI (e.g. "s3://bucket/key"), fetch directly via SDK
+          // instead of handing it to axios which only supports http/https.
+          if (fileUrl.startsWith('s3://')) {
+            const withoutScheme = fileUrl.slice('s3://'.length);
+            const slashIdx = withoutScheme.indexOf('/');
+            const s3Bucket = slashIdx === -1 ? withoutScheme : withoutScheme.slice(0, slashIdx);
+            const s3Key = slashIdx === -1 ? '' : withoutScheme.slice(slashIdx + 1);
+            if (!s3Key) {
+              return {
+                success: false,
+                message: `Cannot parse S3 URL "${fileUrl}": no object key found. Use the full s3://bucket/key format.`,
+              };
+            }
+            let s3Content: string;
+            try {
+              s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
+            } catch (s3Err) {
+              const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+              return {
+                success: false,
+                message: `Failed to download or process file: ${fileUrl}`,
+                error: s3ErrMsg,
+              };
+            }
+            const contentBuffer = Buffer.from(s3Content, 'utf-8');
+            totalSize += contentBuffer.byteLength;
+            if (totalSize > maxTotalSize) {
+              return {
+                success: false,
+                message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+              };
+            }
+            const mimeTypeForS3 = fileUrl.endsWith('.json') ? 'application/json'
+              : fileUrl.endsWith('.csv') ? 'text/csv'
+              : 'text/plain';
+            fileParts.push({
+              inlineData: {
+                mimeType: mimeTypeForS3,
+                data: contentBuffer.toString('base64'),
+              }
+            });
+            continue;
+          }
+
+          // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
+          // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
+          const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
+          if (bareS3KeyPattern.test(fileUrl)) {
+            let s3Content: string;
+            try {
+              s3Content = await getS3ObjectAsString(fileUrl);
+            } catch (s3Err) {
+              const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+              return {
+                success: false,
+                message: `Cannot read tool-response file "${fileUrl}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
+              };
+            }
+            if (!s3Content) {
+              return {
+                success: false,
+                message: `Tool-response file "${fileUrl}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
+              };
+            }
+            const contentBuffer = Buffer.from(s3Content, 'utf-8');
+            totalSize += contentBuffer.byteLength;
+            if (totalSize > maxTotalSize) {
+              return {
+                success: false,
+                message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+              };
+            }
+            fileParts.push({
+              inlineData: {
+                mimeType: fileUrl.endsWith('.json') ? 'application/json' : 'text/plain',
+                data: contentBuffer.toString('base64'),
+              }
+            });
+            continue;
+          }
+
           // Download the file
           const response = await axios.get(fileUrl, {
             responseType: 'arraybuffer',
@@ -5253,7 +5519,7 @@ export class AgentModeService {
       if (isPayloadTooLarge) {
         return {
           success: false,
-          message: `The data payload sent to Gemini was too large. Please use the save_file tool to upload the dataset as a .csv or .txt file first, then call perform_data_analysis with the returned file URL in the file_urls parameter instead of embedding the data inline.`,
+          message: `The data payload sent to Gemini was too large. IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`,
           error: errorMessage
         };
       }
@@ -5409,7 +5675,7 @@ export class AgentModeService {
   // Get CRM sender emails configuration
   public async getCrmSenders(userId: string): Promise<{
     success: boolean;
-    senders: Array<{ id: string; email: string; fromName: string; notes?: string }>;
+    senders: Array<{ id: string; email: string; fromName: string; notes?: string; senderType?: 'gmail'; gmailAccountId?: string }>;
     defaultSenderId: string | null;
     error?: string;
   }> {
@@ -5447,13 +5713,15 @@ export class AgentModeService {
   public async getSenderForLead(
     userId: string,
     leadSelectedSenderId?: string | null,
-    listSenderId?: string | null
+    listSenderId?: string | null,
+    listOwnerId?: string | null
   ): Promise<{
     fromName: string;
     notes?: string;
   } | null> {
     try {
-      const sendersResult = await this.getCrmSenders(userId);
+      // Use list owner's sender config so org members can send using the owner's senders
+      const sendersResult = await this.getCrmSenders(listOwnerId || userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return null;
       }
@@ -7113,6 +7381,21 @@ export class AgentModeService {
           if (!isNaN(numFv) && !isNaN(numV)) return numFv < numV;
           return String(fieldValue || '') < String(value || '');
         }
+        case 'in': {
+          // Membership test against a value array. Used by v3.1 enrichment-
+          // config lead filters (`industry in [SaaS, Fintech, ...]`).
+          // Case-insensitive string compare matches existing `equals` convention.
+          // Malformed value (non-array) → fail-safe to no-match.
+          if (!Array.isArray(value)) return false;
+          const fv = String(fieldValue ?? '').toLowerCase();
+          return value.some((v: any) => String(v ?? '').toLowerCase() === fv);
+        }
+        case 'not_in': {
+          if (!Array.isArray(value)) return false;
+          const fv = String(fieldValue ?? '').toLowerCase();
+          // Empty exclude list → matches everything (vacuously not in nothing).
+          return !value.some((v: any) => String(v ?? '').toLowerCase() === fv);
+        }
         default:
           return false;
       }
@@ -8136,7 +8419,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessSend) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
       }
 
@@ -8170,9 +8454,10 @@ export class AgentModeService {
       }
 
       // Resolve sender: lead → list → account default → first available
-      const sendersResult = await this.getCrmSenders(userId);
+      // Use the list owner's sender config so org members can send using the owner's senders
+      const sendersResult = await this.getCrmSenders(list.userId || userId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
-        return { success: false, message: 'No senders configured', error: 'No CRM sender emails are configured. Please set up a sender email in CRM settings first.' };
+        return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
 
       let sender = null;
@@ -8193,19 +8478,38 @@ export class AgentModeService {
         return { success: false, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
       }
 
-      // Send via Resend
-      const { resendService } = await import('./resendService');
-      const from = `${sender.fromName} <${sender.email}>`;
-      const result = await resendService.sendEmail({
-        from,
-        to: lead.email,
-        subject: draft.subject,
-        html: draft.htmlContent,
-        text: draft.textContent
-      });
+      let emailId: string;
 
-      if (!result) {
-        return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+      if ((sender as any).senderType === 'gmail') {
+        // Send via connected Gmail account
+        const gmailAccountId = (sender as any).gmailAccountId;
+        if (!gmailAccountId) {
+          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+        }
+        const { gmailService } = await import('./gmailService');
+        const body = draft.htmlContent || draft.textContent || '';
+        const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+          to: lead.email,
+          subject: draft.subject,
+          body,
+          isHtml: !!draft.htmlContent,
+        });
+        emailId = gmailResult.messageId;
+      } else {
+        // Send via Resend (custom domain sender)
+        const { resendService } = await import('./resendService');
+        const from = `${sender.fromName} <${sender.email}>`;
+        const result = await resendService.sendEmail({
+          from,
+          to: lead.email,
+          subject: draft.subject,
+          html: draft.htmlContent,
+          text: draft.textContent
+        });
+        if (!result) {
+          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        }
+        emailId = result.id;
       }
 
       // Clear the draft after successful send
@@ -8214,7 +8518,7 @@ export class AgentModeService {
       return {
         success: true,
         message: `Email sent successfully to ${lead.email}`,
-        emailId: result.id,
+        emailId,
         to: lead.email,
         from: sender.email,
         subject: draft.subject
@@ -8392,7 +8696,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
@@ -8432,8 +8737,9 @@ export class AgentModeService {
       const marketStrategy = await this.readMarketStrategy(userId);
 
       // Get sender information (from lead record, or default sender from CRM configuration)
+      // Pass list.userId so org members use the list owner's sender config
       const leadSelectedSenderId = (lead as any).selectedSenderId;
-      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId);
+      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId, list?.userId);
 
       // Get existing draft if it exists
       const existingDraft = (lead as any).emailDraft;
@@ -10214,7 +10520,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
 
   /**
    * Generate a 2-3 word summary of what was achieved in a scheduled chat run.
-   * Uses gemini-3.1-flash-lite-preview for fast, low-cost summarization.
+   * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
   async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
@@ -10243,7 +10549,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
 
   /**
    * Generate 2-3 contextual follow-up suggestion chips for the user after each agent turn.
-   * Uses gemini-3.1-flash-lite-preview for fast, low-cost generation.
+   * Uses gemini-3.1-flash-lite for fast, low-cost generation.
    * Returns null on failure so the caller can fall back to client-side regex heuristics.
    */
   async generateSuggestedReplies(
@@ -10297,7 +10603,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
 
   /**
    * Triage a Slack message to determine if it requires handling (e.g. a client question).
-   * Uses gemini-3.1-flash-lite-preview for fast, low-cost classification.
+   * Uses gemini-3.1-flash-lite for fast, low-cost classification.
    * Returns true if the message needs to be handled, false otherwise.
    */
   public async triageSlackMessage(message: string): Promise<boolean> {
@@ -10364,8 +10670,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
 
       // Fetch campaigns
       console.log('AgentMode: Fetching Meta ad campaigns for user:', userId);
@@ -10613,7 +10918,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             );
           })();
 
-      const version = process.env.META_API_VERSION || "v24.0";
+      const version = process.env.META_API_VERSION || "v25.0";
       const baseUrl = `https://graph.facebook.com/${version}`;
       const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
 
@@ -11756,8 +12061,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
 
       // Calculate date range based on timeframe
       // Exclude today since it's not fully complete - use yesterday as end date
@@ -13238,6 +13542,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       safeMessage.includes('service temporarily unavailable');
     if (isConnectionTimeout) {
       return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
+    }
+    // ReferenceError from browser_run_code means the code references variables not available in
+    // the VM sandbox (only `page` is in scope). Guide the LLM to fix the code, not retry as-is.
+    const isBrowserRunCode =
+      toolName === 'browser_run_code' || toolName.endsWith('_browser_run_code');
+    if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
+    }
+    // Data analysis "too large" errors — LLM must use save_file, not keep retrying with inline data
+    if (toolName === 'perform_data_analysis' &&
+        (safeMessage.includes('too large') || safeMessage.includes('exceeds'))) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST use the save_file tool first to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
@@ -15445,6 +15761,71 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: 'Failed to generate video',
         error: error.message
       };
+    }
+  }
+
+  /**
+   * Mux a video file with a voiceover audio track using ffmpeg.
+   */
+  public async muxVideoWithAudio(
+    videoUrl: string,
+    audioUrl: string,
+    outputFilename: string,
+    userId: string,
+    _sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`AgentMode: Muxing video+audio for user ${userId}`);
+      const { muxVideoWithAudio } = await import('./voiceoverService');
+      const result = await muxVideoWithAudio(videoUrl, audioUrl, outputFilename, userId);
+      if (result.success && result.videoUrl) {
+        return {
+          success: true,
+          message: `✅ Video with voiceover "${result.filename}" ready!`,
+          videoUrl: result.videoUrl,
+          filename: result.filename,
+        };
+      }
+      return { success: false, message: result.error || 'Mux failed', error: result.error };
+    } catch (error: any) {
+      console.error('AgentMode: Error muxing video+audio:', error);
+      return { success: false, message: 'Failed to combine video and audio', error: error.message };
+    }
+  }
+
+  /**
+   * Generate voiceover audio from a script using ElevenLabs TTS.
+   */
+  public async generateVoiceover(
+    script: string,
+    filename: string,
+    userId: string,
+    sessionId: string,
+    voice?: string,
+    stability?: number,
+    similarityBoost?: number
+  ): Promise<any> {
+    try {
+      console.log(`AgentMode: Generating voiceover, script length=${script?.length}, voice=${voice ?? 'george'}, userId=${userId}`);
+      const { generateVoiceover, isAvailable } = await import('./voiceoverService');
+      if (!await isAvailable()) {
+        return { success: false, message: 'Voiceover service is not available. ElevenLabs API key may not be configured.', error: 'Service unavailable' };
+      }
+      const result = await generateVoiceover(script, filename, userId, voice, stability, similarityBoost);
+      if (result.success && result.audioUrl) {
+        return {
+          success: true,
+          message: `✅ Voiceover "${result.filename}" generated successfully!`,
+          audioUrl: result.audioUrl,
+          filename: result.filename,
+          durationSeconds: result.durationSeconds,
+          voiceId: result.voiceId,
+        };
+      }
+      return { success: false, message: result.error || 'Failed to generate voiceover', error: result.error };
+    } catch (error: any) {
+      console.error('AgentMode: Error generating voiceover:', error);
+      return { success: false, message: 'Failed to generate voiceover', error: error.message };
     }
   }
 
@@ -21375,11 +21756,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     cursor?: string;
     limit?: number;
     auto_enrich?: boolean;
+    /** When set, every imported lead in this batch gets
+     *  `lead.system.icpSource = icpSource` so the UI can attribute the
+     *  lead back to the persona that sourced it. Distinct from the
+     *  `lead.icpMatch` scoring field (post-import scoring). */
+    icpSource?: string;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
-      cursor, limit = 20, auto_enrich = false,
+      cursor, limit = 20, auto_enrich = false, icpSource,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -21400,83 +21786,236 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       };
     }
 
-    // Search for people. The structured filters (location/industry/school) are
-    // auto-resolved to LinkedIn entity IDs by linkedInOutreachService when only
-    // free text is supplied; pre-resolved *_id always wins. cursor enables
-    // pagination through a single query.
-    const searchResult = await linkedInOutreachService.searchPeople(accountId, {
-      keywords,
-      url: search_url,
-      title,
-      company,
-      company_id,
-      location,
-      location_id,
-      industry,
-      industry_id,
-      school,
-      school_id,
-      cursor,
+    // Build the audit string ONCE — same for every lead in this batch since
+    // every lead in this loop came from the same set of filters.
+    const findReason = buildFindReason({
+      keywords, title, company, location, industry, school, search_url,
     });
 
-    if (!searchResult?.items?.length) {
-      return { success: true, imported: 0, skipped: 0, message: 'No results found for the given search criteria.' };
+    // Hash criteria so we can persist a per-(list, criteria) cursor and pick
+    // up where the previous top-up loop stopped on a future call.
+    const criteriaHash = computeFindLeadsCriteriaHash({
+      keywords, search_url, title, company, company_id,
+      location, location_id, industry, industry_id, school, school_id,
+    });
+
+    const { crmDb } = await import('./db');
+
+    // Initial cursor: caller-provided wins; otherwise resume from any cursor
+    // we previously persisted for this exact criteria set on this list.
+    let activeCursor: string | undefined = cursor;
+    let preLoopList: any = null;
+    try {
+      preLoopList = await crmDb.getLeadListById(listId);
+      if (!activeCursor) {
+        const stored = (preLoopList as any)?.searchCursors?.[criteriaHash];
+        if (stored?.cursor) activeCursor = stored.cursor as string;
+      }
+    } catch {
+      // List read failure here is recoverable — fall through with no stored cursor.
     }
 
-    // Slice to requested limit
-    const itemsToImport = searchResult.items.slice(0, limit);
+    // Top-up loop. Keep paginating until we've added `limit` *new* leads
+    // (post-dedup), the search exhausts, or we hit the safety cap.
+    const MAX_ITERATIONS = 20;
+    let cumulativeNew = 0;
+    let cumulativeMerged = 0;
+    let totalFetched = 0;
+    let iterationCount = 0;
+    // `nextCursor` is the cursor we'll pass to the *next* searchPeople call.
+    // `lastFetchCursor` is the cursor we passed to the *most recent* call —
+    // tracked separately so that, if we end up trimming on the final page,
+    // we can resume *that* page on the next call (the deleted-from-CRM leads
+    // re-appear as "new" through dedup, so no candidate is permanently lost).
+    let nextCursor: string | null | undefined = activeCursor ?? null;
+    let lastFetchCursor: string | null | undefined = nextCursor;
+    let safetyCapHit = false;
+    let searchError: string | null = null;
+    const allErrors: string[] = [];
+    const allCreated: Array<{ leadId: string; email?: string }> = [];
+    const allMappedLeadsPreview: any[] = []; // first-5 preview only
 
-    // Map Unipile search result fields → CRM lead fields.
-    // Search results use a different shape than full profiles:
-    //   name (full), public_identifier (slug), profile_url (messy with miniProfileUrn),
-    //   headline, location — NO first_name/last_name, NO clean public_profile_url.
-    const leads = itemsToImport.map((item: any) => {
-      const lead: any = {};
-
-      // Split full name into first/last
-      if (item.name) {
-        const parts = (item.name as string).trim().split(/\s+/);
-        lead.firstName = parts[0] || '';
-        lead.lastName = parts.slice(1).join(' ') || '';
-      } else {
-        if (item.first_name) lead.firstName = item.first_name;
-        if (item.last_name) lead.lastName = item.last_name;
+    while (iterationCount < MAX_ITERATIONS) {
+      iterationCount++;
+      lastFetchCursor = nextCursor;
+      let searchResult: any;
+      try {
+        // Structured filters (location/industry/school) are auto-resolved to
+        // LinkedIn entity IDs by linkedInOutreachService when only free text
+        // is supplied; pre-resolved *_id always wins.
+        searchResult = await linkedInOutreachService.searchPeople(accountId, {
+          keywords,
+          url: search_url,
+          title,
+          company,
+          company_id,
+          location,
+          location_id,
+          industry,
+          industry_id,
+          school,
+          school_id,
+          cursor: lastFetchCursor ?? undefined,
+        });
+      } catch (e: any) {
+        searchError = e?.message ? String(e.message) : String(e);
+        break;
       }
 
-      // Build clean LinkedIn URL from slug — avoids the messy miniProfileUrn query string
-      if (item.public_identifier) {
-        lead.linkedin = `https://www.linkedin.com/in/${item.public_identifier}`;
-      } else if (item.profile_url) {
-        // Strip the miniProfileUrn garbage if present
-        const baseUrl = (item.profile_url as string).split('?')[0];
-        lead.linkedin = baseUrl;
+      const items = Array.isArray(searchResult?.items) ? searchResult.items : [];
+      nextCursor = searchResult?.cursor ?? null;
+
+      if (items.length === 0) break;
+      totalFetched += items.length;
+
+      // Map Unipile search result fields → CRM lead fields, then resolve
+      // missing companies through a 4-tier fallback chain. Each tier runs
+      // only on leads still missing `company`:
+      //   1. item.work_experience[].company (sync, from search result)
+      //   2. parseCompanyFromTitle (regex, sync, instant)
+      //   3. batchParseCompaniesFromTitlesWithLLM (ONE Gemini Flash call for all titles in the batch)
+      //   4. Unipile getProfile via cache-first wrapper (HTTP, free on cache hit, parallel)
+
+      // Phase 1: sync map for Tier 1 (work_experience) + Tier 2 (regex).
+      const leads: any[] = items.map((item: any) => {
+        const lead: any = {};
+        if (item.name) {
+          const parts = (item.name as string).trim().split(/\s+/);
+          lead.firstName = parts[0] || '';
+          lead.lastName = parts.slice(1).join(' ') || '';
+        } else {
+          if (item.first_name) lead.firstName = item.first_name;
+          if (item.last_name) lead.lastName = item.last_name;
+        }
+        if (item.public_identifier) {
+          lead.linkedin = `https://www.linkedin.com/in/${item.public_identifier}`;
+        } else if (item.profile_url) {
+          const baseUrl = (item.profile_url as string).split('?')[0];
+          lead.linkedin = baseUrl;
+        }
+        if (item.headline) lead.title = item.headline;
+        if (item.work_experience?.length) {
+          const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+          if (current?.company && !lead.company) lead.company = current.company;
+          if (current?.position && !lead.title) lead.title = current.position;
+        }
+        if (!lead.company && lead.title) {
+          const parsed = parseCompanyFromTitle(lead.title);
+          if (parsed) lead.company = parsed;
+        }
+        if (item.location) {
+          lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
+        }
+        // sys is sidecar — see Phase 0b lead.system top-level field.
+        const sys: Record<string, any> = {};
+        if (findReason) sys.findReason = findReason;
+        if (icpSource) sys.icpSource = icpSource;
+        if (Object.keys(sys).length > 0) {
+          lead.system = { ...(lead.system ?? {}), ...sys };
+        }
+        return lead;
+      });
+
+      // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
+      // missing a company. Skipped entirely when no candidates remain.
+      const llmIndices: number[] = [];
+      const llmTitles: string[] = [];
+      for (let i = 0; i < leads.length; i++) {
+        if (!leads[i].company && typeof leads[i].title === 'string' && leads[i].title) {
+          llmIndices.push(i);
+          llmTitles.push(leads[i].title);
+        }
+      }
+      if (llmTitles.length > 0) {
+        try {
+          const llmClient = await this.getClientForModel('gemini-2.5-flash');
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient);
+          for (let k = 0; k < llmIndices.length; k++) {
+            const v = results[k];
+            if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
+          }
+        } catch (e: any) {
+          console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
+        }
       }
 
-      // Title from headline or current_role
-      if (item.headline) lead.title = item.headline;
-      if (item.work_experience?.length) {
-        const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
-        if (current?.company && !lead.company) lead.company = current.company;
-        if (current?.position && !lead.title) lead.title = current.position;
+      // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
+      await Promise.all(items.map(async (item: any, idx: number) => {
+        const lead = leads[idx];
+        if (lead.company || !item.public_identifier || !accountId) return;
+        try {
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profile = await getUnipileProfileService().getProfile(item.public_identifier, accountId);
+          const raw = (profile as any)?.rawData ?? profile;
+          const exp = raw?.work_experience;
+          if (Array.isArray(exp) && exp.length) {
+            const cur = exp.find((w: any) => w.current) || exp[0];
+            if (cur?.company) lead.company = cur.company;
+          }
+        } catch (e: any) {
+          console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
+        }
+      }));
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+      cumulativeNew += result.newCount ?? 0;
+      cumulativeMerged += result.mergedCount ?? 0;
+      if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
+      const created = Array.isArray((result as any).created) ? (result as any).created : [];
+      if (created.length) allCreated.push(...created);
+
+      if (allMappedLeadsPreview.length < 5) {
+        for (const lead of leads) {
+          if (allMappedLeadsPreview.length >= 5) break;
+          allMappedLeadsPreview.push(lead);
+        }
       }
 
-      if (item.location) lead.notes = `Location: ${item.location}`;
+      if (cumulativeNew >= limit) break;
+      if (!nextCursor) break;
+    }
 
-      return lead;
-    });
+    // Did we exit because we hit the safety cap with more pages still
+    // available? (Surfaces when iteration ran the full count without hitting
+    // limit and a cursor remains.)
+    if (iterationCount >= MAX_ITERATIONS && cumulativeNew < limit && nextCursor) {
+      safetyCapHit = true;
+    }
 
-    // Bulk-import into CRM list
-    const { crmDb } = await import('./db');
-    const { default: crmRouter } = await import('../routes/crm').catch(() => ({ default: null }));
+    // Trim post-hoc to exactly `limit` new leads. Trailing IDs in
+    // `allCreated` come from the last batch insert in iteration order, so
+    // dropping `excess` from the end gives a stable, predictable trim.
+    let trimmedCount = 0;
+    if (cumulativeNew > limit) {
+      const excess = cumulativeNew - limit;
+      const toTrim = allCreated.slice(allCreated.length - excess);
+      for (const entry of toTrim) {
+        try {
+          await crmDb.deleteLead(listId, entry.leadId);
+        } catch (e: any) {
+          allErrors.push(`Failed to trim lead ${entry.leadId}: ${e?.message || e}`);
+        }
+      }
+      allCreated.splice(allCreated.length - excess, excess);
+      cumulativeNew -= excess;
+      trimmedCount = excess;
+    }
 
-    // Call batchCreateLeads directly (same path as the bulk-import endpoint)
-    const result = await crmDb.batchCreateLeads(listId, leads);
+    // Resume cursor — the value we both surface to callers and persist:
+    //  - If we trimmed on the final page, resume from THAT page's fetch
+    //    cursor (lastFetchCursor) so the next call re-fetches it. The
+    //    just-deleted leads come back through dedup as "new", so no candidate
+    //    is permanently lost across calls.
+    //  - Otherwise we advanced cleanly through every page we processed, so
+    //    resume from `nextCursor` (the cursor returned by the last fetch).
+    const resumeCursor: string | null = (trimmedCount > 0 ? lastFetchCursor : nextCursor) ?? null;
+    try {
+      await crmDb.setLeadListSearchCursor(listId, criteriaHash, resumeCursor);
+    } catch {
+      // Persistence failure is non-fatal — the loop already imported the leads.
+    }
 
-    // Surface the post-import list count so callers (especially Emma running
-    // multiple paginated searches) can trust ground truth instead of summing
-    // per-call `imported` values — the same lead can match multiple search
-    // queries and is correctly dedup'd by batchCreateLeads, but the per-call
-    // count alone doesn't reflect that overlap across calls.
+    // Surface the post-import list count.
     let listTotalAfterImport = 0;
     try {
       const list = await crmDb.getLeadListById(listId);
@@ -21488,20 +22027,165 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
     const response: any = {
       success: true,
-      imported: result.newCount,
-      skipped: result.mergedCount,
+      imported: cumulativeNew,
+      skipped: cumulativeMerged,
       list_total_after_import: listTotalAfterImport,
-      errors: result.errors,
-      total: itemsToImport.length,
-      cursor: searchResult.cursor,
+      errors: allErrors,
+      total: totalFetched,
+      cursor: resumeCursor,
+      iterations: iterationCount,
+      trimmed: trimmedCount,
+      safetyCapHit,
     };
+    if (searchError) response.searchError = searchError;
+    if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
+      response.message = 'No results found for the given search criteria.';
+    }
+    response.importedLeads = allMappedLeadsPreview;
 
-    if (auto_enrich && result.newCount > 0) {
-      response.enrich_note = 'auto_enrich is not yet supported — run the Enrich with Web action on the list to enrich imported leads.';
+    if (auto_enrich && cumulativeNew > 0) {
+      const newLeadIds: string[] = allCreated.map((c) => c.leadId);
+      if (newLeadIds.length > 0) {
+        // Indirected through __testHooks so tests can spy and stub.
+        const job = await __testHooks.enqueueFindEmailJobForNewLeads(userId, listId, newLeadIds);
+        // Guard on jobId rather than truthiness — autoEnrich returns a
+        // sentinel { jobId: '', queued: 0, reason: 'quota-exhausted' } in
+        // the no-budget path that we must not surface as a job id.
+        if (job?.jobId) response.autoEnrichJobId = job.jobId;
+      }
     }
 
     return response;
   }
 }
+
+/**
+ * Stable hash of the find-leads filter set, used as the key in the per-list
+ * `searchCursors` map so the next top-up loop with the same criteria resumes
+ * from the cursor we persisted last time.
+ */
+function computeFindLeadsCriteriaHash(filters: {
+  keywords?: string;
+  search_url?: string;
+  title?: string;
+  company?: string;
+  company_id?: string;
+  location?: string;
+  location_id?: string;
+  industry?: string;
+  industry_id?: string;
+  school?: string;
+  school_id?: string;
+}): string {
+  const orderedKeys = [
+    'keywords', 'search_url', 'title', 'company', 'company_id',
+    'location', 'location_id', 'industry', 'industry_id', 'school', 'school_id',
+  ] as const;
+  const obj: Record<string, string> = {};
+  for (const k of orderedKeys) {
+    const v = (filters as any)[k];
+    if (v !== undefined && v !== null && v !== '') obj[k] = String(v);
+  }
+  // SHA-1 of canonical JSON, truncated to 16 hex chars — collision risk is
+  // negligible for the per-list cardinality we expect here.
+  return require('crypto').createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Tier 2 of company resolution for LinkedIn-search leads: cheap regex on
+ * the lead's headline / title. Looks for "Role at Company" or "Role @ Company"
+ * (case-insensitive on "at"). Other separators (|, ·, –) are left to Tier 3
+ * (LLM) so we don't false-positive on "Senior Engineer - Backend".
+ */
+function parseCompanyFromTitle(title: any): string | null {
+  if (typeof title !== 'string' || !title) return null;
+  const match = title.match(/^.*?\S\s+(?:at|@)\s+(\S.*?)\s*$/i);
+  if (!match) return null;
+  const company = match[1].split(/\s*[|·•‧]\s*/)[0].trim();
+  return company || null;
+}
+
+/**
+ * Tier 3 of company resolution: ONE Gemini Flash call per page that takes the
+ * full batch of titles and returns a parallel array of company names (or
+ * "NONE"). Caller passes the resolved llmClient so the helper stays pure and
+ * easily mockable. On any error or response-shape mismatch, returns an
+ * all-"NONE" array so callers fall through to Tier 4 (Unipile getProfile).
+ */
+async function batchParseCompaniesFromTitlesWithLLM(
+  titles: string[],
+  llmClient: any,
+): Promise<string[]> {
+  if (!Array.isArray(titles) || titles.length === 0) return [];
+  if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
+  try {
+    const systemPrompt = [
+      'You extract company names from professional / LinkedIn titles in batch.',
+      'Input is a JSON array of titles. Return a JSON array of the SAME length where each entry is either the extracted company name as plain text, or the literal string "NONE" if no company is identifiable.',
+      '',
+      'Examples:',
+      'Input:  ["Software Engineer at Google", "Founder | Acme Inc", "Senior Engineer", "Developer · Microsoft"]',
+      'Output: ["Google", "Acme Inc", "NONE", "Microsoft"]',
+      '',
+      'Output rules:',
+      '- Return ONLY the JSON array, no preamble, no markdown fence, no commentary.',
+      '- Same length as input.',
+      '- Plain text company names, no quotes inside the strings.',
+      '- Use "NONE" (uppercase) when uncertain.',
+    ].join('\n');
+    const userPrompt = `Titles: ${JSON.stringify(titles)}`;
+    const completion = await llmClient.chat.completions.create({
+      model: 'gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_completion_tokens: Math.max(500, titles.length * 30),
+      temperature: 0.1,
+    });
+    const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
+    // Gemini Flash often adds preamble / postamble / markdown fences despite
+    // explicit instructions. Locate the widest `[ ... ]` substring instead of
+    // strict-parsing the whole response.
+    const firstBracket = raw.indexOf('[');
+    const lastBracket = raw.lastIndexOf(']');
+    if (firstBracket < 0 || lastBracket <= firstBracket) {
+      console.warn('[batchParseCompaniesFromTitlesWithLLM] no JSON array in response:', raw.slice(0, 200));
+      return titles.map(() => 'NONE');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw.slice(firstBracket, lastBracket + 1));
+    } catch (parseErr: any) {
+      console.warn('[batchParseCompaniesFromTitlesWithLLM] JSON.parse failed:', parseErr?.message, '| raw:', raw.slice(0, 200));
+      return titles.map(() => 'NONE');
+    }
+    if (!Array.isArray(parsed) || parsed.length !== titles.length) {
+      return titles.map(() => 'NONE');
+    }
+    return parsed.map((v: any) => {
+      if (typeof v !== 'string') return 'NONE';
+      const t = v.trim();
+      if (!t) return 'NONE';
+      if (t.toUpperCase() === 'NONE') return 'NONE';
+      if (t.length > 100) return 'NONE';
+      return t;
+    });
+  } catch (e: any) {
+    console.warn('[batchParseCompaniesFromTitlesWithLLM] failed:', e?.message ?? String(e));
+    return titles.map(() => 'NONE');
+  }
+}
+
+/**
+ * Test seam — exposes the autoEnrich glue so unit tests can spy/stub
+ * without exporting it as production API. Mutating __testHooks in tests
+ * is safe because each test file imports a fresh module instance.
+ */
+export const __testHooks = {
+  enqueueFindEmailJobForNewLeads,
+  parseCompanyFromTitle,
+  batchParseCompaniesFromTitlesWithLLM,
+};
 
 export const agentModeService = new AgentModeService();

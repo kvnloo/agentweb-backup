@@ -22,12 +22,20 @@ export interface LLMUsageData {
 export type OnUsageCallback = (usage: LLMUsageData) => void;
 
 export class LLMService {
-  private chatModel: AzureChatOpenAI | ChatBedrockConverse;
+  private chatModel: AzureChatOpenAI | ChatBedrockConverse | null;
   private modelName: string;
+  private isGemini: boolean;
 
   constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
     this.modelName = model;
+    this.isGemini = model.toLowerCase().includes('gemini');
+
+    if (this.isGemini) {
+      this.chatModel = null;
+      return;
+    }
+
     const isClaude = model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.');
 
     if (isClaude) {
@@ -85,6 +93,11 @@ export class LLMService {
    * Extract usage data from a LangChain AIMessage response.
    * LangChain standardizes token counts on `usage_metadata` across providers.
    */
+  private requireChatModel(): AzureChatOpenAI | ChatBedrockConverse {
+    if (!this.chatModel) throw new Error(`LLMService: model "${this.modelName}" requires generateJSONContentWithWebSearch, not generateJSONContent`);
+    return this.chatModel;
+  }
+
   private extractUsage(response: any): LLMUsageData {
     const meta = response?.usage_metadata;
     const inputTokens = meta?.input_tokens || 0;
@@ -111,7 +124,7 @@ export class LLMService {
         ['user', userPrompt],
       ]);
 
-      const chain = prompt.pipe(this.chatModel);
+      const chain = prompt.pipe(this.requireChatModel());
 
       if (responseFormat === 'json') {
         // Use JSON output parser for structured responses
@@ -169,7 +182,7 @@ export class LLMService {
         new SystemMessage(systemPrompt),
         new HumanMessage(userPrompt),
       ];
-      const response = await this.chatModel.invoke(messages) as any;
+      const response = await this.requireChatModel().invoke(messages) as any;
       const rawResponse = typeof response.content === 'string' ? response.content : String(response.content || '');
 
       if (onUsage) {
@@ -231,7 +244,7 @@ export class LLMService {
         new SystemMessage(system),
         new HumanMessage(userPrompt),
       ];
-      const response = await this.chatModel.invoke(messages) as any;
+      const response = await this.requireChatModel().invoke(messages) as any;
       const rawResponse = typeof response.content === 'string'
         ? response.content
         : String(response.content || '');
@@ -289,7 +302,7 @@ export class LLMService {
       new SystemMessage(systemPrompt),
       new HumanMessage(userPrompt),
     ];
-    const response = await this.chatModel.invoke(messages) as any;
+    const response = await this.requireChatModel().invoke(messages) as any;
     if (onUsage) {
       onUsage(this.extractUsage(response));
     }
@@ -325,7 +338,7 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
         new HumanMessage(userPrompt),
       ];
 
-      const response = await this.chatModel.invoke(messages) as any;
+      const response = await this.requireChatModel().invoke(messages) as any;
       const rawResponse = typeof response.content === 'string' ? response.content : String(response.content || '');
 
       if (onUsage) {
@@ -358,6 +371,88 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
       console.error('LLMService: Error generating HTML:', error);
       throw error;
     }
+  }
+
+  /**
+   * Generate structured JSON using a web-search-capable model.
+   * - Gemini models: Google Search grounding tool
+   * - Azure/OpenAI models: web_search_preview tool via Responses API
+   * Prompt should instruct the model to use provided context first, then web
+   * search if needed, then its own knowledge, and return null for unknowns.
+   */
+  async generateJSONContentWithWebSearch<T = any>(
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<T> {
+    if (this.isGemini) {
+      const { GoogleGenAI } = await import('@google/genai');
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+      const genai = new GoogleGenAI({ apiKey: apiKey.trim() });
+      const response = await genai.models.generateContent({
+        model: this.modelName,
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          tools: [{ googleSearch: {} }],
+        },
+      });
+      const text = response.text ?? '';
+      return extractJson<T>(text);
+    }
+
+    // Azure OpenAI — Responses API with web_search tool. Called via raw HTTP
+    // because the top-level `openai` SDK in this repo (v4.x) predates the
+    // Responses endpoint, and @langchain/openai v1.x no longer exposes its
+    // bundled v6 client through a stable surface (`chatModel.client` is gone).
+    // The Responses API requires api-version 2025-03-01-preview or later.
+    const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+    const apiKey = process.env.AZURE_OPENAI_API_KEY;
+    if (!apiKey || !endpoint) {
+      throw new Error('AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set');
+    }
+    const apiVersion = process.env.AZURE_OPENAI_RESPONSES_API_VERSION || '2025-03-01-preview';
+    const url = `${endpoint.replace(/\/$/, '')}/openai/responses?api-version=${apiVersion}`;
+    const reqBody = JSON.stringify({
+      model: this.modelName,
+      instructions: systemPrompt,
+      input: userPrompt,
+      tools: [{ type: 'web_search' }],
+    });
+    const debug = process.env.LLM_WEB_SEARCH_DEBUG === '1';
+    const reqStart = Date.now();
+    if (debug) {
+      console.log('[llm.webSearch] → POST', url);
+      console.log('[llm.webSearch] → headers: api-key=[redacted], Content-Type=application/json');
+      console.log('[llm.webSearch] → body:', reqBody.slice(0, 500));
+    }
+    const httpResp = await fetch(url, {
+      method: 'POST',
+      headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
+      body: reqBody,
+    });
+    if (debug) {
+      console.log(`[llm.webSearch] ← status=${httpResp.status} in ${Date.now() - reqStart}ms`);
+    }
+    if (!httpResp.ok) {
+      const errBody = await httpResp.text().catch(() => '');
+      throw new Error(`Azure Responses API ${httpResp.status}: ${errBody.slice(0, 300)}`);
+    }
+    const rawBody = await httpResp.text();
+    if (debug) {
+      console.log('[llm.webSearch] ← body:', rawBody.slice(0, 800));
+    }
+    const resp = JSON.parse(rawBody) as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
+    // Newer responses include `output_text`; older shape returns an `output`
+    // array of items where each item's `content[*].text` carries the chunks.
+    let text = resp.output_text ?? '';
+    if (!text && Array.isArray(resp.output)) {
+      text = resp.output.flatMap(item => item.content ?? [])
+        .map(c => c?.text ?? '')
+        .filter(Boolean)
+        .join('');
+    }
+    return extractJson<T>(text);
   }
 }
 

@@ -357,4 +357,46 @@ describe('EmailEventsDb', () => {
       ).rejects.toThrow('DynamoDB put error');
     });
   });
+
+  describe('addLinkedInMessageEvent', () => {
+    it('stores emailId from messageProviderId when provided', async () => {
+      mockDynamodb.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) } as any);
+
+      await emailEventsDb.addLinkedInMessageEvent({
+        eventId: 'ev-1',
+        emailDomain: 'linkedin-list-1',
+        leadEmail: 'https://www.linkedin.com/in/john-doe',
+        eventType: 'linkedin.message.sent',
+        text: 'Hello!',
+        timestamp: '2026-01-01T10:00:00.000Z',
+        senderId: 'acct-1',
+        messageProviderId: 'msg-provider-123',
+      });
+
+      expect(mockDynamodb.put).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Item: expect.objectContaining({ emailId: 'msg-provider-123' }),
+        }),
+      );
+    });
+
+    it('falls back to eventId when messageProviderId is empty (GSI key cannot be empty string)', async () => {
+      mockDynamodb.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) } as any);
+
+      await emailEventsDb.addLinkedInMessageEvent({
+        eventId: 'ev-fallback-1',
+        emailDomain: 'linkedin-list-2',
+        leadEmail: 'https://www.linkedin.com/in/jane-doe',
+        eventType: 'linkedin.message.sent',
+        text: 'Hi there!',
+        timestamp: '2026-01-01T10:00:00.000Z',
+        senderId: 'acct-1',
+        messageProviderId: '',
+      });
+
+      const putCall = (mockDynamodb.put as jest.Mock).mock.calls[0][0];
+      expect(putCall.Item.emailId).toBe('ev-fallback-1');
+      expect(putCall.Item.emailId).not.toBe('');
+    });
+  });
 });

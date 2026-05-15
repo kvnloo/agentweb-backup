@@ -8,6 +8,7 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { generateChatResponse, chatbotDb } from './services/chatbotService';
 import { checkTokenUsage } from './services/tokenUsageService';
+import { userDb } from './services/db';
 import {
   startLiveSession,
   sendAudioChunk,
@@ -225,10 +226,11 @@ io.on('connection', (socket: Socket) => {
       }
 
       const portalType = data.portal || 'partner';
+      const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin }
+        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
       );
 
       // Send response back to the client
@@ -362,6 +364,17 @@ createTestAccount().then(async () => {
     console.log('enrich.so service initialized');
   } catch (err) {
     console.warn('enrich.so service not initialized — email finder/reverse lookup specialists will fall back to LLM:', (err as Error).message);
+  }
+
+  // Initialize Apollo people-enrichment service. Defensive — a missing API key
+  // (Secrets Manager not yet provisioned) must not crash boot. Apollo features
+  // simply stay dormant; waterfall router falls back to enrich.so / LLM.
+  try {
+    const { initApolloServiceFromEnv } = await import('./services/apolloServiceFactory');
+    await initApolloServiceFromEnv();
+    console.log('Apollo service initialized');
+  } catch (err) {
+    console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
   }
 
   // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of

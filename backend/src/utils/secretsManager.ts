@@ -637,9 +637,10 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+
 /**
  * Get the email-verification provider API key from AWS Secrets Manager.
- * Secret format: plain string API key.
+ * Stored as a plain string at dev/AgentWeb/EnrichSo or prod/AgentWeb/EnrichSo.
  */
 export async function getEnrichSoApiKey(): Promise<string> {
   const environment = process.env.NODE_ENV || 'development';
@@ -651,6 +652,52 @@ export async function getEnrichSoApiKey(): Promise<string> {
     throw new Error(`Email verification API key is empty. Store it in Secrets Manager at ${secretName}.`);
   }
   return key.trim();
+}
+
+export interface ApolloCredentials {
+  apiKey: string;
+  webhookSecret?: string;
+}
+
+/**
+ * Get the Apollo people-enrichment API key from AWS Secrets Manager.
+ * Stored as JSON `{"apiKey":"…","webhookSecret":"…"}` at dev/AgentWeb/Apollo
+ * or prod/AgentWeb/Apollo.
+ */
+export async function getApolloApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Apollo'
+    : 'dev/AgentWeb/Apollo';
+  const secretString = await getSecret(secretName);
+  if (!secretString || secretString.trim() === '') {
+    throw new Error(`Apollo credentials secret is empty. Store JSON {"apiKey","webhookSecret"} in Secrets Manager at ${secretName}.`);
+  }
+  const parsed = JSON.parse(secretString) as ApolloCredentials;
+  if (!parsed.apiKey || parsed.apiKey.trim() === '') {
+    throw new Error(`Apollo credentials at ${secretName} missing apiKey.`);
+  }
+  return parsed.apiKey.trim();
+}
+
+/**
+ * Shared secret used to authenticate the Apollo waterfall webhook callback.
+ * Apollo doesn't HMAC-sign webhook bodies and silently drops `webhook_headers`,
+ * so we embed this value in the **URL path** of the webhook we hand Apollo
+ * (/api/crm/webhooks/apollo/<secret>) and verify it on the receiving route
+ * with a constant-time compare. Must be URL-safe (no characters needing
+ * percent-encoding to round-trip cleanly).
+ *
+ * Resolution order: `APOLLO_WEBHOOK_SECRET` env var if set and non-empty,
+ * otherwise the built-in default. The default ships intentionally so the
+ * webhook works in dev without extra setup; production deploys should set
+ * the env var to a rotated value.
+ */
+const DEFAULT_APOLLO_WEBHOOK_SECRET = 'dev_apl_wh_8k3p2x9qm7n4r5z6_v1';
+
+export async function getApolloWebhookSecret(): Promise<string> {
+  const fromEnv = process.env.APOLLO_WEBHOOK_SECRET?.trim();
+  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_APOLLO_WEBHOOK_SECRET;
 }
 
 export interface AttioCredentials {
@@ -701,6 +748,36 @@ export interface LandingPagesConfig {
  * Returns null (non-throwing) if the secret does not exist or is inaccessible —
  * the deploy succeeds regardless, just without auto-configuration.
  */
+/**
+ * Get ElevenLabs API key from AWS Secrets Manager.
+ * Secret location: dev/AgentWeb/ElevenLabs (or prod/AgentWeb/ElevenLabs)
+ * Secret format: plain string API key (xi_...)
+ */
+export async function getElevenLabsApiKey(): Promise<string> {
+  const secretName = process.env.NODE_ENV === 'production'
+    ? 'prod/AgentWeb/ElevenLabs'
+    : 'dev/AgentWeb/ElevenLabs';
+  return (await getSecret(secretName)).trim();
+}
+
+/**
+ * Get the platform-wide Foreplay API key from AWS Secrets Manager.
+ * Stored as a plain string at dev/AgentWeb/Foreplay or prod/AgentWeb/Foreplay.
+ * Returns null (non-throwing) if the secret does not exist — callers treat this as
+ * "no platform key configured" and degrade gracefully.
+ */
+export async function getForeplayApiKey(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === 'production'
+      ? 'prod/AgentWeb/Foreplay'
+      : 'dev/AgentWeb/Foreplay';
+    const key = await getSecret(secretName);
+    return key && key.trim() ? key.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getLandingPagesConfig(): Promise<LandingPagesConfig | null> {
   try {
     const environment = process.env.NODE_ENV || 'development';

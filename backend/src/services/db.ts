@@ -4,7 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields, buildLeadAttributionFields } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -1223,12 +1223,13 @@ class UserDB {
       .put({ TableName: this.tableName, Item: newItem })
       .promise();
 
-    // Tombstone the old item: update its userId to "deleted_<userId>" so it can be cleaned up later
+    // Tombstone the old item: update its userId to "deleted_<userId>" and clear org membership
+    // so the stale record doesn't appear in org member listings.
     await this.docClient
       .update({
         TableName: this.tableName,
         Key: { email: user.email },
-        UpdateExpression: "SET userId = :tombstone",
+        UpdateExpression: "SET userId = :tombstone REMOVE orgId, orgRole",
         ExpressionAttributeValues: { ":tombstone": `deleted_${userId}` },
       })
       .promise();
@@ -3542,7 +3543,7 @@ export const crmDb = {
           updatedAt: new Date().toISOString(),
           leadCount: 0,
           fieldNames: [], // Initialize with empty array
-          displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
+          displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'companyLinkedin', 'notes'], // Default visible fields
           sortConfig: null,
           alertEvents: normalizedAlertEvents,
           listSenderId: listSenderId ?? null,
@@ -3600,6 +3601,17 @@ export const crmDb = {
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
+      // mergeFieldNames uses list_append (atomic, non-idempotent), which
+      // can leave duplicate entries when concurrent appenders race or when
+      // the same key is written across many leads. Dedupe + sort on read
+      // so /api/crm/lists (and the Configure Display Fields dialog it
+      // powers) never surfaces duplicates. Mirrors getLeadListById's
+      // behavior for the multi-list query path.
+      for (const item of items) {
+        if (Array.isArray(item.fieldNames)) {
+          item.fieldNames = Array.from(new Set(item.fieldNames as string[])).sort();
+        }
+      }
       return items;
     } catch (error: any) {
       // If index doesn't exist, use scan with filter
@@ -3621,6 +3633,11 @@ export const crmDb = {
           lastEvaluatedKey = result.LastEvaluatedKey;
         } while (lastEvaluatedKey);
 
+        for (const item of items) {
+          if (Array.isArray(item.fieldNames)) {
+            item.fieldNames = Array.from(new Set(item.fieldNames as string[])).sort();
+          }
+        }
         return items;
       }
       handleDynamoDbError(error, "getLeadListsByUserId");
@@ -3662,7 +3679,14 @@ export const crmDb = {
       };
 
       const result = await dynamodb.get(params).promise();
-      return result.Item || null;
+      const item = result.Item || null;
+      // mergeFieldNames now writes via atomic list_append, which can leave
+      // duplicates in storage when concurrent appenders race. Dedupe + sort
+      // on read so all consumers see a clean unique set.
+      if (item && Array.isArray(item.fieldNames)) {
+        item.fieldNames = Array.from(new Set(item.fieldNames as string[])).sort();
+      }
+      return item;
     } catch (error) {
       handleDynamoDbError(error, "getLeadListById");
       throw error;
@@ -3710,6 +3734,11 @@ export const crmDb = {
       /** Per-list enrich.so field config — gates which fields the reverse-lookup
        * specialists write to a lead. See enrichmentFieldConfig.ts. */
       enrichmentFieldConfig?: Record<string, boolean>;
+      /** Last successful CSV-import column-mapping for this list. Restored as
+       * the default mapping in the import wizard so repeat imports of the same
+       * template are one-click. Shape: csvHeader → standard field, "skip", or
+       * { customField } / { splitFullName }. */
+      lastImportMapping?: Record<string, any>;
     }
   ) {
     try {
@@ -3799,6 +3828,12 @@ export const crmDb = {
         expressionAttributeNames['#csvExportHistory'] = 'csvExportHistory';
         updateExpressions.push('#csvExportHistory = :csvExportHistory');
         expressionAttributeValues[':csvExportHistory'] = updates.csvExportHistory;
+      }
+
+      if (updates.lastImportMapping !== undefined) {
+        expressionAttributeNames['#lastImportMapping'] = 'lastImportMapping';
+        updateExpressions.push('#lastImportMapping = :lastImportMapping');
+        expressionAttributeValues[':lastImportMapping'] = updates.lastImportMapping;
       }
 
       if (updates.statusConfig !== undefined) {
@@ -3934,6 +3969,104 @@ export const crmDb = {
     }
   },
 
+  /**
+   * v3.1 enrichment config — `enrichmentConfig` attribute on AW-LeadLists.
+   * Per-list scoped. Returns null when no config has ever been saved (callers
+   * should fall back to a default built from the list's field schema).
+   */
+  async getEnrichmentConfig(listId: string): Promise<any | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        ProjectionExpression: 'enrichmentConfig',
+      }).promise();
+      return result.Item?.enrichmentConfig ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentConfig');
+      throw error;
+    }
+  },
+
+  async setEnrichmentConfig(listId: string, config: any): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: 'SET enrichmentConfig = :c, #updatedAt = :now',
+        ExpressionAttributeNames: { '#updatedAt': 'updatedAt' },
+        ExpressionAttributeValues: {
+          ':c': config,
+          ':now': new Date().toISOString(),
+        },
+        ConditionExpression: 'attribute_exists(listId)',
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setEnrichmentConfig');
+      throw error;
+    }
+  },
+
+  /**
+   * Persists the Unipile search cursor for a given (listId, criteriaHash) so
+   * the next find-leads top-up loop with the same filters resumes where the
+   * previous one stopped instead of re-paginating from page 1.
+   *
+   * Stored as: searchCursors: { [criteriaHash]: { cursor, lastUsedAt } }.
+   * Pass cursor=null to clear an entry (e.g. after exhausting results).
+   * LRU-evicts to MAX_SEARCH_CURSORS entries by lastUsedAt to keep the list
+   * item from growing unbounded across many distinct search-criteria sets.
+   */
+  async setLeadListSearchCursor(
+    listId: string,
+    criteriaHash: string,
+    cursor: string | null
+  ): Promise<void> {
+    const MAX_SEARCH_CURSORS = 10;
+    try {
+      const current = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        ProjectionExpression: '#sc',
+        ExpressionAttributeNames: { '#sc': 'searchCursors' },
+      }).promise();
+      const existingMap = (current.Item?.searchCursors as Record<string, { cursor: string; lastUsedAt: string }>) ?? {};
+
+      const nextMap: Record<string, { cursor: string; lastUsedAt: string }> = { ...existingMap };
+      if (cursor === null) {
+        delete nextMap[criteriaHash];
+      } else {
+        nextMap[criteriaHash] = { cursor, lastUsedAt: new Date().toISOString() };
+      }
+
+      const entries = Object.entries(nextMap);
+      if (entries.length > MAX_SEARCH_CURSORS) {
+        // LRU eviction: drop oldest by lastUsedAt until at cap.
+        entries.sort((a, b) => (a[1].lastUsedAt || '').localeCompare(b[1].lastUsedAt || ''));
+        const trimmed = entries.slice(entries.length - MAX_SEARCH_CURSORS);
+        for (const key of Object.keys(nextMap)) delete nextMap[key];
+        for (const [k, v] of trimmed) nextMap[k] = v;
+      }
+
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: 'SET #sc = :map, #updatedAt = :now',
+        ExpressionAttributeNames: {
+          '#sc': 'searchCursors',
+          '#updatedAt': 'updatedAt',
+        },
+        ExpressionAttributeValues: {
+          ':map': nextMap,
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setLeadListSearchCursor');
+      throw error;
+    }
+  },
+
   async deleteLeadList(listId: string) {
     try {
       // First, delete all leads in this list
@@ -4034,6 +4167,31 @@ export const crmDb = {
     }
   },
 
+  async mergeFieldNames(listId: string, newFields: Set<string> | string[]): Promise<void> {
+    // Atomic append via DDB list_append — no read-modify-write. Two concurrent
+    // post-job calls on the same list can no longer lose updates. Storage may
+    // contain transient duplicates under high concurrency; getLeadListById
+    // dedupes + sorts on read so consumers see a clean unique set.
+    const incoming = Array.from(newFields instanceof Set ? newFields : new Set(newFields));
+    if (incoming.length === 0) return;
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression:
+          'SET fieldNames = list_append(if_not_exists(fieldNames, :empty), :incoming), updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':incoming': incoming,
+          ':updatedAt': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'mergeFieldNames');
+      throw error;
+    }
+  },
+
   async updateSearchQueryTemplates(
     listId: string,
     templates: Record<string, string>,
@@ -4113,6 +4271,7 @@ export const crmDb = {
     title?: string;
     notes?: string;
     linkedin?: string;
+    companyLinkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
     status?: string | null;
@@ -4141,6 +4300,10 @@ export const crmDb = {
     lastTouch?: AttributionTouch;
     utmSource?: string;
     utmMedium?: string;
+    // CRM-history Tier 0: list-owner denormalized onto the lead for audit
+    // metadata. Lookup GSIs partition on email/linkedin/nameCompanyKey, not
+    // userId, so userId is not load-bearing for retrieval — only audit.
+    userId?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -4154,6 +4317,7 @@ export const crmDb = {
       }
 
       const emailValue = leadData.email?.trim().toLowerCase();
+      const linkedinValue = leadData.linkedin?.trim();
       const item: any = {
         listId,
         leadId,
@@ -4163,18 +4327,45 @@ export const crmDb = {
         company: leadData.company || '',
         title: leadData.title || '',
         notes: leadData.notes || '',
-        linkedin: leadData.linkedin?.trim() || '',
+        companyLinkedin: leadData.companyLinkedin?.trim() || '',
         customFields: leadData.customFields || {},
-        engagements: [], // Initialize with empty array
+        engagements: [],
         isICP: 0,
         isEngaged: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
-      // Only include email if it's provided (GSI key cannot be empty string)
       if (emailValue) {
         item.email = emailValue;
+      }
+      // Keep linkedin sparse so LinkedinLookupIndex GSI only indexes leads
+      // with a real value (empty-string HASH keys are wasteful in the GSI).
+      if (linkedinValue) {
+        item.linkedin = linkedinValue;
+      }
+      // Derive the list-owner's userId for CRM-history Tier 0 audit metadata.
+      // Caller may override (e.g., backfill / admin tooling); otherwise it
+      // matches the parent list's userId, guaranteeing lead.userId never
+      // desyncs from list.userId.
+      let ownerUserId: string | undefined = leadData.userId;
+      if (!ownerUserId) {
+        try {
+          const list = await this.getLeadListById(listId) as any;
+          if (list?.userId) ownerUserId = String(list.userId);
+        } catch {
+          // List-fetch failures here are non-fatal — userId stays undefined
+          // and the backfill script can repair it later.
+        }
+      }
+      if (ownerUserId) {
+        item.userId = ownerUserId;
+      }
+      const nameCompanyKey = computeNameCompanyKey(
+        leadData.firstName, leadData.lastName, leadData.company,
+      );
+      if (nameCompanyKey) {
+        item.nameCompanyKey = nameCompanyKey;
       }
       if (leadData.selectedSenderId) {
         item.selectedSenderId = leadData.selectedSenderId;
@@ -4246,7 +4437,7 @@ export const crmDb = {
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
       standardFields.forEach(field => {
         if (leadData[field as keyof typeof leadData] && String(leadData[field as keyof typeof leadData]).trim()) {
           fieldNames.push(field);
@@ -4455,6 +4646,101 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Cross-tenant lookup by email — backs CRM-history Tier 0. Queries the
+   * EmailLookupIndex GSI globally (no userId filter) so a sibling lead
+   * enriched on ANY user's list is returned. Sort key `updatedAt` means
+   * `ScanIndexForward: false` gives the freshest match first.
+   */
+  async findLeadsByEmail(email: string) {
+    const value = (email ?? '').trim().toLowerCase();
+    if (!value) return [];
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'EmailLookupIndex',
+        KeyConditionExpression: 'email = :email',
+        ExpressionAttributeValues: { ':email': value },
+        ScanIndexForward: false,
+        Limit: 10,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsByEmail');
+      throw error;
+    }
+  },
+
+  async findLeadsByLinkedin(linkedin: string) {
+    const value = (linkedin ?? '').trim();
+    if (!value) return [];
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'LinkedinLookupIndex',
+        KeyConditionExpression: 'linkedin = :linkedin',
+        ExpressionAttributeValues: { ':linkedin': value },
+        ScanIndexForward: false,
+        Limit: 10,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsByLinkedin');
+      throw error;
+    }
+  },
+
+  async findLeadsByNameCompany(firstName: string, lastName: string, company: string) {
+    const key = computeNameCompanyKey(firstName, lastName, company);
+    if (!key) return [];
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'NameCompanyLookupIndex',
+        KeyConditionExpression: 'nameCompanyKey = :nameCompanyKey',
+        ExpressionAttributeValues: { ':nameCompanyKey': key },
+        ScanIndexForward: false,
+        Limit: 10,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsByNameCompany');
+      throw error;
+    }
+  },
+
+  async batchGetLeads(listId: string, leadIds: string[]) {
+    if (leadIds.length === 0) return [];
+
+    // DynamoDB BatchGetItem caps at 100 keys per call; matching approvalDb's
+    // conservative 25 keeps payloads small and leaves headroom for retries.
+    const BATCH_SIZE = 25;
+    const results: any[] = [];
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+
+    for (let i = 0; i < leadIds.length; i += BATCH_SIZE) {
+      const batch = leadIds.slice(i, i + BATCH_SIZE);
+      const params = {
+        RequestItems: {
+          [tableName]: {
+            Keys: batch.map(leadId => ({ listId, leadId })),
+          },
+        },
+      };
+
+      try {
+        const result = await dynamodb.batchGet(params).promise();
+        const batchItems = (result.Responses?.[tableName] as any[]) || [];
+        results.push(...batchItems);
+      } catch (error) {
+        handleDynamoDbError(error, "batchGetLeads");
+        throw error;
+      }
+    }
+
+    return results;
+  },
+
   async getLeadByEmail(listId: string, email: string) {
     try {
       // Use email-index GSI to query by listId and email
@@ -4504,6 +4790,7 @@ export const crmDb = {
     title?: string;
     notes?: string;
     linkedin?: string;
+    companyLinkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
     emailDraftFormat?: 'text' | 'html';
@@ -4542,12 +4829,35 @@ export const crmDb = {
     syncMetadata?: Record<string, any>;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
+    /** CRM-internal bookkeeping (findReason, freshUntil, scheduledRunAt,
+     *  icpSource). Sidecar map distinct from customFields so it does NOT
+     *  leak into CSV exports, email-template variables, or the
+     *  lead-filter UI as a user-authored column. Pass `null` to clear. */
+    system?: Record<string, any> | null;
+    /** Skip the per-call fieldNames update on AW-LeadLists. Use when the caller
+     *  will do a single consolidated updateFieldNames after bulk writes (avoids
+     *  read-modify-write races under parallel workers). */
+    skipFieldNamesUpdate?: boolean;
   }) {
     try {
       const setExpressions: string[] = [];
       const removeExpressions: string[] = [];
       const expressionAttributeValues: any = {};
       const expressionAttributeNames: Record<string, string> = {};
+
+      // Read the existing row once up-front. Used for two purposes:
+      //   1. Self-heal legacy empty-string GSI key attributes (see below).
+      //   2. Merge values for the nameCompanyKey recompute block further down,
+      //      so we don't do a second getLeadById call.
+      // Empty-string HASH keys are invalid on the three sparse cross-tenant
+      // lookup GSIs (EmailLookupIndex, LinkedinLookupIndex,
+      // NameCompanyLookupIndex). Any updateLead call SETs updatedAt (the
+      // range key on all three), which forces DDB to re-project the GSI
+      // entry; if the row carries email/linkedin/nameCompanyKey as "" from
+      // before the sparse-index guards landed, the update fails with
+      // ValidationException. Queue a REMOVE for each offending attribute
+      // here so the same UpdateExpression cleans the row in-place.
+      const existingLeadForGuard: any = await this.getLeadById(listId, leadId);
 
       // CRM extension: accountOwnerUserId. Supports null => REMOVE.
       if (updates.accountOwnerUserId !== undefined) {
@@ -4602,8 +4912,41 @@ export const crmDb = {
       }
 
       if (updates.linkedin !== undefined) {
-        setExpressions.push('linkedin = :linkedin');
-        expressionAttributeValues[':linkedin'] = updates.linkedin.trim();
+        const trimmedLinkedin = updates.linkedin.trim();
+        if (trimmedLinkedin) {
+          setExpressions.push('linkedin = :linkedin');
+          expressionAttributeValues[':linkedin'] = trimmedLinkedin;
+        } else {
+          // Keep LinkedinLookupIndex sparse — empty values must not appear.
+          removeExpressions.push('linkedin');
+        }
+      }
+
+      // Recompute nameCompanyKey when any of firstName/lastName/company is in
+      // the update payload. Requires a read-before-write to merge the values
+      // we DIDN'T touch (so a partial update doesn't blank-out the key just
+      // because not every field was provided). Reuses existingLeadForGuard.
+      const nameCompanyTouched =
+        updates.firstName !== undefined ||
+        updates.lastName !== undefined ||
+        updates.company !== undefined;
+      if (nameCompanyTouched) {
+        const current = existingLeadForGuard as any;
+        const mergedFirst = updates.firstName !== undefined ? updates.firstName : (current?.firstName || '');
+        const mergedLast = updates.lastName !== undefined ? updates.lastName : (current?.lastName || '');
+        const mergedCompany = updates.company !== undefined ? updates.company : (current?.company || '');
+        const nck = computeNameCompanyKey(mergedFirst, mergedLast, mergedCompany);
+        if (nck) {
+          setExpressions.push('nameCompanyKey = :nameCompanyKey');
+          expressionAttributeValues[':nameCompanyKey'] = nck;
+        } else {
+          removeExpressions.push('nameCompanyKey');
+        }
+      }
+
+      if (updates.companyLinkedin !== undefined) {
+        setExpressions.push('companyLinkedin = :companyLinkedin');
+        expressionAttributeValues[':companyLinkedin'] = updates.companyLinkedin.trim();
       }
 
       if (updates.customFields !== undefined) {
@@ -4614,6 +4957,17 @@ export const crmDb = {
       if (updates.enrichmentMetadata !== undefined) {
         setExpressions.push('enrichmentMetadata = :enrichmentMetadata');
         expressionAttributeValues[':enrichmentMetadata'] = updates.enrichmentMetadata;
+      }
+
+      if (updates.system !== undefined) {
+        if (updates.system === null) {
+          removeExpressions.push('#system');
+          expressionAttributeNames['#system'] = 'system';
+        } else {
+          setExpressions.push('#system = :system');
+          expressionAttributeNames['#system'] = 'system';
+          expressionAttributeValues[':system'] = updates.system;
+        }
       }
 
       if (updates.selectedSenderId !== undefined) {
@@ -4757,8 +5111,33 @@ export const crmDb = {
       setExpressions.push('updatedAt = :updatedAt');
       expressionAttributeValues[':updatedAt'] = new Date().toISOString();
 
+      // Self-heal legacy empty-string GSI key attributes. Must run AFTER all
+      // the field-specific SET/REMOVE blocks above so we can tell whether the
+      // caller is already touching the attribute (SET wins; never emit both
+      // SET and REMOVE for the same name in one UpdateExpression).
+      if (existingLeadForGuard) {
+        const gsiKeyFields: Array<'email' | 'linkedin' | 'nameCompanyKey'> = [
+          'email',
+          'linkedin',
+          'nameCompanyKey',
+        ];
+        const placeholderByField: Record<string, string> = {
+          email: ':email',
+          linkedin: ':linkedin',
+          nameCompanyKey: ':nameCompanyKey',
+        };
+        for (const field of gsiKeyFields) {
+          const current = (existingLeadForGuard as any)[field];
+          if (typeof current !== 'string' || current !== '') continue;
+          const alreadySet = expressionAttributeValues[placeholderByField[field]] !== undefined;
+          const alreadyRemoved = removeExpressions.includes(field);
+          if (alreadySet || alreadyRemoved) continue;
+          removeExpressions.push(field);
+        }
+      }
+
       if (setExpressions.length === 0 && removeExpressions.length === 0) {
-        return await this.getLeadById(listId, leadId);
+        return existingLeadForGuard;
       }
 
       // Build UpdateExpression with proper SET and REMOVE clauses
@@ -4788,7 +5167,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -4805,8 +5184,8 @@ export const crmDb = {
         });
       }
 
-      // Update field names in list
-      if (fieldNames.length > 0) {
+      // Update field names in list (skip when caller handles consolidated write)
+      if (fieldNames.length > 0 && !updates.skipFieldNamesUpdate) {
         const list = await this.getLeadListById(listId);
         const existingFieldNames = (list?.fieldNames as string[]) || [];
         const allFieldNames = [...existingFieldNames, ...fieldNames];
@@ -4851,11 +5230,18 @@ export const crmDb = {
     title?: string;
     notes?: string;
     linkedin?: string;
+    companyLinkedin?: string;
     customFields?: Record<string, any>;
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
     syncMetadata?: Record<string, any>;
+    /** CRM-internal bookkeeping for the find-leads / scheduled-search /
+     *  ICP-sourcing flows (findReason, freshUntil, scheduledRunAt,
+     *  icpSource). Sidecar map distinct from customFields so it does NOT
+     *  leak into CSV exports, email-template variables, or the
+     *  lead-filter UI. */
+    system?: Record<string, any>;
   }>) {
     try {
       const results = {
@@ -4967,9 +5353,7 @@ export const crmDb = {
             company: lead.company || '',
             title: lead.title || '',
             notes: lead.notes || '',
-            // Store LinkedIn URL in canonical form so future dedup reads match
-            // regardless of the source's formatting (Unipile, CSV upload, manual entry).
-            linkedin: normalizeLinkedInUrl(lead.linkedin),
+            companyLinkedin: lead.companyLinkedin?.trim() || '',
             customFields: lead.customFields || {},
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
@@ -4979,9 +5363,15 @@ export const crmDb = {
             updatedAt: new Date().toISOString(),
           };
 
-          // Only include email if it's provided (GSI key cannot be empty string)
+          // Only include email/linkedin if non-empty — GSI key cannot be empty string
           if (emailValue) {
             item.email = emailValue;
+          }
+          // Store LinkedIn URL in canonical form so future dedup reads match
+          // regardless of the source's formatting (Unipile, CSV upload, manual entry).
+          const linkedinValue = normalizeLinkedInUrl(lead.linkedin);
+          if (linkedinValue) {
+            item.linkedin = linkedinValue;
           }
           if (lead.status) {
             item.status = lead.status;
@@ -4991,6 +5381,9 @@ export const crmDb = {
           }
           if (lead.dealCurrency) {
             item.dealCurrency = lead.dealCurrency;
+          }
+          if (lead.system && Object.keys(lead.system).length > 0) {
+            item.system = lead.system;
           }
 
           return {
@@ -5023,9 +5416,9 @@ export const crmDb = {
 
       // Extract all field names from imported leads (both new and updated)
       const allFieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
 
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
 
       // Extract from new leads
       newLeads.forEach(lead => {
@@ -5086,7 +5479,7 @@ export const crmDb = {
 
           // Define standard string fields that should be trimmed and compared
           const standardStringFields: (keyof typeof newData)[] = [
-            'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'dealCurrency'
+            'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'dealCurrency'
           ];
 
           for (const field of standardStringFields) {
@@ -5845,17 +6238,24 @@ export const crmDb = {
     // owns this row, so a future caller cannot silently mislabel an enrich.so
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
-    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param';
-  }): Promise<void> {
+    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
+  }, opts?: { force?: boolean }): Promise<void> {
     try {
-      await dynamodb.put({
+      // `force: true` is set by callers that explicitly asked for a fresh API
+      // hit (forceRefresh=true). Without dropping the ConditionExpression,
+      // those callers would burn API credits but the existing non-expired
+      // row would silently win and stay stale.
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-EnrichmentRawCache`,
         Item: item,
+      };
+      if (!opts?.force) {
         // Only insert if item doesn't exist OR is already expired.
         // Prevents race when multiple clients simultaneously miss the same cache entry.
-        ConditionExpression: 'attribute_not_exists(canonicalId) OR expiresAt < :now',
-        ExpressionAttributeValues: { ':now': Math.floor(Date.now() / 1000) },
-      }).promise();
+        params.ConditionExpression = 'attribute_not_exists(canonicalId) OR expiresAt < :now';
+        params.ExpressionAttributeValues = { ':now': Math.floor(Date.now() / 1000) };
+      }
+      await dynamodb.put(params).promise();
     } catch (error: any) {
       if (error.code === 'ConditionalCheckFailedException') return;  // another worker won the race
       handleDynamoDbError(error, 'putEnrichmentCacheItem');
@@ -5932,6 +6332,258 @@ export const crmDb = {
       if (err.code === 'ConditionalCheckFailedException') return;
       handleDynamoDbError(err, 'setLeadEmailValidation:retry');
       throw err;
+    }
+  },
+
+  /**
+   * Conditional email-fill used by the Apollo waterfall webhook (and any other
+   * path where a parallel writer might have filled the email between the read
+   * and the write). The condition `attribute_not_exists(email)` ensures we
+   * never overwrite an email that landed via Tier 1/2/4 in the meantime.
+   *
+   * Returns:
+   *   { written: true }  — the conditional update applied
+   *   { written: false } — the lead already has an email (no overwrite)
+   */
+  async setLeadEmailIfMissing(
+    listId: string,
+    leadId: string,
+    email: string,
+    enrichmentEmailMeta: Record<string, any>,
+  ): Promise<{ written: boolean }> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) return { written: false };
+
+    const params: any = {
+      TableName: tableName,
+      Key: { listId, leadId },
+      UpdateExpression:
+        'SET email = :email, ' +
+        'enrichmentMetadata.email = :meta, ' +
+        'updatedAt = :ts',
+      ExpressionAttributeValues: {
+        ':email': normalizedEmail,
+        ':meta': enrichmentEmailMeta,
+        ':ts': new Date().toISOString(),
+      },
+      // Two guards:
+      //   1. attribute_exists(leadId) — don't auto-create a deleted lead
+      //   2. attribute_not_exists(email) — TOCTOU protection against parallel fills
+      ConditionExpression: 'attribute_exists(leadId) AND attribute_not_exists(email)',
+    };
+    try {
+      await dynamodb.update(params).promise();
+      return { written: true };
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return { written: false };
+      // ValidationException → enrichmentMetadata map doesn't exist yet.
+      if (err.code !== 'ValidationException') {
+        handleDynamoDbError(err, 'setLeadEmailIfMissing');
+        throw err;
+      }
+    }
+    // Bootstrap missing parent map, then retry.
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return { written: false };
+      handleDynamoDbError(err, 'setLeadEmailIfMissing:bootstrap');
+      throw err;
+    }
+    try {
+      await dynamodb.update(params).promise();
+      return { written: true };
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return { written: false };
+      handleDynamoDbError(err, 'setLeadEmailIfMissing:retry');
+      throw err;
+    }
+  },
+
+  /**
+   * Atomic targeted write for bulk enrichment background jobs.
+   *
+   * Writes top-level scalar fields, enrichmentMetadata sub-keys, and
+   * customFields sub-keys in a single DDB UpdateExpression so concurrent
+   * jobs writing different keys never clobber each other (unlike the full-map
+   * SET that updateLead uses for enrichmentMetadata/customFields).
+   *
+   * Step 1 bootstraps missing parent maps with if_not_exists so document-path
+   * SETs in step 2 never hit ValidationException on cold leads.
+   */
+  async setLeadFields(
+    listId: string,
+    leadId: string,
+    options: {
+      topLevel?: Record<string, string>;
+      enrichmentMetadata?: Record<string, any>;
+      customFields?: Record<string, string>;
+      removeEnrichmentMetadataKeys?: string[];
+      removeCustomFieldKeys?: string[];
+      /** When true, all SET clauses use if_not_exists() — atomically skips any
+       *  field already present in the DB. Use for bulk enrichment paths that
+       *  must never overwrite user-entered or concurrently-written data. */
+      ifNotExists?: boolean;
+    },
+  ): Promise<void> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const key = { listId, leadId };
+    const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
+    const hasCustomKeys = Object.keys(options.customFields ?? {}).length > 0;
+    const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
+    const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
+    const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
+    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
+
+    // Step 1: ensure parent maps exist so document-path SETs don't throw.
+    if (hasMetaKeys || hasCustomKeys) {
+      try {
+        await dynamodb.update({
+          TableName: tableName,
+          Key: key,
+          UpdateExpression:
+            'SET customFields = if_not_exists(customFields, :emptyMap), ' +
+            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+          ExpressionAttributeValues: { ':emptyMap': {} },
+          ConditionExpression: 'attribute_exists(leadId)',
+        }).promise();
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') return;
+        handleDynamoDbError(err, 'setLeadFields:bootstrap');
+        throw err;
+      }
+    }
+
+    // Step 2: build one combined expression — top-level, enrichmentMetadata
+    // sub-keys, and customFields sub-keys all in a single DDB round-trip.
+    const setClauses: string[] = ['updatedAt = :ts'];
+    const removeClauses: string[] = [];
+    const attrNames: Record<string, string> = {};
+    const attrValues: Record<string, any> = { ':ts': new Date().toISOString() };
+
+    const ine = options.ifNotExists ?? false;
+    const topLevelChangesNameOrCompany =
+      options.topLevel && (
+        'firstName' in options.topLevel ||
+        'lastName' in options.topLevel ||
+        'company' in options.topLevel
+      );
+    for (const [k, v] of Object.entries(options.topLevel ?? {})) {
+      attrValues[`:tl_${k}`] = v;
+      setClauses.push(ine ? `${k} = if_not_exists(${k}, :tl_${k})` : `${k} = :tl_${k}`);
+    }
+
+    // Recompute nameCompanyKey when firstName/lastName/company is in topLevel.
+    // With ifNotExists=true the actual top-level SET is skipped for any field
+    // the lead already has — we mirror that here: when the lead has an existing
+    // value for a field, the merged key uses the EXISTING value, not the
+    // proposed one. This keeps the key in sync with the actual stored values.
+    if (topLevelChangesNameOrCompany) {
+      const current = await this.getLeadById(listId, leadId) as any;
+      const tl = options.topLevel!;
+      const pickField = (field: 'firstName' | 'lastName' | 'company'): string => {
+        const proposedVal = field in tl ? String(tl[field] ?? '') : '';
+        const existingVal = current?.[field] ? String(current[field]) : '';
+        if (ine) return existingVal || proposedVal;
+        return field in tl ? proposedVal : existingVal;
+      };
+      const nck = computeNameCompanyKey(pickField('firstName'), pickField('lastName'), pickField('company'));
+      if (nck) {
+        attrValues[':nck'] = nck;
+        setClauses.push(ine ? `nameCompanyKey = if_not_exists(nameCompanyKey, :nck)` : `nameCompanyKey = :nck`);
+      } else {
+        removeClauses.push('nameCompanyKey');
+      }
+    }
+
+    let idx = 0;
+    for (const [k, v] of Object.entries(options.enrichmentMetadata ?? {})) {
+      attrNames[`#em${idx}`] = k;
+      attrValues[`:em${idx}`] = v;
+      setClauses.push(ine
+        ? `enrichmentMetadata.#em${idx} = if_not_exists(enrichmentMetadata.#em${idx}, :em${idx})`
+        : `enrichmentMetadata.#em${idx} = :em${idx}`);
+      idx++;
+    }
+
+    idx = 0;
+    for (const [k, v] of Object.entries(options.customFields ?? {})) {
+      attrNames[`#cf${idx}`] = k;
+      attrValues[`:cf${idx}`] = v;
+      setClauses.push(ine
+        ? `customFields.#cf${idx} = if_not_exists(customFields.#cf${idx}, :cf${idx})`
+        : `customFields.#cf${idx} = :cf${idx}`);
+      idx++;
+    }
+
+    let rmIdx = 0;
+    for (const k of options.removeEnrichmentMetadataKeys ?? []) {
+      attrNames[`#rmem${rmIdx}`] = k;
+      removeClauses.push(`enrichmentMetadata.#rmem${rmIdx}`);
+      rmIdx++;
+    }
+
+    rmIdx = 0;
+    for (const k of options.removeCustomFieldKeys ?? []) {
+      attrNames[`#rmcf${rmIdx}`] = k;
+      removeClauses.push(`customFields.#rmcf${rmIdx}`);
+      rmIdx++;
+    }
+
+    let updateExpr = 'SET ' + setClauses.join(', ');
+    if (removeClauses.length > 0) updateExpr += ' REMOVE ' + removeClauses.join(', ');
+
+    const params: any = {
+      TableName: tableName,
+      Key: key,
+      UpdateExpression: updateExpr,
+      ExpressionAttributeValues: attrValues,
+      ConditionExpression: 'attribute_exists(leadId)',
+    };
+    if (Object.keys(attrNames).length > 0) params.ExpressionAttributeNames = attrNames;
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return;
+      handleDynamoDbError(err, 'setLeadFields');
+      throw err;
+    }
+
+    // Keep the parent list's fieldNames in sync. Without this, enrichment
+    // writes customFields.X on the lead, the Configure Display Fields dialog
+    // (which reads list.fieldNames) doesn't see X, and the user thinks the
+    // enriched field "disappeared."
+    //
+    // We only call mergeFieldNames for TRULY-NEW keys — appending a key that
+    // already exists with DDB's list_append leaves a duplicate behind. Each
+    // per-lead enrichment otherwise spam-appends the same shared key (e.g.
+    // "website") once per lead, leaving N copies after a list-wide run.
+    // Read-then-conditional-write does have a small race window (two
+    // concurrent writers seeing the same "missing" key both append once),
+    // but getLeadListById dedupes on read so the UI never shows the dup.
+    if (hasCustomKeys) {
+      try {
+        const newKeys = Object.keys(options.customFields!);
+        const list = await this.getLeadListById(listId);
+        const existing = new Set((list?.fieldNames as string[] | undefined) ?? []);
+        const trulyNew = newKeys.filter(k => !existing.has(k));
+        if (trulyNew.length > 0) {
+          await this.mergeFieldNames(listId, trulyNew);
+        }
+      } catch (err) {
+        // Field-name sync is best-effort — the lead write already succeeded.
+        // Logging keeps the failure visible without failing the caller.
+        // eslint-disable-next-line no-console
+        console.warn('[setLeadFields] fieldNames sync failed:', (err as Error).message);
+      }
     }
   },
 
@@ -6494,8 +7146,8 @@ export const orgDb = {
     do {
       const result = await dynamodb.scan({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId",
-        ExpressionAttributeValues: { ":orgId": orgId },
+        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
       allItems.push(...(result.Items || []));
@@ -6510,8 +7162,8 @@ export const orgDb = {
     do {
       const result = await dynamodb.scan({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId",
-        ExpressionAttributeValues: { ":orgId": orgId },
+        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         Select: "COUNT",
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();

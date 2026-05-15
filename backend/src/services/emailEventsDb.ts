@@ -344,7 +344,8 @@ class EmailEventsDb {
   }): Promise<void> {
     const item = {
       eventId: params.eventId,
-      emailId: params.messageProviderId,
+      // emailId is a GSI key — DynamoDB rejects empty strings; fall back to eventId
+      emailId: params.messageProviderId || params.eventId,
       emailDomain: params.emailDomain,
       eventType: params.eventType,
       createdAt: params.timestamp,

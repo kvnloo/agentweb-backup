@@ -52,6 +52,7 @@ export interface WorkPlan {
   category?: string;
   steps: WorkPlanStep[];
   ownerId?: string;
+  orgId?: string;
   visibility: WorkPlanVisibility;
   isBuiltIn: boolean;
   createdAt: string;
@@ -148,6 +149,15 @@ export class WorkPlanService {
       IndexName: 'OwnerIndex',
       KeyConditionExpression: 'ownerId = :ownerId',
       ExpressionAttributeValues: { ':ownerId': ownerId },
+    }).promise();
+    return (result.Items as WorkPlan[]) || [];
+  }
+
+  async getWorkPlansByOrg(orgId: string): Promise<WorkPlan[]> {
+    const result = await dynamodb.scan({
+      TableName: this.tableName,
+      FilterExpression: 'orgId = :orgId',
+      ExpressionAttributeValues: { ':orgId': orgId },
     }).promise();
     return (result.Items as WorkPlan[]) || [];
   }

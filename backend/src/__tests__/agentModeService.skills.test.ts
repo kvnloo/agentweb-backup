@@ -232,6 +232,70 @@ describe('AgentModeService - Skills', () => {
       expect(result.installedSkills).toContain('other_skills');
       expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', ['skill-1', '__other_skills__']);
     });
+
+    it('should allow an org member to install a private skill owned by another org member', async () => {
+      const orgId = 'org-abc';
+      const orgMemberUserId = 'member-user-456';
+      const orgPrivateSkill = {
+        skillId: 'org-private-skill-1',
+        name: 'Org Private Skill',
+        description: 'Private skill shared via org',
+        toolNames: ['tool_org'],
+        isPublished: false,
+        ownerId: 'owner-user-123',
+        orgId,
+        visibility: 'private',
+      };
+
+      // getSkillsAvailableToUser returns org skill for the org member
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([orgPrivateSkill]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      // Patch the dynamic import of db so getUserById returns the org member
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: orgMemberUserId, orgId }) };
+
+      const result = await agentModeService.installSkills(
+        ['org-private-skill-1'],
+        orgMemberUserId,
+        'session-abc'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.installedSkills).toContain('Org Private Skill');
+      expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-abc', ['org-private-skill-1']);
+    });
+
+    it('should reject a private org skill for a user outside that org', async () => {
+      const orgId = 'org-abc';
+      const outsiderUserId = 'outsider-user-789';
+      const orgPrivateSkill = {
+        skillId: 'org-private-skill-1',
+        name: 'Org Private Skill',
+        description: 'Private skill shared via org',
+        toolNames: ['tool_org'],
+        isPublished: false,
+        ownerId: 'owner-user-123',
+        orgId,
+        visibility: 'private',
+      };
+
+      // getSkillsAvailableToUser does NOT return org skill for outsider
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
+
+      // Outsider is in a different org
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: outsiderUserId, orgId: 'org-different' }) };
+
+      const result = await agentModeService.installSkills(
+        ['org-private-skill-1'],
+        outsiderUserId,
+        'session-xyz'
+      );
+
+      expect(result.message).toContain('not available with your current subscription');
+      expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+    });
   });
 
   describe('buildSkillContext', () => {

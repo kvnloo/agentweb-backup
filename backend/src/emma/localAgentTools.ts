@@ -119,7 +119,6 @@ const BLOCKED_TASK_PATTERNS = [
   /\baccess token/i,
   /\bapi key/i,
   /\bsecret/i,
-  /\bpost.*form/i,
   /\bsubmit.*form/i,
   /\bclick.*button/i,
   /\bfill.*form/i,
@@ -245,7 +244,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
 
     let rawResponse: { status: number; data: string };
     try {
-      rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 30) * 1000);
+      rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 90) * 1000);
     } catch (err: any) {
       return { success: false, error: `Failed to reach local agent relay: ${err.message}` };
     }
@@ -322,17 +321,34 @@ emmaToolRegistry.register({
       };
     }
 
-    const healthUrl = config.endpoint.replace(/\/$/, '') + '/health';
-    let rawResponse: { status: number; data: string };
+    const base = config.endpoint.replace(/\/$/, '');
+
+    // First check the HTTP server is up
+    let healthResponse: { status: number; data: string };
     try {
-      rawResponse = await httpRequest('GET', healthUrl, '', null, 10_000);
+      healthResponse = await httpRequest('GET', base + '/health', '', null, 10_000);
     } catch (err: any) {
       return { configured: true, reachable: false, error: `Cannot reach relay at ${config.endpoint}: ${err.message}` };
     }
-
-    if (rawResponse.status === 200) {
-      return { configured: true, reachable: true, endpoint: config.endpoint };
+    if (healthResponse.status !== 200) {
+      return { configured: true, reachable: false, status: healthResponse.status, error: healthResponse.data.slice(0, 200) };
     }
-    return { configured: true, reachable: false, status: rawResponse.status, error: rawResponse.data.slice(0, 200) };
+
+    // Probe the worker with a trivial task — this catches a hung worker that still serves /health.
+    // The relay is single-threaded; if it's mid-task it won't respond until it finishes, so allow 120s.
+    let taskResponse: { status: number; data: string };
+    try {
+      taskResponse = await httpRequest('POST', base + '/task', config.apiKey, {
+        task: 'Return the single word: ping',
+        timeout_seconds: 90,
+      }, 120_000);
+    } catch (err: any) {
+      return { configured: true, reachable: false, workerHung: true, error: `Relay HTTP server is up but worker is not responding within 120s: ${err.message}` };
+    }
+    if (taskResponse.status !== 200) {
+      return { configured: true, reachable: false, workerHung: true, error: `Worker probe returned status ${taskResponse.status}: ${taskResponse.data.slice(0, 200)}` };
+    }
+
+    return { configured: true, reachable: true, endpoint: config.endpoint };
   },
 });

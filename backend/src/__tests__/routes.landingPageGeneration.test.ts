@@ -71,6 +71,12 @@ const mockIterateLandingPage = jest.fn();
 const mockGetLandingPage = jest.fn();
 const mockListLandingPages = jest.fn();
 const mockDeleteLandingPage = jest.fn();
+const mockUpdateLandingPageGtm = jest.fn();
+const mockResolveVercelProjectId = jest.fn();
+const mockTriggerVercelDeployment = jest.fn();
+const mockGetProjectEnvVars = jest.fn();
+const mockUpsertEnvVar = jest.fn();
+const mockDeleteEnvVar = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
   generateLandingPage: (...args: any[]) => mockGenerateLandingPage(...args),
@@ -79,9 +85,33 @@ jest.mock("../services/v0Service", () => ({
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
+  updateLandingPageGtm: (...args: any[]) => mockUpdateLandingPageGtm(...args),
+  resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
+  triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
+  getProjectEnvVars: (...args: any[]) => mockGetProjectEnvVars(...args),
+  upsertEnvVar: (...args: any[]) => mockUpsertEnvVar(...args),
+  deleteEnvVar: (...args: any[]) => mockDeleteEnvVar(...args),
   buildBrandEnrichedPrompt: jest.fn(),
   extractTemplateOutline: jest.fn(),
+  getDeploymentStatus: jest.fn(),
+  getPreviewDeploymentUrl: jest.fn(),
   BrandContext: {},
+  INTEGRATIONS: {
+    recaptcha: {
+      siteKey: { envKey: "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", type: "plain", target: ["production", "preview", "development"] },
+      secretKey: { envKey: "RECAPTCHA_SECRET_KEY", type: "encrypted", target: ["production", "preview", "development"] },
+    },
+  },
+}));
+
+// Mock axios for GitHub API calls (used by GTM injection route)
+jest.mock("axios");
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockAxios: any = jest.requireMock("axios");
+
+// Mock secretsManager for GitHub token (used via dynamic import in GTM route)
+jest.mock("../utils/secretsManager", () => ({
+  getGitHubOrgToken: jest.fn().mockResolvedValue({ token: "gh-test-token" }),
 }));
 
 const mockedExtractOutline = extractTemplateOutline as jest.MockedFunction<typeof extractTemplateOutline>;
@@ -105,6 +135,14 @@ beforeEach(() => {
   mockListLandingPages.mockResolvedValue([]);
   mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
+  mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+  // main's tests rely on a non-null project id by default; HEAD's GTM tests
+  // override per-call with `.mockResolvedValueOnce(null)` where needed.
+  mockResolveVercelProjectId.mockResolvedValue("vercel-proj-123");
+  mockTriggerVercelDeployment.mockResolvedValue(undefined);
+  mockGetProjectEnvVars.mockResolvedValue({});
+  mockUpsertEnvVar.mockResolvedValue("env-id-1");
+  mockDeleteEnvVar.mockResolvedValue(undefined);
   _resetRateLimitState();
 });
 
@@ -670,5 +708,331 @@ describe("Rate limiting on expensive endpoints", () => {
       .post("/api/landing-pages/v0/generate")
       .send({ prompt: "Valid prompt" });
     expect(res.status).toBe(429);
+  });
+});
+
+// =============================================================================
+// POST /generated/:id/gtm
+// =============================================================================
+describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
+  const PAGE_WITH_REPO = {
+    id: "page-1",
+    userId: "test-user-id",
+    githubRepoUrl: "https://github.com/testorg/testrepo",
+  };
+  const FAKE_LAYOUT = `<head>\n<title>Test</title>\n</head>\n<body>\nHello\n</body>`;
+  const ENCODED_LAYOUT = Buffer.from(FAKE_LAYOUT).toString("base64");
+
+  it("FAIL: missing gtmContainerId → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/gtmContainerId is required/);
+  });
+
+  it("FAIL: non-string gtmContainerId → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: 12345 });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/gtmContainerId is required/);
+  });
+
+  it("FAIL: invalid GTM container ID format → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "NOT-VALID" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid GTM container ID/);
+  });
+
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/missing/gtm")
+      .send({ gtmContainerId: "GTM-ABC123" });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page has no githubRepoUrl → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({ id: "page-1", userId: "test-user-id" });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-ABC123" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no GitHub repository/);
+  });
+
+  it("FAIL: malformed githubRepoUrl → 400", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      githubRepoUrl: "https://gitlab.example.com/bad/url",
+    });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-ABC123" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid GitHub repo URL/);
+  });
+
+  it("SUCCESS: injects GTM and returns 200", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: ENCODED_LAYOUT, sha: "abc123sha" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-TESTX1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.gtmContainerId).toBe("GTM-TESTX1");
+    expect(mockUpdateLandingPageGtm).toHaveBeenCalledWith("page-1", "test-user-id", "GTM-TESTX1");
+    // Commit message should reference the container ID
+    const putCall = mockAxios.put.mock.calls[0][1] as any;
+    expect(putCall.message).toContain("GTM-TESTX1");
+    expect(putCall.sha).toBe("abc123sha");
+  });
+
+  it("SUCCESS: idempotent — strips existing GTM block before re-injecting", async () => {
+    const layoutWithExistingGtm =
+      `<head>\n        {/* Google Tag Manager */}\n        <script />\n        {/* End Google Tag Manager */}\n</head>\n<body></body>`;
+    mockGetLandingPage.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(layoutWithExistingGtm).toString("base64"), sha: "sha2" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-NEWVAL" });
+
+    expect(res.status).toBe(200);
+    // The committed content should contain the new container ID
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    const committed = Buffer.from(putBody.content, "base64").toString("utf-8");
+    expect(committed).toContain("GTM-NEWVAL");
+    // Old block is stripped — only one GTM head open-comment (not End/noscript variants)
+    const headOpenTags = (committed.match(/\{\/\* Google Tag Manager \*\//g) || []).length;
+    expect(headOpenTags).toBe(1);
+  });
+});
+
+// =============================================================================
+// GET /generated/:id/integrations
+// =============================================================================
+describe("GET /api/landing-pages/v0/generated/:id/integrations", () => {
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/nonexistent/integrations"
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: no vercelProjectId → returns empty fields without calling getProjectEnvVars", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", status: "draft",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce(null);
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.recaptcha.siteKey).toBe("");
+    expect(res.body.recaptcha.secretKeyIsSet).toBe(false);
+    expect(mockGetProjectEnvVars).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: getProjectEnvVars throws → 500", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockRejectedValueOnce(new Error("Vercel API error"));
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it("SUCCESS: no env vars set → returns empty siteKey and secretKeyIsSet=false", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.recaptcha.siteKey).toBe("");
+    expect(res.body.recaptcha.secretKeyIsSet).toBe(false);
+  });
+
+  it("SUCCESS: both recaptcha keys set → returns siteKey value and secretKeyIsSet=true", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({
+      "NEXT_PUBLIC_RECAPTCHA_SITE_KEY": { ids: ["env-abc"], id: "env-abc", value: "6LcSITEKEY", type: "plain" },
+      "RECAPTCHA_SECRET_KEY": { ids: ["env-xyz"], id: "env-xyz", value: "*****", type: "encrypted" },
+    });
+
+    const res = await request(app).get(
+      "/api/landing-pages/v0/generated/page-1/integrations"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.recaptcha.siteKey).toBe("6LcSITEKEY");
+    expect(res.body.recaptcha.secretKeyIsSet).toBe(true);
+  });
+});
+
+// =============================================================================
+// PUT /generated/:id/integrations
+// =============================================================================
+describe("PUT /api/landing-pages/v0/generated/:id/integrations", () => {
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/nonexistent/integrations")
+      .send({ recaptcha: { siteKey: "key", secretKey: "secret" } });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page belongs to different user (getLandingPage returns null) → 404", async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/other-user-page/integrations")
+      .send({ recaptcha: { siteKey: "key" } });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: no vercelProjectId → 400 with 'deploy it first' message", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", status: "draft",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "key" } });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/deploy it first/);
+  });
+
+  it("SUCCESS: upserts both recaptcha keys (create path, no existing env vars)", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "6LcSITE", secretKey: "6LcSECRET" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(mockUpsertEnvVar).toHaveBeenCalledTimes(2);
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", "6LcSITE",
+      ["production", "preview", "development"], undefined, "plain"
+    );
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "RECAPTCHA_SECRET_KEY", "6LcSECRET",
+      ["production", "preview", "development"], undefined, "encrypted"
+    );
+  });
+
+  it("SUCCESS: updates existing keys — deletes old records and recreates to cover all environments", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({
+      "NEXT_PUBLIC_RECAPTCHA_SITE_KEY": { ids: ["env-site-123"], id: "env-site-123", value: "old-key", type: "plain" },
+      "RECAPTCHA_SECRET_KEY": { ids: ["env-secret-456"], id: "env-secret-456", value: "*****", type: "encrypted" },
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "new-site-key", secretKey: "new-secret" } });
+
+    expect(res.status).toBe(200);
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", "new-site-key",
+      ["production", "preview", "development"], ["env-site-123"], "plain"
+    );
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "RECAPTCHA_SECRET_KEY", "new-secret",
+      ["production", "preview", "development"], ["env-secret-456"], "encrypted"
+    );
+  });
+
+  it("SUCCESS: empty string for siteKey → deletes all existing env var records", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({
+      "NEXT_PUBLIC_RECAPTCHA_SITE_KEY": { ids: ["env-site-123", "env-site-456"], id: "env-site-123", value: "old-key", type: "plain" },
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "" } });
+
+    expect(res.status).toBe(200);
+    expect(mockDeleteEnvVar).toHaveBeenCalledWith("proj-1", "env-site-123");
+    expect(mockDeleteEnvVar).toHaveBeenCalledWith("proj-1", "env-site-456");
+    expect(mockUpsertEnvVar).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: omitting secretKey from body → only siteKey is touched", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ recaptcha: { siteKey: "6LcNEW" } });
+
+    expect(res.status).toBe(200);
+    expect(mockUpsertEnvVar).toHaveBeenCalledTimes(1);
+    expect(mockUpsertEnvVar.mock.calls[0][1]).toBe("NEXT_PUBLIC_RECAPTCHA_SITE_KEY");
+  });
+
+  it("SUCCESS: custom variable → stored as plain type so it can be read back", async () => {
+    mockGetLandingPage.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed",
+    });
+    mockResolveVercelProjectId.mockResolvedValueOnce("proj-1");
+    mockGetProjectEnvVars.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/integrations")
+      .send({ custom: [{ key: "MY_API_URL", value: "https://api.example.com" }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.updated).toContain("MY_API_URL");
+    expect(mockUpsertEnvVar).toHaveBeenCalledWith(
+      "proj-1", "MY_API_URL", "https://api.example.com",
+      ["production", "preview", "development"], undefined, "plain"
+    );
   });
 });

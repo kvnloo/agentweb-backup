@@ -16,6 +16,7 @@
 import { emmaToolRegistry } from './registry';
 import { getEnrichSoService } from '../services/enrichSoService';
 import { LookupByEmailQuotaExceededError } from '../services/enrichSoQuota';
+import { waterfallFindEmail } from '../services/enrichmentWaterfall';
 import { crmDb } from '../services/db';
 
 interface SingleInput {
@@ -24,6 +25,9 @@ interface SingleInput {
   lastName?: string;
   company?: string;
   domain?: string;
+  /** LinkedIn URL — Apollo's strongest match key. Linkedin alone is enough
+   *  to find an email through Tier 2 of the waterfall. */
+  linkedin?: string;
   leadId?: string;
   listId?: string;
 }
@@ -53,13 +57,15 @@ async function resolveSingle(input: SingleInput, userId: string): Promise<{ inpu
     const lead: any = await crmDb.getLeadById(input.listId, input.leadId).catch(() => null);
     if (lead) {
       // Inline the lead's fields so the rest of the resolver can use the same
-      // logic regardless of how the input arrived.
+      // logic regardless of how the input arrived. Includes linkedin so a lead
+      // with only a LinkedIn URL still routes through Tier 2 of the waterfall.
       input = {
         ...input,
         email: input.email || lead.email,
         firstName: input.firstName || lead.firstName,
         lastName: input.lastName || lead.lastName,
         company: input.company || lead.company,
+        linkedin: input.linkedin || lead.linkedin,
       };
     }
   }
@@ -88,16 +94,29 @@ async function resolveSingle(input: SingleInput, userId: string): Promise<{ inpu
     };
   }
 
-  // Path 2: name + (company or domain) → email finder
+  // Path 2: linkedin URL OR (name + (company || domain)) → email finder.
+  // Routes through the cross-provider waterfall:
+  //   Tier 1 enrich.so → Tier 2 Apollo (linkedin or name+org) →
+  //   Tier 3 Apollo waterfall → Tier 4 patterns + enrich.so validation.
+  // Linkedin alone is enough — Apollo's matchPerson resolves identity from it.
   const firstName = (input.firstName ?? '').trim();
   const lastName = (input.lastName ?? '').trim();
   const domain = (input.domain ?? '').trim().toLowerCase();
   const company = (input.company ?? '').trim();
-  if ((!firstName && !lastName) || (!domain && !company)) {
+  const linkedin = (input.linkedin ?? '').trim();
+  const haveName = !!(firstName || lastName);
+  const haveOrg = !!(domain || company);
+  if (!linkedin && !(haveName && haveOrg)) {
     return { input, found: false };
   }
-  const r = await svc.findEmail(
-    { firstName, lastName, domain: domain || undefined, company: domain ? undefined : company },
+  const r = await waterfallFindEmail(
+    {
+      firstName,
+      lastName,
+      domain: domain || undefined,
+      company: domain ? undefined : company,
+      linkedin: linkedin || undefined,
+    },
     { userId },
   );
   return {
@@ -117,10 +136,11 @@ emmaToolRegistry.register({
   definition: {
     name: 'find_or_lookup_email',
     description:
-      'Find a professional email by name + company, or look up a profile (name, title, company, LinkedIn) by email. ' +
-      'Pass any one of: (a) `email` to reverse-lookup, (b) `firstName`+`lastName`+(`company` or `domain`) to find an email, ' +
-      'or (c) `leadId`+`listId` to resolve from a CRM lead automatically. Use `bulk` for batch operations. ' +
-      'Returns structured data — does NOT modify the CRM lead.',
+      'Find a professional email or look up a profile by email. ' +
+      'Pass any one of: (a) `email` to reverse-lookup, (b) `linkedin` URL to find an email via Apollo (linkedin alone is enough), ' +
+      '(c) `firstName`+`lastName`+(`company` or `domain`) to find an email through the full waterfall, ' +
+      'or (d) `leadId`+`listId` to resolve from a CRM lead automatically (pulls linkedin/name/company off the lead). ' +
+      'Use `bulk` for batch operations. Returns structured data — does NOT modify the CRM lead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -130,7 +150,8 @@ emmaToolRegistry.register({
         lastName: { type: 'string' },
         company: { type: 'string', description: 'Company name (used when domain is unknown)' },
         domain: { type: 'string', description: 'Company domain like acme.com (preferred over company name)' },
-        leadId: { type: 'string', description: 'CRM lead ID — resolves email/name/company from the lead automatically' },
+        linkedin: { type: 'string', description: 'LinkedIn profile URL — alone is enough to find an email via Apollo' },
+        leadId: { type: 'string', description: 'CRM lead ID — resolves email/name/company/linkedin from the lead automatically' },
         listId: { type: 'string', description: 'CRM list ID (required when leadId is provided)' },
 
         // Bulk
@@ -145,6 +166,7 @@ emmaToolRegistry.register({
               lastName: { type: 'string' },
               company: { type: 'string' },
               domain: { type: 'string' },
+              linkedin: { type: 'string' },
               leadId: { type: 'string' },
               listId: { type: 'string' },
             },

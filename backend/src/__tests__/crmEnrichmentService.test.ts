@@ -17,6 +17,8 @@ jest.mock('../services/db', () => ({
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
     updateFieldNames: jest.fn(),
+    setLeadFields: jest.fn(),
+    mergeFieldNames: jest.fn(),
     updateSearchQueryTemplates: jest.fn(),
     createEnrichmentSnapshotItem: jest.fn(),
     createEnrichmentJobMeta: jest.fn(),
@@ -124,6 +126,20 @@ describe('CrmEnrichmentService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new CrmEnrichmentService();
+    // Bridge new targeted-write API to existing assertions that inspect updateLead payloads.
+    mockCrmDb.setLeadFields.mockImplementation(async (listId: string, leadId: string, options: any) => {
+      const payload: Record<string, any> = { ...(options?.topLevel || {}) };
+      if (options?.customFields && Object.keys(options.customFields).length > 0) {
+        payload.customFields = options.customFields;
+      }
+      if (options?.enrichmentMetadata && Object.keys(options.enrichmentMetadata).length > 0) {
+        payload.enrichmentMetadata = options.enrichmentMetadata;
+      }
+      await mockCrmDb.updateLead(listId, leadId, payload as any);
+    });
+    mockCrmDb.mergeFieldNames.mockImplementation(async (listId: string, newFields: Set<string> | string[]) => {
+      await mockCrmDb.updateFieldNames(listId, Array.from(newFields as any));
+    });
     mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
     mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
     mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
@@ -259,6 +275,40 @@ describe('CrmEnrichmentService', () => {
   });
 
   // ─── SUCCESS CASES ────────────────────────────────────────────────────────
+
+  describe('preview - empty-signal leads', () => {
+    it('skips searchWeb when leads have no email/company (avoids identical-bogus-results bug)', async () => {
+      // Leads have only LinkedIn URLs — no email, no company. The canonical
+      // group templates use {{emailDomain}}, which collapses to "" for these,
+      // making the query "company overview" / "funding investors" — generic
+      // searches that historically returned the same FedEx page for every lead.
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const emptyLeads = [
+        { leadId: 'lead1', linkedin: 'https://www.linkedin.com/in/scott-t', customFields: {} },
+        { leadId: 'lead2', linkedin: 'https://www.linkedin.com/in/mike-h', customFields: {} },
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: emptyLeads, lastEvaluatedKey: null, hasMore: false });
+
+      // No mock searchWeb setup — if it gets called, the mock returns undefined
+      // and the test would throw. We assert it is NOT called.
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_name: null, industry: null }));
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Research {{emailDomain}} {{company}}',
+        outputFields: ['company_name', 'industry'],
+        sources: ['web_search'],
+        // Caller-provided template using emailDomain — common case from the UI
+        webSearchTemplate: '{{emailDomain}} company overview',
+      };
+
+      await service.preview(spec);
+
+      // The whole point of this fix: the broken generic search must NOT fire.
+      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
+    });
+  });
 
   describe('preview - success cases', () => {
     it('should return correct stats and 2 sample results with enriched fields', async () => {
@@ -1420,6 +1470,52 @@ describe('CrmEnrichmentService.applySearchTemplate', () => {
   });
 });
 
+// ─── templateHasNoLeadSignal ─────────────────────────────────────────────────
+
+describe('CrmEnrichmentService.templateHasNoLeadSignal', () => {
+  it('returns true when emailDomain placeholder resolves to empty (no email on lead)', () => {
+    const template = '{{emailDomain}} company overview';
+    const lead = { leadId: 'l1', linkedin: 'https://www.linkedin.com/in/foo' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns false when emailDomain resolves to a real domain', () => {
+    const template = '{{emailDomain}} company overview';
+    const lead = { leadId: 'l1', email: 'jane@acme.com' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(false);
+  });
+
+  it('returns true when template references {{company}} but lead has only email (placeholder unfilled)', () => {
+    const template = '{{company}} funding investors';
+    const lead = { leadId: 'l1', email: 'jane@acme.com' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns false when {{firstName}} {{lastName}} both populated', () => {
+    const template = '{{firstName}} {{lastName}} linkedin';
+    const lead = { leadId: 'l1', firstName: 'Jane', lastName: 'Doe' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(false);
+  });
+
+  it('returns true for a literal template with no placeholders (constant query)', () => {
+    const template = 'company overview';
+    const lead = { leadId: 'l1', email: 'jane@acme.com', company: 'Acme' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns true when {{customFields.foo}} is the only placeholder and not present', () => {
+    const template = '{{customFields.industry}} sector';
+    const lead = { leadId: 'l1', customFields: {} };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(true);
+  });
+
+  it('returns false when at least one placeholder is filled even if others are empty', () => {
+    const template = '{{firstName}} {{lastName}} {{emailDomain}}';
+    const lead = { leadId: 'l1', firstName: 'Jane' };
+    expect(CrmEnrichmentService.templateHasNoLeadSignal(template, lead)).toBe(false);
+  });
+});
+
 // ─── Search grouping / deduplication ─────────────────────────────────────────
 
 describe('CrmEnrichmentService search grouping', () => {
@@ -2060,7 +2156,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     expect(lastUpdateCustomFields().funding_stage).toBe('Series B');
   });
 
-  it('rejects (sets to null) a value when sourceQuote is not found in any source', async () => {
+  it('rejects (removes) a value when sourceQuote is not found in any source', async () => {
     setupSingleLeadJob('Acme is an early-stage startup');
     mockGeminiCreate.mockResolvedValue(
       geminiResponse({
@@ -2082,7 +2178,7 @@ describe('CrmEnrichmentService - citation verification', () => {
 
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
-    expect(lastUpdateCustomFields().funding_stage).toBeNull();
+    expect(lastUpdateCustomFields().funding_stage).toBeUndefined();
   });
 
   it('rejects a value when rich-format response omits sourceQuote', async () => {
@@ -2102,7 +2198,7 @@ describe('CrmEnrichmentService - citation verification', () => {
 
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
-    expect(lastUpdateCustomFields().funding_stage).toBeNull();
+    expect(lastUpdateCustomFields().funding_stage).toBeUndefined();
   });
 
   it('keeps a value from a legacy flat-string LLM response (backwards compat)', async () => {
@@ -2198,7 +2294,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
     // Even though the quote is in source, the slug-check should still reject the URL
-    expect(lastUpdateCustomFields().company_linkedin_url).toBeNull();
+    expect(lastUpdateCustomFields().company_linkedin_url).toBeUndefined();
   });
 
   it('persists enrichmentMetadata sidecar with source, sourceUrl, sourceQuote, confidence, jobId, enrichedAt', async () => {
@@ -2279,13 +2375,11 @@ describe('CrmEnrichmentService - citation verification', () => {
     };
 
     await service.execute(spec);
-    const updateCall = mockCrmDb.updateLead.mock.calls[0];
-    const meta = (updateCall[2] as any).enrichmentMetadata;
-    // Cleared field's metadata is dropped...
-    expect(meta.industry).toBeUndefined();
-    // ...but unrelated metadata is preserved
-    expect(meta.other_field).toBeDefined();
-    expect(meta.other_field.source).toBe('web_search');
+    const setCall = mockCrmDb.setLeadFields.mock.calls[0];
+    const options = setCall[2] as any;
+    // Cleared field should be removed from both maps via targeted REMOVE lists.
+    expect(options.removeCustomFieldKeys).toContain('industry');
+    expect(options.removeEnrichmentMetadataKeys).toContain('industry');
   });
 
   it('omits enrichmentMetadata for null/rejected fields', async () => {
@@ -2405,7 +2499,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     const cf = lastUpdateCustomFields();
     expect(cf.industry).toBe('SaaS');                                  // supported → kept high
     expect(cf.market_size).toBe('$10B');                               // unsupported → kept but low confidence
-    expect(cf.funding_stage).toBeNull();                               // contradicted → dropped
+    expect(cf.funding_stage).toBeUndefined();                          // contradicted → removed
 
     const meta = (mockCrmDb.updateLead.mock.calls[0][2] as any).enrichmentMetadata;
     expect(meta.industry.criticVerdict).toBe('supported');
@@ -2443,7 +2537,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     expect(result.processedCount).toBe(1);
     const cf = lastUpdateCustomFields();
     expect(cf.industry).toBe('SaaS');           // supported → kept
-    expect(cf.funding_stage).toBeNull();        // unsupported → rejected
+    expect(cf.funding_stage).toBeUndefined();   // unsupported → removed
   });
 });
 
@@ -2716,5 +2810,63 @@ describe('CrmEnrichmentService - LinkedIn confidence scoring (Stage 3)', () => {
     expect(allUserMsgs).toContain('john-doe-from-web');
     // But Unipile-derived structured profile data must NOT
     expect(allUserMsgs).not.toContain('LinkedIn profile data');
+  });
+});
+
+describe('CrmEnrichmentService.getEnrichmentConfig', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('falls back to gpt-5-chat-2 defaults when no setting is stored', async () => {
+    mockSettingsService.getSetting.mockResolvedValue(null as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config).toEqual({
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    });
+  });
+
+  it('falls back to gpt-5-chat-2 defaults when stored JSON is malformed', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'crm-enrichment-config',
+      settingValue: 'not-json',
+      updatedBy: 'system',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config).toEqual({
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    });
+  });
+
+  it('returns stored values when present, overriding the default', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'crm-enrichment-config',
+      settingValue: JSON.stringify({
+        enrichmentModel: 'gemini-3-pro-preview',
+        dataExtractionModel: 'anthropic.claude-sonnet-4-6',
+      }),
+      updatedBy: 'admin@example.com',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config).toEqual({
+      enrichmentModel: 'gemini-3-pro-preview',
+      dataExtractionModel: 'anthropic.claude-sonnet-4-6',
+    });
+  });
+
+  it('falls back per-field when stored JSON omits one model', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'crm-enrichment-config',
+      settingValue: JSON.stringify({ enrichmentModel: 'gemini-3-pro-preview' }),
+      updatedBy: 'admin@example.com',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    const config = await CrmEnrichmentService.getEnrichmentConfig();
+    expect(config.enrichmentModel).toBe('gemini-3-pro-preview');
+    expect(config.dataExtractionModel).toBe('gpt-5-chat-2');
   });
 });

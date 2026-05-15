@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-08
+// Last updated: 2026-05-15
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,261 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-15',
+    changes: [
+      'Fixed: Emma No Longer Answers Twice When @Mentioned in a Slack Thread',
+      '- When a user @mentioned Emma inside an existing Slack thread, Slack sent both an app_mention and a message event for the same message',
+      '- Both event handlers were running independently, causing Emma to generate and post two separate responses',
+      '- The thread message handler now skips any message that @mentions Emma, letting the app_mention handler process it exclusively',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
+      'Fixed: Emma Now Correctly Composites Real Logos on Image Ads',
+      '- Emma previously claimed AI image generation "cannot reliably composite a real logo" and silently fell back to building an HTML file instead of the requested image — this was incorrect behavior',
+      '- Emma now uses the logo_image parameter with your brand guidelines logo PNG and generates a proper image ad using Gemini or GPT models',
+      '- Gemini 3.1 Flash and Gemini 3 Pro produce the highest logo fidelity at 4K resolution; GPT-image-2 is also reliable at 1024×1024',
+      '- Emma will never silently switch the output format from image to HTML without explicit approval',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
+      'Improved: Emma Can Now Find Your Favorited and Approved Images',
+      '- Asking Emma "show me my favorited images" now returns only the images you\'ve starred (❤️) on the Images page',
+      '- Asking Emma "show me my approved images" now returns only images that have been approved via the Slack approval workflow',
+      '- Every image result now includes its favorite status, making it easier to reference and act on your curated assets',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
+      'Infrastructure: Meta Marketing API upgraded to v25.0',
+      '- All Meta API calls now use v25.0 by default, ahead of Meta\'s deprecation of versions prior to v24.0 on June 9, 2026',
+    ],
+  },
+  {
+    date: '2026-05-14',
+    changes: [
+      'Fixed: Slack User Mentions Now Show Display Names Instead of Raw IDs',
+      '- When fetching Slack channel messages or thread replies, user mentions like @U08TWRKGESG were shown as raw IDs instead of real names',
+      '- Mentions in message text are now resolved to display names (e.g. @Filipe Dinis, @Ed Mongiovi) consistently across all fetched messages',
+    ],
+  },
+  {
+    date: '2026-05-14',
+    changes: [
+      'Fixed: Daily User Activity Report and Scheduled Reports No Longer Silently Stop Responding',
+      '- Gemini extended-thinking models can return empty text after completing tool calls on large contexts (~108K tokens), causing reports to finish with no output',
+      '- The agent now detects this condition and injects a synthesis prompt to recover — the report is generated correctly in the follow-up response',
+      '- This prevents scheduled sessions from completing with an empty response and a satisfaction score of 1',
+      'Fixed: Organization Members Can Now Use Private Work Plans and Skills Created by Other Org Members',
+      '- Starting a session from a private work plan created by another org member was returning "Not authorized to use this private work plan" (403)',
+      '- Org members can now launch sessions from any private work plan owned by someone in their organization, matching the existing view access that was already in place',
+      '- Installing a private skill created by another org member was silently rejected even though the skill appeared in the skill picker',
+      '- Org members can now install and use private skills shared within their organization, as intended by the org-sharing feature',
+      '- Only the original owner can still edit, delete, or submit their work plan or skill for platform-wide review',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Data Analysis No Longer Fails When Passed Large Tool-Response Files',
+      '- perform_data_analysis was receiving bare S3 storage keys (e.g. tool-responses/<uuid>/file.txt) as file URLs instead of HTTP URLs, causing an "Invalid URL" error',
+      '- The tool now automatically reads those S3 keys and passes the content inline to the analysis model — no change required from the LLM',
+      '- If an S3 key cannot be accessed, the tool now returns a clear error message instead of silently proceeding with empty data',
+      'Fixed: Scheduled Sessions No Longer Loop Indefinitely on S3 / Browser Errors',
+      '- Sessions were retrying S3 tool-response reads (NoSuchBucket, AccessDenied, NoSuchKey) and browser_run_code ReferenceErrors in an infinite loop',
+      '- S3 access failures on read_tool_response / search_tool_response are now flagged as fatal — the LLM is told not to retry and to summarize from in-context data',
+      '- browser_run_code ReferenceErrors now include a targeted fix hint: only `page` is in scope in the sandbox',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Local Agent Web Browsing More Reliable',
+      '- Fixed a safety filter false-positive that was blocking legitimate LinkedIn screenshot tasks (the pattern incorrectly matched phrases like "posted and formatted")',
+      '- Health check now probes the actual Codex worker instead of just the HTTP server — so Emma correctly detects a hung or busy agent rather than falsely reporting it as available',
+      '- Extended the HTTP timeout buffer for long-running tasks (+90s instead of +30s) to prevent spurious timeout errors on tasks that take 120–160 seconds',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Emma Now Gives Correct Instructions for Setting Up CRM Sender Email',
+      '- Emma was directing users to "CRM Settings → Sender Email" to configure a sender, but that location does not exist',
+      '- The correct flow is per lead list: select a lead list, then click "Senders" in the list header',
+      '- Error messages and alert emails now reflect the correct navigation path',
+      'Fixed: LinkedIn Outreach Account Now Saves Reliably After OAuth Completes',
+      '- Connecting a LinkedIn account via Unipile occasionally failed silently — the OAuth popup succeeded but the account never appeared in Connected Accounts',
+      '- The root cause was a timing gap: the save-account call fired before Unipile finished provisioning the new account, causing the account lookup to fail',
+      '- The backend now retries the account lookup up to 3 times with backoff; if retries are exhausted it saves with a fallback name so the connection is never lost',
+      'Fixed: Connected Accounts Page No Longer Crashes on Corrupted Records',
+      '- In rare cases a connected account record was missing required fields, causing the Connected Accounts settings page to show nothing',
+      '- Records missing platform, account_id, or config are now filtered out defensively before processing',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Ad Image Analysis No Longer Fails for Large Images',
+      '- describe_image was returning a hard error when called with images over 5MB (e.g. 16–22MB PNG ad creatives from S3)',
+      '- The tool now automatically resizes oversized images to max 1200px wide at JPEG 85% quality before sending to the vision model — no caller changes needed',
+      '- This restores the ability to fact-check and analyze production-quality ad images in Emma workflows',
+      'Fixed: Research Reports Page Loads Faster',
+      '- The Reports page was loading slowly (and sometimes appearing frozen) for accounts with many reports',
+      '- The API response was ~415KB because each report\'s searchable text was sent in full; it is now trimmed to 500 characters, reducing the payload to ~150KB',
+      '- Page load and report preview are now fast regardless of how many reports are in your account',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
+      'CRM Sequences: LinkedIn DM Steps Now Supported',
+      '- Drip sequences now support LinkedIn direct message steps alongside email steps — mix and match in any order',
+      '- Each step has an Email / LinkedIn channel toggle; LinkedIn steps show a message text field with variable support ({{firstName}}, {{lastName}}, {{company}})',
+      '- The sequences list shows channel badges (✉ / LinkedIn icon) so you can see at a glance which channels a sequence uses',
+      '- LinkedIn steps automatically resolve the connected Unipile outreach account; leads must have a LinkedIn URL set on their record',
+      '- Pre-save verification skips the email sender check for LinkedIn-only sequences',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Research Report Preview No Longer Freezes on Open',
+      '- Previously, opening the HTML report preview dialog would trigger an immediate background fetch of the full HTML file from S3, causing the iframe to re-render twice and freeze the UI for large reports',
+      '- The HTML source is now only fetched when the user explicitly switches to the Editor tab — the default Agentic Revision view loads instantly via the report\'s direct URL',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
+      'Admin: Display Name Editable in Users Tab',
+      '- Admins can now set a display name for any user directly from the Users tab in the Admin Dashboard',
+      '- The display name appears in the customer portal Organization tab, replacing the email fallback for users who did not sign up via Google',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Emma No Longer Incorrectly Suggests Co-Owner Assignment Is Possible',
+      '- Emma (the AI assistant) was incorrectly telling users that making someone a co-owner of an organization was possible, causing support escalations',
+      '- Emma\'s system prompt now explicitly states: only 1 owner is supported per organization, co-owner roles do not exist, and members cannot edit Brand Guidelines or Market Strategy',
+      '- This context is injected automatically whenever the current user is an organization member',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Video Agent Now Stitches Clips in the Correct Shot Order',
+      '- Previously, when an AI video agent generated multiple clips individually (rather than in a single call), the final composed video could stitch shots out of narrative order — e.g. S3 appearing at position 8 instead of position 3',
+      '- Root cause: the agent was passing clip URLs to the compose step in the order they appeared in context (generation order), not in shot order',
+      '- The compose_video tool now includes an explicit ordering requirement: the agent must build a shot-number manifest (S1, S2, S3...) and verify ascending order before composing',
+      '- The Video Production skill prompt has been updated with a mandatory pre-compose checklist enforcing this',
+      '- Haven users: your 30s Meta ad has been re-composed in the correct S1→S8 sequence',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'Admin: Connected Accounts Tab Added to Admin Dashboard',
+      '- A new Connected Accounts tab is available in the Admin Dashboard showing all Unipile (LinkedIn Outreach) accounts across all users',
+      '- Each row shows the user email, account name, account ID, and live Unipile connection status (OK / ERROR / UNKNOWN)',
+      '- Orphaned accounts — those that exist in Unipile but have no matching AgentWeb user (e.g. after a user was deleted or a disconnect failed) — are now surfaced with an ORPHAN status and highlighted in red',
+      '- Admins can force-delete any account directly from the tab, removing it from both the Unipile API and the AgentWeb database',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'Fixed: Scheduled Chat Results Now Always Appear in the Chat View',
+      '- Previously, if a scheduled chat generated a very large response (e.g. a detailed HTML report), the final message could silently fail to save — the email arrived correctly but the chat page showed no response',
+      '- The root cause was an oversized DynamoDB item exceeding the 400KB limit; the fix now correctly detects and truncates oversized messages regardless of content format',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'Improved: Foreplay Ad Library Now Available Platform-Wide',
+      '- The Foreplay Ad Library in the Knowledge Base is now active for all users without any setup required',
+      '- Previously, each user had to connect their own Foreplay API key to use swipefile and board search in agent mode',
+      '- A platform-wide Foreplay account is now used as a fallback, so AI agents can search and read Foreplay ads out of the box',
+      '- Users who connect their own Foreplay API key (via the Knowledge Base page) will continue to use their personal account — the platform key only applies when no personal key is configured',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Report Type Classification on the Reports Page',
+      '- All HTML reports are now automatically classified into one of three types: Creative, Research, or Performance',
+      '- Classification is powered by Gemini 3.1 Flash Lite and uses the report filename and content to determine the type',
+      '- A type badge (purple for Creative, blue for Research, orange for Performance) now appears on every report card',
+      '- Click the badge to manually override the type if the auto-classification is incorrect — the change is saved immediately',
+      '- Use the new All / Creative / Research / Performance tabs at the top of the Reports page to filter by type',
+      '- Existing reports are classified lazily on first page load and the result is cached, so you only pay the classification cost once per report',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Inject Your Own Google Tag Manager Container into Landing Pages',
+      '- Each deployed landing page card now shows an "Add GTM" button if no container is configured, or a green "GTM: GTM-XXXXXX" badge if one is already set',
+      '- Clicking either button opens a dialog where you can enter your GTM container ID (format: GTM-XXXXXXX)',
+      '- Once saved, the GTM snippet is injected into the page\'s layout and the site redeploys automatically in ~30 seconds',
+      '- This enables custom GA4 events (button clicks, PDF downloads, form submissions) to flow into your own Google Analytics property and LookerStudio dashboards',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: CRM Senders Now Support a Default LinkedIn Outreach Account',
+      '- The Senders dialog in the CRM now includes a LinkedIn Sender section',
+      '- If you have a LinkedIn outreach account connected, you can designate one as the default sender for LinkedIn messages',
+      '- When sending a LinkedIn message from a lead, the configured default account is used automatically — no more relying on auto-resolution',
+      '- If no default is set, the existing fallback behavior (your connected account, then a shared account) still applies',
+    ],
+  },
+  {
+    date: '2026-05-11',
+    changes: [
+      'New: Manage Environment Variables for Landing Pages',
+      '- Each deployed landing page card now has an "Env Vars" button that opens a configuration panel',
+      '- Set reCAPTCHA v2 Site Key and Secret Key directly from the portal — no Vercel access needed',
+      '- Add custom environment variables with optional secret/encrypted storage for sensitive values',
+      '- Saving automatically triggers a redeployment so all changes take effect immediately',
+      '- Variables are scoped to the Vercel project, so landing pages sharing a project share the same environment',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
+      'New: Video Ads Now Support AI-Generated Voiceovers',
+      '- The Video Production skill can now generate a professional voiceover for your ad using ElevenLabs TTS and mix it directly into the final video',
+      '- Choose from 6 voices: George (warm, confident male), Rachel (clear, professional female), Adam (deep, authoritative), Bella (soft, friendly), Josh (young, energetic), or Dorothy (pleasant, conversational)',
+      '- To use: ask Emma to generate a voiceover for your script first, then pass the audio URL into your video composition — or just ask for "a video ad with voiceover" and the agent handles the full workflow automatically',
+      '- Voiceovers are baked directly into the Remotion render, so the final MP4 is a single self-contained file with audio included',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
+      'Fixed: Website Scans No Longer Report 429 Asset Errors as Site Failures',
+      '- When the Browser Automation skill scans a website, Cloudflare and similar bot-protection systems may rate-limit asset requests (CSS, JS, images) with 429 responses',
+      '- Previously, Emma could incorrectly report a healthy website as broken based on these blocked asset requests',
+      '- Emma now checks whether the main HTML loaded successfully and page content is present before concluding a site is down, and reports 429 asset errors as bot-protection rate limiting rather than site failures',
+    ],
+  },
+  {
+    date: '2026-05-10',
+    changes: [
+      'Fixed: Scheduled Chat — Email Notifications Now Parsed Correctly',
+      '- When creating or updating a scheduled chat, email addresses passed as a stringified JSON array (a common pattern from AI tools) are now automatically parsed into a proper list',
+      '- For example, ["[\\"will@example.com\\", \\"other@example.com\\"]"] is now correctly stored as two separate addresses',
+      '- Invalid email addresses are filtered out rather than silently saved',
+    ],
+  },
   {
     date: '2026-05-08',
     changes: [
@@ -236,6 +491,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Previously, the tool would silently fail or return simulated results when given paths it could not access, causing the agent to retry the same broken call repeatedly',
       '- The tool description and parameter docs have been updated to make clear that all data must arrive via file_urls (S3 URLs) or inline in analysis_instruction — not via local paths',
       '- For large datasets, the correct workflow is: use save_file to upload the data and get an S3 URL, then pass that URL in file_urls',
+    ],
+  },
+  {
+    date: '2026-05-07',
+    changes: [
+      'Feature: CRM CSV import now has a 3-step wizard with column mapping',
+      '- Upload your CSV and we auto-detect each column to the matching lead field (First Name, Email, Company LinkedIn, etc.) using fuzzy matching that tolerates synonyms like "Co. Linkedin", "Mobile", "Given Name"',
+      '- Step 2 lets you review and override the auto-mapping per column, including marking columns as Custom Field, Skip, or Split Full Name into First + Last',
+      '- New top-level Company LinkedIn URL field is now distinct from the person\'s LinkedIn — searchable, exportable, and visible in the lead detail panel',
+      '- Your last successful mapping is remembered per list, so re-importing the same template is one-click',
     ],
   },
   {
@@ -5948,6 +6213,69 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The AI Model dropdown in the Draft Email dialog now defaults to GPT-5.5 instead of Gemini 3 Flash',
       '- The dialog now shows a "Sending From" field so you can confirm which sender the email will come from before drafting',
       '- The sender is resolved automatically using the same hierarchy: lead-specific PoC → list default → account default',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'New: Use Gmail as a CRM Email Sender',
+      '- You can now connect a Gmail account and use it to send CRM emails directly — no email subdomain setup required',
+      '- In CRM → Senders, click "Connect Gmail" to link your Gmail account via OAuth. Once connected, click "Use as Sender" to add it',
+      '- Note: Gmail senders do not have open/click tracking. Emma reads your Gmail inbox to find reply history for context',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'New: Private Work Plans and Skills Are Now Shared Across Your Organization',
+      '- When you create a private work plan or skill, it is automatically shared with all members of your organization',
+      '- Org members can view and use each other\'s private work plans when starting a new agent session',
+      '- Org members can view and install each other\'s private skills within any session',
+      '- Only the original owner can edit, delete, or submit their plan/skill for platform-wide review',
+      '- Org-shared items are labeled "From org" in the Settings > Skills and Work Plans tabs',
+    ],
+  },
+  {
+    date: '2026-05-12',
+    changes: [
+      'Fixed: Soft-Deleted Accounts No Longer Appear as Org Owners',
+      '- When an admin changed a user\'s email, the old (tombstoned) account was incorrectly shown as an additional owner in the organization members list',
+      '- Tombstoned accounts are now excluded from org member listings',
+      '- Email changes also now clear the org membership fields from the old record at the source',
+    ],
+  },
+  {
+    date: '2026-05-14',
+    changes: [
+      'Fixed: Data Analysis — Files with s3:// URLs Now Download Correctly',
+      '- Passing an s3:// URL (e.g. s3://bucket/key) to the perform_data_analysis tool was failing with "Unsupported protocol s3:"',
+      '- The tool now fetches s3:// URLs directly via the AWS S3 SDK instead of passing them to an HTTP client',
+      '- Mixed s3:// and https:// URLs in the same call are both handled correctly',
+    ],
+  },
+  {
+    date: '2026-05-14',
+    changes: [
+      'Fixed: CRM Email Draft — Organization Members Can Now Draft Emails for Leads in Any Org List',
+      '- Creating an email draft for a lead in a CRM list owned by another org member was returning "Access denied — You do not have permission to access this lead list"',
+      '- The permission check now correctly allows any org member to draft emails for leads across all lists in their organization, consistent with how other CRM actions (viewing leads, sending emails) already work',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Send LinkedIn Message in CRM No Longer Fails with a Validation Error',
+      '- Clicking "Send on LinkedIn" in the CRM lead panel was showing a DynamoDB validation error after the message was sent',
+      '- The error was caused by an empty string being written to a required index field when recording the engagement event',
+      '- Messages now send and record correctly, and engagement history updates immediately in the lead panel',
+    ],
+  },
+  {
+    date: '2026-05-13',
+    changes: [
+      'Fixed: Create Ad Video Task — Selecting One ICP No Longer Selects All',
+      '- Previously, clicking a single ICP in the Create Ad Video task dialog caused all ICPs to appear selected',
+      '- Only the chosen ICP is now activated; others remain unaffected',
     ],
   },
   {

@@ -385,6 +385,30 @@ describe('LinkedInOutreachService', () => {
       });
     });
 
+    // Regression: when paginating a URL-based search, importLeadsFromSearch
+    // passes BOTH url and cursor on every iteration after the first. The
+    // cursor encodes the URL itself, so Unipile resumes correctly when given
+    // the cursor. If we instead send `{ url }`, Unipile re-runs the search
+    // from page 1 on every iteration, which made the find-leads top-up loop
+    // grind through 20 identical pages and report "200 found / 1 imported".
+    it('cursor takes precedence over url when both are provided (URL pagination)', async () => {
+      const mockResults = { object: 'SearchResults', items: [], cursor: 'page-3-cursor' };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockResults);
+
+      await linkedInOutreachService.searchPeople('account-123', {
+        url: 'https://www.linkedin.com/search/results/people/?keywords=cmo',
+        cursor: 'page-2-cursor',
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'POST',
+        path: ['linkedin', 'search'],
+        parameters: { account_id: 'account-123' },
+        headers: { 'Content-Type': 'application/json' },
+        body: { cursor: 'page-2-cursor' },
+      });
+    });
+
     it('should throw a structured error on API failure', async () => {
       const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
         body: { status: 400, title: 'Bad search request' }

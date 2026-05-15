@@ -58,8 +58,8 @@ jest.mock('../config/integrations', () => ({
             ? ['instagram_business_basic', 'instagram_business_content_publish']
             : ['ads_management', 'pages_show_list'];
         return {
-            authorizationUrl: 'https://www.facebook.com/v18.0/dialog/oauth',
-            tokenUrl: 'https://graph.facebook.com/v18.0/oauth/access_token',
+            authorizationUrl: 'https://www.facebook.com/v25.0/dialog/oauth',
+            tokenUrl: 'https://graph.facebook.com/v25.0/oauth/access_token',
             scopes
         };
     }),
