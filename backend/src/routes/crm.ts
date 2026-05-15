@@ -3379,7 +3379,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
  * `isMatch` from the winning category's score — single source of truth so
  * the prompt and the backend can't drift apart on what "match" means.
  */
-const ICP_MATCH_THRESHOLD = 70;
+const ICP_MATCH_THRESHOLD = 50;
 
 /**
  * @route POST /api/crm/lists/:listId/leads/match-icps

@@ -954,7 +954,7 @@ describe('CRM Routes', () => {
     });
 
     it('persists isMatch=false and no matchedIcpTitle when winner score is below threshold', async () => {
-      // Coverage gap from initial PR: winner exists but score < 70.
+      // Coverage gap from initial PR: winner exists but score < 50 (threshold).
       // matchedIcpTitle must stay undefined so the frontend doesn't render a
       // stale title on a non-match.
       const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
@@ -976,7 +976,7 @@ describe('CRM Routes', () => {
           {
             index: 1,
             categoryMatches: [
-              { icpTitle: 'SaaS founders', isMatch: false, score: 50, reason: 'Wrong segment.' },
+              { icpTitle: 'SaaS founders', isMatch: false, score: 49, reason: 'Wrong segment.' },
             ],
           },
         ]),
@@ -994,7 +994,7 @@ describe('CRM Routes', () => {
 
       const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
       expect(updateCall.icpMatch.isMatch).toBe(false);
-      expect(updateCall.icpMatch.score).toBe(50);
+      expect(updateCall.icpMatch.score).toBe(49);
       expect(updateCall.icpMatch.matchedIcpTitle).toBeUndefined();
     });
 
