@@ -3052,11 +3052,14 @@ router.get("/chat-sessions", async (req, res) => {
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
       : null;
 
-    // Filter out sessions that have no user messages (not real sessions)
-    const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
-      Array.isArray(session.messages) &&
-      session.messages.some((msg: any) => msg.role === "user")
-    );
+    // For time-range queries (analytics), include all sessions (scheduled, automated, etc.)
+    // For the paginated admin chat list (no time range), filter out sessions with no user messages
+    const nonEmptySessions = timeRange
+      ? sessionsWithMessages
+      : sessionsWithMessages.filter((session: any) =>
+          Array.isArray(session.messages) &&
+          session.messages.some((msg: any) => msg.role === "user")
+        );
 
     res.json({ sessions: nonEmptySessions, nextCursor });
   } catch (error) {

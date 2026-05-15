@@ -298,7 +298,7 @@ export async function createOncallItem(params: CreateOncallItemParams): Promise<
     body: JSON.stringify({
       parent: { type: 'data_source_id', data_source_id: databaseId },
       properties: {
-        'Name': { title: [{ text: { content: title } }] },
+        'Name': { title: [{ type: 'text', text: { content: title } }] },
         'Status': { status: { name: 'To-do' } },
         'Tags': { multi_select: tags },
         'Sprint': { rich_text: [{ type: 'text', text: { content: 'Backlog' } }] },
