@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-15',
     changes: [
+      'Fixed: LinkedIn Company Page Posts Now Load Correctly',
+      '- list_connected_account_posts now returns posts for LinkedIn company pages instead of always returning an empty list',
+      '- Posts created through AgentWeb are stored locally and served as a fallback when the LinkedIn API is unavailable or returns empty',
+      '- Posts fetched from LinkedIn are cached for 1 day to reduce API calls; use force_reload: true to fetch fresh posts on demand',
+      '- API errors (e.g. permission denied) are now surfaced as a clear error message instead of silently returning 0 posts',
+    ],
+  },
+  {
+    date: '2026-05-15',
+    changes: [
       'Fixed: Emma No Longer Answers Twice When @Mentioned in a Slack Thread',
       '- When a user @mentioned Emma inside an existing Slack thread, Slack sent both an app_mention and a message event for the same message',
       '- Both event handlers were running independently, causing Emma to generate and post two separate responses',

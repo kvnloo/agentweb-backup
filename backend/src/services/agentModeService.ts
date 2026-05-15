@@ -20860,7 +20860,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async loadConnectedAccountPosts(
     userId: string,
     accountId: string,
-    options: { limit?: number; include_metrics?: boolean } = {}
+    options: { limit?: number; include_metrics?: boolean; force_reload?: boolean } = {}
   ): Promise<any> {
     console.log('[AgentMode] loadConnectedAccountPosts called:', {
       userId,
@@ -20885,6 +20885,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
+        forceReload: options.force_reload === true,
       });
 
       // If the account wasn't processed (adapter threw), treat as failure
@@ -20892,6 +20893,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return {
           success: false,
           message: 'Failed to load posts',
+        };
+      }
+
+      // If the account errored (0 posts + error field), surface the real error
+      const accountResult = result.accounts.find(a => a.accountId === accountId);
+      if (accountResult?.error && result.posts.length === 0) {
+        return {
+          success: false,
+          message: `Failed to load posts: ${accountResult.error}`,
+          error: accountResult.error,
         };
       }
 

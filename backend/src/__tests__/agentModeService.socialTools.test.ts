@@ -239,7 +239,7 @@ describe('AgentModeService - Social Media Tools', () => {
         { limit: 10 }
       );
 
-      expect(mockAdapter.listPosts).toHaveBeenCalledWith(mockLinkedInAccount, { limit: 10 }, 'user-123');
+      expect(mockAdapter.listPosts).toHaveBeenCalledWith(mockLinkedInAccount, { limit: 10, force_reload: false }, 'user-123');
       expect(result.success).toBe(true);
       expect(result.posts).toHaveLength(2);
       expect(result.message).toContain('Successfully loaded');
@@ -326,7 +326,7 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toBe('Account not found or access denied');
     });
 
-    it('should return success with 0 posts when adapter fails due to expired token (account stays visible)', async () => {
+    it('should return failure with the real error when adapter fails due to expired token', async () => {
       mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
@@ -335,10 +335,9 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:organization:123456'
       );
 
-      // Account is still included in summaries (with 0 posts) even when listPosts fails
-      expect(result.success).toBe(true);
-      expect(result.posts).toHaveLength(0);
-      expect(result.message).toContain('Successfully loaded 0 posts');
+      // When listPosts throws and there are no cached posts, the real error is surfaced
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('LinkedIn access token expired');
     });
 
     it('should handle empty posts list', async () => {
