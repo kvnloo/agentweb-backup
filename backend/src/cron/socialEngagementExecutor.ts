@@ -256,7 +256,8 @@ export class SocialEngagementExecutor {
                 if (alreadyCommented) {
                     console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
                 } else {
-                    generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext);
+                    const recentComments = await socialEngagementTrackingDb.getRecentGeneratedTexts(engagingConnection.account_id, 10);
+                    generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext, recentComments);
                     console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
                     await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
                     console.log(`[Executor] Comment posted on post ${postId}`);
@@ -338,7 +339,7 @@ export class SocialEngagementExecutor {
         }
     }
 
-    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }): Promise<string> {
+    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }, recentComments?: string[]): Promise<string> {
         try {
             let systemPrompt = POST_COMMENT_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -355,6 +356,9 @@ export class SocialEngagementExecutor {
                 if (ownerContext.name) parts.push(`Name: ${ownerContext.name}`);
                 if (ownerContext.memory) parts.push(ownerContext.memory);
                 systemPrompt += `\n\nPost author profile (who wrote the post you are commenting on):\n${parts.join('\n')}`;
+            }
+            if (recentComments && recentComments.length > 0) {
+                systemPrompt += `\n\nDo NOT repeat or closely echo any of these recent comments you've already written. Make sure your new comment is structurally and tonally distinct from all of these:\n${recentComments.map((c, i) => `${i + 1}. "${c}"`).join('\n')}`;
             }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
@@ -431,7 +435,8 @@ export class SocialEngagementExecutor {
             if (alreadyReplied) {
                 console.log(`[Executor] Account ${engagingConnection.account_id} already replied to ${commentId}, skipping reply.`);
             } else {
-                generatedText = await this.generateCommentReply(commentText || '', engagerMemory, engagerPersonality);
+                const recentComments = await socialEngagementTrackingDb.getRecentGeneratedTexts(engagingConnection.account_id, 10);
+                generatedText = await this.generateCommentReply(commentText || '', engagerMemory, engagerPersonality, recentComments);
                 console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
                 await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
                 console.log(`[Executor] Reply posted on comment ${commentId}`);
@@ -459,7 +464,7 @@ export class SocialEngagementExecutor {
         return { generatedText, reactionType };
     }
 
-    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }): Promise<string> {
+    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, recentComments?: string[]): Promise<string> {
         try {
             let systemPrompt = COMMENT_REPLY_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -470,6 +475,9 @@ export class SocialEngagementExecutor {
             }
             if (engagerMemory) {
                 systemPrompt += `\n\nPerson profile (write as this person, matching their voice and interests):\n${engagerMemory}`;
+            }
+            if (recentComments && recentComments.length > 0) {
+                systemPrompt += `\n\nDo NOT repeat or closely echo any of these recent replies you've already written. Make sure your new reply is structurally and tonally distinct from all of these:\n${recentComments.map((c, i) => `${i + 1}. "${c}"`).join('\n')}`;
             }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({

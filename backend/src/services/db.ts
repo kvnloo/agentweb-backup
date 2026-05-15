@@ -7064,6 +7064,36 @@ export const socialEngagementTrackingDb = {
       throw error;
     }
   },
+
+  // Fetch the most recent N generated comment/reply texts for an account.
+  // Used to inject comment history into LLM prompts to prevent repetitive outputs.
+  async getRecentGeneratedTexts(engagingAccountId: string, limit: number = 10): Promise<string[]> {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        IndexName: 'EngagingAccountIndex',
+        KeyConditionExpression: 'engagingAccountId = :engagingAccountId',
+        FilterExpression: 'attribute_exists(generatedText) AND #status = :completed',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':engagingAccountId': engagingAccountId,
+          ':completed': 'completed',
+        },
+        ScanIndexForward: false,
+        Limit: limit * 3, // over-fetch to account for items without generatedText filtered out
+      };
+
+      const result = await dynamodb.query(params).promise();
+      const texts = (result.Items || [])
+        .map((i: any) => i.generatedText as string)
+        .filter(Boolean)
+        .slice(0, limit);
+      return texts;
+    } catch (error) {
+      console.warn('[socialEngagementTrackingDb] getRecentGeneratedTexts failed, skipping history:', error);
+      return [];
+    }
+  },
 };
 
 // ==================== Organization DB Operations ====================

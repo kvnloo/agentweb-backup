@@ -14,6 +14,7 @@ jest.mock('../services/db', () => ({
   },
   socialEngagementTrackingDb: {
     recordEngagement: jest.fn(),
+    getRecentGeneratedTexts: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -899,6 +900,99 @@ describe('SocialEngagementExecutor', () => {
       expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
         expect.objectContaining({ status: 'completed' })
       );
+    });
+  });
+
+  // ─── comment variety: recent history injection ────────────────────────────
+
+  describe('comment variety — recent history injection', () => {
+    it('should fetch recent generated texts before posting a comment', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('New varied comment') as any);
+      mockTrackingDb.getRecentGeneratedTexts.mockResolvedValue(['Old comment 1', 'Old comment 2']);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockTrackingDb.getRecentGeneratedTexts).toHaveBeenCalledWith('acc-engager-1', 10);
+    });
+
+    it('should include recent comments in the LLM prompt to prevent repetition', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      const mockCreate = jest.fn().mockResolvedValue({ choices: [{ message: { content: 'Fresh comment' } }] });
+      mockAgentModeService.getGeminiClient.mockResolvedValue({ chat: { completions: { create: mockCreate } } } as any);
+      mockTrackingDb.getRecentGeneratedTexts.mockResolvedValue(['This resonates a lot.', 'Worth bookmarking.']);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      const callArgs = mockCreate.mock.calls[0][0];
+      const systemPrompt = callArgs.messages[0].content as string;
+      expect(systemPrompt).toContain('This resonates a lot.');
+      expect(systemPrompt).toContain('Worth bookmarking.');
+      expect(systemPrompt).toContain('Do NOT repeat or closely echo');
+    });
+
+    it('should still post comment when getRecentGeneratedTexts returns empty array', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Normal comment') as any);
+      mockTrackingDb.getRecentGeneratedTexts.mockResolvedValue([]);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalledWith(
+        expect.any(Object), 'urn:li:share:123', 'Normal comment', 'user-1'
+      );
+    });
+
+    it('should fetch recent generated texts before posting a reply', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: 'Nice insight!',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Fresh reply') as any);
+      mockTrackingDb.getRecentGeneratedTexts.mockResolvedValue(['Old reply 1']);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockTrackingDb.getRecentGeneratedTexts).toHaveBeenCalledWith('acc-engager-1', 10);
+    });
+
+    it('should include recent replies in LLM prompt for reply actions', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: 'Nice insight!',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      const mockCreate = jest.fn().mockResolvedValue({ choices: [{ message: { content: 'Varied reply' } }] });
+      mockAgentModeService.getGeminiClient.mockResolvedValue({ chat: { completions: { create: mockCreate } } } as any);
+      mockTrackingDb.getRecentGeneratedTexts.mockResolvedValue(['Fair. That tracks.', 'Interesting point.']);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      const callArgs = mockCreate.mock.calls[0][0];
+      const systemPrompt = callArgs.messages[0].content as string;
+      expect(systemPrompt).toContain('Fair. That tracks.');
+      expect(systemPrompt).toContain('Interesting point.');
+      expect(systemPrompt).toContain('Do NOT repeat or closely echo');
     });
   });
 });
