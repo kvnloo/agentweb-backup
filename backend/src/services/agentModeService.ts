@@ -2454,7 +2454,17 @@ export class AgentModeService {
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
-      console.error('AgentMode: Response generation failed:', error);
+      // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
+      const errorMsg = error?.message || String(error);
+      const bedrockMsg = error?.$response?.body ? String(error.$response.body).slice(0, 500) : undefined;
+      console.error('AgentMode: Response generation failed:', {
+        message: errorMsg,
+        name: error?.name,
+        code: error?.code,
+        httpStatus: error?.status ?? error?.$metadata?.httpStatusCode,
+        bedrockBody: bedrockMsg,
+        sessionId,
+      });
 
       // Determine user-friendly message based on error type
       let userMessage: string;
@@ -2462,13 +2472,15 @@ export class AgentModeService {
         || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
       // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
+      // Check for context-limit patterns in the raw error message before falling through to generic 400
+      const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
       } else if (isTimeout) {
         userMessage = 'Your request took longer than expected. Please try again.';
-      } else if (httpStatus === 400) {
+      } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
@@ -14770,6 +14782,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'read_market_strategy': 50000,
     'search_tool_response': 20000,
     'read_tool_response': 60000,
+    'read_brand_guidelines': 15000,
+    'read_knowledge_base_files': 10000,
+    'read_page_source': 8000,
+  };
+
+  // Tool call argument fields to trim in old assistant messages when context is large.
+  // Maps tool name -> list of argument field names that can be truncated.
+  private static readonly LARGE_TOOL_ARG_TRIM: Record<string, { fields: string[]; limit: number }> = {
+    'create_blog_article': { fields: ['content_draft'], limit: 500 },
+    'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
@@ -14786,6 +14808,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
+    // Track which assistant messages are "old" (all their tool_calls have been resolved
+    // and are not in the preserve set). We identify these to trim large argument fields.
+    const oldAssistantIndices = new Set<number>();
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === 'assistant' && msg.tool_calls?.length) {
+        // Find the tool result indices for this assistant message's tool calls
+        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
+        let allOld = true;
+        for (let j = i + 1; j < messages.length; j++) {
+          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
+            if (preserveSet.has(j)) {
+              allOld = false;
+              break;
+            }
+          }
+        }
+        if (allOld) {
+          oldAssistantIndices.add(i);
+        }
+      }
+    }
+
     // Shallow-copy the array; only deep-copy messages that need modification
     const result = messages.map((msg, idx) => {
       if (
@@ -14800,6 +14845,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
         }
       }
+
+      // Trim large tool call arguments in old assistant messages to prevent context overflow
+      if (msg.role === 'assistant' && oldAssistantIndices.has(idx) && msg.tool_calls?.length) {
+        let modified = false;
+        const newToolCalls = msg.tool_calls.map((tc: any) => {
+          const trimSpec = AgentModeService.LARGE_TOOL_ARG_TRIM[tc.function?.name];
+          if (!trimSpec) return tc;
+          let args: Record<string, any>;
+          try {
+            args = JSON.parse(tc.function.arguments || '{}');
+          } catch {
+            return tc;
+          }
+          let changed = false;
+          for (const field of trimSpec.fields) {
+            if (typeof args[field] === 'string' && args[field].length > trimSpec.limit) {
+              args[field] = args[field].slice(0, trimSpec.limit) + '[…trimmed]';
+              changed = true;
+            }
+          }
+          if (!changed) return tc;
+          modified = true;
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(args) } };
+        });
+        if (modified) {
+          return { ...msg, tool_calls: newToolCalls };
+        }
+      }
+
       return msg;
     });
 
