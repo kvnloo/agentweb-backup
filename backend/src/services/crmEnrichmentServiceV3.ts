@@ -197,12 +197,13 @@ function addTierCounts(a: TierCount, b: TierCount): TierCount {
 }
 
 interface FieldRouting {
-  groupedByGroup: Map<string, string[]>;     // groupName → CANONICAL field names
+  groupedByGroup: Map<string, string[]>;     // groupName → CANONICAL field names (deduped)
   ungrouped: string[];                       // user-facing names (no canonical analog)
-  /** Map from canonical name (what the waterfall sees) → user-facing name
-   *  (what gets written to the lead). Same name on both sides for fields
-   *  whose own `name` matches a FIELD_GROUPS entry. */
-  userNameByCanonical: Map<string, string>;
+  /** Map from canonical name (what the waterfall sees) → list of user-facing
+   *  names to fan the fill out to. Multiple user fields may alias the same
+   *  canonical (e.g. legacy lists with both `company` and `company_name`);
+   *  one canonical fill becomes one fill per user name. */
+  userNamesByCanonical: Map<string, string[]>;
 }
 
 function routeFields(
@@ -210,7 +211,7 @@ function routeFields(
 ): { routing: FieldRouting; needsPerson: boolean; needsCompany: boolean } {
   const groupedByGroup = new Map<string, string[]>();
   const ungrouped: string[] = [];
-  const userNameByCanonical = new Map<string, string>();
+  const userNamesByCanonical = new Map<string, string[]>();
 
   for (const field of config.fields) {
     if (!field.include) continue;
@@ -220,8 +221,11 @@ function routeFields(
     for (const [groupName, groupCfg] of Object.entries(FIELD_GROUPS)) {
       if (groupCfg.fields.includes(canonical)) {
         if (!groupedByGroup.has(groupName)) groupedByGroup.set(groupName, []);
-        groupedByGroup.get(groupName)!.push(canonical);
-        userNameByCanonical.set(canonical, field.name);
+        const groupFields = groupedByGroup.get(groupName)!;
+        if (!groupFields.includes(canonical)) groupFields.push(canonical);
+        const userNames = userNamesByCanonical.get(canonical) ?? [];
+        if (!userNames.includes(field.name)) userNames.push(field.name);
+        userNamesByCanonical.set(canonical, userNames);
         assigned = true;
         break;
       }
@@ -237,7 +241,7 @@ function routeFields(
     if (ent === 'company') needsCompany = true;
   }
 
-  return { routing: { groupedByGroup, ungrouped, userNameByCanonical }, needsPerson, needsCompany };
+  return { routing: { groupedByGroup, ungrouped, userNamesByCanonical }, needsPerson, needsCompany };
 }
 
 function buildRefreshFieldsSet(
@@ -412,13 +416,19 @@ async function processLead(
         leadHint: { listId: input.listId, leadId: lead.leadId },
       });
       // Translate each fill from CANONICAL field name back to the user's
-      // chosen name. e.g. waterfall fills `funding_stage` but the user
+      // chosen names. e.g. waterfall fills `funding_stage` but the user
       // named the field `stag` (via aliasFor) — we store under `stag`.
+      // Legacy lists may have multiple user fields aliased to the same
+      // canonical (e.g. both `company` and `company_name`), so one
+      // canonical fill fans out to every user-facing name.
+      const renamedFills: typeof groupResult.fields = [];
       for (const fill of groupResult.fields) {
-        const userName = routing.userNameByCanonical.get(fill.field);
-        if (userName && userName !== fill.field) fill.field = userName;
+        const userNames = routing.userNamesByCanonical.get(fill.field) ?? [fill.field];
+        for (const userName of userNames) {
+          renamedFills.push(userName === fill.field ? fill : { ...fill, field: userName });
+        }
       }
-      allFills.push(...groupResult.fields);
+      allFills.push(...renamedFills);
       perGroupTierFills.set(
         groupName,
         addTierCounts(perGroupTierFills.get(groupName) ?? emptyTierCount(), groupResult.tierFills),

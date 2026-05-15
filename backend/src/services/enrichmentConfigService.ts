@@ -176,31 +176,40 @@ class ConfigValidationError extends Error {
   }
 }
 
-function validateConfig(config: EnrichmentConfig): void {
+function validateConfig(config: EnrichmentConfig): { warnings: string[] } {
   if (config.schemaVersion !== 1) {
     throw new ConfigValidationError(
       `schemaVersion must be 1; received ${config.schemaVersion}`,
     );
   }
 
-  // Two fields routing to the same canonical name → routing conflict.
+  // Two fields routing to the same canonical name → routing collision.
   // Covers both: explicit aliasFor collisions AND a self-canonical name
   // (e.g. `email`) clashing with an inferred alias (e.g. `Email`→`email`).
-  // The waterfall fills the canonical once and the rename can only land on
-  // one user-facing field — the other silently misses its value.
-  const canonicalOwners = new Map<string, string>();   // canonical → user field name
+  // Real CRM lists commonly have data in both `company` and `company_name`
+  // (or `email` + `Email`), so we ALLOW the collision and fan out fills to
+  // every user-facing field at enrichment time. We surface a warning so the
+  // user understands both columns will receive the same enriched value.
+  const canonicalToUserFields = new Map<string, string[]>();
   for (const field of config.fields) {
     const canonical = field.aliasFor
       ?? (CANONICAL_FIELD_NAMES.has(field.name) ? field.name : null);
     if (!canonical) continue;
-    const existing = canonicalOwners.get(canonical);
-    if (existing && existing !== field.name) {
-      throw new ConfigValidationError(
-        `Fields '${existing}' and '${field.name}' both map to '${canonical}'. ` +
-        `Each canonical field can have only one config field — remove one.`,
-      );
-    }
-    canonicalOwners.set(canonical, field.name);
+    const names = canonicalToUserFields.get(canonical) ?? [];
+    if (!names.includes(field.name)) names.push(field.name);
+    canonicalToUserFields.set(canonical, names);
+  }
+  // Each warning is just the duplicate group descriptor (e.g. `'company' and
+  // 'company_name'`). The frontend wraps the list with a single shared header
+  // + explainer, so the message reads cleanly when several groups collide.
+  const warnings: string[] = [];
+  for (const [, names] of canonicalToUserFields.entries()) {
+    if (names.length < 2) continue;
+    const quoted = names.map(n => `'${n}'`);
+    const list = names.length === 2
+      ? `${quoted[0]} and ${quoted[1]}`
+      : `${quoted.slice(0, -1).join(', ')}, and ${quoted[quoted.length - 1]}`;
+    warnings.push(list);
   }
 
   const seen = new Set<string>();
@@ -234,6 +243,8 @@ function validateConfig(config: EnrichmentConfig): void {
       }
     }
   }
+
+  return { warnings };
 }
 
 // ─── Default-config generator ─────────────────────────────────────────────────
@@ -340,26 +351,37 @@ function mergeSavedWithCandidates(
 export async function getEnrichmentConfig(
   input: { listId: string; userId: string },
   deps: ConfigServiceDeps,
-): Promise<{ config: EnrichmentConfig; isDefault: boolean }> {
+): Promise<{ config: EnrichmentConfig; isDefault: boolean; knownColumns: string[] }> {
   // Always read list field names — we surface the full candidate set in the
   // dialog (standard lead columns + custom fields), regardless of whether a
   // saved config exists. Saved settings are merged in on top.
   const fieldNames = await deps.loadListFieldNames(input.listId);
   const stored = await deps.readListConfig(input.listId);
 
+  // knownColumns = the rows that will auto-resurface on next dialog open
+  // (standard CRM cols ∪ list schema cols, minus excluded/reserved). Frontend
+  // hides the trash icon for these — delete is destructive only for fields
+  // outside this set (manually-added saved-only rows).
+  const knownColumns = candidateFieldNames(fieldNames);
+
   if (stored) {
-    return { config: mergeSavedWithCandidates(stored, fieldNames), isDefault: false };
+    return {
+      config: mergeSavedWithCandidates(stored, fieldNames),
+      isDefault: false,
+      knownColumns,
+    };
   }
   return {
     config: buildDefaultConfig(fieldNames, input.userId),
     isDefault: true,
+    knownColumns,
   };
 }
 
 export async function setEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
   deps: ConfigServiceDeps,
-): Promise<EnrichmentConfig> {
+): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
   // Step 1: heuristic alias inference (camelCase, synonym map, standard
   // columns). Cheap, no API call. Catches the easy 80% of cases.
   // Explicit client-supplied aliasFor is preserved.
@@ -398,7 +420,7 @@ export async function setEnrichmentConfig(
     }
   }
 
-  validateConfig(enriched);
+  const { warnings } = validateConfig(enriched);
 
   // Stamp server-side audit fields, overwriting whatever the client sent.
   // Trusting client-provided timestamps would let bad clients backdate writes.
@@ -409,7 +431,7 @@ export async function setEnrichmentConfig(
   };
 
   await deps.writeListConfig(input.listId, stamped);
-  return stamped;
+  return { config: stamped, warnings };
 }
 
 export async function suggestFieldTypes(
