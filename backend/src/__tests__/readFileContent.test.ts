@@ -47,6 +47,14 @@ jest.mock('xlsx', () => ({
   },
 }));
 
+// Mock s3Utils
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn(),
+  uploadFileToS3WithPath: jest.fn(),
+  uploadScreenshotToS3: jest.fn(),
+  getS3ObjectAsString: jest.fn(),
+}));
+
 describe('readFileContent', () => {
   let agentModeService: AgentModeService;
   let mockDynamoDB: jest.Mocked<DynamoDB>;
@@ -255,8 +263,8 @@ describe('readFileContent', () => {
       expect(result.message).toContain('Failed to parse PDF file');
     });
 
-    it('should handle content size limits', async () => {
-      const largeContent = 'x'.repeat(60000); // Exceeds 50KB limit
+    it('should save large content to S3 and return extracted_content_url', async () => {
+      const largeContent = 'x'.repeat(60000); // Exceeds 50KB inline limit
       const mockResponse = {
         data: Buffer.from(largeContent),
         headers: { 'content-type': 'text/plain' }
@@ -264,11 +272,35 @@ describe('readFileContent', () => {
       const axios = require('axios');
       axios.get.mockResolvedValue(mockResponse);
 
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      uploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.example.com/extracted.txt' });
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/large-file.txt');
+
+      expect(result.success).toBe(true);
+      expect(result.extracted_content_url).toBe('https://s3.example.com/extracted.txt');
+      expect(result.content).toContain('perform_data_analysis');
+      expect(result.content).toContain('https://s3.example.com/extracted.txt');
+      expect(uploadFileToS3).toHaveBeenCalled();
+    });
+
+    it('should fall back to truncation when S3 upload fails', async () => {
+      const largeContent = 'y'.repeat(60000);
+      const mockResponse = {
+        data: Buffer.from(largeContent),
+        headers: { 'content-type': 'text/plain' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      uploadFileToS3.mockResolvedValue({ success: false });
+
       const result = await (agentModeService as any).readFileContent('https://example.com/large-file.txt');
 
       expect(result.success).toBe(true);
       expect(result.content).toContain('[Content truncated due to size limit]');
-      expect(result.content.length).toBeLessThanOrEqual(50050); // Allow some buffer for the truncation message
+      expect(result.extracted_content_url).toBeUndefined();
     });
   });
 

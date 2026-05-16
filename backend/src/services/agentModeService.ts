@@ -15740,26 +15740,43 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
-      // Limit content size to prevent overwhelming the LLM and session storage
-      const maxContentLength = 50000; // 50KB limit for tool results
-      if (extractedContent.length > maxContentLength) {
-        extractedContent = extractedContent.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
-        console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
-      }
-
-      // Format the file content for LLM consumption
-      const formattedContent = this.formatFileContent({
-        success: true,
-        content: extractedContent,
-        file_type: fileType,
-        file_size: buffer.length,
-        content_length: extractedContent.length,
-        file_url: fileUrl
-      });
-
-      // Compute content hash for integrity verification
       const contentHash = createHash('sha256').update(extractedContent).digest('hex');
       console.log(`AgentMode: Computed content hash: ${contentHash}`);
+
+      // For large content, save full text to S3 and return a reference so the LLM
+      // can pass the URL to perform_data_analysis instead of receiving a truncated blob.
+      const maxInlineLength = 50000;
+      if (extractedContent.length > maxInlineLength) {
+        console.log(`AgentMode: Content too large (${extractedContent.length} chars), saving to S3`);
+        try {
+          const urlFilename = new URL(fileUrl).pathname.split('/').pop() || 'file';
+          const s3Filename = `${urlFilename.replace(/\.[^.]+$/, '')}-extracted-${Date.now()}.txt`;
+          const uploadResult = await uploadFileToS3(
+            extractedContent,
+            s3Filename,
+            'anonymous', // no userId in scope here; file is already user-owned
+            'text/plain'
+          );
+          if (uploadResult.success && uploadResult.url) {
+            const preview = extractedContent.substring(0, 2000);
+            return {
+              success: true,
+              content: `${preview}\n\n[Content is large (${extractedContent.length} chars). Full extracted text saved to S3.]\n\nTo analyze this file, pass the following URL to perform_data_analysis:\n${uploadResult.url}`,
+              content_hash: contentHash,
+              file_type: fileType,
+              file_size: buffer.length,
+              content_length: extractedContent.length,
+              file_url: fileUrl,
+              extracted_content_url: uploadResult.url,
+              message: `File content extracted (${extractedContent.length} chars) and saved to S3 for analysis`
+            };
+          }
+        } catch (s3Error) {
+          console.error('AgentMode: Failed to save large file content to S3, falling back to truncation:', s3Error);
+        }
+        // S3 upload failed — fall back to truncation
+        extractedContent = extractedContent.substring(0, maxInlineLength) + '\n\n[Content truncated due to size limit]';
+      }
 
       return {
         success: true,
