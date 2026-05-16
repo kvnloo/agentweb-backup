@@ -5831,6 +5831,7 @@ const bridgedToolNames = [
   // 'list_landing_page_files' — removed: coding_agent handles file listing internally
   'get_landing_page_preview_url',
   'publish_landing_page_changes',
+  'update_landing_page_context',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────

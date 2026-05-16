@@ -1309,6 +1309,29 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'update_landing_page_context',
+  definition: {
+    name: 'update_landing_page_context',
+    description: 'Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. "this is for cold outreach targeting SaaS founders"). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        context: { type: 'string', description: 'Free-text notes: when to use this page, tone, audience, offer, etc.' }
+      },
+      required: ['page_id', 'context']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${args.page_id}/context`, context: ctx(context),
+      body: { context: args.context }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
