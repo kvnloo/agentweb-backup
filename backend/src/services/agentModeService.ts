@@ -2147,6 +2147,18 @@ export class AgentModeService {
               continue;
             }
 
+            // Block context-restricted tools even if LLM hallucinates the call from history
+            if (excludeTools?.includes(toolCall.function.name)) {
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: `Tool "${toolCall.function.name}" is not available in this context.` }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
@@ -3028,9 +3040,11 @@ export class AgentModeService {
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
-    // Build exclusion set: foundation tools + admin-only tools
+    // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
     const excludedTools = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
     ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
+    // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
+    excludedTools.add('get_visual_context');
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
