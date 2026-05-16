@@ -1312,7 +1312,7 @@ mcpToolRegistry.register({
   name: 'update_landing_page_context',
   definition: {
     name: 'update_landing_page_context',
-    description: 'Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. "this is for cold outreach targeting SaaS founders"). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.',
+    description: 'Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. "this is for cold outreach targeting SaaS founders"). Keep it concise (max 500 characters). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.',
     inputSchema: {
       type: 'object',
       properties: {

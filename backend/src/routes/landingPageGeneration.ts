@@ -1377,8 +1377,8 @@ router.patch("/generated/:id/context", authenticateToken, async (req, res: Respo
     if (typeof context !== "string") {
       return res.status(400).json({ error: "context must be a string" });
     }
-    if (context.length > MAX_INPUT_LENGTH) {
-      return res.status(400).json({ error: `context must not exceed ${MAX_INPUT_LENGTH} characters` });
+    if (context.length > 500) {
+      return res.status(400).json({ error: "context must not exceed 500 characters" });
     }
 
     await updateLandingPageContext(req.params.id, userId, context.trim());
