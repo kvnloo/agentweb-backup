@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-16',
     changes: [
+      'Fixed: LinkedIn Outreach No Longer Falsely Reports Invites as Sent When the Message Is Too Long',
+      '- LinkedIn rejects connection-request notes longer than 300 characters with a "Too many characters" error',
+      '- The assistant now validates message length before calling the API — messages over 300 chars are rejected immediately with a clear error',
+      '- When a message is too long, the assistant is explicitly instructed to shorten it and retry rather than proceeding to falsely claim success',
+      '- The 300-character limit is now documented in the tool description so the assistant avoids generating oversized notes in the first place',
+    ],
+  },
+  {
+    date: '2026-05-16',
+    changes: [
       'Fixed: Emma Can Now Read Excel/XLSX Files',
       '- When a user attached an Excel file and asked Emma to analyze it, Emma would acknowledge the file but not actually read it',
       '- XLSX files are binary archives and could not be read as plain text; Emma now parses them correctly using the xlsx library, converting each sheet to CSV',

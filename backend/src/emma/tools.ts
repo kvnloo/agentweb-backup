@@ -187,7 +187,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: message must be 300 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -221,7 +221,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite.'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: must be 300 characters or fewer (LinkedIn hard limit).'
         },
         subject: {
           type: 'string',

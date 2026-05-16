@@ -23,6 +23,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 // Mock linkedInOutreachService
 const mockSendMessage = jest.fn();
 const mockSendInMail = jest.fn();
+const mockSendInvitation = jest.fn();
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
@@ -31,6 +32,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
     sendInMail: (...args: any[]) => mockSendInMail(...args),
+    sendInvitation: (...args: any[]) => mockSendInvitation(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
@@ -672,6 +674,74 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockResolveAccountId).toHaveBeenCalledWith('user-1');
       expect(mockResolve).toHaveBeenCalledWith('site-wide-account', expect.any(Object));
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('send-invite', () => {
+    it('returns success when sendInvitation resolves', async () => {
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'Hi, let us connect!',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id',
+        'provider-abc',
+        false,
+        'Hi, let us connect!'
+      );
+    });
+
+    it('returns success:false with error message when sendInvitation rejects', async () => {
+      mockSendInvitation.mockRejectedValue(
+        new Error('Invitation message is too long (350 characters). LinkedIn limits invitation notes to 300 characters. Please shorten the message and retry.')
+      );
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'a'.repeat(350),
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('too long');
+    });
+  });
+
+  describe('formatToolError — linkedin_outreach char limit guidance', () => {
+    it('returns shorten-and-retry instruction when error message contains "too long"', () => {
+      // Access the private method via cast
+      const errorContent = (service as any).formatToolError(
+        'linkedin_outreach',
+        'Invitation message is too long (350 characters). LinkedIn limits invitation notes to 300 characters. Please shorten the message and retry.'
+      );
+      expect(errorContent).toContain('Do NOT report this as a success');
+      expect(errorContent).toContain('300');
+      expect(errorContent).toContain('shorten');
+    });
+
+    it('returns generic guidance for other linkedin_outreach errors', () => {
+      const errorContent = (service as any).formatToolError(
+        'linkedin_outreach',
+        'Already connected with this person.'
+      );
+      expect(errorContent).toContain('⚠️ Tool Error');
+      expect(errorContent).not.toContain('Do NOT report this as a success');
+    });
+
+    it('returns generic guidance for non-linkedin tools even if error contains "too long"', () => {
+      const errorContent = (service as any).formatToolError(
+        'some_other_tool',
+        'This field is too long for the API.'
+      );
+      expect(errorContent).toContain('⚠️ Tool Error');
+      expect(errorContent).not.toContain('Do NOT report this as a success');
     });
   });
 });
