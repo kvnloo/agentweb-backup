@@ -465,6 +465,35 @@ describe('AgentModeService - Skills', () => {
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('regular_tool');
     });
+
+    it('should exclude get_visual_context from unassociated tools (page-embedded Emma only)', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'regular_tool', definition: { function: { description: 'regular' } } },
+        { name: 'get_visual_context', definition: { function: { description: 'page screenshot tool' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('regular_tool');
+      expect(result.find((t: any) => t.name === 'get_visual_context')).toBeUndefined();
+    });
+
+    it('should exclude get_visual_context via getUnassociatedToolNames (resolveSkillsToToolNames path)', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'regular_tool', definition: { function: { description: 'regular' } } },
+        { name: 'get_visual_context', definition: { function: { description: 'page screenshot tool' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const names = agentModeService.getUnassociatedToolNames(publishedSkills);
+
+      expect(names).toContain('regular_tool');
+      expect(names).not.toContain('get_visual_context');
+    });
   });
 
   describe('buildAvailableSkillsMessage', () => {
