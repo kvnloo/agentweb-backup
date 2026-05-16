@@ -397,7 +397,20 @@ describe("Admin chat sessions endpoint", () => {
       expect(res.body.nextCursor).toBeNull();
     });
 
-    it("ignores sessionId param when it is empty string and uses normal pagination", async () => {
+    it("passes limit=1000 to getRecentSessionsPage when limit=1000 is requested without time range", async () => {
+    mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+      sessions: [],
+      lastEvaluatedKey: undefined,
+    });
+
+    await request(app)
+      .get("/api/admin/chat-sessions?limit=1000")
+      .expect(200);
+
+    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(1000, undefined, undefined);
+  });
+
+  it("ignores sessionId param when it is empty string and uses normal pagination", async () => {
       mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
         sessions: [],
         lastEvaluatedKey: undefined,

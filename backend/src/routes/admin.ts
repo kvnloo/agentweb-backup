@@ -2972,8 +2972,7 @@ router.get("/chat-sessions", async (req, res) => {
     const timeRange = startTime && endTime ? { startTime, endTime } : undefined;
     const syncMode = req.query.sync === "true" || req.query.sync === "1";
 
-    // Allow higher limit when time-range is specified (matching old chat-history behavior)
-    const maxLimit = timeRange ? 1000 : 100;
+    const maxLimit = 1000;
     const defaultLimit = timeRange ? 100 : 30;
     const rawLimit = Number(req.query.limit);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), maxLimit) : defaultLimit;
