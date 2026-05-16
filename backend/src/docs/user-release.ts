@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-16',
+    changes: [
+      'Fixed: Emma Can Now Read Excel/XLSX Files',
+      '- When a user attached an Excel file and asked Emma to analyze it, Emma would acknowledge the file but not actually read it',
+      '- XLSX files are binary archives and could not be read as plain text; Emma now parses them correctly using the xlsx library, converting each sheet to CSV',
+      '- Multi-sheet workbooks are fully supported; each sheet is labeled separately in the output',
+      '- Emma now also explicitly recognizes other attached document types (PDF, CSV, etc.) and knows to call read_file_content to process them',
+    ],
+  },
+  {
     date: '2026-05-15',
     changes: [
       'Tips from Emma: now powered by a hand-curated bank of 160 GTM best practices',
