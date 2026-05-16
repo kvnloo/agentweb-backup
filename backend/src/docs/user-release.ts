@@ -11,6 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-16',
     changes: [
+      'Landing Pages: Context Field for "When to Use" Notes',
+      '- Each landing page now has a Context field where you can describe when the page is best used, its tone, and target audience (e.g. "cold outreach to SaaS founders, conversational, focuses on pain points")',
+      '- The field is collapsed by default on the landing page card — click the summary line (or "+ Add context" if empty) to expand and edit',
+      '- Character counter shows usage up to the 500-character limit',
+      '- Emma can now read and update context when you describe a page in conversation — she will save your notes automatically via the update_landing_page_context tool',
       'Fixed: Agent Mode No Longer Incorrectly Offers Visual Context Tool',
       '- In Agent Mode, Emma was occasionally calling get_visual_context (a page-screenshot tool) when asked about images, returning a useless "screenshot will be captured" response',
       '- This tool is only meaningful when Emma is embedded in a specific portal page with a live browser context; it has no effect in standalone Agent Mode chat',
