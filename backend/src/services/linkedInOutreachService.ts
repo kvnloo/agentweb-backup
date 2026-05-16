@@ -331,7 +331,15 @@ export class LinkedInOutreachService {
    * @param isUrl          - true if profileUrlOrId is a profile URL, false if it is already a provider_id.
    * @param message        - Optional personalised note to attach to the invitation.
    */
+  // LinkedIn (via Unipile) rejects invitation notes longer than 300 characters.
+  static readonly INVITE_MESSAGE_MAX_CHARS = 300;
+
   async sendInvitation(account_id: string, profileUrlOrId: string, isUrl: boolean, message?: string): Promise<any> {
+    if (message !== undefined && message.length > LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS) {
+      throw new Error(
+        `Invitation message is too long (${message.length} characters). LinkedIn limits invitation notes to ${LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS} characters. Please shorten the message and retry.`
+      );
+    }
     try {
       const provider_id = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
       await this.checkIsNotAlreadyConnected(account_id, provider_id);
