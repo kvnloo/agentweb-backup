@@ -13597,6 +13597,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         (safeMessage.includes('too large') || safeMessage.includes('exceeds'))) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST use the save_file tool first to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`;
     }
+    // LinkedIn invite message too long — tell the LLM to shorten and retry, not report success
+    if (toolName === 'linkedin_outreach' && safeMessage.toLowerCase().includes('too long')) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's 300-character limit. Do NOT report this as a success. Shorten the message to 300 characters or fewer (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
