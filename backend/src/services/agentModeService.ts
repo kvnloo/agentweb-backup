@@ -14409,6 +14409,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const pdfParse = require('pdf-parse');
       const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
+    } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
+      mimeType.includes('spreadsheetml') || mimeType.includes('ms-excel')) {
+      const XLSX = require('xlsx');
+      const workbook = XLSX.read(content, { type: 'buffer' });
+      const lines: string[] = [];
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+        if (csv.trim()) {
+          lines.push(`Sheet: ${sheetName}`);
+          lines.push(csv);
+        }
+      }
+      return lines.join('\n\n');
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
       mimeType.startsWith('application/vnd.google-apps.')) {
@@ -14502,6 +14516,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const pdfParse = require('pdf-parse');
         const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
+      } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
+        contentType.includes('spreadsheetml') || contentType.includes('ms-excel')) {
+        const XLSX = require('xlsx');
+        const workbook = XLSX.read(content, { type: 'buffer' });
+        const lines: string[] = [];
+        for (const sheetName of workbook.SheetNames) {
+          const sheet = workbook.Sheets[sheetName];
+          const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+          if (csv.trim()) {
+            lines.push(`Sheet: ${sheetName}`);
+            lines.push(csv);
+          }
+        }
+        contentStr = lines.join('\n\n');
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
       } else {
@@ -15623,8 +15651,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Fetch the file content
       const response = await axios.get(fileUrl, {
-        timeout: 30000, // 30 seconds timeout for larger files
-        responseType: 'arraybuffer', // Use arraybuffer to handle binary files
+        timeout: 30000,
+        responseType: 'arraybuffer',
         headers: {
           'User-Agent': 'AgentWeb-Backend/1.0',
         },
@@ -15656,6 +15684,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             error: pdfError instanceof Error ? pdfError.message : 'PDF parsing failed'
           };
         }
+      } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
+        contentType.includes('spreadsheetml') || contentType.includes('ms-excel')) {
+        // Handle Excel/spreadsheet files
+        try {
+          const XLSX = require('xlsx');
+          const workbook = XLSX.read(buffer, { type: 'buffer' });
+          const lines: string[] = [];
+          for (const sheetName of workbook.SheetNames) {
+            const sheet = workbook.Sheets[sheetName];
+            const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+            if (csv.trim()) {
+              lines.push(`Sheet: ${sheetName}`);
+              lines.push(csv);
+            }
+          }
+          extractedContent = lines.join('\n\n');
+          fileType = 'spreadsheet';
+          console.log(`AgentMode: Successfully parsed Excel file (${workbook.SheetNames.length} sheet(s)), extracted ${extractedContent.length} characters`);
+        } catch (xlsxError) {
+          console.error('AgentMode: Error parsing Excel file:', xlsxError);
+          return {
+            success: false,
+            message: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
+            error: xlsxError instanceof Error ? xlsxError.message : 'Excel parsing failed'
+          };
+        }
       } else if (['txt', 'md', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
         // Handle text-based files
         try {
@@ -15680,30 +15734,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.error('AgentMode: Error reading file as text:', textError);
           return {
             success: false,
-            message: `Unsupported file type (${extension}). Only text files, PDFs, and common document formats are supported.`,
+            message: `Unsupported file type (${extension}). Only text files, PDFs, spreadsheets, and common document formats are supported.`,
             error: 'Unsupported file type'
           };
         }
       }
 
-      // Limit content size to prevent overwhelming the LLM and session storage
-      const maxContentLength = 50000; // 50KB limit for tool results
-      if (extractedContent.length > maxContentLength) {
-        extractedContent = extractedContent.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
-        console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
-      }
-
-      // Format the file content for LLM consumption
-      const formattedContent = this.formatFileContent({
-        success: true,
-        content: extractedContent,
-        file_type: fileType,
-        file_size: buffer.length,
-        content_length: extractedContent.length,
-        file_url: fileUrl
-      });
-
-      // Compute content hash for integrity verification
       const contentHash = createHash('sha256').update(extractedContent).digest('hex');
       console.log(`AgentMode: Computed content hash: ${contentHash}`);
 
