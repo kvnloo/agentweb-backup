@@ -16,6 +16,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- XLSX files are binary archives and could not be read as plain text; Emma now parses them correctly using the xlsx library, converting each sheet to CSV',
       '- Multi-sheet workbooks are fully supported; each sheet is labeled separately in the output',
       '- Emma now also explicitly recognizes other attached document types (PDF, CSV, etc.) and knows to call read_file_content to process them',
+      'Fixed: Admin Chat History — get_chat_history No Longer Undercounts Sessions',
+      '- Calling the chat-sessions API with limit=1000 but without a time range previously returned only ~91 sessions due to a hard cap of 100 items per DynamoDB page',
+      '- The API now paginates through multiple DynamoDB pages to honour the full requested limit, matching the behaviour of the time-range path',
+      '- Emma\'s get_chat_history tool and the Admin Chat History tab now return consistent, accurate session counts for any requested limit',
     ],
   },
   {
