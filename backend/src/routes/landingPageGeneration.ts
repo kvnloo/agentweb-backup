@@ -20,6 +20,7 @@ import {
   getProjectEnvVars,
   upsertEnvVar,
   deleteEnvVar,
+  updateLandingPageContext,
   INTEGRATIONS,
 } from "../services/v0Service";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
@@ -1359,6 +1360,32 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
   } catch (error: any) {
     console.error("[LP GENERATION] Error updating integrations:", error);
     res.status(500).json({ error: error.message || "Failed to update integrations" });
+  }
+});
+
+/**
+ * PATCH /api/landing-pages/v0/generated/:id/context
+ * Save a plain-text context/brief describing when and how to use this landing page.
+ * Body: { context: string }
+ */
+router.patch("/generated/:id/context", authenticateToken, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { context } = req.body as { context?: string };
+    if (typeof context !== "string") {
+      return res.status(400).json({ error: "context must be a string" });
+    }
+    if (context.length > MAX_INPUT_LENGTH) {
+      return res.status(400).json({ error: `context must not exceed ${MAX_INPUT_LENGTH} characters` });
+    }
+
+    await updateLandingPageContext(req.params.id, userId, context.trim());
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error updating context:", error);
+    res.status(500).json({ error: error.message || "Failed to update context" });
   }
 });
 
