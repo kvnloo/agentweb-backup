@@ -76,6 +76,12 @@ IMPORTANT: Tool calls and generated content:
 - If the tool returns a file URL, this is standard behavior - the important part is whether the content passed TO the tool meets requirements
 - Example: If create_social_media_posts is called with plain text posts as parameters, then the requirement "create plain text posts" is satisfied, even if the tool returns a file URL
 
+IMPORTANT: Bug reported during session:
+- If the conversation transcript contains "[called tools: report_product_issues]" (or report_product_issues appears in a tool call list), a bug was formally reported during this session
+- In that case, treat the problematic behavior as a known platform limitation rather than an assistant failure
+- Assume the user will be contacted offline about the fix, and score the overall session as satisfied (score ≥ 4), unless the user expressed strong dissatisfaction AFTER the tool was called
+- The friction leading up to the bug report should still inform dimension scores (e.g. outputQuality may be lower if retries were needed), but the overall satisfaction score should reflect that the issue was properly acknowledged and escalated
+
 In addition to the overall score, rate three specific dimensions (1-5 each):
 - goalCompletion: Did the assistant fully accomplish what the user asked? Did the user get what they came for?
 - dataAccuracy: Did the output contain plausible, consistent, and factually coherent data? Penalize hallucinated facts, made-up numbers, or self-contradictions.
