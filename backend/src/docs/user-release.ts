@@ -23,6 +23,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-16',
+    changes: [
+      'Fixed: Drag-and-Drop File Attachment Now Works on Windows 11 / Chrome',
+      '- Dragging a file onto the Agent Mode chat window on Windows 11 with Chrome would open the file in a new browser tab instead of attaching it',
+      '- The fix suppresses Chrome\'s built-in file-open behavior by registering document-level dragover and drop event listeners that call preventDefault(), which take effect whenever the Agent Mode page is active',
+    ],
+  },
+  {
     date: '2026-05-15',
     changes: [
       'Tips from Emma: now powered by a hand-curated bank of 160 GTM best practices',
