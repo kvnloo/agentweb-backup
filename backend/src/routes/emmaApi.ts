@@ -87,6 +87,17 @@ router.post('/search-ads-knowledge-base', async (req: Request, res: Response) =>
   }
 });
 
+router.post('/search-foreplay-discovery', async (req: Request, res: Response) => {
+  try {
+    const svc = await getAgentModeService();
+    const { query, company_name, max_results, format, platform, niche, live, sort } = req.body;
+    const result = await svc.searchForeplayDiscovery(query, { maxResults: max_results || 10, companyName: company_name, format, platform, niche, live, sort }, userId(req));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.post('/read-knowledge-base-files', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();

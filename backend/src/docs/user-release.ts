@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-15
+// Last updated: 2026-05-16
 
 export interface UserReleaseNote {
   date: string;
@@ -6297,6 +6297,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Email Draft — Organization Members Can Now Draft Emails for Leads in Any Org List',
       '- Creating an email draft for a lead in a CRM list owned by another org member was returning "Access denied — You do not have permission to access this lead list"',
       '- The permission check now correctly allows any org member to draft emails for leads across all lists in their organization, consistent with how other CRM actions (viewing leads, sending emails) already work',
+    ],
+  },
+  {
+    date: '2026-05-16',
+    changes: [
+      'Improved: Foreplay Ad Search Now Searches the Full Discovery Database',
+      '- Emma can now search Foreplay\'s global discovery database of millions of ads — not just your own saved swipefile',
+      '- Use the "search_ads_knowledge_base" tool with source=\'discovery\' to find ads by any company, brand, niche, format, or keyword',
+      '- Supports filtering by company name, ad format (video/image/carousel), platform (Facebook/Instagram), niche, live status, and sort order',
+      '- Discovery searches cost 1 Foreplay credit per result — Emma will always note this and keep results small by default',
+      '- Default behavior (source=\'swipefile\') is unchanged: searching your own saved ads remains free',
+      '- Fixed: When the platform-wide Foreplay API key was missing, Emma showed a misleading "No Foreplay account connected" error instead of a clear admin action message',
     ],
   },
   {

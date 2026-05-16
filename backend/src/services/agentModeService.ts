@@ -13791,7 +13791,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!foreplayToken) {
         return {
           success: false,
-          message: 'No Foreplay account connected. Connect your Foreplay account in Knowledge Base settings.',
+          message: 'Foreplay is not configured. The platform-wide Foreplay API key is missing from AWS Secrets Manager — an admin needs to add it. Users can also connect their own Foreplay account in Knowledge Base settings.',
           results: [],
           totalResults: 0
         };
@@ -13876,6 +13876,91 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay ads. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Search Foreplay discovery database (millions of ads, costs credits per result).
+  public async searchForeplayDiscovery(
+    query: string | undefined,
+    options: {
+      maxResults?: number;
+      companyName?: string;
+      format?: string[];
+      platform?: string[];
+      niche?: string[];
+      live?: boolean;
+      sort?: string;
+    } = {},
+    userId?: string
+  ): Promise<any> {
+    try {
+      if (!userId) {
+        return { success: false, message: 'User ID required to search Foreplay discovery.', results: [], totalResults: 0 };
+      }
+
+      // Build the effective query: combine company_name + query if both provided
+      const effectiveQuery = [options.companyName, query].filter(Boolean).join(' ') || undefined;
+      if (!effectiveQuery) {
+        return { success: false, message: 'Provide a company_name or query to search Foreplay discovery.', results: [], totalResults: 0 };
+      }
+
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return {
+          success: false,
+          message: 'Foreplay is not configured. The platform-wide Foreplay API key is missing from AWS Secrets Manager — an admin needs to add it. Users can also connect their own Foreplay account in Knowledge Base settings.',
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      const limit = Math.min(options.maxResults || 10, 20);
+      const result = await searchForeplayDiscoveryAds(foreplayToken, {
+        query: effectiveQuery,
+        limit,
+        format: options.format,
+        platform: options.platform,
+        niche: options.niche,
+        live: options.live,
+        sort: options.sort,
+      });
+
+      // When a company_name is specified, filter results to only that brand
+      const ads = options.companyName
+        ? result.ads.filter(ad => (ad.brandName || '').toLowerCase().includes(options.companyName!.toLowerCase()))
+        : result.ads;
+
+      const results = ads.map(ad => ({
+        content: (() => {
+          const c = formatForeplayAdAsMarkdown(ad);
+          return c.length > 5000 ? c.substring(0, 5000) + '\n\n[Content truncated]' : c;
+        })(),
+        source: `foreplay-discovery/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+      }));
+
+      const searchLabel = options.companyName
+        ? (query ? `"${options.companyName}" + "${query}"` : `"${options.companyName}"`)
+        : `"${query}"`;
+
+      return {
+        success: true,
+        message: results.length > 0
+          ? `Found ${results.length} ads in Foreplay discovery database for ${searchLabel}${result.cursor ? ' (more available)' : ''}`
+          : `No ads found in Foreplay discovery database for ${searchLabel}`,
+        query: effectiveQuery,
+        companyName: options.companyName,
+        results,
+        totalResults: results.length,
+        hasMore: !!result.cursor,
+        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.'
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching Foreplay discovery:', error);
+      return {
+        success: false,
+        message: 'Failed to search Foreplay discovery. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }

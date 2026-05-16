@@ -4358,24 +4358,71 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search the user's Foreplay ad library (swipefile + boards) for ads the user has SAVED/bookmarked. Use this for ad creative inspiration or finding specific saved ads by brand, headline, or description. IMPORTANT: This only searches the user's own saved collection — it does NOT search the public Meta/Facebook Ads Library for ads currently running by any company. For finding a specific company's currently-running Meta ads, use Playwright to browse https://www.facebook.com/ads/library/ with the company's Facebook Page ID (view_all_page_id=PAGE_ID) — do NOT use keyword search (q=) as that returns false positives. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result — keep max_results small (5–10). For finding a specific company's currently-running Meta ads, use source='discovery' with company_name. Do NOT use search_knowledge_base for Foreplay ad searches. IMPORTANT: This does NOT search the public Meta/Facebook Ads Library — for that, use Playwright to browse https://www.facebook.com/ads/library/.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Search query (e.g. brand name, headline keyword, ad type)"
+          description: "Search query — keyword, headline, ad copy, or niche (e.g. 'checkout', 'SaaS onboarding', 'skincare'). Optional when company_name is provided."
+        },
+        source: {
+          type: "string",
+          enum: ["swipefile", "discovery"],
+          description: "Where to search. 'swipefile' (default) = user's own saved ads, free. 'discovery' = Foreplay's global database of millions of ads, costs 1 credit per result."
+        },
+        company_name: {
+          type: "string",
+          description: "Company or brand name to search ads for (e.g. 'Nike', 'Shopify'). Only used when source='discovery'. Can be combined with query."
         },
         max_results: {
           type: "number",
-          description: "Max results to return (default 5)",
+          description: "Max results to return. Default 5 for swipefile, 10 for discovery (max 20).",
           default: 5
+        },
+        format: {
+          type: "array",
+          items: { type: "string", enum: ["image", "video", "carousel", "dco"] },
+          description: "Filter by ad format. Only applies to source='discovery'."
+        },
+        platform: {
+          type: "array",
+          items: { type: "string", enum: ["facebook", "instagram"] },
+          description: "Filter by publisher platform. Only applies to source='discovery'."
+        },
+        niche: {
+          type: "array",
+          items: { type: "string" },
+          description: "Filter by niche tags (e.g. ['ecommerce', 'saas']). Only applies to source='discovery'."
+        },
+        live: {
+          type: "boolean",
+          description: "If true, return only currently-running ads. If false, return only stopped ads. Only applies to source='discovery'."
+        },
+        sort: {
+          type: "string",
+          enum: ["newest", "oldest", "longest_running"],
+          description: "Sort order. Only applies to source='discovery'."
         }
-      },
-      required: ["query"]
+      }
     }
   },
   execute: async (args: any, context?: any) => {
+    if (args.source === 'discovery') {
+      return await agentModeService.searchForeplayDiscovery(
+        args.query,
+        {
+          maxResults: args.max_results || 10,
+          companyName: args.company_name,
+          format: args.format,
+          platform: args.platform,
+          niche: args.niche,
+          live: args.live,
+          sort: args.sort,
+        },
+        context?.userId
+      );
+    }
     return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
   }
 });
