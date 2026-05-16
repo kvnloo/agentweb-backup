@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-16',
     changes: [
+      'Fixed: Agent Mode No Longer Incorrectly Offers Visual Context Tool',
+      '- In Agent Mode, Emma was occasionally calling get_visual_context (a page-screenshot tool) when asked about images, returning a useless "screenshot will be captured" response',
+      '- This tool is only meaningful when Emma is embedded in a specific portal page with a live browser context; it has no effect in standalone Agent Mode chat',
+      '- The tool is now fully excluded from Agent Mode sessions and cannot be called even if the model hallucinates the call from prior conversation history',
       'Fixed: LinkedIn Outreach No Longer Falsely Reports Invites as Sent When the Message Is Too Long',
       '- LinkedIn rejects connection-request notes longer than 300 characters with a "Too many characters" error',
       '- The assistant now validates message length before calling the API — messages over 300 chars are rejected immediately with a clear error',
