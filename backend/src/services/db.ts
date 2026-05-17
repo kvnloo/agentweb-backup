@@ -1403,7 +1403,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
