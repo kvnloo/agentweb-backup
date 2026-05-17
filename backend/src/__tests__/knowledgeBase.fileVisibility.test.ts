@@ -99,7 +99,7 @@ describe('Knowledge Base File Visibility', () => {
       expect(result[0].knowledgeBaseFiles).toHaveLength(1);
     });
 
-    it('should NOT return knowledge bases with zero size and no files', async () => {
+    it('should NOT return knowledge bases with zero size, no files, and no URL', async () => {
       const mockTasks = [
         {
           taskId: 'task-4',
@@ -116,6 +116,27 @@ describe('Knowledge Base File Visibility', () => {
       const result = await taskDb.getTasksWithKnowledgeBase(mockUserId);
 
       expect(result).toHaveLength(0);
+    });
+
+    it('should return knowledge bases with zero size but a knowledgeBase URL set (stale size metadata)', async () => {
+      const mockTasks = [
+        {
+          taskId: 'task-5',
+          userId: mockUserId,
+          name: 'KB with stale size=0 but valid URL',
+          knowledgeBaseSize: 0,
+          knowledgeBase: 'https://storage.googleapis.com/bucket/tasks/task-5/knowledge-base.txt',
+          knowledgeBaseFiles: [],
+          knowledgeBaseType: 'private',
+        },
+      ];
+
+      taskDb.getTasksByUserId = jest.fn().mockResolvedValue(mockTasks);
+
+      const result = await taskDb.getTasksWithKnowledgeBase(mockUserId);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].taskId).toBe('task-5');
     });
 
     it('should return multiple knowledge bases with different configurations', async () => {

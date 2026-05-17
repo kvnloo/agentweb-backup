@@ -9584,8 +9584,11 @@ Format the response as JSON with this structure:
       });
 
       // 5. Update task with KB metadata
+      // Use max(contentSize, 1) so that size=0 never silently excludes this KB from search results.
+      // The actual content is in GCS; size=0 is a stale-metadata bug, not an empty file.
+      const sizeToStore = Math.max(contentSize, 1);
       await taskDb.updateTask(taskId, {
-        knowledgeBaseSize: contentSize,
+        knowledgeBaseSize: sizeToStore,
         knowledgeBase: url,
         knowledgeBaseUpdatedAt: now
       });
@@ -9762,7 +9765,7 @@ Format the response as JSON with this structure:
 
       if (isMainKB) {
         await taskDb.updateTask(taskId, {
-          knowledgeBaseSize: finalSize,
+          knowledgeBaseSize: Math.max(finalSize, 1),
           knowledgeBase: url,
           knowledgeBaseUpdatedAt: now
         });
@@ -9786,7 +9789,7 @@ Format the response as JSON with this structure:
         const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
         await taskDb.updateTask(taskId, {
           knowledgeBaseFiles: kbFiles,
-          knowledgeBaseSize: totalSize,
+          knowledgeBaseSize: Math.max(totalSize, 1),
           knowledgeBaseUpdatedAt: now
         });
       }
@@ -9926,7 +9929,7 @@ Format the response as JSON with this structure:
       const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
       await taskDb.updateTask(taskId, {
         knowledgeBaseFiles: kbFiles,
-        knowledgeBaseSize: totalSize,
+        knowledgeBaseSize: Math.max(totalSize, 1),
         knowledgeBaseUpdatedAt: new Date().toISOString()
       });
 
@@ -14484,11 +14487,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return { success: false, message: 'Not authorized to access this knowledge base file' };
     }
 
-    // Default file size check
+    // Default file size check — skip if the KB has a URL set (size=0 can be stale metadata)
     const size = typeof task.knowledgeBaseSize === 'string'
       ? parseInt(task.knowledgeBaseSize)
       : task.knowledgeBaseSize || 0;
-    if (fileName === 'knowledge-base.txt' && size === 0) {
+    if (fileName === 'knowledge-base.txt' && size === 0 && !task.knowledgeBase) {
       return { success: false, message: `Knowledge base file "${fileName}" is empty or does not exist` };
     }
 
