@@ -75,6 +75,7 @@ import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
+import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
 import brandBuildRoutes from "./routes/brandBuild";
@@ -307,6 +308,7 @@ app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);
+app.use("/api/orgs/me/members", authenticateToken, orgMemberRemovalRoutes);
 app.use("/api/characters", charactersRoutes);
 
 
