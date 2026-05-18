@@ -31,7 +31,7 @@ Existing partial implementations (WorkPlans, Skills) use an **implicit, auto-sha
 - No changes to the Landing Page GitHub deployment model. LP repos live in the shared `AgentWebPro` GitHub org under a company token (`secretsManager.ts:396-418`), so there is no per-user GitHub auth barrier to remove.
 - No changes to the `visibility` field on WorkPlans and Skills. That field tracks the platform-wide marketplace pipeline (`private → pending_review → public → system`) and is orthogonal to org sharing.
 - No new shared/generic `AW-OrgShares` table or polymorphic ACL. Each entity carries its own share fields.
-- No async job infrastructure for the retroactive bulk update. Synchronous update with a 2000-item cap per flip.
+- No async job infrastructure for the retroactive bulk update. Synchronous update with a 10000-item cap per flip.
 - No GSI on `orgId` in v1. Initial implementation uses Scan + FilterExpression, matching the current WorkPlans pattern. GSI is a v2 upgrade if scale demands it.
 - No retroactive backfill of `orgId` onto items owned by users who never opt in. Items only get `orgId` stamped when a user creates them (current behavior) or when they flip a share toggle ON (new behavior, per §6.2).
 
@@ -289,12 +289,12 @@ User PATCHes `/api/users/me/share-defaults` with a new value for any of the 5 en
 
 **When `share` flips ON for entity type T:**
 1. Query the items owned by the user via the existing `UserIdIndex` (each of the 5 entities has one).
-2. If item count exceeds 2000, refuse with HTTP 400: `{ error: 'BULK_UPDATE_TOO_LARGE', count }` — user contacts support.
+2. If item count exceeds 10000, refuse with HTTP 400: `{ error: 'BULK_UPDATE_TOO_LARGE', count }` — user contacts support.
 3. For each item, issue an `UpdateItem` with:
    - `SET shareToOrg = :true`
    - `SET orgId = :userOrgId` (only if missing)
    - `SET coEditors = :defaultCoEditors`
-4. Run with concurrency 10. Wait for all to complete before responding.
+4. Run with concurrency 25. Wait for all to complete before responding.
 
 **When `share` flips OFF for entity type T:**
 1. Query as above.
@@ -308,13 +308,16 @@ User PATCHes `/api/users/me/share-defaults` with a new value for any of the 5 en
 
 ### 6.3 Safety
 
-- The bulk-update endpoint enforces the 2000-item cap before any writes.
+- The bulk-update endpoint enforces the 10000-item cap before any writes.
 - Each `UpdateItem` is independent; a partial failure leaves some items updated and some not. The endpoint returns `{ updated: N, failed: M, errors: [...] }`. UI shows a summary toast. Users can re-trigger the flip to retry failed items.
-- Concurrency is bounded (10 parallel `UpdateItem` calls) to avoid DDB throttling.
+- Concurrency is bounded (25 parallel `UpdateItem` calls) to avoid DDB throttling. At ~1250-2500 writes/sec sustained, this stays well within on-demand burst capacity for the tables in question.
+- The bulk-update endpoint requires a confirmation parameter (`confirm: true`) so a stray PATCH cannot accidentally rewrite thousands of items.
 
 ### 6.4 Why synchronous, not async
 
-DynamoDB has no SQL-style `UPDATE ... WHERE` (PartiQL `UPDATE` still requires a primary-key match). Bulk update is always N round-trips. For 200 items at ~20ms each with concurrency 10, total ≈ 400ms. For 2000 items, ≈ 4s. This is acceptable as a synchronous request. Async + job-status infrastructure is not justified for the expected workloads.
+DynamoDB has no SQL-style `UPDATE ... WHERE` (PartiQL `UPDATE` still requires a primary-key match). Bulk update is always N round-trips. For 200 items at ~20ms each with concurrency 25, total ≈ 200ms. For 10000 items, ≈ 8s. This is acceptable as a synchronous request for an infrequent settings change. Async + job-status infrastructure is not justified for the expected workloads.
+
+**HTTP timeout implications:** AWS Application Load Balancer default idle timeout is 60s; Elastic Beanstalk nginx default is 60s; the Express server has no global timeout. A worst-case 8-10s synchronous flip fits well within these limits. If we later see >60s response times for any reason, that signals async should be revisited.
 
 ## 7. WorkPlans + Skills Migration
 
@@ -414,7 +417,7 @@ For the bulk update flow, a `backend/src/__tests__/shareDefaultsBulkUpdate.test.
 7. Flipping `share: true` updates all owned items of that type to `shareToOrg = true` and backfills `orgId`.
 8. Flipping `share: false` updates all to `shareToOrg = false`.
 9. Updating co-editors propagates to all shared items of that type.
-10. User with >2000 items of a type receives 400 on flip; no writes occur.
+10. User with >10000 items of a type receives 400 on flip; no writes occur.
 11. Migration script (Step 1 of §7): existing WorkPlans with `orgId` get `shareToOrg = true`; those without `orgId` do not.
 
 For permission helpers (`orgShareService.ts`), a unit test file:
