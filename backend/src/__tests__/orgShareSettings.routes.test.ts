@@ -56,3 +56,55 @@ describe("GET /api/orgs/me/share-settings", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("PATCH /api/orgs/me/share-settings", () => {
+  const validBody = { shareSettings: sampleSettings };
+
+  it("rejects non-admin caller with 403", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "u-1", orgId: "org-1", orgRole: "member" });
+    mockGetOrgById.mockResolvedValueOnce({ orgId: "org-1", shareSettings: sampleSettings });
+    const res = await request(makeApp("u-1"))
+      .patch("/api/orgs/me/share-settings").send(validBody);
+    expect(res.status).toBe(403);
+    expect(mockUpdateShareSettings).not.toHaveBeenCalled();
+  });
+
+  it("accepts admin caller and writes", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "u-1", orgId: "org-1", orgRole: "owner" });
+    mockGetOrgById.mockResolvedValueOnce({ orgId: "org-1" });
+    mockGetOrgMembers.mockResolvedValueOnce([
+      { userId: "u-1" }, { userId: "u-2" },
+    ]);
+    mockUpdateShareSettings.mockResolvedValueOnce(undefined);
+
+    const res = await request(makeApp("u-1"))
+      .patch("/api/orgs/me/share-settings").send(validBody);
+    expect(res.status).toBe(200);
+    expect(mockUpdateShareSettings).toHaveBeenCalledWith("org-1", expect.any(Object));
+  });
+
+  it("rejects editors who are not org members with 400", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "u-1", orgId: "org-1", orgRole: "owner" });
+    mockGetOrgById.mockResolvedValueOnce({ orgId: "org-1" });
+    mockGetOrgMembers.mockResolvedValueOnce([{ userId: "u-1" }]);
+    const bad = {
+      shareSettings: {
+        ...sampleSettings,
+        htmlTemplates: { enabled: true, editors: ["u-not-in-org"] },
+      },
+    };
+    const res = await request(makeApp("u-1"))
+      .patch("/api/orgs/me/share-settings").send(bad);
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/editor/i);
+  });
+
+  it("rejects missing required feature key with 400", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "u-1", orgId: "org-1", orgRole: "owner" });
+    mockGetOrgById.mockResolvedValueOnce({ orgId: "org-1" });
+    const bad = { shareSettings: { ...sampleSettings, brandGuidelines: undefined } };
+    const res = await request(makeApp("u-1"))
+      .patch("/api/orgs/me/share-settings").send(bad);
+    expect(res.status).toBe(400);
+  });
+});
