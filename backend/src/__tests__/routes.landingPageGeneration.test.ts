@@ -45,12 +45,16 @@ jest.mock("../middleware/auth", () => ({
 
 // Mock db service
 const mockGetUserById = jest.fn();
+const mockGetOrgById = jest.fn();
 const mockGetLeadListById = jest.fn();
 const mockUpdateLeadList = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: mockGetUserById,
+  },
+  orgDb: {
+    getOrgById: mockGetOrgById,
   },
   crmDb: {
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
@@ -69,9 +73,14 @@ const mockGenerateLandingPage = jest.fn();
 const mockDeployLandingPage = jest.fn();
 const mockIterateLandingPage = jest.fn();
 const mockGetLandingPage = jest.fn();
+const mockGetLandingPageById = jest.fn();
+const mockGetLandingPagesByOwner = jest.fn();
+const mockGetLandingPagesByOrg = jest.fn();
 const mockListLandingPages = jest.fn();
 const mockDeleteLandingPage = jest.fn();
+const mockDeleteLandingPageByRecord = jest.fn();
 const mockUpdateLandingPageGtm = jest.fn();
+const mockUpdateLandingPageContext = jest.fn();
 const mockResolveVercelProjectId = jest.fn();
 const mockTriggerVercelDeployment = jest.fn();
 const mockGetProjectEnvVars = jest.fn();
@@ -83,9 +92,14 @@ jest.mock("../services/v0Service", () => ({
   deployLandingPage: (...args: any[]) => mockDeployLandingPage(...args),
   iterateLandingPage: (...args: any[]) => mockIterateLandingPage(...args),
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
+  getLandingPageById: (...args: any[]) => mockGetLandingPageById(...args),
+  getLandingPagesByOwner: (...args: any[]) => mockGetLandingPagesByOwner(...args),
+  getLandingPagesByOrg: (...args: any[]) => mockGetLandingPagesByOrg(...args),
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
+  deleteLandingPageByRecord: (...args: any[]) => mockDeleteLandingPageByRecord(...args),
   updateLandingPageGtm: (...args: any[]) => mockUpdateLandingPageGtm(...args),
+  updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
   getProjectEnvVars: (...args: any[]) => mockGetProjectEnvVars(...args),
@@ -132,7 +146,14 @@ app.use("/api/landing-pages/v0", landingPageGenerationRouter);
 beforeEach(() => {
   jest.clearAllMocks();
   mockGetUserById.mockResolvedValue(null);
+  mockGetOrgById.mockResolvedValue(null);
   mockListLandingPages.mockResolvedValue([]);
+  // New org-share functions — default to no-org (no fanout)
+  mockGetLandingPagesByOwner.mockResolvedValue([]);
+  mockGetLandingPagesByOrg.mockResolvedValue([]);
+  mockGetLandingPageById.mockResolvedValue(null);
+  mockDeleteLandingPageByRecord.mockResolvedValue(undefined);
+  mockUpdateLandingPageContext.mockResolvedValue(undefined);
   mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
   mockUpdateLandingPageGtm.mockResolvedValue(undefined);
@@ -452,8 +473,11 @@ describe("POST /api/landing-pages/v0/generated/:id/iterate", () => {
 // GET /generated
 // =============================================================================
 describe("GET /api/landing-pages/v0/generated", () => {
+  // The route now uses getLandingPagesByOwner (+ optional org fanout).
+  // getUserById returns null by default → no org → no fanout.
+
   it("SUCCESS: empty list → 200 { pages: [] }", async () => {
-    mockListLandingPages.mockResolvedValueOnce([]);
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([]);
 
     const res = await request(app).get("/api/landing-pages/v0/generated");
 
@@ -462,7 +486,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
   });
 
   it("SUCCESS: returns pages → 200", async () => {
-    mockListLandingPages.mockResolvedValueOnce([
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
       { id: "page-1", name: "Page 1" },
       { id: "page-2", name: "Page 2" },
     ]);
@@ -474,7 +498,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
   });
 
   it("FAIL: page with vercelProjectId but no customDomainUrl → enriched from AW-CustomDomains", async () => {
-    mockListLandingPages.mockResolvedValueOnce([
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
       { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
@@ -488,7 +512,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
   });
 
   it("FAIL: multiple domains for same project → uses most recent one", async () => {
-    mockListLandingPages.mockResolvedValueOnce([
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
       { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
@@ -503,7 +527,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
   });
 
   it("FAIL: page already has customDomainUrl → not overwritten by domain lookup", async () => {
-    mockListLandingPages.mockResolvedValueOnce([
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
       { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", customDomainUrl: "https://existing.agentwebforms.com", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
@@ -517,7 +541,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
   });
 
   it("FAIL: domain lookup fails → still returns pages without crash", async () => {
-    mockListLandingPages.mockResolvedValueOnce([
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
       { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
     ]);
     mockListDomainsForPages.mockRejectedValueOnce(new Error("DynamoDB error"));
@@ -530,7 +554,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
   });
 
   it("FAIL: page with no vercelProjectId → customDomainUrl not populated", async () => {
-    mockListLandingPages.mockResolvedValueOnce([
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
       { id: "page-1", name: "Page 1", status: "draft" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
@@ -577,9 +601,8 @@ describe("GET /api/landing-pages/v0/generated/:id", () => {
 // =============================================================================
 describe("DELETE /api/landing-pages/v0/generated/:id", () => {
   it("FAIL: not found → 404", async () => {
-    mockDeleteLandingPage.mockRejectedValueOnce(
-      new Error("Landing page not found")
-    );
+    // Route fetches via getLandingPageById first; null → 404
+    mockGetLandingPageById.mockResolvedValueOnce(null);
 
     const res = await request(app).delete(
       "/api/landing-pages/v0/generated/nonexistent"
@@ -588,8 +611,15 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
     expect(res.status).toBe(404);
   });
 
-  it("SUCCESS: deleted → 200 { success: true }", async () => {
-    mockDeleteLandingPage.mockResolvedValueOnce(undefined);
+  it("SUCCESS: owner deletes own page → 200 { success: true }", async () => {
+    // Page belongs to the authenticated test user ("test-user-id")
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "My Page",
+      status: "draft",
+    });
+    mockDeleteLandingPageByRecord.mockResolvedValueOnce(undefined);
 
     const res = await request(app).delete(
       "/api/landing-pages/v0/generated/page-1"

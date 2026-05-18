@@ -4,7 +4,7 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
-import { userDb } from "./db";
+import { userDb, orgDb } from "./db";
 import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
@@ -2363,6 +2363,84 @@ export async function updateLandingPageContext(
       ExpressionAttributeValues: {
         ":ctx": context,
         ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * Get all (non-archived) landing pages for a specific owner.
+ * Uses UserIdIndex GSI on AW-LandingPages.
+ */
+export async function getLandingPagesByOwner(userId: string): Promise<GeneratedLandingPage[]> {
+  return await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :u",
+    FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
+    ExpressionAttributeValues: {
+      ":u": userId,
+      ":archivedFalse": false,
+    },
+    ScanIndexForward: false,
+  });
+}
+
+/**
+ * Get all landing pages visible to org members (fanout).
+ * Returns pages owned by all other org members (caller excluded).
+ */
+export async function getLandingPagesByOrg(orgId: string, callerUserId: string): Promise<GeneratedLandingPage[]> {
+  const members = await orgDb.getOrgMembers(orgId);
+  const others = members.map((m) => m.userId).filter((uid) => uid !== callerUserId);
+  const perMember = await Promise.all(others.map((uid) => getLandingPagesByOwner(uid)));
+  return perMember.flat();
+}
+
+/**
+ * Get a landing page by ID without scoping to a specific user (for org-share permission checks).
+ */
+export async function getLandingPageById(id: string): Promise<GeneratedLandingPage | null> {
+  const result = await dynamodb
+    .get({
+      TableName: TABLE_NAME,
+      Key: { id },
+    })
+    .promise();
+  const item = result.Item as GeneratedLandingPage | undefined;
+  if (!item || item.archived) return null;
+  return item;
+}
+
+/**
+ * Delete a landing page given an already-fetched record (for org-share flows where
+ * the caller may not be the owner). Enforces root-page guard.
+ */
+export async function deleteLandingPageByRecord(record: GeneratedLandingPage): Promise<void> {
+  if (record.isRootPage && record.githubRepoUrl) {
+    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
+  }
+  if (record.isRootPage && record.status !== "failed") {
+    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
+  }
+
+  if (record.githubRepoUrl && record.slug) {
+    try {
+      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+    } catch (err: any) {
+      console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+    }
+  }
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id: record.id },
+      UpdateExpression: "SET archived = :archived, archivedAt = :archivedAt, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":archived": true,
+        ":archivedAt": new Date().toISOString(),
+        ":updatedAt": new Date().toISOString(),
       },
     })
     .promise();

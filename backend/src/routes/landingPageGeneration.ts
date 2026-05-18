@@ -2,14 +2,18 @@ import { Router, Request, Response, NextFunction } from "express";
 import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { settingsService } from "../services/settingsService";
-import { userDb, crmDb } from "../services/db";
+import { userDb, orgDb, crmDb } from "../services/db";
 import {
   generateLandingPage,
   deployLandingPage,
   iterateLandingPage,
   getLandingPage,
+  getLandingPageById,
+  getLandingPagesByOwner,
+  getLandingPagesByOrg,
   listLandingPages,
   deleteLandingPage,
+  deleteLandingPageByRecord,
   updateLandingPageGtm,
   BrandContext,
   getDeploymentStatus,
@@ -23,6 +27,7 @@ import {
   updateLandingPageContext,
   INTEGRATIONS,
 } from "../services/v0Service";
+import { canEditItem } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
 const router = Router();
@@ -350,7 +355,7 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
 
 /**
  * GET /api/landing-pages/v0/generated
- * List all generated landing pages for the current user
+ * List all generated landing pages for the current user, plus org members' pages when enabled.
  */
 router.get("/generated", async (req, res: Response) => {
   try {
@@ -359,7 +364,22 @@ router.get("/generated", async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const pages = await listLandingPages(userId);
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+    const org = orgId ? await orgDb.getOrgById(orgId) : null;
+    const lpEnabled = org?.shareSettings?.landingPages?.enabled === true;
+
+    const [ownPages, orgPages] = await Promise.all([
+      getLandingPagesByOwner(userId),
+      (orgId && lpEnabled) ? getLandingPagesByOrg(orgId, userId) : Promise.resolve([]),
+    ]);
+
+    const seen = new Set<string>();
+    const pages = [...ownPages, ...orgPages].filter((p) => {
+      if (seen.has(p.id)) return false;
+      seen.add(p.id);
+      return true;
+    });
 
     // Enrich pages that have a vercelProjectId but no customDomainUrl saved,
     // by looking up the most recent active domain in AW-CustomDomains.
@@ -421,7 +441,9 @@ router.get("/generated/:id", async (req, res: Response) => {
 
 /**
  * DELETE /api/landing-pages/v0/generated/:id
- * Delete a generated landing page record
+ * Delete a generated landing page record.
+ * Caller must be the page owner OR an org owner (orgRole === "owner").
+ * Editors in shareSettings.landingPages.editors may NOT delete.
  */
 router.delete("/generated/:id", async (req, res: Response) => {
   try {
@@ -430,7 +452,26 @@ router.delete("/generated/:id", async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    await deleteLandingPage(req.params.id, userId);
+    const page = await getLandingPageById(req.params.id);
+    if (!page) {
+      return res.status(404).json({ error: "Landing page not found" });
+    }
+
+    // Owner can always delete their own page; org owner (orgRole === "owner") can also delete
+    if (page.userId !== userId) {
+      const [user, pageOwner] = await Promise.all([
+        userDb.getUserById(userId),
+        userDb.getUserById(page.userId),
+      ]);
+      const ownerOrgId = pageOwner?.orgId;
+      const callerOrgId = user?.orgId;
+      // Must be in same org AND be an org owner to delete another member's page
+      if (!callerOrgId || !ownerOrgId || callerOrgId !== ownerOrgId || user?.orgRole !== "owner") {
+        return res.status(403).json({ error: "Not authorized to delete this landing page" });
+      }
+    }
+
+    await deleteLandingPageByRecord(page);
     res.json({ success: true });
   } catch (error: any) {
     console.error("[LP GENERATION] Error deleting page:", error);
@@ -1367,6 +1408,7 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
  * PATCH /api/landing-pages/v0/generated/:id/context
  * Save a plain-text context/brief describing when and how to use this landing page.
  * Body: { context: string }
+ * Allowed for: page owner, org editors listed in shareSettings.landingPages.editors, org owners.
  */
 router.patch("/generated/:id/context", authenticateToken, async (req, res: Response) => {
   try {
@@ -1381,7 +1423,28 @@ router.patch("/generated/:id/context", authenticateToken, async (req, res: Respo
       return res.status(400).json({ error: "context must not exceed 500 characters" });
     }
 
-    await updateLandingPageContext(req.params.id, userId, context.trim());
+    // Fetch page without user scoping to allow org-share editors
+    const page = await getLandingPageById(req.params.id);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+
+    if (page.userId !== userId) {
+      const [user, pageOwner] = await Promise.all([
+        userDb.getUserById(userId),
+        userDb.getUserById(page.userId),
+      ]);
+      const ownerOrgId = pageOwner?.orgId;
+      const org = (user?.orgId && user.orgId === ownerOrgId) ? await orgDb.getOrgById(user.orgId) : null;
+      const allowed = canEditItem(
+        { userId: page.userId },
+        { userId, orgId: user?.orgId, orgRole: user?.orgRole },
+        org,
+        ownerOrgId,
+        "landingPages"
+      );
+      if (!allowed) return res.status(403).json({ error: "Not authorized to edit this landing page" });
+    }
+
+    await updateLandingPageContext(req.params.id, page.userId, context.trim());
     res.json({ success: true });
   } catch (error: any) {
     console.error("[LP GENERATION] Error updating context:", error);
