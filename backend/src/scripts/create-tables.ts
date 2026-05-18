@@ -1990,6 +1990,7 @@ const main = async () => {
     await createEnrichmentHistoryTable();
     await createEnrichmentRawCacheTable();
     await createCharactersTable();
+    await createHtmlTemplatesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2427,6 +2428,46 @@ const createCharactersTable = async () => {
         Projection: {
           ProjectionType: 'ALL',
         },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createHtmlTemplatesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-HtmlTemplates`,
+    KeySchema: [{ AttributeName: 'templateId', KeyType: 'HASH' }],
+    AttributeDefinitions: [
+      { AttributeName: 'templateId', AttributeType: 'S' },
+      { AttributeName: 'userId',     AttributeType: 'S' },
+      { AttributeName: 'isPublic',   AttributeType: 'S' },
+      { AttributeName: 'createdAt',  AttributeType: 'S' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId',    KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'IsPublicIndex',
+        KeySchema: [{ AttributeName: 'isPublic', KeyType: 'HASH' }],
+        Projection: { ProjectionType: 'ALL' },
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
