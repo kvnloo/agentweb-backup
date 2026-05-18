@@ -2,6 +2,7 @@ import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
+import { canEditItem } from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -90,7 +91,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Update own private plan
+// Update own private plan (or org editor updating another member's plan)
 router.put("/:planId", async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -98,9 +99,24 @@ router.put("/:planId", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(planId);
 
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
-    if (plan.ownerId !== userId) return res.status(403).json({ message: "Not authorized" });
     if (plan.visibility !== 'private') {
       return res.status(403).json({ message: "Cannot edit plans that are public or pending review" });
+    }
+
+    // Resolve caller's user record and org context for permission check
+    const callerUser = await userDb.getUserById(userId);
+    const callerOrgId = callerUser?.orgId;
+    const ownerUser = plan.ownerId && plan.ownerId !== userId
+      ? await userDb.getUserById(plan.ownerId)
+      : null;
+    const ownerOrgId = plan.ownerId === userId ? callerOrgId : ownerUser?.orgId;
+    const org = callerOrgId ? await orgDb.getOrgById(callerOrgId) : null;
+
+    const callerUserLike = { userId, orgId: callerOrgId, orgRole: callerUser?.orgRole as "owner" | "member" | undefined };
+    const planItemLike = { userId: plan.ownerId };
+
+    if (!canEditItem(planItemLike, callerUserLike, org, ownerOrgId, "workPlans")) {
+      return res.status(403).json({ message: "Not authorized" });
     }
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, defaultModel } = req.body;
@@ -123,7 +139,7 @@ router.put("/:planId", async (req, res) => {
   }
 });
 
-// Delete own private plan
+// Delete own private plan (owner or org owner/admin only; editors cannot delete)
 router.delete("/:planId", async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -131,10 +147,20 @@ router.delete("/:planId", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(planId);
 
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
-    if (plan.ownerId !== userId) return res.status(403).json({ message: "Not authorized" });
     if (plan.visibility !== 'private') {
       return res.status(403).json({ message: "Cannot delete plans that are public or pending review" });
     }
+
+    // Only the plan owner or an org owner (admin override) may delete
+    let allowed = plan.ownerId === userId;
+    if (!allowed && plan.ownerId) {
+      const callerUser = await userDb.getUserById(userId);
+      if (callerUser?.orgRole === "owner" && callerUser?.orgId) {
+        const owner = await userDb.getUserById(plan.ownerId);
+        if (owner?.orgId === callerUser.orgId) allowed = true;
+      }
+    }
+    if (!allowed) return res.status(403).json({ message: "Not authorized" });
 
     await workPlanService.deleteWorkPlan(planId);
     res.json({ message: "Work plan deleted successfully" });
