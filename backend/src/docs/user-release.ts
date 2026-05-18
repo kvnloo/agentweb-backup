@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-19',
+    changes: [
+      'Org-wide sharing for KB, Templates, Landing Pages, Work Plans, and Skills',
+      '- Org admins can now decide which features are shared with their organization via Settings → Org Sharing',
+      '- Five feature areas are toggleable: Knowledge Bases, HTML Templates, Landing Pages, Work Plans, and Skills',
+      '- Brand Guidelines and Marketing Strategy remain always shared with the org; admins can now grant edit access to specific members',
+      '- Each feature has a per-feature editor list — designated members can edit shared items even if they don\'t own them',
+      '- When a member is removed from an org, the admin chooses per feature whether to transfer items, delete them, or leave them with the departing member',
+    ],
+  },
+  {
     date: '2026-05-17',
     changes: [
       'Fixed: Knowledge Bases with Content Were Not Appearing in the Knowledge Base Page',
