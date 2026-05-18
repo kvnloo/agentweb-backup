@@ -1,6 +1,7 @@
 import {
   canViewItem, canEditItem, isAlwaysOnFeature,
   Feature,
+  listOrgVisibleItems, MEMBER_FANOUT_CAP,
 } from "../services/orgShareService";
 import type { Organization } from "../services/db";
 
@@ -85,5 +86,66 @@ describe("isAlwaysOnFeature", () => {
   it("classifies the five toggleable features", () => {
     (["knowledgeBase","htmlTemplates","landingPages","workPlans","skills"] as Feature[])
       .forEach(f => expect(isAlwaysOnFeature(f)).toBe(false));
+  });
+});
+
+describe("listOrgVisibleItems", () => {
+  it("returns only ownItems when feature is disabled", async () => {
+    const result = await listOrgVisibleItems({
+      callerUserId: "u-1",
+      orgId: "org-1",
+      featureEnabled: false,
+      getOwnerItems: async () => [{ id: "a", userId: "u-1" }],
+      getMemberIds:  async () => ["u-1", "u-2"],
+      getItemsForOwner: async () => [{ id: "x", userId: "u-2" }],
+      getId: (i: any) => i.id,
+    });
+    expect(result.items.map((i: any) => i.id)).toEqual(["a"]);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("merges own + each other member's items when enabled", async () => {
+    const ownItems    = [{ id: "a", userId: "u-1" }];
+    const otherItems  = {
+      "u-2": [{ id: "b", userId: "u-2" }, { id: "c", userId: "u-2" }],
+      "u-3": [{ id: "d", userId: "u-3" }],
+    };
+    const result = await listOrgVisibleItems({
+      callerUserId: "u-1",
+      orgId: "org-1",
+      featureEnabled: true,
+      getOwnerItems: async () => ownItems,
+      getMemberIds:  async () => ["u-1", "u-2", "u-3"],
+      getItemsForOwner: async (uid: string) => (otherItems as any)[uid] || [],
+      getId: (i: any) => i.id,
+    });
+    expect(result.items.map((i: any) => i.id).sort()).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("dedupes by id (own item also present in org list)", async () => {
+    const result = await listOrgVisibleItems({
+      callerUserId: "u-1",
+      orgId: "org-1",
+      featureEnabled: true,
+      getOwnerItems: async () => [{ id: "a", userId: "u-1" }],
+      getMemberIds:  async () => ["u-1", "u-2"],
+      getItemsForOwner: async () => [{ id: "a", userId: "u-1" }],
+      getId: (i: any) => i.id,
+    });
+    expect(result.items).toHaveLength(1);
+  });
+
+  it("caps member fanout and flags truncated when over MEMBER_FANOUT_CAP", async () => {
+    const many = Array.from({ length: MEMBER_FANOUT_CAP + 5 }, (_, i) => `u-${i}`);
+    const result = await listOrgVisibleItems({
+      callerUserId: "u-x",
+      orgId: "org-1",
+      featureEnabled: true,
+      getOwnerItems: async () => [],
+      getMemberIds:  async () => many,
+      getItemsForOwner: async () => [],
+      getId: (i: any) => i.id,
+    });
+    expect(result.truncated).toBe(true);
   });
 });

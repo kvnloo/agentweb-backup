@@ -53,3 +53,39 @@ export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
 export const ALWAYS_ON_FEATURES: ReadonlyArray<AlwaysOnFeature> = [
   "brandGuidelines", "marketingStrategy",
 ];
+
+export interface ListOrgVisibleArgs<T> {
+  callerUserId: string;
+  orgId: string;
+  featureEnabled: boolean;
+  getOwnerItems: () => Promise<T[]>;
+  getMemberIds:  () => Promise<string[]>;
+  getItemsForOwner: (ownerUserId: string) => Promise<T[]>;
+  getId: (item: T) => string;
+}
+
+export interface ListOrgVisibleResult<T> { items: T[]; truncated: boolean; }
+
+export async function listOrgVisibleItems<T>(args: ListOrgVisibleArgs<T>): Promise<ListOrgVisibleResult<T>> {
+  const own = await args.getOwnerItems();
+  if (!args.featureEnabled) {
+    return { items: own.slice(0, RESPONSE_CAP), truncated: own.length >= PER_SOURCE_CAP };
+  }
+  const allMembers = await args.getMemberIds();
+  const others = allMembers.filter(uid => uid !== args.callerUserId);
+  const truncatedFanout = others.length > MEMBER_FANOUT_CAP;
+  const fanoutTargets = truncatedFanout ? others.slice(0, MEMBER_FANOUT_CAP) : others;
+  const perMember = await Promise.all(fanoutTargets.map(args.getItemsForOwner));
+  const orgItems = perMember.flat();
+  const truncatedItems = orgItems.length >= ORG_ITEMS_CAP || own.length >= PER_SOURCE_CAP;
+  const seen = new Set<string>();
+  const merged: T[] = [];
+  for (const i of [...own, ...orgItems.slice(0, ORG_ITEMS_CAP)]) {
+    const k = args.getId(i);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    merged.push(i);
+    if (merged.length >= RESPONSE_CAP) break;
+  }
+  return { items: merged, truncated: truncatedFanout || truncatedItems };
+}
