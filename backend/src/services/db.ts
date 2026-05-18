@@ -1403,7 +1403,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -2127,12 +2127,15 @@ export const taskDb = {
       }
 
       // Filter tasks with non-empty knowledge base (either main content OR files)
+      // Also include tasks that have a knowledgeBase URL set even if size=0
+      // (size can be incorrectly 0 due to a race condition or update failure)
       const tasksWithKnowledgeBase = tasks.filter((task: any) => {
         const size = typeof task.knowledgeBaseSize === 'string'
           ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
+        const hasKnowledgeBaseUrl = !!task.knowledgeBase;
         const hasFiles = task.knowledgeBaseFiles && task.knowledgeBaseFiles.length > 0;
-        return size > 0 || hasFiles;
+        return size > 0 || hasKnowledgeBaseUrl || hasFiles;
       });
 
       // Map to return standardized fields

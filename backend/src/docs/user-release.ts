@@ -18,6 +18,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-17',
+    changes: [
+      'Fixed: Knowledge Bases with Content Were Not Appearing in the Knowledge Base Page',
+      '- Knowledge bases whose content was saved correctly but had a size of 0 recorded in the database were not showing up in the Knowledge Base page',
+      '- This affected knowledge bases that were created or updated in sessions where the size metadata was not written — the content existed in storage but the listing logic filtered them out',
+      '- Affected knowledge bases are now visible and fully accessible again',
+      '- New saves now always record a size of at least 1, preventing this from recurring',
+    ],
+  },
+  {
     date: '2026-05-16',
     changes: [
       'Landing Pages: Context Field for "When to Use" Notes',
