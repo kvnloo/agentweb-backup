@@ -2,7 +2,7 @@ import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
-import { canEditItem } from "../services/orgShareService";
+import { canEditItem, listOrgVisibleItems } from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -13,21 +13,31 @@ router.get("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
     const org = orgId ? await orgDb.getOrgById(orgId) : null;
-    const wpEnabled = org?.shareSettings?.workPlans?.enabled === true;
+    const enabled = org?.shareSettings?.workPlans?.enabled === true;
 
-    const [ownPlans, publicPlans, orgPlans] = await Promise.all([
+    const [ownPlans, publicPlans, fanout] = await Promise.all([
       workPlanService.getWorkPlansByOwner(userId),
       workPlanService.getPublicPlansForAgentMode(),
-      (orgId && wpEnabled) ? workPlanService.getWorkPlansByOrg(orgId, userId) : Promise.resolve([] as WorkPlan[]),
+      orgId
+        ? listOrgVisibleItems({
+            callerUserId: userId,
+            orgId,
+            featureEnabled: enabled,
+            getOwnerItems: async () => [],
+            getMemberIds:  async () => (await orgDb.getOrgMembers(orgId)).map((m: any) => m.userId),
+            getItemsForOwner: (uid: string) => workPlanService.getWorkPlansByOwner(uid),
+            getId: (p: any) => p.planId,
+          })
+        : Promise.resolve({ items: [] as WorkPlan[], truncated: false }),
     ]);
 
     const seen = new Set<string>();
-    const all = [...ownPlans, ...orgPlans, ...publicPlans].filter(p => {
+    const all = [...ownPlans, ...fanout.items, ...publicPlans].filter(p => {
       if (seen.has(p.planId)) return false;
       seen.add(p.planId);
       return true;
     });
-    res.json({ items: all, truncated: false });
+    res.json({ items: all, truncated: fanout.truncated });
   } catch (error) {
     console.error("Error fetching user work plans:", error);
     res.status(500).json({ message: "Failed to fetch work plans" });

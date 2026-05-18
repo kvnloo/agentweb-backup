@@ -76,9 +76,10 @@ jest.mock("../services/emailService", () => ({
 
 const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
+const mockGetOrgMembers = jest.fn();
 jest.mock("../services/db", () => ({
   userDb: { getUserById: mockGetUserById },
-  orgDb: { getOrgById: mockGetOrgById },
+  orgDb: { getOrgById: mockGetOrgById, getOrgMembers: mockGetOrgMembers },
 }));
 
 jest.mock("../middleware/auth", () => ({
@@ -95,10 +96,17 @@ const app = express();
 app.use(express.json());
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
 
+import { MEMBER_FANOUT_CAP } from "../services/orgShareService";
+
 describe("GET /api/user-work-plans — org sharing", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetPublicPlansForAgentMode.mockResolvedValue([]);
+    // Default: org has only two members (user-1 and user-2)
+    mockGetOrgMembers.mockResolvedValue([
+      { userId: mockUserId },
+      { userId: mockOrgMemberId },
+    ]);
   });
 
   it("includes org members' private plans when user is in an org with workPlans enabled", async () => {
@@ -108,9 +116,12 @@ describe("GET /api/user-work-plans — org sharing", () => {
       orgId: mockOrgId,
       shareSettings: { workPlans: { enabled: true } },
     });
-    mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    // fanout excludes caller — only memberPlan returned by getWorkPlansByOrg
-    mockGetWorkPlansByOrg.mockResolvedValue([memberPlan]);
+    // getWorkPlansByOwner called for user-1 (own) and user-2 (fanout)
+    mockGetWorkPlansByOwner.mockImplementation((uid: string) => {
+      if (uid === mockUserId) return Promise.resolve([myPlan]);
+      if (uid === mockOrgMemberId) return Promise.resolve([memberPlan]);
+      return Promise.resolve([]);
+    });
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
@@ -125,8 +136,11 @@ describe("GET /api/user-work-plans — org sharing", () => {
       orgId: mockOrgId,
       shareSettings: { workPlans: { enabled: true } },
     });
-    mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    mockGetWorkPlansByOrg.mockResolvedValue([memberPlan]);
+    mockGetWorkPlansByOwner.mockImplementation((uid: string) => {
+      if (uid === mockUserId) return Promise.resolve([myPlan]);
+      if (uid === mockOrgMemberId) return Promise.resolve([memberPlan]);
+      return Promise.resolve([]);
+    });
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
@@ -147,15 +161,18 @@ describe("GET /api/user-work-plans — org sharing", () => {
     expect(mockGetOrgById).not.toHaveBeenCalled();
   });
 
-  it("deduplicates plans that appear in both own and org results", async () => {
+  it("deduplicates plans that appear in both own and fanout results", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
     mockGetOrgById.mockResolvedValue({
       orgId: mockOrgId,
       shareSettings: { workPlans: { enabled: true } },
     });
-    mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    // Simulate a case where getWorkPlansByOrg somehow also returns myPlan
-    mockGetWorkPlansByOrg.mockResolvedValue([myPlan, memberPlan]);
+    // getWorkPlansByOwner for user-1 returns myPlan; fanout (user-2) also returns myPlan + memberPlan
+    mockGetWorkPlansByOwner.mockImplementation((uid: string) => {
+      if (uid === mockUserId) return Promise.resolve([myPlan]);
+      if (uid === mockOrgMemberId) return Promise.resolve([myPlan, memberPlan]);
+      return Promise.resolve([]);
+    });
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
@@ -189,14 +206,40 @@ describe("GET /api/user-work-plans — org sharing", () => {
       orgId: mockOrgId,
       shareSettings: { workPlans: { enabled: true } },
     });
-    mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    mockGetWorkPlansByOrg.mockResolvedValue([memberPlan]);
+    mockGetWorkPlansByOwner.mockImplementation((uid: string) => {
+      if (uid === mockUserId) return Promise.resolve([myPlan]);
+      if (uid === mockOrgMemberId) return Promise.resolve([memberPlan]);
+      return Promise.resolve([]);
+    });
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("items");
     expect(res.body).toHaveProperty("truncated", false);
     expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it("sets truncated=true when org has more than MEMBER_FANOUT_CAP members", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: true } },
+    });
+    // Create MEMBER_FANOUT_CAP + 1 member IDs (excluding the caller)
+    const manyMembers = Array.from({ length: MEMBER_FANOUT_CAP + 1 }, (_, i) => ({
+      userId: `member-${i}`,
+    }));
+    // Include caller in members list so the helper can filter them out
+    mockGetOrgMembers.mockResolvedValue([{ userId: mockUserId }, ...manyMembers]);
+    // Only own plans returned for the caller
+    mockGetWorkPlansByOwner.mockImplementation((uid: string) => {
+      if (uid === mockUserId) return Promise.resolve([myPlan]);
+      return Promise.resolve([]);
+    });
+
+    const res = await request(app).get("/api/user-work-plans");
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("truncated", true);
   });
 });
 
