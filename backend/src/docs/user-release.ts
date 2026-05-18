@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-18',
+    changes: [
+      'Fixed: CRM Lead Enrichment and Field Edits Now Work for All Leads',
+      '- A subset of leads imported before a data-quality fix had empty strings stored for email, LinkedIn URL, or name+company key fields',
+      '- DynamoDB rejected any write to these leads — silently blocking enrichment updates and CRM field edits',
+      '- All affected leads (~158k) have been repaired; enrichment and manual edits now work correctly across the entire CRM',
+    ],
+  },
+  {
     date: '2026-05-16',
     changes: [
       'Landing Pages: Context Field for "When to Use" Notes',
