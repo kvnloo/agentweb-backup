@@ -1,7 +1,8 @@
 import express from "express";
-import { skillService } from "../services/skillService";
+import { skillService, Skill } from "../services/skillService";
 import { emailService } from "../services/emailService";
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
+import { canEditItem } from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -11,12 +12,14 @@ router.get("/", async (req, res) => {
     const { userId } = (req as any).user;
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
+    const org = orgId ? await orgDb.getOrgById(orgId) : null;
+    const skillsEnabled = org?.shareSettings?.skills?.enabled === true;
 
     const [ownSkills, publicSkills, systemSkills, orgSkills] = await Promise.all([
       skillService.getSkillsByOwner(userId),
       skillService.getSkillsByVisibility('public'),
       skillService.getSkillsByVisibility('system'),
-      orgId ? skillService.getSkillsByOrg(orgId) : Promise.resolve([]),
+      (orgId && skillsEnabled) ? skillService.getSkillsByOrg(orgId, userId) : Promise.resolve([] as Skill[]),
     ]);
 
     const seen = new Set<string>();
@@ -25,7 +28,7 @@ router.get("/", async (req, res) => {
       seen.add(s.skillId);
       return true;
     });
-    res.json(all);
+    res.json({ items: all, truncated: false });
   } catch (error) {
     console.error("Error fetching user skills:", error);
     res.status(500).json({ message: "Failed to fetch skills" });
@@ -79,7 +82,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Update own private skill
+// Update own private skill (or org editor updating another member's skill)
 router.put("/:skillId", async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -87,7 +90,23 @@ router.put("/:skillId", async (req, res) => {
     const skill = await skillService.getSkill(skillId);
 
     if (!skill) return res.status(404).json({ message: "Skill not found" });
-    if (skill.ownerId !== userId) return res.status(403).json({ message: "Not authorized" });
+
+    // Resolve caller's user record and org context for permission check
+    const callerUser = await userDb.getUserById(userId);
+    const callerOrgId = callerUser?.orgId;
+    const ownerUser = skill.ownerId && skill.ownerId !== userId
+      ? await userDb.getUserById(skill.ownerId)
+      : null;
+    const ownerOrgId = skill.ownerId === userId ? callerOrgId : ownerUser?.orgId;
+    const org = callerOrgId ? await orgDb.getOrgById(callerOrgId) : null;
+
+    const callerUserLike = { userId, orgId: callerOrgId, orgRole: callerUser?.orgRole as "owner" | "member" | undefined };
+    const skillItemLike = { userId: skill.ownerId };
+
+    if (!canEditItem(skillItemLike, callerUserLike, org, ownerOrgId, "skills")) {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+
     if (skill.visibility !== 'private') {
       return res.status(403).json({ message: "Cannot edit skills that are public or pending review" });
     }
@@ -108,7 +127,7 @@ router.put("/:skillId", async (req, res) => {
   }
 });
 
-// Delete own private skill
+// Delete own private skill (owner or org owner/admin only; editors cannot delete)
 router.delete("/:skillId", async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -116,7 +135,15 @@ router.delete("/:skillId", async (req, res) => {
     const skill = await skillService.getSkill(skillId);
 
     if (!skill) return res.status(404).json({ message: "Skill not found" });
-    if (skill.ownerId !== userId) return res.status(403).json({ message: "Not authorized" });
+
+    // Only the skill owner or an org owner (admin override) may delete
+    if (skill.ownerId !== userId) {
+      const callerUser = await userDb.getUserById(userId);
+      if (callerUser?.orgRole !== "owner") {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+    }
+
     if (skill.visibility !== 'private') {
       return res.status(403).json({ message: "Cannot delete skills that are public or pending review" });
     }
