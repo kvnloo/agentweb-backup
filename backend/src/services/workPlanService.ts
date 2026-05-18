@@ -153,13 +153,12 @@ export class WorkPlanService {
     return (result.Items as WorkPlan[]) || [];
   }
 
-  async getWorkPlansByOrg(orgId: string): Promise<WorkPlan[]> {
-    const result = await dynamodb.scan({
-      TableName: this.tableName,
-      FilterExpression: 'orgId = :orgId',
-      ExpressionAttributeValues: { ':orgId': orgId },
-    }).promise();
-    return (result.Items as WorkPlan[]) || [];
+  async getWorkPlansByOrg(orgId: string, callerUserId: string = ""): Promise<WorkPlan[]> {
+    const { orgDb } = await import("./db");
+    const members = await orgDb.getOrgMembers(orgId);
+    const others = members.map((m: { userId: string }) => m.userId).filter((uid: string) => uid !== callerUserId);
+    const perMember = await Promise.all(others.map((uid: string) => this.getWorkPlansByOwner(uid)));
+    return perMember.flat();
   }
 
   async getWorkPlansByVisibility(visibility: WorkPlanVisibility): Promise<WorkPlan[]> {

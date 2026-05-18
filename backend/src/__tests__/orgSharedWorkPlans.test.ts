@@ -75,8 +75,10 @@ jest.mock("../services/emailService", () => ({
 }));
 
 const mockGetUserById = jest.fn();
+const mockGetOrgById = jest.fn();
 jest.mock("../services/db", () => ({
   userDb: { getUserById: mockGetUserById },
+  orgDb: { getOrgById: mockGetOrgById },
 }));
 
 jest.mock("../middleware/auth", () => ({
@@ -99,27 +101,36 @@ describe("GET /api/user-work-plans — org sharing", () => {
     mockGetPublicPlansForAgentMode.mockResolvedValue([]);
   });
 
-  it("includes org members' private plans when user is in an org", async () => {
-    // user-1 is in org-abc
+  it("includes org members' private plans when user is in an org with workPlans enabled", async () => {
+    // user-1 is in org-abc, shareSettings.workPlans.enabled = true
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: true } },
+    });
     mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    mockGetWorkPlansByOrg.mockResolvedValue([myPlan, memberPlan]);
+    // fanout excludes caller — only memberPlan returned by getWorkPlansByOrg
+    mockGetWorkPlansByOrg.mockResolvedValue([memberPlan]);
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
-    const ids = res.body.map((p: any) => p.planId);
+    const ids = res.body.items.map((p: any) => p.planId);
     expect(ids).toContain("plan-1");
     expect(ids).toContain("plan-2");
   });
 
   it("does NOT include plans from outside the org", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: true } },
+    });
     mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    mockGetWorkPlansByOrg.mockResolvedValue([myPlan, memberPlan]);
+    mockGetWorkPlansByOrg.mockResolvedValue([memberPlan]);
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
-    const ids = res.body.map((p: any) => p.planId);
+    const ids = res.body.items.map((p: any) => p.planId);
     expect(ids).not.toContain("plan-3");
   });
 
@@ -129,21 +140,63 @@ describe("GET /api/user-work-plans — org sharing", () => {
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
-    const ids = res.body.map((p: any) => p.planId);
+    const ids = res.body.items.map((p: any) => p.planId);
     expect(ids).toContain("plan-1");
     expect(ids).not.toContain("plan-2");
+    // getOrgById should NOT be called when there is no orgId
+    expect(mockGetOrgById).not.toHaveBeenCalled();
   });
 
   it("deduplicates plans that appear in both own and org results", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: true } },
+    });
     mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
-    mockGetWorkPlansByOrg.mockResolvedValue([myPlan, memberPlan]); // myPlan appears in both
+    // Simulate a case where getWorkPlansByOrg somehow also returns myPlan
+    mockGetWorkPlansByOrg.mockResolvedValue([myPlan, memberPlan]);
 
     const res = await request(app).get("/api/user-work-plans");
     expect(res.status).toBe(200);
-    const ids = res.body.map((p: any) => p.planId);
+    const ids = res.body.items.map((p: any) => p.planId);
     const plan1Occurrences = ids.filter((id: string) => id === "plan-1").length;
     expect(plan1Occurrences).toBe(1);
+  });
+
+  it("list excludes other-member plans when shareSettings.workPlans.enabled is false", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: false } },
+    });
+    mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
+
+    const res = await request(app).get("/api/user-work-plans");
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((p: any) => p.planId);
+    // Own plan should still be present
+    expect(ids).toContain("plan-1");
+    // Org member plan should NOT be present when sharing is disabled
+    expect(ids).not.toContain("plan-2");
+    // getWorkPlansByOrg should NOT be called when sharing is disabled
+    expect(mockGetWorkPlansByOrg).not.toHaveBeenCalled();
+  });
+
+  it("response has items and truncated fields", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: true } },
+    });
+    mockGetWorkPlansByOwner.mockResolvedValue([myPlan]);
+    mockGetWorkPlansByOrg.mockResolvedValue([memberPlan]);
+
+    const res = await request(app).get("/api/user-work-plans");
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("items");
+    expect(res.body).toHaveProperty("truncated", false);
+    expect(Array.isArray(res.body.items)).toBe(true);
   });
 });
 

@@ -1,7 +1,7 @@
 import express from "express";
-import { workPlanService } from "../services/workPlanService";
+import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { emailService } from "../services/emailService";
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
 
 const router = express.Router();
 
@@ -11,11 +11,13 @@ router.get("/", async (req, res) => {
     const { userId } = (req as any).user;
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
+    const org = orgId ? await orgDb.getOrgById(orgId) : null;
+    const wpEnabled = org?.shareSettings?.workPlans?.enabled === true;
 
     const [ownPlans, publicPlans, orgPlans] = await Promise.all([
       workPlanService.getWorkPlansByOwner(userId),
       workPlanService.getPublicPlansForAgentMode(),
-      orgId ? workPlanService.getWorkPlansByOrg(orgId) : Promise.resolve([]),
+      (orgId && wpEnabled) ? workPlanService.getWorkPlansByOrg(orgId, userId) : Promise.resolve([] as WorkPlan[]),
     ]);
 
     const seen = new Set<string>();
@@ -24,7 +26,7 @@ router.get("/", async (req, res) => {
       seen.add(p.planId);
       return true;
     });
-    res.json(all);
+    res.json({ items: all, truncated: false });
   } catch (error) {
     console.error("Error fetching user work plans:", error);
     res.status(500).json({ message: "Failed to fetch work plans" });
