@@ -26,6 +26,90 @@ import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 // Fields NOT listed here fall straight from Tier 1 to Tier 4 (web) for the group.
 // Phase 1 keeps this narrow — only fields with a direct Apollo→CRM mapping.
 
+// ─── Unipile person coverage map ─────────────────────────────────────────────
+// Fields directly mappable from a Unipile profile raw response without LLM.
+// Remaining fields after direct map still go through extractFieldsViaLLM.
+
+export const UNIPILE_PERSON_COVERAGE: Record<string, string[]> = {
+  person_identity: ['first_name', 'last_name', 'title', 'location', 'linkedin_url', 'email', 'phone'],
+  person_career:   ['tenure_at_company', 'prior_companies', 'education', 'recent_role_change_date'],
+};
+
+/** Direct map from Unipile raw profile JSON → CRM field names.
+ *  Field names verified against real Unipile /api/v1/users response. */
+function mapUnipilePersonToCrmFields(raw: any, leadCompany?: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (raw.first_name)  out.first_name  = raw.first_name;
+  if (raw.last_name)   out.last_name   = raw.last_name;
+  if (raw.location)    out.location    = raw.location;
+  if (raw.public_identifier) {
+    out.linkedin_url = `https://www.linkedin.com/in/${raw.public_identifier}`;
+  }
+
+  const we: any[] = Array.isArray(raw.work_experience) ? raw.work_experience : [];
+  const currentJobs = we.filter((e) => !e.end);
+
+  // Smart current-job selection: if lead has a company name, prefer the entry
+  // whose company matches — handles people with multiple concurrent roles.
+  let current: any = null;
+  if (currentJobs.length === 1) {
+    current = currentJobs[0];
+  } else if (currentJobs.length > 1 && leadCompany) {
+    const norm = leadCompany.toLowerCase().trim();
+    current = currentJobs.find((e) =>
+      typeof e.company === 'string' && e.company.toLowerCase().includes(norm),
+    ) ?? currentJobs[0];
+  } else if (currentJobs.length > 1) {
+    current = currentJobs[0];
+  }
+
+  // title: prefer structured position from work_experience, fall back to headline
+  if (current?.position) out.title = current.position;
+  else if (raw.headline)  out.title = raw.headline;
+
+  // tenure_at_company from current job start date (format: "M/D/YYYY")
+  if (current?.start) {
+    const start = new Date(current.start);
+    if (!isNaN(start.getTime())) {
+      const months = Math.floor((Date.now() - start.getTime()) / (1000 * 60 * 60 * 24 * 30));
+      const years  = Math.floor(months / 12);
+      const rem    = months % 12;
+      out.tenure_at_company = years > 0 ? `${years}y ${rem}m` : `${rem}m`;
+    }
+  }
+
+  // prior_companies — past entries only, field name is `company` not `company_name`
+  const prior = we
+    .filter((e) => !!e.end && typeof e.company === 'string')
+    .map((e) => e.company as string)
+    .filter(Boolean);
+  if (prior.length) out.prior_companies = prior.join(', ');
+
+  // education — field name is `school` not `school_name`; no separate field_of_study
+  const ed: any[] = Array.isArray(raw.education) ? raw.education : [];
+  if (ed.length) {
+    const top   = ed[0];
+    const parts = [top.school, top.degree].filter(Boolean);
+    if (parts.length) out.education = parts.join(', ');
+  }
+
+  // recent_role_change_date — start date of current role (sales signal: new exec = buying window)
+  if (current?.start) out.recent_role_change_date = current.start;
+
+  // contact_info — available on Sales Navigator / Recruiter accounts; empty arrays on normal accounts
+  const ci = raw.contact_info;
+  if (ci) {
+    const emails: any[] = Array.isArray(ci.emails) ? ci.emails : [];
+    const phones: any[] = Array.isArray(ci.phones) ? ci.phones : [];
+    const email = emails[0]?.address ?? emails[0]?.value ?? null;
+    const phone = phones[0]?.number ?? phones[0]?.value ?? null;
+    if (email) out.email = email;
+    if (phone) out.phone = phone;
+  }
+
+  return out;
+}
+
 export const APOLLO_GROUP_COVERAGE: Record<string, string[]> = {
   company_firmographic: [
     'company_name', 'website', 'industry', 'employee_count',
@@ -129,7 +213,7 @@ export interface WaterfallDeps {
     groupName: string,
   ): Promise<{ webContext: string } | null>;
   findLinkedInUrl(lead: LeadRecord): Promise<string | null>;
-  findUnipileCompany?(lead: LeadRecord, companyLinkedInUrl?: string): Promise<any | null>;
+  findUnipileCompany?(lead: LeadRecord, companyLinkedInUrl?: string, profileOnly?: boolean): Promise<{ companyRaw: any; personProfileRaw?: any } | null>;
   /** Tier 3.5: Apollo broker chain (run_waterfall_email). Optional — only
    *  wired when the caller has a persisted lead to receive the webhook result. */
   apolloBrokerChain?: (
@@ -420,32 +504,80 @@ export async function runWaterfall(
     }
   }
 
-  // ─ Tier 3.5c: Unipile company enrichment ────────────────────────────────────
-  // Fires for company entity groups when fields remain after Apollo tiers.
-  // Cascades: company LinkedIn URL → lead LinkedIn URL → name+company search.
+  // ─ Tier 3.5c: Unipile enrichment (company + person) ────────────────────────
+  // For company groups: cascades company LinkedIn URL → lead LinkedIn URL →
+  // name+company search to fetch company data.
+  // For person groups: reuses the profile fetched during company lookup (zero
+  // extra API calls) or fetches directly from lead.linkedin when available.
   let unipileCompanyFills = 0;
-  if (deps.findUnipileCompany && groupEntityType(groupName) === 'company' && remaining.length > 0) {
-    const companyLinkedInUrl: string | undefined =
-      lead.company_linkedin_url ||
-      filled.find(f => f.field === 'company_linkedin_url')?.value;
-    const companyRaw = await deps.findUnipileCompany(lead, companyLinkedInUrl);
-    if (companyRaw) {
-      const llmResult = await deps.extractFieldsViaLLM({
-        tier: 'apollo',
-        sourceContext: JSON.stringify(companyRaw),
-        fields: remaining,
-        groupName,
-        lead,
-        configFieldsByName: input.configFieldsByName,
-      });
-      for (const f of remaining) {
-        const entry = llmResult.filled[f];
-        if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
-          filled.push({ field: f, value: entry.value, meta: metaUnipile() });
-          unipileCompanyFills += 1;
+  if (deps.findUnipileCompany && remaining.length > 0) {
+    const entityType = groupEntityType(groupName);
+    if (entityType === 'company') {
+      const companyLinkedInUrl: string | undefined =
+        lead.company_linkedin_url ||
+        filled.find(f => f.field === 'company_linkedin_url')?.value;
+      const result = await deps.findUnipileCompany(lead, companyLinkedInUrl);
+      if (result?.companyRaw) {
+        const llmResult = await deps.extractFieldsViaLLM({
+          tier: 'apollo',
+          sourceContext: JSON.stringify(result.companyRaw),
+          fields: remaining,
+          groupName,
+          lead,
+          configFieldsByName: input.configFieldsByName,
+        });
+        for (const f of remaining) {
+          const entry = llmResult.filled[f];
+          if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+            filled.push({ field: f, value: entry.value, meta: metaUnipile() });
+            unipileCompanyFills += 1;
+          }
+        }
+        remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
+      }
+    } else if (entityType === 'person') {
+      // Fetch person profile — reuse profile already fetched by findUnipileCompany
+      // (via Approach 1/3) when company group ran first, or fetch fresh if not.
+      // profileOnly=true skips the company API call since we only need the profile.
+      // Prefer linkedin_url freshly filled by 3.5b over the original lead field.
+      const resolvedLinkedin = lead.linkedin || filled.find(f => f.field === 'linkedin_url')?.value;
+      const leadForProfile = resolvedLinkedin ? { ...lead, linkedin: resolvedLinkedin } : lead;
+      const result = await deps.findUnipileCompany(leadForProfile, undefined, true);
+      const profileRaw = result?.personProfileRaw;
+      if (profileRaw) {
+        // Step 1: direct map known Unipile profile fields (no LLM cost)
+        const directCoverage = UNIPILE_PERSON_COVERAGE[groupName] ?? [];
+        const directMapped = mapUnipilePersonToCrmFields(profileRaw, lead.company ?? undefined);
+        for (const f of remaining) {
+          if (!directCoverage.includes(f)) continue;
+          const value = directMapped[f];
+          if (typeof value === 'string' && value.length > 0) {
+            filled.push({ field: f, value, meta: metaUnipile() });
+            unipileCompanyFills += 1;
+          }
+        }
+        remaining = remaining.filter(f => !filled.find(x => x.field === f));
+
+        // Step 2: LLM over full raw profile for anything direct map missed
+        if (remaining.length > 0) {
+          const llmResult = await deps.extractFieldsViaLLM({
+            tier: 'apollo',
+            sourceContext: JSON.stringify(profileRaw),
+            fields: remaining,
+            groupName,
+            lead,
+            configFieldsByName: input.configFieldsByName,
+          });
+          for (const f of remaining) {
+            const entry = llmResult.filled[f];
+            if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+              filled.push({ field: f, value: entry.value, meta: metaUnipile() });
+              unipileCompanyFills += 1;
+            }
+          }
+          remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
         }
       }
-      remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
     }
   }
 
