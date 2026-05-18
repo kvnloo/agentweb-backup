@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { userDb, orgDb } from "../services/db";
+import { canEditItem } from "../services/orgShareService";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -136,36 +137,42 @@ router.post("/", authenticateToken, async (req, res) => {
     const user = users[0];
     console.log(`[MARKET STRATEGY DEBUG] Found user: ${user.email}`);
 
-    // If user is in an org, read existing from org and save to org
+    // If user is in an org, load the org record once for both auth check and existing-data merge
     let existingSource = user.marketStrategy;
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
+
+      // Gate: only org admin OR users in marketingStrategy.editors may write
+      const allowed = canEditItem(
+        { userId: org?.ownerUserId } as any,
+        { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
+        org,
+        user.orgId,
+        "marketingStrategy",
+      );
+      if (!allowed) {
+        return res.status(403).json({ message: "Not authorized to edit marketing strategy" });
+      }
+
       if (org) {
         existingSource = org.marketStrategy || null;
       }
-    }
 
-    const existingMarketStrategyMerged = existingSource || {
-      businessOverview: "",
-      competitors: [],
-      icp: [],
-    };
+      const existingMarketStrategyMerged = existingSource || {
+        businessOverview: "",
+        competitors: [],
+        icp: [],
+      };
 
-    // Merge: only update fields that are provided
-    const now = new Date().toISOString();
-    const marketStrategy = {
-      businessOverview: businessOverview !== undefined ? businessOverview : existingMarketStrategyMerged.businessOverview,
-      competitors: competitors !== undefined ? competitors : existingMarketStrategyMerged.competitors,
-      icp: icp !== undefined ? icp : existingMarketStrategyMerged.icp,
-      createdAt: (existingMarketStrategyMerged as any).createdAt || now,
-      updatedAt: now,
-    };
+      const now = new Date().toISOString();
+      const marketStrategy = {
+        businessOverview: businessOverview !== undefined ? businessOverview : existingMarketStrategyMerged.businessOverview,
+        competitors: competitors !== undefined ? competitors : existingMarketStrategyMerged.competitors,
+        icp: icp !== undefined ? icp : existingMarketStrategyMerged.icp,
+        createdAt: (existingMarketStrategyMerged as any).createdAt || now,
+        updatedAt: now,
+      };
 
-    // If user is in an org, save to org (owner only)
-    if (user.orgId) {
-      if (user.orgRole !== "owner") {
-        return res.status(403).json({ error: "Only the org owner can update market strategy" });
-      }
       await orgDb.updateOrg(user.orgId, { marketStrategy });
       console.log(`[MARKET STRATEGY DEBUG] Updated org ${user.orgId} market strategy`);
       return res.json({
@@ -174,6 +181,22 @@ router.post("/", authenticateToken, async (req, res) => {
         message: "Market strategy saved successfully (org-level)",
       });
     }
+
+    // Solo user (no org): merge and save to user record
+    const existingMarketStrategyMerged = existingSource || {
+      businessOverview: "",
+      competitors: [],
+      icp: [],
+    };
+
+    const now = new Date().toISOString();
+    const marketStrategy = {
+      businessOverview: businessOverview !== undefined ? businessOverview : existingMarketStrategyMerged.businessOverview,
+      competitors: competitors !== undefined ? competitors : existingMarketStrategyMerged.competitors,
+      icp: icp !== undefined ? icp : existingMarketStrategyMerged.icp,
+      createdAt: (existingMarketStrategyMerged as any).createdAt || now,
+      updatedAt: now,
+    };
 
     // Update user record with market strategy data
     const updateParams = {
