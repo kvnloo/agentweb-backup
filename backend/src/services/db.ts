@@ -556,6 +556,17 @@ export interface Organization {
   maxMembers: number;
   createdAt: string;
   updatedAt: string;
+  shareSettings?: OrgShareSettings;
+}
+
+export interface OrgShareSettings {
+  knowledgeBase:     { enabled: boolean; editors: string[] };
+  htmlTemplates:     { enabled: boolean; editors: string[] };
+  landingPages:      { enabled: boolean; editors: string[] };
+  workPlans:         { enabled: boolean; editors: string[] };
+  skills:            { enabled: boolean; editors: string[] };
+  brandGuidelines:   { editors: string[] };
+  marketingStrategy: { editors: string[] };
 }
 
 interface UserInteraction {
