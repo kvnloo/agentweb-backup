@@ -1,23 +1,30 @@
 /**
- * Tests for org-sharing edit gates on marketing strategy (POST /api/market-strategy).
+ * Tests for org-sharing edit gates on:
+ * - marketing strategy (POST /api/market-strategy) in marketStrategy.ts
+ * - brand guidelines (POST /api/brand/guidelines) in brand.ts
  *
- * Brand Guidelines live in brand.ts (a separate route); this file covers the
- * marketing strategy endpoint in marketStrategy.ts.
- *
- * Scenarios:
+ * Scenarios for marketing strategy:
  * 1. Org admin (orgRole === 'owner') can POST regardless of editor list.
  * 2. User in editors.marketingStrategy can POST marketing strategy.
  * 3. Non-editor org member is rejected with 403.
  * 4. Solo user (no org) can POST their own data (user-scoped path).
  * 5. GET is always allowed for org members (existing behavior unchanged).
+ *
+ * Scenarios for brand guidelines:
+ * 6. Org admin can POST /guidelines.
+ * 7. User in shareSettings.brandGuidelines.editors can POST /guidelines.
+ * 8. User in shareSettings.marketingStrategy.editors (but not brandGuidelines.editors) gets 403 on POST /guidelines.
+ * 9. Non-editor org member gets 403 on POST /guidelines.
+ * 10. Solo user (no orgId) can POST and writes to their own user row.
  */
 
 import express from "express";
 import request from "supertest";
 
-// ── Mock aws-sdk (marketStrategy.ts creates a DynamoDB.DocumentClient) ────────
+// ── Mock aws-sdk (marketStrategy.ts and brand.ts create DynamoDB.DocumentClient / S3) ──
 const mockDynamoQuery = jest.fn();
 const mockDynamoUpdate = jest.fn();
+const mockDynamoGet = jest.fn();
 
 jest.mock("aws-sdk", () => ({
   config: { update: jest.fn() },
@@ -25,20 +32,26 @@ jest.mock("aws-sdk", () => ({
     DocumentClient: jest.fn(() => ({
       query:  jest.fn((params: any) => ({ promise: () => mockDynamoQuery(params) })),
       update: jest.fn((params: any) => ({ promise: () => mockDynamoUpdate(params) })),
-      get:    jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+      get:    jest.fn((params: any) => ({ promise: () => mockDynamoGet(params) })),
       put:    jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       delete: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
     })),
   },
-  S3: jest.fn(() => ({})),
+  S3: jest.fn(() => ({
+    putObject: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+    deleteObject: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+  })),
 }));
 
 // ── Mock db service ────────────────────────────────────────────────────────────
 const mockGetOrgById  = jest.fn();
 const mockUpdateOrg   = jest.fn();
+const mockUpdateUser  = jest.fn();
 
 jest.mock("../services/db", () => ({
-  userDb: {},
+  userDb: {
+    updateUser: (...a: any[]) => mockUpdateUser(...a),
+  },
   orgDb: {
     getOrgById:  (...a: any[]) => mockGetOrgById(...a),
     updateOrg:   (...a: any[]) => mockUpdateOrg(...a),
@@ -53,8 +66,15 @@ jest.mock("../middleware/auth", () => ({
   AuthenticatedRequest: {},
 }));
 
-// ── Import route after mocks ───────────────────────────────────────────────────
+// ── Mock brandBuildStatusService (used in brand.ts, returns null so no updateUser call) ──
+jest.mock("../services/brandBuildStatusService", () => ({
+  buildReadyPatch:    jest.fn().mockReturnValue(null),
+  logCompletionMetric: jest.fn(),
+}));
+
+// ── Import routes after mocks ──────────────────────────────────────────────────
 import marketStrategyRouter from "../routes/marketStrategy";
+import brandRouter from "../routes/brand";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const ORG_ID      = "org-1";
@@ -103,6 +123,11 @@ const validBody = { businessOverview: "We sell widgets" };
 beforeEach(() => {
   jest.clearAllMocks();
   mockUpdateOrg.mockResolvedValue({});
+  mockUpdateUser.mockResolvedValue({});
+  // Default dynamodb.get returns empty (no user found) — individual tests override as needed
+  mockDynamoGet.mockResolvedValue({});
+  // Default dynamodb.update resolves with empty attributes
+  mockDynamoUpdate.mockResolvedValue({ Attributes: {} });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -244,5 +269,148 @@ describe("Scenario 5: GET is always allowed for org members", () => {
       .get("/api/market-strategy");
 
     expect(res.status).toBe(200);
+  });
+});
+
+// =============================================================================
+// Brand Guidelines write gate tests
+// =============================================================================
+
+const BRAND_EDITOR_ID = "brand-editor-u";
+
+/** Org with ADMIN_ID as owner, BRAND_EDITOR_ID in brandGuidelines.editors, EDITOR_ID in marketingStrategy.editors only */
+const sampleOrgBrand = {
+  ...sampleOrg,
+  ownerUserId: ADMIN_ID,
+  shareSettings: {
+    ...sampleOrg.shareSettings,
+    brandGuidelines:   { editors: [BRAND_EDITOR_ID] },
+    marketingStrategy: { editors: [EDITOR_ID] },
+  },
+};
+
+/**
+ * Build an express app that injects a full user object (userId + email) into req.user
+ * and mounts the brand router. brand.ts reads req.user.email for DynamoDB.get lookups.
+ */
+function makeBrandApp(userRecord: { userId: string; email: string; orgId?: string; orgRole?: string }) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).user = userRecord;
+    next();
+  });
+  app.use("/api/brand", brandRouter);
+  return app;
+}
+
+/** Returns a DynamoDB get result (Item) for the brand route's user fetch */
+function userGetResult(userRecord: object) {
+  return { Item: userRecord };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// brandGuidelines write — Scenario 6: Org admin can POST /guidelines
+// ─────────────────────────────────────────────────────────────────────────────
+describe("brandGuidelines write — Scenario 6: org admin can POST /guidelines", () => {
+  it("returns 201 when orgRole === 'owner' regardless of editors list", async () => {
+    const adminUser = { userId: ADMIN_ID, orgId: ORG_ID, orgRole: "owner", email: "admin@test.com" };
+    mockDynamoGet.mockResolvedValueOnce(userGetResult(adminUser));
+    mockGetOrgById.mockResolvedValueOnce(sampleOrgBrand);
+
+    const res = await request(makeBrandApp(adminUser))
+      .post("/api/brand/guidelines")
+      .field("brandName", "Acme Corp");
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateOrg).toHaveBeenCalledWith(ORG_ID, expect.objectContaining({ brandGuidelines: expect.any(Object) }));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// brandGuidelines write — Scenario 7: User in brandGuidelines.editors can POST
+// ─────────────────────────────────────────────────────────────────────────────
+describe("brandGuidelines write — Scenario 7: user in brandGuidelines.editors can POST /guidelines", () => {
+  it("returns 201 for a user listed in brandGuidelines.editors", async () => {
+    const brandEditorUser = { userId: BRAND_EDITOR_ID, orgId: ORG_ID, orgRole: "member", email: "brand-editor@test.com" };
+    mockDynamoGet.mockResolvedValueOnce(userGetResult(brandEditorUser));
+    mockGetOrgById.mockResolvedValueOnce(sampleOrgBrand);
+
+    const res = await request(makeBrandApp(brandEditorUser))
+      .post("/api/brand/guidelines")
+      .field("brandName", "Acme Corp");
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateOrg).toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// brandGuidelines write — Scenario 8: marketingStrategy editor cannot POST /guidelines
+// ─────────────────────────────────────────────────────────────────────────────
+describe("brandGuidelines write — Scenario 8: marketingStrategy editor gets 403 on POST /guidelines", () => {
+  it("returns 403 for a user in marketingStrategy.editors but not brandGuidelines.editors", async () => {
+    const msEditorUser = { userId: EDITOR_ID, orgId: ORG_ID, orgRole: "member", email: "editor@test.com" };
+    mockDynamoGet.mockResolvedValueOnce(userGetResult(msEditorUser));
+    mockGetOrgById.mockResolvedValueOnce(sampleOrgBrand);
+
+    const res = await request(makeBrandApp(msEditorUser))
+      .post("/api/brand/guidelines")
+      .field("brandName", "Acme Corp");
+
+    expect(res.status).toBe(403);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// brandGuidelines write — Scenario 9: Non-editor org member gets 403
+// ─────────────────────────────────────────────────────────────────────────────
+describe("brandGuidelines write — Scenario 9: non-editor org member gets 403 on POST /guidelines", () => {
+  it("returns 403 for an org member not in any editors list", async () => {
+    const memberUser = { userId: MEMBER_ID, orgId: ORG_ID, orgRole: "member", email: "member@test.com" };
+    mockDynamoGet.mockResolvedValueOnce(userGetResult(memberUser));
+    mockGetOrgById.mockResolvedValueOnce(sampleOrgBrand);
+
+    const res = await request(makeBrandApp(memberUser))
+      .post("/api/brand/guidelines")
+      .field("brandName", "Acme Corp");
+
+    expect(res.status).toBe(403);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 even when org has no shareSettings at all", async () => {
+    const orgNoSettings = { orgId: ORG_ID, ownerUserId: ADMIN_ID };
+    const memberUser = { userId: MEMBER_ID, orgId: ORG_ID, orgRole: "member", email: "member@test.com" };
+    mockDynamoGet.mockResolvedValueOnce(userGetResult(memberUser));
+    mockGetOrgById.mockResolvedValueOnce(orgNoSettings);
+
+    const res = await request(makeBrandApp(memberUser))
+      .post("/api/brand/guidelines")
+      .field("brandName", "Acme Corp");
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// brandGuidelines write — Scenario 10: Solo user (no orgId) can POST their own data
+// ─────────────────────────────────────────────────────────────────────────────
+describe("brandGuidelines write — Scenario 10: solo user (no org) can POST their own brand guidelines", () => {
+  it("returns 201 and writes to user record (not org) for solo user", async () => {
+    const soloUser = { userId: SOLO_ID, email: "solo@test.com" };
+    mockDynamoGet.mockResolvedValueOnce(userGetResult(soloUser));
+    mockDynamoUpdate.mockResolvedValueOnce({ Attributes: { ...soloUser, brandGuidelines: {} } });
+
+    const res = await request(makeBrandApp(soloUser))
+      .post("/api/brand/guidelines")
+      .field("brandName", "Solo Brand");
+
+    expect(res.status).toBe(201);
+    // orgDb.updateOrg must NOT be called for solo users
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    // DynamoDB update (user record) must be called for solo path
+    expect(mockDynamoUpdate).toHaveBeenCalled();
   });
 });
