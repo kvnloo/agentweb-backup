@@ -22,6 +22,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-18',
     changes: [
+      'Fixed: Org-Shared LinkedIn Outreach Accounts Now Visible to All Team Members',
+      '- When a team member connected a LinkedIn Outreach (Unipile) account and shared it with the organization, other team members could not see or use the account',
+      '- The connected accounts list was only returning the calling user\'s personal accounts, ignoring org-shared accounts from teammates',
+      '- Org-shared accounts are now included for all members of the same organization',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
       'CRM Group Email: Format Verification Before Sending',
       '- The "Prepare for Sending" step now checks your email HTML for common issues before you send',
       '- Warns if dark mode handling is missing (add <meta name="color-scheme" content="light"> to opt iOS Mail out of color inversion)',

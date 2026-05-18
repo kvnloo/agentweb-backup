@@ -16,6 +16,7 @@ jest.mock('../../services/connectedAccountsDb', () => ({
   deleteAccount: jest.fn(),
   deleteAccountById: jest.fn(),
   getAccountsByUserId: jest.fn(),
+  getAccountsByUserIdIncludingOrgShared: jest.fn(),
   getAccountByPlatform: jest.fn(),
   updateAccountConfig: jest.fn(),
 }));
@@ -172,7 +173,7 @@ describe('Connected Accounts - Fathom', () => {
         },
       ];
 
-      (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+      (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
       mockValidateApiKey.mockResolvedValue(true);
 
       const response = await request(app).get('/api/oauth/connected-accounts');
@@ -200,7 +201,7 @@ describe('Connected Accounts - Fathom', () => {
         },
       ];
 
-      (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+      (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
       mockValidateApiKey.mockResolvedValue(false);
 
       const response = await request(app).get('/api/oauth/connected-accounts');
