@@ -7244,6 +7244,39 @@ export const orgDb = {
     return null;
   },
 
+  async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
+    await dynamodb.update({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
+      ExpressionAttributeValues: {
+        ":s": settings,
+        ":u": new Date().toISOString(),
+      },
+    }).promise();
+  },
+
+  async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {
+    const got = await dynamodb.get({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+    }).promise();
+    const org = got.Item as Organization | undefined;
+    if (!org?.shareSettings) return;
+    const ss = org.shareSettings;
+    const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
+    const next: OrgShareSettings = {
+      knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
+      htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
+      landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
+      workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
+      skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+      brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
+      marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
+    };
+    await this.updateShareSettings(orgId, next);
+  },
+
   ORG_MAX_MEMBERS,
 };
 
