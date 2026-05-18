@@ -290,16 +290,18 @@ Same as the main migration — `dynamodb:Scan` and `dynamodb:UpdateItem` on `AW-
 
 | Field | Dev | Staging | Prod |
 |---|---|---|---|
-| Operator | | | |
-| Run start (UTC) | | | |
-| Run end (UTC) | | | |
-| Pre-flight item count | | | |
-| Billing mode | | | |
-| PITR enabled? | | | |
-| Dry-run `touched` / `skippedNoop` / `skippedOrphaned` | | | |
-| Real-run `touched` / `errored` | | | |
-| Anomalies / notes | | | |
-| Sign-off (engineering) | | | |
+| Operator | — | — | rui |
+| Run start (UTC) | — | — | 2026-05-15 ~19:08 UTC |
+| Run end (UTC) | — | — | 2026-05-18 |
+| Pre-flight item count | — | — | 206,028 |
+| Billing mode | — | — | PAY_PER_REQUEST |
+| PITR enabled? | — | — | Unknown (IAM lacked DescribeContinuousBackups) |
+| Dry-run `touched` / `skippedNoop` / `skippedOrphaned` | — | — | 204,842 / 4 / 1,187 |
+| Real-run `touched` / `errored` | — | — | 46,777 / 158,092 (empty GSI keys — repaired separately) |
+| Repair run `repaired` / `errored` | — | — | 158,091 / 0 |
+| Post-repair verification `touched` / `errored` | — | — | 28 (live writes) / 0 ✅ |
+| Anomalies / notes | — | — | 1,187 orphaned leads from 2 deleted lists (list_1772000220985 + list_1772000519919, created 2026-02-25, lists since deleted). 158k leads had `linkedin=""` from pre-GSI import paths — repaired via repairEmptyGsiKeys.ts (PR #1560). |
+| Sign-off (engineering) | — | — | rui 2026-05-18 |
 
 ---
 
