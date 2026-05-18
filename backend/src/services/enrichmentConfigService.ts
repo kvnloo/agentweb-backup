@@ -431,14 +431,15 @@ export async function setEnrichmentConfig(
   }
 
   // Step 3: Classify smart fields via LLM. Only classify fields that have an
-  // instruction but haven't been classified yet (smartCondition absent).
-  // Fields without instructions can't be smart — nothing to derive from.
-  // Classify fields that are new (no smartCondition) OR whose instruction has
-  // changed since last classification (smartCondition holds the old instruction).
+  // instruction, are enabled, and haven't been classified with the current
+  // instruction yet (either as smart or not-smart).
+  // smartCondition holds the instruction used when LLM said "smart".
+  // notSmartInstruction holds the instruction used when LLM said "not smart".
+  // If either matches the current instruction, skip — result is already cached.
   const classificationCandidates = enriched.fields.filter(
-    f => f.instruction && (
-      !f.smartCondition ||
-      f.smartCondition !== f.instruction
+    f => f.instruction && f.include && (
+      f.smartCondition !== f.instruction &&
+      f.notSmartInstruction !== f.instruction
     ),
   );
   if (classificationCandidates.length > 0) {
@@ -466,11 +467,18 @@ export async function setEnrichmentConfig(
             : {};
 
           if (cls.isSmartField) {
+            // Only canonical FIELD_GROUPS names are kept as dependencies.
+            // This means smart fields cannot depend on other smart fields —
+            // a user-field name like `isQualified` would be filtered here.
+            // See the POST eval loop in crmEnrichmentServiceV3 for full context.
             const validDeps = (cls.dependencies ?? []).filter(d => CANONICAL_FIELD_NAMES.has(d));
-            return { ...f, ...typeOverride, smartCondition: f.instruction, smartDependencies: validDeps };
+            const out = { ...f, ...typeOverride, smartCondition: f.instruction, smartDependencies: validDeps };
+            delete (out as any).notSmartInstruction;
+            return out;
           }
-          // LLM says not smart — strip stale smart tags, apply inferred type.
-          const out = { ...f, ...typeOverride };
+          // LLM says not smart — strip stale smart tags, cache this instruction
+          // in notSmartInstruction so we don't re-classify on the next save.
+          const out = { ...f, ...typeOverride, notSmartInstruction: f.instruction };
           delete (out as any).smartCondition;
           delete (out as any).smartDependencies;
           return out;

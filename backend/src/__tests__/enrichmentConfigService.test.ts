@@ -1018,4 +1018,115 @@ describe('setEnrichmentConfig — smart field classification', () => {
     expect(field?.smartDependencies).toEqual(['funding_stage']);
     expect(field?.smartDependencies).not.toContain('made_up_field_xyz');
   });
+
+  it('stores notSmartInstruction when LLM classifies a field as not smart', async () => {
+    const deps = makeDeps({
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        industry: { isSmartField: false, dependencies: [] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: 'company industry', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.fields.find(f => f.name === 'industry');
+    expect(field?.notSmartInstruction).toBe('company industry');
+    expect(field?.smartCondition).toBeUndefined();
+  });
+
+  it('skips re-classification when notSmartInstruction matches current instruction (cached not-smart)', async () => {
+    const classifyMock = jest.fn().mockResolvedValue({});
+    const deps = makeDeps({ llmClassifySmartFields: classifyMock });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'company industry',  // cached — same as current instruction
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const classifyCall = classifyMock.mock.calls[0]?.[0] ?? [];
+    expect(classifyCall.map((f: any) => f.name)).not.toContain('industry');
+  });
+
+  it('re-classifies a not-smart field when its instruction changes', async () => {
+    const deps = makeDeps({
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        industry: { isSmartField: false, dependencies: [], fieldType: 'string' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'NEW: primary industry sector',  // changed
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'OLD: company industry',  // stale
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    expect(deps.llmClassifySmartFields).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ name: 'industry' })]),
+    );
+  });
+
+  it('clears notSmartInstruction when field flips from not-smart to smart', async () => {
+    const deps = makeDeps({
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        score: { isSmartField: true, dependencies: ['employee_count'], fieldType: 'number' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'score',
+          type: 'number',
+          instruction: '1-100 score based on employee count',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'OLD: plain score field',  // stale from previous not-smart run
+        },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.fields.find(f => f.name === 'score');
+    expect(field?.smartCondition).toBe('1-100 score based on employee count');
+    expect(field?.notSmartInstruction).toBeUndefined();
+  });
+
+  it('skips classification for include:false fields', async () => {
+    const classifyMock = jest.fn().mockResolvedValue({});
+    const deps = makeDeps({ llmClassifySmartFields: classifyMock });
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: 'company industry', include: false, overwritePolicy: 'fill_if_empty' },
+        { name: 'company', type: 'string', instruction: 'company name', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const classifyCall = classifyMock.mock.calls[0]?.[0] ?? [];
+    const names = classifyCall.map((f: any) => f.name);
+    expect(names).not.toContain('industry');   // include:false — skipped
+    expect(names).toContain('company');         // include:true — classified
+  });
 });

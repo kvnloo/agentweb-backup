@@ -241,11 +241,11 @@ export function buildSmartFieldClassificationUserPrompt(
   fields: Array<{ name: string; instruction: string }>,
 ): string {
   const lines = fields.map(f => `- ${f.name}: "${f.instruction}"`).join('\n');
-  return `Classify each field as smart or normal and extract dependencies for smart fields:
+  return `Classify each field as smart or normal, extract dependencies for smart fields, and infer field type:
 
 ${lines}
 
-Return JSON: { "<fieldName>": { "isSmartField": true|false, "dependencies": [...] }, ... }`;
+Return JSON: { "<fieldName>": { "isSmartField": true|false, "dependencies": [...], "fieldType": "boolean"|"number"|"date"|"enum"|"string", "enumOptions": ["opt1", ...] }, ... }`;
 }
 
 /**

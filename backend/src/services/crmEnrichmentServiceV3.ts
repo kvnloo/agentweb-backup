@@ -77,6 +77,13 @@ export interface EnrichmentFieldConfig {
    * Populated at config-save time alongside smartCondition.
    */
   smartDependencies?: string[];
+  /**
+   * The instruction text that was last classified as NOT a smart field.
+   * When this equals the current instruction, classification is skipped
+   * (LLM already determined this is a regular field with this exact instruction).
+   * Populated at config-save time; never sent by client.
+   */
+  notSmartInstruction?: string;
 }
 
 export interface EnrichmentConfig {
@@ -528,13 +535,11 @@ async function processLead(
     for (const sf of smartFields) {
       for (const dep of sf.smartDependencies ?? []) {
         if (fillValueMap[dep]) continue;
-        const topVal = (enrichedLead as any)[dep];
         // Check customFields by canonical name (injected deps) and by user-facing name (aliased fields).
         const customValDirect = enrichedLead.customFields?.[dep];
         const userFacingName = canonicalToUserFieldName[dep];
         const customValAlias = userFacingName ? enrichedLead.customFields?.[userFacingName] : undefined;
         const existing =
-          (typeof topVal === 'string' && topVal.trim()) ? topVal :
           (typeof customValDirect === 'string' && customValDirect.trim()) ? customValDirect :
           (typeof customValAlias === 'string' && customValAlias.trim()) ? customValAlias :
           null;
@@ -542,6 +547,13 @@ async function processLead(
       }
     }
 
+    // Known limitation: smart fields cannot depend on other smart fields.
+    // smartDependencies only accepts canonical FIELD_GROUPS names — user-field
+    // names (including other smart fields like `isQualified`) are filtered out
+    // at classification time. A smart field B whose instruction references
+    // another smart field A will receive no value for A in its depValues, and
+    // the LLM eval will likely return null. Fix requires a separate
+    // `smartFieldDependencies` array + topological sort before this loop.
     for (const sf of smartFields) {
       const depValues: Record<string, string> = {};
       for (const dep of sf.smartDependencies ?? []) {
@@ -680,6 +692,11 @@ export async function runEnrichment(
   // Smart fields are excluded from the regular enrichment routing; their
   // dependency canonical fields are injected as synthetic fields so the
   // waterfall populates them, then the POST phase evaluates the smart fields.
+  //
+  // Limitation: smart field chaining is NOT supported. A smart field can only
+  // depend on canonical FIELD_GROUPS data fields (funding_stage, employee_count,
+  // etc.) — it cannot depend on another smart field's computed output. See the
+  // POST eval loop below and enrichmentConfigService validDeps filter for detail.
   const smartFields = input.config.fields.filter(f => f.smartCondition && f.include);
 
   // Canonical names already covered by the user's non-smart config fields.
@@ -691,6 +708,10 @@ export async function runEnrichment(
 
   // Deps not yet in the config → inject as synthetic fields (canonical name,
   // empty instruction, fill_if_empty policy, result stays on the lead).
+  // fill_if_empty is intentional: if the lead already has the dep value,
+  // the waterfall skips it and the fillValueMap fallback reads it from
+  // enrichedLead.customFields instead — that path is load-bearing.
+  // Injected fills are stripped before writeLeadOutcome (writableFills filter).
   const injectedDepNames = new Set<string>();
   const injectedDeps: EnrichmentFieldConfig[] = [];
   for (const sf of smartFields) {
