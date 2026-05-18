@@ -560,12 +560,13 @@ export interface Organization {
 }
 
 export interface OrgShareSettings {
-  knowledgeBase:     { enabled: boolean; editors: string[] };
-  htmlTemplates:     { enabled: boolean; editors: string[] };
-  landingPages:      { enabled: boolean; editors: string[] };
-  workPlans:         { enabled: boolean; editors: string[] };
-  skills:            { enabled: boolean; editors: string[] };
-  brandGuidelines:   { editors: string[] };
+  knowledgeBase: { enabled: boolean; editors: string[] };
+  htmlTemplates: { enabled: boolean; editors: string[] };
+  landingPages: { enabled: boolean; editors: string[] };
+  workPlans: { enabled: boolean; editors: string[] };
+  skills: { enabled: boolean; editors: string[] };
+  // Always shared with org—only editors are configurable, enabled is implicit
+  brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
 }
 
