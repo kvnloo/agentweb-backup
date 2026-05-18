@@ -7208,7 +7208,8 @@ export const orgDb = {
         TableName: `${TABLE_PREFIX}AW-Users`,
         IndexName: "OrgIdIndex",
         KeyConditionExpression: "orgId = :orgId",
-        ExpressionAttributeValues: { ":orgId": orgId },
+        FilterExpression: "NOT begins_with(userId, :tombstone)",
+        ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
       for (const item of result.Items || []) {
