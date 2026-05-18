@@ -395,12 +395,18 @@ export async function setEnrichmentConfig(
   // Explicit client-supplied aliasFor is preserved.
   let enriched: EnrichmentConfig = {
     ...input.config,
-    fields: input.config.fields.map(f => ({
-      ...f,
-      // Blocklisted fields (e.g. emailDomain) must never get an aliasFor —
-      // strip even if the stored config has a stale one from old inference.
-      aliasFor: ALIAS_INFERENCE_BLOCKLIST.has(f.name) ? undefined : (f.aliasFor ?? inferAliasFor(f.name)),
-    })),
+    fields: input.config.fields.map(
+      // Strip server-managed classification keys from the client payload.
+      // These are computed server-side and must not be client-injectable:
+      // - smartCondition / smartDependencies: trust these → skip POST eval
+      // - notSmartInstruction: set this === instruction → suppress classification
+      ({ smartCondition: _sc, smartDependencies: _sd, notSmartInstruction: _nsi, ...f }) => ({
+        ...f,
+        // Blocklisted fields (e.g. emailDomain) must never get an aliasFor —
+        // strip even if the stored config has a stale one from old inference.
+        aliasFor: ALIAS_INFERENCE_BLOCKLIST.has(f.name) ? undefined : (f.aliasFor ?? inferAliasFor(f.name)),
+      }),
+    ),
   };
 
   // Step 2: LLM fallback for fields the heuristic couldn't resolve. One LLM
@@ -430,7 +436,30 @@ export async function setEnrichmentConfig(
     }
   }
 
-  // Step 3: Classify smart fields via LLM. Only classify fields that have an
+  // Step 3a: Restore server-persisted classification keys from DB.
+  // Client-supplied values were stripped in Step 1 — client must not control
+  // these. Load from DB (authoritative) and re-attach for fields that match by
+  // name. If no stored config exists (new list), nothing to restore.
+  {
+    const storedConfig = await deps.readListConfig(input.listId).catch(() => null);
+    const storedByName = new Map(
+      (storedConfig?.fields ?? []).map(f => [f.name, f]),
+    );
+    enriched = {
+      ...enriched,
+      fields: enriched.fields.map(f => {
+        const sf = storedByName.get(f.name);
+        if (!sf) return f;
+        const restored: Partial<EnrichmentFieldConfig> = {};
+        if (sf.smartCondition !== undefined) restored.smartCondition = sf.smartCondition;
+        if (sf.smartDependencies !== undefined) restored.smartDependencies = sf.smartDependencies;
+        if (sf.notSmartInstruction !== undefined) restored.notSmartInstruction = sf.notSmartInstruction;
+        return { ...f, ...restored };
+      }),
+    };
+  }
+
+  // Step 3b: Classify smart fields via LLM. Only classify fields that have an
   // instruction, are enabled, and haven't been classified with the current
   // instruction yet (either as smart or not-smart).
   // smartCondition holds the instruction used when LLM said "smart".
@@ -438,8 +467,8 @@ export async function setEnrichmentConfig(
   // If either matches the current instruction, skip — result is already cached.
   const classificationCandidates = enriched.fields.filter(
     f => f.instruction && f.include && (
-      f.smartCondition !== f.instruction &&
-      f.notSmartInstruction !== f.instruction
+      f.smartCondition?.trim() !== f.instruction.trim() &&
+      f.notSmartInstruction?.trim() !== f.instruction.trim()
     ),
   );
   if (classificationCandidates.length > 0) {
@@ -458,13 +487,15 @@ export async function setEnrichmentConfig(
             ? cls.fieldType as 'string' | 'number' | 'boolean' | 'date' | 'enum'
             : undefined;
           const validEnumOptions = (cls.enumOptions ?? []).filter(o => typeof o === 'string' && o.trim());
-          const typeOverride: Partial<EnrichmentFieldConfig> = inferredType
-            ? inferredType === 'enum' && validEnumOptions.length > 0
-              ? { type: 'enum', enumOptions: validEnumOptions }
-              : inferredType !== 'enum'
-                ? { type: inferredType, enumOptions: undefined }  // clear stale enumOptions
-                : {}  // enum with no valid options — skip type change
-            : {};
+          let typeOverride: Partial<EnrichmentFieldConfig> = {};
+          if (inferredType) {
+            if (inferredType === 'enum' && validEnumOptions.length > 0) {
+              typeOverride = { type: 'enum', enumOptions: validEnumOptions };
+            } else if (inferredType !== 'enum') {
+              typeOverride = { type: inferredType, enumOptions: undefined };  // clear stale enumOptions
+            }
+            // else: enum with no valid options — skip type change
+          }
 
           if (cls.isSmartField) {
             // Only canonical FIELD_GROUPS names are kept as dependencies.
@@ -472,6 +503,11 @@ export async function setEnrichmentConfig(
             // a user-field name like `isQualified` would be filtered here.
             // See the POST eval loop in crmEnrichmentServiceV3 for full context.
             const validDeps = (cls.dependencies ?? []).filter(d => CANONICAL_FIELD_NAMES.has(d));
+            const droppedDeps = (cls.dependencies ?? []).filter(d => !CANONICAL_FIELD_NAMES.has(d));
+            if (droppedDeps.length > 0) {
+              // eslint-disable-next-line no-console
+              console.warn(`[enrichmentConfigService] smart field '${f.name}' had non-canonical deps filtered: ${droppedDeps.join(', ')} — these may be other smart field names (chaining not supported)`);
+            }
             const out = { ...f, ...typeOverride, smartCondition: f.instruction, smartDependencies: validDeps };
             delete (out as any).notSmartInstruction;
             return out;

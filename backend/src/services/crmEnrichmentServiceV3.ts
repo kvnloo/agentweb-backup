@@ -345,19 +345,44 @@ interface PerLeadOutcome {
   apolloPersonFailed: boolean;
 }
 
+// Minimal counting semaphore — limits concurrent async operations to `max`.
+class Semaphore {
+  private count: number;
+  private readonly queue: Array<() => void> = [];
+  constructor(private readonly max: number) { this.count = max; }
+  acquire(): Promise<void> {
+    if (this.count > 0) { this.count--; return Promise.resolve(); }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+  release(): void {
+    const next = this.queue.shift();
+    if (next) { next(); } else { this.count++; }
+  }
+}
+
+// Max concurrent smart-field LLM eval calls across all leads in a single run.
+// 20 leads × N smart fields can fan out to 20×N calls without this cap.
+const SMART_EVAL_CONCURRENCY = 15;
+
+interface ProcessLeadContext {
+  input: RunEnrichmentInput;
+  deps: OrchestratorDeps;
+  routing: FieldRouting;
+  needsPerson: boolean;
+  needsCompany: boolean;
+  refreshSet: Set<string>;
+  configFieldsByName: Record<string, EnrichmentFieldConfig>;
+  siblingMappingTable: SiblingFieldMappingTable;
+  smartFields: EnrichmentFieldConfig[];
+  injectedDepNames: Set<string>;
+  smartEvalSemaphore: Semaphore;
+}
+
 async function processLead(
   lead: LeadRecord,
-  input: RunEnrichmentInput,
-  deps: OrchestratorDeps,
-  routing: FieldRouting,
-  needsPerson: boolean,
-  needsCompany: boolean,
-  refreshSet: Set<string>,
-  configFieldsByName: Record<string, EnrichmentFieldConfig>,
-  siblingMappingTable: SiblingFieldMappingTable,
-  smartFields: EnrichmentFieldConfig[],
-  injectedDepNames: Set<string>,
+  ctx: ProcessLeadContext,
 ): Promise<PerLeadOutcome> {
+  const { input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable, smartFields, injectedDepNames, smartEvalSemaphore } = ctx;
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
@@ -534,7 +559,7 @@ async function processLead(
     // Fallback: pull dep values from the lead's existing fields (pre-run data).
     for (const sf of smartFields) {
       for (const dep of sf.smartDependencies ?? []) {
-        if (fillValueMap[dep]) continue;
+        if (fillValueMap[dep] != null && fillValueMap[dep].trim()) continue;
         // Check customFields by canonical name (injected deps) and by user-facing name (aliased fields).
         const customValDirect = enrichedLead.customFields?.[dep];
         const userFacingName = canonicalToUserFieldName[dep];
@@ -567,6 +592,7 @@ async function processLead(
       }
       const smartStart = Date.now();
       console.log(`[v3][lead ${lead.leadId}] smart-eval START field=${sf.name} deps=${JSON.stringify(Object.keys(depValues))}`);
+      await smartEvalSemaphore.acquire();
       try {
         const evalResult = await deps.evaluateSmartField({
           lead: enrichedLead,
@@ -590,6 +616,8 @@ async function processLead(
       } catch (err) {
         // Fail soft — smart field miss never fails the whole lead.
         console.warn(`[v3][lead ${lead.leadId}] smart-eval failed for ${sf.name}: ${(err as Error).message}`);
+      } finally {
+        smartEvalSemaphore.release();
       }
     }
   }
@@ -805,13 +833,16 @@ export async function runEnrichment(
 
   // Phase 1 keeps the loop simple — slice by chunks to bound concurrency.
   // (A semaphore-based approach is the obvious upgrade if needed.)
+  const leadCtx: ProcessLeadContext = {
+    input, deps, routing, needsPerson, needsCompany, refreshSet,
+    configFieldsByName, siblingMappingTable, smartFields, injectedDepNames,
+    smartEvalSemaphore: new Semaphore(SMART_EVAL_CONCURRENCY),
+  };
   for (let i = 0; i < leads.length; i += CONCURRENCY) {
     const chunk = leads.slice(i, i + CONCURRENCY);
     const outcomes = await Promise.all(
       chunk.map(lead =>
-        processLead(
-          lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable, smartFields, injectedDepNames,
-        ).then(outcome => {
+        processLead(lead, leadCtx).then(outcome => {
           emitPerLeadProgress();
           return { lead, outcome };
         }),

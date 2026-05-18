@@ -237,10 +237,14 @@ Return ONLY valid JSON (no markdown, no backticks):
 enumOptions is required when fieldType is "enum", omit or set to [] for all other types.`;
 }
 
+// Strip characters that break the prompt structure: quotes, newlines, backticks.
+// Bounded impact — the LLM still classifies correctly on sanitized text.
+const sanitizeInstruction = (s: string) => s.replace(/["\n`]/g, ' ').trim();
+
 export function buildSmartFieldClassificationUserPrompt(
   fields: Array<{ name: string; instruction: string }>,
 ): string {
-  const lines = fields.map(f => `- ${f.name}: "${f.instruction}"`).join('\n');
+  const lines = fields.map(f => `- ${f.name}: "${sanitizeInstruction(f.instruction)}"`).join('\n');
   return `Classify each field as smart or normal, extract dependencies for smart fields, and infer field type:
 
 ${lines}
@@ -278,7 +282,7 @@ export function buildSmartFieldEvalUserPrompt(
     .map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`)
     .join('\n');
   return `Field to evaluate: ${fieldName}
-Condition: "${condition}"
+Condition: "${sanitizeInstruction(condition)}"
 
 Enriched lead data available:
 ${dataLines || '  (no data available)'}

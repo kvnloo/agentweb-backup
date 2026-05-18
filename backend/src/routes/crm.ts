@@ -157,7 +157,7 @@ const enrichmentConfigDeps: ConfigServiceDeps = {
       .join('\n');
 
     try {
-      const llm = mkLLM(process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
+      const llm = mkLLM(process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
       const result = await llm.generateJSONContent<
         Record<string, { isSmartField: boolean; dependencies: string[]; fieldType?: 'string' | 'number' | 'boolean' | 'date' | 'enum'; enumOptions?: string[] }>
       >(

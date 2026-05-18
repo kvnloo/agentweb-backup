@@ -578,6 +578,23 @@ describe('setEnrichmentConfig — validation', () => {
     expect(saved.fields[0].aliasFor).toBe('funding_stage');
   });
 
+  it('never assigns aliasFor to emailDomain even when client sends one', async () => {
+    // emailDomain is computed server-side from the email field. If it were aliased
+    // to a canonical enrichment field, the waterfall would overwrite the computed
+    // value with fetched data — incorrect behavior. This is the regression guard.
+    const deps = makeDeps({
+      llmInferAliases: jest.fn().mockResolvedValue({ emailDomain: 'email_domain' }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'emailDomain', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email_domain' as any },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.fields.find(f => f.name === 'emailDomain')?.aliasFor).toBeUndefined();
+  });
+
   it("accepts a valid aliasFor pointing at a real FIELD_GROUPS field", async () => {
     const deps = makeDeps();
     const config = validConfig({
@@ -765,7 +782,23 @@ describe('setEnrichmentConfig — smart field classification', () => {
   });
 
   it('does NOT re-classify a field whose instruction matches existing smartCondition', async () => {
+    // The stored DB config holds the cached smartCondition — client-supplied
+    // classification keys are stripped and re-loaded from DB (concern #1 fix).
+    const storedConfig = validConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'true when series A or later',
+          smartDependencies: ['funding_stage'],
+        },
+      ],
+    });
     const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(storedConfig),
       writeListConfig: jest.fn().mockResolvedValue(undefined),
       llmClassifySmartFields: jest.fn().mockResolvedValue({}),
     });
@@ -774,18 +807,17 @@ describe('setEnrichmentConfig — smart field classification', () => {
         {
           name: 'isQualified',
           type: 'boolean',
-          instruction: 'true when series A or later',  // same as smartCondition
+          instruction: 'true when series A or later',  // same as stored smartCondition
           include: true,
           overwritePolicy: 'fill_if_empty',
-          smartCondition: 'true when series A or later',
-          smartDependencies: ['funding_stage'],
+          // client does NOT send smartCondition — server must read it from DB
         },
       ],
     });
 
     await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    // instruction == smartCondition → unchanged → NOT in classification call
+    // instruction == stored smartCondition → NOT in classification call
     const classifyCall = (deps.llmClassifySmartFields as jest.Mock).mock.calls[0]?.[0] ?? [];
     const names = classifyCall.map((f: any) => f.name);
     expect(names).not.toContain('isQualified');
@@ -1019,6 +1051,37 @@ describe('setEnrichmentConfig — smart field classification', () => {
     expect(field?.smartDependencies).not.toContain('made_up_field_xyz');
   });
 
+  it('ignores client-supplied notSmartInstruction — uses DB as source of truth', async () => {
+    // Security: a malicious client could send notSmartInstruction === instruction
+    // to permanently suppress LLM classification. Server must discard client values
+    // and restore only from DB. With no stored config, field should be classified.
+    const classifyMock = jest.fn().mockResolvedValue({
+      industry: { isSmartField: false, dependencies: [] },
+    });
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),  // no stored config
+      llmClassifySmartFields: classifyMock,
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'company industry',  // forged by client — must be ignored
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    // Field must appear in classification call despite client-supplied notSmartInstruction
+    const classifyCall = classifyMock.mock.calls[0]?.[0] ?? [];
+    expect(classifyCall.map((f: any) => f.name)).toContain('industry');
+  });
+
   it('stores notSmartInstruction when LLM classifies a field as not smart', async () => {
     const deps = makeDeps({
       llmClassifySmartFields: jest.fn().mockResolvedValue({
@@ -1039,9 +1102,9 @@ describe('setEnrichmentConfig — smart field classification', () => {
   });
 
   it('skips re-classification when notSmartInstruction matches current instruction (cached not-smart)', async () => {
-    const classifyMock = jest.fn().mockResolvedValue({});
-    const deps = makeDeps({ llmClassifySmartFields: classifyMock });
-    const config = validConfig({
+    // DB holds the cached notSmartInstruction — client classification keys are
+    // stripped and restored from DB (concern #1 fix).
+    const storedConfig = validConfig({
       fields: [
         {
           name: 'industry',
@@ -1049,7 +1112,24 @@ describe('setEnrichmentConfig — smart field classification', () => {
           instruction: 'company industry',
           include: true,
           overwritePolicy: 'fill_if_empty',
-          notSmartInstruction: 'company industry',  // cached — same as current instruction
+          notSmartInstruction: 'company industry',
+        },
+      ],
+    });
+    const classifyMock = jest.fn().mockResolvedValue({});
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(storedConfig),
+      llmClassifySmartFields: classifyMock,
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry',  // same as stored notSmartInstruction
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          // client does NOT send notSmartInstruction — server reads from DB
         },
       ],
     });
