@@ -63,6 +63,27 @@ export interface EnrichmentFieldConfig {
    * fills it directly. Undefined for custom fields with no canonical analog.
    */
   aliasFor?: string;
+  /**
+   * Natural-language condition set by the user. Presence marks this as a
+   * "smart field" — its value is COMPUTED in the POST phase using enriched
+   * dependency field values, never fetched directly from a data source.
+   * Populated at config-save time by LLM classification; never sent by client.
+   */
+  smartCondition?: string;
+  /**
+   * Canonical FIELD_GROUPS names needed to evaluate this smart field's condition.
+   * Dependencies absent from the user's config are auto-injected into the
+   * regular enrichment run so they exist before POST evaluation.
+   * Populated at config-save time alongside smartCondition.
+   */
+  smartDependencies?: string[];
+  /**
+   * The instruction text that was last classified as NOT a smart field.
+   * When this equals the current instruction, classification is skipped
+   * (LLM already determined this is a regular field with this exact instruction).
+   * Populated at config-save time; never sent by client.
+   */
+  notSmartInstruction?: string;
 }
 
 export interface EnrichmentConfig {
@@ -172,6 +193,21 @@ export interface OrchestratorDeps {
     enrichmentMetadata: Record<string, EnrichedFieldMeta>;
     ifNotExists: boolean;
   }): Promise<void>;
+
+  /**
+   * Evaluate a smart field's natural-language condition given the lead's
+   * enriched dependency values. Called once per (lead, smart field) in the
+   * POST phase, after all regular waterfall fills are available.
+   * Must fail soft — return { value: null } on error rather than throwing.
+   */
+  evaluateSmartField(input: {
+    lead: LeadRecord;
+    fieldName: string;
+    condition: string;
+    /** Canonical dep name → enriched value, gathered from waterfall fills
+     *  and the lead's existing field data. */
+    depValues: Record<string, string>;
+  }): Promise<{ value: string | null; reasoning: string }>;
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
@@ -214,6 +250,7 @@ function routeFields(
 
   for (const field of config.fields) {
     if (!field.include) continue;
+    if (field.smartCondition) continue;  // smart fields evaluated in POST phase, not fetched
     // Canonical for routing: prefer explicit aliasFor; otherwise the field's own name.
     const canonical = field.aliasFor || field.name;
     let assigned = false;
@@ -308,17 +345,44 @@ interface PerLeadOutcome {
   apolloPersonFailed: boolean;
 }
 
+// Minimal counting semaphore — limits concurrent async operations to `max`.
+class Semaphore {
+  private count: number;
+  private readonly queue: Array<() => void> = [];
+  constructor(private readonly max: number) { this.count = max; }
+  acquire(): Promise<void> {
+    if (this.count > 0) { this.count--; return Promise.resolve(); }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+  release(): void {
+    const next = this.queue.shift();
+    if (next) { next(); } else { this.count++; }
+  }
+}
+
+// Max concurrent smart-field LLM eval calls across all leads in a single run.
+// 20 leads × N smart fields can fan out to 20×N calls without this cap.
+const SMART_EVAL_CONCURRENCY = 15;
+
+interface ProcessLeadContext {
+  input: RunEnrichmentInput;
+  deps: OrchestratorDeps;
+  routing: FieldRouting;
+  needsPerson: boolean;
+  needsCompany: boolean;
+  refreshSet: Set<string>;
+  configFieldsByName: Record<string, EnrichmentFieldConfig>;
+  siblingMappingTable: SiblingFieldMappingTable;
+  smartFields: EnrichmentFieldConfig[];
+  injectedDepNames: Set<string>;
+  smartEvalSemaphore: Semaphore;
+}
+
 async function processLead(
   lead: LeadRecord,
-  input: RunEnrichmentInput,
-  deps: OrchestratorDeps,
-  routing: FieldRouting,
-  needsPerson: boolean,
-  needsCompany: boolean,
-  refreshSet: Set<string>,
-  configFieldsByName: Record<string, EnrichmentFieldConfig>,
-  siblingMappingTable: SiblingFieldMappingTable,
+  ctx: ProcessLeadContext,
 ): Promise<PerLeadOutcome> {
+  const { input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable, smartFields, injectedDepNames, smartEvalSemaphore } = ctx;
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
@@ -473,9 +537,100 @@ async function processLead(
     };
   }
 
-  console.log(`[v3][lead ${lead.leadId}] done in ${Date.now() - leadStart}ms (fills=${allFills.length})`);
+  // Step 4: smart field POST evaluation — fail-soft per field, never fails the lead.
+  // Runs AFTER the waterfall try/catch so a smart field error can't clobber the
+  // regular fills already collected.
+  if (smartFields.length > 0) {
+    // Build a value map keyed by BOTH user-facing name and canonical alias so
+    // dep lookups work regardless of how the user named the dep field.
+    const fillValueMap: Record<string, string> = {};
+    for (const fill of allFills) {
+      fillValueMap[fill.field] = fill.value;
+      const fieldCfg = configFieldsByName[fill.field];
+      if (fieldCfg?.aliasFor) fillValueMap[fieldCfg.aliasFor] = fill.value;
+    }
+    // Reverse alias map: canonical name → user-facing field name(s) in workingConfig.
+    // Needed because customFields is keyed by user-facing name, not canonical name.
+    const canonicalToUserFieldName: Record<string, string> = {};
+    for (const [fieldName, fieldCfg] of Object.entries(configFieldsByName)) {
+      if (fieldCfg.aliasFor) canonicalToUserFieldName[fieldCfg.aliasFor] = fieldName;
+    }
+
+    // Fallback: pull dep values from the lead's existing fields (pre-run data).
+    for (const sf of smartFields) {
+      for (const dep of sf.smartDependencies ?? []) {
+        if (fillValueMap[dep] != null && fillValueMap[dep].trim()) continue;
+        // Check customFields by canonical name (injected deps) and by user-facing name (aliased fields).
+        const customValDirect = enrichedLead.customFields?.[dep];
+        const userFacingName = canonicalToUserFieldName[dep];
+        const customValAlias = userFacingName ? enrichedLead.customFields?.[userFacingName] : undefined;
+        const existing =
+          (typeof customValDirect === 'string' && customValDirect.trim()) ? customValDirect :
+          (typeof customValAlias === 'string' && customValAlias.trim()) ? customValAlias :
+          null;
+        if (existing) fillValueMap[dep] = existing;
+      }
+    }
+
+    // Known limitation: smart fields cannot depend on other smart fields.
+    // smartDependencies only accepts canonical FIELD_GROUPS names — user-field
+    // names (including other smart fields like `isQualified`) are filtered out
+    // at classification time. A smart field B whose instruction references
+    // another smart field A will receive no value for A in its depValues, and
+    // the LLM eval will likely return null. Fix requires a separate
+    // `smartFieldDependencies` array + topological sort before this loop.
+    for (const sf of smartFields) {
+      const depValues: Record<string, string> = {};
+      for (const dep of sf.smartDependencies ?? []) {
+        if (fillValueMap[dep]) depValues[dep] = fillValueMap[dep];
+      }
+      // Skip eval when no dep data is available — LLM would return null anyway.
+      const hasDeps = (sf.smartDependencies ?? []).length > 0;
+      if (hasDeps && Object.keys(depValues).length === 0) {
+        console.log(`[v3][lead ${lead.leadId}] smart-eval SKIP field=${sf.name} (no dep data)`);
+        continue;
+      }
+      const smartStart = Date.now();
+      console.log(`[v3][lead ${lead.leadId}] smart-eval START field=${sf.name} deps=${JSON.stringify(Object.keys(depValues))}`);
+      await smartEvalSemaphore.acquire();
+      try {
+        const evalResult = await deps.evaluateSmartField({
+          lead: enrichedLead,
+          fieldName: sf.name,
+          condition: sf.smartCondition!,
+          depValues,
+        });
+        console.log(`[v3][lead ${lead.leadId}] smart-eval DONE field=${sf.name} value=${evalResult.value} in ${Date.now() - smartStart}ms`);
+        if (evalResult.value !== null) {
+          allFills.push({
+            field: sf.name,
+            value: evalResult.value,
+            meta: {
+              source: 'llm',
+              enrichedAt: new Date().toISOString(),
+              confidence: 'medium',
+              ...(evalResult.reasoning ? { sourceQuote: evalResult.reasoning } : {}),
+            },
+          });
+        }
+      } catch (err) {
+        // Fail soft — smart field miss never fails the whole lead.
+        console.warn(`[v3][lead ${lead.leadId}] smart-eval failed for ${sf.name}: ${(err as Error).message}`);
+      } finally {
+        smartEvalSemaphore.release();
+      }
+    }
+  }
+
+  // Strip injected dep fills — they were never part of the user's config so should
+  // not be persisted on the lead. allFills stays intact above for fillValueMap use.
+  const writableFills = injectedDepNames.size > 0
+    ? allFills.filter(f => !injectedDepNames.has(f.field))
+    : allFills;
+
+  console.log(`[v3][lead ${lead.leadId}] done in ${Date.now() - leadStart}ms (fills=${writableFills.length})`);
   return {
-    fills: allFills,
+    fills: writableFills,
     perGroupTierFills,
     failureCategory: null,
     apolloOrgFailed: apolloCtx.orgFetchFailed,
@@ -560,20 +715,81 @@ export async function runEnrichment(
   });
   console.log(`[v3] loadLeads → ${leads.length} lead(s) in ${Date.now() - loadStart}ms (leadIds filter: ${leadIdsFilter ? leadIdsFilter.length : 'none'})`);
 
-  const { routing, needsPerson, needsCompany } = routeFields(input.config);
+  // ─── PRE: smart field analysis ────────────────────────────────────────────────
+  // Separate smart fields (computed/derived) from normal fields (fetchable).
+  // Smart fields are excluded from the regular enrichment routing; their
+  // dependency canonical fields are injected as synthetic fields so the
+  // waterfall populates them, then the POST phase evaluates the smart fields.
+  //
+  // Limitation: smart field chaining is NOT supported. A smart field can only
+  // depend on canonical FIELD_GROUPS data fields (funding_stage, employee_count,
+  // etc.) — it cannot depend on another smart field's computed output. See the
+  // POST eval loop below and enrichmentConfigService validDeps filter for detail.
+  const smartFields = input.config.fields.filter(f => f.smartCondition && f.include);
+
+  // Canonical names already covered by the user's non-smart config fields.
+  const existingCanonicals = new Set<string>();
+  for (const f of input.config.fields) {
+    if (f.smartCondition) continue;
+    existingCanonicals.add(f.aliasFor ?? f.name);
+  }
+
+  // Deps not yet in the config → inject as synthetic fields (canonical name,
+  // empty instruction, fill_if_empty policy, result stays on the lead).
+  // fill_if_empty is intentional: if the lead already has the dep value,
+  // the waterfall skips it and the fillValueMap fallback reads it from
+  // enrichedLead.customFields instead — that path is load-bearing.
+  // Injected fills are stripped before writeLeadOutcome (writableFills filter).
+  const injectedDepNames = new Set<string>();
+  const injectedDeps: EnrichmentFieldConfig[] = [];
+  for (const sf of smartFields) {
+    for (const dep of sf.smartDependencies ?? []) {
+      if (!existingCanonicals.has(dep) && !injectedDepNames.has(dep)) {
+        injectedDeps.push({
+          name: dep,
+          type: 'string',
+          instruction: '',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+        });
+        injectedDepNames.add(dep);
+      }
+    }
+  }
+
+  // Working config: smart fields removed, injected deps added.
+  // Used for routing + waterfall; writeLeadOutcome still uses input.config
+  // so smart field overwrite policies are respected.
+  const workingConfig: EnrichmentConfig =
+    smartFields.length === 0 && injectedDeps.length === 0
+      ? input.config
+      : {
+          ...input.config,
+          fields: [
+            ...input.config.fields.filter(f => !f.smartCondition),
+            ...injectedDeps,
+          ],
+        };
+
+  if (injectedDeps.length > 0) {
+    console.log(`[v3] injected ${injectedDeps.length} smart-field dep(s): ${injectedDeps.map(d => d.name).join(',')}`);
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const { routing, needsPerson, needsCompany } = routeFields(workingConfig);
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
 
   // Build sibling field mapping table once per run (one LLM call for unaliased
   // fields, canonical match is free). Passed to every processLead call.
-  const siblingMappingTable = await buildSiblingFieldMappingTable(input.config.fields);
+  const siblingMappingTable = await buildSiblingFieldMappingTable(workingConfig.fields);
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   const fieldAliasMap: Record<string, string> = {};
-  for (const f of input.config.fields) {
+  for (const f of workingConfig.fields) {
     configFieldsByName[f.name] = f;
     if (f.aliasFor) fieldAliasMap[f.name] = f.aliasFor;
   }
 
-  const includedFieldNames = input.config.fields
+  const includedFieldNames = workingConfig.fields
     .filter(f => f.include)
     .map(f => f.name);
 
@@ -617,13 +833,16 @@ export async function runEnrichment(
 
   // Phase 1 keeps the loop simple — slice by chunks to bound concurrency.
   // (A semaphore-based approach is the obvious upgrade if needed.)
+  const leadCtx: ProcessLeadContext = {
+    input, deps, routing, needsPerson, needsCompany, refreshSet,
+    configFieldsByName, siblingMappingTable, smartFields, injectedDepNames,
+    smartEvalSemaphore: new Semaphore(SMART_EVAL_CONCURRENCY),
+  };
   for (let i = 0; i < leads.length; i += CONCURRENCY) {
     const chunk = leads.slice(i, i + CONCURRENCY);
     const outcomes = await Promise.all(
       chunk.map(lead =>
-        processLead(
-          lead, input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable,
-        ).then(outcome => {
+        processLead(lead, leadCtx).then(outcome => {
           emitPerLeadProgress();
           return { lead, outcome };
         }),
