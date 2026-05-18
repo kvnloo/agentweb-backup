@@ -199,6 +199,97 @@ ${ctx}
 Return ONLY a JSON array of { "fields": [...], "searchTemplate": "..." } objects.`;
 }
 
+/**
+ * Smart field classification — identifies which user-defined fields describe
+ * computed/derived values (conditions, scores, rules) vs. directly fetchable
+ * data points. Also extracts canonical dependency fields for smart fields.
+ *
+ * Called once per config save (not per enrichment run).
+ */
+export function buildSmartFieldClassificationSystemPrompt(canonicalFieldList: string): string {
+  return `You classify CRM enrichment fields as "smart" (computed/derived) or "normal" (directly fetchable), and infer their value type.
+
+A field IS smart when its instruction describes:
+- A condition or rule: "true when funding > $1M", "qualified if series A or later"
+- A derived score or rating: "0-100 score based on company size and funding stage"
+- A category computed from other data: "tier A/B/C based on employee count and revenue"
+- Any value that must be COMPUTED from other fields, not fetched from a web or data source
+
+A field is NOT smart when its instruction describes:
+- A factual data point that can be found by searching the web or querying a data API
+- Examples of non-smart: "company funding stage", "number of employees", "tech stack used"
+
+For smart fields, identify which canonical field names are needed as inputs to evaluate the condition.
+Only pick from the canonical fields listed below — do NOT invent field names.
+
+For fieldType, infer from the field name and instruction:
+- "boolean" — yes/no flag, qualifies/disqualifies, true/false condition (e.g. isQualified, hasWebsite)
+- "number" — score, count, amount, percentage, numeric rating (e.g. employeeCount, fundingScore)
+- "date" — any date or timestamp value (e.g. foundedYear, lastFundingDate, lastContactedAt)
+- "enum" — fixed set of named categories explicitly mentioned in the instruction (e.g. "tier A/B/C", "small/medium/large", "low/medium/high"). When enum, also list the exact options in enumOptions.
+- "string" — free-form text, labels, URLs, names, anything not fitting the above
+
+Available canonical fields:
+${canonicalFieldList}
+
+Return ONLY valid JSON (no markdown, no backticks):
+{ "<fieldName>": { "isSmartField": true|false, "dependencies": [...], "fieldType": "boolean"|"number"|"date"|"enum"|"string", "enumOptions": ["opt1", ...] } }
+enumOptions is required when fieldType is "enum", omit or set to [] for all other types.`;
+}
+
+// Strip characters that break the prompt structure: quotes, newlines, backticks.
+// Bounded impact — the LLM still classifies correctly on sanitized text.
+const sanitizeInstruction = (s: string) => s.replace(/["\n`]/g, ' ').trim();
+
+export function buildSmartFieldClassificationUserPrompt(
+  fields: Array<{ name: string; instruction: string }>,
+): string {
+  const lines = fields.map(f => `- ${f.name}: "${sanitizeInstruction(f.instruction)}"`).join('\n');
+  return `Classify each field as smart or normal, extract dependencies for smart fields, and infer field type:
+
+${lines}
+
+Return JSON: { "<fieldName>": { "isSmartField": true|false, "dependencies": [...], "fieldType": "boolean"|"number"|"date"|"enum"|"string", "enumOptions": ["opt1", ...] }, ... }`;
+}
+
+/**
+ * Smart field evaluation — given the user's natural language condition and the
+ * lead's enriched dependency field values, compute the smart field's value.
+ *
+ * Called once per (lead, smart field) pair during the POST enrichment phase.
+ */
+export function buildSmartFieldEvalSystemPrompt(): string {
+  return `You evaluate a derived CRM field condition using enriched lead data.
+
+Rules:
+- Base your answer on the provided enriched data plus standard domain knowledge (e.g. funding stage terminology, industry classifications, common abbreviations).
+- For boolean conditions: return "true" or "false" as a string value.
+- For categorical conditions: return the matching category string.
+- For numeric or scored conditions: return the computed value as a string.
+- If the condition has multiple criteria (AND/OR), evaluate accordingly — partial data can satisfy OR conditions.
+- Return null ONLY when the available data is genuinely insufficient to make any determination.
+
+Return ONLY valid JSON (no markdown, no backticks):
+{ "value": "<string>" | null, "reasoning": "<≤20-word explanation>" }`;
+}
+
+export function buildSmartFieldEvalUserPrompt(
+  fieldName: string,
+  condition: string,
+  depValues: Record<string, string>,
+): string {
+  const dataLines = Object.entries(depValues)
+    .map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`)
+    .join('\n');
+  return `Field to evaluate: ${fieldName}
+Condition: "${sanitizeInstruction(condition)}"
+
+Enriched lead data available:
+${dataLines || '  (no data available)'}
+
+Evaluate the condition and return the field value.`;
+}
+
 export function buildSuggestEnrichmentSystemPrompt(): string {
   return `You are a data enrichment specialist for a B2B CRM system.
 
