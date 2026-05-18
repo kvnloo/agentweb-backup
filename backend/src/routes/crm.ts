@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, checkEmailFormat } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
 import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
@@ -5112,6 +5112,9 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
     const eligibleCount = eligibleLeads.length;
 
+    // Run format verification on the HTML content
+    const formatWarnings = checkEmailFormat(htmlContent || '');
+
     if (variables.length === 0) {
       // No variables used — all eligible leads are ready
       return res.json({
@@ -5120,6 +5123,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
         notReadyCount: 0,
         variables: [],
         variableCoverage: {},
+        formatWarnings,
       });
     }
 
@@ -5149,6 +5153,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
       notReadyCount: eligibleCount - readyCount,
       variables,
       variableCoverage,
+      formatWarnings,
     });
   } catch (error) {
     console.error('Error preparing group email:', error);
@@ -5510,14 +5515,10 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       bodyContent = bodyContent.substring(0, 200000);
     }
 
-    // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
-    // Doing this at import time avoids the LLM call at every test-send or real send.
-    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
-
     return res.json({
       success: true,
       title: extractedTitle,
-      message: inlinedContent,
+      message: bodyContent,
     });
   } catch (error: any) {
     console.error('Error loading HTML from URL:', error.message || error);
