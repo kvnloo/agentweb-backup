@@ -15,6 +15,21 @@ jest.mock('../utils/tokenUtils', () => ({
     getTokenStatus: jest.fn().mockReturnValue('active'),
     formatExpiryMessage: jest.fn().mockReturnValue('Expires in 30 days')
 }));
+jest.mock('../services/linkedInOutreachService', () => ({
+    linkedInOutreachService: {
+        getStatusesForAccounts: jest.fn().mockResolvedValue(new Map()),
+        deleteAccount: jest.fn().mockResolvedValue(undefined),
+    }
+}));
+jest.mock('../services/fathomApiService', () => ({
+    FathomApiService: jest.fn().mockImplementation(() => ({
+        validateApiKey: jest.fn().mockResolvedValue(true),
+        deleteWebhook: jest.fn().mockResolvedValue(undefined),
+    }))
+}));
+jest.mock('../services/subscriptionService', () => ({
+    getAllowedConnectedAccounts: jest.fn().mockResolvedValue([])
+}));
 
 const app = express();
 app.use(express.json());
@@ -44,7 +59,7 @@ describe('Connected Accounts Routes', () => {
                 }
             ];
 
-            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
 
             const response = await request(app).get('/api/oauth/connected-accounts');
 
@@ -74,7 +89,7 @@ describe('Connected Accounts Routes', () => {
                 }
             ];
 
-            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
 
             const response = await request(app).get('/api/oauth/connected-accounts');
 
@@ -101,7 +116,7 @@ describe('Connected Accounts Routes', () => {
                 }
             ];
 
-            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
             const { getTokenStatus, formatExpiryMessage } = require('../utils/tokenUtils');
 
             const response = await request(app).get('/api/oauth/connected-accounts');
@@ -134,7 +149,7 @@ describe('Connected Accounts Routes', () => {
                 }
             ];
 
-            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
 
             const response = await request(app).get('/api/oauth/connected-accounts');
 
@@ -158,7 +173,7 @@ describe('Connected Accounts Routes', () => {
                 }
             ];
 
-            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
             const { getTokenStatus, formatExpiryMessage } = require('../utils/tokenUtils');
 
             const response = await request(app).get('/api/oauth/connected-accounts');
@@ -168,11 +183,80 @@ describe('Connected Accounts Routes', () => {
             expect(formatExpiryMessage).toHaveBeenCalled();
         });
 
-        it('returns 500 when getAccountsByUserId throws', async () => {
-            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockRejectedValue(new Error('DB error'));
+        it('returns 500 when getAccountsByUserIdIncludingOrgShared throws', async () => {
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockRejectedValue(new Error('DB error'));
 
             const response = await request(app).get('/api/oauth/connected-accounts');
             expect(response.status).toBe(500);
+        });
+
+        it('includes org-shared unipile accounts from other org members', async () => {
+            const ownAccount = {
+                platform: 'gmail',
+                account_id: 'gmail-own',
+                account_name: 'My Gmail',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                sharedWithOrg: false,
+                config: {
+                    account_type: 'gmail',
+                    email: 'me@example.com',
+                    access_token: 'own-token',
+                    refresh_token: 'own-refresh',
+                    token_expires_at: Date.now() + 3600000,
+                    granted_scopes: [],
+                }
+            };
+            const sharedUnipile = {
+                platform: 'unipile',
+                account_id: 'uni-shared-001',
+                account_name: 'Rui LinkedIn Outreach',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                sharedWithOrg: true,
+                config: {
+                    account_type: 'personal',
+                    unipile_account_id: 'uni-shared-001',
+                    access_token: 'uni-token',
+                    token_expires_at: 9999999999999,
+                }
+            };
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue([ownAccount, sharedUnipile]);
+            const { linkedInOutreachService } = require('../services/linkedInOutreachService');
+            linkedInOutreachService.getStatusesForAccounts.mockResolvedValue(new Map([['uni-shared-001', 'OK']]));
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            const ids = response.body.accounts.map((a: any) => a.account_id);
+            expect(ids).toContain('uni-shared-001');
+            expect(ids).toContain('gmail-own');
+        });
+
+        it('does not include org-shared accounts when getAccountsByUserIdIncludingOrgShared only returns own accounts', async () => {
+            const ownAccount = {
+                platform: 'unipile',
+                account_id: 'uni-own-001',
+                account_name: 'My LinkedIn Outreach',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                sharedWithOrg: false,
+                config: {
+                    account_type: 'personal',
+                    unipile_account_id: 'uni-own-001',
+                    access_token: 'own-token',
+                    token_expires_at: 9999999999999,
+                }
+            };
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue([ownAccount]);
+            const { linkedInOutreachService } = require('../services/linkedInOutreachService');
+            linkedInOutreachService.getStatusesForAccounts.mockResolvedValue(new Map([['uni-own-001', 'OK']]));
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts).toHaveLength(1);
+            expect(response.body.accounts[0].account_id).toBe('uni-own-001');
         });
     });
 
