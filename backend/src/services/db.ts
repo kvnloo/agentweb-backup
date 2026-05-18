@@ -7186,28 +7186,35 @@ export const orgDb = {
   },
 
   async getOrgMembers(orgId: string): Promise<User[]> {
-    const allItems: any[] = [];
+    const allItems: User[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     do {
-      const result = await dynamodb.scan({
+      const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
-        ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
+        IndexName: "OrgIdIndex",
+        KeyConditionExpression: "orgId = :orgId",
+        ExpressionAttributeValues: { ":orgId": orgId },
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
-      allItems.push(...(result.Items || []));
+      for (const item of result.Items || []) {
+        if (typeof item.userId === "string" && !item.userId.startsWith("deleted_")) {
+          allItems.push(item as User);
+        }
+      }
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
-    return allItems as User[];
+    return allItems;
   },
 
   async getOrgMemberCount(orgId: string): Promise<number> {
     let total = 0;
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     do {
-      const result = await dynamodb.scan({
+      const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        IndexName: "OrgIdIndex",
+        KeyConditionExpression: "orgId = :orgId",
+        FilterExpression: "NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         Select: "COUNT",
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
