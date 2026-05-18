@@ -688,13 +688,14 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       findLinkedInUrl: (lead: LeadRecord) =>
         findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
 
-      findUnipileCompany: async (lead: LeadRecord, companyLinkedInUrl?: string): Promise<any | null> => {
+      findUnipileCompany: async (lead: LeadRecord, companyLinkedInUrl?: string, profileOnly?: boolean): Promise<{ companyRaw: any; personProfileRaw?: any } | null> => {
         try {
           const { linkedInOutreachService } = await import('./linkedInOutreachService');
           const accountId = await linkedInOutreachService.resolveAccountId(userId);
           if (!accountId) return null;
 
           let companyIdentifier: string | null = null;
+          let personProfileRaw: any | undefined;
 
           // Approach 2: company LinkedIn URL → extract identifier directly (1 API call)
           if (companyLinkedInUrl) {
@@ -702,11 +703,13 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           }
 
           // Approach 1: person LinkedIn URL → profile → current work_experience company_id (2 API calls)
+          // Profile raw data is preserved for person field enrichment (no extra API call).
           if (!companyIdentifier && lead.linkedin) {
             try {
               const profileResult = await getUnipileProfileService().getProfile(lead.linkedin, accountId);
-              if (profileResult?.found && profileResult.rawData?.work_experience) {
-                const current = (profileResult.rawData.work_experience as any[]).find((e) => !e.end);
+              if (profileResult?.found && profileResult.rawData) {
+                personProfileRaw = profileResult.rawData;
+                const current = (profileResult.rawData.work_experience as any[] | undefined)?.find((e) => !e.end);
                 if (current?.company_id) companyIdentifier = String(current.company_id);
               }
             } catch {
@@ -715,6 +718,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           }
 
           // Approach 3: name + company search → profile → company_id (3 API calls)
+          // Profile raw data is preserved for person field enrichment (no extra API call).
           if (!companyIdentifier && lead.firstName && lead.lastName && lead.company) {
             try {
               const searchResult = await linkedInOutreachService.searchPeople(accountId, {
@@ -725,8 +729,9 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               if (first?.public_identifier && unipileNameMatches(first, lead.firstName, lead.lastName)) {
                 const profileUrl = `https://www.linkedin.com/in/${first.public_identifier}`;
                 const profileResult = await getUnipileProfileService().getProfile(profileUrl, accountId);
-                if (profileResult?.found && profileResult.rawData?.work_experience) {
-                  const current = (profileResult.rawData.work_experience as any[]).find((e) => !e.end);
+                if (profileResult?.found && profileResult.rawData) {
+                  personProfileRaw = profileResult.rawData;
+                  const current = (profileResult.rawData.work_experience as any[] | undefined)?.find((e) => !e.end);
                   if (current?.company_id) companyIdentifier = String(current.company_id);
                 }
               }
@@ -735,11 +740,13 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
             }
           }
 
-          if (!companyIdentifier) return null;
+          // Return person profile even if no company identifier found — caller can
+          // still use personProfileRaw to fill person fields.
+          if (!companyIdentifier || profileOnly) return personProfileRaw ? { companyRaw: null, personProfileRaw } : null;
 
           const companyResult = await getUnipileCompanyService().getCompany(companyIdentifier, accountId);
-          if (!companyResult.found || !companyResult.rawData) return null;
-          return companyResult.rawData;
+          if (!companyResult.found || !companyResult.rawData) return personProfileRaw ? { companyRaw: null, personProfileRaw } : null;
+          return { companyRaw: companyResult.rawData, personProfileRaw };
         } catch (err) {
           console.warn('[v3 deps] findUnipileCompany failed:', (err as Error).message);
           return null;

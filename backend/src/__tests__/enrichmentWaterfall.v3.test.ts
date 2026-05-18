@@ -12,6 +12,7 @@ import {
   runWaterfall,
   createApolloFetchContext,
   APOLLO_GROUP_COVERAGE,
+  UNIPILE_PERSON_COVERAGE,
   type WaterfallDeps,
   type RunWaterfallInput,
   type ApolloFetchContext,
@@ -629,7 +630,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
   it('fires for company group with remaining fields; fills via LLM; meta=unipile', async () => {
     const companyRaw = { name: 'Acme Corp', description: 'A SaaS company', employee_count: 42 };
     const deps = makeDeps({
-      findUnipileCompany: jest.fn().mockResolvedValue(companyRaw),
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
         filled: { company_description: 'A SaaS company', employee_count: '42' },
         missing: [],
@@ -707,7 +708,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
     expect(result.tierFills.apollo).toBe(0);
   });
 
-  it('does NOT fire for person entity groups', async () => {
+  it('does NOT fire for person entity groups when Apollo already fills all fields', async () => {
     const deps = makeDeps({
       fetchApolloPerson: jest.fn().mockResolvedValue(apolloResult({ first_name: 'Jane' })),
       findUnipileCompany: jest.fn(),
@@ -746,7 +747,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
 
   it('does not fill field when LLM returns empty string for it', async () => {
     const deps = makeDeps({
-      findUnipileCompany: jest.fn().mockResolvedValue({ name: 'Acme' }),
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: { name: 'Acme' } }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { company_description: '' }, missing: [] }),
       fetchWebForGroup: jest.fn().mockResolvedValue(null),
     });
@@ -762,7 +763,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
   it('calls extractFieldsViaLLM with full JSON of company raw data', async () => {
     const companyRaw = { name: 'Acme', industry: ['SaaS'], employee_count: 100 };
     const deps = makeDeps({
-      findUnipileCompany: jest.fn().mockResolvedValue(companyRaw),
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: ['company_description'] }),
       fetchWebForGroup: jest.fn().mockResolvedValue(null),
     });
@@ -775,11 +776,12 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
     expect(llmCall.tier).toBe('apollo');
     expect(llmCall.sourceContext).toBe(JSON.stringify(companyRaw));
     expect(llmCall.fields).toContain('company_description');
+    // sourceContext is the companyRaw JSON, not the wrapper object
   });
 
   it('accounts for company fills under apollo in tierFills when no web needed', async () => {
     const deps = makeDeps({
-      findUnipileCompany: jest.fn().mockResolvedValue({ name: 'Acme' }),
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: { name: 'Acme' } }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
         filled: { company_description: 'A company' },
         missing: [],
@@ -792,5 +794,239 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
 
     expect(result.tierFills).toEqual({ crm: 0, apollo: 1, web: 0, missing: 0 });
     expect(result.missing).toEqual([]);
+  });
+});
+
+// ─── Tier 3.5c (Unipile person enrichment) ────────────────────────────────────
+
+describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
+  const personProfileRaw = {
+    first_name: 'Jane',
+    last_name: 'Doe',
+    headline: 'VP Marketing at Acme',
+    location: 'San Francisco, California, United States',
+    public_identifier: 'jane-doe-acme',
+    work_experience: [
+      { company: 'Acme', position: 'VP Marketing', start: '1/1/2023', end: null, company_id: '111' },
+      { company: 'OldCo', position: 'Manager', start: '1/1/2020', end: '12/31/2022', company_id: '222' },
+    ],
+    education: [{ school: 'MIT', degree: 'MBA' }],
+  };
+
+  it('fires for person group when Apollo misses fields; direct-maps known fields', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name', 'last_name', 'title', 'location', 'linkedin_url'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
+    expect(result.fields.find(f => f.field === 'last_name')?.value).toBe('Doe');
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
+    expect(result.fields.find(f => f.field === 'location')?.value).toBe('San Francisco, California, United States');
+    expect(result.fields.find(f => f.field === 'linkedin_url')?.value).toBe('https://www.linkedin.com/in/jane-doe-acme');
+    expect(result.fields.every(f => f.meta.source === 'api' && f.meta.provider === 'unipile')).toBe(true);
+  });
+
+  it('calls findUnipileCompany with profileOnly=true for person groups', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+
+    expect(deps.findUnipileCompany).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      true,
+    );
+  });
+
+  it('uses linkedin_url filled by 3.5b when lead.linkedin is absent', async () => {
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-doe-acme'),
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const lead = makeLead({ firstName: 'Jane', lastName: 'Doe', company: 'Acme' });
+    await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['linkedin_url', 'first_name'], lead }),
+      deps,
+    );
+
+    const callLead = (deps.findUnipileCompany as jest.Mock).mock.calls[0][0];
+    expect(callLead.linkedin).toBe('https://www.linkedin.com/in/jane-doe-acme');
+  });
+
+  it('falls through to LLM for fields not in direct map', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { seniority: 'vp' }, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['seniority'] }),
+      deps,
+    );
+
+    expect(deps.extractFieldsViaLLM).toHaveBeenCalled();
+    expect(result.fields.find(f => f.field === 'seniority')?.value).toBe('vp');
+  });
+
+  it('skips LLM when direct map fills all remaining fields', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name', 'last_name'] }),
+      deps,
+    );
+
+    // direct map fills first_name + last_name → LLM called with empty remaining
+    const llmCall = (deps.extractFieldsViaLLM as jest.Mock).mock.calls[0];
+    if (llmCall) {
+      expect(llmCall[0].fields).toHaveLength(0);
+    }
+  });
+
+  it('maps tenure_at_company and prior_companies for person_career group', async () => {
+    jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z').getTime());
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_career', requestedFields: ['tenure_at_company', 'prior_companies', 'education'] }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'prior_companies')?.value).toBe('OldCo');
+    expect(result.fields.find(f => f.field === 'education')?.value).toBe('MIT, MBA');
+    expect(result.fields.find(f => f.field === 'tenure_at_company')?.value).toBeDefined();
+  });
+
+  it('smart company match — picks correct job when multiple concurrent roles', async () => {
+    const multiJobProfile = {
+      ...personProfileRaw,
+      work_experience: [
+        { company: 'SideProject', position: 'Advisor', start: '1/1/2024', end: null, company_id: '333' },
+        { company: 'Acme', position: 'VP Marketing', start: '1/1/2023', end: null, company_id: '111' },
+      ],
+    };
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw: multiJobProfile }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['title'],
+        lead: makeLead({ company: 'Acme' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
+  });
+
+  it('gracefully skips when findUnipileCompany returns null for person group', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue(null),
+      fetchWebForGroup: jest.fn().mockResolvedValue(null),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+
+    expect(result.missing).toContain('first_name');
+  });
+
+  it('gracefully skips when personProfileRaw is absent in result', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null }),
+      fetchWebForGroup: jest.fn().mockResolvedValue(null),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+
+    expect(result.missing).toContain('first_name');
+  });
+
+  it('maps recent_role_change_date from current work_experience start', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_career', requestedFields: ['recent_role_change_date'] }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'recent_role_change_date')?.value).toBe('1/1/2023');
+  });
+
+  it('maps email and phone from contact_info when present (Sales Nav accounts)', async () => {
+    const profileWithContact = {
+      ...personProfileRaw,
+      contact_info: {
+        emails: [{ address: 'jane@acme.com' }],
+        phones: [{ number: '+1-555-0100' }],
+      },
+    };
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw: profileWithContact }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['email', 'phone'] }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'email')?.value).toBe('jane@acme.com');
+    expect(result.fields.find(f => f.field === 'phone')?.value).toBe('+1-555-0100');
+  });
+
+  it('gracefully skips contact_info when absent (normal LinkedIn accounts)', async () => {
+    const deps = makeDeps({
+      findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
+      fetchWebForGroup: jest.fn().mockResolvedValue(null),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['email', 'phone'] }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'email')).toBeUndefined();
+    expect(result.fields.find(f => f.field === 'phone')).toBeUndefined();
+  });
+});
+
+// ─── UNIPILE_PERSON_COVERAGE map ──────────────────────────────────────────────
+
+describe('UNIPILE_PERSON_COVERAGE', () => {
+  it('covers identity fields', () => {
+    expect(UNIPILE_PERSON_COVERAGE.person_identity).toEqual(
+      expect.arrayContaining(['first_name', 'last_name', 'title', 'location', 'linkedin_url']),
+    );
+  });
+
+  it('covers career fields', () => {
+    expect(UNIPILE_PERSON_COVERAGE.person_career).toEqual(
+      expect.arrayContaining(['tenure_at_company', 'prior_companies', 'education', 'recent_role_change_date']),
+    );
   });
 });
