@@ -24,9 +24,10 @@ This design moves access control from the **per-user, per-item** model to a **pe
 1. Add admin-controlled, org-wide sharing for five entity types: KB-bearing Tasks, HtmlTemplates, Landing Pages, WorkPlans, and Skills.
 2. Replace ownership-of-orgId-on-items with **dynamic lookup**: an item belongs to whichever org its owner currently belongs to.
 3. Per-feature editor lists on the Organization record, assigned by the admin.
-4. When a member is removed from an org, the admin chooses per-feature what happens to their items (transfer to admin, delete, or let them leave with the user).
-5. Preserve current visibility behavior for WorkPlans and Skills (existing orgs continue to see each other's plans / skills post-migration).
-6. Audit Brand Guidelines and Marketing Strategy (the other two "pillars" xCures mentioned) to confirm they org-share as expected; fix only if broken.
+4. Add editor-list controls for the two existing "pillars" — Brand Guidelines and Marketing Strategy — which remain always viewable by the org (no enable toggle) but gain admin-controlled edit permissions.
+5. When a member is removed from an org, the admin chooses per-feature what happens to their items (transfer to admin, delete, or let them leave with the user).
+6. Preserve current visibility behavior for WorkPlans and Skills (existing orgs continue to see each other's plans / skills post-migration).
+7. Audit Brand Guidelines and Marketing Strategy view-sharing today; fix only if broken.
 
 ## 3. Non-Goals
 
@@ -105,11 +106,16 @@ Add a new field on `Organization` (in `AW-Organizations`):
 interface Organization {
   // existing fields: orgId, ownerUserId, name, maxMembers, pendingInvites, marketStrategy, brandGuidelines, ...
   shareSettings?: {
-    knowledgeBase:  { enabled: boolean; editors: string[] };
-    htmlTemplates:  { enabled: boolean; editors: string[] };
-    landingPages:   { enabled: boolean; editors: string[] };
-    workPlans:      { enabled: boolean; editors: string[] };
-    skills:         { enabled: boolean; editors: string[] };
+    // Toggleable features: view is granted to org members only when enabled === true.
+    knowledgeBase:     { enabled: boolean; editors: string[] };
+    htmlTemplates:     { enabled: boolean; editors: string[] };
+    landingPages:      { enabled: boolean; editors: string[] };
+    workPlans:         { enabled: boolean; editors: string[] };
+    skills:            { enabled: boolean; editors: string[] };
+
+    // Always-on features: view is always shared with org members. Admin only controls editors.
+    brandGuidelines:   { editors: string[] };
+    marketingStrategy: { editors: string[] };
   };
 }
 ```
@@ -118,7 +124,13 @@ interface Organization {
 
 The org owner is **implicitly** always an editor of every feature. They do not need to appear in any `editors` list. This is enforced in the permission helper, not in the data.
 
-Default value for new orgs and orgs without the field: all five features `{ enabled: false, editors: [] }`. This implements Filipe's opt-out default.
+**Toggleable features** (`knowledgeBase`, `htmlTemplates`, `landingPages`, `workPlans`, `skills`) have an `enabled` flag controlling whether org members can view items of that type at all.
+
+**Always-on features** (`brandGuidelines`, `marketingStrategy`) have **no `enabled` flag** because their view sharing is already org-wide today and the customer relies on that behavior. Admins only control who can *edit*.
+
+Default value for new orgs and orgs without the field:
+- All five toggleable features: `{ enabled: false, editors: [] }` — Filipe's opt-out default.
+- Both always-on features: `{ editors: [] }` — visible to all org members; only org owner can edit.
 
 ### 5.2 No per-item sharing fields
 
@@ -137,11 +149,15 @@ It trades that simplicity for read-time lookups (one `getUserById` per non-owned
 Create `backend/src/services/orgShareService.ts`:
 
 ```typescript
-type Feature = 'knowledgeBase' | 'htmlTemplates' | 'landingPages' | 'workPlans' | 'skills';
+type ToggleableFeature = 'knowledgeBase' | 'htmlTemplates' | 'landingPages' | 'workPlans' | 'skills';
+type AlwaysOnFeature   = 'brandGuidelines' | 'marketingStrategy';
+type Feature           = ToggleableFeature | AlwaysOnFeature;
 
 interface ItemLike { userId?: string; }  // each entity exposes the owner's userId
 interface UserLike { userId: string; orgId?: string; orgRole?: 'owner' | 'member'; }
 interface OrgLike { orgId: string; ownerUserId: string; shareSettings?: ... }
+
+const ALWAYS_ON: ReadonlySet<Feature> = new Set<Feature>(['brandGuidelines', 'marketingStrategy']);
 
 // Required: callers pass ownerOrgId — pre-resolved to keep the helper synchronous.
 export function canViewItem(
@@ -154,7 +170,8 @@ export function canViewItem(
   if (item.userId === user.userId) return true;
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
-  return org.shareSettings?.[feature]?.enabled === true;
+  if (ALWAYS_ON.has(feature)) return true;                       // BG/MS: view always granted to org
+  return (org.shareSettings as any)?.[feature]?.enabled === true;
 }
 
 export function canEditItem(
@@ -167,15 +184,20 @@ export function canEditItem(
   if (item.userId === user.userId) return true;
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
-  if (org.shareSettings?.[feature]?.enabled !== true) return false;
-  if (user.orgRole === 'owner') return true;                          // org admin: implicit editor
-  return org.shareSettings[feature].editors.includes(user.userId);
+  if (user.orgRole === 'owner') return true;                     // org admin: implicit editor for every feature
+  const cfg = (org.shareSettings as any)?.[feature];
+  if (!cfg) return false;
+  // Toggleable features require enabled === true for edit too; always-on don't.
+  if (!ALWAYS_ON.has(feature) && cfg.enabled !== true) return false;
+  return Array.isArray(cfg.editors) && cfg.editors.includes(user.userId);
 }
 ```
 
 Helpers are pure / synchronous; the caller is responsible for pre-loading `org` and `ownerOrgId`. This keeps them unit-testable without DDB mocks.
 
 Delete permission uses `canEditItem` plus an extra constraint: only the original `userId` owner OR the org admin can DELETE. Editors can edit but cannot delete. This is encoded directly in each route's DELETE handler, not in the helper, because the rule is short.
+
+Brand Guidelines and Marketing Strategy are not "items" in the same per-row sense; they're single fields on the Organization. Their edit permission uses `canEditItem` with an `item.userId = org.ownerUserId` shim (the org owner is the de-facto author), `feature = 'brandGuidelines'` / `'marketingStrategy'`, and `ownerOrgId = org.orgId`. View is always allowed to org members (already the case today; see §10).
 
 ### 5.4 List endpoints: member-fanout pattern
 
@@ -281,16 +303,19 @@ New section in the org-management area (only visible to users where `user.orgRol
 ```
 Org-wide Sharing
 ─────────────────────────────────────
-☐ Knowledge Bases         Editors: [+ Add]
-☐ HtmlTemplates           Editors: [+ Add]
-☐ Landing Pages           Editors: [+ Add]
-☑ Work Plans              Editors: [Alice ×] [Bob ×] [+ Add]
-☑ Skills                  Editors: [+ Add]
+Toggleable (admin chooses to share + who edits)
+  ☐ Knowledge Bases       Editors: [+ Add]
+  ☐ HtmlTemplates         Editors: [+ Add]
+  ☐ Landing Pages         Editors: [+ Add]
+  ☑ Work Plans            Editors: [Alice ×] [Bob ×] [+ Add]
+  ☑ Skills                Editors: [+ Add]
+
+Always shared with org (admin only chooses who edits)
+  • Brand Guidelines      Editors: [+ Add]
+  • Marketing Strategy    Editors: [+ Add]
 ```
 
-Each row:
-- Toggle to enable / disable sharing for that feature in this org.
-- Multi-select of org members for the editor list. Org owner is shown as an implicit editor (greyed-out chip) and cannot be removed.
+Each toggleable row: toggle to enable / disable sharing + a multi-select of org members for the editor list. Each always-on row: just the multi-select. Org owner is shown as an implicit editor (greyed-out chip) and cannot be removed in either kind of row.
 
 Saves call `PATCH /api/orgs/me/share-settings`. Changes take effect immediately — no bulk update to items is needed.
 
@@ -364,14 +389,16 @@ WorkPlans and Skills currently auto-share to org if the owner has `orgId`. After
 **Step 1 — Migrate org records:**
 ```
 For each existing Organization:
-  SET shareSettings.workPlans = { enabled: true,  editors: [] }
-  SET shareSettings.skills    = { enabled: true,  editors: [] }
-  SET shareSettings.knowledgeBase = { enabled: false, editors: [] }
-  SET shareSettings.htmlTemplates = { enabled: false, editors: [] }
-  SET shareSettings.landingPages  = { enabled: false, editors: [] }
+  SET shareSettings.workPlans         = { enabled: true,  editors: [] }
+  SET shareSettings.skills            = { enabled: true,  editors: [] }
+  SET shareSettings.knowledgeBase     = { enabled: false, editors: [] }
+  SET shareSettings.htmlTemplates     = { enabled: false, editors: [] }
+  SET shareSettings.landingPages      = { enabled: false, editors: [] }
+  SET shareSettings.brandGuidelines   = { editors: [] }   // always shared with org
+  SET shareSettings.marketingStrategy = { editors: [] }   // always shared with org
 ```
 
-New orgs created post-deploy: all five default to `{ enabled: false, editors: [] }`.
+New orgs created post-deploy: all five toggleable features default to `{ enabled: false, editors: [] }`; both always-on features default to `{ editors: [] }`.
 
 **Step 2 — Update list endpoints:**
 
@@ -387,15 +414,28 @@ DELETE remains owner-or-admin only.
 
 The migration runs as `backend/src/scripts/migrate-org-share-settings.ts`, executed manually post-deploy by an admin. Idempotent — skips orgs where `shareSettings` is already set.
 
-## 10. Brand Guidelines + Marketing Strategy Audit
+## 10. Brand Guidelines + Marketing Strategy
 
-Before merge, a two-user test in staging:
-1. User A in Org X sets Brand Guidelines + Marketing Strategy via existing UI.
+These are always shared with the org (read-side). This design adds **edit-side** control: the org admin picks who can modify them via the per-feature `editors` arrays on `shareSettings.brandGuidelines` and `shareSettings.marketingStrategy`.
+
+### 10.1 View-side audit
+
+Before merge, confirm current org-wide read works as expected. Two-user test in staging:
+1. User A (in Org X) sets Brand Guidelines + Marketing Strategy via existing UI.
 2. User B (same Org X) loads Emma and uses `read_brand_guidelines` and `read_market_strategy` tools (`agentModeService.ts:4330,4349`).
 3. Confirm User B receives User A's content.
 
-If audit passes: no changes needed; xCures' "three pillars" request is satisfied by this design + existing behavior.
-If audit fails: file as a separate bug, fix in a follow-up PR (out of scope for this design).
+If audit passes: no view-side changes needed.
+If audit fails: file a follow-up bug; this spec does not redesign read sharing for those two pillars.
+
+### 10.2 Edit-side changes
+
+Update the existing edit routes for Brand Guidelines and Marketing Strategy (`marketStrategy.ts` and equivalent) to:
+- Allow PUT/PATCH if caller is the org owner.
+- Allow PUT/PATCH if caller is in `org.shareSettings.brandGuidelines.editors` (or `.marketingStrategy.editors` respectively) and in the same org as the resource owner.
+- Reject otherwise.
+
+These two features have no `enabled` flag (view is always on); only the editor list gates writes.
 
 ## 11. Routes Surface
 
@@ -464,41 +504,162 @@ For each of the five entity types, a `backend/src/__tests__/orgShared<Entity>.te
 For `services/orgShareService.ts`:
 
 10. Unit tests for `canViewItem` and `canEditItem` covering all combinations of owner / admin / editor / non-editor org member / different-org user / no-org user, with `enabled` true and false.
+11. Coverage of always-on features (`brandGuidelines`, `marketingStrategy`): view is always granted to same-org members regardless of any flag; edit requires admin OR membership in the corresponding `editors` array.
+
+For Brand Guidelines + Marketing Strategy edit (`backend/src/__tests__/orgPillarEditors.test.ts`):
+
+12. Org admin can PUT brand guidelines and marketing strategy regardless of editor list.
+13. User in `editors.brandGuidelines` can PUT brand guidelines but not marketing strategy.
+14. User in `editors.marketingStrategy` can PUT marketing strategy but not brand guidelines.
+15. Non-editor org member can GET both but not PUT either.
+16. Different-org user can neither GET nor PUT.
 
 For the member-removal flow (`backend/src/__tests__/orgMemberRemoval.test.ts`):
 
-11. Preview returns correct counts per feature.
-12. Decisions `transfer` change item ownership; `delete` removes items; `leave` is a no-op.
-13. Caller without `orgRole === 'owner'` is rejected.
-14. Removed user is also pruned from every `shareSettings.<feature>.editors` array.
-15. Member with >10000 items in any feature: removal request fails with `BULK_UPDATE_TOO_LARGE`.
-16. Removal request without `confirm: true` is rejected with 400.
+17. Preview returns correct counts per feature.
+18. Decisions `transfer` change item ownership; `delete` removes items; `leave` is a no-op.
+19. Caller without `orgRole === 'owner'` is rejected.
+20. Removed user is also pruned from every `shareSettings.<feature>.editors` array, including `brandGuidelines.editors` and `marketingStrategy.editors`.
+21. Member with >10000 items in any feature: removal request fails with `BULK_UPDATE_TOO_LARGE`.
+22. Removal request without `confirm: true` is rejected with 400.
 
 For the migration (`backend/src/__tests__/migrateOrgShareSettings.test.ts`):
 
-17. Existing orgs receive `workPlans.enabled = true, skills.enabled = true` and the other three features `false`.
-18. Re-running the migration is a no-op (idempotent).
+23. Existing orgs receive `workPlans.enabled = true, skills.enabled = true`, the three new toggleable features `false`, and `brandGuidelines.editors = [], marketingStrategy.editors = []`.
+24. Re-running the migration is a no-op (idempotent).
 
-## 14. Deployment
+## 14. Playwright Scenarios (cloud test environment)
+
+Run after every `./test-env/test-env.sh sync` during implementation, and as the final acceptance gate before merge. Uses the Playwright MCP tools (`mcp__playwright__browser_*`) against the cloud test env URL printed by the test-env script. All scenarios use the standard test accounts (`test@example.com` / `Test123!` as admin and `test1@example.com` / `Test123!` as basic user) plus dynamically seeded users where multi-tenant testing is needed.
+
+### 14.1 Seed data prerequisites
+
+Before any scenario, create the following via UI or API (admin-delegated):
+
+- **Org A** with owner `ownerA@test.local`, members `editorA1@test.local`, `editorA2@test.local`, `memberA@test.local`.
+- **Org B** with owner `ownerB@test.local`, member `memberB@test.local`.
+- **Solo user** `solo@test.local` (no org).
+
+Each user has at least one item of every entity type pre-created so the multi-tenant view paths can be exercised.
+
+### 14.2 Admin settings panel (Scenarios PW-1 to PW-6)
+
+PW-1. **Owner-only access.** Sign in as `memberA@test.local`. Navigate to org settings. Confirm the "Org-wide Sharing" panel is not visible. Sign out, sign in as `ownerA@test.local`, confirm it is visible.
+
+PW-2. **Toggleable features render with toggles + editor pickers.** As owner of Org A, confirm five toggleable rows (Knowledge Bases / HtmlTemplates / Landing Pages / Work Plans / Skills) each have a checkbox + editor multi-select.
+
+PW-3. **Always-on features render without toggles.** Confirm Brand Guidelines and Marketing Strategy rows show only an editor multi-select — no checkbox.
+
+PW-4. **Org owner shown as implicit editor.** In every editor multi-select, the owner appears as a non-removable chip.
+
+PW-5. **Editor multi-select restricts to org members.** Open any editor dropdown. Confirm `memberB@test.local` (Org B) is not listed; `solo@test.local` is not listed; only Org A members appear.
+
+PW-6. **Save persists.** Toggle `knowledgeBase.enabled = true`, add `editorA1@test.local` as a Templates editor, save. Refresh the page. Both states persist.
+
+### 14.3 Toggle behavior is immediate (PW-7 to PW-10)
+
+PW-7. **Toggle ON → org members see items.** As `memberA@test.local`, navigate to the templates list. Note count N. As `ownerA@test.local`, enable HtmlTemplates sharing. Switch back to `memberA@test.local` (use Playwright tab/session switching), reload the templates list. Confirm count is N + (owner's templates count). Each foreign template shows the "Shared by ownerA" badge.
+
+PW-8. **Toggle OFF → org members lose visibility.** From the above state, switch to `ownerA@test.local`, disable HtmlTemplates sharing. Switch to `memberA@test.local`, reload. Confirm count drops back to N. No bulk write delay — change is instant.
+
+PW-9. **Always-on features ignore the toggle.** As `memberA@test.local`, confirm Brand Guidelines and Marketing Strategy values from `ownerA@test.local` are always visible in Emma's context, regardless of any toggle state.
+
+PW-10. **Cross-org isolation.** As `memberB@test.local`, confirm none of Org A's items ever appear regardless of Org A's toggle states.
+
+### 14.4 Editor permission paths per feature (PW-11 to PW-25)
+
+For each of the 7 features, run a 3-scenario set proving:
+- editor in the feature's `editors` list can PATCH but not DELETE;
+- non-editor org member can GET but not PATCH or DELETE;
+- non-org user is denied all three.
+
+Concretely (using HtmlTemplates as the worked example, repeated for each feature):
+
+PW-11. **Owner creates a template** as `ownerA@test.local`. Note `templateId`.
+PW-12. **Owner adds `editorA1@test.local` to Templates editors.**
+PW-13. **Editor can PATCH.** As `editorA1@test.local`, open the template, edit `name`, save. Confirm 200 + persisted change.
+PW-14. **Editor cannot DELETE.** As `editorA1@test.local`, attempt DELETE. Confirm UI hides the button; direct DELETE via API returns 403.
+PW-15. **Non-editor org member can GET, cannot PATCH.** As `memberA@test.local`, can open the template (read-only UI). Edit form fields are disabled. PATCH via API returns 403.
+PW-16. **Non-org user denied.** As `memberB@test.local`, the template is not in the list and direct GET by id returns 403.
+
+Repeat the pattern for KB-Tasks (PW-17), Landing Pages (PW-18), Work Plans (PW-19), Skills (PW-20). For Brand Guidelines (PW-21) and Marketing Strategy (PW-22), there is no `enabled` toggle — the same editor-vs-non-editor distinction applies to the PUT/PATCH endpoint while GET is always available to org members. PW-23 verifies that org owner (`ownerA@test.local`) can always PATCH and DELETE regardless of editor list across every feature. PW-24 verifies that when a feature's `enabled` flag is false, even an explicit editor cannot view or edit (except the owner of the item itself). PW-25 verifies the "Shared by" badge appears only on foreign items, never on the caller's own items.
+
+### 14.5 Member removal flow (PW-26 to PW-34)
+
+PW-26. **Removal preview shows correct counts.** As `ownerA@test.local`, seed `memberA@test.local` with 3 KBs, 5 templates, 2 LPs, 1 workplan, 0 skills. Open the remove dialog. Confirm the preview shows exactly those counts.
+
+PW-27. **`transfer` decision moves ownership.** Pick `transfer` for KBs only, `delete` for templates, `leave` for everything else. Confirm. Sign in as `ownerA@test.local`, confirm 3 KBs now show up in own list with owner = owner. Sign in as the (now removed) `memberA@test.local`, confirm KBs are gone from their account.
+
+PW-28. **`delete` decision removes items.** From the same removal run, confirm the 5 templates no longer exist via any path (admin can't see them; ex-member can't see them; direct GET returns 404).
+
+PW-29. **`leave` decision keeps ownership.** The 2 LPs and 1 workplan: confirm they remain owned by `memberA@test.local`, but with `memberA.orgId` now cleared, neither Org A admin nor any Org A member sees them. The ex-member sees them in their own list still.
+
+PW-30. **Removed user is pruned from editor lists.** Before removal, add `memberA@test.local` to `editors.htmlTemplates` and `editors.brandGuidelines`. After removal, reload org settings; confirm both editor lists no longer contain that userId.
+
+PW-31. **Caller must be org owner.** Attempt removal as `editorA1@test.local`. Confirm 403 from API; UI shows no "Remove" button.
+
+PW-32. **`confirm: true` required.** Issue the removal POST without `confirm: true` via direct API call. Confirm 400.
+
+PW-33. **Cap enforcement.** Use a seeded user with >10000 items in a feature (created via a fixture script). Confirm removal request returns 400 `BULK_UPDATE_TOO_LARGE` and the user is NOT removed.
+
+PW-34. **Mixed feature decisions in one request.** Verify `decisions = { knowledgeBase: 'transfer', htmlTemplates: 'delete', landingPages: 'leave', workPlans: 'transfer', skills: 'leave' }` are all applied independently and atomically per feature.
+
+### 14.6 Ownership-follows-owner (PW-35 to PW-38)
+
+PW-35. **Move user between orgs.** As platform admin, move `editorA2@test.local` from Org A to Org B. As `memberA@test.local` (still in Org A), confirm `editorA2`'s items vanish from Org A views. As `memberB@test.local`, confirm those items appear (if Org B has the matching feature enabled).
+
+PW-36. **No item-level migration needed.** Run PW-35 within a single page reload of each user — confirm the change appears without any background-task delay.
+
+PW-37. **Editor list grooms across org moves.** If `editorA2@test.local` was in Org A's `editors.workPlans`, confirm the move strips that entry from Org A's `editors.workPlans`.
+
+PW-38. **Solo user has no org behavior.** Confirm `solo@test.local` sees only their own items in every feature list and cannot access any settings panel.
+
+### 14.7 HtmlTemplate migration (PW-39 to PW-42)
+
+Run these immediately after deploying the migration script.
+
+PW-39. **Pre-existing private templates visible.** Sign in as a pre-migration user. Confirm all templates from the old settings row appear in the new list. Each is editable, deletable, and creatable.
+
+PW-40. **Pre-existing public templates visible.** Sign in as any user. Confirm admin-published public templates (with `isPublic: true`) appear alongside the user's own templates. `isPublic` interaction unaffected by org settings.
+
+PW-41. **New template creation writes to new table.** As `ownerA@test.local`, create a template. Verify (via admin debugging tool / DDB console) the row exists in `AW-HtmlTemplates` with the correct `userId` and no `orgId` field.
+
+PW-42. **Old settings rows untouched post-migration.** Confirm the original `templates_${userId}` row in `AW-Settings` is unchanged (cleanup is a follow-up commit, not part of this migration).
+
+### 14.8 Performance + caps (PW-43 to PW-45)
+
+PW-43. **List endpoint within latency budget.** With Org A populated to ~100 templates per member and ~10 members, time the templates list response. Target: under 2s p95 in the test environment.
+
+PW-44. **Caps trigger truncated flag.** Seed an org member with >500 of any item type. Trigger the list endpoint as another org member. Confirm response includes `truncated: true` and items are capped.
+
+PW-45. **Fanout cap.** Seed an org with >100 members (or simulate via test fixture). Confirm list endpoint completes within timeout and signals `truncated: true`.
+
+### 14.9 Acceptance gate
+
+Every scenario above must pass on the cloud test environment before the PR is marked ready for review. Use the Playwright MCP tools to drive interactions; capture screenshots of any failure (`mcp__playwright__browser_take_screenshot`). On any unexpected console error (`mcp__playwright__browser_console_messages`), file it under the scenario that triggered it and fix before re-running.
+
+The "Prep for Deploy" workflow in `CLAUDE.md` is unchanged — Playwright runs are an addition, not a replacement.
+
+## 15. Deployment
 
 Standard backend + customer-portal PR flow per `CLAUDE.md` "Prep for Deploy" section. Migration scripts (§5.5 HtmlTemplate move and §9 org settings) are executed manually post-deploy in production. HtmlTemplate settings-row cleanup is a separate follow-up commit after one production deploy cycle.
 
-## 15. AW-Users `OrgIdIndex` GSI (included in this scope)
+## 16. AW-Users `OrgIdIndex` GSI (included in this scope)
 
 Resolved during spec review: today's `userDb.getOrgMembers(orgId)` (`db.ts:7176`) is a **full Scan** of `AW-Users` with `FilterExpression: 'orgId = :orgId'`. Existing callers use it sparingly (e.g. once per session). After this design, every list endpoint for the five shared entities calls it on every hit. At platform scale (tens of thousands of users), that's prohibitive.
 
 This design **adds a GSI** `OrgIdIndex` on `AW-Users` (partition: `orgId`) and replaces the Scan inside `getOrgMembers` with a Query against that GSI. One-time table change; backwards-compatible. Both the new flows and the existing callers benefit.
 
-The GSI also makes the §7 member-removal cleanup of editor lists more efficient.
+The GSI also makes the §7 member-removal cleanup of editor lists and the §14 Playwright multi-tenant scenarios more efficient.
 
 `getOrgMembers` returns Users with `orgId === <given>`. Org owners have `orgId` set on their User row, so they are included naturally — no special-casing needed for the fanout.
 
-## 16. Open Questions
+## 17. Open Questions
 
 - **HtmlTemplate `isPublic` interaction:** Some HtmlTemplates today are admin-published with `isPublic: true`. The new model treats `isPublic` as orthogonal — those templates remain visible to all platform users regardless of org settings. Tests cover the combination.
 - **Editor list size:** No explicit cap on `editors` arrays. The implicit ceiling is `org.maxMembers` (only current org members are valid). No additional cap needed.
 
-## 17. Future Work
+## 18. Future Work
 
 - Cursor-paginated list endpoints with a new `OwnerIdCreatedAtIndex` GSI per table, replacing the per-source caps in §5.4.
 - Per-item sharing override for users who need to keep a specific item private even when their feature is enabled org-wide.
