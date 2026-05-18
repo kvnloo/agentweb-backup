@@ -12,6 +12,7 @@ jest.mock('../middleware/auth', () => ({
 // Mock connectedAccountsDb
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
+  getAccountsByUserIdIncludingOrgShared: jest.fn(),
   deleteAccount: jest.fn(),
   deleteAccountById: jest.fn(),
   getAccountByPlatform: jest.fn(),
@@ -64,11 +65,11 @@ jest.mock('../services/subscriptionService', () => {
 
 import connectedAccountsRoutes from '../routes/connectedAccounts';
 import * as subscriptionService from '../services/subscriptionService';
-import { getAccountsByUserId } from '../services/connectedAccountsDb';
+import { getAccountsByUserIdIncludingOrgShared } from '../services/connectedAccountsDb';
 
 const mockedGetSubscriptionTypeConfig = subscriptionService.getSubscriptionTypeConfig as jest.Mock;
 const mockedGetUserSubscriptionType = subscriptionService.getUserSubscriptionType as jest.Mock;
-const mockedGetAccountsByUserId = getAccountsByUserId as jest.Mock;
+const mockedGetAccountsByUserId = getAccountsByUserIdIncludingOrgShared as jest.Mock;
 
 let app: express.Application;
 

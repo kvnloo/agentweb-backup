@@ -1,6 +1,6 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, deleteAccount, deleteAccountById, getAccountByPlatform, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -17,7 +17,7 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
-    const accounts = await getAccountsByUserId(userId);
+    const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
 
     // Check real connection status for Unipile accounts in a single paginated call
     const unipileAccountIds = accounts

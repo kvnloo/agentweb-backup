@@ -287,6 +287,43 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
 };
 
 /**
+ * Get connected accounts for a user, including org-shared accounts from other members.
+ * Own accounts are always returned. Org members' accounts are included only when
+ * sharedWithOrg === true. Deduplication is by account_id — own account wins on conflict.
+ */
+export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Promise<ConnectedAccount[]> => {
+  const { orgDb } = await import('./db');
+
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    return [];
+  }
+
+  const ownAccounts = normalizeAccounts((user as User).connected_accounts);
+
+  if (!(user as User).orgId) {
+    return ownAccounts;
+  }
+
+  const members = await orgDb.getOrgMembers((user as User).orgId!);
+  const seen = new Set(ownAccounts.map(a => a.account_id));
+  const sharedAccounts: ConnectedAccount[] = [];
+
+  for (const member of members) {
+    if (member.userId === userId) continue;
+    const memberAccounts = normalizeAccounts(member.connected_accounts);
+    for (const account of memberAccounts) {
+      if (account.sharedWithOrg && !seen.has(account.account_id)) {
+        seen.add(account.account_id);
+        sharedAccounts.push(account);
+      }
+    }
+  }
+
+  return [...ownAccounts, ...sharedAccounts];
+};
+
+/**
  * Get a specific connected account by platform
  */
 export const getAccountByPlatform = async (
