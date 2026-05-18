@@ -3,9 +3,16 @@ import { userDb, orgDb, taskDb } from "../services/db";
 import { workPlanService } from "../services/workPlanService";
 import { skillService } from "../services/skillService";
 import { htmlTemplateService } from "../services/htmlTemplateService";
-import { getLandingPagesByOwner } from "../services/v0Service";
+import {
+  getLandingPagesByOwner,
+  deleteLandingPageByRecord,
+  transferLandingPageOwner,
+} from "../services/v0Service";
+import { TOGGLEABLE_FEATURES, ToggleableFeature } from "../services/orgShareService";
 
 const router = express.Router();
+
+// ── GET /:userId/removal-preview ───────────────────────────────────────────
 
 router.get("/:userId/removal-preview", async (req, res) => {
   try {
@@ -46,5 +53,153 @@ router.get("/:userId/removal-preview", async (req, res) => {
     res.status(500).json({ message: "Failed to fetch removal preview" });
   }
 });
+
+// ── POST /:userId/remove ───────────────────────────────────────────────────
+
+const PER_FEATURE_CAP = 10000;
+const CONCURRENCY = 25;
+
+type Decision = "transfer" | "delete" | "leave";
+
+router.post("/:userId/remove", async (req, res) => {
+  try {
+    const callerId = (req as any).user.userId;
+    const caller = await userDb.getUserById(callerId);
+    if (!caller?.orgId || caller.orgRole !== "owner") {
+      return res.status(403).json({ message: "Org owner only" });
+    }
+
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ message: "confirm:true required" });
+    }
+
+    const target = await userDb.getUserById(req.params.userId);
+    if (!target || target.orgId !== caller.orgId) {
+      return res.status(404).json({ message: "Member not found in your org" });
+    }
+
+    const decisions: Partial<Record<ToggleableFeature, Decision>> = req.body?.decisions || {};
+    for (const f of TOGGLEABLE_FEATURES) {
+      const d = decisions[f];
+      if (!d || !["transfer", "delete", "leave"].includes(d)) {
+        return res.status(400).json({ message: `Invalid decision for ${f}: ${d}` });
+      }
+    }
+
+    // Cap pre-check — fetch counts before making any writes
+    for (const f of TOGGLEABLE_FEATURES) {
+      if (decisions[f] === "leave") continue;
+      const items = await fetchItemsForFeature(target.userId, f);
+      if (items.length > PER_FEATURE_CAP) {
+        return res.status(400).json({ error: "BULK_UPDATE_TOO_LARGE", feature: f, count: items.length });
+      }
+    }
+
+    const summary: Record<string, { updated: number; deleted: number; errors: string[] }> = {};
+
+    for (const f of TOGGLEABLE_FEATURES) {
+      const d = decisions[f]!;
+      summary[f] = { updated: 0, deleted: 0, errors: [] };
+      if (d === "leave") continue;
+
+      const items = await fetchItemsForFeature(target.userId, f);
+
+      // Bounded concurrency — use a shared queue with fixed worker count
+      const queue = [...items];
+      const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length || 1) }, () =>
+        (async () => {
+          while (queue.length) {
+            const item = queue.shift();
+            if (!item) break;
+            try {
+              if (d === "transfer") {
+                await transferItemOwner(item, f, callerId);
+                summary[f].updated++;
+              } else if (d === "delete") {
+                await deleteItem(item, f);
+                summary[f].deleted++;
+              }
+            } catch (e: any) {
+              summary[f].errors.push(`${f}/${getItemId(item, f)}: ${e?.message ?? e}`);
+            }
+          }
+        })()
+      );
+      await Promise.all(workers);
+    }
+
+    // Clear org membership on the target user
+    await userDb.clearOrgMembership(target.userId);
+    // Prune editor lists
+    await orgDb.pruneEditorListsForUser(caller.orgId, target.userId);
+
+    res.json({ summary });
+  } catch (e) {
+    console.error("Error removing member:", e);
+    res.status(500).json({ message: "Failed to remove member" });
+  }
+});
+
+// ── Per-feature helpers ────────────────────────────────────────────────────
+
+async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promise<any[]> {
+  switch (f) {
+    case "knowledgeBase":  return (await taskDb.getTasksByUserId(userId)) ?? [];
+    case "htmlTemplates":  return htmlTemplateService.getTemplatesByOwner(userId);
+    case "landingPages":   return getLandingPagesByOwner(userId);
+    case "workPlans":      return workPlanService.getWorkPlansByOwner(userId);
+    case "skills":         return skillService.getSkillsByOwner(userId);
+  }
+}
+
+function getItemId(item: any, f: ToggleableFeature): string {
+  switch (f) {
+    case "knowledgeBase":  return item.taskId;
+    case "htmlTemplates":  return item.templateId;
+    case "landingPages":   return item.id;
+    case "workPlans":      return item.planId;
+    case "skills":         return item.skillId;
+  }
+}
+
+async function transferItemOwner(item: any, f: ToggleableFeature, newOwnerId: string): Promise<void> {
+  switch (f) {
+    case "knowledgeBase":
+      await taskDb.updateTaskOwner(item.taskId, newOwnerId);
+      return;
+    case "htmlTemplates":
+      await htmlTemplateService.transferOwner(item.templateId, newOwnerId);
+      return;
+    case "landingPages":
+      await transferLandingPageOwner(item.id, newOwnerId);
+      return;
+    case "workPlans":
+      await workPlanService.transferOwner(item.planId, newOwnerId);
+      return;
+    case "skills":
+      await skillService.transferOwner(item.skillId, newOwnerId);
+      return;
+  }
+}
+
+async function deleteItem(item: any, f: ToggleableFeature): Promise<void> {
+  switch (f) {
+    case "knowledgeBase":
+      await taskDb.deleteTask(item.taskId);
+      return;
+    case "htmlTemplates":
+      await htmlTemplateService.deleteTemplate(item.templateId);
+      return;
+    case "landingPages":
+      await deleteLandingPageByRecord(item);
+      return;
+    case "workPlans":
+      await workPlanService.deleteWorkPlan(item.planId);
+      return;
+    case "skills":
+      await skillService.deleteSkill(item.skillId);
+      return;
+  }
+}
 
 export default router;

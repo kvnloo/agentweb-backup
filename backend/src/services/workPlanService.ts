@@ -131,6 +131,21 @@ export class WorkPlanService {
     }).promise();
   }
 
+  /**
+   * Transfer ownership of a work plan to a new user (used when removing a member from an org).
+   */
+  async transferOwner(planId: string, newOwnerId: string): Promise<void> {
+    await dynamodb.update({
+      TableName: this.tableName,
+      Key: { planId },
+      UpdateExpression: "SET ownerId = :newOwner, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":newOwner": newOwnerId,
+        ":now": new Date().toISOString(),
+      },
+    }).promise();
+  }
+
   async getAllWorkPlans(): Promise<WorkPlan[]> {
     try {
       const items = await paginatedScan(dynamodb, { TableName: this.tableName });

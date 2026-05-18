@@ -1267,6 +1267,21 @@ class UserDB {
       return null;
     }
   }
+
+  /**
+   * Remove orgId and orgRole from a user record (used when removing a member from an org).
+   */
+  async clearOrgMembership(userId: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+    await this.docClient.update({
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "REMOVE orgId, orgRole",
+    }).promise();
+  }
 }
 
 // Initialize and export userDb instance

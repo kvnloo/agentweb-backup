@@ -64,4 +64,19 @@ export const htmlTemplateService = {
   async deleteTemplate(templateId: string): Promise<void> {
     await dynamodb.delete({ TableName: TABLE, Key: { templateId } }).promise();
   },
+
+  /**
+   * Transfer ownership of an HTML template to a new user (used when removing a member from an org).
+   */
+  async transferOwner(templateId: string, newOwnerId: string): Promise<void> {
+    await dynamodb.update({
+      TableName: TABLE,
+      Key: { templateId },
+      UpdateExpression: "SET userId = :newOwner, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":newOwner": newOwnerId,
+        ":now": new Date().toISOString(),
+      },
+    }).promise();
+  },
 };

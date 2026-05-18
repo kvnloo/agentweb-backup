@@ -452,6 +452,26 @@ export class SkillService {
       throw error;
     }
   }
+
+  /**
+   * Transfer ownership of a skill to a new user (used when removing a member from an org).
+   */
+  async transferOwner(skillId: string, newOwnerId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { skillId },
+        UpdateExpression: "SET userId = :newOwner, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":newOwner": newOwnerId,
+          ":now": new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error transferring skill ${skillId} to ${newOwnerId}:`, error);
+      throw error;
+    }
+  }
 }
 
 export const skillService = new SkillService();

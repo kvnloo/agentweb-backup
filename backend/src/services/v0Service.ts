@@ -2413,6 +2413,23 @@ export async function getLandingPageById(id: string): Promise<GeneratedLandingPa
 }
 
 /**
+ * Transfer ownership of a landing page to a new user (used when removing a member from an org).
+ */
+export async function transferLandingPageOwner(id: string, newOwnerId: string): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET userId = :newOwner, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":newOwner": newOwnerId,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
  * Delete a landing page given an already-fetched record (for org-share flows where
  * the caller may not be the owner). Enforces root-page guard.
  */
