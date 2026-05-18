@@ -3949,6 +3949,7 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
       sources: ['web_search' as const],
       forceOverwrite: forceEnrich,
       leadIds,
+      apolloTechStack: true,
     };
 
     if (mode === 'preview') {
