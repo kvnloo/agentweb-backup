@@ -11,6 +11,19 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-18',
     changes: [
+      'CRM Group Email: Format Verification Before Sending',
+      '- The "Prepare for Sending" step now checks your email HTML for common issues before you send',
+      '- Warns if dark mode handling is missing (add <meta name="color-scheme" content="light"> to opt iOS Mail out of color inversion)',
+      '- Warns if dark text on a light background has no dark mode protection — the cause of unreadable text seen in Apple Mail / iOS dark mode',
+      '- Warns if CSS class rules outside @media blocks are present (Gmail strips these, breaking layout)',
+      'CRM Group Email: "Load from URL" Now Instant',
+      '- Loading an email HTML file from a URL in the Group Email composer no longer hangs',
+      '- Previously took up to 80+ seconds due to an unnecessary LLM call on every load; now returns in under 1 second',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
       'Fixed: CRM Lead Enrichment and Field Edits Now Work for All Leads',
       '- A subset of leads imported before a data-quality fix had empty strings stored for email, LinkedIn URL, or name+company key fields',
       '- DynamoDB rejected any write to these leads — silently blocking enrichment updates and CRM field edits',
@@ -25,8 +38,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- This affected knowledge bases that were created or updated in sessions where the size metadata was not written — the content existed in storage but the listing logic filtered them out',
       '- Affected knowledge bases are now visible and fully accessible again',
       '- New saves now always record a size of at least 1, preventing this from recurring',
-    ],
-  },
   {
     date: '2026-05-16',
     changes: [
