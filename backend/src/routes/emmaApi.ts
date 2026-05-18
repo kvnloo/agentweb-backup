@@ -172,10 +172,10 @@ router.post('/generate-video', async (req: Request, res: Response) => {
 router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { type, url, prompt, llm_model } = req.body;
+    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time } = req.body;
     let result;
     if (type === 'video') {
-      result = await svc.describeVideo(url, prompt);
+      result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time });
     } else {
       result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt);
     }

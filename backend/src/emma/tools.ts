@@ -3806,7 +3806,7 @@ emmaToolRegistry.register({
   name: "describe_video",
   definition: {
     name: "describe_video",
-    description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video, asks to "read" a video, or when you need to understand video content (mp4, mov, avi, webm, mkv, etc.). Always prefer this over read_file_content for video files.',
+    description: 'Analyze and describe a video from a URL using Gemini. Accepts direct video file URLs (mp4, mov, avi, webm, mkv, etc.) AND YouTube URLs (youtube.com or youtu.be). Always prefer this over read_file_content for video files. For scripting and content repurposing, set return_transcript=true to get a timestamped spoken-word transcript, and/or return_scenes=true to get a structured scene-by-scene breakdown. Use start_time/end_time to focus on a specific segment.',
     inputSchema: {
       type: "object",
       properties: {
@@ -3818,13 +3818,34 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Custom prompt/instructions for analyzing the video. Specify what aspects to focus on (e.g., key events, narration, visual details, or timing).',
           default: 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.'
+        },
+        return_transcript: {
+          type: 'boolean',
+          description: 'When true, returns a timestamped transcript of all spoken content as an array of {start, end, text} objects. Use for scripting, captioning, or content repurposing workflows.'
+        },
+        return_scenes: {
+          type: 'boolean',
+          description: 'When true, returns scene segmentation as an array of {start, end, title, description} objects identifying distinct video segments. Use for scene planning or B-roll identification.'
+        },
+        start_time: {
+          type: 'string',
+          description: 'Focus analysis on a time range starting at this timestamp (e.g. "0:30", "1:15"). Use together with end_time for targeted segment analysis.'
+        },
+        end_time: {
+          type: 'string',
+          description: 'Focus analysis on a time range ending at this timestamp (e.g. "2:00", "3:45"). Use together with start_time for targeted segment analysis.'
         }
       },
       required: ["video_file_url"]
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.describeVideo(args.video_file_url, args.prompt);
+    return await agentModeService.describeVideo(args.video_file_url, args.prompt, {
+      return_transcript: args.return_transcript,
+      return_scenes: args.return_scenes,
+      start_time: args.start_time,
+      end_time: args.end_time
+    });
   }
 });
 

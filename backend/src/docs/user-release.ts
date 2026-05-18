@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-16
+// Last updated: 2026-05-18
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,17 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-18',
+    changes: [
+      'Improved: Emma Can Now Return Timestamped Transcripts and Scene Breakdowns from Videos',
+      '- When asking Emma to analyze a video for scripting or content repurposing, you can now request a timestamped spoken-word transcript (every line with start/end time in seconds)',
+      '- Emma can also return a scene-by-scene breakdown with titles, descriptions, and timestamps — useful for identifying B-roll opportunities, cut points, or content segments',
+      '- You can focus analysis on a specific time range (e.g. "analyze the segment from 0:30 to 1:15") without re-processing the full video',
+      '- Works on direct video file URLs (mp4, mov, webm, etc.) and YouTube links',
+      '- Duration is now returned as part of the structured analysis',
+    ],
+  },
   {
     date: '2026-05-18',
     changes: [
