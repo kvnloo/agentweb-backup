@@ -41,6 +41,21 @@ export function canEditItem(
   return Array.isArray(cfg.editors) && cfg.editors.includes(user.userId);
 }
 
+// Whether `user` may create new items of `feature` in `org`.
+// - Solo users (no orgId)            → allowed (no org to gate against).
+// - Org owners                       → allowed.
+// - Listed editors + feature enabled → allowed (always-on features ignore the enabled gate).
+// - Everyone else                    → denied.
+export function canManageOrgFeature(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
+  if (!user.orgId) return true;
+  if (!org) return false;
+  if (user.orgRole === "owner") return true;
+  const cfg = configFor(org, feature);
+  if (!cfg) return false;
+  if (!isAlwaysOnFeature(feature) && cfg.enabled !== true) return false;
+  return Array.isArray(cfg.editors) && cfg.editors.includes(user.userId);
+}
+
 // Caps used by list-merge endpoints (per spec §5.4)
 export const MEMBER_FANOUT_CAP = 100;
 export const PER_SOURCE_CAP    = 500;
