@@ -4316,6 +4316,7 @@ export const crmDb = {
     // CRM Unification v1 extensions (A1)
     domain?: string;
     accountOwnerUserId?: string;
+    pocEmails?: string[];
     priority?: 'Low' | 'Medium' | 'High';
     expectedClose?: string;
     closedDate?: string;
@@ -4432,6 +4433,7 @@ export const crmDb = {
       const crmFields = buildLeadCrmFields(emailValue, {
         domain: leadData.domain,
         accountOwnerUserId: leadData.accountOwnerUserId,
+        pocEmails: leadData.pocEmails,
         priority: leadData.priority,
         expectedClose: leadData.expectedClose,
         closedDate: leadData.closedDate,
@@ -4858,6 +4860,7 @@ export const crmDb = {
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
     accountOwnerUserId?: string | null;
+    pocEmails?: string[] | null;
     syncMetadata?: Record<string, any>;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
@@ -4898,6 +4901,16 @@ export const crmDb = {
         } else {
           setExpressions.push('accountOwnerUserId = :accountOwnerUserId');
           expressionAttributeValues[':accountOwnerUserId'] = String(updates.accountOwnerUserId);
+        }
+      }
+
+      // CRM extension: pocEmails. Supports null/empty => REMOVE.
+      if (updates.pocEmails !== undefined) {
+        if (updates.pocEmails === null || updates.pocEmails.length === 0) {
+          removeExpressions.push('pocEmails');
+        } else {
+          setExpressions.push('pocEmails = :pocEmails');
+          expressionAttributeValues[':pocEmails'] = updates.pocEmails;
         }
       }
 

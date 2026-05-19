@@ -945,6 +945,41 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
 });
 
 /**
+ * @route GET /api/crm/org-members
+ * @desc Return org members for the current user's org (for account owner dropdown)
+ * @access Private
+ */
+router.get('/org-members', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(401).json({ message: 'Unauthorized' });
+
+    if (!user.orgId) {
+      // No org — return just the current user as the only member
+      return res.json({
+        success: true,
+        members: [{ userId: user.userId, email: user.email, displayName: user.displayName ?? null }],
+      });
+    }
+
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const safeMembers = members.map((m) => ({
+      userId: m.userId,
+      email: m.email,
+      displayName: m.displayName ?? null,
+    }));
+
+    return res.json({ success: true, members: safeMembers });
+  } catch (err) {
+    console.error('[CRM] GET /org-members error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
  * @route GET /api/crm/lists
  * @desc Get all lead lists for the authenticated user
  * @access Private
